@@ -1,0 +1,116 @@
+import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+
+export type Note = {
+  id: string;
+  title: string;
+  body: string;
+  transcript: string;
+  summary: string;
+  audio_path: string | null;
+  summary_preset: string;
+  created_at: number;
+  updated_at: number;
+};
+
+export type SettingsKey =
+  | "language"
+  | "transcribe_provider"
+  | "transcribe_model"
+  | "speechmatics_operating_point"
+  | "speechmatics_region"
+  | "summary_model"
+  | "summary_prompt"
+  | "theme";
+
+export type TranscribeProvider = "openai" | "speechmatics" | "local";
+
+export type LocalWhisperStatus = {
+  downloaded: boolean;
+  sizeBytes: number | null;
+  path: string | null;
+};
+
+export type LocalWhisperProgress = { received: number; total: number | null };
+
+export const ipc = {
+  listNotes: () => invoke<Note[]>("notes_list"),
+  getNote: (id: string) => invoke<Note>("notes_get", { id }),
+  createNote: () => invoke<Note>("notes_create"),
+  updateNote: (id: string, patch: Partial<Pick<Note, "title" | "body" | "transcript" | "summary" | "summary_preset">>) =>
+    invoke<void>("notes_update", { id, patch }),
+  deleteNote: (id: string) => invoke<void>("notes_delete", { id }),
+
+  getSetting: (key: SettingsKey) => invoke<string | null>("settings_get", { key }),
+  setSetting: (key: SettingsKey, value: string) => invoke<void>("settings_set", { key, value }),
+
+  getApiKey: () => invoke<string | null>("api_key_get"),
+  setApiKey: (key: string) => invoke<void>("api_key_set", { key }),
+  testApiKey: () => invoke<{ ok: boolean; status: number; error: string | null }>("api_key_test"),
+
+  getSpeechmaticsKey: () => invoke<string | null>("speechmatics_api_key_get"),
+  setSpeechmaticsKey: (key: string) => invoke<void>("speechmatics_api_key_set", { key }),
+  testSpeechmaticsKey: () =>
+    invoke<{ ok: boolean; status: number; error: string | null }>("speechmatics_api_key_test"),
+
+  localWhisperStatus: () =>
+    invoke<LocalWhisperStatus>("local_whisper_status"),
+  localWhisperDownload: () => invoke<void>("local_whisper_download"),
+  localWhisperDelete: () => invoke<void>("local_whisper_delete"),
+
+  recordingStart: (noteId: string) => invoke<void>("recording_start", { noteId }),
+  recordingStop: () => invoke<void>("recording_stop"),
+  recordingPause: () => invoke<void>("recording_pause"),
+  recordingResume: () => invoke<void>("recording_resume"),
+  recordingState: () => invoke<"idle" | "recording">("recording_state"),
+  summarizeNote: (noteId: string) => invoke<void>("summarize_note", { noteId }),
+
+  permissionsStatus: () => invoke<PermissionsStatus>("permissions_status"),
+  permissionsRequest: (kind: PermissionKind) => invoke<PermissionsStatus>("permissions_request", { kind }),
+  permissionsOpenSettings: (kind: PermissionKind) => invoke<void>("permissions_open_settings", { kind }),
+};
+
+export type PermissionKind = "microphone" | "screen";
+export type PermissionStatus =
+  | "granted"
+  | "denied"
+  | "restricted"
+  | "not_determined"
+  | "unknown";
+export type PermissionsStatus = {
+  microphone: PermissionStatus;
+  screen: PermissionStatus;
+};
+
+export type TranscriptEvent = { noteId: string; text: string };
+export type SummaryEvent = { noteId: string; summary: string };
+export type RecordingPhase = "idle" | "starting" | "recording" | "paused" | "stopping" | "summarizing";
+export type RecordingStatus = { noteId: string | null; phase: RecordingPhase };
+export type RecordingError = { noteId: string | null; message: string };
+export type RecordingDiagnostic = {
+  noteId: string;
+  micFrames: number;
+  sysFrames: number;
+  chunks: number;
+  micPeak: number;
+  sysPeak: number;
+};
+
+export function onTranscript(cb: (e: TranscriptEvent) => void): Promise<UnlistenFn> {
+  return listen<TranscriptEvent>("transcript_appended", (e) => cb(e.payload));
+}
+export function onSummary(cb: (e: SummaryEvent) => void): Promise<UnlistenFn> {
+  return listen<SummaryEvent>("summary_ready", (e) => cb(e.payload));
+}
+export function onRecordingStatus(cb: (e: RecordingStatus) => void): Promise<UnlistenFn> {
+  return listen<RecordingStatus>("recording_status", (e) => cb(e.payload));
+}
+export function onRecordingError(cb: (e: RecordingError) => void): Promise<UnlistenFn> {
+  return listen<RecordingError>("recording_error", (e) => cb(e.payload));
+}
+export function onRecordingDiagnostic(cb: (e: RecordingDiagnostic) => void): Promise<UnlistenFn> {
+  return listen<RecordingDiagnostic>("recording_diagnostic", (e) => cb(e.payload));
+}
+export function onLocalWhisperProgress(cb: (e: LocalWhisperProgress) => void): Promise<UnlistenFn> {
+  return listen<LocalWhisperProgress>("local_whisper_progress", (e) => cb(e.payload));
+}

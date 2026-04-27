@@ -1,0 +1,990 @@
+use crate::db::{self, Note, NotePatch};
+use crate::openai;
+use crate::speechmatics;
+use crate::local_whisper;
+use crate::presets;
+use crate::wav;
+use crate::recording::{DiagnosticPayload, ErrorPayload, Inflight, Phase, RecordingStatus, SidecarEvent, SummaryPayload, TranscriptPayload};
+use crate::AppState;
+use futures_util::StreamExt;
+use std::path::PathBuf;
+use std::process::Stdio;
+use std::sync::Arc;
+use tauri::{AppHandle, Emitter, Manager, State};
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::Command;
+
+const DEFAULT_LANGUAGE: &str = "no";
+const DEFAULT_TRANSCRIBE_PROVIDER: &str = "openai";
+const DEFAULT_TRANSCRIBE_MODEL: &str = "whisper-1";
+const DEFAULT_SPEECHMATICS_OP: &str = "enhanced";
+const DEFAULT_SPEECHMATICS_REGION: &str = "eu1";
+const DEFAULT_SUMMARY_MODEL: &str = "gpt-5.4-mini";
+const DEFAULT_SUMMARY_PROMPT: &str = "Du lager møtenotater fra en automatisk transkribert samtale.\n\nKilder du får:\n- [Notater] — det brukeren skrev under møtet (autoritativ kilde for navn, tall og beslutninger).\n- [Transkripsjon] — automatisk generert fra lyden, kan inneholde feil.\n\nNår transkripsjon og notater er i konflikt, stol på notatene.\n\nSkriv på norsk i Markdown. Inkluder kun seksjoner som er reelt relevante — ikke skriv \"Ingen identifisert\".\n\n- **Sammendrag** — 2–4 setninger som fanger essensen.\n- **Beslutninger** — kun reelle beslutninger som ble tatt.\n- **Handlingspunkter** — på formen \"Beskrivelse — Ansvarlig (frist når oppgitt)\".\n- **Åpne spørsmål** — uavklarte ting som krever oppfølging.\n\nVær konkret og kort. Ikke gjenta deg selv. Ikke finn på detaljer som ikke står i kilden.";
+const API_KEY: &str = "__openai_api_key__";
+const SPEECHMATICS_API_KEY: &str = "__speechmatics_api_key__";
+
+fn read_secret(state: &State<AppState>, key: &str) -> Result<Option<String>, String> {
+    let conn = state.db.lock();
+    db::get_setting(&conn, key).map_err(err).map(|opt| {
+        opt.and_then(|s| {
+            let t = s.trim().to_string();
+            if t.is_empty() { None } else { Some(t) }
+        })
+    })
+}
+
+fn err<E: std::fmt::Display>(e: E) -> String { e.to_string() }
+
+#[tauri::command]
+pub fn notes_list(state: State<AppState>) -> Result<Vec<Note>, String> {
+    let conn = state.db.lock();
+    db::list_notes(&conn).map_err(err)
+}
+
+#[tauri::command]
+pub fn notes_get(state: State<AppState>, id: String) -> Result<Note, String> {
+    let conn = state.db.lock();
+    db::get_note(&conn, &id).map_err(err)
+}
+
+#[tauri::command]
+pub fn notes_create(state: State<AppState>) -> Result<Note, String> {
+    let conn = state.db.lock();
+    db::create_note(&conn).map_err(err)
+}
+
+#[tauri::command]
+pub fn notes_update(state: State<AppState>, id: String, patch: NotePatch) -> Result<(), String> {
+    let conn = state.db.lock();
+    db::update_note(&conn, &id, &patch).map_err(err)
+}
+
+#[tauri::command]
+pub fn notes_delete(state: State<AppState>, id: String) -> Result<(), String> {
+    let conn = state.db.lock();
+    db::delete_note(&conn, &id).map_err(err)
+}
+
+#[tauri::command]
+pub fn settings_get(state: State<AppState>, key: String) -> Result<Option<String>, String> {
+    let conn = state.db.lock();
+    db::get_setting(&conn, &key).map_err(err)
+}
+
+#[tauri::command]
+pub fn settings_set(state: State<AppState>, key: String, value: String) -> Result<(), String> {
+    let conn = state.db.lock();
+    db::set_setting(&conn, &key, &value).map_err(err)
+}
+
+#[tauri::command]
+pub fn api_key_get(state: State<AppState>) -> Result<Option<String>, String> {
+    Ok(read_secret(&state, API_KEY)?.map(|_| "stored".to_string()))
+}
+
+#[tauri::command]
+pub fn api_key_set(state: State<AppState>, key: String) -> Result<(), String> {
+    let conn = state.db.lock();
+    db::set_setting(&conn, API_KEY, key.trim()).map_err(err)
+}
+
+#[derive(serde::Serialize)]
+pub struct TestResult {
+    ok: bool,
+    status: u16,
+    error: Option<String>,
+}
+
+#[tauri::command]
+pub async fn api_key_test(state: State<'_, AppState>) -> Result<TestResult, String> {
+    let key = read_secret(&state, API_KEY)?.ok_or_else(|| "No API key stored".to_string())?;
+
+    let r = openai::client()
+        .get(format!("{}/models", openai::BASE))
+        .bearer_auth(&key)
+        .send()
+        .await
+        .map_err(|e| format!("network: {e}"))?;
+
+    let status = r.status();
+    if status.is_success() {
+        return Ok(TestResult { ok: true, status: status.as_u16(), error: None });
+    }
+    let body = r.text().await.unwrap_or_default();
+    let snippet: String = body.chars().take(300).collect();
+    Ok(TestResult { ok: false, status: status.as_u16(), error: Some(snippet) })
+}
+
+#[tauri::command]
+pub fn speechmatics_api_key_get(state: State<AppState>) -> Result<Option<String>, String> {
+    Ok(read_secret(&state, SPEECHMATICS_API_KEY)?.map(|_| "stored".to_string()))
+}
+
+#[tauri::command]
+pub fn speechmatics_api_key_set(state: State<AppState>, key: String) -> Result<(), String> {
+    let conn = state.db.lock();
+    db::set_setting(&conn, SPEECHMATICS_API_KEY, key.trim()).map_err(err)
+}
+
+#[tauri::command]
+pub async fn speechmatics_api_key_test(state: State<'_, AppState>) -> Result<TestResult, String> {
+    let key = read_secret(&state, SPEECHMATICS_API_KEY)?
+        .ok_or_else(|| "No Speechmatics API key stored".to_string())?;
+    let region = {
+        let conn = state.db.lock();
+        db::get_setting(&conn, "speechmatics_region")
+            .map_err(err)?
+            .unwrap_or_else(|| DEFAULT_SPEECHMATICS_REGION.to_string())
+    };
+
+    let r = speechmatics::client()
+        .get(format!("{}/jobs/", speechmatics::base_url(&region)))
+        .bearer_auth(&key)
+        .send()
+        .await
+        .map_err(|e| format!("network: {e}"))?;
+
+    let status = r.status();
+    if status.is_success() {
+        return Ok(TestResult { ok: true, status: status.as_u16(), error: None });
+    }
+    let body = r.text().await.unwrap_or_default();
+    let snippet: String = body.chars().take(300).collect();
+    Ok(TestResult { ok: false, status: status.as_u16(), error: Some(snippet) })
+}
+
+// ---- Local Whisper model management ----------------------------------------
+
+fn local_model_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app.path().app_data_dir().map_err(err)?.join("models");
+    Ok(dir)
+}
+
+fn local_model_path(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(local_model_dir(app)?.join(local_whisper::MODEL_FILE))
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalWhisperStatus {
+    downloaded: bool,
+    size_bytes: Option<u64>,
+    path: Option<String>,
+}
+
+#[tauri::command]
+pub fn local_whisper_status(app: AppHandle) -> Result<LocalWhisperStatus, String> {
+    let path = local_model_path(&app)?;
+    if !path.exists() {
+        return Ok(LocalWhisperStatus { downloaded: false, size_bytes: None, path: None });
+    }
+    let size_bytes = std::fs::metadata(&path).ok().map(|m| m.len());
+    Ok(LocalWhisperStatus {
+        downloaded: true,
+        size_bytes,
+        path: path.to_str().map(|s| s.to_string()),
+    })
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DownloadProgress {
+    received: u64,
+    total: Option<u64>,
+}
+
+#[tauri::command]
+pub async fn local_whisper_download(app: AppHandle) -> Result<(), String> {
+    let dir = local_model_dir(&app)?;
+    tokio::fs::create_dir_all(&dir).await.map_err(|e| format!("mkdir: {e}"))?;
+    let final_path = dir.join(local_whisper::MODEL_FILE);
+    // Download to a temp file in the same dir, then rename atomically so a
+    // crash mid-download never leaves a half-written model in place.
+    let tmp_path = dir.join(format!("{}.partial", local_whisper::MODEL_FILE));
+
+    let resp = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60 * 30))
+        .build()
+        .map_err(|e| format!("client: {e}"))?
+        .get(local_whisper::MODEL_URL)
+        .send()
+        .await
+        .map_err(|e| format!("network: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("download {}: HTTP {}", local_whisper::MODEL_URL, resp.status()));
+    }
+    let total = resp.content_length();
+    let _ = app.emit("local_whisper_progress", DownloadProgress { received: 0, total });
+
+    use tokio::io::AsyncWriteExt;
+    let mut file = tokio::fs::File::create(&tmp_path)
+        .await
+        .map_err(|e| format!("create tmp: {e}"))?;
+    let mut received: u64 = 0;
+    let mut last_emit = std::time::Instant::now();
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let bytes = chunk.map_err(|e| format!("stream: {e}"))?;
+        file.write_all(&bytes).await.map_err(|e| format!("write: {e}"))?;
+        received += bytes.len() as u64;
+        // Throttle progress events to ~10/sec; UI doesn't need every chunk.
+        if last_emit.elapsed() >= std::time::Duration::from_millis(100) {
+            let _ = app.emit("local_whisper_progress", DownloadProgress { received, total });
+            last_emit = std::time::Instant::now();
+        }
+    }
+    file.flush().await.map_err(|e| format!("flush: {e}"))?;
+    drop(file);
+    tokio::fs::rename(&tmp_path, &final_path)
+        .await
+        .map_err(|e| format!("rename: {e}"))?;
+    let _ = app.emit("local_whisper_progress", DownloadProgress { received, total });
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn local_whisper_delete(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    let path = local_model_path(&app)?;
+    // Drop the loaded model from RAM first so we're not holding the file.
+    local_whisper::unload(&state.whisper);
+    if path.exists() {
+        tokio::fs::remove_file(&path).await.map_err(|e| format!("remove: {e}"))?;
+    }
+    Ok(())
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+pub struct PermissionsStatus {
+    pub microphone: String,
+    pub screen: String,
+}
+
+async fn run_sidecar_cmd(app: &AppHandle, mode: &str) -> Result<String, String> {
+    let path = sidecar_path(app)?;
+    let mut child = tokio::process::Command::new(&path)
+        .arg(mode)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("spawn: {e}"))?;
+    let fut = child.wait_with_output();
+    match tokio::time::timeout(std::time::Duration::from_secs(3), fut).await {
+        Ok(Ok(out)) => Ok(String::from_utf8_lossy(&out.stdout).to_string()),
+        Ok(Err(e)) => Err(format!("read: {e}")),
+        Err(_) => Err("sidecar timed out".into()),
+    }
+}
+
+#[tauri::command]
+pub async fn permissions_status(app: AppHandle) -> Result<PermissionsStatus, String> {
+    let stdout = run_sidecar_cmd(&app, "status").await?;
+    let line = stdout.lines().last().unwrap_or("");
+    serde_json::from_str(line).map_err(|e| format!("parse: {e}: {line}"))
+}
+
+#[tauri::command]
+pub async fn permissions_request(app: AppHandle, kind: String) -> Result<PermissionsStatus, String> {
+    let mode = match kind.as_str() {
+        "microphone" => "request-microphone",
+        "screen" => "request-screen",
+        _ => return Err("unknown kind".into()),
+    };
+    let _ = run_sidecar_cmd(&app, mode).await; // result ignored; we re-query
+    permissions_status(app).await
+}
+
+#[tauri::command]
+pub async fn permissions_open_settings(kind: String) -> Result<(), String> {
+    let url = match kind.as_str() {
+        "microphone" => "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone",
+        "screen" => "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture",
+        _ => return Err("unknown kind".into()),
+    };
+    tokio::process::Command::new("open")
+        .arg(url)
+        .spawn()
+        .map_err(|e| format!("open: {e}"))?
+        .wait()
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn recording_pause(state: State<AppState>) -> Result<(), String> {
+    let s = state.recording.lock();
+    let child = s.child.as_ref().ok_or("not recording")?;
+    let pid = child.id().ok_or("no pid")? as i32;
+    #[cfg(unix)]
+    unsafe {
+        if libc::kill(pid, libc::SIGUSR1) != 0 {
+            return Err(format!("kill: {}", std::io::Error::last_os_error()));
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn recording_resume(state: State<AppState>) -> Result<(), String> {
+    let s = state.recording.lock();
+    let child = s.child.as_ref().ok_or("not recording")?;
+    let pid = child.id().ok_or("no pid")? as i32;
+    #[cfg(unix)]
+    unsafe {
+        if libc::kill(pid, libc::SIGUSR2) != 0 {
+            return Err(format!("kill: {}", std::io::Error::last_os_error()));
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn recording_state(state: State<AppState>) -> Result<&'static str, String> {
+    let s = state.recording.lock();
+    Ok(if s.note_id.is_some() { "recording" } else { "idle" })
+}
+
+#[tauri::command]
+pub async fn recording_start(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    note_id: String,
+) -> Result<(), String> {
+    {
+        let mut s = state.recording.lock();
+        if s.note_id.is_some() {
+            // If the child has exited (sidecar crashed without emitting
+            // Stopped), the session is stale. Reset and continue rather
+            // than pinning the user in "already recording" forever.
+            let dead = match s.child.as_mut() {
+                Some(c) => matches!(c.try_wait(), Ok(Some(_)) | Err(_)),
+                None => true,
+            };
+            if !dead {
+                return Err("already recording".into());
+            }
+            // Stale — clear it. Inflight handles + reader from the dead
+            // session are abandoned (their tasks will exit on their own
+            // when the closed pipe yields EOF).
+            s.note_id = None;
+            s.child = None;
+            s.temp_dir = None;
+            s.reader = None;
+            s.inflight = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        }
+    }
+
+    // Pre-check the configured provider's prerequisites — without them
+    // transcription always fails silently.
+    let provider = {
+        let conn = state.db.lock();
+        db::get_setting(&conn, "transcribe_provider")
+            .map_err(err)?
+            .unwrap_or_else(|| DEFAULT_TRANSCRIBE_PROVIDER.to_string())
+    };
+    let pre_err = match provider.as_str() {
+        "speechmatics" => read_secret(&state, SPEECHMATICS_API_KEY)?
+            .is_none()
+            .then_some("Speechmatics API key not set. Add one in Settings → API keys."),
+        "local" => {
+            let p = local_model_path(&app).map_err(|e| e.to_string())?;
+            (!p.exists()).then_some(
+                "Local Whisper model not downloaded. Download it in Settings → Transcription.",
+            )
+        }
+        _ => read_secret(&state, API_KEY)?
+            .is_none()
+            .then_some("OpenAI API key not set. Add one in Settings → API keys."),
+    };
+    if let Some(msg) = pre_err {
+        emit_error(&app, Some(&note_id), msg);
+        return Err(msg.to_string());
+    }
+
+    // Pre-check microphone permission — without it we can't capture anything useful.
+    if let Ok(p) = permissions_status(app.clone()).await {
+        if p.microphone != "granted" {
+            let msg = "Microphone permission required. Open Settings → Permissions to grant.".to_string();
+            emit_error(&app, Some(&note_id), &msg);
+            return Err(msg);
+        }
+        if p.screen != "granted" {
+            emit_error(&app, Some(&note_id),
+                "Screen Recording not granted — only your microphone will be captured. Grant in Settings → Permissions and restart for the full meeting transcript.");
+        }
+    }
+
+    emit_status(&app, Some(&note_id), Phase::Starting);
+
+    let temp_dir = std::env::temp_dir().join(format!("notes-app-{}", note_id));
+    std::fs::create_dir_all(&temp_dir).map_err(err)?;
+
+    let sidecar_path = sidecar_path(&app)?;
+    let mut cmd = Command::new(&sidecar_path);
+    cmd.arg("--out").arg(&temp_dir);
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    cmd.kill_on_drop(true);
+    // Detach the child into a new session so macOS TCC doesn't tie its
+    // microphone / screen-recording authorization to the parent dev binary.
+    // Without this, the sidecar inherits the parent's TCC "responsible process"
+    // and is silently denied even though its own binary is granted.
+    #[cfg(unix)]
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                // Non-fatal: continue without detaching.
+            }
+            Ok(())
+        });
+    }
+
+    let mut child = cmd.spawn().map_err(|e| format!("spawn audio-capture: {e}"))?;
+    let stdout = child.stdout.take().ok_or("no stdout")?;
+    let stderr = child.stderr.take().ok_or("no stderr")?;
+
+    // Drain stderr in the background so the pipe never fills, and surface
+    // anything written there as a recording_error so silent failures aren't.
+    {
+        let app_err = app.clone();
+        let note_id_err = note_id.clone();
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                let trimmed = line.trim();
+                if trimmed.is_empty() { continue; }
+                eprintln!("audio-capture stderr: {trimmed}");
+                let _ = app_err.emit("recording_error", ErrorPayload {
+                    note_id: Some(note_id_err.clone()),
+                    message: format!("audio-capture: {trimmed}"),
+                });
+            }
+        });
+    }
+
+    // Fresh inflight list for this session so handles from a previous
+    // recording can never mix in.
+    let inflight: Inflight = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    {
+        let mut s = state.recording.lock();
+        s.note_id = Some(note_id.clone());
+        s.child = Some(child);
+        s.temp_dir = Some(temp_dir);
+        s.inflight = inflight.clone();
+    }
+
+    let app_clone = app.clone();
+    let note_id_clone = note_id.clone();
+    let inflight_for_reader = inflight.clone();
+    let reader_handle = tokio::spawn(async move {
+        let mut reader = BufReader::new(stdout).lines();
+        while let Ok(Some(line)) = reader.next_line().await {
+            let trimmed = line.trim();
+            if trimmed.is_empty() { continue; }
+            match serde_json::from_str::<SidecarEvent>(trimmed) {
+                Ok(SidecarEvent::Chunk { path }) => {
+                    let pb = PathBuf::from(path);
+                    let app2 = app_clone.clone();
+                    let note_id2 = note_id_clone.clone();
+                    let h = tokio::spawn(async move {
+                        if let Err(e) = transcribe_chunk(app2.clone(), note_id2.clone(), pb).await {
+                            let msg = format!("Transcription failed: {e}");
+                            eprintln!("{msg}");
+                            let _ = app2.emit("recording_error", ErrorPayload {
+                                note_id: Some(note_id2),
+                                message: msg,
+                            });
+                        }
+                    });
+                    inflight_for_reader.lock().push(h);
+                }
+                Ok(SidecarEvent::Error { message }) => {
+                    eprintln!("sidecar error: {message}");
+                    let _ = app_clone.emit("recording_error", ErrorPayload {
+                        note_id: Some(note_id_clone.clone()),
+                        message,
+                    });
+                }
+                Ok(SidecarEvent::Stopped) => break,
+                Ok(SidecarEvent::Paused) => emit_status(&app_clone, Some(&note_id_clone), Phase::Paused),
+                Ok(SidecarEvent::Resumed) => emit_status(&app_clone, Some(&note_id_clone), Phase::Recording),
+                Ok(SidecarEvent::Heartbeat { mic_frames, sys_frames, chunks, mic_peak, sys_peak }) => {
+                    let _ = app_clone.emit("recording_diagnostic", DiagnosticPayload {
+                        note_id: note_id_clone.clone(),
+                        mic_frames,
+                        sys_frames,
+                        chunks,
+                        mic_peak,
+                        sys_peak,
+                    });
+                }
+                Err(e) => eprintln!("bad sidecar line: {e} -- {line}"),
+            }
+        }
+        // Reader exited (sidecar closed its pipe). If the session is still
+        // marked as recording for THIS note, that means the sidecar died
+        // without us asking — i.e. a crash. Clean up and notify the UI so
+        // the user isn't pinned in a stale "recording" state.
+        let state: tauri::State<AppState> = app_clone.state();
+        let was_active = {
+            let mut s = state.recording.lock();
+            if s.note_id.as_deref() == Some(&note_id_clone) {
+                s.note_id = None;
+                s.child = None;
+                s.temp_dir = None;
+                s.reader = None;
+                s.inflight = Arc::new(parking_lot::Mutex::new(Vec::new()));
+                true
+            } else {
+                false
+            }
+        };
+        if was_active {
+            let _ = app_clone.emit("recording_status", RecordingStatus { note_id: None, phase: Phase::Idle });
+            let _ = app_clone.emit("recording_error", ErrorPayload {
+                note_id: Some(note_id_clone.clone()),
+                message: "Recording stopped unexpectedly. Try again.".to_string(),
+            });
+        }
+    });
+
+    state.recording.lock().reader = Some(reader_handle);
+
+    emit_status(&app, Some(&note_id), Phase::Recording);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn recording_stop(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let (child, note_id, temp_dir, inflight, reader) = {
+        let mut s = state.recording.lock();
+        let note_id = s.note_id.take().ok_or("not recording")?;
+        let child = s.child.take();
+        let temp_dir = s.temp_dir.take();
+        // The reader holds a clone of this same Arc, so chunks emitted during
+        // shutdown still land in the list we drain below. Swap in a fresh
+        // list to keep `s` self-consistent for the next session.
+        let inflight = std::mem::replace(&mut s.inflight, Arc::new(parking_lot::Mutex::new(Vec::new())));
+        let reader = s.reader.take();
+        (child, note_id, temp_dir, inflight, reader)
+    };
+
+    emit_status(&app, Some(&note_id), Phase::Stopping);
+
+    if let Some(mut child) = child {
+        // Send SIGTERM so the Swift sidecar runs its shutdown handler:
+        // drains the mixer, finalizes the current WAV file, emits the partial
+        // chunk. Then wait up to 3 seconds for it to exit gracefully before
+        // falling back to SIGKILL.
+        if let Some(pid) = child.id() {
+            #[cfg(unix)]
+            unsafe { libc::kill(pid as i32, libc::SIGTERM); }
+        }
+        let waited = tokio::time::timeout(std::time::Duration::from_secs(3), child.wait()).await;
+        if waited.is_err() {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+        }
+    }
+
+    // Wait for the stdout reader to finish first: it exits when the sidecar
+    // closes the pipe, which is guaranteed now that `child.wait()` returned.
+    // After this point no more transcribe handles can be pushed to inflight.
+    if let Some(r) = reader {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), r).await;
+    }
+
+    // Drain in-flight transcribe tasks (incl. any final chunk spawned during
+    // the sidecar's shutdown handler). Cap the total drain so a stuck OpenAI
+    // call can't pin us in Stopping forever.
+    let drain = async {
+        loop {
+            let next = inflight.lock().pop();
+            match next {
+                Some(h) => { let _ = h.await; }
+                None => break,
+            }
+        }
+    };
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(30), drain).await;
+
+    emit_status(&app, None, Phase::Idle);
+
+    if let Some(dir) = temp_dir {
+        // Best-effort cleanup later; keep until summary is in the DB.
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            let _ = tokio::fs::remove_dir_all(dir).await;
+        });
+    }
+    Ok(())
+}
+
+async fn transcribe_chunk(
+    app: AppHandle,
+    note_id: String,
+    path: PathBuf,
+) -> anyhow::Result<()> {
+    let cfg = {
+        let state: State<AppState> = app.state();
+        let conn = state.db.lock();
+        let provider = db::get_setting(&conn, "transcribe_provider")?
+            .unwrap_or_else(|| DEFAULT_TRANSCRIBE_PROVIDER.to_string());
+        let language = db::get_setting(&conn, "language")?
+            .unwrap_or_else(|| DEFAULT_LANGUAGE.to_string());
+        // Cloud providers need a key; local Whisper does not.
+        let api_key = match provider.as_str() {
+            "speechmatics" => db::get_setting(&conn, SPEECHMATICS_API_KEY)?
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("no Speechmatics API key"))?,
+            "local" => String::new(),
+            _ => db::get_setting(&conn, API_KEY)?
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("no OpenAI API key"))?,
+        };
+        let openai_model = db::get_setting(&conn, "transcribe_model")?
+            .unwrap_or_else(|| DEFAULT_TRANSCRIBE_MODEL.to_string());
+        let speechmatics_op = db::get_setting(&conn, "speechmatics_operating_point")?
+            .unwrap_or_else(|| DEFAULT_SPEECHMATICS_OP.to_string());
+        let speechmatics_region = db::get_setting(&conn, "speechmatics_region")?
+            .unwrap_or_else(|| DEFAULT_SPEECHMATICS_REGION.to_string());
+        TranscribeCfg { provider, api_key, language, openai_model, speechmatics_op, speechmatics_region }
+    };
+
+    // Skip near-silent chunks. Whisper and gpt-4o-transcribe both hallucinate
+    // confident text (often in the wrong language) when fed silence. The WAV
+    // chunks are 16kHz mono 16-bit PCM little-endian — read the data section
+    // and compute RMS in [0, 1].
+    if let Ok(rms) = wav::rms(&path).await {
+        // Threshold tuned empirically: pure silence ~0.0001, room tone ~0.001,
+        // soft speech ~0.01+. 0.003 cuts silence/room without clipping speech.
+        if rms < 0.003 {
+            return Ok(());
+        }
+    }
+
+    let text = match cfg.provider.as_str() {
+        "speechmatics" => {
+            // Speechmatics uses ISO 639-1 too; pass-through.
+            speechmatics::transcribe_file(
+                &cfg.api_key,
+                &cfg.speechmatics_region,
+                &cfg.language,
+                &cfg.speechmatics_op,
+                &path,
+            )
+            .await?
+        }
+        "local" => {
+            let model_path = local_model_path(&app).map_err(|e| anyhow::anyhow!(e))?;
+            let shared = {
+                let state: State<AppState> = app.state();
+                state.whisper.clone()
+            };
+            local_whisper::transcribe_file(shared, model_path, &cfg.language, &path).await?
+        }
+        _ => {
+            let prompt = language_prompt(&cfg.language);
+            openai::transcribe_file(&cfg.api_key, &cfg.openai_model, Some(&cfg.language), prompt, &path).await?
+        }
+    };
+    if is_likely_hallucination(&text, &cfg.language) {
+        return Ok(());
+    }
+    // Whisper was trained on closed-caption data and frequently appends
+    // subtitle attribution ("Undertekster av Ai-Media", "Subtitles by Amara",
+    // "Thanks for watching") at the end of real speech. Trim those tails.
+    let text = strip_attribution_tail(&text);
+    let trimmed = text.trim().to_string();
+    if !trimmed.is_empty() {
+        let state: State<AppState> = app.state();
+        {
+            let conn = state.db.lock();
+            db::append_transcript(&conn, &note_id, &trimmed)?;
+        }
+        let _ = app.emit("transcript_appended", TranscriptPayload {
+            note_id: note_id.clone(),
+            text: trimmed,
+        });
+    }
+    Ok(())
+}
+
+struct TranscribeCfg {
+    provider: String,
+    api_key: String,
+    language: String,
+    openai_model: String,
+    speechmatics_op: String,
+    speechmatics_region: String,
+}
+
+#[tauri::command]
+pub async fn summarize_note(app: AppHandle, note_id: String) -> Result<(), String> {
+    // Reflect the in-flight summary in the recording status so the UI can
+    // show a spinner. Use the existing Summarizing phase.
+    emit_status(&app, Some(&note_id), Phase::Summarizing);
+    let result = run_summary(app.clone(), note_id.clone()).await;
+    emit_status(&app, None, Phase::Idle);
+    result.map_err(|e| e.to_string())
+}
+
+async fn run_summary(app: AppHandle, note_id: String) -> anyhow::Result<()> {
+    let (api_key, model, custom_prompt, language, note) = {
+        let state: State<AppState> = app.state();
+        let conn = state.db.lock();
+        let key = db::get_setting(&conn, API_KEY)?
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("no api key"))?;
+        let m = db::get_setting(&conn, "summary_model")?
+            .unwrap_or_else(|| DEFAULT_SUMMARY_MODEL.to_string());
+        let p = db::get_setting(&conn, "summary_prompt")?
+            .unwrap_or_else(|| DEFAULT_SUMMARY_PROMPT.to_string());
+        let lang = db::get_setting(&conn, "language")?
+            .unwrap_or_else(|| DEFAULT_LANGUAGE.to_string());
+        let n = db::get_note(&conn, &note_id)?;
+        (key, m, p, lang, n)
+    };
+    if note.transcript.trim().is_empty() && note.body.trim().is_empty() {
+        return Ok(());
+    }
+    // Resolve the prompt for this note: a named preset, or the user's custom
+    // prompt from Settings if preset == "custom".
+    let prompt = if note.summary_preset == "custom" {
+        custom_prompt
+    } else {
+        presets::prompt(&note.summary_preset, &language)
+    };
+    let body_text = html_to_text(&note.body);
+    let user_message = match (body_text.is_empty(), note.transcript.trim().is_empty()) {
+        (true, _) => format!("[Transkripsjon]\n{}", note.transcript),
+        (false, true) => format!("[Notater]\n{body_text}"),
+        (false, false) => format!("[Notater]\n{body_text}\n\n[Transkripsjon]\n{}", note.transcript),
+    };
+    // Hard language directive in case the prompt was authored in a different
+    // language than the user has now chosen.
+    let full_prompt = format!("{prompt}\n\n{}", language_directive(&language));
+    let summary = openai::summarize(&api_key, &model, &full_prompt, &user_message).await?;
+    let state: State<AppState> = app.state();
+    {
+        let conn = state.db.lock();
+        db::update_note(&conn, &note_id, &NotePatch {
+            summary: Some(summary.clone()),
+            ..Default::default()
+        })?;
+    }
+    let _ = app.emit("summary_ready", SummaryPayload { note_id, summary });
+    Ok(())
+}
+
+fn emit_status(app: &AppHandle, note_id: Option<&str>, phase: Phase) {
+    let _ = app.emit("recording_status", RecordingStatus {
+        note_id: note_id.map(|s| s.to_string()),
+        phase,
+    });
+}
+
+fn emit_error(app: &AppHandle, note_id: Option<&str>, message: &str) {
+    let _ = app.emit("recording_error", ErrorPayload {
+        note_id: note_id.map(|s| s.to_string()),
+        message: message.to_string(),
+    });
+}
+
+fn sidecar_path(_app: &AppHandle) -> Result<PathBuf, String> {
+    // 1) Production / `tauri build`: Tauri copies external binaries next to
+    //    the main executable inside the .app bundle's MacOS folder, with the
+    //    triple suffix stripped. So look for ../MacOS/audio-capture first.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let candidates = [
+                dir.join("audio-capture"),
+                dir.join("audio-capture-aarch64-apple-darwin"),
+                dir.join("audio-capture-x86_64-apple-darwin"),
+            ];
+            for c in candidates {
+                if c.exists() {
+                    return Ok(c);
+                }
+            }
+        }
+    }
+
+    // 2) Dev (`tauri dev`): the binary lives under src-tauri/binaries/.
+    if let Ok(cwd) = std::env::current_dir() {
+        for triple in ["aarch64-apple-darwin", "x86_64-apple-darwin"] {
+            let p = cwd.join(format!("src-tauri/binaries/audio-capture-{triple}"));
+            if p.exists() { return Ok(p); }
+            let p = cwd.join(format!("binaries/audio-capture-{triple}"));
+            if p.exists() { return Ok(p); }
+        }
+    }
+
+    Err("audio-capture sidecar not found".into())
+}
+
+// Strip Tiptap-emitted HTML to plain text, preserving paragraph and list
+// structure so the summarizer sees the user's note shape. Not a full HTML
+// parser — only handles the small set of tags Tiptap produces.
+fn html_to_text(html: &str) -> String {
+    let s = html
+        .replace("<br>", "\n")
+        .replace("<br/>", "\n")
+        .replace("<br />", "\n")
+        .replace("</p>", "\n")
+        .replace("</li>", "\n")
+        .replace("</h1>", "\n")
+        .replace("</h2>", "\n")
+        .replace("</h3>", "\n")
+        .replace("</h4>", "\n")
+        .replace("</blockquote>", "\n")
+        .replace("<li>", "- ");
+    let mut out = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for c in s.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    let out = out
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&nbsp;", " ");
+    // Collapse runs of 3+ newlines down to 2 so paragraph breaks survive
+    // but the model doesn't see endless whitespace.
+    let mut collapsed = String::with_capacity(out.len());
+    let mut nl = 0;
+    for c in out.chars() {
+        if c == '\n' {
+            nl += 1;
+            if nl <= 2 {
+                collapsed.push(c);
+            }
+        } else {
+            nl = 0;
+            collapsed.push(c);
+        }
+    }
+    collapsed.trim().to_string()
+}
+
+// Hard directive appended to the summary system prompt. Enforces output
+// language regardless of which language the user wrote their prompt in.
+fn language_directive(lang: &str) -> &'static str {
+    match lang {
+        "no" => "VIKTIG: Skriv hele svaret på norsk.",
+        "sv" => "VIKTIGT: Skriv hela svaret på svenska.",
+        "da" => "VIGTIGT: Skriv hele svaret på dansk.",
+        "auto" => "Respond in the same language as the user's notes.",
+        _ => "IMPORTANT: Write the entire response in English.",
+    }
+}
+
+// Anchor prompt fed to the transcription model to lock decoding to the
+// chosen language. Whisper accepts keywords; gpt-4o-transcribe takes free
+// text. A short multilingual phrase works for both. Diarize ignores prompt
+// (filtered out in openai::transcribe_file).
+fn language_prompt(lang: &str) -> Option<&'static str> {
+    match lang {
+        "no" => Some("Dette er en samtale på norsk. Transkriber ordrett på norsk."),
+        "en" => Some("This is a conversation in English. Transcribe verbatim in English."),
+        "sv" => Some("Detta är ett samtal på svenska. Transkribera ordagrant på svenska."),
+        "da" => Some("Dette er en samtale på dansk. Transskriber ordret på dansk."),
+        _ => None,
+    }
+}
+
+// Whisper's training data contained millions of subtitle files, so it
+// regularly appends "Subtitles by …" / "Undertekster av …" / "Thanks for
+// watching" at the end of real speech. If we see one of these markers
+// anywhere in the text, strip it back to the preceding sentence boundary.
+fn strip_attribution_tail(text: &str) -> String {
+    // Triggers are ASCII so to_ascii_lowercase keeps byte offsets aligned
+    // with the original string for slicing.
+    let lower = text.to_ascii_lowercase();
+    const TRIGGERS: &[&str] = &[
+        // Norwegian/Scandinavian subtitle credits
+        "undertekster av",
+        "undertekstet av",
+        "tekstet av",
+        "norske tekster",
+        // English subtitle credits
+        "subtitles by",
+        "subtitled by",
+        "captions by",
+        "captioning by",
+        "closed captions",
+        "translation by",
+        "translated by",
+        "transcribed by",
+        "amara.org",
+        "ai-media",
+        // YouTube-style sign-offs
+        "thanks for watching",
+        "thank you for watching",
+        "subscribe to",
+        "like and subscribe",
+        "see you next time",
+        "see you in the next",
+    ];
+    let mut cut: Option<usize> = None;
+    for trigger in TRIGGERS {
+        if let Some(pos) = lower.rfind(trigger) {
+            // Back up to the nearest sentence boundary before the trigger so
+            // we drop the whole offending phrase, not just the trigger word.
+            let start = text[..pos]
+                .rfind(|c: char| matches!(c, '.' | '!' | '?' | '\n'))
+                .map(|p| p + 1)
+                .unwrap_or(pos);
+            cut = Some(cut.map_or(start, |c| c.min(start)));
+        }
+    }
+    match cut {
+        Some(c) => text[..c].trim_end().to_string(),
+        None => text.to_string(),
+    }
+}
+
+// Whisper produces a small set of stock English phrases when fed silence
+// regardless of the `language` parameter. Drop them when:
+//   - the chunk is short (≤120 chars, typical of a hallucinated standalone
+//     phrase) AND
+//   - the chosen target language is not English (so we don't eat a real
+//     English meeting that happens to say "thanks for watching this demo").
+// We err on the side of keeping content; the silence gate above is the
+// primary defense.
+fn is_likely_hallucination(text: &str, language: &str) -> bool {
+    let t = text.trim();
+    if t.is_empty() {
+        return true;
+    }
+    if language == "en" || t.len() > 120 {
+        return false;
+    }
+    let lower = t.to_lowercase();
+    const FRAGMENTS: &[&str] = &[
+        "thanks for watching",
+        "thank you for watching",
+        "subscribe to",
+        "subtitles by",
+        "subtitled by",
+        "amara.org",
+        "transcribed by",
+    ];
+    FRAGMENTS.iter().any(|f| lower.contains(f))
+}

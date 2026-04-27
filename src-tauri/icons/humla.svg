@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Humla app icon — bumblebee silhouette inside a macOS squircle.
+  Three black horizontal stripes inside a circular body read as both a
+  bumblebee and an audio waveform. Pure black + white, no gradients.
+  Source for tauri icon generation.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!-- macOS Big Sur squircle (~22.37% corner radius). -->
+  <rect x="0" y="0" width="1024" height="1024" rx="229" ry="229" fill="#FFFFFF"/>
+
+  <!-- Bumblebee body: black circle, ~46% of canvas. -->
+  <circle cx="512" cy="512" r="240" fill="#000000"/>
+
+  <!-- Two white stripes across the body (bee markings).
+       Stripe height = 36px, gap = 60px, vertically centered. -->
+  <rect x="280" y="450" width="464" height="36" fill="#FFFFFF"/>
+  <rect x="280" y="538" width="464" height="36" fill="#FFFFFF"/>
+</svg>

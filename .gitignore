@@ -1,0 +1,33 @@
+# Frontend
+node_modules/
+dist/
+.vite/
+*.log
+
+# Tauri / Rust
+src-tauri/target/
+src-tauri/gen/
+
+# Built sidecar binaries (machine-specific, regenerable via build-sidecar.sh)
+src-tauri/binaries/
+
+# Swift sidecar build artifacts
+audio-capture/.build/
+audio-capture/Package.resolved
+
+# Icon pipeline staging
+src-tauri/icons/.app-icon-staged.png
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Env / secrets
+.env
+.env.local
+.env.*.local

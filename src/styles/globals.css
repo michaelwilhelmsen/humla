@@ -1,0 +1,451 @@
+@import "tailwindcss";
+@import "tippy.js/dist/tippy.css";
+
+/* Nothing-design typography. Space Grotesk for UI text, Space Mono for
+   labels and numeric data. Doto (dot-matrix) intentionally skipped — Space
+   Mono fills the display role on hero moments. */
+@import url("https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;700&family=Space+Mono:wght@400;700&display=swap");
+
+@theme {
+  --font-serif: "Space Grotesk", ui-sans-serif, system-ui, sans-serif;
+  --font-sans: "Space Grotesk", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "Space Mono", ui-monospace, "SF Mono", monospace;
+}
+
+/* Light mode = printed technical manual: warm off-white paper, black ink.
+   Dark mode = instrument panel: OLED black, white data. */
+:root {
+  /* Existing semantic names remap to Nothing tokens so nothing breaks.
+     Light defaults; the dark block below overrides via system + override. */
+  --color-canvas: #f5f5f5;            /* page bg */
+  --color-surface: #ffffff;           /* cards, raised surfaces */
+  --color-surface-raised: #f0f0f0;
+  --color-text: #1a1a1a;              /* primary body */
+  --color-text-display: #000000;      /* hero numbers, headlines */
+  --color-text-muted: #666666;        /* labels, captions */
+  --color-text-disabled: #999999;
+  --color-line: #e8e8e8;              /* subtle dividers */
+  --color-line-visible: #cccccc;      /* intentional borders */
+  --color-pill: transparent;          /* chips have no fill in Nothing style */
+  --color-pill-hover: rgba(0, 0, 0, 0.06);
+  --color-input-bg: #ffffff;
+  --color-shadow: transparent;        /* no shadows in Nothing */
+  --color-accent: #d71921;            /* signal red — interrupt only */
+  --color-success: #4a9e5c;
+  --color-warning: #d4a843;
+  --color-interactive: #007aff;       /* tappable text */
+  /* Aliases used for backwards compat: ink + ink-muted */
+  --color-ink: var(--color-text);
+  --color-ink-muted: var(--color-text-muted);
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --color-canvas: #000000;
+    --color-surface: #111111;
+    --color-surface-raised: #1a1a1a;
+    --color-text: #e8e8e8;
+    --color-text-display: #ffffff;
+    --color-text-muted: #999999;
+    --color-text-disabled: #666666;
+    --color-line: #222222;
+    --color-line-visible: #333333;
+    --color-pill: transparent;
+    --color-pill-hover: rgba(255, 255, 255, 0.08);
+    --color-input-bg: #111111;
+    --color-shadow: transparent;
+    --color-interactive: #5b9bf6;
+    color-scheme: dark;
+  }
+}
+
+:root[data-theme="light"] {
+  --color-canvas: #f5f5f5;
+  --color-surface: #ffffff;
+  --color-surface-raised: #f0f0f0;
+  --color-text: #1a1a1a;
+  --color-text-display: #000000;
+  --color-text-muted: #666666;
+  --color-text-disabled: #999999;
+  --color-line: #e8e8e8;
+  --color-line-visible: #cccccc;
+  --color-pill: transparent;
+  --color-pill-hover: rgba(0, 0, 0, 0.06);
+  --color-input-bg: #ffffff;
+  --color-shadow: transparent;
+  --color-interactive: #007aff;
+  color-scheme: light;
+}
+
+:root[data-theme="dark"] {
+  --color-canvas: #000000;
+  --color-surface: #111111;
+  --color-surface-raised: #1a1a1a;
+  --color-text: #e8e8e8;
+  --color-text-display: #ffffff;
+  --color-text-muted: #999999;
+  --color-text-disabled: #666666;
+  --color-line: #222222;
+  --color-line-visible: #333333;
+  --color-pill: transparent;
+  --color-pill-hover: rgba(255, 255, 255, 0.08);
+  --color-input-bg: #111111;
+  --color-shadow: transparent;
+  --color-interactive: #5b9bf6;
+  color-scheme: dark;
+}
+
+html, body, #root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  background: var(--color-canvas);
+  color: var(--color-text);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+button { font-family: inherit; color: inherit; }
+
+input, select, textarea {
+  font-family: inherit;
+  color: inherit;
+  outline: none;
+}
+
+/* Default form-control surface. Inputs stay transparent (they're often
+   embedded in styled containers) but selects and textareas always read as
+   form fields. */
+input { background: transparent; }
+
+select, textarea {
+  background: var(--color-input-bg);
+  border: 1px solid var(--color-line);
+  border-radius: 6px;
+  padding: 8px 12px;
+  transition: border-color 200ms cubic-bezier(0.25, 0.1, 0.25, 1);
+}
+
+select:focus, textarea:focus {
+  border-color: var(--color-text-muted);
+}
+
+/* Selects inside .nd-chip inherit the chip's framing — the chip is the
+   surface, not the select. */
+.nd-chip select {
+  background: transparent;
+  border: none;
+  padding: 0;
+  border-radius: 0;
+}
+
+/* Transcript textarea is rendered inside a Card, which already provides the
+   surface. Opt out via .nd-bare. */
+.nd-bare {
+  background: transparent !important;
+  border: none !important;
+  padding: 0 !important;
+  border-radius: 0 !important;
+}
+
+textarea { resize: none; }
+
+input::placeholder, textarea::placeholder {
+  color: var(--color-text-muted);
+}
+
+/* Nothing-design helpers ---------------------------------------------------
+   Use .nd-label for the "instrument panel" caption (Space Mono ALL CAPS,
+   tight letter-spacing). Use .nd-chip for tags, statuses, and pickers — a
+   1px-bordered pill with no fill. */
+.nd-label {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--color-text-muted);
+  line-height: 1.2;
+}
+
+.nd-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 12px;
+  border: 1px solid var(--color-line-visible);
+  border-radius: 999px;
+  background: transparent;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--color-text-muted);
+  line-height: 1.2;
+  transition: color 200ms cubic-bezier(0.25, 0.1, 0.25, 1),
+              border-color 200ms cubic-bezier(0.25, 0.1, 0.25, 1);
+}
+
+.nd-chip:hover {
+  color: var(--color-text);
+  border-color: var(--color-text-muted);
+}
+
+.nd-chip[aria-pressed="true"],
+.nd-chip.is-active {
+  color: var(--color-text-display);
+  border-color: var(--color-text-display);
+}
+
+/* Primary action pill — Nothing-style: white surface, mono caps label,
+   visible border, mechanical feel. Used by Record / Summarize / etc. */
+.nd-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 18px;
+  border: 1px solid var(--color-line-visible);
+  border-radius: 999px;
+  background: var(--color-surface);
+  color: var(--color-text);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  line-height: 1.2;
+  cursor: pointer;
+  transition: border-color 200ms cubic-bezier(0.25, 0.1, 0.25, 1),
+              background-color 200ms cubic-bezier(0.25, 0.1, 0.25, 1);
+}
+
+.nd-action:hover:not(:disabled) {
+  border-color: var(--color-text);
+}
+
+.nd-action:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* WebKit on macOS sometimes ignores `appearance: none` on <select>, leaking
+   the native arrow. Force it off everywhere we render a custom caret. */
+.nd-chip select,
+.nd-select {
+  -webkit-appearance: none !important;
+  -moz-appearance: none !important;
+  appearance: none !important;
+  background-image: none !important;
+}
+
+select {
+  appearance: none;
+  -webkit-appearance: none;
+  background-image:
+    linear-gradient(45deg, transparent 50%, currentColor 50%),
+    linear-gradient(135deg, currentColor 50%, transparent 50%);
+  background-position:
+    calc(100% - 14px) 50%,
+    calc(100% - 9px) 50%;
+  background-size: 5px 5px, 5px 5px;
+  background-repeat: no-repeat;
+  padding-right: 28px !important;
+}
+
+.drag { -webkit-app-region: drag; }
+.no-drag { -webkit-app-region: no-drag; }
+
+@keyframes shimmer {
+  0%   { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
+.skeleton {
+  background-image: linear-gradient(
+    90deg,
+    var(--color-pill) 0%,
+    var(--color-pill-hover) 50%,
+    var(--color-pill) 100%
+  );
+  background-size: 200% 100%;
+  background-repeat: no-repeat;
+  animation: shimmer 1.6s ease-in-out infinite;
+  border-radius: 6px;
+}
+
+@keyframes recording-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50%      { opacity: 0.6; transform: scale(1.15); }
+}
+
+.rec-dot {
+  animation: recording-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes recording-bar {
+  0%, 100% { transform: scaleY(0.4); }
+  50%      { transform: scaleY(1); }
+}
+
+.rec-bar {
+  transform-origin: center;
+  animation: recording-bar 1s ease-in-out infinite;
+}
+
+/* ------------------------------------------------------------------ */
+/* Prose styles for the Tiptap note editor + read-only blocks         */
+/* ------------------------------------------------------------------ */
+
+.prose-note {
+  font-size: 16px;
+  line-height: 1.65;
+  color: var(--color-text);
+}
+
+.prose-note > * + * { margin-top: 0.85em; }
+
+.prose-note h1 {
+  font-family: var(--font-serif);
+  font-size: 2rem;
+  line-height: 1.2;
+  font-weight: 600;
+  margin-top: 1.4em;
+}
+.prose-note h2 {
+  font-family: var(--font-serif);
+  font-size: 1.5rem;
+  line-height: 1.25;
+  font-weight: 600;
+  margin-top: 1.3em;
+}
+.prose-note h3 {
+  font-size: 1.2rem;
+  line-height: 1.3;
+  font-weight: 600;
+  margin-top: 1.2em;
+}
+.prose-note h4 {
+  font-size: 1.05rem;
+  line-height: 1.35;
+  font-weight: 600;
+  margin-top: 1.1em;
+}
+.prose-note p { margin: 0; }
+.prose-note ul,
+.prose-note ol {
+  padding-left: 1.5em;
+}
+.prose-note ul { list-style: disc; }
+.prose-note ol { list-style: decimal; }
+.prose-note ul li,
+.prose-note ol li { padding-left: 0.25em; }
+.prose-note li + li { margin-top: 0.25em; }
+.prose-note blockquote {
+  border-left: 3px solid var(--color-line);
+  padding-left: 1em;
+  color: var(--color-text-muted);
+  font-style: italic;
+}
+.prose-note code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.9em;
+  background: var(--color-pill);
+  padding: 0.1em 0.35em;
+  border-radius: 4px;
+}
+.prose-note pre {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  background: var(--color-pill);
+  padding: 0.75em 1em;
+  border-radius: 8px;
+  overflow-x: auto;
+  font-size: 0.9em;
+}
+.prose-note pre code {
+  background: transparent;
+  padding: 0;
+}
+.prose-note hr {
+  border: none;
+  border-top: 1px solid var(--color-line);
+  margin: 1.5em 0;
+}
+.prose-note strong { font-weight: 600; }
+.prose-note em { font-style: italic; }
+.prose-note s { text-decoration: line-through; }
+
+/* Markdown rendering for the summary card. Mirrors prose-note but tuned
+   for the smaller block of text Whisper-summary models emit. */
+.prose-summary > * + * { margin-top: 0.75em; }
+.prose-summary p { margin: 0; }
+.prose-summary strong { font-weight: 600; }
+.prose-summary em { font-style: italic; }
+.prose-summary h1,
+.prose-summary h2,
+.prose-summary h3,
+.prose-summary h4 {
+  font-family: var(--font-sans);
+  font-weight: 500;
+  line-height: 1.2;
+  letter-spacing: -0.01em;
+}
+.prose-summary h1 { font-size: 1.5rem; }
+.prose-summary h2 { font-size: 1.25rem; }
+.prose-summary h3 { font-size: 1.1rem; }
+.prose-summary h4 { font-size: 1rem; }
+.prose-summary code {
+  font-family: var(--font-mono);
+}
+.prose-summary ul,
+.prose-summary ol {
+  padding-left: 1.4em;
+}
+.prose-summary ul { list-style: disc; }
+.prose-summary ol { list-style: decimal; }
+.prose-summary ul li,
+.prose-summary ol li { padding-left: 0.25em; }
+.prose-summary li + li { margin-top: 0.25em; }
+.prose-summary code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.9em;
+  padding: 0.1em 0.35em;
+  border-radius: 4px;
+  background: var(--color-pill);
+}
+.prose-summary blockquote {
+  padding-left: 1em;
+  border-left: 3px solid var(--color-line);
+  color: var(--color-text-muted);
+}
+
+.prose-note .is-editor-empty:first-child::before {
+  content: attr(data-placeholder);
+  float: left;
+  color: var(--color-text-muted);
+  pointer-events: none;
+  height: 0;
+}
+
+/* tippy.js defaults force a dark background and white text on every popup,
+   which fights our theme. Neutralize them and let the inner element style
+   itself with our CSS variables. */
+.tippy-box {
+  background-color: transparent;
+  color: inherit;
+}
+.tippy-box > .tippy-arrow { display: none; }
+.tippy-box[data-theme~="slash"] > .tippy-content { padding: 0; }
+.tippy-box[data-theme~="slash"] {
+  box-shadow: none;
+}
+
+/* The slash menu and bubble menu render outside the React tree (tippy
+   appends to body), so make sure they inherit the live theme variables. */
+.slash-menu,
+.tippy-box .bubble-menu {
+  color: var(--color-text);
+}
+
+kbd {
+  font-family: inherit;
+}
