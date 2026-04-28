@@ -113,7 +113,6 @@ export function Note() {
 
         <div className="flex items-center gap-3 mb-10">
           <span className="nd-chip">{dateChip}</span>
-          <span className="nd-chip">Me</span>
           <PresetPicker
             value={draft.summary_preset || "meeting"}
             lang={uiLang}
