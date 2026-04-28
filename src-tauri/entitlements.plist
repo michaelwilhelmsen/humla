@@ -8,9 +8,15 @@
     <true/>
     <key>com.apple.security.network.client</key>
     <true/>
-    <key>NSMicrophoneUsageDescription</key>
-    <string>Notes records your microphone during meetings to transcribe and summarize them.</string>
-    <key>NSScreenCaptureUsageDescription</key>
-    <string>Notes captures system audio (the other side of meetings) to transcribe and summarize them. No video is recorded.</string>
+
+    <!-- Hardened runtime entitlements for WebKit / WKWebView. Without these,
+         the kernel kills the process before main() runs because the JS
+         engine can't allocate executable memory for JIT. -->
+    <key>com.apple.security.cs.allow-jit</key>
+    <true/>
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
 </dict>
 </plist>

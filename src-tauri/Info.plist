@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Humla records your microphone during meetings to transcribe and summarize them.</string>
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>Humla captures system audio (the other side of meetings) to transcribe and summarize them. No video is recorded.</string>
+</dict>
+</plist>
