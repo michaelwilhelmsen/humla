@@ -89,7 +89,7 @@ export function Updater() {
             <div className="flex gap-2">
               <button
                 onClick={() => install(phase.update)}
-                className="px-3 py-1.5 rounded-md bg-[var(--color-text)] text-[var(--color-bg)] hover:opacity-90"
+                className="px-3 py-1.5 rounded-md bg-[var(--color-text)] text-[var(--color-surface)] hover:opacity-90"
               >
                 Install &amp; Restart
               </button>
