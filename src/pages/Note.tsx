@@ -119,6 +119,16 @@ export function Note() {
             lang={uiLang}
             onChange={(v) => patch("summary_preset", v)}
           />
+          <FolderPicker
+            value={draft.folder_id}
+            onChange={async (folderId) => {
+              if (!draft) return;
+              const next = { ...draft, folder_id: folderId };
+              setDraft(next);
+              await ipc.moveNote(draft.id, folderId);
+              upsert(next);
+            }}
+          />
           {(isRecording || isStarting) && (
             <span className="nd-chip" style={{ color: "var(--color-accent)", borderColor: "var(--color-accent)" }}>
               <span className="rec-dot inline-block w-1.5 h-1.5 rounded-full" style={{ background: "var(--color-accent)" }} />
@@ -186,6 +196,85 @@ export function Note() {
 
       <RecordingBar noteId={draft.id} />
     </div>
+  );
+}
+
+function FolderPicker({
+  value,
+  onChange,
+}: {
+  value: string | null;
+  onChange: (folderId: string | null) => void;
+}) {
+  const folders = useNotesStore((s) => s.folders);
+  const upsertFolder = useNotesStore((s) => s.upsertFolder);
+  const [creating, setCreating] = useState(false);
+  const [name, setName] = useState("");
+
+  async function handleChange(raw: string) {
+    if (raw === "__new__") {
+      setCreating(true);
+      setName("");
+      return;
+    }
+    onChange(raw === "__root__" ? null : raw);
+  }
+
+  async function commit() {
+    const trimmed = name.trim();
+    if (!trimmed) {
+      setCreating(false);
+      setName("");
+      return;
+    }
+    try {
+      const folder = await ipc.createFolder(trimmed);
+      upsertFolder(folder);
+      onChange(folder.id);
+    } finally {
+      setCreating(false);
+      setName("");
+    }
+  }
+
+  if (creating) {
+    return (
+      <span className="nd-chip" style={{ borderColor: "var(--color-text-muted)" }}>
+        <input
+          autoFocus
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") commit();
+            else if (e.key === "Escape") { setCreating(false); setName(""); }
+          }}
+          onBlur={commit}
+          placeholder="Folder name"
+          className="bg-transparent outline-none w-32 uppercase tracking-[0.08em] text-[11px]"
+          style={{ fontFamily: "var(--font-mono)" }}
+        />
+      </span>
+    );
+  }
+
+  return (
+    <label className="nd-chip cursor-pointer pr-2">
+      <select
+        value={value ?? "__root__"}
+        onChange={(e) => handleChange(e.target.value)}
+        className="bg-transparent appearance-none outline-none cursor-pointer uppercase tracking-[0.08em]"
+        style={{ fontFamily: "var(--font-mono)" }}
+      >
+        <option value="__root__">No folder</option>
+        {folders.map((f) => (
+          <option key={f.id} value={f.id}>
+            {f.name}
+          </option>
+        ))}
+        <option value="__new__">+ New folder…</option>
+      </select>
+      <span aria-hidden style={{ color: "var(--color-text-muted)" }}>▾</span>
+    </label>
   );
 }
 

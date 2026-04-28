@@ -61,10 +61,12 @@ pub async fn transcribe_file(
     shared: SharedContext,
     model_path: PathBuf,
     language: &str,
+    initial_prompt: Option<&str>,
     audio_path: &Path,
 ) -> Result<String> {
     let samples = wav::read_f32_mono_16k(audio_path).await?;
     let lang = if language == "auto" { None } else { Some(language.to_string()) };
+    let prompt = initial_prompt.map(|s| s.to_string());
 
     // whisper-rs is sync and CPU/GPU-bound. Run on a blocking thread so we
     // don't stall the tokio reactor. Each call gets its own state; the
@@ -83,6 +85,9 @@ pub async fn transcribe_file(
         params.set_temperature(0.0);
         if let Some(l) = lang.as_deref() {
             params.set_language(Some(l));
+        }
+        if let Some(p) = prompt.as_deref() {
+            params.set_initial_prompt(p);
         }
 
         state

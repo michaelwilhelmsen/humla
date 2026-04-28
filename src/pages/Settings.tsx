@@ -21,6 +21,7 @@ const DEFAULTS: Record<EditableKey, string> = {
   transcribe_model: "whisper-1",
   speechmatics_operating_point: "enhanced",
   speechmatics_region: "eu1",
+  custom_vocabulary: "",
   summary_model: "gpt-5.4-mini",
   summary_prompt: SUMMARY_PRESETS[0].prompt_no,
 };
@@ -309,6 +310,23 @@ export function Settings() {
               onDownload={downloadModel}
               onDelete={deleteModel}
             />
+          </Row>
+          <Row label="Custom vocabulary">
+            <textarea
+              value={s.custom_vocabulary}
+              onChange={(e) => update("custom_vocabulary", e.target.value)}
+              rows={3}
+              placeholder="Speechmatics, Tauri, Humla, ScreenCaptureKit, Granola"
+              className={inputClass + " leading-relaxed"}
+              style={{ fontFamily: "var(--font-mono)" }}
+            />
+            <p className="text-xs text-[var(--color-text-muted)] mt-2">
+              Comma- or newline-separated. Names, jargon, and uncommon
+              spellings — biases the transcriber toward these tokens. Sent as
+              a free-text prompt to OpenAI / local Whisper, and as
+              <code> additional_vocab </code> to Speechmatics.
+              <code> gpt-4o-transcribe-diarize </code> ignores it.
+            </p>
           </Row>
         </Section>
 

@@ -9,6 +9,14 @@ export type Note = {
   summary: string;
   audio_path: string | null;
   summary_preset: string;
+  folder_id: string | null;
+  created_at: number;
+  updated_at: number;
+};
+
+export type Folder = {
+  id: string;
+  name: string;
   created_at: number;
   updated_at: number;
 };
@@ -19,6 +27,7 @@ export type SettingsKey =
   | "transcribe_model"
   | "speechmatics_operating_point"
   | "speechmatics_region"
+  | "custom_vocabulary"
   | "summary_model"
   | "summary_prompt"
   | "theme";
@@ -40,6 +49,14 @@ export const ipc = {
   updateNote: (id: string, patch: Partial<Pick<Note, "title" | "body" | "transcript" | "summary" | "summary_preset">>) =>
     invoke<void>("notes_update", { id, patch }),
   deleteNote: (id: string) => invoke<void>("notes_delete", { id }),
+  moveNote: (id: string, folderId: string | null) =>
+    invoke<void>("notes_move", { id, folderId }),
+
+  listFolders: () => invoke<Folder[]>("folders_list"),
+  createFolder: (name: string) => invoke<Folder>("folders_create", { name }),
+  renameFolder: (id: string, name: string) =>
+    invoke<void>("folders_rename", { id, name }),
+  deleteFolder: (id: string) => invoke<void>("folders_delete", { id }),
 
   getSetting: (key: SettingsKey) => invoke<string | null>("settings_get", { key }),
   setSetting: (key: SettingsKey, value: string) => invoke<void>("settings_set", { key, value }),

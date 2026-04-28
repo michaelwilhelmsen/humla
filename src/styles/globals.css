@@ -385,10 +385,25 @@ select {
 .prose-summary h3,
 .prose-summary h4 {
   font-family: var(--font-sans);
-  font-weight: 500;
+  font-weight: 600;
   line-height: 1.2;
   letter-spacing: -0.01em;
+  margin-bottom: 0.4em;
 }
+/* Headings need extra breathing room above them. The first heading in the
+   block doesn't (the card's own padding handles it). */
+.prose-summary > h1 + *,
+.prose-summary > h2 + *,
+.prose-summary > h3 + *,
+.prose-summary > h4 + * { margin-top: 0.4em; }
+.prose-summary > * + h1,
+.prose-summary > * + h2,
+.prose-summary > * + h3,
+.prose-summary > * + h4 { margin-top: 1.6em; }
+.prose-summary > h1:first-child,
+.prose-summary > h2:first-child,
+.prose-summary > h3:first-child,
+.prose-summary > h4:first-child { margin-top: 0; }
 .prose-summary h1 { font-size: 1.5rem; }
 .prose-summary h2 { font-size: 1.25rem; }
 .prose-summary h3 { font-size: 1.1rem; }

@@ -1,8 +1,16 @@
 import Foundation
+import AppKit
 import AVFoundation
 import ScreenCaptureKit
 import CoreMedia
 import CoreGraphics
+
+// Hide the sidecar from the Dock and menu bar. ScreenCaptureKit and
+// AVAudioEngine pull in AppKit transitively, which by default registers the
+// process as a regular foreground app (Dock icon, menu bar). `.prohibited`
+// makes it a true background helper. Must run before any AppKit API touches
+// process activation state, so it goes at the top of main.
+NSApplication.shared.setActivationPolicy(.prohibited)
 
 // MARK: - Mode dispatch
 

@@ -46,6 +46,7 @@ pub async fn transcribe_file(
     region: &str,
     language: &str,
     operating_point: &str,
+    additional_vocab: &[String],
     audio_path: &Path,
 ) -> Result<String> {
     let base = base_url(region);
@@ -57,12 +58,22 @@ pub async fn transcribe_file(
         .to_string();
 
     let lang = if language == "auto" { "en" } else { language };
+    let mut transcription_config = serde_json::json!({
+        "language": lang,
+        "operating_point": operating_point,
+    });
+    if !additional_vocab.is_empty() {
+        // Speechmatics accepts a list of {content, sounds_like?} entries.
+        // We only have plain strings, so map content-only.
+        let entries: Vec<serde_json::Value> = additional_vocab
+            .iter()
+            .map(|w| serde_json::json!({ "content": w }))
+            .collect();
+        transcription_config["additional_vocab"] = serde_json::Value::Array(entries);
+    }
     let config = serde_json::json!({
         "type": "transcription",
-        "transcription_config": {
-            "language": lang,
-            "operating_point": operating_point,
-        }
+        "transcription_config": transcription_config,
     });
 
     let part = reqwest::multipart::Part::bytes(bytes)

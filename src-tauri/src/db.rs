@@ -12,6 +12,15 @@ pub struct Note {
     pub summary: String,
     pub audio_path: Option<String>,
     pub summary_preset: String,
+    pub folder_id: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Folder {
+    pub id: String,
+    pub name: String,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -31,11 +40,19 @@ pub fn open(path: &Path) -> Result<Connection> {
             summary         TEXT NOT NULL DEFAULT '',
             audio_path      TEXT,
             summary_preset  TEXT NOT NULL DEFAULT 'meeting',
+            folder_id       TEXT,
             created_at      INTEGER NOT NULL,
             updated_at      INTEGER NOT NULL
         );
 
         CREATE INDEX IF NOT EXISTS idx_notes_updated ON notes(updated_at DESC);
+
+        CREATE TABLE IF NOT EXISTS folders (
+            id          TEXT PRIMARY KEY,
+            name        TEXT NOT NULL,
+            created_at  INTEGER NOT NULL,
+            updated_at  INTEGER NOT NULL
+        );
 
         CREATE TABLE IF NOT EXISTS settings (
             key   TEXT PRIMARY KEY,
@@ -43,11 +60,20 @@ pub fn open(path: &Path) -> Result<Connection> {
         );
         "#,
     )?;
-    // Idempotent migration for existing DBs created before summary_preset existed.
+    // Idempotent migrations for older schemas. ALTER TABLE adds columns
+    // that didn't exist in earlier versions; if they already exist, the
+    // execute fails and we ignore.
     let _ = conn.execute(
         "ALTER TABLE notes ADD COLUMN summary_preset TEXT NOT NULL DEFAULT 'meeting'",
         [],
     );
+    let _ = conn.execute("ALTER TABLE notes ADD COLUMN folder_id TEXT", []);
+    // Index is created AFTER the ALTERs so it's safe on both fresh DBs and
+    // older DBs that needed the column added.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_notes_folder ON notes(folder_id)",
+        [],
+    )?;
     Ok(conn)
 }
 
@@ -55,11 +81,12 @@ pub fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
+const NOTE_COLS: &str = "id, title, body, transcript, summary, audio_path, summary_preset, folder_id, created_at, updated_at";
+
 pub fn list_notes(conn: &Connection) -> Result<Vec<Note>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, title, body, transcript, summary, audio_path, summary_preset, created_at, updated_at
-         FROM notes ORDER BY updated_at DESC",
-    )?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {NOTE_COLS} FROM notes ORDER BY updated_at DESC"
+    ))?;
     let rows = stmt
         .query_map([], map_note)?
         .collect::<Result<Vec<_>, _>>()?;
@@ -68,8 +95,7 @@ pub fn list_notes(conn: &Connection) -> Result<Vec<Note>> {
 
 pub fn get_note(conn: &Connection, id: &str) -> Result<Note> {
     let n = conn.query_row(
-        "SELECT id, title, body, transcript, summary, audio_path, summary_preset, created_at, updated_at
-         FROM notes WHERE id = ?1",
+        &format!("SELECT {NOTE_COLS} FROM notes WHERE id = ?1"),
         params![id],
         map_note,
     )?;
@@ -80,11 +106,70 @@ pub fn create_note(conn: &Connection) -> Result<Note> {
     let id = uuid::Uuid::new_v4().to_string();
     let now = now_ms();
     conn.execute(
-        "INSERT INTO notes (id, title, body, transcript, summary, audio_path, summary_preset, created_at, updated_at)
-         VALUES (?1, '', '', '', '', NULL, 'meeting', ?2, ?2)",
+        "INSERT INTO notes (id, title, body, transcript, summary, audio_path, summary_preset, folder_id, created_at, updated_at)
+         VALUES (?1, '', '', '', '', NULL, 'meeting', NULL, ?2, ?2)",
         params![id, now],
     )?;
     get_note(conn, &id)
+}
+
+pub fn move_note(conn: &Connection, id: &str, folder_id: Option<&str>) -> Result<()> {
+    let now = now_ms();
+    conn.execute(
+        "UPDATE notes SET folder_id = ?1, updated_at = ?2 WHERE id = ?3",
+        params![folder_id, now, id],
+    )?;
+    Ok(())
+}
+
+pub fn list_folders(conn: &Connection) -> Result<Vec<Folder>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, name, created_at, updated_at FROM folders ORDER BY name COLLATE NOCASE",
+    )?;
+    let rows = stmt
+        .query_map([], map_folder)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+pub fn create_folder(conn: &Connection, name: &str) -> Result<Folder> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = now_ms();
+    conn.execute(
+        "INSERT INTO folders (id, name, created_at, updated_at) VALUES (?1, ?2, ?3, ?3)",
+        params![id, name, now],
+    )?;
+    conn.query_row(
+        "SELECT id, name, created_at, updated_at FROM folders WHERE id = ?1",
+        params![id],
+        map_folder,
+    )
+    .map_err(Into::into)
+}
+
+pub fn rename_folder(conn: &Connection, id: &str, name: &str) -> Result<()> {
+    let now = now_ms();
+    conn.execute(
+        "UPDATE folders SET name = ?1, updated_at = ?2 WHERE id = ?3",
+        params![name, now, id],
+    )?;
+    Ok(())
+}
+
+pub fn delete_folder(conn: &Connection, id: &str) -> Result<()> {
+    // Notes in the folder fall back to root (folder_id = NULL), they're not deleted.
+    conn.execute("UPDATE notes SET folder_id = NULL WHERE folder_id = ?1", params![id])?;
+    conn.execute("DELETE FROM folders WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
+fn map_folder(row: &rusqlite::Row) -> rusqlite::Result<Folder> {
+    Ok(Folder {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        created_at: row.get(2)?,
+        updated_at: row.get(3)?,
+    })
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -170,7 +255,8 @@ fn map_note(row: &rusqlite::Row) -> rusqlite::Result<Note> {
         summary: row.get(4)?,
         audio_path: row.get(5)?,
         summary_preset: row.get(6)?,
-        created_at: row.get(7)?,
-        updated_at: row.get(8)?,
+        folder_id: row.get(7)?,
+        created_at: row.get(8)?,
+        updated_at: row.get(9)?,
     })
 }

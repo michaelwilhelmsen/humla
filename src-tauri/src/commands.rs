@@ -67,6 +67,48 @@ pub fn notes_delete(state: State<AppState>, id: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+pub fn notes_move(
+    state: State<AppState>,
+    id: String,
+    folder_id: Option<String>,
+) -> Result<(), String> {
+    let conn = state.db.lock();
+    db::move_note(&conn, &id, folder_id.as_deref()).map_err(err)
+}
+
+#[tauri::command]
+pub fn folders_list(state: State<AppState>) -> Result<Vec<db::Folder>, String> {
+    let conn = state.db.lock();
+    db::list_folders(&conn).map_err(err)
+}
+
+#[tauri::command]
+pub fn folders_create(state: State<AppState>, name: String) -> Result<db::Folder, String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err("Folder name cannot be empty".into());
+    }
+    let conn = state.db.lock();
+    db::create_folder(&conn, trimmed).map_err(err)
+}
+
+#[tauri::command]
+pub fn folders_rename(state: State<AppState>, id: String, name: String) -> Result<(), String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err("Folder name cannot be empty".into());
+    }
+    let conn = state.db.lock();
+    db::rename_folder(&conn, &id, trimmed).map_err(err)
+}
+
+#[tauri::command]
+pub fn folders_delete(state: State<AppState>, id: String) -> Result<(), String> {
+    let conn = state.db.lock();
+    db::delete_folder(&conn, &id).map_err(err)
+}
+
+#[tauri::command]
 pub fn settings_get(state: State<AppState>, key: String) -> Result<Option<String>, String> {
     let conn = state.db.lock();
     db::get_setting(&conn, &key).map_err(err)
@@ -656,7 +698,17 @@ async fn transcribe_chunk(
             .unwrap_or_else(|| DEFAULT_SPEECHMATICS_OP.to_string());
         let speechmatics_region = db::get_setting(&conn, "speechmatics_region")?
             .unwrap_or_else(|| DEFAULT_SPEECHMATICS_REGION.to_string());
-        TranscribeCfg { provider, api_key, language, openai_model, speechmatics_op, speechmatics_region }
+        let vocabulary = db::get_setting(&conn, "custom_vocabulary")?
+            .unwrap_or_default();
+        TranscribeCfg {
+            provider,
+            api_key,
+            language,
+            openai_model,
+            speechmatics_op,
+            speechmatics_region,
+            vocabulary,
+        }
     };
 
     // Skip near-silent chunks. Whisper and gpt-4o-transcribe both hallucinate
@@ -671,14 +723,20 @@ async fn transcribe_chunk(
         }
     }
 
+    // Custom vocabulary fans out to each provider in its native shape:
+    //   - OpenAI / local Whisper: free-text prompt (comma-separated names bias decoding)
+    //   - Speechmatics: structured additional_vocab list
+    let vocab_prompt = vocabulary_prompt(&cfg.vocabulary);
+    let vocab_list = vocabulary_list(&cfg.vocabulary);
+
     let text = match cfg.provider.as_str() {
         "speechmatics" => {
-            // Speechmatics uses ISO 639-1 too; pass-through.
             speechmatics::transcribe_file(
                 &cfg.api_key,
                 &cfg.speechmatics_region,
                 &cfg.language,
                 &cfg.speechmatics_op,
+                &vocab_list,
                 &path,
             )
             .await?
@@ -689,11 +747,24 @@ async fn transcribe_chunk(
                 let state: State<AppState> = app.state();
                 state.whisper.clone()
             };
-            local_whisper::transcribe_file(shared, model_path, &cfg.language, &path).await?
+            local_whisper::transcribe_file(
+                shared,
+                model_path,
+                &cfg.language,
+                vocab_prompt.as_deref(),
+                &path,
+            )
+            .await?
         }
         _ => {
-            let prompt = language_prompt(&cfg.language);
-            openai::transcribe_file(&cfg.api_key, &cfg.openai_model, Some(&cfg.language), prompt, &path).await?
+            openai::transcribe_file(
+                &cfg.api_key,
+                &cfg.openai_model,
+                Some(&cfg.language),
+                vocab_prompt.as_deref(),
+                &path,
+            )
+            .await?
         }
     };
     if is_likely_hallucination(&text, &cfg.language) {
@@ -725,6 +796,7 @@ struct TranscribeCfg {
     openai_model: String,
     speechmatics_op: String,
     speechmatics_region: String,
+    vocabulary: String,
 }
 
 #[tauri::command]
@@ -895,18 +967,26 @@ fn language_directive(lang: &str) -> &'static str {
     }
 }
 
-// Anchor prompt fed to the transcription model to lock decoding to the
-// chosen language. Whisper accepts keywords; gpt-4o-transcribe takes free
-// text. A short multilingual phrase works for both. Diarize ignores prompt
-// (filtered out in openai::transcribe_file).
-fn language_prompt(lang: &str) -> Option<&'static str> {
-    match lang {
-        "no" => Some("Dette er en samtale på norsk. Transkriber ordrett på norsk."),
-        "en" => Some("This is a conversation in English. Transcribe verbatim in English."),
-        "sv" => Some("Detta är ett samtal på svenska. Transkribera ordagrant på svenska."),
-        "da" => Some("Dette er en samtale på dansk. Transskriber ordret på dansk."),
-        _ => None,
+// Trim and dedupe the user's custom vocabulary into a free-text prompt for
+// Whisper-family models. Whisper treats the prompt as the previous turn it
+// continues from, so a comma-separated list of names/jargon biases decoding
+// toward those tokens. Returns None when the vocabulary is empty.
+fn vocabulary_prompt(raw: &str) -> Option<String> {
+    let items = vocabulary_list(raw);
+    if items.is_empty() {
+        return None;
     }
+    Some(items.join(", "))
+}
+
+// Same vocabulary, parsed into discrete entries for Speechmatics's
+// `additional_vocab` schema. Splits on commas and newlines; trims each.
+fn vocabulary_list(raw: &str) -> Vec<String> {
+    raw.split(|c: char| c == ',' || c == '\n')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
 }
 
 // Whisper's training data contained millions of subtitle files, so it

@@ -1,10 +1,14 @@
 import { create } from "zustand";
-import { ipc, onRecordingDiagnostic, onRecordingError, onRecordingStatus, onSummary, onTranscript, type Note, type RecordingDiagnostic, type RecordingStatus } from "./ipc";
+import { ipc, onRecordingDiagnostic, onRecordingError, onRecordingStatus, onSummary, onTranscript, type Folder, type Note, type RecordingDiagnostic, type RecordingStatus } from "./ipc";
 
 type NotesState = {
   notes: Note[];
+  folders: Folder[];
   refresh: () => Promise<void>;
+  refreshFolders: () => Promise<void>;
   upsertLocal: (note: Note) => void;
+  upsertFolder: (folder: Folder) => void;
+  removeFolder: (id: string) => void;
   appendTranscript: (id: string, text: string) => void;
   setSummary: (id: string, summary: string) => void;
   removeLocal: (id: string) => void;
@@ -12,10 +16,29 @@ type NotesState = {
 
 export const useNotesStore = create<NotesState>((set) => ({
   notes: [],
+  folders: [],
   refresh: async () => {
-    const notes = await ipc.listNotes();
-    set({ notes });
+    const [notes, folders] = await Promise.all([ipc.listNotes(), ipc.listFolders()]);
+    set({ notes, folders });
   },
+  refreshFolders: async () => {
+    const folders = await ipc.listFolders();
+    set({ folders });
+  },
+  upsertFolder: (folder) =>
+    set((s) => {
+      const idx = s.folders.findIndex((f) => f.id === folder.id);
+      if (idx === -1) return { folders: [...s.folders, folder] };
+      const next = s.folders.slice();
+      next[idx] = folder;
+      return { folders: next };
+    }),
+  removeFolder: (id) =>
+    set((s) => ({
+      folders: s.folders.filter((f) => f.id !== id),
+      // Notes in the deleted folder fall back to root.
+      notes: s.notes.map((n) => (n.folder_id === id ? { ...n, folder_id: null } : n)),
+    })),
   upsertLocal: (note) =>
     set((s) => {
       const idx = s.notes.findIndex((n) => n.id === note.id);
