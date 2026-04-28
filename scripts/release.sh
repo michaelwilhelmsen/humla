@@ -62,7 +62,14 @@ if gh release view "$TAG" >/dev/null 2>&1; then
 fi
 
 # 3. Build (signs, notarises, staples, produces updater artifacts).
-./scripts/build-dmg.sh
+# Set SKIP_BUILD=1 to reuse existing artifacts on disk — useful when
+# recovering from a release-script failure that happened *after* a
+# successful build, so we don't rebuild and re-notarise needlessly.
+if [[ "${SKIP_BUILD:-0}" == "1" ]]; then
+  echo "SKIP_BUILD=1 → reusing existing artifacts (no rebuild)"
+else
+  ./scripts/build-dmg.sh
+fi
 
 # 4. Locate artifacts.
 DMG=$(ls -t src-tauri/target/release/bundle/dmg/*.dmg | head -n1)
@@ -76,7 +83,6 @@ for f in "$DMG" "$TARBALL" "$SIG_FILE"; do
   fi
 done
 
-SIGNATURE=$(cat "$SIG_FILE")
 PUB_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 DOWNLOAD_URL="https://github.com/michaelwilhelmsen/humla/releases/download/$TAG/$(basename "$TARBALL")"
 
@@ -90,23 +96,34 @@ case "$ARCH" in
 esac
 
 LATEST_JSON="src-tauri/target/release/bundle/latest.json"
-node -e "
-  const fs = require('fs');
-  const manifest = {
-    version: '$VERSION',
-    notes: 'See https://github.com/michaelwilhelmsen/humla/releases/tag/$TAG',
-    pub_date: '$PUB_DATE',
-    platforms: {
-      '$PLATFORM': {
-        signature: ${JSON.stringify(process.env.SIG ?? '')} || '$SIGNATURE'.replace(/\n/g, '\\n'),
-        url: '$DOWNLOAD_URL',
-      },
+
+# Pass all the values into node via env so bash never interpolates into
+# the JS source — that breaks on `${...}` JS template-style fragments.
+VERSION="$VERSION" \
+TAG="$TAG" \
+PUB_DATE="$PUB_DATE" \
+DOWNLOAD_URL="$DOWNLOAD_URL" \
+PLATFORM="$PLATFORM" \
+SIG_FILE="$SIG_FILE" \
+LATEST_JSON="$LATEST_JSON" \
+node <<'NODE_EOF'
+const fs = require('fs');
+const {
+  VERSION, TAG, PUB_DATE, DOWNLOAD_URL, PLATFORM, SIG_FILE, LATEST_JSON,
+} = process.env;
+const manifest = {
+  version: VERSION,
+  notes: `See https://github.com/michaelwilhelmsen/humla/releases/tag/${TAG}`,
+  pub_date: PUB_DATE,
+  platforms: {
+    [PLATFORM]: {
+      signature: fs.readFileSync(SIG_FILE, 'utf8').trim(),
+      url: DOWNLOAD_URL,
     },
-  };
-  // The signature has real newlines; encode them properly.
-  manifest.platforms['$PLATFORM'].signature = fs.readFileSync('$SIG_FILE', 'utf8').trim();
-  fs.writeFileSync('$LATEST_JSON', JSON.stringify(manifest, null, 2));
-"
+  },
+};
+fs.writeFileSync(LATEST_JSON, JSON.stringify(manifest, null, 2));
+NODE_EOF
 
 echo "latest.json:"
 cat "$LATEST_JSON"
