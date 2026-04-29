@@ -1,4 +1,5 @@
 use crate::db::{self, Note, NotePatch};
+use crate::diarize;
 use crate::openai;
 use crate::local_whisper;
 use crate::presets;
@@ -34,6 +35,11 @@ NEVER:
 - Add headings, bullet lists, markdown, bolding, italics, or any other formatting markers.
 - Add facts, names, numbers, or claims that are not present in the raw transcript.
 - Translate the transcript or change its language.
+
+SPEAKER LABELS:
+- Lines may begin with a label like 'Speaker 1: ', 'Speaker 2: ', etc. These are speaker turn markers from a diarization step. Preserve them EXACTLY: same number, same colon-space, same position at the start of the line.
+- NEVER move text between speakers, merge consecutive turns from different speakers, split a single turn across multiple speakers, or invent new speakers.
+- The number of lines beginning with a 'Speaker N:' label in the output must equal the number of such lines in the input. The order of speakers must be identical.
 
 When uncertain whether a word is a mishearing, leave it as-is. Doing nothing is always safer than guessing.
 
@@ -667,23 +673,28 @@ pub async fn recording_stop(
     };
     let _ = tokio::time::timeout(std::time::Duration::from_secs(30), drain).await;
 
-    // Spawn the polish pass in the background. It owns its own status
-    // transitions (Polishing → Idle) so the UI gets a single coherent
-    // state stream from Stopping → Polishing → Idle. Polish silently
-    // skips when there's no transcript or no API key, in which case we
-    // still settle to Idle here.
-    let app_for_polish = app.clone();
-    let note_for_polish = note_id.clone();
+    // Spawn the post-stop processing chain in the background:
+    //   Stopping → Diarizing → Polishing → Idle
+    // Each stage owns its own status emission. Errors in one stage don't
+    // cancel later stages — a failed diarization still benefits from
+    // polish on the raw transcript, etc. Final Idle is always emitted.
+    let app_for_post = app.clone();
+    let note_for_post = note_id.clone();
     tokio::spawn(async move {
-        if let Err(e) = polish_transcript(app_for_polish.clone(), note_for_polish.clone()).await {
+        if let Err(e) = run_diarization(app_for_post.clone(), note_for_post.clone()).await {
+            eprintln!("diarization: {e}");
+            // Don't surface as a recording error toast — diarization is
+            // best-effort. The transcript still goes through polish.
+        }
+        if let Err(e) = polish_transcript(app_for_post.clone(), note_for_post.clone()).await {
             eprintln!("polish_transcript: {e}");
             emit_error(
-                &app_for_polish,
-                Some(&note_for_polish),
+                &app_for_post,
+                Some(&note_for_post),
                 &format!("Polish failed: {e}"),
             );
         }
-        emit_status(&app_for_polish, None, Phase::Idle);
+        emit_status(&app_for_post, None, Phase::Idle);
     });
 
     if let Some(dir) = temp_dir {
@@ -862,6 +873,133 @@ pub async fn summarize_note(app: AppHandle, note_id: String) -> Result<(), Strin
     let result = run_summary(app.clone(), note_id.clone()).await;
     emit_status(&app, None, Phase::Idle);
     result.map_err(|e| e.to_string())
+}
+
+// Run speaker diarization on the full-recording WAV (written by the sidecar's
+// FullRecordingWriter), then rebuild the transcript with `Speaker N:` line
+// prefixes for each turn. This replaces the live-appended raw transcript
+// with the tagged version; the polish step that runs immediately after sees
+// the tagged form and is told to preserve the labels.
+//
+// Skips silently if:
+//   - The full WAV path isn't set (sidecar didn't emit `full_recording`).
+//   - The chunk_log is empty (no transcribed content to tag).
+//   - The diarize sidecar isn't installed (e.g. dev build without
+//     ./scripts/build-diarize.sh having run).
+//   - Diarization itself fails — caller falls through to polish on raw text.
+async fn run_diarization(app: AppHandle, note_id: String) -> anyhow::Result<()> {
+    let (full_wav_path, chunks) = {
+        let state: State<AppState> = app.state();
+        let session = state.recording.lock();
+        let path = session.full_wav_path.lock().clone();
+        let chunks = session.chunk_log.lock().clone();
+        (path, chunks)
+    };
+
+    let Some(wav_path) = full_wav_path else {
+        return Ok(());
+    };
+
+    if chunks.is_empty() {
+        diarize::cleanup_full_wav(&wav_path).await;
+        return Ok(());
+    }
+
+    emit_status(&app, Some(&note_id), Phase::Diarizing);
+
+    let segments_result = diarize::diarize_file(&app, &wav_path).await;
+    diarize::cleanup_full_wav(&wav_path).await;
+
+    let segments = segments_result?;
+
+    let tagged = build_tagged_transcript(&chunks, &segments);
+    if tagged.trim().is_empty() {
+        return Ok(());
+    }
+
+    {
+        let state: State<AppState> = app.state();
+        let conn = state.db.lock();
+        db::update_note(
+            &conn,
+            &note_id,
+            &NotePatch {
+                transcript: Some(tagged.clone()),
+                ..Default::default()
+            },
+        )?;
+    }
+
+    let _ = app.emit(
+        "transcript_replaced",
+        TranscriptPayload {
+            note_id,
+            text: tagged,
+        },
+    );
+    Ok(())
+}
+
+// Build a `Speaker N:` line-prefixed transcript by walking the chunk log in
+// time order and looking up each chunk's dominant speaker via the segments.
+// Coarse but pragmatic: with VAD-bounded chunks, boundaries usually align
+// with speaker turn changes, so attributing the whole chunk to its
+// start-time speaker is right most of the time. Fine-grained word-level
+// alignment is a future improvement.
+fn build_tagged_transcript(
+    chunks: &[crate::recording::ChunkRecord],
+    segments: &[diarize::Segment],
+) -> String {
+    if chunks.is_empty() {
+        return String::new();
+    }
+    if segments.is_empty() {
+        // No diarization data — fall back to plain newlined transcript.
+        return chunks
+            .iter()
+            .map(|c| c.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+
+    let mut output = String::new();
+    let mut last_speaker: Option<String> = None;
+
+    for chunk in chunks {
+        let speaker = find_speaker_at(segments, chunk.start_ms)
+            .or_else(|| last_speaker.clone())
+            .unwrap_or_else(|| "speaker_0".to_string());
+
+        if last_speaker.as_deref() != Some(speaker.as_str()) {
+            if !output.is_empty() {
+                output.push('\n');
+            }
+            output.push_str(&display_speaker_label(&speaker));
+            output.push_str(": ");
+            last_speaker = Some(speaker);
+        } else if !output.ends_with(' ') {
+            output.push(' ');
+        }
+        output.push_str(chunk.text.trim());
+    }
+
+    output
+}
+
+fn find_speaker_at(segments: &[diarize::Segment], time_ms: u64) -> Option<String> {
+    segments
+        .iter()
+        .find(|s| time_ms >= s.start_ms && time_ms < s.end_ms)
+        .map(|s| s.speaker_id.clone())
+}
+
+// FluidAudio returns ids like "speaker_0"; render them as user-facing
+// "Speaker 1", "Speaker 2" (1-indexed because that's what users expect).
+fn display_speaker_label(id: &str) -> String {
+    id.strip_prefix("speaker_")
+        .and_then(|n| n.parse::<u32>().ok())
+        .map(|n| format!("Speaker {}", n + 1))
+        .unwrap_or_else(|| format!("Speaker {id}"))
 }
 
 // Polish a freshly-recorded transcript via a chat-completion pass. Whisper's

@@ -31,7 +31,6 @@ parking_lot = "0.12"
 dirs = "5"
 libc = "0.2"
 tauri-plugin-process = "2"
-fluidaudio-rs = "0.1.0"
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]

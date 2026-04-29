@@ -99,7 +99,7 @@ export type PermissionsStatus = {
 
 export type TranscriptEvent = { noteId: string; text: string };
 export type SummaryEvent = { noteId: string; summary: string };
-export type RecordingPhase = "idle" | "starting" | "recording" | "paused" | "stopping" | "polishing" | "summarizing";
+export type RecordingPhase = "idle" | "starting" | "recording" | "paused" | "stopping" | "diarizing" | "polishing" | "summarizing";
 export type RecordingStatus = { noteId: string | null; phase: RecordingPhase };
 export type RecordingError = { noteId: string | null; message: string };
 export type RecordingDiagnostic = {
