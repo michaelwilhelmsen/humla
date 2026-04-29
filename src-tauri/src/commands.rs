@@ -3,7 +3,7 @@ use crate::openai;
 use crate::local_whisper;
 use crate::presets;
 use crate::wav;
-use crate::recording::{DiagnosticPayload, ErrorPayload, Inflight, Phase, RecordingStatus, SidecarEvent, SummaryPayload, TranscriptPayload};
+use crate::recording::{ChunkRecord, DiagnosticPayload, ErrorPayload, Inflight, Phase, RecordingStatus, SidecarEvent, SummaryPayload, TranscriptPayload};
 use crate::AppState;
 use futures_util::StreamExt;
 use std::path::PathBuf;
@@ -518,6 +518,8 @@ pub async fn recording_start(
         // sentence fragments from a different conversation would only confuse
         // this session's decoder.
         s.trail.lock().clear();
+        s.chunk_log.lock().clear();
+        *s.full_wav_path.lock() = None;
     }
 
     let app_clone = app.clone();
@@ -529,12 +531,12 @@ pub async fn recording_start(
             let trimmed = line.trim();
             if trimmed.is_empty() { continue; }
             match serde_json::from_str::<SidecarEvent>(trimmed) {
-                Ok(SidecarEvent::Chunk { path }) => {
+                Ok(SidecarEvent::Chunk { path, start_ms }) => {
                     let pb = PathBuf::from(path);
                     let app2 = app_clone.clone();
                     let note_id2 = note_id_clone.clone();
                     let h = tokio::spawn(async move {
-                        if let Err(e) = transcribe_chunk(app2.clone(), note_id2.clone(), pb).await {
+                        if let Err(e) = transcribe_chunk(app2.clone(), note_id2.clone(), pb, start_ms).await {
                             let msg = format!("Transcription failed: {e}");
                             eprintln!("{msg}");
                             let _ = app2.emit("recording_error", ErrorPayload {
@@ -544,6 +546,13 @@ pub async fn recording_start(
                         }
                     });
                     inflight_for_reader.lock().push(h);
+                }
+                Ok(SidecarEvent::FullRecording { path, duration_ms: _ }) => {
+                    // Stash the path on the session; the diarization pass on
+                    // stop reads it. We don't act on it here — the recording
+                    // is still wrapping up.
+                    let state: tauri::State<AppState> = app_clone.state();
+                    *state.recording.lock().full_wav_path.lock() = Some(PathBuf::from(path));
                 }
                 Ok(SidecarEvent::Error { message }) => {
                     eprintln!("sidecar error: {message}");
@@ -691,6 +700,7 @@ async fn transcribe_chunk(
     app: AppHandle,
     note_id: String,
     path: PathBuf,
+    start_ms: u64,
 ) -> anyhow::Result<()> {
     let cfg = {
         let state: State<AppState> = app.state();
@@ -817,9 +827,15 @@ async fn transcribe_chunk(
         // chunk's prompt includes it. Only commit-stage text reaches here
         // (silence-gated, hallucination-filtered, attribution-stripped),
         // which keeps the trail from poisoning subsequent decodes.
+        // Same data goes into chunk_log paired with start_ms — used by the
+        // diarization step on stop to align speaker segments with chunks.
         {
             let session = state.recording.lock();
             session.trail.lock().push(&trimmed);
+            session.chunk_log.lock().push(ChunkRecord {
+                start_ms,
+                text: trimmed.clone(),
+            });
         }
         let _ = app.emit("transcript_appended", TranscriptPayload {
             note_id: note_id.clone(),

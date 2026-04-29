@@ -56,6 +56,16 @@ impl Default for TranscriptTrail {
     }
 }
 
+/// Per-chunk metadata captured during recording. The diarization step needs
+/// to align speaker segments (timestamps relative to the full recording)
+/// against chunk-level transcripts; this log holds the link between
+/// "chunk N's text" and "chunk N started at start_ms in the full audio".
+#[derive(Clone, Debug)]
+pub struct ChunkRecord {
+    pub start_ms: u64,
+    pub text: String,
+}
+
 #[derive(Default)]
 pub struct RecordingSession {
     pub note_id: Option<String>,
@@ -72,6 +82,13 @@ pub struct RecordingSession {
     // Whisper's `initial_prompt` for every chunk so decoding stays anchored
     // to the conversation rather than treating each chunk as a cold start.
     pub trail: Arc<Mutex<TranscriptTrail>>,
+    // Per-chunk metadata. Populated as chunks transcribe; consumed by the
+    // diarization pass on stop to build a speaker-tagged transcript.
+    pub chunk_log: Arc<Mutex<Vec<ChunkRecord>>>,
+    // Path to the full-recording WAV file written by the sidecar's
+    // FullRecordingWriter. Set when the `full_recording` event arrives;
+    // consumed by the diarization pass on stop, then deleted.
+    pub full_wav_path: Arc<Mutex<Option<PathBuf>>>,
 }
 
 #[derive(Clone, Serialize)]
@@ -89,6 +106,7 @@ pub enum Phase {
     Recording,
     Paused,
     Stopping,
+    Diarizing,
     Polishing,
     Summarizing,
 }
@@ -117,8 +135,23 @@ pub struct ErrorPayload {
 #[derive(serde::Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum SidecarEvent {
-    Chunk { path: String },
-    Error { message: String },
+    Chunk {
+        path: String,
+        // Time (in milliseconds) at which this chunk's audio starts relative
+        // to the beginning of the recording. Defaults to 0 for older sidecar
+        // builds that didn't emit this — the diarization step will treat
+        // start-less chunks as if they all start at 0, which collapses the
+        // alignment to "best effort".
+        #[serde(default)]
+        start_ms: u64,
+    },
+    FullRecording {
+        path: String,
+        duration_ms: u64,
+    },
+    Error {
+        message: String,
+    },
     Stopped,
     Paused,
     Resumed,
