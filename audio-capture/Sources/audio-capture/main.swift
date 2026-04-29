@@ -123,18 +123,24 @@ let writeSettings: [String: Any] = [
 
 final class ChunkWriter {
     private let dir: URL
-    private let chunkFrames: AVAudioFrameCount
+    private let minFrames: AVAudioFrameCount
+    private let maxFrames: AVAudioFrameCount
+    private let vadSilenceFrames: AVAudioFrameCount
+    private let silenceThreshold: Float = 0.005   // chunk-level: below this we drop the chunk
+    private let vadFrameThreshold: Float = 0.008  // per-buffer peak: above this counts as voice
     private var index: Int = 0
     private var file: AVAudioFile?
     private var url: URL?
     private var written: AVAudioFrameCount = 0
     private var chunkPeak: Float = 0
+    private var silentRun: AVAudioFrameCount = 0
     private let queue = DispatchQueue(label: "chunk.writer")
-    private let silenceThreshold: Float = 0.005  // ~-46dB; below this Whisper hallucinates
 
-    init(dir: URL, chunkSeconds: Double) {
+    init(dir: URL, minSeconds: Double, maxSeconds: Double, vadSilenceMs: Double) {
         self.dir = dir
-        self.chunkFrames = AVAudioFrameCount(chunkSeconds * targetSampleRate)
+        self.minFrames = AVAudioFrameCount(minSeconds * targetSampleRate)
+        self.maxFrames = AVAudioFrameCount(maxSeconds * targetSampleRate)
+        self.vadSilenceFrames = AVAudioFrameCount((vadSilenceMs / 1000.0) * targetSampleRate)
     }
 
     func write(_ buffer: AVAudioPCMBuffer) {
@@ -143,16 +149,33 @@ final class ChunkWriter {
                 if file == nil { try openNext() }
                 try file!.write(from: buffer)
                 written += buffer.frameLength
+
+                // Per-buffer peak feeds both the chunk-level peak (used for the
+                // silence-drop on close) and the silent-run counter (used by
+                // the VAD rotation trigger).
+                var bufPeak: Float = 0
                 if let chans = buffer.floatChannelData {
                     let n = Int(buffer.frameLength)
-                    var peak: Float = 0
                     for i in 0..<n {
                         let v = abs(chans[0][i])
-                        if v > peak { peak = v }
+                        if v > bufPeak { bufPeak = v }
                     }
-                    if peak > chunkPeak { chunkPeak = peak }
                 }
-                if written >= chunkFrames {
+                if bufPeak > chunkPeak { chunkPeak = bufPeak }
+                if bufPeak < vadFrameThreshold {
+                    silentRun += buffer.frameLength
+                } else {
+                    silentRun = 0
+                }
+
+                // Rotate on whichever fires first:
+                //  - hard cap (maxFrames) so a continuous monologue still gets
+                //    transcribed periodically and the trailing-context prompt
+                //    stays fresh on the consuming side.
+                //  - VAD pause detected, but only after the chunk reached
+                //    minFrames so we don't emit micro-chunks that lose context.
+                let vadRotate = written >= minFrames && silentRun >= vadSilenceFrames
+                if written >= maxFrames || vadRotate {
                     try rotate()
                 }
             } catch {
@@ -176,6 +199,7 @@ final class ChunkWriter {
             url = nil
             written = 0
             chunkPeak = 0
+            silentRun = 0
             emit(["event": "stopped"])
         }
     }
@@ -198,11 +222,16 @@ final class ChunkWriter {
             try? FileManager.default.removeItem(at: u)
         }
         chunkPeak = 0
+        silentRun = 0
         try openNext()
     }
 }
 
-let writer = ChunkWriter(dir: outDir, chunkSeconds: 20.0)
+// Min 1.5s prevents micro-chunks that lose context. Max 12s caps so a
+// monologue with no pauses still gets transcribed periodically and the
+// trailing-context prompt stays fresh. 600 ms silence ≈ a normal sentence
+// pause; tighter values trigger on word-internal stops.
+let writer = ChunkWriter(dir: outDir, minSeconds: 1.5, maxSeconds: 12.0, vadSilenceMs: 600.0)
 
 // MARK: - Stats (diagnostics)
 
