@@ -121,7 +121,14 @@ func runDownload() async -> Int32 {
 func runDiarize(audioPath: String) async -> Int32 {
     do {
         let models = try await DiarizerModels.downloadIfNeeded()
-        let diarizer = DiarizerManager()
+        // 0.5 leans aggressive on speaker SEPARATION (lower threshold ⇒ more
+        // speakers detected). YouTube / Teams / system-audio captures put
+        // multiple voices through the same downstream codec, which makes
+        // their embeddings sit closer together than they would in clean
+        // multi-channel recordings — at threshold 0.6 (and especially 0.7)
+        // the model tends to merge them.
+        let config = DiarizerConfig(clusteringThreshold: 0.5)
+        let diarizer = DiarizerManager(config: config)
         diarizer.initialize(models: models)
 
         let converter = AudioConverter()

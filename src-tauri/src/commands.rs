@@ -1000,6 +1000,12 @@ async fn run_diarization(app: AppHandle, note_id: String) -> anyhow::Result<()> 
 // with speaker turn changes, so attributing the whole chunk to its
 // start-time speaker is right most of the time. Fine-grained word-level
 // alignment is a future improvement.
+//
+// Speaker labels are assigned in first-encounter order — the first distinct
+// speaker_id we see becomes "Speaker 1", the second "Speaker 2", etc. This
+// keeps the labels stable and readable regardless of what underlying ID
+// format FluidAudio uses (UUID strings, numeric strings, "speaker_N" — all
+// have shown up across versions).
 fn build_tagged_transcript(
     chunks: &[crate::recording::ChunkRecord],
     segments: &[diarize::Segment],
@@ -1016,20 +1022,36 @@ fn build_tagged_transcript(
             .join("\n");
     }
 
+    // First pass: assign each underlying speaker_id a stable display index
+    // (1-based) in order of first appearance.
+    let mut display_map: std::collections::HashMap<String, u32> =
+        std::collections::HashMap::new();
+    let mut next_idx: u32 = 1;
+    for chunk in chunks {
+        let id = find_speaker_at(segments, chunk.start_ms);
+        if let Some(id) = id {
+            display_map.entry(id).or_insert_with(|| {
+                let n = next_idx;
+                next_idx += 1;
+                n
+            });
+        }
+    }
+
     let mut output = String::new();
     let mut last_speaker: Option<String> = None;
 
     for chunk in chunks {
         let speaker = find_speaker_at(segments, chunk.start_ms)
             .or_else(|| last_speaker.clone())
-            .unwrap_or_else(|| "speaker_0".to_string());
+            .unwrap_or_else(|| "unknown".to_string());
 
         if last_speaker.as_deref() != Some(speaker.as_str()) {
             if !output.is_empty() {
                 output.push('\n');
             }
-            output.push_str(&display_speaker_label(&speaker));
-            output.push_str(": ");
+            let n = display_map.get(&speaker).copied().unwrap_or(1);
+            output.push_str(&format!("Speaker {n}: "));
             last_speaker = Some(speaker);
         } else if !output.ends_with(' ') {
             output.push(' ');
@@ -1045,15 +1067,6 @@ fn find_speaker_at(segments: &[diarize::Segment], time_ms: u64) -> Option<String
         .iter()
         .find(|s| time_ms >= s.start_ms && time_ms < s.end_ms)
         .map(|s| s.speaker_id.clone())
-}
-
-// FluidAudio returns ids like "speaker_0"; render them as user-facing
-// "Speaker 1", "Speaker 2" (1-indexed because that's what users expect).
-fn display_speaker_label(id: &str) -> String {
-    id.strip_prefix("speaker_")
-        .and_then(|n| n.parse::<u32>().ok())
-        .map(|n| format!("Speaker {}", n + 1))
-        .unwrap_or_else(|| format!("Speaker {id}"))
 }
 
 // Polish a freshly-recorded transcript via a chat-completion pass. Whisper's

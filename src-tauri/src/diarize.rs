@@ -50,6 +50,17 @@ pub async fn diarize_file(app: &AppHandle, audio_path: &Path) -> Result<Vec<Segm
     let stdout = String::from_utf8_lossy(&output.stdout);
     let segments: Vec<Segment> = serde_json::from_str(stdout.trim())
         .map_err(|e| anyhow!("parse segments JSON: {e} -- {stdout}"))?;
+    // Echo to stderr for live debugging — visible in `pnpm tauri dev`'s
+    // terminal. Cheap to leave on; segments are typically small.
+    eprintln!(
+        "diarize: {} segment(s): {:?}",
+        segments.len(),
+        segments
+            .iter()
+            .map(|s| format!("{}({}–{}ms)", s.speaker_id, s.start_ms, s.end_ms))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
     Ok(segments)
 }
 
