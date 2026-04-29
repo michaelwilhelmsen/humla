@@ -10,6 +10,10 @@ export type Note = {
   audio_path: string | null;
   summary_preset: string;
   folder_id: string | null;
+  // ISO 639-1 code or "auto". Empty string means "fall back to the global
+  // language setting" — used by pre-feature notes and as the create-time
+  // sentinel before the user makes an explicit choice.
+  language: string;
   created_at: number;
   updated_at: number;
 };
@@ -45,7 +49,7 @@ export const ipc = {
   listNotes: () => invoke<Note[]>("notes_list"),
   getNote: (id: string) => invoke<Note>("notes_get", { id }),
   createNote: () => invoke<Note>("notes_create"),
-  updateNote: (id: string, patch: Partial<Pick<Note, "title" | "body" | "transcript" | "summary" | "summary_preset">>) =>
+  updateNote: (id: string, patch: Partial<Pick<Note, "title" | "body" | "transcript" | "summary" | "summary_preset" | "language">>) =>
     invoke<void>("notes_update", { id, patch }),
   deleteNote: (id: string) => invoke<void>("notes_delete", { id }),
   moveNote: (id: string, folderId: string | null) =>

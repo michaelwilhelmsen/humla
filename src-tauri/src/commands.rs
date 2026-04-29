@@ -48,7 +48,14 @@ pub fn notes_get(state: State<AppState>, id: String) -> Result<Note, String> {
 #[tauri::command]
 pub fn notes_create(state: State<AppState>) -> Result<Note, String> {
     let conn = state.db.lock();
-    db::create_note(&conn).map_err(err)
+    // New notes inherit the current global language as their default. The
+    // user can change this per-note from the note view; existing notes
+    // pre-feature have an empty language and fall back to the global at
+    // transcribe / summary time.
+    let default_language = db::get_setting(&conn, "language")
+        .map_err(err)?
+        .unwrap_or_else(|| DEFAULT_LANGUAGE.to_string());
+    db::create_note(&conn, &default_language).map_err(err)
 }
 
 #[tauri::command]
@@ -653,8 +660,18 @@ async fn transcribe_chunk(
         let conn = state.db.lock();
         let provider = db::get_setting(&conn, "transcribe_provider")?
             .unwrap_or_else(|| DEFAULT_TRANSCRIBE_PROVIDER.to_string());
-        let language = db::get_setting(&conn, "language")?
+        // Per-note language wins over the global. Empty (pre-feature notes
+        // and the "use default" sentinel) falls back to the global setting.
+        let global_language = db::get_setting(&conn, "language")?
             .unwrap_or_else(|| DEFAULT_LANGUAGE.to_string());
+        let note_language = db::get_note(&conn, &note_id)
+            .map(|n| n.language)
+            .unwrap_or_default();
+        let language = if note_language.trim().is_empty() {
+            global_language
+        } else {
+            note_language
+        };
         // Cloud providers need a key; local Whisper does not.
         let api_key = match provider.as_str() {
             "local" => String::new(),
@@ -806,9 +823,16 @@ async fn run_summary(app: AppHandle, note_id: String) -> anyhow::Result<()> {
             .unwrap_or_else(|| DEFAULT_SUMMARY_MODEL.to_string());
         let p = db::get_setting(&conn, "summary_prompt")?
             .unwrap_or_else(|| DEFAULT_SUMMARY_PROMPT.to_string());
-        let lang = db::get_setting(&conn, "language")?
+        let global_lang = db::get_setting(&conn, "language")?
             .unwrap_or_else(|| DEFAULT_LANGUAGE.to_string());
         let n = db::get_note(&conn, &note_id)?;
+        // Same fallback rule as transcription: note language wins, empty
+        // means "follow the global default".
+        let lang = if n.language.trim().is_empty() {
+            global_lang
+        } else {
+            n.language.clone()
+        };
         (key, m, p, lang, n)
     };
     if note.transcript.trim().is_empty() && note.body.trim().is_empty() {

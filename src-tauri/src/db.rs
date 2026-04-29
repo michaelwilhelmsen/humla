@@ -13,6 +13,10 @@ pub struct Note {
     pub audio_path: Option<String>,
     pub summary_preset: String,
     pub folder_id: Option<String>,
+    // Per-note transcription language. Empty string means "fall back to the
+    // global language setting" — that's how pre-feature notes are handled
+    // without a backfill migration.
+    pub language: String,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -41,6 +45,7 @@ pub fn open(path: &Path) -> Result<Connection> {
             audio_path      TEXT,
             summary_preset  TEXT NOT NULL DEFAULT 'meeting',
             folder_id       TEXT,
+            language        TEXT NOT NULL DEFAULT '',
             created_at      INTEGER NOT NULL,
             updated_at      INTEGER NOT NULL
         );
@@ -68,6 +73,10 @@ pub fn open(path: &Path) -> Result<Connection> {
         [],
     );
     let _ = conn.execute("ALTER TABLE notes ADD COLUMN folder_id TEXT", []);
+    let _ = conn.execute(
+        "ALTER TABLE notes ADD COLUMN language TEXT NOT NULL DEFAULT ''",
+        [],
+    );
     // Index is created AFTER the ALTERs so it's safe on both fresh DBs and
     // older DBs that needed the column added.
     conn.execute(
@@ -81,7 +90,7 @@ pub fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
-const NOTE_COLS: &str = "id, title, body, transcript, summary, audio_path, summary_preset, folder_id, created_at, updated_at";
+const NOTE_COLS: &str = "id, title, body, transcript, summary, audio_path, summary_preset, folder_id, language, created_at, updated_at";
 
 pub fn list_notes(conn: &Connection) -> Result<Vec<Note>> {
     let mut stmt = conn.prepare(&format!(
@@ -102,13 +111,13 @@ pub fn get_note(conn: &Connection, id: &str) -> Result<Note> {
     Ok(n)
 }
 
-pub fn create_note(conn: &Connection) -> Result<Note> {
+pub fn create_note(conn: &Connection, default_language: &str) -> Result<Note> {
     let id = uuid::Uuid::new_v4().to_string();
     let now = now_ms();
     conn.execute(
-        "INSERT INTO notes (id, title, body, transcript, summary, audio_path, summary_preset, folder_id, created_at, updated_at)
-         VALUES (?1, '', '', '', '', NULL, 'meeting', NULL, ?2, ?2)",
-        params![id, now],
+        "INSERT INTO notes (id, title, body, transcript, summary, audio_path, summary_preset, folder_id, language, created_at, updated_at)
+         VALUES (?1, '', '', '', '', NULL, 'meeting', NULL, ?2, ?3, ?3)",
+        params![id, default_language, now],
     )?;
     get_note(conn, &id)
 }
@@ -179,6 +188,7 @@ pub struct NotePatch {
     pub transcript: Option<String>,
     pub summary: Option<String>,
     pub summary_preset: Option<String>,
+    pub language: Option<String>,
 }
 
 pub fn update_note(conn: &Connection, id: &str, patch: &NotePatch) -> Result<()> {
@@ -197,6 +207,9 @@ pub fn update_note(conn: &Connection, id: &str, patch: &NotePatch) -> Result<()>
     }
     if let Some(p) = &patch.summary_preset {
         conn.execute("UPDATE notes SET summary_preset = ?1, updated_at = ?2 WHERE id = ?3", params![p, now, id])?;
+    }
+    if let Some(l) = &patch.language {
+        conn.execute("UPDATE notes SET language = ?1, updated_at = ?2 WHERE id = ?3", params![l, now, id])?;
     }
     Ok(())
 }
@@ -256,7 +269,8 @@ fn map_note(row: &rusqlite::Row) -> rusqlite::Result<Note> {
         audio_path: row.get(5)?,
         summary_preset: row.get(6)?,
         folder_id: row.get(7)?,
-        created_at: row.get(8)?,
-        updated_at: row.get(9)?,
+        language: row.get(8)?,
+        created_at: row.get(9)?,
+        updated_at: row.get(10)?,
     })
 }

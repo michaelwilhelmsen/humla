@@ -9,6 +9,16 @@ import { SkeletonLines } from "../components/Skeleton";
 import { NoteEditor } from "../components/Editor";
 import { SUMMARY_PRESETS, presetLabelForLang } from "../lib/presets";
 
+// Mirrors the dropdown in Settings. Kept inline for now; if a third place
+// needs it we can extract to a shared module.
+const LANGS: { value: string; label: string }[] = [
+  { value: "auto", label: "Auto" },
+  { value: "no", label: "Norsk" },
+  { value: "en", label: "English" },
+  { value: "sv", label: "Svenska" },
+  { value: "da", label: "Dansk" },
+];
+
 function formatDateChip(ts: number) {
   const d = new Date(ts);
   const today = new Date(); today.setHours(0, 0, 0, 0);
@@ -67,7 +77,7 @@ export function Note() {
     });
   }, [note?.transcript, note?.summary, allowTranscriptSync]);
 
-  function patch(field: "title" | "body" | "transcript" | "summary_preset", value: string) {
+  function patch(field: "title" | "body" | "transcript" | "summary_preset" | "language", value: string) {
     if (!draft) return;
     const next = { ...draft, [field]: value };
     setDraft(next);
@@ -117,6 +127,10 @@ export function Note() {
             value={draft.summary_preset || "meeting"}
             lang={uiLang}
             onChange={(v) => patch("summary_preset", v)}
+          />
+          <LanguagePicker
+            value={draft.language || uiLang}
+            onChange={(v) => patch("language", v)}
           />
           <FolderPicker
             value={draft.folder_id}
@@ -300,6 +314,32 @@ function PresetPicker({
           </option>
         ))}
         <option value="custom">{lang === "no" ? "Egendefinert" : "Custom"}</option>
+      </select>
+      <span aria-hidden style={{ color: "var(--color-text-muted)" }}>▾</span>
+    </label>
+  );
+}
+
+function LanguagePicker({
+  value,
+  onChange,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+}) {
+  return (
+    <label className="nd-chip cursor-pointer pr-2">
+      <select
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        className="bg-transparent appearance-none outline-none cursor-pointer uppercase tracking-[0.08em]"
+        style={{ fontFamily: "var(--font-mono)" }}
+      >
+        {LANGS.map((l) => (
+          <option key={l.value} value={l.value}>
+            {l.label}
+          </option>
+        ))}
       </select>
       <span aria-hidden style={{ color: "var(--color-text-muted)" }}>▾</span>
     </label>
