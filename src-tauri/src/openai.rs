@@ -81,7 +81,12 @@ pub async fn transcribe_file(
 struct ChatRequest<'a> {
     model: &'a str,
     messages: Vec<ChatMessage<'a>>,
-    temperature: f32,
+    // Reasoning models (gpt-5.x family + o-series) reject custom temperature
+    // values with a 400 error; only the default (1) is allowed. Traditional
+    // chat models (gpt-4o, gpt-4, gpt-3.5) accept it. `skip_serializing_if`
+    // lets us send the right shape per model without a per-model payload.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
 }
 
 #[derive(Serialize)]
@@ -105,6 +110,24 @@ struct ChatMessageOwned {
     content: String,
 }
 
+/// Reasoning models: gpt-5.x family and the o-series. They reject the
+/// `temperature` parameter and accept extra knobs like `reasoning_effort`
+/// (which we leave at the API default).
+fn is_reasoning_model(model: &str) -> bool {
+    if let Some(rest) = model.strip_prefix("gpt-5") {
+        // "gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-5.4", "gpt-5.4-mini",
+        // "gpt-5.5", … all match. "gpt-50" (hypothetical future non-reasoning
+        // brand) wouldn't match because the next char would be a digit.
+        rest.is_empty() || rest.starts_with('.') || rest.starts_with('-')
+    } else if let Some(rest) = model.strip_prefix('o') {
+        // "o1", "o3", "o4-mini" — but not "openai-something" or other
+        // o-prefixed names that aren't reasoning models.
+        rest.chars().next().is_some_and(|c| c.is_ascii_digit())
+    } else {
+        false
+    }
+}
+
 pub async fn summarize(
     api_key: &str,
     model: &str,
@@ -113,7 +136,7 @@ pub async fn summarize(
 ) -> Result<String> {
     let req = ChatRequest {
         model,
-        temperature: 0.2,
+        temperature: if is_reasoning_model(model) { None } else { Some(0.2) },
         messages: vec![
             ChatMessage { role: "system", content: system_prompt },
             ChatMessage { role: "user", content: transcript },
@@ -136,4 +159,31 @@ pub async fn summarize(
         .map(|c| c.message.content)
         .unwrap_or_default();
     Ok(content)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reasoning_models_detected() {
+        for m in [
+            "gpt-5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano", "gpt-5.5",
+            "gpt-5-mini", "gpt-5-nano",
+            "o1", "o3", "o4-mini",
+        ] {
+            assert!(is_reasoning_model(m), "expected reasoning: {m}");
+        }
+    }
+
+    #[test]
+    fn traditional_chat_models_not_reasoning() {
+        for m in [
+            "gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-4",
+            "gpt-3.5-turbo", "chatgpt-4o-latest",
+            "openai-internal", // "o" prefix but not followed by a digit
+        ] {
+            assert!(!is_reasoning_model(m), "expected NOT reasoning: {m}");
+        }
+    }
 }
