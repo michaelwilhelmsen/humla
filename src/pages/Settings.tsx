@@ -139,6 +139,7 @@ export function Settings() {
   const [local, setLocal] = useState<LocalState>(EMPTY_LOCAL_STATE);
   const [diarize, setDiarize] = useState<DiarizeState>(EMPTY_DIARIZE_STATE);
   const [llm, setLlm] = useState<LlmState>(EMPTY_LLM_STATE);
+  const [memoryGb, setMemoryGb] = useState<number>(0);
   const [s, setS] = useState<Record<EditableKey, string>>(DEFAULTS);
   const theme = useThemeStore((t) => t.theme);
   const setThemePref = useThemeStore((t) => t.setTheme);
@@ -155,6 +156,7 @@ export function Settings() {
       setLocal((p) => ({ ...p, status: lw }));
       setDiarize((p) => ({ ...p, status: ds }));
       setLlm((p) => ({ ...p, status: ls }));
+      ipc.systemMemoryGb().then(setMemoryGb).catch(() => setMemoryGb(0));
       const entries = await Promise.all(
         (Object.keys(DEFAULTS) as EditableKey[]).map(async (key) => [key, (await ipc.getSetting(key)) ?? DEFAULTS[key]] as const)
       );
@@ -536,6 +538,14 @@ export function Settings() {
               onDownload={() => downloadLlm("e4b")}
               onDelete={() => deleteLlm("e4b")}
             />
+            {memoryGb > 0 && memoryGb <= 16 && (
+              <p className="text-xs text-[var(--color-text-muted)] -mt-2">
+                Heads up: your Mac has {memoryGb} GB of RAM. E4B uses ~5 GB
+                resident during summary; with Whisper and your browser
+                already loaded that may swap. E2B is the safer pick on
+                16 GB systems.
+              </p>
+            )}
             <Row label="Already installed?">
               <button
                 onClick={scanLlm}

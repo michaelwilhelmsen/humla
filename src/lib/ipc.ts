@@ -101,6 +101,7 @@ export const ipc = {
   localLlmScan: () => invoke<DiscoveredLlm[]>("local_llm_scan"),
   localLlmSelectExisting: (path: string) =>
     invoke<void>("local_llm_select_existing", { path }),
+  systemMemoryGb: () => invoke<number>("system_memory_gb"),
 
   recordingStart: (noteId: string) => invoke<void>("recording_start", { noteId }),
   recordingStop: () => invoke<void>("recording_stop"),

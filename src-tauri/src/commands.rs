@@ -488,6 +488,25 @@ pub async fn local_llm_delete(
     Ok(())
 }
 
+// Read total physical RAM in GB. macOS-only; returns 0 on failure.
+// Used to warn users on 16 GB Macs that running E4B alongside Whisper +
+// FluidAudio + their browser may swap.
+#[tauri::command]
+pub fn system_memory_gb() -> u32 {
+    use std::process::Command;
+    let out = Command::new("sysctl")
+        .args(["-n", "hw.memsize"])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {
+            let s = String::from_utf8_lossy(&o.stdout);
+            let bytes: u64 = s.trim().parse().unwrap_or(0);
+            (bytes / 1_000_000_000) as u32
+        }
+        _ => 0,
+    }
+}
+
 #[tauri::command]
 pub async fn local_llm_scan() -> Result<Vec<llm_discovery::DiscoveredLlm>, String> {
     let home = dirs::home_dir().ok_or_else(|| "no home dir".to_string())?;

@@ -109,6 +109,7 @@ pub fn run() {
             commands::local_llm_delete,
             commands::local_llm_scan,
             commands::local_llm_select_existing,
+            commands::system_memory_gb,
             commands::diarize_status,
             commands::diarize_download,
             commands::diarize_delete,
