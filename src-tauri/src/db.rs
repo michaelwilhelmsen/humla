@@ -17,6 +17,11 @@ pub struct Note {
     // global language setting" — that's how pre-feature notes are handled
     // without a backfill migration.
     pub language: String,
+    // Per-note summary provider override. None means "fall back to the
+    // global summary_provider setting." Same null-as-fallback pattern as
+    // `language` but using Option since we want a tri-state (null / openai
+    // / local) rather than empty-string-as-null.
+    pub summary_provider: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -77,6 +82,7 @@ pub fn open(path: &Path) -> Result<Connection> {
         "ALTER TABLE notes ADD COLUMN language TEXT NOT NULL DEFAULT ''",
         [],
     );
+    let _ = conn.execute("ALTER TABLE notes ADD COLUMN summary_provider TEXT", []);
     // Index is created AFTER the ALTERs so it's safe on both fresh DBs and
     // older DBs that needed the column added.
     conn.execute(
@@ -90,7 +96,7 @@ pub fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
-const NOTE_COLS: &str = "id, title, body, transcript, summary, audio_path, summary_preset, folder_id, language, created_at, updated_at";
+const NOTE_COLS: &str = "id, title, body, transcript, summary, audio_path, summary_preset, folder_id, language, summary_provider, created_at, updated_at";
 
 pub fn list_notes(conn: &Connection) -> Result<Vec<Note>> {
     let mut stmt = conn.prepare(&format!(
@@ -115,8 +121,8 @@ pub fn create_note(conn: &Connection, default_language: &str) -> Result<Note> {
     let id = uuid::Uuid::new_v4().to_string();
     let now = now_ms();
     conn.execute(
-        "INSERT INTO notes (id, title, body, transcript, summary, audio_path, summary_preset, folder_id, language, created_at, updated_at)
-         VALUES (?1, '', '', '', '', NULL, 'meeting', NULL, ?2, ?3, ?3)",
+        "INSERT INTO notes (id, title, body, transcript, summary, audio_path, summary_preset, folder_id, language, summary_provider, created_at, updated_at)
+         VALUES (?1, '', '', '', '', NULL, 'meeting', NULL, ?2, NULL, ?3, ?3)",
         params![id, default_language, now],
     )?;
     get_note(conn, &id)
@@ -189,6 +195,11 @@ pub struct NotePatch {
     pub summary: Option<String>,
     pub summary_preset: Option<String>,
     pub language: Option<String>,
+    // Two-level Option: outer = "did the patch include this field", inner =
+    // "is the chosen value null (fall back to global) or a string". An
+    // explicit null in JSON deserializes to Some(None), which lets the UI
+    // clear a per-note override.
+    pub summary_provider: Option<Option<String>>,
 }
 
 pub fn update_note(conn: &Connection, id: &str, patch: &NotePatch) -> Result<()> {
@@ -210,6 +221,13 @@ pub fn update_note(conn: &Connection, id: &str, patch: &NotePatch) -> Result<()>
     }
     if let Some(l) = &patch.language {
         conn.execute("UPDATE notes SET language = ?1, updated_at = ?2 WHERE id = ?3", params![l, now, id])?;
+    }
+    if let Some(sp) = &patch.summary_provider {
+        // sp is Option<String>: Some(value) sets the override, None clears it.
+        conn.execute(
+            "UPDATE notes SET summary_provider = ?1, updated_at = ?2 WHERE id = ?3",
+            params![sp.as_deref(), now, id],
+        )?;
     }
     Ok(())
 }
@@ -274,7 +292,8 @@ fn map_note(row: &rusqlite::Row) -> rusqlite::Result<Note> {
         summary_preset: row.get(6)?,
         folder_id: row.get(7)?,
         language: row.get(8)?,
-        created_at: row.get(9)?,
-        updated_at: row.get(10)?,
+        summary_provider: row.get(9)?,
+        created_at: row.get(10)?,
+        updated_at: row.get(11)?,
     })
 }
