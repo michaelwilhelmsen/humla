@@ -2,9 +2,10 @@ use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
 // fluidaudio-rs v0.1.0 advertises diarization but the Rust bindings are
 // stubs — only the underlying FluidAudio Swift package implements it. So
@@ -216,6 +217,120 @@ pub async fn download(app: &AppHandle) -> Result<()> {
         return Err(anyhow!("download failed: {stderr_text}"));
     }
     Ok(())
+}
+
+/// Long-running classifier subprocess. The sidecar's `streaming` mode keeps
+/// a single DiarizerManager alive across chunks so speaker memory persists
+/// — the same person consistently maps to the same speaker_id throughout
+/// the recording. We spawn one of these at recording_start and tear it
+/// down on recording_stop.
+pub struct StreamingDiarizer {
+    child: Child,
+    stdin: ChildStdin,
+    stdout_lines: Lines<BufReader<ChildStdout>>,
+}
+
+impl StreamingDiarizer {
+    /// Spawn the sidecar in streaming mode and wait for its `ready` event
+    /// (model loaded, CoreML warm). First call after a fresh download
+    /// includes the ANE compile, which can take 20–30 s; subsequent
+    /// recordings see ~1 s.
+    pub async fn start(app: &AppHandle) -> Result<Self> {
+        let sidecar = sidecar_path(app)?;
+        let mut child = Command::new(&sidecar)
+            .arg("streaming")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|e| anyhow!("spawn streaming sidecar: {e}"))?;
+
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("no stdin on streaming sidecar"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow!("no stdout on streaming sidecar"))?;
+        // Drain stderr so the pipe never blocks; surface to console for
+        // diagnostics (visible in `pnpm tauri dev`).
+        if let Some(stderr) = child.stderr.take() {
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    eprintln!("speaker-diarize streaming stderr: {line}");
+                }
+            });
+        }
+
+        let mut lines = BufReader::new(stdout).lines();
+
+        // First message must be {event: ready}. Cap the wait so a wedged
+        // model load doesn't pin the recording forever.
+        let ready = tokio::time::timeout(Duration::from_secs(120), lines.next_line()).await;
+        match ready {
+            Ok(Ok(Some(line))) if line.contains("\"ready\"") => {}
+            Ok(Ok(Some(line))) => return Err(anyhow!("unexpected ready frame: {line}")),
+            Ok(Ok(None)) => return Err(anyhow!("streaming sidecar exited before ready")),
+            Ok(Err(e)) => return Err(anyhow!("read ready: {e}")),
+            Err(_) => return Err(anyhow!("streaming sidecar didn't signal ready in 120s")),
+        }
+
+        Ok(Self {
+            child,
+            stdin,
+            stdout_lines: lines,
+        })
+    }
+
+    /// Classify a single chunk WAV. Returns the speaker_id assigned by
+    /// FluidAudio's SpeakerManager — stable across calls within this
+    /// session. None means the chunk wasn't speech-like enough to cluster
+    /// (e.g. short silence, low confidence).
+    pub async fn classify(&mut self, path: &Path) -> Result<Option<String>> {
+        let path_str = path
+            .to_str()
+            .ok_or_else(|| anyhow!("non-utf8 chunk path"))?;
+        let req = serde_json::json!({ "path": path_str });
+        let mut line = req.to_string();
+        line.push('\n');
+        self.stdin
+            .write_all(line.as_bytes())
+            .await
+            .map_err(|e| anyhow!("write classify request: {e}"))?;
+        self.stdin
+            .flush()
+            .await
+            .map_err(|e| anyhow!("flush classify request: {e}"))?;
+
+        // The sidecar processes requests in FIFO and emits exactly one
+        // response per request, so reading the next line is correct.
+        let resp_line = tokio::time::timeout(Duration::from_secs(30), self.stdout_lines.next_line())
+            .await
+            .map_err(|_| anyhow!("classify timed out after 30s"))?
+            .map_err(|e| anyhow!("read classify response: {e}"))?
+            .ok_or_else(|| anyhow!("classify: sidecar closed stdout"))?;
+
+        let resp: serde_json::Value = serde_json::from_str(&resp_line)
+            .map_err(|e| anyhow!("parse classify response: {e} -- {resp_line}"))?;
+        if let Some(err) = resp.get("error").and_then(|v| v.as_str()) {
+            return Err(anyhow!("classify error: {err}"));
+        }
+        // speaker_id may be null when clustering rejected the embedding.
+        let id = resp.get("speaker_id").and_then(|v| v.as_str()).map(String::from);
+        Ok(id)
+    }
+
+    /// Cleanly stop the sidecar by closing stdin (signals EOF; the sidecar
+    /// breaks out of its readLine loop and exits 0). Falls back to SIGKILL
+    /// if it doesn't exit promptly.
+    pub async fn shutdown(mut self) {
+        drop(self.stdin);
+        let _ = tokio::time::timeout(Duration::from_secs(3), self.child.wait()).await;
+        let _ = self.child.kill().await;
+    }
 }
 
 pub async fn delete(app: &AppHandle) -> Result<()> {

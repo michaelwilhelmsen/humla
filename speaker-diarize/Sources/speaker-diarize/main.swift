@@ -6,6 +6,9 @@ import FluidAudio
 // final payload). Exit 0 on success, 1 on failure with stderr message.
 //
 //   speaker-diarize <wav-path>   — run diarization on a WAV file
+//   speaker-diarize streaming    — long-running classifier; reads chunk
+//                                  paths from stdin, emits speaker IDs to
+//                                  stdout. Exits when stdin closes.
 //   speaker-diarize status       — model presence + size on disk
 //   speaker-diarize download     — download + compile the model (streams progress)
 //   speaker-diarize delete       — wipe the cached model directory
@@ -118,6 +121,64 @@ func runDownload() async -> Int32 {
     }
 }
 
+// Long-running classifier. Keeps a single DiarizerManager alive for the
+// duration of a recording so cross-chunk speaker memory persists — chunk N
+// matches its embedding against everyone the model has heard up to chunk
+// N-1, returning a stable speaker ID. Exits cleanly when stdin closes
+// (parent stopped recording or died).
+func runStreaming() async -> Int32 {
+    do {
+        let models = try await DiarizerModels.downloadIfNeeded()
+        let config = DiarizerConfig(clusteringThreshold: 0.5)
+        let diarizer = DiarizerManager(config: config)
+        diarizer.initialize(models: models)
+        let converter = AudioConverter()
+
+        // Signal ready so the parent can start sending requests.
+        writeStdout(["event": "ready"])
+
+        while let line = readLine() {
+            guard let data = line.data(using: .utf8),
+                  let req = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let path = req["path"] as? String else {
+                continue
+            }
+            do {
+                let url = URL(fileURLWithPath: path)
+                let samples = try converter.resampleAudioFile(url)
+                let embedding = try diarizer.extractSpeakerEmbedding(from: Array(samples))
+                let durationSeconds = Float(samples.count) / 16000.0
+                let speaker = await diarizer.speakerManager.assignSpeaker(
+                    embedding,
+                    speechDuration: durationSeconds
+                )
+                if let s = speaker {
+                    writeStdout([
+                        "path": path,
+                        "speaker_id": s.id,
+                    ] as [String: Any])
+                } else {
+                    // Embedding extraction succeeded but clustering rejected
+                    // it (e.g. silence below speech-duration threshold).
+                    writeStdout([
+                        "path": path,
+                        "speaker_id": NSNull(),
+                    ] as [String: Any])
+                }
+            } catch {
+                writeStdout([
+                    "path": path,
+                    "error": "\(error)",
+                ] as [String: Any])
+            }
+        }
+        return 0
+    } catch {
+        writeStderr("streaming setup error: \(error)")
+        return 1
+    }
+}
+
 func runDiarize(audioPath: String) async -> Int32 {
     do {
         let models = try await DiarizerModels.downloadIfNeeded()
@@ -165,6 +226,12 @@ case "delete":
 case "download":
     Task {
         exitCode = await runDownload()
+        semaphore.signal()
+    }
+    semaphore.wait()
+case "streaming":
+    Task {
+        exitCode = await runStreaming()
         semaphore.signal()
     }
     semaphore.wait()

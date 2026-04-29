@@ -214,14 +214,18 @@ pub fn update_note(conn: &Connection, id: &str, patch: &NotePatch) -> Result<()>
     Ok(())
 }
 
-pub fn append_transcript(conn: &Connection, id: &str, text: &str) -> Result<String> {
+/// Append `text` to the note's transcript, inserting `separator` between
+/// the existing text and the new content. Caller decides the separator —
+/// " " for same-speaker continuation, "\n" for a speaker switch, "" when
+/// the existing transcript is empty.
+pub fn append_transcript(conn: &Connection, id: &str, text: &str, separator: &str) -> Result<String> {
     let mut current: String = conn.query_row(
         "SELECT transcript FROM notes WHERE id = ?1",
         params![id],
         |row| row.get(0),
     )?;
-    if !current.is_empty() && !current.ends_with(' ') {
-        current.push(' ');
+    if !current.is_empty() {
+        current.push_str(separator);
     }
     current.push_str(text);
     let now = now_ms();

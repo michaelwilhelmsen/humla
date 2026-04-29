@@ -21,6 +21,11 @@ pub struct AppState {
     // mean each chunk's initial_prompt sees the *committed* output of every
     // prior chunk in this session.
     pub transcribe_gate: Arc<tokio::sync::Mutex<()>>,
+    // Long-running speaker classifier sidecar, alive only while a recording
+    // is in flight. None when no recording is active or when the diarize
+    // model isn't downloaded. Wrapped in tokio::sync::Mutex because
+    // classify() awaits the sidecar's response.
+    pub diarize_stream: Arc<tokio::sync::Mutex<Option<diarize::StreamingDiarizer>>>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -42,6 +47,7 @@ pub fn run() {
                 recording: Arc::new(Mutex::new(recording::RecordingSession::default())),
                 whisper: local_whisper::new_shared(),
                 transcribe_gate: Arc::new(tokio::sync::Mutex::new(())),
+                diarize_stream: Arc::new(tokio::sync::Mutex::new(None)),
             });
 
             let menu = build_menu(app.handle())?;
