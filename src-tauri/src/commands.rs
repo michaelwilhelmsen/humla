@@ -18,27 +18,26 @@ const DEFAULT_TRANSCRIBE_PROVIDER: &str = "openai";
 const DEFAULT_TRANSCRIBE_MODEL: &str = "whisper-1";
 const DEFAULT_WHISPER_PRESET: &str = "quality";
 const DEFAULT_SUMMARY_MODEL: &str = "gpt-5.4-mini";
-const DEFAULT_POLISH_PROMPT: &str = "You are polishing a raw speech-to-text transcript produced by Whisper. The transcript is approximately correct but contains typos, missing punctuation, words cut at chunk boundaries, and minor mishearings of common words and proper nouns.
+const DEFAULT_POLISH_PROMPT: &str = "You are correcting a raw speech-to-text transcript produced by Whisper. The transcript is already mostly correct. Your job is conservative cleanup, not rewriting.
 
-Your job is to produce a clean version that reads naturally while staying faithful to what was actually said.
+Apply ONLY these changes:
+- Fix typos where the intended word is unambiguous from context.
+- Repair words cut at chunk boundaries (e.g. 'mistred' → 'mistenkte') only when context strongly supports the correction.
+- Add missing punctuation (commas, periods, question marks) where a sentence is clearly complete and unambiguous.
+- Use the user's notes (when provided) and the custom vocabulary (when provided) to spell proper nouns and domain terms correctly.
 
-Rules — apply:
-- Fix typos and reconstruct words that were cut at chunk boundaries when context strongly supports the correction.
-- Restore punctuation, capitalization, and paragraph breaks based on speech rhythm and topic shifts.
-- Use the user's notes (when provided) as context for the meeting topic, proper nouns, and domain terminology.
-- Use the custom vocabulary (when provided) to spell names and technical terms correctly.
-- Remove obvious filler ('uh', 'um', 'eh', 'liksom', 'ikke sant') only when they don't carry meaning.
+NEVER:
+- Add or remove line breaks, paragraph breaks, or whitespace structure. Preserve the input's exact line layout.
+- Split sentences that are joined or merge sentences that are split. Leave the existing sentence boundaries alone.
+- Rephrase, 'improve', shorten, or smooth over the speaker's actual words. Preserve their voice — clumsy phrasing stays clumsy.
+- Remove filler ('uh', 'um', 'liksom', 'ikke sant', 'altså'). The user wants their actual speech, not a cleaned-up version. They can edit if they want filler gone.
+- Add headings, bullet lists, markdown, bolding, italics, or any other formatting markers.
+- Add facts, names, numbers, or claims that are not present in the raw transcript.
+- Translate the transcript or change its language.
 
-Forbidden — never:
-- Add factual content, numbers, names, or claims that are not present in the raw transcript.
-- Remove substantive content or rephrase sentences in ways that change meaning.
-- Translate the transcript or change its language — preserve the input language exactly.
-- Add formatting (no headings, no bullet lists, no markdown).
-- Soften or 'improve' the speaker's actual phrasing — preserve their voice.
+When uncertain whether a word is a mishearing, leave it as-is. Doing nothing is always safer than guessing.
 
-If you are uncertain whether a word is a mishearing, leave it as-is. The user can edit further; you should not invent.
-
-Output ONLY the corrected transcript text as continuous prose. No commentary, no preamble, no formatting markers.";
+Output ONLY the corrected transcript text. Preserve the input's line structure exactly — same number of lines, same line breaks, same paragraph layout. No commentary, no preamble.";
 const DEFAULT_SUMMARY_PROMPT: &str = "Du lager møtenotater fra en automatisk transkribert samtale.\n\nKilder du får:\n- [Notater] — det brukeren skrev under møtet (autoritativ kilde for navn, tall og beslutninger).\n- [Transkripsjon] — automatisk generert fra lyden, kan inneholde feil.\n\nNår transkripsjon og notater er i konflikt, stol på notatene.\n\nSkriv på norsk i Markdown. Inkluder kun seksjoner som er reelt relevante — ikke skriv \"Ingen identifisert\".\n\n- **Sammendrag** — 2–4 setninger som fanger essensen.\n- **Beslutninger** — kun reelle beslutninger som ble tatt.\n- **Handlingspunkter** — på formen \"Beskrivelse — Ansvarlig (frist når oppgitt)\".\n- **Åpne spørsmål** — uavklarte ting som krever oppfølging.\n\nVær konkret og kort. Ikke gjenta deg selv. Ikke finn på detaljer som ikke står i kilden.";
 const API_KEY: &str = "__openai_api_key__";
 
