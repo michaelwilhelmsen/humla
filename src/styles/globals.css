@@ -176,6 +176,24 @@ input::placeholder, textarea::placeholder {
   line-height: 1.2;
 }
 
+/* Speaker label pill — small filled chip used inline in the transcript and
+   in the rename strip. Colour is set per-speaker via inline style; we cycle
+   through the four semantic colours in first-encounter order so each note
+   has a stable visual mapping. */
+.nd-speaker-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 9px;
+  border-radius: 999px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.04em;
+  color: #ffffff;
+  white-space: nowrap;
+  vertical-align: 1px;
+}
+
 .nd-chip {
   display: inline-flex;
   align-items: center;

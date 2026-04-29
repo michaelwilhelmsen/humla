@@ -371,6 +371,27 @@ function Card({ children, className = "" }: { children: React.ReactNode; classNa
   );
 }
 
+// Stable colour palette for speaker pills. Pulled from the design tokens so
+// dark mode adapts automatically. The order is intentional: blue first
+// because --color-interactive is the most "neutral" decorative colour we
+// have; red (--color-accent) last because the design language reserves it
+// for "interrupt only" — a five-speaker meeting will still get red, but
+// for the common 2–3 speaker case it stays out of the way.
+const SPEAKER_COLORS = [
+  "var(--color-interactive)",
+  "var(--color-success)",
+  "var(--color-warning)",
+  "var(--color-accent)",
+];
+
+function speakerColorMap(labels: string[]): Map<string, string> {
+  const map = new Map<string, string>();
+  labels.forEach((label, i) => {
+    map.set(label, SPEAKER_COLORS[i % SPEAKER_COLORS.length]);
+  });
+  return map;
+}
+
 // Parse the transcript for speaker turn prefixes — any line starting with
 // `<label>: ` (label can be any non-colon text) is treated as a speaker
 // turn. Returns labels in first-encounter order, deduplicated.
@@ -411,19 +432,33 @@ function SpeakerLabels({
   onRename: (oldLabel: string, newLabel: string) => void;
 }) {
   const labels = useMemo(() => extractSpeakerLabels(transcript), [transcript]);
+  const colors = useMemo(() => speakerColorMap(labels), [labels]);
   // Only render the strip when there are 2+ unique speakers — solo
   // monologues don't need management UI.
   if (labels.length < 2) return null;
   return (
     <div className="flex flex-wrap gap-2 mb-4">
       {labels.map((label) => (
-        <SpeakerChip key={label} label={label} onRename={(next) => onRename(label, next)} />
+        <SpeakerChip
+          key={label}
+          label={label}
+          color={colors.get(label) ?? SPEAKER_COLORS[0]}
+          onRename={(next) => onRename(label, next)}
+        />
       ))}
     </div>
   );
 }
 
-function SpeakerChip({ label, onRename }: { label: string; onRename: (next: string) => void }) {
+function SpeakerChip({
+  label,
+  color,
+  onRename,
+}: {
+  label: string;
+  color: string;
+  onRename: (next: string) => void;
+}) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(label);
   const inputRef = useRef<HTMLInputElement | null>(null);
@@ -466,8 +501,8 @@ function SpeakerChip({ label, onRename }: { label: string; onRename: (next: stri
             setEditing(false);
           }
         }}
-        className="nd-chip cursor-text bg-[var(--color-input-bg)] outline-none focus:border-[var(--color-text)]"
-        style={{ fontFamily: "var(--font-mono)", minWidth: "8ch" }}
+        className="nd-speaker-pill cursor-text outline-none"
+        style={{ background: color, minWidth: "8ch" }}
       />
     );
   }
@@ -477,8 +512,8 @@ function SpeakerChip({ label, onRename }: { label: string; onRename: (next: stri
       type="button"
       onClick={() => setEditing(true)}
       title="Click to rename — applies to every turn from this speaker"
-      className="nd-chip cursor-pointer hover:border-[var(--color-text)]"
-      style={{ fontFamily: "var(--font-mono)" }}
+      className="nd-speaker-pill cursor-pointer hover:opacity-90"
+      style={{ background: color }}
     >
       {label}
     </button>
@@ -494,25 +529,113 @@ function TranscriptEditor({
   onChange: (v: string) => void;
   disabled: boolean;
 }) {
-  const ref = useRef<HTMLTextAreaElement | null>(null);
+  const [editing, setEditing] = useState(false);
+  const taRef = useRef<HTMLTextAreaElement | null>(null);
 
-  // Auto-size to content so the textarea grows like a div.
+  // Auto-size the textarea while in edit mode.
   useEffect(() => {
-    const el = ref.current;
+    if (!editing) return;
+    const el = taRef.current;
     if (!el) return;
     el.style.height = "auto";
     el.style.height = el.scrollHeight + "px";
-  }, [value]);
+    el.focus();
+    // Park the cursor at the end so the user can append without
+    // re-positioning. Could be smarter (cursor at click position) but
+    // good enough for v1.
+    const len = el.value.length;
+    el.setSelectionRange(len, len);
+  }, [editing, value]);
+
+  // Force the styled-view path while a recording is in flight — we don't
+  // want the user typing into a transcript that the backend is about to
+  // replace via diarize/polish.
+  const showEditor = editing && !disabled;
+
+  if (showEditor) {
+    return (
+      <textarea
+        ref={taRef}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        onBlur={() => setEditing(false)}
+        onKeyDown={(e) => {
+          if (e.key === "Escape") {
+            e.preventDefault();
+            setEditing(false);
+          }
+        }}
+        className="nd-bare w-full resize-none text-sm leading-relaxed text-[var(--color-text-muted)] focus:outline-none"
+      />
+    );
+  }
 
   return (
-    <textarea
-      ref={ref}
-      value={value}
-      onChange={(e) => onChange(e.target.value)}
+    <TranscriptView
+      transcript={value}
+      onClick={() => {
+        if (!disabled) setEditing(true);
+      }}
       disabled={disabled}
-      title={disabled ? "Editing is paused while recording" : undefined}
-      className="nd-bare w-full resize-none text-sm leading-relaxed text-[var(--color-text-muted)] focus:outline-none disabled:cursor-default"
     />
+  );
+}
+
+// Styled transcript reader. Each line that begins with a speaker label
+// renders the label as a coloured pill; the rest of the line stays as
+// plain text. Lines without a label render as plain paragraphs. The whole
+// view is click-to-edit unless `disabled` (i.e. recording is in flight).
+function TranscriptView({
+  transcript,
+  onClick,
+  disabled,
+}: {
+  transcript: string;
+  onClick: () => void;
+  disabled: boolean;
+}) {
+  const labels = useMemo(() => extractSpeakerLabels(transcript), [transcript]);
+  const colors = useMemo(() => speakerColorMap(labels), [labels]);
+  const lines = transcript.split("\n");
+
+  return (
+    <div
+      onClick={onClick}
+      title={disabled ? "Editing is paused while recording" : "Click to edit"}
+      className={
+        "text-sm leading-relaxed text-[var(--color-text-muted)] " +
+        (disabled ? "cursor-default" : "cursor-text")
+      }
+    >
+      {lines.map((line, i) => {
+        const m = line.match(/^(\s*)([^:]{1,40}):\s(.*)$/);
+        if (m) {
+          const [, lead, label, rest] = m;
+          const color = colors.get(label.trim());
+          if (color) {
+            return (
+              <p key={i} className={i > 0 ? "mt-2" : ""}>
+                {lead}
+                <span className="nd-speaker-pill mr-2" style={{ background: color }}>
+                  {label}
+                </span>
+                {rest}
+              </p>
+            );
+          }
+        }
+        // Empty line → preserve vertical rhythm without rendering a
+        // zero-height paragraph (would collapse).
+        if (line.trim() === "") {
+          return <p key={i} className="h-3" aria-hidden />;
+        }
+        return (
+          <p key={i} className={i > 0 ? "mt-2" : ""}>
+            {line}
+          </p>
+        );
+      })}
+    </div>
   );
 }
 
