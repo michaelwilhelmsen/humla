@@ -30,6 +30,62 @@ pub fn new_shared() -> SharedContext {
     Arc::new(Mutex::new(None))
 }
 
+/// Trades latency for accuracy. The three presets bundle the underlying
+/// whisper parameters that move together: sampling strategy and the
+/// no_speech threshold that decides whether borderline segments survive.
+#[derive(Clone, Copy)]
+pub enum Preset {
+    /// Greedy decoding, default no_speech threshold. ~5× realtime on
+    /// Apple Silicon. Snappiest, but borderline clauses may be dropped.
+    Fast,
+    /// Beam search (size 3) with a moderate no_speech threshold. ~3×
+    /// realtime. The middle ground.
+    Balanced,
+    /// Beam search (size 5) with an aggressive no_speech threshold so
+    /// almost no segments are silently dropped. ~2× realtime. Best for
+    /// meetings, news copy, and dense Norwegian.
+    Quality,
+}
+
+impl Preset {
+    pub fn from_setting(s: &str) -> Self {
+        match s {
+            "fast" => Preset::Fast,
+            "balanced" => Preset::Balanced,
+            // Default to Quality on unknown values so a corrupted setting
+            // can't accidentally regress users to the old greedy path.
+            _ => Preset::Quality,
+        }
+    }
+
+    fn sampling(self) -> SamplingStrategy {
+        match self {
+            Preset::Fast => SamplingStrategy::Greedy { best_of: 1 },
+            Preset::Balanced => SamplingStrategy::BeamSearch {
+                beam_size: 3,
+                patience: -1.0,
+            },
+            Preset::Quality => SamplingStrategy::BeamSearch {
+                beam_size: 5,
+                patience: -1.0,
+            },
+        }
+    }
+
+    fn no_speech_thold(self) -> f32 {
+        match self {
+            // Whisper's stock default — drops anything it isn't confident is
+            // speech. Pairs naturally with greedy decoding.
+            Preset::Fast => 0.6,
+            // Loosened so beam search has more candidates to choose from.
+            Preset::Balanced => 0.4,
+            // Aggressive: keeps almost everything; relies on the wider beam
+            // to pick the best hypothesis among low-confidence segments.
+            Preset::Quality => 0.3,
+        }
+    }
+}
+
 fn ensure_loaded(shared: &SharedContext, model_path: &Path) -> Result<Arc<WhisperContext>> {
     let mut guard = shared.lock();
     if let Some(loaded) = guard.as_ref() {
@@ -76,6 +132,7 @@ pub async fn transcribe_file(
     model_path: PathBuf,
     language: &str,
     initial_prompt: Option<&str>,
+    preset: Preset,
     audio_path: &Path,
 ) -> Result<String> {
     let samples = wav::read_f32_mono_16k(audio_path).await?;
@@ -90,27 +147,17 @@ pub async fn transcribe_file(
         let mut state = ctx
             .create_state()
             .map_err(|e| anyhow!("create whisper state: {e}"))?;
-        // Beam search recovers from confusion (proper nouns, dense Norwegian
-        // news copy) far better than greedy at ~2× the cost. patience = -1.0
-        // disables Whisper's beam-patience early exit; beam_size = 5 is the
-        // sweet spot — beam_size = 8+ adds < 1% accuracy at 1.5× the latency.
-        let mut params = FullParams::new(SamplingStrategy::BeamSearch {
-            beam_size: 5,
-            patience: -1.0,
-        });
+        let mut params = FullParams::new(preset.sampling());
         params.set_print_progress(false);
         params.set_print_special(false);
         params.set_print_realtime(false);
         params.set_print_timestamps(false);
         params.set_translate(false);
         params.set_temperature(0.0);
-        // Default no_speech_thold (0.6) is aggressive — Whisper drops whole
-        // borderline clauses (proper-noun-heavy Norwegian sentences are the
-        // typical victim). 0.3 keeps low-confidence segments; the user can
-        // edit a slightly-wrong transcript but can't recover dropped words.
-        params.set_no_speech_thold(0.3);
-        // Default logprob_thold (-1.0) is fine — keeps fallback decoding on
-        // for confused segments, which complements the lowered no_speech.
+        params.set_no_speech_thold(preset.no_speech_thold());
+        // Default logprob_thold (-1.0) keeps fallback decoding on for
+        // confused segments. Same across all presets — it complements
+        // no_speech rather than substituting for it.
         params.set_logprob_thold(-1.0);
         if let Some(l) = lang.as_deref() {
             params.set_language(Some(l));

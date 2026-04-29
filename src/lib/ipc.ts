@@ -25,6 +25,7 @@ export type SettingsKey =
   | "language"
   | "transcribe_provider"
   | "transcribe_model"
+  | "whisper_preset"
   | "custom_vocabulary"
   | "summary_model"
   | "summary_prompt"

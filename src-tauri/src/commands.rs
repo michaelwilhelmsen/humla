@@ -16,6 +16,7 @@ use tokio::process::Command;
 const DEFAULT_LANGUAGE: &str = "no";
 const DEFAULT_TRANSCRIBE_PROVIDER: &str = "openai";
 const DEFAULT_TRANSCRIBE_MODEL: &str = "whisper-1";
+const DEFAULT_WHISPER_PRESET: &str = "quality";
 const DEFAULT_SUMMARY_MODEL: &str = "gpt-5.4-mini";
 const DEFAULT_SUMMARY_PROMPT: &str = "Du lager møtenotater fra en automatisk transkribert samtale.\n\nKilder du får:\n- [Notater] — det brukeren skrev under møtet (autoritativ kilde for navn, tall og beslutninger).\n- [Transkripsjon] — automatisk generert fra lyden, kan inneholde feil.\n\nNår transkripsjon og notater er i konflikt, stol på notatene.\n\nSkriv på norsk i Markdown. Inkluder kun seksjoner som er reelt relevante — ikke skriv \"Ingen identifisert\".\n\n- **Sammendrag** — 2–4 setninger som fanger essensen.\n- **Beslutninger** — kun reelle beslutninger som ble tatt.\n- **Handlingspunkter** — på formen \"Beskrivelse — Ansvarlig (frist når oppgitt)\".\n- **Åpne spørsmål** — uavklarte ting som krever oppfølging.\n\nVær konkret og kort. Ikke gjenta deg selv. Ikke finn på detaljer som ikke står i kilden.";
 const API_KEY: &str = "__openai_api_key__";
@@ -664,6 +665,8 @@ async fn transcribe_chunk(
         };
         let openai_model = db::get_setting(&conn, "transcribe_model")?
             .unwrap_or_else(|| DEFAULT_TRANSCRIBE_MODEL.to_string());
+        let whisper_preset = db::get_setting(&conn, "whisper_preset")?
+            .unwrap_or_else(|| DEFAULT_WHISPER_PRESET.to_string());
         let vocabulary = db::get_setting(&conn, "custom_vocabulary")?
             .unwrap_or_default();
         TranscribeCfg {
@@ -671,6 +674,7 @@ async fn transcribe_chunk(
             api_key,
             language,
             openai_model,
+            whisper_preset,
             vocabulary,
         }
     };
@@ -719,11 +723,13 @@ async fn transcribe_chunk(
                 let state: State<AppState> = app.state();
                 state.whisper.clone()
             };
+            let preset = local_whisper::Preset::from_setting(&cfg.whisper_preset);
             local_whisper::transcribe_file(
                 shared,
                 model_path,
                 &cfg.language,
                 prompt.as_deref(),
+                preset,
                 &path,
             )
             .await?
@@ -774,6 +780,7 @@ struct TranscribeCfg {
     api_key: String,
     language: String,
     openai_model: String,
+    whisper_preset: String,
     vocabulary: String,
 }
 

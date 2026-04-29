@@ -19,6 +19,7 @@ const DEFAULTS: Record<EditableKey, string> = {
   language: "no",
   transcribe_provider: "openai",
   transcribe_model: "whisper-1",
+  whisper_preset: "quality",
   custom_vocabulary: "",
   summary_model: "gpt-5.4-mini",
   summary_prompt: SUMMARY_PRESETS[0].prompt_no,
@@ -28,6 +29,12 @@ const PROVIDERS_BASE = [
   { value: "openai", label: "OpenAI" },
 ];
 const LOCAL_PROVIDER = { value: "local", label: "Local (Whisper turbo, on-device)" };
+
+const WHISPER_PRESETS = [
+  { value: "fast", label: "Fast — lower latency, may drop borderline words" },
+  { value: "balanced", label: "Balanced — good speed and accuracy" },
+  { value: "quality", label: "Quality — slowest, best for meetings" },
+];
 
 const THEMES: { value: Theme; label: string }[] = [
   { value: "system", label: "System" },
@@ -244,6 +251,21 @@ export function Settings() {
                   <code> gpt-4o-transcribe</code>.
                 </p>
               )}
+            </Row>
+          )}
+          {provider === "local" && (
+            <Row label="Quality preset">
+              <Select
+                value={s.whisper_preset}
+                onChange={(v) => update("whisper_preset", v)}
+                options={WHISPER_PRESETS}
+              />
+              <p className="text-xs text-[var(--color-text-muted)] mt-2">
+                Trades latency for accuracy. Quality runs beam search with
+                an aggressive no-speech threshold so almost no segments are
+                silently dropped — best for meetings and dense speech. Fast
+                falls back to greedy decoding for live-caption snappiness.
+              </p>
             </Row>
           )}
           <Row label="Local model">
