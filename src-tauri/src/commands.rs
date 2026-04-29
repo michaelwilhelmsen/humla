@@ -4,6 +4,7 @@ use crate::openai;
 use crate::local_llm;
 use crate::local_whisper;
 use crate::gguf;
+use crate::llm_discovery;
 use crate::presets;
 use crate::wav;
 use crate::recording::{ChunkRecord, DiagnosticPayload, ErrorPayload, Inflight, Phase, RecordingStatus, SidecarEvent, SummaryPayload, TranscriptPayload};
@@ -484,6 +485,41 @@ pub async fn local_llm_delete(
             .await
             .map_err(|e| format!("remove: {e}"))?;
     }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn local_llm_scan() -> Result<Vec<llm_discovery::DiscoveredLlm>, String> {
+    let home = dirs::home_dir().ok_or_else(|| "no home dir".to_string())?;
+    // Scanning hits the filesystem and parses JSON manifests; offload to a
+    // blocking thread so we don't tie up the tokio reactor for a few seconds
+    // on machines with large LM Studio / HF caches.
+    tokio::task::spawn_blocking(move || llm_discovery::scan_all(&home))
+        .await
+        .map_err(|e| format!("scan task: {e}"))
+}
+
+#[tauri::command]
+pub async fn local_llm_select_existing(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<(), String> {
+    let p = PathBuf::from(&path);
+    if !p.exists() {
+        return Err("path does not exist".into());
+    }
+    // Validate before persisting so we can return a useful error to the UI
+    // rather than silently storing a bad path that fails at first use.
+    let info = gguf::sniff(&p).map_err(|e| e.to_string())?;
+    if !llm_discovery::is_compatible(&info.architecture, &info.quantization) {
+        return Err(format!(
+            "incompatible model: {} / {}",
+            info.architecture, info.quantization
+        ));
+    }
+    let conn = state.db.lock();
+    db::set_setting(&conn, "summary_local_model", &format!("path:{}", p.display()))
+        .map_err(err)?;
     Ok(())
 }
 

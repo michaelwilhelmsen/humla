@@ -24,6 +24,7 @@ reqwest = { version = "0.12", features = ["json", "multipart", "rustls-tls", "st
 futures-util = "0.3"
 whisper-rs = { version = "0.13", features = ["metal"] }
 llama-cpp-2 = "0.1"
+walkdir = "2"
 uuid = { version = "1", features = ["v4"] }
 anyhow = "1"
 thiserror = "2"

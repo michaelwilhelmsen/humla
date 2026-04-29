@@ -4,6 +4,7 @@ mod local_whisper;
 mod local_llm;
 mod diarize;
 mod gguf;
+mod llm_discovery;
 mod presets;
 mod wav;
 mod recording;
@@ -106,6 +107,8 @@ pub fn run() {
             commands::local_llm_status,
             commands::local_llm_download,
             commands::local_llm_delete,
+            commands::local_llm_scan,
+            commands::local_llm_select_existing,
             commands::diarize_status,
             commands::diarize_download,
             commands::diarize_delete,
