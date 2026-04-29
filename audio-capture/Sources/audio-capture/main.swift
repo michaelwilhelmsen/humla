@@ -134,6 +134,12 @@ final class ChunkWriter {
     private var written: AVAudioFrameCount = 0
     private var chunkPeak: Float = 0
     private var silentRun: AVAudioFrameCount = 0
+    // Total frames written across ALL chunks since the writer started. Used
+    // to compute each chunk's start time relative to the start of the
+    // recording — the diarization step needs this to align speaker segments
+    // (which it gets from the full-recording WAV) with chunk transcripts.
+    private var totalFramesWritten: AVAudioFrameCount = 0
+    private var chunkStartFrames: AVAudioFrameCount = 0
     private let queue = DispatchQueue(label: "chunk.writer")
 
     init(dir: URL, minSeconds: Double, maxSeconds: Double, vadSilenceMs: Double) {
@@ -149,6 +155,7 @@ final class ChunkWriter {
                 if file == nil { try openNext() }
                 try file!.write(from: buffer)
                 written += buffer.frameLength
+                totalFramesWritten += buffer.frameLength
 
                 // Per-buffer peak feeds both the chunk-level peak (used for the
                 // silence-drop on close) and the silent-run counter (used by
@@ -189,7 +196,8 @@ final class ChunkWriter {
             if let u = url, written > 0 {
                 file = nil
                 if chunkPeak >= silenceThreshold {
-                    emit(["event": "chunk", "path": u.path])
+                    let startMs = Int(Double(chunkStartFrames) / targetSampleRate * 1000.0)
+                    emit(["event": "chunk", "path": u.path, "start_ms": startMs])
                     stats.lock.lock(); stats.chunks += 1; stats.lock.unlock()
                 } else {
                     try? FileManager.default.removeItem(at: u)
@@ -210,13 +218,15 @@ final class ChunkWriter {
         url = u
         file = try AVAudioFile(forWriting: u, settings: writeSettings)
         written = 0
+        chunkStartFrames = totalFramesWritten
     }
 
     private func rotate() throws {
         guard let u = url else { return }
         file = nil
         if chunkPeak >= silenceThreshold {
-            emit(["event": "chunk", "path": u.path])
+            let startMs = Int(Double(chunkStartFrames) / targetSampleRate * 1000.0)
+            emit(["event": "chunk", "path": u.path, "start_ms": startMs])
             stats.lock.lock(); stats.chunks += 1; stats.lock.unlock()
         } else {
             try? FileManager.default.removeItem(at: u)
@@ -237,6 +247,54 @@ final class ChunkWriter {
 //   - vadSilenceMs 500 catches sentence-end pauses without triggering on
 //     normal between-word stops (which are typically 100–300 ms).
 let writer = ChunkWriter(dir: outDir, minSeconds: 1.0, maxSeconds: 15.0, vadSilenceMs: 500.0)
+
+// MARK: - Full-recording writer
+
+// Parallel writer that captures every drained sample into a single WAV
+// for the duration of the recording. Used by the diarization pass on the
+// Rust side, which needs the full audio in one file to identify speakers
+// across chunk boundaries. ~58 MB per 30-min meeting at 16 kHz mono 16-bit.
+final class FullRecordingWriter {
+    private let dir: URL
+    private var file: AVAudioFile?
+    private var url: URL?
+    private var written: AVAudioFrameCount = 0
+    private let queue = DispatchQueue(label: "full.writer")
+
+    init(dir: URL) {
+        self.dir = dir
+    }
+
+    func write(_ buffer: AVAudioPCMBuffer) {
+        queue.sync {
+            do {
+                if file == nil {
+                    let u = dir.appendingPathComponent("full.wav")
+                    url = u
+                    file = try AVAudioFile(forWriting: u, settings: writeSettings)
+                }
+                try file!.write(from: buffer)
+                written += buffer.frameLength
+            } catch {
+                emitError("full write: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    func close() {
+        queue.sync {
+            file = nil
+            if let u = url, written > 0 {
+                let durationMs = Int(Double(written) / targetSampleRate * 1000.0)
+                emit(["event": "full_recording", "path": u.path, "duration_ms": durationMs])
+            }
+            url = nil
+            written = 0
+        }
+    }
+}
+
+let fullWriter = FullRecordingWriter(dir: outDir)
 
 // MARK: - Stats (diagnostics)
 
@@ -473,6 +531,7 @@ drainTimer.setEventHandler {
         }
     }
     writer.write(buf)
+    fullWriter.write(buf)
 }
 drainTimer.resume()
 
@@ -562,13 +621,20 @@ let shutdown: () -> Void = {
                     }
                 }
                 writer.write(buf)
+                fullWriter.write(buf)
             }
+            // Order matters: close ChunkWriter first so its final chunk
+            // event lands before the full_recording event. The Rust reader
+            // uses the latter as a signal that no more chunk events are
+            // coming.
             writer.close()
+            fullWriter.close()
             exit(0)
         }
     } else {
         engine.stop()
         writer.close()
+        fullWriter.close()
         exit(0)
     }
 }
