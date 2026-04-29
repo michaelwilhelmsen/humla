@@ -33,6 +33,8 @@ export type SettingsKey =
   | "custom_vocabulary"
   | "summary_model"
   | "summary_prompt"
+  | "summary_provider"
+  | "summary_local_model"
   | "theme";
 
 export type TranscribeProvider = "openai" | "local";

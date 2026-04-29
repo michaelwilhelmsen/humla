@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { ipc, onDiarizeDownloadProgress, onLocalWhisperProgress, type DiarizeModelStatus, type LocalWhisperStatus, type SettingsKey } from "../lib/ipc";
+import { ipc, onDiarizeDownloadProgress, onLocalLlmProgress, onLocalWhisperProgress, type DiarizeModelStatus, type DiscoveredLlm, type LocalLlmStatus, type LocalWhisperStatus, type SettingsKey } from "../lib/ipc";
 import { useThemeStore, type Theme } from "../lib/theme";
 import { Permissions } from "../components/Permissions";
 import { SUMMARY_PRESETS, presetPromptForLang, presetLabelForLang } from "../lib/presets";
@@ -23,6 +23,8 @@ const DEFAULTS: Record<EditableKey, string> = {
   custom_vocabulary: "",
   summary_model: "gpt-5.4-mini",
   summary_prompt: SUMMARY_PRESETS[0].prompt_no,
+  summary_provider: "openai",
+  summary_local_model: "managed:e4b",
 };
 
 const PROVIDERS_BASE = [
@@ -112,24 +114,47 @@ const EMPTY_DIARIZE_STATE: DiarizeState = {
   error: null,
 };
 
+type LlmState = {
+  status: LocalLlmStatus | null;
+  downloading: "e2b" | "e4b" | null;
+  received: number;
+  total: number | null;
+  scan: DiscoveredLlm[] | null;
+  scanning: boolean;
+  error: string | null;
+};
+
+const EMPTY_LLM_STATE: LlmState = {
+  status: null,
+  downloading: null,
+  received: 0,
+  total: null,
+  scan: null,
+  scanning: false,
+  error: null,
+};
+
 export function Settings() {
   const [openaiKey, setOpenaiKey] = useState<KeyState>(EMPTY_KEY_STATE);
   const [local, setLocal] = useState<LocalState>(EMPTY_LOCAL_STATE);
   const [diarize, setDiarize] = useState<DiarizeState>(EMPTY_DIARIZE_STATE);
+  const [llm, setLlm] = useState<LlmState>(EMPTY_LLM_STATE);
   const [s, setS] = useState<Record<EditableKey, string>>(DEFAULTS);
   const theme = useThemeStore((t) => t.theme);
   const setThemePref = useThemeStore((t) => t.setTheme);
 
   useEffect(() => {
     (async () => {
-      const [k1, lw, ds] = await Promise.all([
+      const [k1, lw, ds, ls] = await Promise.all([
         ipc.getApiKey(),
         ipc.localWhisperStatus(),
         ipc.diarizeStatus().catch(() => null),
+        ipc.localLlmStatus().catch(() => null),
       ]);
       setOpenaiKey((p) => ({ ...p, hasKey: !!k1 }));
       setLocal((p) => ({ ...p, status: lw }));
       setDiarize((p) => ({ ...p, status: ds }));
+      setLlm((p) => ({ ...p, status: ls }));
       const entries = await Promise.all(
         (Object.keys(DEFAULTS) as EditableKey[]).map(async (key) => [key, (await ipc.getSetting(key)) ?? DEFAULTS[key]] as const)
       );
@@ -152,6 +177,63 @@ export function Settings() {
     }).then((u) => (unlisten = u));
     return () => { unlisten?.(); };
   }, []);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    onLocalLlmProgress((p) => {
+      setLlm((s) => ({ ...s, received: p.received, total: p.total }));
+    }).then((u) => (unlisten = u));
+    return () => { unlisten?.(); };
+  }, []);
+
+  async function downloadLlm(variant: "e2b" | "e4b") {
+    setLlm((p) => ({ ...p, downloading: variant, received: 0, total: null, error: null }));
+    try {
+      await ipc.localLlmDownload(variant);
+      const status = await ipc.localLlmStatus();
+      setLlm((p) => ({ ...p, status, downloading: null }));
+    } catch (e) {
+      const status = await ipc.localLlmStatus().catch(() => null);
+      setLlm((p) => ({ ...p, status, downloading: null, error: String(e) }));
+    }
+  }
+
+  async function deleteLlm(variant: "e2b" | "e4b") {
+    try {
+      await ipc.localLlmDelete(variant);
+      const status = await ipc.localLlmStatus();
+      setLlm((p) => ({ ...p, status, error: null }));
+    } catch (e) {
+      setLlm((p) => ({ ...p, error: String(e) }));
+    }
+  }
+
+  async function scanLlm() {
+    setLlm((p) => ({ ...p, scanning: true, error: null }));
+    try {
+      const found = await ipc.localLlmScan();
+      // Sort: compatible first, then alphabetical by name.
+      found.sort((a, b) => {
+        if (a.compatible !== b.compatible) return a.compatible ? -1 : 1;
+        return a.name.localeCompare(b.name);
+      });
+      setLlm((p) => ({ ...p, scanning: false, scan: found }));
+    } catch (e) {
+      setLlm((p) => ({ ...p, scanning: false, error: String(e) }));
+    }
+  }
+
+  async function selectExistingLlm(path: string) {
+    try {
+      await ipc.localLlmSelectExisting(path);
+      // Refresh the persisted setting so the radio picks up the path.
+      const v = (await ipc.getSetting("summary_local_model")) ?? `path:${path}`;
+      setS((prev) => ({ ...prev, summary_local_model: v }));
+      setLlm((p) => ({ ...p, error: null }));
+    } catch (e) {
+      setLlm((p) => ({ ...p, error: String(e) }));
+    }
+  }
 
   async function downloadModel() {
     setLocal({ status: null, downloading: true, received: 0, total: null, error: null });
@@ -354,13 +436,41 @@ export function Settings() {
         </Section>
 
         <Section title="Summary">
-          <Row label="Model">
-            <Select
-              value={s.summary_model}
-              onChange={(v) => update("summary_model", v)}
-              options={SUMMARY_MODELS.map((m) => ({ value: m, label: m }))}
-            />
+          <Row label="Provider">
+            <div className="flex gap-2">
+              {[
+                { value: "openai", label: "Cloud (OpenAI)" },
+                { value: "local", label: "Local (Gemma 4, on-device)" },
+              ].map((opt) => (
+                <button
+                  key={opt.value}
+                  onClick={() => update("summary_provider", opt.value)}
+                  className={
+                    "px-3 py-1.5 rounded-md text-sm border " +
+                    (s.summary_provider === opt.value
+                      ? "border-[var(--color-text)] bg-[var(--color-text)] text-[var(--color-bg)]"
+                      : "border-[var(--color-line)]")
+                  }
+                >
+                  {opt.label}
+                </button>
+              ))}
+            </div>
+            <p className="text-xs text-[var(--color-text-muted)] mt-2">
+              Local keeps the transcript on your Mac — pick this for confidential
+              meetings. Cloud is faster and produces better summaries but sends
+              the transcript to OpenAI.
+            </p>
           </Row>
+          {s.summary_provider !== "local" && (
+            <Row label="Model">
+              <Select
+                value={s.summary_model}
+                onChange={(v) => update("summary_model", v)}
+                options={SUMMARY_MODELS.map((m) => ({ value: m, label: m }))}
+              />
+            </Row>
+          )}
           <Row label="Custom prompt">
             <p className="text-xs text-[var(--color-text-muted)] mb-2">
               Each note picks a preset (Meeting, 1:1, Lecture, …) from its
@@ -395,6 +505,166 @@ export function Settings() {
             />
           </Row>
         </Section>
+
+        {s.summary_provider === "local" && (
+          <Section title="Local summarization model">
+            <p className="text-xs text-[var(--color-text-muted)] -mt-2">
+              Gemma 4 runs entirely on your Mac. Pick a size, or scan for
+              models you already have installed via LM Studio or Ollama.
+            </p>
+            <ManagedLlmRow
+              label="Gemma 4 E2B"
+              hint="~2.9 GB · Q8_0 · faster"
+              variant="e2b"
+              downloaded={!!llm.status?.e2bDownloaded}
+              size={llm.status?.e2bSizeBytes ?? null}
+              selected={s.summary_local_model === "managed:e2b"}
+              progress={llm.downloading === "e2b" ? llm : null}
+              onSelect={() => update("summary_local_model", "managed:e2b")}
+              onDownload={() => downloadLlm("e2b")}
+              onDelete={() => deleteLlm("e2b")}
+            />
+            <ManagedLlmRow
+              label="Gemma 4 E4B"
+              hint="~5.0 GB · Q4_K_M · recommended"
+              variant="e4b"
+              downloaded={!!llm.status?.e4bDownloaded}
+              size={llm.status?.e4bSizeBytes ?? null}
+              selected={s.summary_local_model === "managed:e4b"}
+              progress={llm.downloading === "e4b" ? llm : null}
+              onSelect={() => update("summary_local_model", "managed:e4b")}
+              onDownload={() => downloadLlm("e4b")}
+              onDelete={() => deleteLlm("e4b")}
+            />
+            <Row label="Already installed?">
+              <button
+                onClick={scanLlm}
+                disabled={llm.scanning}
+                className="px-3 py-1.5 rounded-md text-sm border border-[var(--color-line)] disabled:opacity-50"
+              >
+                {llm.scanning ? "Scanning…" : "Scan LM Studio / Ollama / HF"}
+              </button>
+              {llm.scan && llm.scan.length === 0 && (
+                <p className="text-xs text-[var(--color-text-muted)] mt-2">
+                  No compatible models found. We look in <code>~/.cache/lm-studio</code>,
+                  <code> ~/.ollama</code>, and <code>~/.cache/huggingface</code>.
+                </p>
+              )}
+              {llm.scan && llm.scan.length > 0 && (
+                <div className="mt-3 space-y-2">
+                  {llm.scan.map((m) => {
+                    const active = s.summary_local_model === `path:${m.path}`;
+                    const sizeGb = (m.sizeBytes / 1e9).toFixed(1);
+                    return (
+                      <div
+                        key={m.path}
+                        className="flex items-center justify-between rounded-md border border-[var(--color-line)] px-3 py-2 text-sm"
+                      >
+                        <div className="min-w-0 flex-1">
+                          <div className="truncate" title={m.path}>{m.name}</div>
+                          <div className="text-xs text-[var(--color-text-muted)]">
+                            {m.source} · {m.architecture} {m.quantization} · {sizeGb} GB
+                            {!m.compatible && " · incompatible"}
+                          </div>
+                        </div>
+                        <button
+                          onClick={() => selectExistingLlm(m.path)}
+                          disabled={!m.compatible || active}
+                          className="px-2 py-1 rounded text-xs border border-[var(--color-line)] disabled:opacity-40 ml-3 shrink-0"
+                        >
+                          {active ? "Active" : "Use this"}
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </Row>
+            {llm.error && (
+              <p className="text-xs text-[var(--color-accent)]">Error: {llm.error}</p>
+            )}
+          </Section>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ManagedLlmRow({
+  label,
+  hint,
+  variant,
+  downloaded,
+  size,
+  selected,
+  progress,
+  onSelect,
+  onDownload,
+  onDelete,
+}: {
+  label: string;
+  hint: string;
+  variant: "e2b" | "e4b";
+  downloaded: boolean;
+  size: number | null;
+  selected: boolean;
+  progress: LlmState | null;
+  onSelect: () => void;
+  onDownload: () => void;
+  onDelete: () => void;
+}) {
+  const sizeGb = size != null ? (size / 1e9).toFixed(1) : null;
+  const downloading = progress?.downloading === variant;
+  const fraction =
+    progress && progress.total && progress.total > 0
+      ? progress.received / progress.total
+      : 0;
+  return (
+    <div className="flex items-center justify-between gap-3 rounded-md border border-[var(--color-line)] px-3 py-2 text-sm">
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center gap-2">
+          <span>{label}</span>
+          {selected && (
+            <span className="text-xs px-1.5 py-0.5 rounded bg-[var(--color-text)] text-[var(--color-bg)]">
+              Active
+            </span>
+          )}
+        </div>
+        <div className="text-xs text-[var(--color-text-muted)]">
+          {hint}
+          {downloaded && sizeGb && ` · installed (${sizeGb} GB)`}
+        </div>
+        {downloading && (
+          <div className="text-xs mt-1">
+            Downloading… {Math.round(fraction * 100)}%
+          </div>
+        )}
+      </div>
+      <div className="flex gap-2 shrink-0">
+        {!downloaded && !downloading && (
+          <button
+            onClick={onDownload}
+            className="px-2 py-1 rounded text-xs border border-[var(--color-line)]"
+          >
+            Download
+          </button>
+        )}
+        {downloaded && !selected && (
+          <button
+            onClick={onSelect}
+            className="px-2 py-1 rounded text-xs border border-[var(--color-line)]"
+          >
+            Use
+          </button>
+        )}
+        {downloaded && (
+          <button
+            onClick={onDelete}
+            className="px-2 py-1 rounded text-xs border border-[var(--color-line)]"
+          >
+            Delete
+          </button>
+        )}
       </div>
     </div>
   );
