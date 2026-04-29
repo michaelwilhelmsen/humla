@@ -14,6 +14,9 @@ export type Note = {
   // language setting" — used by pre-feature notes and as the create-time
   // sentinel before the user makes an explicit choice.
   language: string;
+  // Per-note override for summary provider. Empty string = use global
+  // setting; same convention as `language`.
+  summary_provider: string;
   created_at: number;
   updated_at: number;
 };
@@ -62,7 +65,7 @@ export const ipc = {
   listNotes: () => invoke<Note[]>("notes_list"),
   getNote: (id: string) => invoke<Note>("notes_get", { id }),
   createNote: () => invoke<Note>("notes_create"),
-  updateNote: (id: string, patch: Partial<Pick<Note, "title" | "body" | "transcript" | "summary" | "summary_preset" | "language">>) =>
+  updateNote: (id: string, patch: Partial<Pick<Note, "title" | "body" | "transcript" | "summary" | "summary_preset" | "language" | "summary_provider">>) =>
     invoke<void>("notes_update", { id, patch }),
   deleteNote: (id: string) => invoke<void>("notes_delete", { id }),
   moveNote: (id: string, folderId: string | null) =>

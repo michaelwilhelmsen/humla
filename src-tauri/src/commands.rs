@@ -1227,12 +1227,14 @@ fn resolve_provider(
     note: &Note,
     app: &AppHandle,
 ) -> anyhow::Result<ResolvedProvider> {
-    let provider = note
-        .summary_provider
-        .clone()
-        .filter(|s| !s.trim().is_empty())
-        .or_else(|| db::get_setting(conn, "summary_provider").ok().flatten())
-        .unwrap_or_else(|| "openai".into());
+    let provider = if note.summary_provider.trim().is_empty() {
+        db::get_setting(conn, "summary_provider")
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "openai".into())
+    } else {
+        note.summary_provider.clone()
+    };
 
     match provider.as_str() {
         "local" => {

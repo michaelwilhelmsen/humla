@@ -35,10 +35,12 @@ export function Note() {
   const note = useNotesStore((s) => s.notes.find((n) => n.id === id));
   const [draft, setDraft] = useState<TNote | null>(null);
   const [uiLang, setUiLang] = useState<string>("no");
+  const [globalProvider, setGlobalProvider] = useState<string>("openai");
   const saveTimer = useRef<number | null>(null);
 
   useEffect(() => {
     ipc.getSetting("language").then((v) => v && setUiLang(v));
+    ipc.getSetting("summary_provider").then((v) => v && setGlobalProvider(v));
   }, []);
 
   useEffect(() => {
@@ -93,6 +95,19 @@ export function Note() {
     }, 300);
   }
 
+  // Empty-string-as-null for summary_provider. "" clears the override and
+  // lets the global setting kick in; "openai" / "local" sets it explicitly.
+  function patchProvider(value: string) {
+    if (!draft) return;
+    const next = { ...draft, summary_provider: value };
+    setDraft(next);
+    if (saveTimer.current) window.clearTimeout(saveTimer.current);
+    saveTimer.current = window.setTimeout(async () => {
+      await ipc.updateNote(next.id, { summary_provider: value });
+      upsert(next);
+    }, 300);
+  }
+
   // Existing notes have plain-text bodies; wrap them in <p> tags so Tiptap
   // renders sensible paragraphs on first load. New bodies are stored as HTML.
   const initialBody = useMemo(() => {
@@ -136,6 +151,11 @@ export function Note() {
           <LanguagePicker
             value={draft.language || uiLang}
             onChange={(v) => patch("language", v)}
+          />
+          <SummaryProviderChip
+            value={draft.summary_provider}
+            globalDefault={globalProvider}
+            onChange={patchProvider}
           />
           <FolderPicker
             value={draft.folder_id}
@@ -351,6 +371,39 @@ function LanguagePicker({
             {l.label}
           </option>
         ))}
+      </select>
+      <span aria-hidden style={{ color: "var(--color-text-muted)" }}>▾</span>
+    </label>
+  );
+}
+
+// Per-note summary provider override. The "auto" option (empty string) clears
+// the override so the global setting kicks in. Display label tracks the
+// effective provider so the user can tell at a glance whether *this* note
+// will go to OpenAI or stay on-device.
+function SummaryProviderChip({
+  value,
+  globalDefault,
+  onChange,
+}: {
+  value: string;
+  globalDefault: string;
+  onChange: (v: string) => void;
+}) {
+  const effective = value.length > 0 ? value : globalDefault;
+  const display = effective === "local" ? "Local" : "Cloud";
+  const suffix = value.length > 0 ? "" : " · auto";
+  return (
+    <label className="nd-chip cursor-pointer pr-2">
+      <select
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        className="bg-transparent appearance-none outline-none cursor-pointer uppercase tracking-[0.08em]"
+        style={{ fontFamily: "var(--font-mono)" }}
+      >
+        <option value="">Summary: {display}{suffix}</option>
+        <option value="openai">Summary: Cloud</option>
+        <option value="local">Summary: Local</option>
       </select>
       <span aria-hidden style={{ color: "var(--color-text-muted)" }}>▾</span>
     </label>
