@@ -15,6 +15,11 @@ pub struct AppState {
     pub db: Arc<Mutex<rusqlite::Connection>>,
     pub recording: Arc<Mutex<recording::RecordingSession>>,
     pub whisper: local_whisper::SharedContext,
+    // Held for the duration of one chunk's transcription so back-to-back
+    // chunks don't both read a stale trail snapshot. Sequential transcribes
+    // mean each chunk's initial_prompt sees the *committed* output of every
+    // prior chunk in this session.
+    pub transcribe_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -35,6 +40,7 @@ pub fn run() {
                 db: Arc::new(Mutex::new(conn)),
                 recording: Arc::new(Mutex::new(recording::RecordingSession::default())),
                 whisper: local_whisper::new_shared(),
+                transcribe_gate: Arc::new(tokio::sync::Mutex::new(())),
             });
 
             let menu = build_menu(app.handle())?;

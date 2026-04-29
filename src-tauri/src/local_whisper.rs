@@ -90,13 +90,28 @@ pub async fn transcribe_file(
         let mut state = ctx
             .create_state()
             .map_err(|e| anyhow!("create whisper state: {e}"))?;
-        let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+        // Beam search recovers from confusion (proper nouns, dense Norwegian
+        // news copy) far better than greedy at ~2× the cost. patience = -1.0
+        // disables Whisper's beam-patience early exit; beam_size = 5 is the
+        // sweet spot — beam_size = 8+ adds < 1% accuracy at 1.5× the latency.
+        let mut params = FullParams::new(SamplingStrategy::BeamSearch {
+            beam_size: 5,
+            patience: -1.0,
+        });
         params.set_print_progress(false);
         params.set_print_special(false);
         params.set_print_realtime(false);
         params.set_print_timestamps(false);
         params.set_translate(false);
         params.set_temperature(0.0);
+        // Default no_speech_thold (0.6) is aggressive — Whisper drops whole
+        // borderline clauses (proper-noun-heavy Norwegian sentences are the
+        // typical victim). 0.3 keeps low-confidence segments; the user can
+        // edit a slightly-wrong transcript but can't recover dropped words.
+        params.set_no_speech_thold(0.3);
+        // Default logprob_thold (-1.0) is fine — keeps fallback decoding on
+        // for confused segments, which complements the lowered no_speech.
+        params.set_logprob_thold(-1.0);
         if let Some(l) = lang.as_deref() {
             params.set_language(Some(l));
         }

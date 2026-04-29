@@ -227,14 +227,16 @@ final class ChunkWriter {
     }
 }
 
-// Tuned for snappy live captioning:
-//   - minSeconds 1.0 lets short utterances ("yes", "ok, let's go") flush
-//     quickly instead of waiting for the next clause.
-//   - maxSeconds 8.0 caps unbroken monologues so the UI sees fresh text
-//     within ~8 s even if the speaker never pauses.
+// Tuned to keep VAD as the primary boundary picker, with the max only as
+// a safety net:
+//   - minSeconds 1.0 lets short utterances flush quickly.
+//   - maxSeconds 15.0 — high enough that an 8 s monologue doesn't cap
+//     mid-word ("mistenkte" → "mistred"). Whisper actually transcribes
+//     longer chunks more accurately because it sees more context, so we
+//     prefer letting VAD pick the boundary even if that's a bit slower.
 //   - vadSilenceMs 500 catches sentence-end pauses without triggering on
 //     normal between-word stops (which are typically 100–300 ms).
-let writer = ChunkWriter(dir: outDir, minSeconds: 1.0, maxSeconds: 8.0, vadSilenceMs: 500.0)
+let writer = ChunkWriter(dir: outDir, minSeconds: 1.0, maxSeconds: 15.0, vadSilenceMs: 500.0)
 
 // MARK: - Stats (diagnostics)
 

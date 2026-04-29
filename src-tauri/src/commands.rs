@@ -687,6 +687,17 @@ async fn transcribe_chunk(
         }
     }
 
+    // Serialize transcription per session: each chunk's initial_prompt must
+    // see the *committed* trail of every prior chunk. With parallel
+    // transcribes, two back-to-back chunks both grab the same stale snapshot
+    // and the trail's quality benefit collapses. Sequential trades a little
+    // throughput (chunks queue if inference is slow) for accurate context.
+    let gate = {
+        let state: State<AppState> = app.state();
+        state.transcribe_gate.clone()
+    };
+    let _guard = gate.lock().await;
+
     // Whisper's `initial_prompt` slot conditions decoding on prior context.
     // We compose two parts: the user's custom vocabulary (proper-noun bias)
     // and a snapshot of the last ~150 committed words from this session.
