@@ -1,7 +1,9 @@
 use crate::db::{self, Note, NotePatch};
 use crate::diarize;
 use crate::openai;
+use crate::local_llm;
 use crate::local_whisper;
+use crate::gguf;
 use crate::presets;
 use crate::wav;
 use crate::recording::{ChunkRecord, DiagnosticPayload, ErrorPayload, Inflight, Phase, RecordingStatus, SidecarEvent, SummaryPayload, TranscriptPayload};
@@ -316,6 +318,171 @@ pub async fn local_whisper_delete(app: AppHandle, state: State<'_, AppState>) ->
     local_whisper::unload(&state.whisper);
     if path.exists() {
         tokio::fs::remove_file(&path).await.map_err(|e| format!("remove: {e}"))?;
+    }
+    Ok(())
+}
+
+// ---- Local LLM model management --------------------------------------------
+
+fn llm_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    let app_data = app.path().app_data_dir().map_err(err)?;
+    Ok(local_llm::managed_dir(&app_data))
+}
+
+fn llm_variant_file(variant: &str) -> Result<&'static str, String> {
+    match variant {
+        "e2b" => Ok(local_llm::E2B_FILE),
+        "e4b" => Ok(local_llm::E4B_FILE),
+        _ => Err(format!("unknown LLM variant: {variant}")),
+    }
+}
+
+fn llm_variant_url(variant: &str) -> Result<&'static str, String> {
+    match variant {
+        "e2b" => Ok(local_llm::E2B_URL),
+        "e4b" => Ok(local_llm::E4B_URL),
+        _ => Err(format!("unknown LLM variant: {variant}")),
+    }
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalLlmStatus {
+    e2b_downloaded: bool,
+    e2b_size_bytes: Option<u64>,
+    e4b_downloaded: bool,
+    e4b_size_bytes: Option<u64>,
+    managed_dir: String,
+}
+
+#[tauri::command]
+pub fn local_llm_status(app: AppHandle) -> Result<LocalLlmStatus, String> {
+    let dir = llm_dir(&app)?;
+    let check = |file: &str| -> (bool, Option<u64>) {
+        let p = dir.join(file);
+        match std::fs::metadata(&p) {
+            Ok(m) if m.is_file() => (true, Some(m.len())),
+            _ => (false, None),
+        }
+    };
+    let (e2b_d, e2b_s) = check(local_llm::E2B_FILE);
+    let (e4b_d, e4b_s) = check(local_llm::E4B_FILE);
+    Ok(LocalLlmStatus {
+        e2b_downloaded: e2b_d,
+        e2b_size_bytes: e2b_s,
+        e4b_downloaded: e4b_d,
+        e4b_size_bytes: e4b_s,
+        managed_dir: dir.display().to_string(),
+    })
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LlmDownloadProgress {
+    variant: String,
+    received: u64,
+    total: Option<u64>,
+}
+
+#[tauri::command]
+pub async fn local_llm_download(app: AppHandle, variant: String) -> Result<(), String> {
+    let file = llm_variant_file(&variant)?;
+    let url = llm_variant_url(&variant)?;
+    let dir = llm_dir(&app)?;
+    tokio::fs::create_dir_all(&dir).await.map_err(|e| format!("mkdir: {e}"))?;
+    let final_path = dir.join(file);
+    let tmp_path = dir.join(format!("{file}.partial"));
+
+    let resp = reqwest::Client::builder()
+        // Generous timeout: a 5 GB download on a slow link can take a while.
+        .timeout(std::time::Duration::from_secs(60 * 60))
+        .build()
+        .map_err(|e| format!("client: {e}"))?
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| format!("network: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("download {url}: HTTP {}", resp.status()));
+    }
+    let total = resp.content_length();
+    let _ = app.emit(
+        "local_llm_progress",
+        LlmDownloadProgress { variant: variant.clone(), received: 0, total },
+    );
+
+    use tokio::io::AsyncWriteExt;
+    let mut f = tokio::fs::File::create(&tmp_path)
+        .await
+        .map_err(|e| format!("create tmp: {e}"))?;
+    let mut received: u64 = 0;
+    let mut last_emit = std::time::Instant::now();
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let bytes = chunk.map_err(|e| format!("stream: {e}"))?;
+        f.write_all(&bytes).await.map_err(|e| format!("write: {e}"))?;
+        received += bytes.len() as u64;
+        if last_emit.elapsed() >= std::time::Duration::from_millis(100) {
+            let _ = app.emit(
+                "local_llm_progress",
+                LlmDownloadProgress { variant: variant.clone(), received, total },
+            );
+            last_emit = std::time::Instant::now();
+        }
+    }
+    f.flush().await.map_err(|e| format!("flush: {e}"))?;
+    drop(f);
+
+    // Validate before promoting the file. A truncated download or a redirect
+    // landed on an HTML page would slip past content-length checks; a GGUF
+    // header sniff catches both.
+    let info = match gguf::sniff(&tmp_path) {
+        Ok(i) => i,
+        Err(e) => {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return Err(format!("downloaded file failed validation: {e}"));
+        }
+    };
+    if !info.architecture.starts_with("gemma") {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return Err(format!(
+            "expected gemma architecture, got {}",
+            info.architecture
+        ));
+    }
+
+    tokio::fs::rename(&tmp_path, &final_path)
+        .await
+        .map_err(|e| format!("rename: {e}"))?;
+    let _ = app.emit(
+        "local_llm_progress",
+        LlmDownloadProgress { variant, received, total },
+    );
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn local_llm_delete(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    variant: String,
+) -> Result<(), String> {
+    let file = llm_variant_file(&variant)?;
+    let path = llm_dir(&app)?.join(file);
+
+    // If the loaded model is the one being deleted, drop it from memory first.
+    let should_unload = {
+        let guard = state.llm.lock();
+        guard.as_ref().map(|m| m.path == path).unwrap_or(false)
+    };
+    if should_unload {
+        local_llm::unload(&state.llm);
+    }
+
+    if path.exists() {
+        tokio::fs::remove_file(&path)
+            .await
+            .map_err(|e| format!("remove: {e}"))?;
     }
     Ok(())
 }
