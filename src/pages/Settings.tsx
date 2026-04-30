@@ -450,7 +450,7 @@ export function Settings() {
                   className={
                     "px-3 py-1.5 rounded-md text-sm border " +
                     (s.summary_provider === opt.value
-                      ? "border-[var(--color-text)] bg-[var(--color-text)] text-[var(--color-bg)]"
+                      ? "border-[var(--color-text)] bg-[var(--color-text)] text-[var(--color-canvas)]"
                       : "border-[var(--color-line)]")
                   }
                 >
@@ -635,7 +635,7 @@ function ManagedLlmRow({
         <div className="flex items-center gap-2">
           <span>{label}</span>
           {selected && (
-            <span className="text-xs px-1.5 py-0.5 rounded bg-[var(--color-text)] text-[var(--color-bg)]">
+            <span className="text-xs px-1.5 py-0.5 rounded bg-[var(--color-text)] text-[var(--color-canvas)]">
               Active
             </span>
           )}
