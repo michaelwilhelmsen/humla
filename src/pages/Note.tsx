@@ -62,6 +62,17 @@ export function Note() {
     return () => { cancelled = true; };
   }, [id, upsert]);
 
+  const titleRef = useRef<HTMLTextAreaElement | null>(null);
+  // Resolved summary provider for *this* note: per-note override beats global.
+  // Used to gate the live-reasoning panel — cloud OpenAI never streams
+  // thinking content, so showing the dropdown there would be a permanent
+  // "waiting for the model…" placeholder that never becomes anything.
+  const effectiveProvider =
+    draft?.summary_provider && draft.summary_provider.length > 0
+      ? draft.summary_provider
+      : globalProvider || "openai";
+  const isLocalProvider = effectiveProvider === "local";
+
   const recPhase = useRecordingStore((s) => s.status);
   const isThisNoteActive = !!draft && recPhase.noteId === draft.id;
   const isRecording = isThisNoteActive && recPhase.phase === "recording";
@@ -128,6 +139,15 @@ export function Note() {
     const el = reasoningRef.current;
     if (el) el.scrollTop = el.scrollHeight;
   }, [thinkingStream]);
+
+  // Auto-grow the title textarea so long titles wrap onto a second line
+  // instead of horizontally clipping at the right edge of the page.
+  useEffect(() => {
+    const el = titleRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = el.scrollHeight + "px";
+  }, [draft?.title]);
 
   // Always pull summary updates from the store. Pull transcript updates only
   // while a recording, diarization, or polish is in flight — otherwise our
@@ -197,11 +217,22 @@ export function Note() {
     <div className="h-full flex flex-col">
       <div data-tauri-drag-region className="h-10 shrink-0" />
       <div className="flex-1 overflow-y-auto px-12 pb-32 max-w-3xl mx-auto w-full">
-        <input
+        <textarea
+          ref={titleRef}
           value={draft.title}
           onChange={(e) => patch("title", e.target.value)}
+          onKeyDown={(e) => {
+            // Block Enter so the title behaves like a single-line conceptual
+            // field — text still wraps when wider than the column, but the
+            // user can't accidentally introduce a literal newline.
+            if (e.key === "Enter") {
+              e.preventDefault();
+              (e.currentTarget as HTMLTextAreaElement).blur();
+            }
+          }}
           placeholder="New note"
-          className="text-5xl font-light tracking-[-0.02em] w-full mb-6 placeholder:text-[var(--color-text-muted)]/50"
+          rows={1}
+          className="text-5xl font-light tracking-[-0.02em] w-full mb-6 placeholder:text-[var(--color-text-muted)]/50 bg-transparent resize-none overflow-hidden focus:outline-none"
         />
 
         <div className="flex flex-col gap-2 mb-10">
@@ -257,11 +288,15 @@ export function Note() {
         {showSummarySection && (
           <Card className="mt-8">
             <h2 className="nd-label mb-4">Summary</h2>
-            {/* Live reasoning trace: shown while the model is thinking.
-                Auto-scrolls; collapsible via the header. Once the final
-                summary lands the panel stays available but starts
-                collapsed so it doesn't dominate. */}
-            {(thinkingStream.length > 0 || (isSummarizing && contentStream.length === 0)) && (
+            {/* Live reasoning trace: shown only on local LLM providers
+                while the model is thinking. Cloud OpenAI doesn't stream
+                a thinking trace through this path (reasoning models keep
+                their chain-of-thought server-side), so showing the panel
+                there is just a permanent "waiting for the model…"
+                placeholder. Auto-scrolls; collapsible via the header.
+                Once the final summary lands it starts collapsed so it
+                doesn't dominate. */}
+            {isLocalProvider && (thinkingStream.length > 0 || (isSummarizing && contentStream.length === 0)) && (
               <div className="mb-4 rounded-md border border-[var(--color-line)] bg-[var(--color-surface-raised)]">
                 <button
                   type="button"
