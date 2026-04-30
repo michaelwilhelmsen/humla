@@ -32,12 +32,6 @@ function messageForPhase(phase: string): { title: string; subtitle: string } | n
       subtitle: "Running the diarization model.",
     };
   }
-  if (phase === "loading_model") {
-    return {
-      title: "Loading local model…",
-      subtitle: "First polish on a fresh launch takes a few seconds.",
-    };
-  }
   if (phase === "polishing") {
     return {
       title: "Polishing transcript…",

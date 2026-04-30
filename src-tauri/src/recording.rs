@@ -116,9 +116,6 @@ pub enum Phase {
     Paused,
     Stopping,
     Diarizing,
-    // Cold-loading the local LLM (5–10s on a 5 GB model). Surfaces in the
-    // toast as "Loading local model…" so users don't think polish is stuck.
-    LoadingModel,
     Polishing,
     Summarizing,
 }

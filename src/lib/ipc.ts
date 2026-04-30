@@ -37,7 +37,8 @@ export type SettingsKey =
   | "summary_model"
   | "summary_prompt"
   | "summary_provider"
-  | "summary_local_model"
+  | "local_llm_base_url"
+  | "local_llm_model"
   | "theme";
 
 export type TranscribeProvider = "openai" | "local";
@@ -93,15 +94,8 @@ export const ipc = {
   diarizeDownload: () => invoke<void>("diarize_download"),
   diarizeDelete: () => invoke<void>("diarize_delete"),
 
-  localLlmStatus: () => invoke<LocalLlmStatus>("local_llm_status"),
-  localLlmDownload: (variant: string) =>
-    invoke<void>("local_llm_download", { variant }),
-  localLlmDelete: (variant: string) =>
-    invoke<void>("local_llm_delete", { variant }),
-  localLlmScan: () => invoke<DiscoveredLlm[]>("local_llm_scan"),
-  localLlmSelectExisting: (path: string) =>
-    invoke<void>("local_llm_select_existing", { path }),
-  systemMemoryGb: () => invoke<number>("system_memory_gb"),
+  localLlmListModels: (baseUrl: string) =>
+    invoke<string[]>("local_llm_list_models", { baseUrl }),
 
   recordingStart: (noteId: string) => invoke<void>("recording_start", { noteId }),
   recordingStop: () => invoke<void>("recording_stop"),
@@ -129,38 +123,8 @@ export type PermissionsStatus = {
 
 export type TranscriptEvent = { noteId: string; text: string };
 export type SummaryEvent = { noteId: string; summary: string };
-export type RecordingPhase = "idle" | "starting" | "recording" | "paused" | "stopping" | "diarizing" | "loading_model" | "polishing" | "summarizing";
+export type RecordingPhase = "idle" | "starting" | "recording" | "paused" | "stopping" | "diarizing" | "polishing" | "summarizing";
 export type SummaryProvider = "openai" | "local";
-
-export type LocalLlmModelEntry = {
-  variant: string;
-  label: string;
-  bytesHint: number;
-  downloaded: boolean;
-  sizeBytes: number | null;
-  path: string | null;
-};
-
-export type LocalLlmStatus = {
-  models: LocalLlmModelEntry[];
-  managedDir: string;
-};
-
-export type DiscoveredLlm = {
-  source: "lm-studio" | "ollama" | "huggingface";
-  name: string;
-  path: string;
-  sizeBytes: number;
-  architecture: string;
-  quantization: string;
-  compatible: boolean;
-};
-
-export type LocalLlmProgress = {
-  variant: string;
-  received: number;
-  total: number | null;
-};
 export type RecordingStatus = { noteId: string | null; phase: RecordingPhase };
 export type RecordingError = { noteId: string | null; message: string };
 export type RecordingDiagnostic = {
@@ -195,7 +159,4 @@ export function onLocalWhisperProgress(cb: (e: LocalWhisperProgress) => void): P
 }
 export function onDiarizeDownloadProgress(cb: (e: DiarizeDownloadProgress) => void): Promise<UnlistenFn> {
   return listen<DiarizeDownloadProgress>("diarize_download_progress", (e) => cb(e.payload));
-}
-export function onLocalLlmProgress(cb: (e: LocalLlmProgress) => void): Promise<UnlistenFn> {
-  return listen<LocalLlmProgress>("local_llm_progress", (e) => cb(e.payload));
 }

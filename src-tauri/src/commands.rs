@@ -1,10 +1,7 @@
 use crate::db::{self, Note, NotePatch};
 use crate::diarize;
 use crate::openai;
-use crate::local_llm;
 use crate::local_whisper;
-use crate::gguf;
-use crate::llm_discovery;
 use crate::presets;
 use crate::wav;
 use crate::recording::{ChunkRecord, DiagnosticPayload, ErrorPayload, Inflight, Phase, RecordingStatus, SidecarEvent, SummaryPayload, TranscriptPayload};
@@ -22,6 +19,9 @@ const DEFAULT_TRANSCRIBE_PROVIDER: &str = "openai";
 const DEFAULT_TRANSCRIBE_MODEL: &str = "whisper-1";
 const DEFAULT_WHISPER_PRESET: &str = "quality";
 const DEFAULT_SUMMARY_MODEL: &str = "gpt-5.4-mini";
+// Ollama's default port + OpenAI-compat path. Any user running LM Studio,
+// llama-server, or vLLM will override this in Settings.
+const DEFAULT_LOCAL_LLM_BASE_URL: &str = "http://localhost:11434/v1";
 const DEFAULT_POLISH_PROMPT: &str = "You are correcting a raw speech-to-text transcript produced by Whisper. The transcript is already mostly correct. Your job is conservative cleanup, not rewriting.
 
 Apply ONLY these changes:
@@ -323,227 +323,15 @@ pub async fn local_whisper_delete(app: AppHandle, state: State<'_, AppState>) ->
     Ok(())
 }
 
-// ---- Local LLM model management --------------------------------------------
+// ---- Local LLM (OpenAI-compatible HTTP server) ----------------------------
 
-fn llm_dir(app: &AppHandle) -> Result<PathBuf, String> {
-    let app_data = app.path().app_data_dir().map_err(err)?;
-    Ok(local_llm::managed_dir(&app_data))
-}
-
-fn llm_spec(variant: &str) -> Result<&'static local_llm::ManagedSpec, String> {
-    local_llm::spec_for_variant(variant)
-        .ok_or_else(|| format!("unknown LLM variant: {variant}"))
-}
-
-#[derive(serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct LocalLlmModelEntry {
-    variant: String,
-    label: String,
-    bytes_hint: u64,
-    downloaded: bool,
-    size_bytes: Option<u64>,
-    path: Option<String>,
-}
-
-#[derive(serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct LocalLlmStatus {
-    models: Vec<LocalLlmModelEntry>,
-    managed_dir: String,
-}
-
+// Hit the user-configured local LLM server's /v1/models endpoint and return
+// the list of model IDs. Used by Settings to populate the Model dropdown when
+// the user picks Local provider. Most servers (Ollama, LM Studio, llama-server,
+// vLLM) implement this exact OpenAI-compatible shape.
 #[tauri::command]
-pub fn local_llm_status(app: AppHandle) -> Result<LocalLlmStatus, String> {
-    let dir = llm_dir(&app)?;
-    let models = local_llm::ALL_MANAGED
-        .iter()
-        .map(|spec| {
-            let p = dir.join(spec.file);
-            let (downloaded, size_bytes, path) = match std::fs::metadata(&p) {
-                Ok(m) if m.is_file() => (true, Some(m.len()), Some(p.display().to_string())),
-                _ => (false, None, None),
-            };
-            LocalLlmModelEntry {
-                variant: spec.variant.into(),
-                label: spec.label.into(),
-                bytes_hint: spec.bytes_hint,
-                downloaded,
-                size_bytes,
-                path,
-            }
-        })
-        .collect();
-    Ok(LocalLlmStatus {
-        models,
-        managed_dir: dir.display().to_string(),
-    })
-}
-
-#[derive(Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-struct LlmDownloadProgress {
-    variant: String,
-    received: u64,
-    total: Option<u64>,
-}
-
-#[tauri::command]
-pub async fn local_llm_download(app: AppHandle, variant: String) -> Result<(), String> {
-    let spec = llm_spec(&variant)?;
-    let dir = llm_dir(&app)?;
-    tokio::fs::create_dir_all(&dir).await.map_err(|e| format!("mkdir: {e}"))?;
-    let final_path = dir.join(spec.file);
-    let tmp_path = dir.join(format!("{}.partial", spec.file));
-
-    let resp = reqwest::Client::builder()
-        // Generous timeout: a 5 GB download on a slow link can take a while.
-        .timeout(std::time::Duration::from_secs(60 * 60))
-        .build()
-        .map_err(|e| format!("client: {e}"))?
-        .get(spec.url)
-        .send()
-        .await
-        .map_err(|e| format!("network: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("download {}: HTTP {}", spec.url, resp.status()));
-    }
-    let total = resp.content_length();
-    let _ = app.emit(
-        "local_llm_progress",
-        LlmDownloadProgress { variant: variant.clone(), received: 0, total },
-    );
-
-    use tokio::io::AsyncWriteExt;
-    let mut f = tokio::fs::File::create(&tmp_path)
-        .await
-        .map_err(|e| format!("create tmp: {e}"))?;
-    let mut received: u64 = 0;
-    let mut last_emit = std::time::Instant::now();
-    let mut stream = resp.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let bytes = chunk.map_err(|e| format!("stream: {e}"))?;
-        f.write_all(&bytes).await.map_err(|e| format!("write: {e}"))?;
-        received += bytes.len() as u64;
-        if last_emit.elapsed() >= std::time::Duration::from_millis(100) {
-            let _ = app.emit(
-                "local_llm_progress",
-                LlmDownloadProgress { variant: variant.clone(), received, total },
-            );
-            last_emit = std::time::Instant::now();
-        }
-    }
-    f.flush().await.map_err(|e| format!("flush: {e}"))?;
-    drop(f);
-
-    // Validate before promoting the file. A truncated download or a redirect
-    // landed on an HTML page would slip past content-length checks; a GGUF
-    // header sniff catches both.
-    let info = match gguf::sniff(&tmp_path) {
-        Ok(i) => i,
-        Err(e) => {
-            let _ = tokio::fs::remove_file(&tmp_path).await;
-            return Err(format!("downloaded file failed validation: {e}"));
-        }
-    };
-    let arch_ok = info.architecture.starts_with("gemma")
-        || info.architecture.starts_with("qwen");
-    if !arch_ok {
-        let _ = tokio::fs::remove_file(&tmp_path).await;
-        return Err(format!(
-            "unexpected architecture {} for variant {variant}",
-            info.architecture
-        ));
-    }
-
-    tokio::fs::rename(&tmp_path, &final_path)
-        .await
-        .map_err(|e| format!("rename: {e}"))?;
-    let _ = app.emit(
-        "local_llm_progress",
-        LlmDownloadProgress { variant, received, total },
-    );
-    Ok(())
-}
-
-#[tauri::command]
-pub async fn local_llm_delete(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    variant: String,
-) -> Result<(), String> {
-    let spec = llm_spec(&variant)?;
-    let path = llm_dir(&app)?.join(spec.file);
-
-    // If the loaded model is the one being deleted, drop it from memory first.
-    let should_unload = {
-        let guard = state.llm.lock();
-        guard.as_ref().map(|m| m.path == path).unwrap_or(false)
-    };
-    if should_unload {
-        local_llm::unload(&state.llm);
-    }
-
-    if path.exists() {
-        tokio::fs::remove_file(&path)
-            .await
-            .map_err(|e| format!("remove: {e}"))?;
-    }
-    Ok(())
-}
-
-// Read total physical RAM in GB. macOS-only; returns 0 on failure.
-// Used to warn users on 16 GB Macs that running E4B alongside Whisper +
-// FluidAudio + their browser may swap.
-#[tauri::command]
-pub fn system_memory_gb() -> u32 {
-    use std::process::Command;
-    let out = Command::new("sysctl")
-        .args(["-n", "hw.memsize"])
-        .output();
-    match out {
-        Ok(o) if o.status.success() => {
-            let s = String::from_utf8_lossy(&o.stdout);
-            let bytes: u64 = s.trim().parse().unwrap_or(0);
-            (bytes / 1_000_000_000) as u32
-        }
-        _ => 0,
-    }
-}
-
-#[tauri::command]
-pub async fn local_llm_scan() -> Result<Vec<llm_discovery::DiscoveredLlm>, String> {
-    let home = dirs::home_dir().ok_or_else(|| "no home dir".to_string())?;
-    // Scanning hits the filesystem and parses JSON manifests; offload to a
-    // blocking thread so we don't tie up the tokio reactor for a few seconds
-    // on machines with large LM Studio / HF caches.
-    tokio::task::spawn_blocking(move || llm_discovery::scan_all(&home))
-        .await
-        .map_err(|e| format!("scan task: {e}"))
-}
-
-#[tauri::command]
-pub async fn local_llm_select_existing(
-    state: State<'_, AppState>,
-    path: String,
-) -> Result<(), String> {
-    let p = PathBuf::from(&path);
-    if !p.exists() {
-        return Err("path does not exist".into());
-    }
-    // Validate before persisting so we can return a useful error to the UI
-    // rather than silently storing a bad path that fails at first use.
-    let info = gguf::sniff(&p).map_err(|e| e.to_string())?;
-    if !llm_discovery::is_compatible(&info.architecture, &info.quantization) {
-        return Err(format!(
-            "incompatible model: {} / {}",
-            info.architecture, info.quantization
-        ));
-    }
-    let conn = state.db.lock();
-    db::set_setting(&conn, "summary_local_model", &format!("path:{}", p.display()))
-        .map_err(err)?;
-    Ok(())
+pub async fn local_llm_list_models(base_url: String) -> Result<Vec<String>, String> {
+    openai::list_models(&base_url).await.map_err(err)
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Default)]
@@ -1232,23 +1020,25 @@ struct TranscribeCfg {
     vocabulary: String,
 }
 
-// Resolved provider for a single polish or summary call. `OpenAi` carries the
-// API key + model name; `Local` carries the model kind + on-disk path. The
-// dispatch happens after this resolves, inside polish_transcript/run_summary.
-enum ResolvedProvider {
-    OpenAi { api_key: String, model: String },
-    Local { kind: local_llm::ModelKind, path: PathBuf },
+// Resolved provider for a single polish or summary call. Both cloud OpenAI
+// and any local OpenAI-compatible server (Ollama, LM Studio, llama-server,
+// vLLM) flow through this same shape — the only difference is `base_url`.
+struct ResolvedProvider {
+    base_url: String,
+    api_key: String,
+    model: String,
 }
 
-// Decide whether this note's polish/summary call should hit OpenAI or the
-// local LLM. Note-level override beats the global setting; default is openai.
+// Decide whether this note's polish/summary call should hit cloud OpenAI or
+// a local OpenAI-compatible server. Note-level override beats the global
+// setting; default is openai.
 //
-// For local: requires `summary_local_model` to be set AND the resolved model
-// file to exist on disk. Either condition missing returns an actionable error.
+// For local: reads `local_llm_base_url` and `local_llm_model` from settings.
+// `api_key` is forwarded as-is — local servers typically ignore it but
+// Ollama requires a non-empty bearer string, so we send a sentinel.
 fn resolve_provider(
     conn: &rusqlite::Connection,
     note: &Note,
-    app: &AppHandle,
 ) -> anyhow::Result<ResolvedProvider> {
     let provider = if note.summary_provider.trim().is_empty() {
         db::get_setting(conn, "summary_provider")
@@ -1261,26 +1051,21 @@ fn resolve_provider(
 
     match provider.as_str() {
         "local" => {
-            let model_setting = db::get_setting(conn, "summary_local_model")?
+            let base_url = db::get_setting(conn, "local_llm_base_url")?
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| DEFAULT_LOCAL_LLM_BASE_URL.to_string());
+            let model = db::get_setting(conn, "local_llm_model")?
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
                 .ok_or_else(|| anyhow::anyhow!(
-                    "local LLM not configured — pick a model in Settings"
+                    "local LLM model not configured — pick one in Settings"
                 ))?;
-            let kind = local_llm::ModelKind::from_setting(&model_setting)
-                .ok_or_else(|| anyhow::anyhow!(
-                    "invalid summary_local_model: {model_setting}"
-                ))?;
-            let app_data = app
-                .path()
-                .app_data_dir()
-                .map_err(|e| anyhow::anyhow!("app data dir: {e}"))?;
-            let path = local_llm::resolve_path(&kind, &app_data);
-            if !path.exists() {
-                return Err(anyhow::anyhow!(
-                    "local model file missing at {}",
-                    path.display()
-                ));
-            }
-            Ok(ResolvedProvider::Local { kind, path })
+            Ok(ResolvedProvider {
+                base_url,
+                api_key: "humla-local".into(),
+                model,
+            })
         }
         _ => {
             let api_key = db::get_setting(conn, API_KEY)?
@@ -1289,7 +1074,11 @@ fn resolve_provider(
                 .ok_or_else(|| anyhow::anyhow!("OpenAI API key not set"))?;
             let model = db::get_setting(conn, "summary_model")?
                 .unwrap_or_else(|| DEFAULT_SUMMARY_MODEL.to_string());
-            Ok(ResolvedProvider::OpenAi { api_key, model })
+            Ok(ResolvedProvider {
+                base_url: openai::BASE.into(),
+                api_key,
+                model,
+            })
         }
     }
 }
@@ -1324,7 +1113,7 @@ async fn polish_transcript(app: AppHandle, note_id: String) -> anyhow::Result<()
         }
         // No-provider conditions (no API key, no local model) silently skip
         // — polish is a best-effort step, not something to error the recording out for.
-        let provider = match resolve_provider(&conn, &n, &app) {
+        let provider = match resolve_provider(&conn, &n) {
             Ok(p) => p,
             Err(_) => return Ok(()),
         };
@@ -1346,33 +1135,15 @@ async fn polish_transcript(app: AppHandle, note_id: String) -> anyhow::Result<()
     let user_message =
         format!("{vocab_section}{notes_section}[Raw transcript]\n{transcript_snapshot}");
 
-    // Surface a "Loading model" phase before generation starts on the local
-    // path so the toast shows the slow cold-load instead of a stuck "Polishing".
-    let polished = match provider {
-        ResolvedProvider::OpenAi { api_key, model } => {
-            emit_status(&app, Some(&note_id), Phase::Polishing);
-            openai::summarize(&api_key, &model, DEFAULT_POLISH_PROMPT, &user_message).await?
-        }
-        ResolvedProvider::Local { kind, path } => {
-            emit_status(&app, Some(&note_id), Phase::LoadingModel);
-            let state: State<AppState> = app.state();
-            let llm = state.llm.clone();
-            local_llm::prewarm(llm.clone(), kind.clone(), path.clone()).await?;
-            emit_status(&app, Some(&note_id), Phase::Polishing);
-            // Allow up to 4096 generation tokens — polish output should never
-            // exceed input length, but the limit prevents an infinite loop on
-            // a confused model.
-            local_llm::generate(
-                llm,
-                kind,
-                path,
-                DEFAULT_POLISH_PROMPT.to_string(),
-                user_message,
-                4096,
-            )
-            .await?
-        }
-    };
+    emit_status(&app, Some(&note_id), Phase::Polishing);
+    let polished = openai::summarize_with_base(
+        &provider.base_url,
+        &provider.api_key,
+        &provider.model,
+        DEFAULT_POLISH_PROMPT,
+        &user_message,
+    )
+    .await?;
     let polished = polished.trim().to_string();
     if polished.is_empty() {
         return Ok(());
@@ -1414,7 +1185,7 @@ async fn run_summary(app: AppHandle, note_id: String) -> anyhow::Result<()> {
         let state: State<AppState> = app.state();
         let conn = state.db.lock();
         let n = db::get_note(&conn, &note_id)?;
-        let p_resolved = resolve_provider(&conn, &n, &app)?;
+        let p_resolved = resolve_provider(&conn, &n)?;
         let p = db::get_setting(&conn, "summary_prompt")?
             .unwrap_or_else(|| DEFAULT_SUMMARY_PROMPT.to_string());
         let global_lang = db::get_setting(&conn, "language")?
@@ -1447,19 +1218,14 @@ async fn run_summary(app: AppHandle, note_id: String) -> anyhow::Result<()> {
     // Hard language directive in case the prompt was authored in a different
     // language than the user has now chosen.
     let full_prompt = format!("{prompt}\n\n{}", language_directive(&language));
-    let summary = match provider {
-        ResolvedProvider::OpenAi { api_key, model } => {
-            openai::summarize(&api_key, &model, &full_prompt, &user_message).await?
-        }
-        ResolvedProvider::Local { kind, path } => {
-            emit_status(&app, Some(&note_id), Phase::LoadingModel);
-            let state: State<AppState> = app.state();
-            let llm = state.llm.clone();
-            local_llm::prewarm(llm.clone(), kind.clone(), path.clone()).await?;
-            emit_status(&app, Some(&note_id), Phase::Summarizing);
-            local_llm::generate(llm, kind, path, full_prompt, user_message, 4096).await?
-        }
-    };
+    let summary = openai::summarize_with_base(
+        &provider.base_url,
+        &provider.api_key,
+        &provider.model,
+        &full_prompt,
+        &user_message,
+    )
+    .await?;
     let state: State<AppState> = app.state();
     {
         let conn = state.db.lock();

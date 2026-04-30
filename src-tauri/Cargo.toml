@@ -23,11 +23,10 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 reqwest = { version = "0.12", features = ["json", "multipart", "rustls-tls", "stream"], default-features = false }
 futures-util = "0.3"
 whisper-rs = { version = "0.13", features = ["metal"] }
-# llama-cpp-2 = "0.1" — removed: linking it alongside whisper-rs ships two
-# copies of GGML in the same binary, and Metal backend registration aborts on
-# the duplicate. Local LLM inference will move to a sidecar process to
-# isolate the GGMLs (matching the audio-capture + speaker-diarize pattern).
-walkdir = "2"
+# Local LLM inference is delegated to whichever OpenAI-compatible HTTP server
+# the user runs (Ollama, LM Studio, llama-server, vLLM, …). We reuse the
+# existing reqwest client; no in-process GGML runtime to avoid the static
+# duplicate-GGML conflict with whisper-rs.
 uuid = { version = "1", features = ["v4"] }
 anyhow = "1"
 thiserror = "2"

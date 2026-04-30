@@ -134,16 +134,40 @@ pub async fn summarize(
     system_prompt: &str,
     transcript: &str,
 ) -> Result<String> {
+    summarize_with_base(BASE, api_key, model, system_prompt, transcript).await
+}
+
+/// Same shape as `summarize` but takes an explicit base URL. Used to route
+/// summary calls at any OpenAI-compatible HTTP endpoint — most local-LLM
+/// runtimes (Ollama, LM Studio, llama-server, vLLM) implement this exact
+/// schema, so a one-line change in the caller flips between cloud OpenAI
+/// and a local server.
+///
+/// `api_key` is forwarded as a bearer token regardless of base URL; local
+/// servers typically ignore it but Ollama accepts any non-empty string.
+pub async fn summarize_with_base(
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    system_prompt: &str,
+    transcript: &str,
+) -> Result<String> {
     let req = ChatRequest {
         model,
-        temperature: if is_reasoning_model(model) { None } else { Some(0.2) },
+        // Local OpenAI-compat servers accept temperature; reasoning-model
+        // suppression only applies when the actual server is OpenAI's.
+        temperature: if base_url == BASE && is_reasoning_model(model) {
+            None
+        } else {
+            Some(0.2)
+        },
         messages: vec![
             ChatMessage { role: "system", content: system_prompt },
             ChatMessage { role: "user", content: transcript },
         ],
     };
     let r = client()
-        .post(format!("{BASE}/chat/completions"))
+        .post(format!("{base_url}/chat/completions"))
         .bearer_auth(api_key)
         .json(&req)
         .send()
@@ -152,13 +176,38 @@ pub async fn summarize(
     if !r.status().is_success() {
         let s = r.status();
         let body = r.text().await.unwrap_or_default();
-        return Err(anyhow!("OpenAI {s}: {body}"));
+        return Err(anyhow!("HTTP {s} from {base_url}: {body}"));
     }
     let body: ChatResponse = r.json().await?;
     let content = body.choices.into_iter().next()
         .map(|c| c.message.content)
         .unwrap_or_default();
     Ok(content)
+}
+
+/// Fetch the list of models a local OpenAI-compat server has loaded. Used by
+/// the Settings UI to populate a model dropdown when the user picks Local
+/// provider. Hits `<base_url>/models` and returns the `id` field for each
+/// entry — the universal OpenAI/Ollama/LM Studio shape.
+pub async fn list_models(base_url: &str) -> Result<Vec<String>> {
+    #[derive(Deserialize)]
+    struct ListResponse {
+        data: Vec<ModelEntry>,
+    }
+    #[derive(Deserialize)]
+    struct ModelEntry {
+        id: String,
+    }
+    let r = client()
+        .get(format!("{base_url}/models"))
+        .send()
+        .await?;
+    if !r.status().is_success() {
+        let s = r.status();
+        return Err(anyhow!("HTTP {s} from {base_url}/models"));
+    }
+    let body: ListResponse = r.json().await?;
+    Ok(body.data.into_iter().map(|m| m.id).collect())
 }
 
 #[cfg(test)]

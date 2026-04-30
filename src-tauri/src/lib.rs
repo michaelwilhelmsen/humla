@@ -1,10 +1,7 @@
 mod db;
 mod openai;
 mod local_whisper;
-mod local_llm;
 mod diarize;
-mod gguf;
-mod llm_discovery;
 mod presets;
 mod wav;
 mod recording;
@@ -19,10 +16,6 @@ pub struct AppState {
     pub db: Arc<Mutex<rusqlite::Connection>>,
     pub recording: Arc<Mutex<recording::RecordingSession>>,
     pub whisper: local_whisper::SharedContext,
-    // Local LLM model handle. Loaded lazily on first polish/summary call when
-    // the user has picked a local provider; persists across calls so the
-    // 5–10 s cold-load only hits once per app session.
-    pub llm: local_llm::SharedContext,
     // Held for the duration of one chunk's transcription so back-to-back
     // chunks don't both read a stale trail snapshot. Sequential transcribes
     // mean each chunk's initial_prompt sees the *committed* output of every
@@ -54,7 +47,6 @@ pub fn run() {
                 db: Arc::new(Mutex::new(conn)),
                 recording: Arc::new(Mutex::new(recording::RecordingSession::default())),
                 whisper: local_whisper::new_shared(),
-                llm: local_llm::new_shared(),
                 transcribe_gate: Arc::new(tokio::sync::Mutex::new(())),
                 diarize_stream: diarize_stream.clone(),
             });
@@ -104,12 +96,7 @@ pub fn run() {
             commands::local_whisper_status,
             commands::local_whisper_download,
             commands::local_whisper_delete,
-            commands::local_llm_status,
-            commands::local_llm_download,
-            commands::local_llm_delete,
-            commands::local_llm_scan,
-            commands::local_llm_select_existing,
-            commands::system_memory_gb,
+            commands::local_llm_list_models,
             commands::diarize_status,
             commands::diarize_download,
             commands::diarize_delete,
