@@ -11,15 +11,15 @@ pub fn client() -> reqwest::Client {
         .expect("reqwest client")
 }
 
-// Local LLM servers (Ollama especially) cold-load the model on first request,
-// which adds 5-15s before any tokens stream. A long-meeting summary can then
-// generate for 30-60s on a 9B model. The 120s default isn't enough headroom
-// for first-call-of-the-day on slower hardware. 5 minutes is a comfortable
-// ceiling that still surfaces a stuck server as an error rather than hanging
-// the UI forever.
+// Local LLM servers (Ollama especially) cold-load the model on first request
+// (~10s on a 9B), then generate at ~30 tok/s on Apple Silicon. A long-meeting
+// summary can run 60s; long-meeting *polish* (which regenerates the whole
+// transcript) can run several minutes. 10 minutes is generous enough that
+// genuine slow paths complete, while still surfacing a wedged server as an
+// error rather than hanging the UI indefinitely.
 fn local_client() -> reqwest::Client {
     reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(300))
+        .timeout(std::time::Duration::from_secs(600))
         .build()
         .expect("reqwest client")
 }
@@ -193,9 +193,9 @@ pub async fn summarize_with_base(
             // opaque to the user; map to something actionable.
             if e.is_timeout() {
                 anyhow!(
-                    "Timed out after 5 minutes waiting for {base_url}. \
-                     The local model may be cold-loading or stuck — \
-                     try again, or restart your local-LLM server."
+                    "Timed out after 10 minutes waiting for {base_url}. \
+                     The local model may be stuck — restart your \
+                     local-LLM server (e.g. `pkill ollama && ollama serve`)."
                 )
             } else if e.is_connect() {
                 anyhow!(

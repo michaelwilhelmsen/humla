@@ -446,6 +446,14 @@ export function Settings() {
               meetings. Cloud is faster and produces better summaries but sends
               the transcript to OpenAI.
             </p>
+            {s.summary_provider === "local" && (
+              <p className="text-xs text-[var(--color-text-muted)] mt-2">
+                Note: post-recording transcript polish is skipped on local —
+                it would otherwise regenerate the whole transcript and block
+                Ollama for several minutes. Whisper turbo's raw output is the
+                summary input.
+              </p>
+            )}
           </Row>
           {s.summary_provider === "openai" && (
             <Row label="Model">

@@ -1117,6 +1117,16 @@ async fn polish_transcript(app: AppHandle, note_id: String) -> anyhow::Result<()
             Ok(p) => p,
             Err(_) => return Ok(()),
         };
+        // Skip polish on local providers. Polish regenerates the entire
+        // transcript with edits, so on a 30-min meeting it's ~6,000 output
+        // tokens at ~30 tok/s = several minutes per call. That blocks the
+        // Ollama queue and makes the user-triggered Summarize wait behind
+        // it. Cloud OpenAI is fast enough that this isn't an issue.
+        // Whisper turbo's raw output is high-quality enough that skipping
+        // polish on local is an acceptable trade for not waiting.
+        if provider.base_url != openai::BASE {
+            return Ok(());
+        }
         let vocab = db::get_setting(&conn, "custom_vocabulary")?.unwrap_or_default();
         (provider, n.transcript.clone(), n.body.clone(), vocab)
     };
