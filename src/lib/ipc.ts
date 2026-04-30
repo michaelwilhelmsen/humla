@@ -124,6 +124,7 @@ export type PermissionsStatus = {
 
 export type TranscriptEvent = { noteId: string; text: string };
 export type SummaryEvent = { noteId: string; summary: string };
+export type StreamDeltaEvent = { noteId: string; delta: string };
 export type RecordingPhase = "idle" | "starting" | "recording" | "paused" | "stopping" | "diarizing" | "polishing" | "summarizing";
 export type SummaryProvider = "openai" | "local";
 export type RecordingStatus = { noteId: string | null; phase: RecordingPhase };
@@ -145,6 +146,12 @@ export function onTranscriptReplaced(cb: (e: TranscriptEvent) => void): Promise<
 }
 export function onSummary(cb: (e: SummaryEvent) => void): Promise<UnlistenFn> {
   return listen<SummaryEvent>("summary_ready", (e) => cb(e.payload));
+}
+export function onSummaryThinkingDelta(cb: (e: StreamDeltaEvent) => void): Promise<UnlistenFn> {
+  return listen<StreamDeltaEvent>("summary_thinking_delta", (e) => cb(e.payload));
+}
+export function onSummaryContentDelta(cb: (e: StreamDeltaEvent) => void): Promise<UnlistenFn> {
+  return listen<StreamDeltaEvent>("summary_content_delta", (e) => cb(e.payload));
 }
 export function onRecordingStatus(cb: (e: RecordingStatus) => void): Promise<UnlistenFn> {
   return listen<RecordingStatus>("recording_status", (e) => cb(e.payload));

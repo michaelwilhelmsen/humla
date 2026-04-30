@@ -136,6 +136,13 @@ pub struct SummaryPayload {
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct StreamDeltaPayload {
+    pub note_id: String,
+    pub delta: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ErrorPayload {
     pub note_id: Option<String>,
     pub message: String,

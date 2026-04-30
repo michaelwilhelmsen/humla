@@ -153,7 +153,7 @@ pub async fn summarize(
     system_prompt: &str,
     transcript: &str,
 ) -> Result<String> {
-    summarize_with_base(BASE, api_key, model, false, system_prompt, transcript).await
+    summarize_with_base(BASE, api_key, model, false, system_prompt, transcript, |_| {}).await
 }
 
 /// Same shape as `summarize` but takes an explicit base URL. Used to route
@@ -164,24 +164,35 @@ pub async fn summarize(
 ///
 /// `api_key` is forwarded as a bearer token regardless of base URL; local
 /// servers typically ignore it but Ollama accepts any non-empty string.
-pub async fn summarize_with_base(
+pub async fn summarize_with_base<F>(
     base_url: &str,
     api_key: &str,
     model: &str,
     think: bool,
     system_prompt: &str,
     transcript: &str,
-) -> Result<String> {
+    on_chunk: F,
+) -> Result<String>
+where
+    F: FnMut(StreamChunk) + Send,
+{
     let is_local = base_url != BASE;
     // For Ollama, route through the native /api/chat endpoint so we can
     // pass an explicit `think` flag and reliably control Qwen 3+'s
     // thinking mode. The OpenAI-compat endpoint renders the chat template
-    // internally and strips user-message /no_think directives.
+    // internally and strips user-message /no_think directives. The native
+    // path also streams, so the callback fires per-frame while the model
+    // works.
     if is_local {
         if let Some(native_base) = ollama_native_url(base_url) {
-            return ollama_native_chat(&native_base, model, think, system_prompt, transcript).await;
+            return ollama_native_chat(
+                &native_base, model, think, system_prompt, transcript, on_chunk,
+            )
+            .await;
         }
     }
+    // Cloud OpenAI-compat path is non-streaming; on_chunk is unused.
+    let _ = on_chunk;
     let req = ChatRequest {
         model,
         // Local OpenAI-compat servers accept temperature; reasoning-model
@@ -330,28 +341,46 @@ struct OllamaOptions {
     num_predict: i32,
 }
 
+// One JSON object per newline-delimited frame Ollama emits when stream:true.
+// Each frame's `message.thinking` and `message.content` carry the delta since
+// the previous frame; we accumulate content for the return value and forward
+// thinking deltas to the caller's callback for live UI rendering.
 #[derive(Deserialize)]
-struct OllamaChatResponse {
-    message: OllamaMessage,
+struct OllamaStreamChunk {
+    message: OllamaStreamMessage,
+    #[serde(default)]
+    done: bool,
 }
 
-#[derive(Deserialize)]
-struct OllamaMessage {
+#[derive(Deserialize, Default)]
+struct OllamaStreamMessage {
+    #[serde(default)]
     content: String,
-    // Ollama's `/api/chat` with think:true puts the reasoning here as a
-    // sibling of `content`. If we see thinking text but no content, the
-    // model spent its budget reasoning and never produced an answer.
     #[serde(default)]
     thinking: Option<String>,
 }
 
-async fn ollama_native_chat(
+/// Tagged delta for streaming summary callbacks. `Thinking` is the model's
+/// reasoning trace (only emitted when think:true); `Content` is the actual
+/// answer being assembled. Caller decides what to do with each kind — most
+/// commonly emit Tauri events for live UI rendering.
+#[derive(Clone, Copy, Debug)]
+pub enum StreamChunk<'a> {
+    Thinking(&'a str),
+    Content(&'a str),
+}
+
+async fn ollama_native_chat<F>(
     native_base: &str,
     model: &str,
     think: bool,
     system_prompt: &str,
     user_message: &str,
-) -> Result<String> {
+    mut on_chunk: F,
+) -> Result<String>
+where
+    F: FnMut(StreamChunk) + Send,
+{
     let url = format!("{native_base}/chat");
     let req = OllamaChatRequest {
         model,
@@ -359,7 +388,7 @@ async fn ollama_native_chat(
             ChatMessage { role: "system", content: system_prompt },
             ChatMessage { role: "user", content: user_message },
         ],
-        stream: false,
+        stream: true,
         think,
         options: OllamaOptions {
             temperature: 0.2,
@@ -372,7 +401,7 @@ async fn ollama_native_chat(
     };
     let started = std::time::Instant::now();
     eprintln!(
-        "[llm] POST {url} (ollama-native) model={model} think={think} system_chars={} user_chars={}",
+        "[llm] POST {url} (ollama-native, streaming) model={model} think={think} system_chars={} user_chars={}",
         system_prompt.len(),
         user_message.len()
     );
@@ -401,24 +430,59 @@ async fn ollama_native_chat(
         eprintln!("[llm] ollama error body: {body}");
         return Err(anyhow!("HTTP {status} from {url}: {body}"));
     }
-    let body_text = r.text().await?;
-    let body: OllamaChatResponse = match serde_json::from_str(&body_text) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!(
-                "[llm] could not parse ollama response: {e}\n[llm] body (first 500 chars): {}",
-                &body_text.chars().take(500).collect::<String>()
-            );
-            return Err(anyhow!("unexpected response shape from {url}: {e}"));
+
+    // Ollama streams newline-delimited JSON. Each chunk frame can land at any
+    // byte boundary, so we accumulate into a buffer and parse on '\n'. Each
+    // frame's content/thinking fields are *deltas* — we accumulate content
+    // for the return value and forward thinking to the caller's callback.
+    use futures_util::StreamExt;
+    let mut byte_stream = r.bytes_stream();
+    let mut buf = String::new();
+    let mut content = String::new();
+    let mut thinking_chars: usize = 0;
+    let mut chunks_seen: usize = 0;
+
+    while let Some(chunk_res) = byte_stream.next().await {
+        let bytes = chunk_res.map_err(|e| anyhow!("stream read: {e}"))?;
+        // Lossy is fine — Ollama's frames are ASCII/UTF-8 JSON; if a multibyte
+        // character spans frames the next chunk will replay the prefix.
+        buf.push_str(&String::from_utf8_lossy(&bytes));
+        while let Some(idx) = buf.find('\n') {
+            let line: String = buf.drain(..=idx).collect();
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let frame: OllamaStreamChunk = match serde_json::from_str(line) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("[llm] could not parse stream frame: {e}\n[llm] frame: {line}");
+                    return Err(anyhow!("unexpected stream frame from {url}: {e}"));
+                }
+            };
+            chunks_seen += 1;
+            if let Some(t) = frame.message.thinking.as_deref() {
+                if !t.is_empty() {
+                    thinking_chars += t.len();
+                    on_chunk(StreamChunk::Thinking(t));
+                }
+            }
+            if !frame.message.content.is_empty() {
+                content.push_str(&frame.message.content);
+                on_chunk(StreamChunk::Content(&frame.message.content));
+            }
+            if frame.done {
+                break;
+            }
         }
-    };
-    let content = body.message.content;
-    let thinking_chars = body.message.thinking.as_deref().map(str::len).unwrap_or(0);
+    }
+
     eprintln!(
-        "[llm] ollama success in {:?}, content {} chars, thinking {} chars",
+        "[llm] ollama success in {:?}, content {} chars, thinking {} chars, frames {}",
         started.elapsed(),
         content.len(),
-        thinking_chars
+        thinking_chars,
+        chunks_seen
     );
     if content.trim().is_empty() {
         if thinking_chars > 0 {

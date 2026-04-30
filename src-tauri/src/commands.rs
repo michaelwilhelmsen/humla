@@ -4,7 +4,7 @@ use crate::openai;
 use crate::local_whisper;
 use crate::presets;
 use crate::wav;
-use crate::recording::{ChunkRecord, DiagnosticPayload, ErrorPayload, Inflight, Phase, RecordingStatus, SidecarEvent, SummaryPayload, TranscriptPayload};
+use crate::recording::{ChunkRecord, DiagnosticPayload, ErrorPayload, Inflight, Phase, RecordingStatus, SidecarEvent, StreamDeltaPayload, SummaryPayload, TranscriptPayload};
 use crate::AppState;
 use futures_util::StreamExt;
 use std::path::PathBuf;
@@ -1175,6 +1175,7 @@ async fn polish_transcript(app: AppHandle, note_id: String) -> anyhow::Result<()
         provider.think,
         DEFAULT_POLISH_PROMPT,
         &user_message,
+        |_| {}, // polish never runs on local, no streaming UI
     )
     .await?;
     let polished = polished.trim().to_string();
@@ -1251,6 +1252,12 @@ async fn run_summary(app: AppHandle, note_id: String) -> anyhow::Result<()> {
     // Hard language directive in case the prompt was authored in a different
     // language than the user has now chosen.
     let full_prompt = format!("{prompt}\n\n{}", language_directive(&language));
+    // Stream thinking + content deltas to the frontend so the user sees
+    // the model working in real time. Especially valuable when think=true
+    // on Qwen 3.5+ — without live feedback users wait minutes wondering if
+    // it's stuck.
+    let app_for_stream = app.clone();
+    let note_for_stream = note_id.clone();
     let summary = openai::summarize_with_base(
         &provider.base_url,
         &provider.api_key,
@@ -1258,6 +1265,26 @@ async fn run_summary(app: AppHandle, note_id: String) -> anyhow::Result<()> {
         provider.think,
         &full_prompt,
         &user_message,
+        move |chunk| match chunk {
+            openai::StreamChunk::Thinking(t) => {
+                let _ = app_for_stream.emit(
+                    "summary_thinking_delta",
+                    StreamDeltaPayload {
+                        note_id: note_for_stream.clone(),
+                        delta: t.to_string(),
+                    },
+                );
+            }
+            openai::StreamChunk::Content(c) => {
+                let _ = app_for_stream.emit(
+                    "summary_content_delta",
+                    StreamDeltaPayload {
+                        note_id: note_for_stream.clone(),
+                        delta: c.to_string(),
+                    },
+                );
+            }
+        },
     )
     .await?;
     let state: State<AppState> = app.state();

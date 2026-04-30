@@ -2,7 +2,7 @@ import { useParams } from "react-router-dom";
 import { useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { ipc, type Note as TNote } from "../lib/ipc";
+import { ipc, onSummaryThinkingDelta, onSummaryContentDelta, type Note as TNote } from "../lib/ipc";
 import { useNotesStore, useRecordingStore } from "../lib/store";
 import { RecordingBar } from "../components/RecordingBar";
 import { SkeletonLines } from "../components/Skeleton";
@@ -36,6 +36,12 @@ export function Note() {
   const [draft, setDraft] = useState<TNote | null>(null);
   const [uiLang, setUiLang] = useState<string>("no");
   const [globalProvider, setGlobalProvider] = useState<string>("openai");
+  // Live reasoning + content streamed from the local LLM. Cleared each time a
+  // new summarize starts and again when the summary lands. Scoped by note id
+  // so a delta from a different note's run doesn't leak into this view.
+  const [thinkingStream, setThinkingStream] = useState<string>("");
+  const [contentStream, setContentStream] = useState<string>("");
+  const [thinkingExpanded, setThinkingExpanded] = useState<boolean>(true);
   const saveTimer = useRef<number | null>(null);
 
   useEffect(() => {
@@ -65,6 +71,45 @@ export function Note() {
   const isDiarizing = isThisNoteActive && recPhase.phase === "diarizing";
   const isPolishing = isThisNoteActive && recPhase.phase === "polishing";
   const isSummarizing = isThisNoteActive && recPhase.phase === "summarizing";
+
+  // Subscribe once per note id. Only append a delta if it belongs to this
+  // note — defensive in case multiple summary calls are interleaved.
+  useEffect(() => {
+    if (!id) return;
+    const unsubs: (() => void)[] = [];
+    onSummaryThinkingDelta((e) => {
+      if (e.noteId === id) setThinkingStream((s) => s + e.delta);
+    }).then((u) => unsubs.push(u));
+    onSummaryContentDelta((e) => {
+      if (e.noteId === id) setContentStream((s) => s + e.delta);
+    }).then((u) => unsubs.push(u));
+    return () => unsubs.forEach((u) => u());
+  }, [id]);
+
+  // Reset the streams when a new summarize starts (phase transitions to
+  // summarizing) and again when it ends — keeps stale text from sticking.
+  useEffect(() => {
+    if (isSummarizing) {
+      setThinkingStream("");
+      setContentStream("");
+      setThinkingExpanded(true);
+    }
+  }, [isSummarizing]);
+
+  // Once the saved summary lands, fold the reasoning panel away. Users can
+  // still re-expand it from the header to inspect the trace.
+  const summaryText = draft?.summary ?? "";
+  useEffect(() => {
+    if (summaryText.trim().length > 0) setThinkingExpanded(false);
+  }, [summaryText]);
+
+  // Auto-scroll the reasoning panel to the latest chunk so users see the
+  // model thinking live without having to chase the scrollbar themselves.
+  const reasoningRef = useRef<HTMLPreElement | null>(null);
+  useEffect(() => {
+    const el = reasoningRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [thinkingStream]);
 
   // Always pull summary updates from the store. Pull transcript updates only
   // while a recording, diarization, or polish is in flight — otherwise our
@@ -194,9 +239,41 @@ export function Note() {
         {showSummarySection && (
           <Card className="mt-8">
             <h2 className="nd-label mb-4">Summary</h2>
+            {/* Live reasoning trace: shown while the model is thinking.
+                Auto-scrolls; collapsible via the header. Once the final
+                summary lands the panel stays available but starts
+                collapsed so it doesn't dominate. */}
+            {(thinkingStream.length > 0 || (isSummarizing && contentStream.length === 0)) && (
+              <div className="mb-4 rounded-md border border-[var(--color-line)] bg-[var(--color-surface-raised)]">
+                <button
+                  type="button"
+                  onClick={() => setThinkingExpanded((v) => !v)}
+                  className="w-full flex items-center justify-between px-3 py-2 text-xs text-[var(--color-text-muted)]"
+                >
+                  <span>
+                    {thinkingExpanded ? "▾" : "▸"} Reasoning
+                    {thinkingStream.length > 0 && ` · ${thinkingStream.length.toLocaleString()} chars`}
+                    {isSummarizing && thinkingStream.length === 0 && " · waiting for the model…"}
+                  </span>
+                </button>
+                {thinkingExpanded && thinkingStream.length > 0 && (
+                  <pre
+                    ref={reasoningRef}
+                    className="px-3 pb-3 text-xs leading-relaxed font-mono text-[var(--color-text-muted)] whitespace-pre-wrap break-words max-h-64 overflow-y-auto"
+                  >
+                    {thinkingStream}
+                  </pre>
+                )}
+              </div>
+            )}
             {hasSummary ? (
               <div className="prose-summary text-base leading-relaxed">
                 <ReactMarkdown remarkPlugins={[remarkGfm]}>{draft.summary}</ReactMarkdown>
+              </div>
+            ) : contentStream.length > 0 ? (
+              // Content is streaming in — render markdown live as it arrives.
+              <div className="prose-summary text-base leading-relaxed">
+                <ReactMarkdown remarkPlugins={[remarkGfm]}>{contentStream}</ReactMarkdown>
               </div>
             ) : (
               <SkeletonLines lines={5} />
