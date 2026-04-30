@@ -104,6 +104,7 @@ export const ipc = {
   recordingResume: () => invoke<void>("recording_resume"),
   recordingState: () => invoke<"idle" | "recording">("recording_state"),
   summarizeNote: (noteId: string) => invoke<void>("summarize_note", { noteId }),
+  polishNote: (noteId: string) => invoke<void>("polish_note", { noteId }),
 
   permissionsStatus: () => invoke<PermissionsStatus>("permissions_status"),
   permissionsRequest: (kind: PermissionKind) => invoke<PermissionsStatus>("permissions_request", { kind }),

@@ -252,6 +252,19 @@ pub fn append_transcript(conn: &Connection, id: &str, text: &str, separator: &st
     Ok(current)
 }
 
+/// Replace the note's transcript with `text`. Used by the offline
+/// diarization step to rewrite a chunk-by-chunk transcript with
+/// `Speaker N:` prefixes once the full audio has been clustered, and by
+/// the polish step which regenerates the whole transcript at once.
+pub fn set_transcript(conn: &Connection, id: &str, text: &str) -> Result<()> {
+    let now = now_ms();
+    conn.execute(
+        "UPDATE notes SET transcript = ?1, updated_at = ?2 WHERE id = ?3",
+        params![text, now, id],
+    )?;
+    Ok(())
+}
+
 pub fn delete_note(conn: &Connection, id: &str) -> Result<()> {
     conn.execute("DELETE FROM notes WHERE id = ?1", params![id])?;
     Ok(())

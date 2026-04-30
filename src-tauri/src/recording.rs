@@ -82,22 +82,19 @@ pub struct RecordingSession {
     // Whisper's `initial_prompt` for every chunk so decoding stays anchored
     // to the conversation rather than treating each chunk as a cold start.
     pub trail: Arc<Mutex<TranscriptTrail>>,
-    // Per-chunk metadata. Retained for diagnostic / future hybrid use;
-    // current live-diarization path doesn't read it.
+    // Per-chunk metadata. Read by the offline diarization pass on
+    // recording_stop to align FluidAudio's speaker segments back to the
+    // chunks the user saw stream in.
     pub chunk_log: Arc<Mutex<Vec<ChunkRecord>>>,
-    // Path to the full-recording WAV file. Currently unused (live
-    // diarization classifies per-chunk), but kept around in case we ever
-    // want a stop-time correction pass.
+    // Path to the full-recording WAV file. Consumed by the offline
+    // diarization pass on stop, then deleted alongside the temp dir.
     pub full_wav_path: Arc<Mutex<Option<PathBuf>>>,
-    // Maps FluidAudio's stable speaker_id (e.g. "1", "2") to a 1-indexed
-    // display number assigned in first-encounter order. Cleared on
-    // recording_start. Used by the live-diarization path to render
-    // "Speaker 1: " / "Speaker 2: " prefixes consistently across chunks.
-    pub speaker_display: Arc<Mutex<std::collections::HashMap<String, u32>>>,
-    // The speaker_id of the last committed chunk. Used to decide whether
-    // a new chunk continues the current speaker (just append) or starts
-    // a new turn (newline + "Speaker N: " prefix). None at start.
-    pub last_speaker: Arc<Mutex<Option<String>>>,
+    // Snapshot of the note's transcript at recording_start. Used by the
+    // offline diarization step to prepend prior content to this session's
+    // diarized output, so resuming a recording adds to the transcript
+    // instead of clobbering it. Empty string means "fresh recording, no
+    // prior content."
+    pub transcript_at_start: Arc<Mutex<String>>,
 }
 
 #[derive(Clone, Serialize)]

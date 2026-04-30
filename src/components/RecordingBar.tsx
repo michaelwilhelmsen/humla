@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Circle, Pause, Play, Square, Sparkles } from "lucide-react";
+import { Circle, Pause, Play, Square, Sparkles, Wand2 } from "lucide-react";
 import { ipc } from "../lib/ipc";
 import { useNotesStore, useRecordingStore } from "../lib/store";
 import { cn } from "../lib/cn";
@@ -55,6 +55,13 @@ export function RecordingBar({ noteId }: { noteId: string }) {
       useRecordingStore.getState().pushError({ noteId, message: String(e) });
     }
   }
+  async function polish() {
+    try {
+      await ipc.polishNote(noteId);
+    } catch (e) {
+      useRecordingStore.getState().pushError({ noteId, message: String(e) });
+    }
+  }
 
   const otherNoteRecording = status.noteId !== null && !isThisNote;
 
@@ -85,6 +92,16 @@ export function RecordingBar({ noteId }: { noteId: string }) {
           </button>
           {hasTranscript && (
             <button
+              onClick={polish}
+              className="nd-action no-drag"
+              title="Re-run polish (typo + punctuation cleanup) on the saved transcript"
+            >
+              <Wand2 size={13} strokeWidth={1.5} />
+              <span>Polish</span>
+            </button>
+          )}
+          {hasTranscript && (
+            <button
               onClick={summarize}
               className="nd-action no-drag"
               title="Summarize transcript"
@@ -98,6 +115,8 @@ export function RecordingBar({ noteId }: { noteId: string }) {
 
       {phase === "starting" && <BusyPill label="Starting" />}
       {phase === "stopping" && <BusyPill label="Stopping" />}
+      {phase === "diarizing" && <BusyPill label="Diarizing" />}
+      {phase === "polishing" && <BusyPill label="Polishing" />}
       {phase === "summarizing" && <BusyPill label="Summarizing" />}
 
       {(phase === "recording" || phase === "paused") && (

@@ -25,35 +25,42 @@ struct Preset {
     en: &'static str,
 }
 
+// Minimal presets — two constraints only: kind of summary + language.
+// Source labels stay because the user message uses them; the parenthetical
+// "(brukerens)" / "(automatisk)" implicitly tells the model which to trust
+// on conflict, so we drop the explicit rule. No section list, no "real
+// content only" — let the model pick a structure that fits the input.
+// Voice memo carries one extra constraint ("Behold brukerens stemme") because
+// preserving tone is the *purpose* of that preset.
 const ALL: &[Preset] = &[
     Preset {
         value: "meeting",
-        no: "Du lager møtenotater fra [Notater] (skrevet av brukeren) og [Transkripsjon] (automatisk, kan ha feil). Stol på Notater ved konflikt.\n\nSkriv på norsk i Markdown. Bare disse seksjonene, og bare når de har reelt innhold:\n\n- **Sammendrag** — 2–4 setninger.\n- **Beslutninger** — bullets.\n- **Handlingspunkter** — \"Beskrivelse — Ansvarlig (frist hvis nevnt)\".\n- **Åpne spørsmål** — bullets.",
-        en: "You produce meeting notes from [Notater] (written by the user) and [Transkripsjon] (auto, may have errors). Trust Notater on conflict.\n\nReply in {LANGUAGE} using Markdown. Only these sections, and only when they have real content:\n\n- **Summary** — 2–4 sentences.\n- **Decisions** — bullets.\n- **Action items** — \"Description — Owner (due date if stated)\".\n- **Open questions** — bullets.",
+        no: "Du lager møtenotater fra [Notater] (brukerens) og [Transkripsjon] (automatisk). Skriv på norsk i Markdown.",
+        en: "You produce meeting notes from [Notater] (user-written) and [Transkripsjon] (auto). Reply in {LANGUAGE} using Markdown.",
     },
     Preset {
         value: "one_on_one",
-        no: "Du lager notater fra en 1:1-samtale fra [Notater] (skrevet av brukeren) og [Transkripsjon] (automatisk, kan ha feil). Stol på Notater ved konflikt.\n\nSkriv på norsk i Markdown. Bare disse seksjonene, og bare når de har reelt innhold:\n\n- **Hovedtemaer** — 2–5 bullets.\n- **Tilbakemeldinger** — gitt eller mottatt.\n- **Avtalt oppfølging** — \"Beskrivelse — Ansvarlig (frist hvis nevnt)\".\n- **Stemning/observasjoner** — kort, kun hvis tydelig.",
-        en: "You produce 1:1 notes from [Notater] (written by the user) and [Transkripsjon] (auto, may have errors). Trust Notater on conflict.\n\nReply in {LANGUAGE} using Markdown. Only these sections, and only when they have real content:\n\n- **Main themes** — 2–5 bullets.\n- **Feedback** — given or received.\n- **Agreed follow-ups** — \"Description — Owner (due date if stated)\".\n- **Mood/observations** — brief, only if clear.",
+        no: "Du lager notater fra en 1:1-samtale fra [Notater] (brukerens) og [Transkripsjon] (automatisk). Skriv på norsk i Markdown.",
+        en: "You produce 1:1 notes from [Notater] (user-written) and [Transkripsjon] (auto). Reply in {LANGUAGE} using Markdown.",
     },
     Preset {
         value: "lecture",
-        no: "Du lager studienotater fra [Notater] (skrevet av brukeren) og [Transkripsjon] (automatisk, kan ha feil). Stol på Notater ved konflikt.\n\nSkriv på norsk i Markdown. Bare disse seksjonene, og bare når de har reelt innhold:\n\n- **Hovedbudskap** — 1–3 setninger.\n- **Sentrale punkter** — bullets.\n- **Begreper og definisjoner**.\n- **Eksempler**.\n- **Spørsmål til videre studie**.",
-        en: "You produce study notes from [Notater] (written by the user) and [Transkripsjon] (auto, may have errors). Trust Notater on conflict.\n\nReply in {LANGUAGE} using Markdown. Only these sections, and only when they have real content:\n\n- **Key takeaways** — 1–3 sentences.\n- **Main points** — bullets.\n- **Terms and definitions**.\n- **Examples**.\n- **Questions for further study**.",
+        no: "Du lager studienotater fra [Notater] (brukerens) og [Transkripsjon] (automatisk). Skriv på norsk i Markdown.",
+        en: "You produce study notes from [Notater] (user-written) and [Transkripsjon] (auto). Reply in {LANGUAGE} using Markdown.",
     },
     Preset {
         value: "interview",
-        no: "Du lager intervjunotater fra [Notater] (skrevet av brukeren) og [Transkripsjon] (automatisk, kan ha feil). Stol på Notater ved konflikt.\n\nSkriv på norsk i Markdown. Bare disse seksjonene, og bare når de har reelt innhold:\n\n- **Kort oppsummering** — 2–3 setninger.\n- **Sentrale svar** — gruppert etter tema; korte sitater i kursiv hvis viktige.\n- **Tematiske observasjoner**.\n- **Oppfølgingsspørsmål**.",
-        en: "You produce interview notes from [Notater] (written by the user) and [Transkripsjon] (auto, may have errors). Trust Notater on conflict.\n\nReply in {LANGUAGE} using Markdown. Only these sections, and only when they have real content:\n\n- **Short summary** — 2–3 sentences.\n- **Key responses** — grouped by theme; short direct quotes in italics when important.\n- **Thematic observations**.\n- **Follow-up questions**.",
+        no: "Du lager intervjunotater fra [Notater] (brukerens) og [Transkripsjon] (automatisk). Skriv på norsk i Markdown.",
+        en: "You produce interview notes from [Notater] (user-written) and [Transkripsjon] (auto). Reply in {LANGUAGE} using Markdown.",
     },
     Preset {
         value: "brainstorm",
-        no: "Du oppsummerer en idémyldring fra [Notater] (skrevet av brukeren) og [Transkripsjon] (automatisk, kan ha feil). Stol på Notater ved konflikt.\n\nSkriv på norsk i Markdown. Inkluder alle ideene, også de som ble forkastet. Bare disse seksjonene, og bare når de har reelt innhold:\n\n- **Tema**.\n- **Ideer** — bullets, grupper relaterte ideer.\n- **Vurdering** — hva ble valgt eller forkastet, og hvorfor.\n- **Neste steg**.",
-        en: "You summarize a brainstorm from [Notater] (written by the user) and [Transkripsjon] (auto, may have errors). Trust Notater on conflict.\n\nReply in {LANGUAGE} using Markdown. Include every idea — even rejected ones. Only these sections, and only when they have real content:\n\n- **Topic**.\n- **Ideas** — bullets, group related ones.\n- **Evaluation** — what was chosen or rejected, and why.\n- **Next steps**.",
+        no: "Du oppsummerer en idémyldring fra [Notater] (brukerens) og [Transkripsjon] (automatisk). Skriv på norsk i Markdown.",
+        en: "You summarize a brainstorm from [Notater] (user-written) and [Transkripsjon] (auto). Reply in {LANGUAGE} using Markdown.",
     },
     Preset {
         value: "voice_memo",
-        no: "Du rydder opp i et stemmenotat fra [Notater] (skrevet av brukeren) og [Transkripsjon] (automatisk, kan ha feil). Stol på Notater ved konflikt.\n\nSkriv på norsk i Markdown. Behold brukerens stemme. Strukturen kan være enkel — bullets eller korte avsnitt etter behov.",
-        en: "You clean up a voice memo from [Notater] (written by the user) and [Transkripsjon] (auto, may have errors). Trust Notater on conflict.\n\nReply in {LANGUAGE} using Markdown. Preserve the user's voice. Structure can be simple — bullets or short paragraphs as needed.",
+        no: "Du rydder opp i et stemmenotat fra [Notater] (brukerens) og [Transkripsjon] (automatisk). Behold brukerens stemme. Skriv på norsk i Markdown.",
+        en: "You clean up a voice memo from [Notater] (user-written) and [Transkripsjon] (auto). Preserve the user's voice. Reply in {LANGUAGE} using Markdown.",
     },
 ];

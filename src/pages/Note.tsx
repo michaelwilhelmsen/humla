@@ -688,21 +688,31 @@ function TranscriptEditor({
   const [editing, setEditing] = useState(false);
   const taRef = useRef<HTMLTextAreaElement | null>(null);
 
-  // Auto-size the textarea while in edit mode.
+  // Auto-size the textarea on every keystroke. MUST be its own effect with
+  // only `value` in deps — folding focus/setSelectionRange into the same
+  // effect resets the cursor to the end every time the user types one
+  // character (because the effect re-runs on each value change).
   useEffect(() => {
     if (!editing) return;
     const el = taRef.current;
     if (!el) return;
     el.style.height = "auto";
     el.style.height = el.scrollHeight + "px";
-    // preventScroll so the browser doesn't yank the viewport when the
-    // textarea takes focus — the user clicked here, they don't want to
-    // be teleported. Cursor parks at end (could be smarter — map click
-    // position to character index — but good enough for v1).
+  }, [editing, value]);
+
+  // Focus + park cursor at end ONLY on the editing-mode transition. No
+  // `value` dependency — re-running this on each keystroke is what caused
+  // the cursor to jump to the end after every typed character.
+  // preventScroll keeps the viewport from yanking when the textarea takes
+  // focus.
+  useEffect(() => {
+    if (!editing) return;
+    const el = taRef.current;
+    if (!el) return;
     el.focus({ preventScroll: true });
     const len = el.value.length;
     el.setSelectionRange(len, len);
-  }, [editing, value]);
+  }, [editing]);
 
   // Force the styled-view path while a recording is in flight — we don't
   // want the user typing into a transcript that the backend is about to

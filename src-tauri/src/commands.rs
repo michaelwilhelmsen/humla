@@ -199,27 +199,12 @@ pub async fn diarize_status(app: AppHandle) -> Result<diarize::ModelStatus, Stri
 }
 
 #[tauri::command]
-pub async fn diarize_download(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
-    diarize::download(&app).await.map_err(err)?;
-    // Once the model is on disk, prewarm the streaming sidecar so it's
-    // already running for the user's next recording instead of a fresh
-    // 1–2 s spin-up at recording_start.
-    let stream_arc = state.diarize_stream.clone();
-    let app_for_warm = app.clone();
-    tokio::spawn(async move {
-        diarize::ensure_streaming_running(&app_for_warm, &stream_arc).await;
-    });
-    Ok(())
+pub async fn diarize_download(app: AppHandle) -> Result<(), String> {
+    diarize::download(&app).await.map_err(err)
 }
 
 #[tauri::command]
-pub async fn diarize_delete(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
-    // Shut down the streaming sidecar before wiping the model directory —
-    // the live process might be holding model files open via the loaded
-    // CoreML context, and we don't want a half-deleted state.
-    if let Some(d) = state.diarize_stream.lock().await.take() {
-        d.shutdown().await;
-    }
+pub async fn diarize_delete(app: AppHandle) -> Result<(), String> {
     diarize::delete(&app).await.map_err(err)
 }
 
@@ -593,33 +578,21 @@ pub async fn recording_start(
         s.trail.lock().clear();
         s.chunk_log.lock().clear();
         *s.full_wav_path.lock() = None;
-        s.speaker_display.lock().clear();
-        *s.last_speaker.lock() = None;
     }
 
-    // Live diarization: the streaming sidecar is spawned at app launch
-    // (and after a successful model download), so usually it's already
-    // warm by the time we get here. Reset its speaker memory so a fresh
-    // recording doesn't get matched against the previous meeting's
-    // voices. If the sidecar isn't running yet (model wasn't downloaded
-    // at app start, or the prewarm task is still in flight), spin it up
-    // now in the background — first few chunks may land unprefixed but
-    // subsequent ones tag correctly.
+    // Snapshot any existing transcript so diarize_and_apply can prepend it
+    // to this session's output. Resuming a recording on a note that already
+    // has transcript content adds to it; starting on a blank note produces
+    // the snapshot "" and behaves like a fresh recording.
     {
         let state: State<AppState> = app.state();
-        let stream_arc = state.diarize_stream.clone();
-        let app_for_diarize = app.clone();
-        tokio::spawn(async move {
-            let mut guard = stream_arc.lock().await;
-            if let Some(d) = guard.as_mut() {
-                if let Err(e) = d.reset().await {
-                    eprintln!("streaming diarize reset: {e}");
-                }
-            } else {
-                drop(guard);
-                diarize::ensure_streaming_running(&app_for_diarize, &stream_arc).await;
-            }
-        });
+        let existing = {
+            let conn = state.db.lock();
+            db::get_note(&conn, &note_id)
+                .map(|n| n.transcript)
+                .unwrap_or_default()
+        };
+        *state.recording.lock().transcript_at_start.lock() = existing;
     }
 
     let app_clone = app.clone();
@@ -767,20 +740,26 @@ pub async fn recording_stop(
     };
     let _ = tokio::time::timeout(std::time::Duration::from_secs(30), drain).await;
 
-    // The streaming diarize sidecar is NOT torn down here — it stays
-    // alive across recordings so the next recording's chunks tag
-    // immediately. recording_start sends a `reset` command to wipe the
-    // SpeakerManager between sessions. The sidecar exits when the app
-    // does (parent-death watchdog OR drop semantics).
-
     // Spawn the post-stop processing chain in the background:
-    //   Stopping → Polishing → Idle
-    // Diarization happens live during recording; polish picks up the
-    // already-tagged transcript and gets a strict "preserve speaker
-    // labels" rule.
+    //   Stopping → Diarizing → Polishing → Idle
+    // Diarization runs offline on the full recording so FluidAudio can
+    // cluster across the entire audio at once (per-chunk classification
+    // drifted on long recordings). Polish picks up the now-diarized
+    // transcript and gets a strict "preserve speaker labels" rule.
     let app_for_post = app.clone();
     let note_for_post = note_id.clone();
     tokio::spawn(async move {
+        if let Err(e) = diarize_and_apply(app_for_post.clone(), note_for_post.clone()).await {
+            // Non-fatal: a diarize failure leaves the plain transcript
+            // intact. Log + surface a soft toast so the user knows why
+            // they don't see speaker labels.
+            eprintln!("diarize_and_apply: {e}");
+            emit_error(
+                &app_for_post,
+                Some(&note_for_post),
+                &format!("Diarization failed (transcript still saved): {e}"),
+            );
+        }
         if let Err(e) = polish_transcript(app_for_post.clone(), note_for_post.clone()).await {
             eprintln!("polish_transcript: {e}");
             emit_error(
@@ -800,6 +779,210 @@ pub async fn recording_stop(
         });
     }
     Ok(())
+}
+
+/// Run offline speaker diarization on the just-finished recording and
+/// rewrite the transcript with `Speaker N:` prefixes. Resumed recordings
+/// prepend the snapshotted prior transcript and offset this session's
+/// speaker numbers past any existing `Speaker N:` labels so the two halves
+/// don't share IDs (diarization can't unify speakers across independent
+/// sessions without seeing the combined audio). No-ops gracefully when
+/// the diarize model isn't downloaded, when the full-recording WAV isn't
+/// available, or when no chunks were captured.
+async fn diarize_and_apply(app: AppHandle, note_id: String) -> anyhow::Result<()> {
+    // Pull session state with cloning so we can drop the parking_lot
+    // guards before the long await on the sidecar.
+    let (wav_path, chunks, snapshot): (Option<PathBuf>, Vec<ChunkRecord>, String) = {
+        let state: State<AppState> = app.state();
+        let session = state.recording.lock();
+        let wav = session.full_wav_path.lock().clone();
+        let log = session.chunk_log.lock().clone();
+        let snap = session.transcript_at_start.lock().clone();
+        (wav, log, snap)
+    };
+    let Some(wav) = wav_path else {
+        eprintln!("diarize: no full.wav captured, skipping");
+        return Ok(());
+    };
+    if chunks.is_empty() {
+        eprintln!("diarize: no chunks captured, skipping");
+        return Ok(());
+    }
+    // Skip silently when the model isn't downloaded — diarization is
+    // optional and the user might not have grabbed the model yet.
+    match diarize::status(&app).await {
+        Ok(s) if s.downloaded => {}
+        _ => {
+            eprintln!("diarize: model not downloaded, skipping");
+            return Ok(());
+        }
+    }
+
+    emit_status(&app, Some(&note_id), Phase::Diarizing);
+    let segments = diarize::diarize_file(&app, &wav).await?;
+    if segments.is_empty() {
+        eprintln!("diarize: no segments returned, leaving transcript untagged");
+        return Ok(());
+    }
+
+    let new_session = build_diarized_transcript(&chunks, &segments);
+    let combined = combine_with_snapshot(&snapshot, &new_session);
+    if combined.trim().is_empty() {
+        return Ok(());
+    }
+    {
+        let state: State<AppState> = app.state();
+        let conn = state.db.lock();
+        db::set_transcript(&conn, &note_id, &combined)?;
+    }
+    let _ = app.emit(
+        "transcript_replaced",
+        TranscriptPayload {
+            note_id: note_id.clone(),
+            text: combined,
+        },
+    );
+
+    // Free the full.wav ahead of the temp-dir cleanup. Best-effort.
+    diarize::cleanup_full_wav(&wav).await;
+    Ok(())
+}
+
+/// Stitch the prior transcript snapshot to a freshly diarized session.
+/// When the snapshot is empty, the new text wins outright. When both have
+/// content, this offsets the new session's `Speaker N:` numbers past the
+/// highest one already in the snapshot (so a resume doesn't collide
+/// "Speaker 1" from session 1 with a different "Speaker 1" from session 2)
+/// and joins them with a newline.
+fn combine_with_snapshot(snapshot: &str, new_session: &str) -> String {
+    let snap_trimmed = snapshot.trim_end();
+    if snap_trimmed.is_empty() {
+        return new_session.to_string();
+    }
+    let new_trimmed = new_session.trim();
+    if new_trimmed.is_empty() {
+        return snap_trimmed.to_string();
+    }
+    let offset = max_speaker_number(snap_trimmed);
+    let offset_new = if offset > 0 {
+        offset_speaker_numbers(new_trimmed, offset)
+    } else {
+        new_trimmed.to_string()
+    };
+    format!("{snap_trimmed}\n{offset_new}")
+}
+
+/// Highest N appearing in any line that starts with `Speaker N:`. Returns
+/// 0 when none are found — useful for "should we offset?" checks.
+fn max_speaker_number(text: &str) -> u32 {
+    let mut max = 0u32;
+    for line in text.lines() {
+        if let Some(rest) = line.trim_start().strip_prefix("Speaker ") {
+            // Read digits up to the colon; "Speaker 12: foo" → 12.
+            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(n) = digits.parse::<u32>() {
+                if n > max {
+                    max = n;
+                }
+            }
+        }
+    }
+    max
+}
+
+/// Rewrite `Speaker N:` line prefixes by adding `offset` to every N. Only
+/// touches the literal pattern we emit ourselves (`^Speaker \d+: `), so
+/// renamed speakers ("Michael:", "Wilma:") stay untouched and free text
+/// that happens to contain "Speaker 1" mid-sentence isn't rewritten.
+fn offset_speaker_numbers(text: &str, offset: u32) -> String {
+    let mut out = String::with_capacity(text.len());
+    for (i, line) in text.lines().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        if let Some(rest) = line.strip_prefix("Speaker ") {
+            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            let after_digits = &rest[digits.len()..];
+            if !digits.is_empty() && after_digits.starts_with(": ") {
+                if let Ok(n) = digits.parse::<u32>() {
+                    out.push_str(&format!("Speaker {}{}", n + offset, after_digits));
+                    continue;
+                }
+            }
+        }
+        out.push_str(line);
+    }
+    out
+}
+
+/// Map a chunk's start time to a speaker_id by checking which segment
+/// contains it; falls back to the closest segment by edge distance when
+/// the chunk lands in a gap (silence between turns, or before/after the
+/// segmented region). Returns None only when `segments` is empty.
+fn assign_speaker<'a>(chunk_start_ms: u64, segments: &'a [diarize::Segment]) -> Option<&'a str> {
+    for seg in segments {
+        if chunk_start_ms >= seg.start_ms && chunk_start_ms < seg.end_ms {
+            return Some(&seg.speaker_id);
+        }
+    }
+    segments
+        .iter()
+        .min_by_key(|s| {
+            if chunk_start_ms < s.start_ms {
+                s.start_ms - chunk_start_ms
+            } else {
+                chunk_start_ms.saturating_sub(s.end_ms)
+            }
+        })
+        .map(|s| s.speaker_id.as_str())
+}
+
+/// Rebuild the transcript with `Speaker N:` prefixes by walking the chunk
+/// log and assigning each chunk to a segment-derived speaker. Display
+/// numbers are 1-indexed in first-encounter order, matching what the
+/// previous live-diarization path produced. Same-speaker continuations
+/// get a single space; turn changes get a newline + new prefix.
+fn build_diarized_transcript(chunks: &[ChunkRecord], segments: &[diarize::Segment]) -> String {
+    let mut output = String::new();
+    let mut display_map: std::collections::HashMap<String, u32> =
+        std::collections::HashMap::new();
+    let mut last_speaker: Option<String> = None;
+
+    for chunk in chunks {
+        let trimmed = chunk.text.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let sid = assign_speaker(chunk.start_ms, segments);
+        match sid {
+            Some(sid_str) => {
+                let display_n = if let Some(&n) = display_map.get(sid_str) {
+                    n
+                } else {
+                    let n = (display_map.len() as u32) + 1;
+                    display_map.insert(sid_str.to_string(), n);
+                    n
+                };
+                let speaker_changed = last_speaker.as_deref() != Some(sid_str);
+                if speaker_changed {
+                    if !output.is_empty() {
+                        output.push('\n');
+                    }
+                    output.push_str(&format!("Speaker {display_n}: "));
+                    last_speaker = Some(sid_str.to_string());
+                } else {
+                    output.push(' ');
+                }
+            }
+            None => {
+                if !output.is_empty() {
+                    output.push(' ');
+                }
+            }
+        }
+        output.push_str(trimmed);
+    }
+    output
 }
 
 async fn transcribe_chunk(
@@ -927,66 +1110,16 @@ async fn transcribe_chunk(
         return Ok(());
     }
 
-    // Live diarization: ask the streaming sidecar (if running) to classify
-    // this chunk's speaker. Returns None if the model isn't downloaded, the
-    // sidecar isn't running, or classification failed — we just append
-    // without a speaker prefix in those cases.
-    let speaker_id: Option<String> = {
-        let state: State<AppState> = app.state();
-        let stream_arc = state.diarize_stream.clone();
-        let mut guard = stream_arc.lock().await;
-        match guard.as_mut() {
-            Some(diarizer) => match diarizer.classify(&path).await {
-                Ok(id) => id,
-                Err(e) => {
-                    eprintln!("diarize classify: {e}");
-                    None
-                }
-            },
-            None => None,
-        }
-    };
-
-    // Decide what to append + which separator to use against the existing
-    // transcript. db::append_transcript skips the separator entirely when
-    // the existing transcript is empty, so we don't have to special-case
-    // the very first chunk.
-    //
-    //   - Speaker change (or no prior speaker): "Speaker N: <chunk>" + "\n"
-    //   - Same speaker as last: "<chunk>" + " "
-    //   - No speaker info available: "<chunk>" + " "
+    // Speaker prefixes are added by the offline diarization pass on
+    // recording_stop, not here. Per-chunk live diarization performed
+    // poorly on long recordings (clustering drifts as speaker memory
+    // accumulates), so chunks are appended as plain text and the full
+    // transcript is rewritten with `Speaker N:` prefixes after stop, when
+    // FluidAudio can cluster across the entire audio at once.
     let state: State<AppState> = app.state();
-    let (formatted_text, separator) = {
-        let session = state.recording.lock();
-        let mut display_map = session.speaker_display.lock();
-        let mut last_speaker = session.last_speaker.lock();
-
-        if let Some(sid) = speaker_id.as_ref() {
-            let display_n = if let Some(n) = display_map.get(sid).copied() {
-                n
-            } else {
-                let next = (display_map.len() as u32) + 1;
-                display_map.insert(sid.clone(), next);
-                next
-            };
-            let speaker_changed = last_speaker.as_deref() != Some(sid.as_str());
-            *last_speaker = Some(sid.clone());
-            if speaker_changed {
-                (format!("Speaker {display_n}: {trimmed}"), "\n".to_string())
-            } else {
-                (trimmed.clone(), " ".to_string())
-            }
-        } else {
-            // No classification — append with a space and don't prefix.
-            // Don't update last_speaker so the next classified chunk can
-            // still emit a "Speaker N:" prefix correctly.
-            (trimmed.clone(), " ".to_string())
-        }
-    };
-
     let updated_transcript = {
         let conn = state.db.lock();
-        db::append_transcript(&conn, &note_id, &formatted_text, &separator)?
+        db::append_transcript(&conn, &note_id, &trimmed, " ")?
     };
     {
         let session = state.recording.lock();
@@ -996,11 +1129,6 @@ async fn transcribe_chunk(
             text: trimmed.clone(),
         });
     }
-    // Emit the FULL updated transcript via transcript_replaced so the
-    // frontend's store gets the speaker prefix + separator we just wrote
-    // verbatim. The legacy transcript_appended event used a hardcoded
-    // space separator on the frontend side, which would clobber our
-    // newline turns.
     let _ = app.emit(
         "transcript_replaced",
         TranscriptPayload {
@@ -1112,6 +1240,52 @@ pub async fn summarize_note(app: AppHandle, note_id: String) -> Result<(), Strin
         Err(e) => eprintln!("[llm] summarize_note failed: {e:#}"),
     }
     result.map_err(|e| e.to_string())
+}
+
+/// User-triggered polish. Validates that there's a cloud provider available
+/// (polish currently skips on local), then runs polish in a background task
+/// so the IPC call returns immediately. Emits Phase::Polishing → Phase::Idle
+/// the same way the auto-polish path does.
+#[tauri::command]
+pub async fn polish_note(app: AppHandle, note_id: String) -> Result<(), String> {
+    {
+        let state: State<AppState> = app.state();
+        let conn = state.db.lock();
+        let n = db::get_note(&conn, &note_id).map_err(err)?;
+        if n.transcript.trim().is_empty() {
+            return Err("Nothing to polish — transcript is empty.".to_string());
+        }
+        match resolve_provider(&conn, &n) {
+            Ok(p) if p.base_url == openai::BASE => {}
+            Ok(_) => {
+                return Err(
+                    "Polish requires the OpenAI provider. Switch the summary provider to OpenAI in Settings to enable polish."
+                        .to_string(),
+                );
+            }
+            Err(_) => {
+                return Err(
+                    "No summary provider configured. Add an OpenAI API key in Settings."
+                        .to_string(),
+                );
+            }
+        }
+    }
+
+    let app_for_task = app.clone();
+    let note_for_task = note_id.clone();
+    tokio::spawn(async move {
+        if let Err(e) = polish_transcript(app_for_task.clone(), note_for_task.clone()).await {
+            eprintln!("manual polish failed: {e:#}");
+            emit_error(
+                &app_for_task,
+                Some(&note_for_task),
+                &format!("Polish failed: {e}"),
+            );
+        }
+        emit_status(&app_for_task, None, Phase::Idle);
+    });
+    Ok(())
 }
 
 // Polish a freshly-recorded transcript via a chat-completion pass. Whisper's
@@ -1539,4 +1713,167 @@ fn is_likely_hallucination(text: &str, language: &str) -> bool {
         "transcribed by",
     ];
     FRAGMENTS.iter().any(|f| lower.contains(f))
+}
+
+#[cfg(test)]
+mod diarize_tests {
+    use super::*;
+    use crate::diarize::Segment;
+
+    fn seg(start_ms: u64, end_ms: u64, sid: &str) -> Segment {
+        Segment { start_ms, end_ms, speaker_id: sid.to_string() }
+    }
+
+    fn chunk(start_ms: u64, text: &str) -> ChunkRecord {
+        ChunkRecord { start_ms, text: text.to_string() }
+    }
+
+    #[test]
+    fn assign_speaker_inside_segment() {
+        let segs = vec![seg(0, 5000, "A"), seg(5000, 10000, "B")];
+        assert_eq!(assign_speaker(2500, &segs), Some("A"));
+        assert_eq!(assign_speaker(5000, &segs), Some("B"));
+        assert_eq!(assign_speaker(9999, &segs), Some("B"));
+    }
+
+    #[test]
+    fn assign_speaker_in_gap_uses_closest() {
+        // Gap from 5000-7000. Chunk at 5500 is closer to A (gap edge 5000)
+        // than to B (gap edge 7000), so falls back to A.
+        let segs = vec![seg(0, 5000, "A"), seg(7000, 10000, "B")];
+        assert_eq!(assign_speaker(5500, &segs), Some("A"));
+        assert_eq!(assign_speaker(6800, &segs), Some("B"));
+    }
+
+    #[test]
+    fn assign_speaker_before_first_segment() {
+        let segs = vec![seg(2000, 5000, "A")];
+        assert_eq!(assign_speaker(500, &segs), Some("A"));
+    }
+
+    #[test]
+    fn assign_speaker_empty_segments() {
+        let segs: Vec<Segment> = vec![];
+        assert_eq!(assign_speaker(1000, &segs), None);
+    }
+
+    #[test]
+    fn build_transcript_empty_chunks() {
+        let segs = vec![seg(0, 1000, "A")];
+        assert_eq!(build_diarized_transcript(&[], &segs), "");
+    }
+
+    #[test]
+    fn build_transcript_single_speaker_runs() {
+        // Three chunks all from speaker A — no newline, single-space joins.
+        let segs = vec![seg(0, 10000, "A")];
+        let chunks = vec![
+            chunk(0, "hello"),
+            chunk(2000, "world"),
+            chunk(5000, "again"),
+        ];
+        assert_eq!(
+            build_diarized_transcript(&chunks, &segs),
+            "Speaker 1: hello world again"
+        );
+    }
+
+    #[test]
+    fn build_transcript_speaker_switch_inserts_newline_and_prefix() {
+        let segs = vec![seg(0, 3000, "A"), seg(3000, 6000, "B"), seg(6000, 9000, "A")];
+        let chunks = vec![
+            chunk(0, "first turn"),
+            chunk(3500, "second turn"),
+            chunk(7000, "third turn"),
+        ];
+        // Display numbers assigned in first-encounter order: A=1, B=2.
+        // A returns later → "Speaker 1:" again, not a new number.
+        assert_eq!(
+            build_diarized_transcript(&chunks, &segs),
+            "Speaker 1: first turn\nSpeaker 2: second turn\nSpeaker 1: third turn"
+        );
+    }
+
+    #[test]
+    fn build_transcript_skips_empty_chunks() {
+        let segs = vec![seg(0, 5000, "A")];
+        let chunks = vec![chunk(0, "real text"), chunk(1000, "   "), chunk(2000, "more")];
+        assert_eq!(
+            build_diarized_transcript(&chunks, &segs),
+            "Speaker 1: real text more"
+        );
+    }
+
+    #[test]
+    fn max_speaker_number_finds_highest() {
+        let text = "Speaker 1: hi\nSpeaker 2: hello\nSpeaker 1: again";
+        assert_eq!(max_speaker_number(text), 2);
+    }
+
+    #[test]
+    fn max_speaker_number_zero_when_no_labels() {
+        assert_eq!(max_speaker_number("just plain text"), 0);
+        assert_eq!(max_speaker_number("Michael: hi\nWilma: hello"), 0);
+        assert_eq!(max_speaker_number(""), 0);
+    }
+
+    #[test]
+    fn max_speaker_number_handles_multi_digit() {
+        let text = "Speaker 1: hi\nSpeaker 12: hello";
+        assert_eq!(max_speaker_number(text), 12);
+    }
+
+    #[test]
+    fn offset_speaker_numbers_adds_offset() {
+        let text = "Speaker 1: hi\nSpeaker 2: hello";
+        assert_eq!(
+            offset_speaker_numbers(text, 3),
+            "Speaker 4: hi\nSpeaker 5: hello"
+        );
+    }
+
+    #[test]
+    fn offset_speaker_numbers_preserves_renamed() {
+        // Only literal "Speaker N:" prefixes get rewritten; renamed lines
+        // and free-text mentions stay untouched.
+        let text = "Michael: hi\nWilma: hello\nSpeaker 1 was great";
+        assert_eq!(offset_speaker_numbers(text, 5), text);
+    }
+
+    #[test]
+    fn combine_with_empty_snapshot_passes_through() {
+        let new = "Speaker 1: hi\nSpeaker 2: hello";
+        assert_eq!(combine_with_snapshot("", new), new);
+        assert_eq!(combine_with_snapshot("   \n  ", new), new);
+    }
+
+    #[test]
+    fn combine_with_empty_new_returns_snapshot() {
+        let snap = "Michael: prior content";
+        assert_eq!(combine_with_snapshot(snap, ""), snap);
+    }
+
+    #[test]
+    fn combine_offsets_new_session_speakers() {
+        // Snapshot has Speaker 1 + Speaker 2; new session also numbers
+        // from 1 — should be bumped to 3 + 4 to avoid collision.
+        let snap = "Speaker 1: prior A\nSpeaker 2: prior B";
+        let new = "Speaker 1: new A\nSpeaker 2: new B";
+        assert_eq!(
+            combine_with_snapshot(snap, new),
+            "Speaker 1: prior A\nSpeaker 2: prior B\nSpeaker 3: new A\nSpeaker 4: new B"
+        );
+    }
+
+    #[test]
+    fn combine_no_offset_when_snapshot_uses_renamed() {
+        // Snapshot only has renamed labels (no "Speaker N:") — offset is 0,
+        // new session keeps its original numbering.
+        let snap = "Michael: prior\nWilma: prior";
+        let new = "Speaker 1: new";
+        assert_eq!(
+            combine_with_snapshot(snap, new),
+            "Michael: prior\nWilma: prior\nSpeaker 1: new"
+        );
+    }
 }

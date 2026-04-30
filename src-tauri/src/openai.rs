@@ -331,20 +331,39 @@ struct OllamaChatRequest<'a> {
     options: OllamaOptions,
 }
 
+// Per Qwen team's HuggingFace model cards for Qwen 3.5 (9B/4B/2B/0.8B):
+//   thinking, general:   temp=1.0, top_p=0.95, top_k=20, min_p=0.0,
+//                        presence_penalty=1.5, repetition_penalty=1.0
+//   non-thinking, general: temp=0.7, top_p=0.8,  top_k=20, min_p=0.0,
+//                        presence_penalty=1.5, repetition_penalty=1.0
+//
+// presence_penalty=1.5 breaks *thinking-phase* loops (the "Wait, I need to
+// check the language. Okay, let's write." cycle) because the cycle alternates
+// between distinct constraint phrases — penalizing each token's first
+// reappearance is enough to push the sampler off-track.
+//
+// presence_penalty does NOT reliably stop *content-phase* token loops like
+// "Note: Wilma sa nei. Note: Michael tilbød yoghurt." repeating 100×. Once
+// every token in the looped phrase has appeared once, presence_penalty
+// applies a uniform constant — no differential pressure remains. For that
+// case we add frequency_penalty (scales with token count, so each loop
+// iteration further suppresses the looped tokens) and a final post-processing
+// pass in `trim_runaway_repetition()`. Qwen team's recs leave
+// frequency_penalty at default 0; we override only because their tuning
+// targets benchmark prompts where content runaway is rare. Long structured
+// summaries on small models hit it more often.
 #[derive(Serialize)]
 struct OllamaOptions {
     temperature: f32,
+    top_p: f32,
+    top_k: i32,
+    min_p: f32,
+    presence_penalty: f32,
+    frequency_penalty: f32,
+    repeat_penalty: f32,
     // Hard cap on generated tokens. Without this, Qwen 3+ thinking mode can
     // burn 5K+ tokens reasoning before answering even on tiny inputs.
     num_predict: i32,
-    // Penalize tokens that appeared in the last N positions, mitigating the
-    // "Okay, let's write. Wait, I need to check the language. Norwegian.
-    //  Okay, let's write. Wait, I need to check the format. Markdown..."
-    // degenerate loop Qwen 3.5:9B falls into during thinking. Default in
-    // Ollama is 1.1 (mild); 1.3 is meaningfully stronger without distorting
-    // normal output. last_n=256 covers a few sentences of context.
-    repeat_penalty: f32,
-    repeat_last_n: i32,
 }
 
 // One JSON object per newline-delimited frame Ollama emits when stream:true.
@@ -397,15 +416,25 @@ where
         stream: true,
         think,
         options: OllamaOptions {
-            temperature: 0.2,
+            // Mode-specific temp + top_p per Qwen team. Higher temp in
+            // thinking is counter-intuitive but their reasoning is that
+            // determinism (low temp) is exactly what locks the model into
+            // the same loop branch each step — sampling diversity is the
+            // escape hatch, with presence_penalty preventing it from
+            // wandering into repetition.
+            temperature: if think { 1.0 } else { 0.7 },
+            top_p: if think { 0.95 } else { 0.8 },
+            top_k: 20,
+            min_p: 0.0,
+            presence_penalty: 1.5,
+            frequency_penalty: 0.5,
+            repeat_penalty: 1.0,
             // Thinking burns thousands of reasoning tokens before the final
             // answer; 4096 is enough for the fast path, 8192 gives thinking
             // headroom while still failing fast on degenerate loops (was
             // 16384, but a stuck Qwen takes ~9 minutes to hit that — too
             // long to wait for the timeout to free up Ollama).
             num_predict: if think { 8192 } else { 4096 },
-            repeat_penalty: 1.3,
-            repeat_last_n: 256,
         },
     };
     let started = std::time::Instant::now();
@@ -504,7 +533,45 @@ where
         }
         return Err(anyhow!("{model} returned an empty response"));
     }
-    Ok(content)
+    let trimmed = trim_runaway_repetition(&content);
+    if trimmed.len() < content.len() {
+        eprintln!(
+            "[llm] trimmed runaway repetition: {} → {} chars",
+            content.len(),
+            trimmed.len()
+        );
+    }
+    Ok(trimmed)
+}
+
+/// Detect runaway repetition (the same non-empty line repeated 3+ times
+/// consecutively) and truncate at the first repetition. Qwen 3.5 sometimes
+/// produces a clean summary, then degenerates into "Note: Wilma sa nei.
+/// Note: Michael tilbød yoghurt." for thousands of tokens — sampling
+/// penalties (presence_penalty=1.5, frequency_penalty=0.5) slow this down
+/// but don't always kill it before num_predict expires. Final safety net.
+///
+/// Conservative on purpose: only triggers on *exact* line equality (after
+/// trim) and requires 3+ consecutive copies. False positives (truncating
+/// a list that legitimately repeats a short phrase) are worse than missing
+/// some tail spam.
+fn trim_runaway_repetition(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.len() < 3 {
+        return text.to_string();
+    }
+    let mut i = 0;
+    while i + 2 < lines.len() {
+        let normalized = lines[i].trim();
+        if !normalized.is_empty()
+            && lines[i + 1].trim() == normalized
+            && lines[i + 2].trim() == normalized
+        {
+            return lines[..i].join("\n").trim_end().to_string();
+        }
+        i += 1;
+    }
+    text.to_string()
 }
 
 /// Fetch the list of models a local OpenAI-compat server has loaded. Used by
@@ -545,6 +612,36 @@ mod tests {
         ] {
             assert!(is_reasoning_model(m), "expected reasoning: {m}");
         }
+    }
+
+    #[test]
+    fn trim_truncates_at_3plus_consecutive_dupes() {
+        let input = "Hovedtemaer\n- A\n- B\n\nNote: spam.\nNote: spam.\nNote: spam.\nNote: spam.";
+        let out = trim_runaway_repetition(input);
+        assert_eq!(out, "Hovedtemaer\n- A\n- B");
+    }
+
+    #[test]
+    fn trim_keeps_clean_output() {
+        let input = "Hovedtemaer\n- A\n- B\n- C\n\nTilbakemeldinger\n- One\n- Two";
+        let out = trim_runaway_repetition(input);
+        assert_eq!(out, input);
+    }
+
+    #[test]
+    fn trim_keeps_two_consecutive_dupes() {
+        // A list with two identical entries shouldn't trigger; only 3+ does.
+        let input = "- Same\n- Same\n- Different";
+        let out = trim_runaway_repetition(input);
+        assert_eq!(out, input);
+    }
+
+    #[test]
+    fn trim_ignores_empty_line_runs() {
+        // Multiple blank lines must not count as repetition.
+        let input = "Header\n\n\n\nBody";
+        let out = trim_runaway_repetition(input);
+        assert_eq!(out, input);
     }
 
     #[test]
