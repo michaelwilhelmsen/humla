@@ -1027,6 +1027,10 @@ struct ResolvedProvider {
     base_url: String,
     api_key: String,
     model: String,
+    // Ollama-only knob: enable thinking mode (Qwen 3+ <think>...</think>
+    // chain-of-thought). Default off; flipping it on lets users A/B the
+    // quality difference in dev. Ignored for cloud + non-Ollama servers.
+    think: bool,
 }
 
 // Decide whether this note's polish/summary call should hit cloud OpenAI or
@@ -1066,11 +1070,15 @@ fn resolve_provider(
                 .ok_or_else(|| anyhow::anyhow!(
                     "local LLM model not configured — pick one in Settings"
                 ))?;
-            eprintln!("[llm] resolved local: url={base_url} model={model}");
+            let think = db::get_setting(conn, "local_llm_think")?
+                .map(|s| s.trim().eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            eprintln!("[llm] resolved local: url={base_url} model={model} think={think}");
             Ok(ResolvedProvider {
                 base_url,
                 api_key: "humla-local".into(),
                 model,
+                think,
             })
         }
         _ => {
@@ -1085,6 +1093,7 @@ fn resolve_provider(
                 base_url: openai::BASE.into(),
                 api_key,
                 model,
+                think: false,
             })
         }
     }
@@ -1163,6 +1172,7 @@ async fn polish_transcript(app: AppHandle, note_id: String) -> anyhow::Result<()
         &provider.base_url,
         &provider.api_key,
         &provider.model,
+        provider.think,
         DEFAULT_POLISH_PROMPT,
         &user_message,
     )
@@ -1245,6 +1255,7 @@ async fn run_summary(app: AppHandle, note_id: String) -> anyhow::Result<()> {
         &provider.base_url,
         &provider.api_key,
         &provider.model,
+        provider.think,
         &full_prompt,
         &user_message,
     )

@@ -27,6 +27,7 @@ const DEFAULTS: Record<EditableKey, string> = {
   summary_provider: "openai",
   local_llm_base_url: "http://localhost:11434/v1",
   local_llm_model: "",
+  local_llm_think: "false",
 };
 
 const PROVIDERS_BASE = [
@@ -527,6 +528,24 @@ export function Settings() {
                     <code> ollama pull qwen3:4b</code> (or similar) first.
                   </p>
                 )}
+              </Row>
+              <Row label="Thinking mode">
+                <label className="flex items-center gap-2 cursor-pointer text-sm">
+                  <input
+                    type="checkbox"
+                    checked={s.local_llm_think === "true"}
+                    onChange={(e) =>
+                      update("local_llm_think", e.target.checked ? "true" : "false")
+                    }
+                  />
+                  Enable Qwen 3+ thinking mode (slower, sometimes higher quality)
+                </label>
+                <p className="text-xs text-[var(--color-text-muted)] mt-2">
+                  Off by default — thinking mode makes the model reason
+                  internally before answering, which can take many minutes
+                  on a long meeting. Turn on to A/B against the fast path.
+                  Only applies to Ollama; other servers ignore this.
+                </p>
               </Row>
             </>
           )}

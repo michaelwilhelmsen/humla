@@ -39,6 +39,7 @@ export type SettingsKey =
   | "summary_provider"
   | "local_llm_base_url"
   | "local_llm_model"
+  | "local_llm_think"
   | "theme";
 
 export type TranscribeProvider = "openai" | "local";

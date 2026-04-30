@@ -153,7 +153,7 @@ pub async fn summarize(
     system_prompt: &str,
     transcript: &str,
 ) -> Result<String> {
-    summarize_with_base(BASE, api_key, model, system_prompt, transcript).await
+    summarize_with_base(BASE, api_key, model, false, system_prompt, transcript).await
 }
 
 /// Same shape as `summarize` but takes an explicit base URL. Used to route
@@ -168,18 +168,18 @@ pub async fn summarize_with_base(
     base_url: &str,
     api_key: &str,
     model: &str,
+    think: bool,
     system_prompt: &str,
     transcript: &str,
 ) -> Result<String> {
     let is_local = base_url != BASE;
     // For Ollama, route through the native /api/chat endpoint so we can
-    // pass `think: false` and reliably disable Qwen 3+'s thinking mode.
-    // The OpenAI-compat endpoint renders the chat template internally and
-    // strips user-message /no_think directives, so we'd otherwise hang for
-    // many minutes on internal reasoning.
+    // pass an explicit `think` flag and reliably control Qwen 3+'s
+    // thinking mode. The OpenAI-compat endpoint renders the chat template
+    // internally and strips user-message /no_think directives.
     if is_local {
         if let Some(native_base) = ollama_native_url(base_url) {
-            return ollama_native_chat(&native_base, model, system_prompt, transcript).await;
+            return ollama_native_chat(&native_base, model, think, system_prompt, transcript).await;
         }
     }
     let req = ChatRequest {
@@ -333,6 +333,7 @@ struct OllamaMessage {
 async fn ollama_native_chat(
     native_base: &str,
     model: &str,
+    think: bool,
     system_prompt: &str,
     user_message: &str,
 ) -> Result<String> {
@@ -344,12 +345,12 @@ async fn ollama_native_chat(
             ChatMessage { role: "user", content: user_message },
         ],
         stream: false,
-        think: false,
+        think,
         options: OllamaOptions { temperature: 0.2 },
     };
     let started = std::time::Instant::now();
     eprintln!(
-        "[llm] POST {url} (ollama-native) model={model} think=false system_chars={} user_chars={}",
+        "[llm] POST {url} (ollama-native) model={model} think={think} system_chars={} user_chars={}",
         system_prompt.len(),
         user_message.len()
     );
