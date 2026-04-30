@@ -232,7 +232,7 @@ export function Note() {
           }}
           placeholder="New note"
           rows={1}
-          className="block text-5xl font-light tracking-[-0.02em] w-full mb-6 placeholder:text-[var(--color-text-muted)]/50 bg-transparent border-0 p-0 resize-none overflow-hidden focus:outline-none focus:ring-0 leading-tight"
+          className="nd-bare block text-5xl font-light tracking-[-0.02em] w-full mb-6 placeholder:text-[var(--color-text-muted)]/50 resize-none overflow-hidden focus:outline-none leading-tight"
         />
 
         <div className="flex flex-col gap-2 mb-10">
