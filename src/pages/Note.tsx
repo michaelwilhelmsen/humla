@@ -74,16 +74,34 @@ export function Note() {
 
   // Subscribe once per note id. Only append a delta if it belongs to this
   // note — defensive in case multiple summary calls are interleaved.
+  //
+  // The cancelled flag is load-bearing under React StrictMode (dev-only):
+  // effects run mount → cleanup → mount again to surface lifecycle bugs.
+  // Tauri's listen() is async, so a naive `.then((u) => unsubs.push(u))`
+  // races: the first cleanup runs while the Promise is still pending, so
+  // unsubs is empty and the listener leaks. The second mount adds a *new*
+  // listener; both stay alive and every event fires twice — which is what
+  // produced the "ThinkingThinking ProcessProcess" doubling in the
+  // reasoning panel. The flag-and-immediately-unsub pattern below cleans
+  // up listeners that finish registering after their effect was torn down.
   useEffect(() => {
     if (!id) return;
+    let cancelled = false;
     const unsubs: (() => void)[] = [];
+    const claim = (u: () => void) => {
+      if (cancelled) u();
+      else unsubs.push(u);
+    };
     onSummaryThinkingDelta((e) => {
       if (e.noteId === id) setThinkingStream((s) => s + e.delta);
-    }).then((u) => unsubs.push(u));
+    }).then(claim);
     onSummaryContentDelta((e) => {
       if (e.noteId === id) setContentStream((s) => s + e.delta);
-    }).then((u) => unsubs.push(u));
-    return () => unsubs.forEach((u) => u());
+    }).then(claim);
+    return () => {
+      cancelled = true;
+      unsubs.forEach((u) => u());
+    };
   }, [id]);
 
   // Reset the streams when a new summarize starts (phase transitions to

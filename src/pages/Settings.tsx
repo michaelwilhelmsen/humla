@@ -164,20 +164,37 @@ export function Settings() {
     })();
   }, []);
 
+  // Tauri listen() is async; the .then() can resolve *after* a StrictMode
+  // remount has already torn down this effect, leaking the listener. The
+  // cancelled flag plus immediate-unsub on race protects against that.
   useEffect(() => {
+    let cancelled = false;
     let unlisten: (() => void) | undefined;
     onLocalWhisperProgress((p) => {
       setLocal((s) => ({ ...s, received: p.received, total: p.total }));
-    }).then((u) => (unlisten = u));
-    return () => { unlisten?.(); };
+    }).then((u) => {
+      if (cancelled) u();
+      else unlisten = u;
+    });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
   }, []);
 
   useEffect(() => {
+    let cancelled = false;
     let unlisten: (() => void) | undefined;
     onDiarizeDownloadProgress((p) => {
       setDiarize((s) => ({ ...s, fraction: p.fraction, phase: p.phase }));
-    }).then((u) => (unlisten = u));
-    return () => { unlisten?.(); };
+    }).then((u) => {
+      if (cancelled) u();
+      else unlisten = u;
+    });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
   }, []);
 
   // Hit the user-configured local server's /v1/models endpoint and populate
