@@ -333,6 +333,11 @@ struct OllamaChatResponse {
 #[derive(Deserialize)]
 struct OllamaMessage {
     content: String,
+    // Ollama's `/api/chat` with think:true puts the reasoning here as a
+    // sibling of `content`. If we see thinking text but no content, the
+    // model spent its budget reasoning and never produced an answer.
+    #[serde(default)]
+    thinking: Option<String>,
 }
 
 async fn ollama_native_chat(
@@ -353,7 +358,11 @@ async fn ollama_native_chat(
         think,
         options: OllamaOptions {
             temperature: 0.2,
-            num_predict: 4096,
+            // Thinking mode burns thousands of reasoning tokens before the
+            // final answer; 4096 isn't enough headroom for thinking + reply,
+            // but it is for the fast path. Generous cap when think=true so
+            // a single run can actually complete for comparison.
+            num_predict: if think { 16384 } else { 4096 },
         },
     };
     let started = std::time::Instant::now();
@@ -399,12 +408,22 @@ async fn ollama_native_chat(
         }
     };
     let content = body.message.content;
+    let thinking_chars = body.message.thinking.as_deref().map(str::len).unwrap_or(0);
     eprintln!(
-        "[llm] ollama success in {:?}, content {} chars",
+        "[llm] ollama success in {:?}, content {} chars, thinking {} chars",
         started.elapsed(),
-        content.len()
+        content.len(),
+        thinking_chars
     );
     if content.trim().is_empty() {
+        if thinking_chars > 0 {
+            return Err(anyhow!(
+                "{model} spent {thinking_chars} chars thinking and ran out of tokens \
+                 before producing an answer. Disable thinking mode in Settings or \
+                 increase the cap. Thinking is rarely worth the latency for \
+                 summary work."
+            ));
+        }
         return Err(anyhow!("{model} returned an empty response"));
     }
     Ok(content)
