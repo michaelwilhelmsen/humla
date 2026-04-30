@@ -127,6 +127,9 @@ type LlmState = {
   scan: DiscoveredLlm[] | null;
   scanning: boolean;
   error: string | null;
+  // Transient confirmation message ("Model deleted", "Download complete").
+  // Cleared by a setTimeout in the action handler.
+  flash: string | null;
 };
 
 const EMPTY_LLM_STATE: LlmState = {
@@ -137,6 +140,7 @@ const EMPTY_LLM_STATE: LlmState = {
   scan: null,
   scanning: false,
   error: null,
+  flash: null,
 };
 
 export function Settings() {
@@ -193,12 +197,20 @@ export function Settings() {
     return () => { unlisten?.(); };
   }, []);
 
+  function flashMessage(msg: string) {
+    setLlm((p) => ({ ...p, flash: msg }));
+    window.setTimeout(() => {
+      setLlm((p) => (p.flash === msg ? { ...p, flash: null } : p));
+    }, 4000);
+  }
+
   async function downloadLlm(variant: "e2b" | "e4b") {
-    setLlm((p) => ({ ...p, downloading: variant, received: 0, total: null, error: null }));
+    setLlm((p) => ({ ...p, downloading: variant, received: 0, total: null, error: null, flash: null }));
     try {
       await ipc.localLlmDownload(variant);
       const status = await ipc.localLlmStatus();
       setLlm((p) => ({ ...p, status, downloading: null }));
+      flashMessage(`Gemma 4 ${variant.toUpperCase()} downloaded`);
     } catch (e) {
       const status = await ipc.localLlmStatus().catch(() => null);
       setLlm((p) => ({ ...p, status, downloading: null, error: String(e) }));
@@ -206,10 +218,20 @@ export function Settings() {
   }
 
   async function deleteLlm(variant: "e2b" | "e4b") {
+    // Snapshot the path before delete so we can show it in the confirmation —
+    // by the time the toast fires the status has already cleared the field.
+    const beforePath = variant === "e2b"
+      ? llm.status?.e2bPath
+      : llm.status?.e4bPath;
     try {
       await ipc.localLlmDelete(variant);
       const status = await ipc.localLlmStatus();
       setLlm((p) => ({ ...p, status, error: null }));
+      flashMessage(
+        beforePath
+          ? `Deleted ${beforePath}`
+          : `Gemma 4 ${variant.toUpperCase()} deleted`
+      );
     } catch (e) {
       setLlm((p) => ({ ...p, error: String(e) }));
     }
@@ -504,6 +526,14 @@ export function Settings() {
                   onDownload={downloadLlm}
                   onDelete={deleteLlm}
                 />
+                {llm.flash && (
+                  <p
+                    className="text-xs mt-2 px-2 py-1 rounded bg-[var(--color-pill-hover)] inline-block break-all"
+                    role="status"
+                  >
+                    {llm.flash}
+                  </p>
+                )}
               </Row>
               <Row label="Already installed?">
                 <div className="flex flex-col gap-2">
@@ -600,6 +630,11 @@ function LocalLlmModelManager({
     : variant === "e4b"
     ? state.status?.e4bSizeBytes
     : null;
+  const path = variant === "e2b"
+    ? state.status?.e2bPath
+    : variant === "e4b"
+    ? state.status?.e4bPath
+    : null;
   const total = state.total ?? null;
   const pct = state.downloading && total
     ? Math.min(100, (state.received / total) * 100)
@@ -644,6 +679,11 @@ function LocalLlmModelManager({
           Downloaded — Gemma 4 {variant?.toUpperCase()}
           {sizeBytes ? ` (${formatBytes(sizeBytes)})` : ""}
         </div>
+        {path && (
+          <div className="text-xs text-[var(--color-text-muted)] font-mono break-all">
+            {path}
+          </div>
+        )}
         <div className="flex gap-2">
           <Btn onClick={() => variant && onDelete(variant)}>Delete model</Btn>
         </div>

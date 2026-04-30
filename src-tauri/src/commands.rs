@@ -351,28 +351,32 @@ fn llm_variant_url(variant: &str) -> Result<&'static str, String> {
 pub struct LocalLlmStatus {
     e2b_downloaded: bool,
     e2b_size_bytes: Option<u64>,
+    e2b_path: Option<String>,
     e4b_downloaded: bool,
     e4b_size_bytes: Option<u64>,
+    e4b_path: Option<String>,
     managed_dir: String,
 }
 
 #[tauri::command]
 pub fn local_llm_status(app: AppHandle) -> Result<LocalLlmStatus, String> {
     let dir = llm_dir(&app)?;
-    let check = |file: &str| -> (bool, Option<u64>) {
+    let check = |file: &str| -> (bool, Option<u64>, Option<String>) {
         let p = dir.join(file);
         match std::fs::metadata(&p) {
-            Ok(m) if m.is_file() => (true, Some(m.len())),
-            _ => (false, None),
+            Ok(m) if m.is_file() => (true, Some(m.len()), Some(p.display().to_string())),
+            _ => (false, None, None),
         }
     };
-    let (e2b_d, e2b_s) = check(local_llm::E2B_FILE);
-    let (e4b_d, e4b_s) = check(local_llm::E4B_FILE);
+    let (e2b_d, e2b_s, e2b_p) = check(local_llm::E2B_FILE);
+    let (e4b_d, e4b_s, e4b_p) = check(local_llm::E4B_FILE);
     Ok(LocalLlmStatus {
         e2b_downloaded: e2b_d,
         e2b_size_bytes: e2b_s,
+        e2b_path: e2b_p,
         e4b_downloaded: e4b_d,
         e4b_size_bytes: e4b_s,
+        e4b_path: e4b_p,
         managed_dir: dir.display().to_string(),
     })
 }

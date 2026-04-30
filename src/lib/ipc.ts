@@ -135,8 +135,10 @@ export type SummaryProvider = "openai" | "local";
 export type LocalLlmStatus = {
   e2bDownloaded: boolean;
   e2bSizeBytes: number | null;
+  e2bPath: string | null;
   e4bDownloaded: boolean;
   e4bSizeBytes: number | null;
+  e4bPath: string | null;
   managedDir: string;
 };
 
