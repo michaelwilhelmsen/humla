@@ -223,6 +223,92 @@ input::placeholder, textarea::placeholder {
   border-color: var(--color-text-display);
 }
 
+/* Properties panel — Obsidian-style two-column metadata block. Used by
+   the Note header to surface per-note settings (folder, preset, language,
+   speakers, etc.) without the chip pile-up. The label column is fixed-
+   width monospace; the value column is borderless picker text that
+   reveals its dropdown affordance only on hover. */
+.nd-prop-table {
+  display: grid;
+  grid-template-columns: 132px 1fr;
+  row-gap: 2px;
+  column-gap: 12px;
+  align-items: center;
+}
+
+.nd-prop-row {
+  display: contents;
+}
+
+.nd-prop-row > .nd-prop-label,
+.nd-prop-row > .nd-prop-value {
+  padding: 6px 8px;
+  border-radius: 6px;
+  transition: background-color 150ms cubic-bezier(0.25, 0.1, 0.25, 1);
+}
+
+.nd-prop-row:hover > .nd-prop-label,
+.nd-prop-row:hover > .nd-prop-value,
+.nd-prop-row:focus-within > .nd-prop-label,
+.nd-prop-row:focus-within > .nd-prop-value {
+  background: var(--color-surface-raised);
+}
+
+.nd-prop-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  color: var(--color-text-muted);
+  user-select: none;
+}
+
+.nd-prop-label > svg {
+  flex-shrink: 0;
+  opacity: 0.7;
+}
+
+.nd-prop-value {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--color-text);
+  min-height: 28px;
+}
+
+/* Selects living inside .nd-prop-value drop their default form-control
+   chrome — they should look like plain inline text until interacted with.
+   The select itself sits on the row's hover background. */
+.nd-prop-value select {
+  background: transparent;
+  border: none;
+  padding: 0;
+  border-radius: 0;
+  font-family: inherit;
+  font-size: inherit;
+  color: inherit;
+  cursor: pointer;
+}
+
+.nd-prop-value select:focus {
+  outline: none;
+  border: none;
+}
+
+.nd-prop-value .nd-prop-caret {
+  color: var(--color-text-muted);
+  opacity: 0;
+  transition: opacity 150ms cubic-bezier(0.25, 0.1, 0.25, 1);
+}
+
+.nd-prop-row:hover .nd-prop-caret,
+.nd-prop-row:focus-within .nd-prop-caret {
+  opacity: 1;
+}
+
 /* Primary action pill — Nothing-style: white surface, mono caps label,
    visible border, mechanical feel. Used by Record / Summarize / etc. */
 .nd-action {
@@ -504,6 +590,65 @@ select {
 .prose-summary blockquote {
   padding-left: 1em;
   border-left: 3px solid var(--color-line);
+  color: var(--color-text-muted);
+}
+
+/* Reasoning trace from local LLMs (Qwen 3.5 thinking, etc). Same markdown
+   coverage as prose-summary but tuned to feel like a quiet sibling of the
+   actual summary above it: smaller, muted, tighter. Modeled on ChatGPT's
+   "thoughts" panel — no panel border, just indented muted text. Headings
+   still bold but at the body size so they don't outshout the real summary. */
+.prose-reasoning {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--color-text-muted);
+}
+.prose-reasoning > * + * { margin-top: 0.5em; }
+.prose-reasoning p { margin: 0; }
+.prose-reasoning strong { font-weight: 600; color: var(--color-text); }
+.prose-reasoning em { font-style: italic; }
+.prose-reasoning h1,
+.prose-reasoning h2,
+.prose-reasoning h3,
+.prose-reasoning h4 {
+  font-family: var(--font-sans);
+  font-weight: 600;
+  font-size: 12px;
+  line-height: 1.3;
+  margin-bottom: 0.3em;
+  color: var(--color-text);
+}
+.prose-reasoning > * + h1,
+.prose-reasoning > * + h2,
+.prose-reasoning > * + h3,
+.prose-reasoning > * + h4 { margin-top: 0.9em; }
+.prose-reasoning ul,
+.prose-reasoning ol {
+  padding-left: 1.2em;
+}
+.prose-reasoning ul { list-style: disc; }
+.prose-reasoning ol { list-style: decimal; }
+.prose-reasoning li + li { margin-top: 0.2em; }
+.prose-reasoning code {
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+  padding: 0.1em 0.3em;
+  border-radius: 3px;
+  background: var(--color-pill);
+}
+.prose-reasoning pre {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  word-break: break-word;
+  padding: 0.6em 0.8em;
+  border-radius: 4px;
+  background: var(--color-pill);
+}
+.prose-reasoning blockquote {
+  padding-left: 0.8em;
+  border-left: 2px solid var(--color-line);
   color: var(--color-text-muted);
 }
 

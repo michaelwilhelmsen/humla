@@ -11,10 +11,15 @@ use tokio::process::Command;
 // we wrap that Swift package in a sidecar binary (`speaker-diarize`) and
 // IPC over stdout JSON, mirroring our `audio-capture` sidecar pattern.
 //
-// The sidecar handles: model download (~500 MB on first run, cached after),
-// CoreML compile for the Apple Neural Engine, audio resample to 16 kHz mono
-// Float32, and the actual diarization. It writes a single JSON array of
-// segments to stdout and exits.
+// The sidecar uses FluidAudio's `OfflineDiarizerManager` (community-1
+// segmentation + VBx clustering with PLDA) — the upgrade from the 3.1-based
+// `DiarizerManager` we used initially. Picked because community-1 counts and
+// assigns speakers more accurately on dense single-mic captures (e.g.
+// in-person meetings where everyone shares one acoustic context). The
+// sidecar handles: model download (~30 MB of CoreML files on first run,
+// cached after), compile for the Apple Neural Engine, audio resample to
+// 16 kHz mono Float32, and the actual diarization. It writes a single JSON
+// array of segments to stdout and exits.
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Segment {
@@ -24,18 +29,32 @@ pub struct Segment {
 }
 
 /// Run speaker diarization on a WAV file by invoking the speaker-diarize
-/// sidecar. First call downloads the model (~500 MB) and compiles it for
-/// the Apple Neural Engine — that's slow (20-30 s). Subsequent calls reuse
-/// the cached model + compilation and run in roughly realtime/30 (i.e.
-/// ~1 s per 30 min of audio on M-series).
-pub async fn diarize_file(app: &AppHandle, audio_path: &Path) -> Result<Vec<Segment>> {
+/// sidecar. First call downloads the offline diarizer models (~30 MB of
+/// CoreML files) and compiles them for the Apple Neural Engine — that's
+/// slow (20–30 s). Subsequent calls reuse the cached + compiled models and
+/// run substantially faster than realtime on M-series.
+///
+/// `num_speakers` is an optional caller-supplied hint. When provided, the
+/// sidecar pins the cluster count via `OfflineDiarizerConfig.withSpeakers
+/// (exactly:)`, which is the most reliable fix for dominant-speaker
+/// recordings where VBx auto-detection collapses to one cluster. `None`
+/// leaves auto-detection on.
+pub async fn diarize_file(
+    app: &AppHandle,
+    audio_path: &Path,
+    num_speakers: Option<i64>,
+) -> Result<Vec<Segment>> {
     let sidecar = sidecar_path(app)?;
     let path_str = audio_path
         .to_str()
         .ok_or_else(|| anyhow!("non-utf8 audio path"))?;
 
-    let output = Command::new(&sidecar)
-        .arg(path_str)
+    let mut cmd = Command::new(&sidecar);
+    cmd.arg(path_str);
+    if let Some(n) = num_speakers.filter(|n| *n > 0) {
+        cmd.arg("--num-speakers").arg(n.to_string());
+    }
+    let output = cmd
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
@@ -105,6 +124,65 @@ fn sidecar_path(app: &AppHandle) -> Result<PathBuf> {
 pub async fn cleanup_full_wav(path: &Path) {
     if let Err(e) = tokio::fs::remove_file(path).await {
         eprintln!("cleanup full.wav: {e}");
+    }
+}
+
+/// One-shot purge of the old streaming diarization model files left behind
+/// by pre-v0.8.0 installs. The community-1 (offline) pipeline lives in the
+/// same FluidAudio directory but uses different filenames, so leftover
+/// `pyannote_segmentation.mlmodelc` + `wespeaker_v2.mlmodelc` directories
+/// stick around as ~14 MB of dead weight after upgrade.
+///
+/// Gated on a settings flag so it runs exactly once per install. Running on
+/// every launch would be technically idempotent today (the names we wipe
+/// are no longer produced by FluidAudio), but it would silently delete any
+/// future upstream model file that happens to reuse those names — a hard-
+/// to-debug failure mode. The flag pins the cleanup to "once, right after
+/// the upgrade" and makes the function inert thereafter.
+///
+/// Resolves the FluidAudio dir from `app_data_dir().parent()` rather than
+/// hardcoding `~/Library/...` so the function survives a future Tauri path
+/// reshuffle. FluidAudio writes to `~/Library/Application Support/FluidAudio/`,
+/// a sibling of our own `~/Library/Application Support/no.humla.app/`.
+pub fn cleanup_legacy_streaming_models(app: &AppHandle, conn: &rusqlite::Connection) {
+    const FLAG_KEY: &str = "legacy_streaming_models_purged_v1";
+    match crate::db::get_setting(conn, FLAG_KEY) {
+        Ok(Some(_)) => return, // already purged on a prior launch
+        Ok(None) => {}
+        Err(e) => {
+            eprintln!("cleanup_legacy: read flag failed: {e}");
+            // Don't proceed without a working DB — the flag write below
+            // would also fail and we'd loop on every launch.
+            return;
+        }
+    }
+
+    let app_data = match app.path().app_data_dir() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("cleanup_legacy: no app_data_dir: {e}");
+            return;
+        }
+    };
+    let Some(application_support) = app_data.parent() else {
+        eprintln!("cleanup_legacy: app_data_dir has no parent");
+        return;
+    };
+    let fluid_dir = application_support
+        .join("FluidAudio")
+        .join("Models")
+        .join("speaker-diarization");
+    for legacy in ["pyannote_segmentation.mlmodelc", "wespeaker_v2.mlmodelc"] {
+        let p = fluid_dir.join(legacy);
+        if p.exists() {
+            match std::fs::remove_dir_all(&p) {
+                Ok(_) => eprintln!("cleanup_legacy: removed {}", p.display()),
+                Err(e) => eprintln!("cleanup_legacy: remove {} failed: {e}", p.display()),
+            }
+        }
+    }
+    if let Err(e) = crate::db::set_setting(conn, FLAG_KEY, "1") {
+        eprintln!("cleanup_legacy: write flag failed: {e}");
     }
 }
 

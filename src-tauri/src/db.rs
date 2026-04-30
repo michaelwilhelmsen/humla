@@ -21,6 +21,12 @@ pub struct Note {
     // to the global summary_provider setting" (same convention as `language`).
     // Populated values are "openai" or "local".
     pub summary_provider: String,
+    // Optional speaker count hint, passed through to the offline diarizer
+    // as `OfflineDiarizerConfig.withSpeakers(exactly: N)`. `None` (or 0)
+    // means "let VBx auto-detect" — the default for fresh notes. A positive
+    // value pins the cluster count, which is the most reliable fix for
+    // dominant-speaker conversations where auto-detect collapses to 1.
+    pub expected_speakers: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -85,6 +91,10 @@ pub fn open(path: &Path) -> Result<Connection> {
         "ALTER TABLE notes ADD COLUMN summary_provider TEXT NOT NULL DEFAULT ''",
         [],
     );
+    let _ = conn.execute(
+        "ALTER TABLE notes ADD COLUMN expected_speakers INTEGER",
+        [],
+    );
     // Index is created AFTER the ALTERs so it's safe on both fresh DBs and
     // older DBs that needed the column added.
     conn.execute(
@@ -98,7 +108,7 @@ pub fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
-const NOTE_COLS: &str = "id, title, body, transcript, summary, audio_path, summary_preset, folder_id, language, summary_provider, created_at, updated_at";
+const NOTE_COLS: &str = "id, title, body, transcript, summary, audio_path, summary_preset, folder_id, language, summary_provider, expected_speakers, created_at, updated_at";
 
 pub fn list_notes(conn: &Connection) -> Result<Vec<Note>> {
     let mut stmt = conn.prepare(&format!(
@@ -123,8 +133,8 @@ pub fn create_note(conn: &Connection, default_language: &str) -> Result<Note> {
     let id = uuid::Uuid::new_v4().to_string();
     let now = now_ms();
     conn.execute(
-        "INSERT INTO notes (id, title, body, transcript, summary, audio_path, summary_preset, folder_id, language, summary_provider, created_at, updated_at)
-         VALUES (?1, '', '', '', '', NULL, 'meeting', NULL, ?2, '', ?3, ?3)",
+        "INSERT INTO notes (id, title, body, transcript, summary, audio_path, summary_preset, folder_id, language, summary_provider, expected_speakers, created_at, updated_at)
+         VALUES (?1, '', '', '', '', NULL, 'meeting', NULL, ?2, '', NULL, ?3, ?3)",
         params![id, default_language, now],
     )?;
     get_note(conn, &id)
@@ -199,6 +209,25 @@ pub struct NotePatch {
     pub language: Option<String>,
     // Empty string clears the override. Same pattern as `language`.
     pub summary_provider: Option<String>,
+    // `Some(Some(n))` writes a hint, `Some(None)` clears it back to
+    // auto-detect, `None` leaves the existing value untouched. The double
+    // `Option` is intentional — the outer one says "is the patch touching
+    // this field?", the inner one says "what value to write?".
+    #[serde(default, deserialize_with = "deserialize_optional_optional")]
+    pub expected_speakers: Option<Option<i64>>,
+}
+
+/// Custom deserializer so the JSON shapes `{}`, `{"expectedSpeakers": null}`,
+/// and `{"expectedSpeakers": 2}` map to `None`, `Some(None)`, and
+/// `Some(Some(2))` respectively. Without this, serde collapses null and
+/// missing into the same `None` and we lose the "clear the hint" signal.
+fn deserialize_optional_optional<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<Option<i64>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<i64>::deserialize(deserializer).map(Some)
 }
 
 pub fn update_note(conn: &Connection, id: &str, patch: &NotePatch) -> Result<()> {
@@ -225,6 +254,15 @@ pub fn update_note(conn: &Connection, id: &str, patch: &NotePatch) -> Result<()>
         conn.execute(
             "UPDATE notes SET summary_provider = ?1, updated_at = ?2 WHERE id = ?3",
             params![sp, now, id],
+        )?;
+    }
+    if let Some(es) = &patch.expected_speakers {
+        // Inner `None` writes SQL NULL (clears the hint back to auto). Inner
+        // `Some(n)` writes the speaker count. `params![]` resolves both via
+        // `ToSql` for `Option<i64>`.
+        conn.execute(
+            "UPDATE notes SET expected_speakers = ?1, updated_at = ?2 WHERE id = ?3",
+            params![es, now, id],
         )?;
     }
     Ok(())
@@ -304,7 +342,8 @@ fn map_note(row: &rusqlite::Row) -> rusqlite::Result<Note> {
         folder_id: row.get(7)?,
         language: row.get(8)?,
         summary_provider: row.get(9)?,
-        created_at: row.get(10)?,
-        updated_at: row.get(11)?,
+        expected_speakers: row.get(10)?,
+        created_at: row.get(11)?,
+        updated_at: row.get(12)?,
     })
 }

@@ -52,6 +52,19 @@ pub fn run() {
                 }
             });
 
+            // One-shot cleanup of pre-v0.8.0 streaming diarizer files
+            // (pyannote_segmentation.mlmodelc + wespeaker_v2.mlmodelc).
+            // Replaced by the community-1 offline set in v0.8.0 — same dir,
+            // different filenames, so the old files would otherwise sit
+            // there forever as dead weight. Gated on a settings flag so
+            // this only runs once per install, never re-deleting files
+            // upstream might legitimately reintroduce later.
+            {
+                let state: tauri::State<AppState> = app.state();
+                let conn = state.db.lock();
+                diarize::cleanup_legacy_streaming_models(app.handle(), &conn);
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

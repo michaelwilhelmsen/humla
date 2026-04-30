@@ -119,9 +119,15 @@ let writeSettings: [String: Any] = [
     AVLinearPCMIsBigEndianKey: false,
 ]
 
-// MARK: - Chunk writer
+// MARK: - Chunk writer (per source)
 
+// One ChunkWriter per source (mic / sys). Each writes its own VAD-bounded
+// chunk WAVs and tags every emitted event with the `source` so the Rust side
+// can route transcribes and label the final transcript ("You" for mic, the
+// diarized speaker IDs for system). Filenames are prefixed by source so the
+// two writers can share the same temp dir without colliding.
 final class ChunkWriter {
+    private let source: String
     private let dir: URL
     private let minFrames: AVAudioFrameCount
     private let maxFrames: AVAudioFrameCount
@@ -134,19 +140,22 @@ final class ChunkWriter {
     private var written: AVAudioFrameCount = 0
     private var chunkPeak: Float = 0
     private var silentRun: AVAudioFrameCount = 0
-    // Total frames written across ALL chunks since the writer started. Used
-    // to compute each chunk's start time relative to the start of the
-    // recording — the diarization step needs this to align speaker segments
-    // (which it gets from the full-recording WAV) with chunk transcripts.
+    // Total frames written across ALL chunks since the writer opened. Used
+    // to compute each chunk's start_ms relative to this stream's t=0 (the
+    // first frame this writer ever received). Each stream has its own
+    // timeline; the offline diarize pass aligns chunks within their own
+    // full.wav, so per-stream-relative is the right anchor.
     private var totalFramesWritten: AVAudioFrameCount = 0
     private var chunkStartFrames: AVAudioFrameCount = 0
-    private let queue = DispatchQueue(label: "chunk.writer")
+    private let queue: DispatchQueue
 
-    init(dir: URL, minSeconds: Double, maxSeconds: Double, vadSilenceMs: Double) {
+    init(source: String, dir: URL, minSeconds: Double, maxSeconds: Double, vadSilenceMs: Double) {
+        self.source = source
         self.dir = dir
         self.minFrames = AVAudioFrameCount(minSeconds * targetSampleRate)
         self.maxFrames = AVAudioFrameCount(maxSeconds * targetSampleRate)
         self.vadSilenceFrames = AVAudioFrameCount((vadSilenceMs / 1000.0) * targetSampleRate)
+        self.queue = DispatchQueue(label: "chunk.writer.\(source)")
     }
 
     func write(_ buffer: AVAudioPCMBuffer) {
@@ -186,7 +195,7 @@ final class ChunkWriter {
                     try rotate()
                 }
             } catch {
-                emitError("write: \(error.localizedDescription)")
+                emitError("\(source) write: \(error.localizedDescription)")
             }
         }
     }
@@ -197,7 +206,12 @@ final class ChunkWriter {
                 file = nil
                 if chunkPeak >= silenceThreshold {
                     let startMs = Int(Double(chunkStartFrames) / targetSampleRate * 1000.0)
-                    emit(["event": "chunk", "path": u.path, "start_ms": startMs])
+                    emit([
+                        "event": "chunk",
+                        "source": source,
+                        "path": u.path,
+                        "start_ms": startMs,
+                    ])
                     stats.lock.lock(); stats.chunks += 1; stats.lock.unlock()
                 } else {
                     try? FileManager.default.removeItem(at: u)
@@ -208,13 +222,12 @@ final class ChunkWriter {
             written = 0
             chunkPeak = 0
             silentRun = 0
-            emit(["event": "stopped"])
         }
     }
 
     private func openNext() throws {
         index += 1
-        let u = dir.appendingPathComponent(String(format: "chunk-%04d.wav", index))
+        let u = dir.appendingPathComponent(String(format: "%@-chunk-%04d.wav", source, index))
         url = u
         file = try AVAudioFile(forWriting: u, settings: writeSettings)
         written = 0
@@ -226,7 +239,12 @@ final class ChunkWriter {
         file = nil
         if chunkPeak >= silenceThreshold {
             let startMs = Int(Double(chunkStartFrames) / targetSampleRate * 1000.0)
-            emit(["event": "chunk", "path": u.path, "start_ms": startMs])
+            emit([
+                "event": "chunk",
+                "source": source,
+                "path": u.path,
+                "start_ms": startMs,
+            ])
             stats.lock.lock(); stats.chunks += 1; stats.lock.unlock()
         } else {
             try? FileManager.default.removeItem(at: u)
@@ -246,37 +264,43 @@ final class ChunkWriter {
 //     prefer letting VAD pick the boundary even if that's a bit slower.
 //   - vadSilenceMs 500 catches sentence-end pauses without triggering on
 //     normal between-word stops (which are typically 100–300 ms).
-let writer = ChunkWriter(dir: outDir, minSeconds: 1.0, maxSeconds: 15.0, vadSilenceMs: 500.0)
+let micWriter = ChunkWriter(source: "mic", dir: outDir, minSeconds: 1.0, maxSeconds: 15.0, vadSilenceMs: 500.0)
+let sysWriter = ChunkWriter(source: "sys", dir: outDir, minSeconds: 1.0, maxSeconds: 15.0, vadSilenceMs: 500.0)
 
-// MARK: - Full-recording writer
+// MARK: - Full-recording writer (per source)
 
-// Parallel writer that captures every drained sample into a single WAV
-// for the duration of the recording. Used by the diarization pass on the
-// Rust side, which needs the full audio in one file to identify speakers
-// across chunk boundaries. ~58 MB per 30-min meeting at 16 kHz mono 16-bit.
+// Parallel writer that captures every received frame into a single WAV for
+// the duration of the recording. Each source gets its own full.wav (so the
+// post-stop diarizer can treat them as independent streams: in-person calls
+// produce only mic_full.wav and run multi-speaker diarize there; remote
+// calls produce both files and run "mic = You, sys = diarize speakers").
+// ~58 MB per 30-min meeting at 16 kHz mono 16-bit per source.
 final class FullRecordingWriter {
+    private let source: String
     private let dir: URL
     private var file: AVAudioFile?
     private var url: URL?
     private var written: AVAudioFrameCount = 0
-    private let queue = DispatchQueue(label: "full.writer")
+    private let queue: DispatchQueue
 
-    init(dir: URL) {
+    init(source: String, dir: URL) {
+        self.source = source
         self.dir = dir
+        self.queue = DispatchQueue(label: "full.writer.\(source)")
     }
 
     func write(_ buffer: AVAudioPCMBuffer) {
         queue.sync {
             do {
                 if file == nil {
-                    let u = dir.appendingPathComponent("full.wav")
+                    let u = dir.appendingPathComponent("\(source)-full.wav")
                     url = u
                     file = try AVAudioFile(forWriting: u, settings: writeSettings)
                 }
                 try file!.write(from: buffer)
                 written += buffer.frameLength
             } catch {
-                emitError("full write: \(error.localizedDescription)")
+                emitError("\(source) full write: \(error.localizedDescription)")
             }
         }
     }
@@ -286,7 +310,12 @@ final class FullRecordingWriter {
             file = nil
             if let u = url, written > 0 {
                 let durationMs = Int(Double(written) / targetSampleRate * 1000.0)
-                emit(["event": "full_recording", "path": u.path, "duration_ms": durationMs])
+                emit([
+                    "event": "full_recording",
+                    "source": source,
+                    "path": u.path,
+                    "duration_ms": durationMs,
+                ])
             }
             url = nil
             written = 0
@@ -294,7 +323,8 @@ final class FullRecordingWriter {
     }
 }
 
-let fullWriter = FullRecordingWriter(dir: outDir)
+let micFullWriter = FullRecordingWriter(source: "mic", dir: outDir)
+let sysFullWriter = FullRecordingWriter(source: "sys", dir: outDir)
 
 // MARK: - Stats (diagnostics)
 
@@ -308,58 +338,37 @@ final class Stats {
 }
 let stats = Stats()
 
-// MARK: - Mixing buffer
-
-/// A simple lock-protected sliding mix buffer. Each source writes Float32 samples
-/// at the target rate; on timer tick, we take the prefix that both sources have
-/// reached, mix them sample-wise, and emit. Slight drift is tolerated.
-final class Mixer {
-    private let lock = NSLock()
-    private var mic: [Float] = []
-    private var sys: [Float] = []
-    private(set) var mixed: [Float] = []
-
-    func push(mic samples: [Float]) {
-        let peak = samples.reduce(0 as Float) { max($0, abs($1)) }
-        lock.lock()
-        mic.append(contentsOf: samples)
-        lock.unlock()
-        stats.lock.lock()
-        stats.micFrames += samples.count
-        if peak > stats.micPeak { stats.micPeak = peak }
-        stats.lock.unlock()
-    }
-    func push(sys samples: [Float]) {
-        let peak = samples.reduce(0 as Float) { max($0, abs($1)) }
-        lock.lock()
-        sys.append(contentsOf: samples)
-        lock.unlock()
-        stats.lock.lock()
-        stats.sysFrames += samples.count
-        if peak > stats.sysPeak { stats.sysPeak = peak }
-        stats.lock.unlock()
-    }
-
-    /// Returns up to `maxFrames` mixed samples. If only one source has data,
-    /// passes through that source. Caller drives the consumption pace.
-    func drain(maxFrames: Int) -> [Float] {
-        lock.lock(); defer { lock.unlock() }
-        let n = min(maxFrames, max(mic.count, sys.count))
-        if n == 0 { return [] }
-        var out = [Float](repeating: 0, count: n)
-        let mTake = min(mic.count, n)
-        let sTake = min(sys.count, n)
-        for i in 0..<mTake { out[i] += mic[i] * 0.85 }
-        for i in 0..<sTake { out[i] += sys[i] * 0.85 }
-        // Soft clip
-        for i in 0..<n { out[i] = max(-1.0, min(1.0, out[i])) }
-        if mTake > 0 { mic.removeFirst(mTake) }
-        if sTake > 0 { sys.removeFirst(sTake) }
-        return out
-    }
+func recordMicStats(samples: [Float]) {
+    let peak = samples.reduce(0 as Float) { max($0, abs($1)) }
+    stats.lock.lock()
+    stats.micFrames += samples.count
+    if peak > stats.micPeak { stats.micPeak = peak }
+    stats.lock.unlock()
 }
 
-let mixer = Mixer()
+func recordSysStats(samples: [Float]) {
+    let peak = samples.reduce(0 as Float) { max($0, abs($1)) }
+    stats.lock.lock()
+    stats.sysFrames += samples.count
+    if peak > stats.sysPeak { stats.sysPeak = peak }
+    stats.lock.unlock()
+}
+
+// Wrap a Float32 sample array into an AVAudioPCMBuffer for the writers. The
+// writers expect mono Float32 at the target sample rate.
+func makeBuffer(_ samples: [Float]) -> AVAudioPCMBuffer? {
+    guard !samples.isEmpty,
+          let buf = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: AVAudioFrameCount(samples.count)) else {
+        return nil
+    }
+    buf.frameLength = AVAudioFrameCount(samples.count)
+    if let chans = buf.floatChannelData {
+        samples.withUnsafeBufferPointer { src in
+            chans[0].update(from: src.baseAddress!, count: samples.count)
+        }
+    }
+    return buf
+}
 
 // MARK: - Mic via AVAudioEngine
 
@@ -393,7 +402,11 @@ do {
            let chans = out.floatChannelData {
             let n = Int(out.frameLength)
             let arr = Array(UnsafeBufferPointer(start: chans[0], count: n))
-            mixer.push(mic: arr)
+            recordMicStats(samples: arr)
+            if let buf = makeBuffer(arr) {
+                micWriter.write(buf)
+                micFullWriter.write(buf)
+            }
         }
     }
     engine.prepare()
@@ -469,7 +482,11 @@ final class SystemAudioOutput: NSObject, SCStreamOutput {
         guard convStatus != .error, let chans = out.floatChannelData else { return }
         let n = Int(out.frameLength)
         let arr = Array(UnsafeBufferPointer(start: chans[0], count: n))
-        mixer.push(sys: arr)
+        recordSysStats(samples: arr)
+        if let buf = makeBuffer(arr) {
+            sysWriter.write(buf)
+            sysFullWriter.write(buf)
+        }
     }
 }
 
@@ -514,26 +531,6 @@ final class NoopVideoOutput: NSObject, SCStreamOutput {
 }
 
 Task { await startSystemAudio() }
-
-// MARK: - Drain timer → write to chunk
-
-let drainQueue = DispatchQueue(label: "drain")
-let drainTimer = DispatchSource.makeTimerSource(queue: drainQueue)
-drainTimer.schedule(deadline: .now() + .milliseconds(200), repeating: .milliseconds(200))
-drainTimer.setEventHandler {
-    let frames = mixer.drain(maxFrames: Int(targetSampleRate)) // up to 1s per tick
-    if frames.isEmpty { return }
-    guard let buf = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: AVAudioFrameCount(frames.count)) else { return }
-    buf.frameLength = AVAudioFrameCount(frames.count)
-    if let chans = buf.floatChannelData {
-        frames.withUnsafeBufferPointer { src in
-            chans[0].update(from: src.baseAddress!, count: frames.count)
-        }
-    }
-    writer.write(buf)
-    fullWriter.write(buf)
-}
-drainTimer.resume()
 
 // MARK: - Heartbeat (every 2s) for live diagnostics
 
@@ -628,37 +625,21 @@ signal(SIGTERM, SIG_IGN)
 signal(SIGINT, SIG_IGN)
 
 let shutdown: () -> Void = {
-    drainTimer.cancel()
-    if let s = scStream {
-        Task {
+    Task {
+        if let s = scStream {
             try? await s.stopCapture()
-            engine.stop()
-            // Final drain
-            let leftover = mixer.drain(maxFrames: Int(targetSampleRate) * 60)
-            if !leftover.isEmpty,
-               let buf = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: AVAudioFrameCount(leftover.count)) {
-                buf.frameLength = AVAudioFrameCount(leftover.count)
-                if let chans = buf.floatChannelData {
-                    leftover.withUnsafeBufferPointer { src in
-                        chans[0].update(from: src.baseAddress!, count: leftover.count)
-                    }
-                }
-                writer.write(buf)
-                fullWriter.write(buf)
-            }
-            // Order matters: emit `full_recording` BEFORE `stopped` so the
-            // Rust reader sees the full WAV path before its loop breaks
-            // out on `stopped`. ChunkWriter.close() emits the final chunk
-            // (if any) AND `stopped` in one atomic step, so it must come
-            // last.
-            fullWriter.close()
-            writer.close()
-            exit(0)
         }
-    } else {
         engine.stop()
-        fullWriter.close()
-        writer.close()
+        // Order matters: emit `full_recording` events BEFORE `stopped` so the
+        // Rust reader sees both full WAV paths before its loop breaks out on
+        // `stopped`. Each ChunkWriter.close() emits its final chunk (if any);
+        // the single `stopped` event signals end-of-stream for the entire
+        // sidecar (both sources finished).
+        micFullWriter.close()
+        sysFullWriter.close()
+        micWriter.close()
+        sysWriter.close()
+        emit(["event": "stopped"])
         exit(0)
     }
 }

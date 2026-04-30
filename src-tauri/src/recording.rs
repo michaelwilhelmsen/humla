@@ -56,12 +56,37 @@ impl Default for TranscriptTrail {
     }
 }
 
+/// Which audio stream a chunk came from. The mic stream is always the user
+/// (we label its chunks "You" without diarization). The system stream
+/// captures remote participants on calls; we run the offline diarizer on it
+/// to separate multiple remote speakers. In-person meetings produce only
+/// mic chunks (system is silent → no chunks emitted) and the diarizer runs
+/// on the mic stream instead so multiple humans in the same room get
+/// distinct labels.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChunkSource {
+    Mic,
+    Sys,
+}
+
+impl Default for ChunkSource {
+    fn default() -> Self {
+        // Pre-v0.8.0 sidecars didn't emit `source`. If we ever load an old
+        // sidecar event for any reason (stale dev cache mid-upgrade), treat
+        // the chunk as mic — the safer default since mic always exists.
+        ChunkSource::Mic
+    }
+}
+
 /// Per-chunk metadata captured during recording. The diarization step needs
-/// to align speaker segments (timestamps relative to the full recording)
-/// against chunk-level transcripts; this log holds the link between
-/// "chunk N's text" and "chunk N started at start_ms in the full audio".
+/// to align speaker segments (timestamps relative to the per-source full
+/// recording WAV) against chunk-level transcripts; this log holds the link
+/// between "chunk N's text", which source it came from, and where it sits
+/// on that source's timeline.
 #[derive(Clone, Debug)]
 pub struct ChunkRecord {
+    pub source: ChunkSource,
     pub start_ms: u64,
     pub text: String,
 }
@@ -78,17 +103,23 @@ pub struct RecordingSession {
     // Handle for the stdout reader task that spawns transcribes. Awaiting
     // it guarantees no further pushes to `inflight` are coming.
     pub reader: Option<JoinHandle<()>>,
-    // Rolling context window of the last ~150 committed words. Fed to
-    // Whisper's `initial_prompt` for every chunk so decoding stays anchored
-    // to the conversation rather than treating each chunk as a cold start.
-    pub trail: Arc<Mutex<TranscriptTrail>>,
+    // Per-source rolling context windows of the last ~150 committed words.
+    // Fed to Whisper's `initial_prompt` for every chunk so decoding stays
+    // anchored to its own stream rather than mixing the user's side with
+    // the remote side's vocabulary, which would harm proper-noun spelling
+    // and pull each Whisper invocation toward the wrong language.
+    pub mic_trail: Arc<Mutex<TranscriptTrail>>,
+    pub sys_trail: Arc<Mutex<TranscriptTrail>>,
     // Per-chunk metadata. Read by the offline diarization pass on
     // recording_stop to align FluidAudio's speaker segments back to the
     // chunks the user saw stream in.
     pub chunk_log: Arc<Mutex<Vec<ChunkRecord>>>,
-    // Path to the full-recording WAV file. Consumed by the offline
-    // diarization pass on stop, then deleted alongside the temp dir.
-    pub full_wav_path: Arc<Mutex<Option<PathBuf>>>,
+    // Paths to the per-source full-recording WAV files. Consumed by the
+    // offline diarization pass on stop, then deleted alongside the temp dir.
+    // Either may be `None` if its source produced no audio (mic permission
+    // denied, no system audio active for the whole recording, etc).
+    pub mic_full_wav_path: Arc<Mutex<Option<PathBuf>>>,
+    pub sys_full_wav_path: Arc<Mutex<Option<PathBuf>>>,
     // Snapshot of the note's transcript at recording_start. Used by the
     // offline diarization step to prepend prior content to this session's
     // diarized output, so resuming a recording adds to the transcript
@@ -149,16 +180,25 @@ pub struct ErrorPayload {
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum SidecarEvent {
     Chunk {
+        // Which audio stream produced this chunk. Older sidecars (pre-v0.8.0)
+        // didn't emit a source — `Default` for `ChunkSource` is `Mic`, which
+        // matches the legacy "single-mixed-stream" semantics where everything
+        // ended up labeled as mic.
+        #[serde(default)]
+        source: ChunkSource,
         path: String,
         // Time (in milliseconds) at which this chunk's audio starts relative
-        // to the beginning of the recording. Defaults to 0 for older sidecar
-        // builds that didn't emit this — the diarization step will treat
-        // start-less chunks as if they all start at 0, which collapses the
-        // alignment to "best effort".
+        // to the first frame of its source stream's full WAV. Defaults to 0
+        // for older sidecar builds that didn't emit this.
         #[serde(default)]
         start_ms: u64,
     },
     FullRecording {
+        // See `Chunk.source`. The two streams produce two `full_recording`
+        // events, one each for `mic` and `sys`. Either may be absent if its
+        // source never wrote any frames (e.g. screen permission denied).
+        #[serde(default)]
+        source: ChunkSource,
         path: String,
         duration_ms: u64,
     },

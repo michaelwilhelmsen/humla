@@ -5,13 +5,25 @@ import FluidAudio
 // (with download additionally streaming progress lines as JSON before the
 // final payload). Exit 0 on success, 1 on failure with stderr message.
 //
-//   speaker-diarize <wav-path>   — run diarization on a WAV file
-//   speaker-diarize streaming    — long-running classifier; reads chunk
-//                                  paths from stdin, emits speaker IDs to
-//                                  stdout. Exits when stdin closes.
+//   speaker-diarize <wav-path> [--num-speakers N]
+//                                — run offline diarization on a WAV file.
+//                                  Optional `--num-speakers N` pins the
+//                                  cluster count when the caller knows it
+//                                  (e.g. "I'm in a 1:1 with one other
+//                                  person → N=2"). Without the flag, VBx
+//                                  decides cluster count on its own —
+//                                  which under-counts on conversations
+//                                  dominated by one speaker.
 //   speaker-diarize status       — model presence + size on disk
 //   speaker-diarize download     — download + compile the model (streams progress)
 //   speaker-diarize delete       — wipe the cached model directory
+//
+// Backed by FluidAudio's `OfflineDiarizerManager` (community-1 segmentation +
+// VBx clustering with PLDA score normalisation). This is the upgrade from the
+// 3.1-based `DiarizerManager`, picked because community-1 counts and assigns
+// speakers more accurately on dense single-mic captures (e.g. an in-person
+// meeting where everyone shares one acoustic context — the failure mode that
+// drove this change was different humans collapsing onto the same cluster).
 
 let args = CommandLine.arguments
 
@@ -51,8 +63,19 @@ func directorySize(_ url: URL) -> Int64 {
     return total
 }
 
+// FluidAudio stores the offline diarizer files under
+// <FluidAudio/Models>/speaker-diarization/ — the parent dir comes from
+// `OfflineDiarizerModels.defaultModelsDirectory()`, the subdir name from
+// `Repo.diarizer.folderName`. We resolve the leaf path here so status/delete
+// inspect exactly what `OfflineDiarizerModels.load` writes.
+func offlineModelsDirectory() -> URL {
+    OfflineDiarizerModels
+        .defaultModelsDirectory()
+        .appendingPathComponent(Repo.diarizer.folderName, isDirectory: true)
+}
+
 func runStatus() {
-    let dir = DiarizerModels.defaultModelsDirectory()
+    let dir = offlineModelsDirectory()
     let exists = FileManager.default.fileExists(atPath: dir.path)
     if !exists {
         writeStdout([
@@ -62,11 +85,12 @@ func runStatus() {
         ] as [String: Any])
         return
     }
-    // Treat the directory as "downloaded" iff every required model file is
-    // present underneath it. Partial-download leftovers report as
-    // not-downloaded so the UI prompts a re-download instead of pretending
-    // diarization will work.
-    let required = DiarizerModels.requiredModelNames
+    // Treat the directory as "downloaded" iff every required offline model
+    // file (segmentation, fbank, embedding, plda) plus the plda-parameters
+    // JSON is present. Partial-download leftovers report as not-downloaded
+    // so the UI prompts a re-download instead of pretending diarization will
+    // work.
+    let required = ModelNames.OfflineDiarizer.requiredModels
     var allPresent = true
     for name in required {
         let modelURL = dir.appendingPathComponent(name)
@@ -84,7 +108,7 @@ func runStatus() {
 }
 
 func runDelete() {
-    let dir = DiarizerModels.defaultModelsDirectory()
+    let dir = offlineModelsDirectory()
     if FileManager.default.fileExists(atPath: dir.path) {
         try? FileManager.default.removeItem(at: dir)
     }
@@ -93,14 +117,11 @@ func runDelete() {
 
 func runDownload() async -> Int32 {
     do {
-        // FluidAudio's progressHandler is invoked during the underlying
-        // HuggingFace fetch + Core ML compile. Forward each call to stdout
-        // so the Rust side can emit Tauri events.
-        let _ = try await DiarizerModels.downloadIfNeeded(progressHandler: { progress in
-            // FluidAudio progress goes through three phases: listing files,
-            // downloading them, and compiling the CoreML models for the
-            // Apple Neural Engine. We surface a phase tag so the UI can
-            // distinguish the download vs the (slower) compile step.
+        // `OfflineDiarizerModels.load` triggers downloadIfNeeded under the
+        // hood and surfaces the same DownloadProgress phases as the streaming
+        // path used to. Forward each tick to stdout so the Rust side can emit
+        // Tauri events to the UI progress bar.
+        _ = try await OfflineDiarizerModels.load(progressHandler: { progress in
             let phase: String
             switch progress.phase {
             case .listing: phase = "listing"
@@ -121,100 +142,40 @@ func runDownload() async -> Int32 {
     }
 }
 
-// Long-running classifier. Keeps a single DiarizerManager alive for the
-// duration of a recording so cross-chunk speaker memory persists — chunk N
-// matches its embedding against everyone the model has heard up to chunk
-// N-1, returning a stable speaker ID. Exits cleanly when stdin closes
-// (parent stopped recording or died).
-func runStreaming() async -> Int32 {
+func runDiarize(audioPath: String, numSpeakers: Int?) async -> Int32 {
     do {
-        let models = try await DiarizerModels.downloadIfNeeded()
-        let config = DiarizerConfig(clusteringThreshold: 0.5)
-        let diarizer = DiarizerManager(config: config)
-        diarizer.initialize(models: models)
-        let converter = AudioConverter()
-
-        // Signal ready so the parent can start sending requests.
-        writeStdout(["event": "ready"])
-
-        while let line = readLine() {
-            guard let data = line.data(using: .utf8),
-                  let req = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                continue
-            }
-            // Default to classify when cmd is omitted (back-compat).
-            let cmd = (req["cmd"] as? String) ?? "classify"
-
-            if cmd == "reset" {
-                // Wipe the SpeakerManager between recordings so meeting 1's
-                // "Speaker 1" embedding doesn't match against meeting 2's
-                // voices. The actor reset is fast — just clears the
-                // in-memory speaker database; doesn't touch the model.
-                await diarizer.speakerManager.reset(keepIfPermanent: false)
-                writeStdout(["event": "reset_done"] as [String: Any])
-                continue
-            }
-
-            // classify (default)
-            guard let path = req["path"] as? String else {
-                writeStdout(["error": "missing path"] as [String: Any])
-                continue
-            }
-            do {
-                let url = URL(fileURLWithPath: path)
-                let samples = try converter.resampleAudioFile(url)
-                let embedding = try diarizer.extractSpeakerEmbedding(from: Array(samples))
-                let durationSeconds = Float(samples.count) / 16000.0
-                let speaker = await diarizer.speakerManager.assignSpeaker(
-                    embedding,
-                    speechDuration: durationSeconds
-                )
-                if let s = speaker {
-                    writeStdout([
-                        "path": path,
-                        "speaker_id": s.id,
-                    ] as [String: Any])
-                } else {
-                    // Embedding extraction succeeded but clustering rejected
-                    // it (e.g. silence below speech-duration threshold).
-                    writeStdout([
-                        "path": path,
-                        "speaker_id": NSNull(),
-                    ] as [String: Any])
-                }
-            } catch {
-                writeStdout([
-                    "path": path,
-                    "error": "\(error)",
-                ] as [String: Any])
-            }
+        // Tuning notes for in-person meetings on a shared mic:
+        //   - clusteringThreshold 0.4 (down from community default 0.6, and
+        //     down from the 0.5 we shipped initially) so similar-sounding
+        //     voices recorded in the same room don't collapse onto one
+        //     cluster. Lower = more aggressive separation. The value was
+        //     tightened after observing the v0.8.0 build still merging
+        //     two-person conversations into a single cluster when one
+        //     speaker dominated and the other only dropped short
+        //     interjections.
+        //   - excludeOverlap stays true (default): when two speakers overlap,
+        //     the overlapping frames are masked out before extracting per-
+        //     speaker embeddings, so the embedding stays clean.
+        //   - exclusiveSegments stays true (default): output is non-overlapping
+        //     so each chunk maps to exactly one speaker for the chunk-to-
+        //     segment alignment in commands.rs::assign_speaker.
+        var config = OfflineDiarizerConfig(clusteringThreshold: 0.4)
+        // Caller-supplied speaker count hint when the user knows the count
+        // ahead of time. `withSpeakers(exactly:)` overrides the auto cluster
+        // detection inside VBx — without it, VBx is free to pick any
+        // count, and on dominant-speaker conversations it tends to choose 1.
+        if let n = numSpeakers, n > 0 {
+            config = config.withSpeakers(exactly: n)
         }
-        return 0
-    } catch {
-        writeStderr("streaming setup error: \(error)")
-        return 1
-    }
-}
+        let manager = OfflineDiarizerManager(config: config)
+        try await manager.prepareModels()
 
-func runDiarize(audioPath: String) async -> Int32 {
-    do {
-        let models = try await DiarizerModels.downloadIfNeeded()
-        // 0.5 leans aggressive on speaker SEPARATION (lower threshold ⇒ more
-        // speakers detected). YouTube / Teams / system-audio captures put
-        // multiple voices through the same downstream codec, which makes
-        // their embeddings sit closer together than they would in clean
-        // multi-channel recordings — at threshold 0.6 (and especially 0.7)
-        // the model tends to merge them.
-        let config = DiarizerConfig(clusteringThreshold: 0.5)
-        let diarizer = DiarizerManager(config: config)
-        diarizer.initialize(models: models)
-
-        let converter = AudioConverter()
         let url = URL(fileURLWithPath: audioPath)
-        let samples = try converter.resampleAudioFile(url)
+        let result = try await manager.process(url)
 
-        let result = try await diarizer.performCompleteDiarization(samples)
-
+        // Output shape stays identical to the previous DiarizerManager path:
+        // an array of {start_ms, end_ms, speaker_id} that the Rust side can
+        // align to chunks via start_ms.
         let payload: [[String: Any]] = result.segments.map { seg in
             [
                 "start_ms": Int(seg.startTimeSeconds * 1000.0),
@@ -246,16 +207,18 @@ case "download":
         semaphore.signal()
     }
     semaphore.wait()
-case "streaming":
-    Task {
-        exitCode = await runStreaming()
-        semaphore.signal()
-    }
-    semaphore.wait()
 default:
+    // Positional <wav-path>, optional `--num-speakers N` (in any position).
     let path = args[1]
+    var numSpeakers: Int? = nil
+    if let i = args.firstIndex(of: "--num-speakers"),
+       i + 1 < args.count,
+       let n = Int(args[i + 1]),
+       n > 0 {
+        numSpeakers = n
+    }
     Task {
-        exitCode = await runDiarize(audioPath: path)
+        exitCode = await runDiarize(audioPath: path, numSpeakers: numSpeakers)
         semaphore.signal()
     }
     semaphore.wait()

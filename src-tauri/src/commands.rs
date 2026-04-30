@@ -4,7 +4,7 @@ use crate::openai;
 use crate::local_whisper;
 use crate::presets;
 use crate::wav;
-use crate::recording::{ChunkRecord, DiagnosticPayload, ErrorPayload, Inflight, Phase, RecordingStatus, SidecarEvent, StreamDeltaPayload, SummaryPayload, TranscriptPayload};
+use crate::recording::{ChunkRecord, ChunkSource, DiagnosticPayload, ErrorPayload, Inflight, Phase, RecordingStatus, SidecarEvent, StreamDeltaPayload, SummaryPayload, TranscriptPayload};
 use crate::AppState;
 use futures_util::StreamExt;
 use std::path::PathBuf;
@@ -40,7 +40,7 @@ NEVER:
 - Translate the transcript or change its language.
 
 SPEAKER LABELS:
-- Lines may begin with a speaker label followed by ': ' — e.g. 'Speaker 1: ', 'Speaker 2: ', or a custom name the user has assigned like 'Michael: ' or 'Anna: '. Preserve these labels EXACTLY as they appear: same text, same colon-space, same position at the start of the line.
+- Lines may begin with a speaker label followed by ': ' — e.g. 'Speaker 1: ', 'Speaker 2: ', the special 'You: ' (which marks the user's own side on calls), or a custom name the user has assigned like 'Michael: ' or 'Anna: '. Preserve these labels EXACTLY as they appear: same text, same colon-space, same position at the start of the line.
 - NEVER move text between speakers, merge consecutive turns from different speakers, split a single turn across multiple speakers, or invent new speakers.
 - The number of lines beginning with a label-followed-by-colon must equal the input. The order of speakers must be identical.
 
@@ -574,10 +574,15 @@ pub async fn recording_start(
         s.inflight = inflight.clone();
         // Wipe any context from a previous recording — proper nouns and
         // sentence fragments from a different conversation would only confuse
-        // this session's decoder. Same for the speaker bookkeeping.
-        s.trail.lock().clear();
+        // this session's decoder. Same for the speaker bookkeeping. Per-source
+        // trails because the mic and system streams are separate
+        // conversations — sharing a trail would pull each Whisper invocation
+        // toward the other side's vocabulary and language.
+        s.mic_trail.lock().clear();
+        s.sys_trail.lock().clear();
         s.chunk_log.lock().clear();
-        *s.full_wav_path.lock() = None;
+        *s.mic_full_wav_path.lock() = None;
+        *s.sys_full_wav_path.lock() = None;
     }
 
     // Snapshot any existing transcript so diarize_and_apply can prepend it
@@ -604,12 +609,12 @@ pub async fn recording_start(
             let trimmed = line.trim();
             if trimmed.is_empty() { continue; }
             match serde_json::from_str::<SidecarEvent>(trimmed) {
-                Ok(SidecarEvent::Chunk { path, start_ms }) => {
+                Ok(SidecarEvent::Chunk { source, path, start_ms }) => {
                     let pb = PathBuf::from(path);
                     let app2 = app_clone.clone();
                     let note_id2 = note_id_clone.clone();
                     let h = tokio::spawn(async move {
-                        if let Err(e) = transcribe_chunk(app2.clone(), note_id2.clone(), pb, start_ms).await {
+                        if let Err(e) = transcribe_chunk(app2.clone(), note_id2.clone(), source, pb, start_ms).await {
                             let msg = format!("Transcription failed: {e}");
                             eprintln!("{msg}");
                             let _ = app2.emit("recording_error", ErrorPayload {
@@ -620,12 +625,19 @@ pub async fn recording_start(
                     });
                     inflight_for_reader.lock().push(h);
                 }
-                Ok(SidecarEvent::FullRecording { path, duration_ms: _ }) => {
+                Ok(SidecarEvent::FullRecording { source, path, duration_ms: _ }) => {
                     // Stash the path on the session; the diarization pass on
-                    // stop reads it. We don't act on it here — the recording
-                    // is still wrapping up.
+                    // stop reads them. We don't act here — the recording is
+                    // still wrapping up. Each source has its own slot so the
+                    // post-stop pass can branch (mic-only → diarize mic;
+                    // both present → "You" + diarize sys).
                     let state: tauri::State<AppState> = app_clone.state();
-                    *state.recording.lock().full_wav_path.lock() = Some(PathBuf::from(path));
+                    let session = state.recording.lock();
+                    let slot = match source {
+                        ChunkSource::Mic => &session.mic_full_wav_path,
+                        ChunkSource::Sys => &session.sys_full_wav_path,
+                    };
+                    *slot.lock() = Some(PathBuf::from(path));
                 }
                 Ok(SidecarEvent::Error { message }) => {
                     eprintln!("sidecar error: {message}");
@@ -782,27 +794,45 @@ pub async fn recording_stop(
 }
 
 /// Run offline speaker diarization on the just-finished recording and
-/// rewrite the transcript with `Speaker N:` prefixes. Resumed recordings
-/// prepend the snapshotted prior transcript and offset this session's
-/// speaker numbers past any existing `Speaker N:` labels so the two halves
-/// don't share IDs (diarization can't unify speakers across independent
-/// sessions without seeing the combined audio). No-ops gracefully when
-/// the diarize model isn't downloaded, when the full-recording WAV isn't
-/// available, or when no chunks were captured.
+/// rewrite the transcript with proper labels. Branches on which streams
+/// produced content:
+///
+/// - **Mic only** (in-person meeting, no system audio): diarize the mic
+///   full WAV, label chunks `Speaker N:` in first-encounter order. This is
+///   the original single-stream path; multiple humans sharing the same mic
+///   get separated by community-1's clustering.
+/// - **System only** (very rare; mic permission denied or some platform
+///   weirdness): diarize the system full WAV, same `Speaker N:` labelling.
+/// - **Both present** (remote/hybrid call): diarize the system stream for
+///   remote-side speakers, label every mic chunk as `You:` (the user is
+///   the only person on the mic side, by definition of channel
+///   attribution). Skips diarizing the mic stream entirely — there's no
+///   point classifying a stream where every chunk is the same person.
+///
+/// Resumed recordings prepend the snapshotted prior transcript and offset
+/// this session's `Speaker N:` numbers past any existing ones so resumed
+/// halves don't collide IDs (`You:` is a fixed label and isn't offset).
+/// No-ops gracefully when the diarize model isn't downloaded, when no
+/// chunks were captured, or when both streams produced nothing.
 async fn diarize_and_apply(app: AppHandle, note_id: String) -> anyhow::Result<()> {
     // Pull session state with cloning so we can drop the parking_lot
-    // guards before the long await on the sidecar.
-    let (wav_path, chunks, snapshot): (Option<PathBuf>, Vec<ChunkRecord>, String) = {
+    // guards before the long await on the sidecar. Also read the per-note
+    // expected_speakers hint here while we're in the DB — passing the
+    // resolved value forward keeps the long-await section free of locks.
+    let (mic_wav, sys_wav, chunks, snapshot, expected_speakers) = {
         let state: State<AppState> = app.state();
         let session = state.recording.lock();
-        let wav = session.full_wav_path.lock().clone();
+        let mic = session.mic_full_wav_path.lock().clone();
+        let sys = session.sys_full_wav_path.lock().clone();
         let log = session.chunk_log.lock().clone();
         let snap = session.transcript_at_start.lock().clone();
-        (wav, log, snap)
-    };
-    let Some(wav) = wav_path else {
-        eprintln!("diarize: no full.wav captured, skipping");
-        return Ok(());
+        drop(session);
+        let conn = state.db.lock();
+        let hint = db::get_note(&conn, &note_id)
+            .ok()
+            .and_then(|n| n.expected_speakers)
+            .filter(|n| *n > 0);
+        (mic, sys, log, snap, hint)
     };
     if chunks.is_empty() {
         eprintln!("diarize: no chunks captured, skipping");
@@ -818,14 +848,144 @@ async fn diarize_and_apply(app: AppHandle, note_id: String) -> anyhow::Result<()
         }
     }
 
-    emit_status(&app, Some(&note_id), Phase::Diarizing);
-    let segments = diarize::diarize_file(&app, &wav).await?;
-    if segments.is_empty() {
-        eprintln!("diarize: no segments returned, leaving transcript untagged");
-        return Ok(());
-    }
+    let mic_chunks_present = chunks.iter().any(|c| c.source == ChunkSource::Mic);
+    let sys_chunks_present = chunks.iter().any(|c| c.source == ChunkSource::Sys);
 
-    let new_session = build_diarized_transcript(&chunks, &segments);
+    emit_status(&app, Some(&note_id), Phase::Diarizing);
+
+    // Decide which WAV to diarize and how to label chunks. The label
+    // assignment is a per-chunk closure so the merge step doesn't need to
+    // know which mode we're in.
+    // The labeller closure crosses a `.await` (the cleanup_full_wav calls
+    // below) inside a spawned task, so it has to be `Send`. The captured
+    // segments + display map are both Send, so the bound just needs to be
+    // declared on the trait object.
+    type Labeller = dyn Fn(&ChunkRecord) -> Option<String> + Send;
+    let label_for_chunk: Box<Labeller> = match (mic_chunks_present, sys_chunks_present) {
+        (true, false) => {
+            // In-person mode: diarize the mic stream, every chunk gets a
+            // numbered label from its segment. The per-note expected
+            // speaker hint applies directly — every speaker is on the mic.
+            let Some(wav) = mic_wav.clone() else {
+                // Missing mic_full.wav despite mic chunks: typically a
+                // SIGKILL of the audio-capture sidecar before its shutdown
+                // handler ran. Surface a toast so the user understands why
+                // their transcript shows no speaker labels.
+                eprintln!("diarize: mic chunks present but mic_full.wav missing, skipping");
+                emit_error(
+                    &app,
+                    Some(&note_id),
+                    "Diarization unavailable: the recording sidecar didn't write the full audio file. Transcript saved without speaker labels.",
+                );
+                return Ok(());
+            };
+            let segments = diarize::diarize_file(&app, &wav, expected_speakers).await?;
+            if segments.is_empty() {
+                eprintln!("diarize: no segments returned for mic stream, leaving transcript untagged");
+                return Ok(());
+            }
+            let display_map = build_display_map(&chunks, &segments, ChunkSource::Mic);
+            Box::new(move |c: &ChunkRecord| {
+                let sid = assign_speaker(c.start_ms, &segments)?;
+                display_map.get(sid).map(|n| format!("Speaker {n}"))
+            })
+        }
+        (false, true) => {
+            // Edge case: system-only recording. Same as mic-only but on
+            // the other stream. Numbered labels.
+            let Some(wav) = sys_wav.clone() else {
+                eprintln!("diarize: sys chunks present but sys_full.wav missing, skipping");
+                emit_error(
+                    &app,
+                    Some(&note_id),
+                    "Diarization unavailable: the recording sidecar didn't write the full audio file. Transcript saved without speaker labels.",
+                );
+                return Ok(());
+            };
+            let segments = diarize::diarize_file(&app, &wav, expected_speakers).await?;
+            if segments.is_empty() {
+                eprintln!("diarize: no segments returned for sys stream, leaving transcript untagged");
+                return Ok(());
+            }
+            let display_map = build_display_map(&chunks, &segments, ChunkSource::Sys);
+            Box::new(move |c: &ChunkRecord| {
+                let sid = assign_speaker(c.start_ms, &segments)?;
+                display_map.get(sid).map(|n| format!("Speaker {n}"))
+            })
+        }
+        (true, true) => {
+            // Remote/hybrid call: mic = "You" by channel attribution; the
+            // system stream gets diarized for remote-side speakers. Skip
+            // the mic diarize call entirely — no information to gain when
+            // every mic chunk is the same person.
+            //
+            // The per-note speaker hint is the *total* count the user
+            // expects (themselves + remote participants). Subtract one for
+            // the user's `You:` label so the diarizer is asked to find the
+            // remaining N-1 on the system stream. Floors at 1 — entering
+            // a hint of 1 in remote mode is nonsensical (would mean "just
+            // me" yet sys has chunks), so treat it as "find 1 remote".
+            let sys_speaker_hint = expected_speakers.map(|n| (n - 1).max(1));
+            //
+            // Three failure modes drop us into the single-speaker fallback
+            // labeller (mic = "You", sys = "Speaker 1"):
+            //   1. sys_full.wav missing (sidecar SIGKILL'd before close).
+            //   2. diarize sidecar errored.
+            //   3. diarize returned zero segments.
+            //
+            // The fallback assigns sys chunks `Speaker 1` rather than
+            // returning `None`, because a `None` label causes
+            // `build_labelled_transcript` to glue the chunk's text onto the
+            // previous label's line — i.e. remote audio would silently
+            // merge into the user's `You:` line. Better to surface a single
+            // unlabeled-but-distinct speaker than to lose the boundary.
+            let single_speaker_fallback = || -> Box<Labeller> {
+                Box::new(|c: &ChunkRecord| match c.source {
+                    ChunkSource::Mic => Some("You".to_string()),
+                    ChunkSource::Sys => Some("Speaker 1".to_string()),
+                })
+            };
+            match sys_wav.clone() {
+                None => {
+                    eprintln!("diarize: sys chunks present but sys_full.wav missing, falling back to single-speaker labels");
+                    emit_error(
+                        &app,
+                        Some(&note_id),
+                        "Diarization unavailable for the remote side; remote speakers grouped under Speaker 1.",
+                    );
+                    single_speaker_fallback()
+                }
+                Some(wav) => match diarize::diarize_file(&app, &wav, sys_speaker_hint).await {
+                    Err(e) => {
+                        eprintln!("diarize: sys diarize failed ({e}), falling back to single-speaker labels");
+                        emit_error(
+                            &app,
+                            Some(&note_id),
+                            &format!("Diarization failed for the remote side ({e}); remote speakers grouped under Speaker 1."),
+                        );
+                        single_speaker_fallback()
+                    }
+                    Ok(segments) if segments.is_empty() => {
+                        eprintln!("diarize: sys diarize returned no segments, falling back to single-speaker labels");
+                        single_speaker_fallback()
+                    }
+                    Ok(segments) => {
+                        let display_map = build_display_map(&chunks, &segments, ChunkSource::Sys);
+                        Box::new(move |c: &ChunkRecord| match c.source {
+                            ChunkSource::Mic => Some("You".to_string()),
+                            ChunkSource::Sys => {
+                                let sid = assign_speaker(c.start_ms, &segments)?;
+                                display_map.get(sid).map(|n| format!("Speaker {n}"))
+                            }
+                        })
+                    }
+                },
+            }
+        }
+        (false, false) => unreachable!("chunks.is_empty() returned earlier"),
+    };
+
+    let new_session = build_labelled_transcript(&chunks, label_for_chunk.as_ref());
     let combined = combine_with_snapshot(&snapshot, &new_session);
     if combined.trim().is_empty() {
         return Ok(());
@@ -843,9 +1003,32 @@ async fn diarize_and_apply(app: AppHandle, note_id: String) -> anyhow::Result<()
         },
     );
 
-    // Free the full.wav ahead of the temp-dir cleanup. Best-effort.
-    diarize::cleanup_full_wav(&wav).await;
+    // Free the full.wav files ahead of the temp-dir cleanup. Best-effort.
+    if let Some(p) = mic_wav { diarize::cleanup_full_wav(&p).await; }
+    if let Some(p) = sys_wav { diarize::cleanup_full_wav(&p).await; }
     Ok(())
+}
+
+/// Walk the chunks of a given source in order, assigning each a 1-indexed
+/// display number based on the speaker_id its start_ms maps to. The map
+/// is built up-front so the per-chunk label closure is allocation-free
+/// and produces identical numbers on repeated lookups for the same
+/// speaker_id.
+fn build_display_map(
+    chunks: &[ChunkRecord],
+    segments: &[diarize::Segment],
+    source: ChunkSource,
+) -> std::collections::HashMap<String, u32> {
+    let mut map: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    for chunk in chunks.iter().filter(|c| c.source == source) {
+        if let Some(sid) = assign_speaker(chunk.start_ms, segments) {
+            if !map.contains_key(sid) {
+                let n = (map.len() as u32) + 1;
+                map.insert(sid.to_string(), n);
+            }
+        }
+    }
+    map
 }
 
 /// Stitch the prior transcript snapshot to a freshly diarized session.
@@ -937,39 +1120,50 @@ fn assign_speaker<'a>(chunk_start_ms: u64, segments: &'a [diarize::Segment]) -> 
         .map(|s| s.speaker_id.as_str())
 }
 
-/// Rebuild the transcript with `Speaker N:` prefixes by walking the chunk
-/// log and assigning each chunk to a segment-derived speaker. Display
-/// numbers are 1-indexed in first-encounter order, matching what the
-/// previous live-diarization path produced. Same-speaker continuations
-/// get a single space; turn changes get a newline + new prefix.
-fn build_diarized_transcript(chunks: &[ChunkRecord], segments: &[diarize::Segment]) -> String {
-    let mut output = String::new();
-    let mut display_map: std::collections::HashMap<String, u32> =
-        std::collections::HashMap::new();
-    let mut last_speaker: Option<String> = None;
+/// Rebuild the transcript by walking chunks in chronological order and
+/// emitting each one prefixed with its assigned label. Same-label runs
+/// get a single space between chunks (continuation); label changes get
+/// a newline + new prefix. Chunks the labeller declines to label
+/// (returns `None`) get joined to whatever came before them with a
+/// space, no prefix change — typically only happens when diarize
+/// produces zero segments and we're degrading gracefully.
+///
+/// Chronological ordering uses `(start_ms, source)`. Mic and system
+/// chunks each carry start_ms relative to their own stream's first
+/// frame — close to but not exactly the same as global wall time
+/// (the streams start within a few hundred ms of each other). The
+/// tie-break preferring `Mic` reflects the typical UX assumption that
+/// the user speaks first; in practice the imprecision is well below
+/// the threshold a reader would notice.
+fn build_labelled_transcript(
+    chunks: &[ChunkRecord],
+    label_for_chunk: &(dyn Fn(&ChunkRecord) -> Option<String> + Send),
+) -> String {
+    let mut sorted: Vec<&ChunkRecord> = chunks.iter().collect();
+    sorted.sort_by_key(|c| {
+        let source_rank = match c.source {
+            ChunkSource::Mic => 0,
+            ChunkSource::Sys => 1,
+        };
+        (c.start_ms, source_rank)
+    });
 
-    for chunk in chunks {
+    let mut output = String::new();
+    let mut last_label: Option<String> = None;
+
+    for chunk in sorted {
         let trimmed = chunk.text.trim();
         if trimmed.is_empty() {
             continue;
         }
-        let sid = assign_speaker(chunk.start_ms, segments);
-        match sid {
-            Some(sid_str) => {
-                let display_n = if let Some(&n) = display_map.get(sid_str) {
-                    n
-                } else {
-                    let n = (display_map.len() as u32) + 1;
-                    display_map.insert(sid_str.to_string(), n);
-                    n
-                };
-                let speaker_changed = last_speaker.as_deref() != Some(sid_str);
-                if speaker_changed {
+        match label_for_chunk(chunk) {
+            Some(label) => {
+                if last_label.as_deref() != Some(label.as_str()) {
                     if !output.is_empty() {
                         output.push('\n');
                     }
-                    output.push_str(&format!("Speaker {display_n}: "));
-                    last_speaker = Some(sid_str.to_string());
+                    output.push_str(&format!("{label}: "));
+                    last_label = Some(label);
                 } else {
                     output.push(' ');
                 }
@@ -988,6 +1182,7 @@ fn build_diarized_transcript(chunks: &[ChunkRecord], segments: &[diarize::Segmen
 async fn transcribe_chunk(
     app: AppHandle,
     note_id: String,
+    source: ChunkSource,
     path: PathBuf,
     start_ms: u64,
 ) -> anyhow::Result<()> {
@@ -1057,14 +1252,18 @@ async fn transcribe_chunk(
 
     // Whisper's `initial_prompt` slot conditions decoding on prior context.
     // We compose two parts: the user's custom vocabulary (proper-noun bias)
-    // and a snapshot of the last ~150 committed words from this session.
-    // Combined, this carries sentence continuity, proper-noun spelling, and
-    // a non-empty prior — the single best mitigation for Whisper's
-    // silence/short-clip hallucinations.
+    // and a snapshot of the last ~150 committed words from THIS source's
+    // stream. Per-source trails because the mic and system streams are
+    // separate conversations — sharing one trail would pull a mic chunk's
+    // decode toward remote-side vocabulary (or vice versa) and cause
+    // language drift on bilingual calls.
     let trail_snapshot = {
         let state: State<AppState> = app.state();
         let session = state.recording.lock();
-        let trail = session.trail.lock();
+        let trail = match source {
+            ChunkSource::Mic => session.mic_trail.lock(),
+            ChunkSource::Sys => session.sys_trail.lock(),
+        };
         trail.as_prompt()
     };
     let prompt = build_initial_prompt(&cfg.vocabulary, trail_snapshot);
@@ -1114,8 +1313,15 @@ async fn transcribe_chunk(
     // recording_stop, not here. Per-chunk live diarization performed
     // poorly on long recordings (clustering drifts as speaker memory
     // accumulates), so chunks are appended as plain text and the full
-    // transcript is rewritten with `Speaker N:` prefixes after stop, when
-    // FluidAudio can cluster across the entire audio at once.
+    // transcript is rewritten with proper labels after stop, when
+    // FluidAudio can cluster across the entire audio at once and we can
+    // assign "You" to mic chunks vs diarized speakers to system chunks.
+    //
+    // The live-display transcript appends in arrival order regardless of
+    // source. Mic and sys chunks may interleave slightly out of strict
+    // wall-clock order during recording, but `diarize_and_apply` rebuilds
+    // the transcript from the chunk log sorted by (source, start_ms) at
+    // stop time, so the saved transcript ends up properly ordered.
     let state: State<AppState> = app.state();
     let updated_transcript = {
         let conn = state.db.lock();
@@ -1123,8 +1329,13 @@ async fn transcribe_chunk(
     };
     {
         let session = state.recording.lock();
-        session.trail.lock().push(&trimmed);
+        let mut trail = match source {
+            ChunkSource::Mic => session.mic_trail.lock(),
+            ChunkSource::Sys => session.sys_trail.lock(),
+        };
+        trail.push(&trimmed);
         session.chunk_log.lock().push(ChunkRecord {
+            source,
             start_ms,
             text: trimmed.clone(),
         });
@@ -1746,8 +1957,28 @@ mod diarize_tests {
         Segment { start_ms, end_ms, speaker_id: sid.to_string() }
     }
 
-    fn chunk(start_ms: u64, text: &str) -> ChunkRecord {
-        ChunkRecord { start_ms, text: text.to_string() }
+    fn mic(start_ms: u64, text: &str) -> ChunkRecord {
+        ChunkRecord { source: ChunkSource::Mic, start_ms, text: text.to_string() }
+    }
+
+    fn sys(start_ms: u64, text: &str) -> ChunkRecord {
+        ChunkRecord { source: ChunkSource::Sys, start_ms, text: text.to_string() }
+    }
+
+    /// Build the same labeller `diarize_and_apply` would build in the
+    /// mic-only branch: every chunk gets `Speaker N:` from its segment.
+    /// Pulled into a test helper so we can exercise `build_labelled_transcript`
+    /// without mocking the sidecar.
+    fn mic_only_labeller(
+        chunks: Vec<ChunkRecord>,
+        segments: Vec<Segment>,
+    ) -> String {
+        let display_map = build_display_map(&chunks, &segments, ChunkSource::Mic);
+        let labeller = move |c: &ChunkRecord| {
+            let sid = assign_speaker(c.start_ms, &segments)?;
+            display_map.get(sid).map(|n| format!("Speaker {n}"))
+        };
+        build_labelled_transcript(&chunks, &labeller)
     }
 
     #[test]
@@ -1781,48 +2012,127 @@ mod diarize_tests {
 
     #[test]
     fn build_transcript_empty_chunks() {
-        let segs = vec![seg(0, 1000, "A")];
-        assert_eq!(build_diarized_transcript(&[], &segs), "");
+        assert_eq!(mic_only_labeller(vec![], vec![seg(0, 1000, "A")]), "");
     }
 
     #[test]
     fn build_transcript_single_speaker_runs() {
         // Three chunks all from speaker A — no newline, single-space joins.
-        let segs = vec![seg(0, 10000, "A")];
-        let chunks = vec![
-            chunk(0, "hello"),
-            chunk(2000, "world"),
-            chunk(5000, "again"),
-        ];
+        let chunks = vec![mic(0, "hello"), mic(2000, "world"), mic(5000, "again")];
         assert_eq!(
-            build_diarized_transcript(&chunks, &segs),
+            mic_only_labeller(chunks, vec![seg(0, 10000, "A")]),
             "Speaker 1: hello world again"
         );
     }
 
     #[test]
     fn build_transcript_speaker_switch_inserts_newline_and_prefix() {
-        let segs = vec![seg(0, 3000, "A"), seg(3000, 6000, "B"), seg(6000, 9000, "A")];
         let chunks = vec![
-            chunk(0, "first turn"),
-            chunk(3500, "second turn"),
-            chunk(7000, "third turn"),
+            mic(0, "first turn"),
+            mic(3500, "second turn"),
+            mic(7000, "third turn"),
         ];
+        let segs = vec![seg(0, 3000, "A"), seg(3000, 6000, "B"), seg(6000, 9000, "A")];
         // Display numbers assigned in first-encounter order: A=1, B=2.
         // A returns later → "Speaker 1:" again, not a new number.
         assert_eq!(
-            build_diarized_transcript(&chunks, &segs),
+            mic_only_labeller(chunks, segs),
             "Speaker 1: first turn\nSpeaker 2: second turn\nSpeaker 1: third turn"
         );
     }
 
     #[test]
     fn build_transcript_skips_empty_chunks() {
-        let segs = vec![seg(0, 5000, "A")];
-        let chunks = vec![chunk(0, "real text"), chunk(1000, "   "), chunk(2000, "more")];
+        let chunks = vec![mic(0, "real text"), mic(1000, "   "), mic(2000, "more")];
         assert_eq!(
-            build_diarized_transcript(&chunks, &segs),
+            mic_only_labeller(chunks, vec![seg(0, 5000, "A")]),
             "Speaker 1: real text more"
+        );
+    }
+
+    #[test]
+    fn build_transcript_remote_call_mic_is_you_sys_is_diarized() {
+        // Remote-call shape: mic chunks get fixed "You" label; sys chunks
+        // get diarized. Ordering by (start_ms, source) interleaves them.
+        let chunks = vec![
+            mic(0, "hi there"),
+            sys(500, "hello"),
+            mic(2500, "how are you"),
+            sys(4000, "doing well"),
+        ];
+        let sys_segs = vec![seg(0, 10000, "REMOTE_A")];
+        let display_map = build_display_map(&chunks, &sys_segs, ChunkSource::Sys);
+        let labeller = move |c: &ChunkRecord| match c.source {
+            ChunkSource::Mic => Some("You".to_string()),
+            ChunkSource::Sys => assign_speaker(c.start_ms, &sys_segs)
+                .and_then(|sid| display_map.get(sid).map(|n| format!("Speaker {n}"))),
+        };
+        assert_eq!(
+            build_labelled_transcript(&chunks, &labeller),
+            "You: hi there\nSpeaker 1: hello\nYou: how are you\nSpeaker 1: doing well"
+        );
+    }
+
+    #[test]
+    fn hybrid_fallback_keeps_sys_chunks_distinct_from_mic() {
+        // Reproduces the silent-merge bug: in the (mic+sys) branch when
+        // diarize is unavailable for the sys stream, sys chunks must NOT
+        // get a None label — that would glue their text onto the previous
+        // `You:` line, hiding remote speech inside the user's transcript.
+        // The single-speaker fallback labels them `Speaker 1` so the
+        // boundary survives.
+        let chunks = vec![
+            mic(0, "ok thanks"),
+            sys(500, "you got it"),
+            mic(2000, "see you tomorrow"),
+        ];
+        let labeller = |c: &ChunkRecord| match c.source {
+            ChunkSource::Mic => Some("You".to_string()),
+            ChunkSource::Sys => Some("Speaker 1".to_string()),
+        };
+        assert_eq!(
+            build_labelled_transcript(&chunks, &labeller),
+            "You: ok thanks\nSpeaker 1: you got it\nYou: see you tomorrow"
+        );
+    }
+
+    #[test]
+    fn label_returning_none_glues_to_previous_label_dont_use_for_distinct_speakers() {
+        // Documents the underlying behavior the fallback above protects
+        // against. With the buggy labeller (sys → None) the remote text
+        // appears inside the user's `You:` line — silent data loss for
+        // the reader. Locked into a test so a future "simplification" of
+        // the fallback that goes back to None gets caught here.
+        let chunks = vec![
+            mic(0, "ok thanks"),
+            sys(500, "you got it"),
+        ];
+        let buggy = |c: &ChunkRecord| match c.source {
+            ChunkSource::Mic => Some("You".to_string()),
+            ChunkSource::Sys => None,
+        };
+        let result = build_labelled_transcript(&chunks, &buggy);
+        // This is the pathological output we DO NOT want from the
+        // production code; it's only here as a tripwire on the helper.
+        assert_eq!(result, "You: ok thanks you got it");
+    }
+
+    #[test]
+    fn build_transcript_orders_by_start_ms_with_mic_priority_on_tie() {
+        // Mic and sys chunks at the same start_ms — mic is emitted first.
+        // Reflects the typical UX assumption that the user speaks before
+        // they hear a response, and stabilises ordering on tie.
+        let chunks = vec![
+            sys(0, "from sys"),
+            mic(0, "from mic"),
+        ];
+        let labeller = |c: &ChunkRecord| match c.source {
+            ChunkSource::Mic => Some("You".to_string()),
+            ChunkSource::Sys => Some("Speaker 1".to_string()),
+        };
+        assert_eq!(
+            build_labelled_transcript(&chunks, &labeller),
+            "You: from mic\nSpeaker 1: from sys"
         );
     }
 

@@ -2,6 +2,15 @@ import { useParams } from "react-router-dom";
 import { useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import {
+  Calendar,
+  Circle,
+  Cloud,
+  FileText,
+  Folder,
+  Languages,
+  Users,
+} from "lucide-react";
 import { ipc, onSummaryThinkingDelta, onSummaryContentDelta, type Note as TNote } from "../lib/ipc";
 import { useNotesStore, useRecordingStore } from "../lib/store";
 import { RecordingBar } from "../components/RecordingBar";
@@ -134,7 +143,7 @@ export function Note() {
 
   // Auto-scroll the reasoning panel to the latest chunk so users see the
   // model thinking live without having to chase the scrollbar themselves.
-  const reasoningRef = useRef<HTMLPreElement | null>(null);
+  const reasoningRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
     const el = reasoningRef.current;
     if (el) el.scrollTop = el.scrollHeight;
@@ -235,9 +244,22 @@ export function Note() {
           className="nd-bare block text-5xl font-light tracking-[-0.02em] w-full mb-6 placeholder:text-[var(--color-text-muted)]/50 resize-none overflow-hidden focus:outline-none leading-tight"
         />
 
-        <div className="flex flex-col gap-2 mb-10">
-          <div className="flex items-center gap-3 flex-wrap">
-            <span className="nd-chip">{dateChip}</span>
+        <div className="nd-prop-table mb-10">
+          <PropertyRow icon={<Calendar size={14} />} label="created">
+            <span>{dateChip}</span>
+          </PropertyRow>
+          {(isRecording || isStarting || isPaused) && (
+            <PropertyRow
+              icon={<Circle size={14} fill={isPaused ? "transparent" : "currentColor"} />}
+              label="status"
+              accent={isRecording || isStarting ? "var(--color-accent)" : undefined}
+            >
+              <span style={{ color: isRecording || isStarting ? "var(--color-accent)" : undefined }}>
+                {isStarting ? "Starting" : isPaused ? "Paused" : "Recording"}
+              </span>
+            </PropertyRow>
+          )}
+          <PropertyRow icon={<Folder size={14} />} label="folder">
             <FolderPicker
               value={draft.folder_id}
               onChange={async (folderId) => {
@@ -248,35 +270,39 @@ export function Note() {
                 upsert(next);
               }}
             />
-            {(isRecording || isStarting) && (
-              <span className="nd-chip" style={{ color: "var(--color-accent)", borderColor: "var(--color-accent)" }}>
-                <span className="rec-dot inline-block w-1.5 h-1.5 rounded-full" style={{ background: "var(--color-accent)" }} />
-                {isStarting ? "Starting" : "Recording"}
-              </span>
-            )}
-            {isPaused && (
-              <span className="nd-chip">
-                <span className="inline-block w-1.5 h-1.5 rounded-full bg-[var(--color-text-muted)]" />
-                Paused
-              </span>
-            )}
-          </div>
-          <div className="flex items-center gap-3 flex-wrap">
+          </PropertyRow>
+          <PropertyRow icon={<FileText size={14} />} label="preset">
             <PresetPicker
               value={draft.summary_preset || "meeting"}
               lang={uiLang}
               onChange={(v) => patch("summary_preset", v)}
             />
+          </PropertyRow>
+          <PropertyRow icon={<Languages size={14} />} label="language">
             <LanguagePicker
               value={draft.language || uiLang}
               onChange={(v) => patch("language", v)}
             />
+          </PropertyRow>
+          <PropertyRow icon={<Users size={14} />} label="speakers">
+            <SpeakersPicker
+              value={draft.expected_speakers}
+              onChange={async (n) => {
+                if (!draft) return;
+                const next = { ...draft, expected_speakers: n };
+                setDraft(next);
+                await ipc.updateNote(draft.id, { expected_speakers: n });
+                upsert(next);
+              }}
+            />
+          </PropertyRow>
+          <PropertyRow icon={<Cloud size={14} />} label="summary">
             <SummaryProviderChip
               value={draft.summary_provider}
               globalDefault={globalProvider}
               onChange={patchProvider}
             />
-          </div>
+          </PropertyRow>
         </div>
 
         <NoteEditor
@@ -293,29 +319,32 @@ export function Note() {
                 a thinking trace through this path (reasoning models keep
                 their chain-of-thought server-side), so showing the panel
                 there is just a permanent "waiting for the model…"
-                placeholder. Auto-scrolls; collapsible via the header.
-                Once the final summary lands it starts collapsed so it
-                doesn't dominate. */}
+                placeholder. Rendered ChatGPT-style — small muted text
+                directly under the header, no inner border or panel, with
+                full markdown formatting since Qwen-class models emit
+                their thoughts as markdown. Once the final summary lands
+                the trace starts collapsed so it doesn't dominate. */}
             {isLocalProvider && (thinkingStream.length > 0 || (isSummarizing && contentStream.length === 0)) && (
-              <div className="mb-4 rounded-md border border-[var(--color-line)] bg-[var(--color-surface-raised)]">
+              <div className="mb-6">
                 <button
                   type="button"
                   onClick={() => setThinkingExpanded((v) => !v)}
-                  className="w-full flex items-center justify-between px-3 py-2 text-xs text-[var(--color-text-muted)]"
+                  className="flex items-center gap-1.5 text-xs text-[var(--color-text-muted)] hover:text-[var(--color-text)] transition-colors"
                 >
                   <span>
-                    {thinkingExpanded ? "▾" : "▸"} Reasoning
+                    Reasoning
                     {thinkingStream.length > 0 && ` · ${thinkingStream.length.toLocaleString()} chars`}
                     {isSummarizing && thinkingStream.length === 0 && " · waiting for the model…"}
                   </span>
+                  <span aria-hidden className="inline-block w-3 text-center">{thinkingExpanded ? "▾" : "▸"}</span>
                 </button>
                 {thinkingExpanded && thinkingStream.length > 0 && (
-                  <pre
+                  <div
                     ref={reasoningRef}
-                    className="px-3 pb-3 text-xs leading-relaxed font-mono text-[var(--color-text-muted)] whitespace-pre-wrap break-words max-h-64 overflow-y-auto"
+                    className="prose-reasoning mt-2 max-h-64 overflow-y-auto"
                   >
-                    {thinkingStream}
-                  </pre>
+                    <ReactMarkdown remarkPlugins={[remarkGfm]}>{thinkingStream}</ReactMarkdown>
+                  </div>
                 )}
               </div>
             )}
@@ -377,6 +406,31 @@ export function Note() {
   );
 }
 
+/// One row in the Note's properties panel: icon + label on the left,
+/// child editor on the right. Hover/focus styling and the dropdown caret
+/// reveal are handled by the surrounding `.nd-prop-table` CSS.
+function PropertyRow({
+  icon,
+  label,
+  children,
+  accent,
+}: {
+  icon: React.ReactNode;
+  label: string;
+  children: React.ReactNode;
+  accent?: string;
+}) {
+  return (
+    <div className="nd-prop-row">
+      <div className="nd-prop-label" style={accent ? { color: accent } : undefined}>
+        {icon}
+        <span>{label}</span>
+      </div>
+      <div className="nd-prop-value">{children}</div>
+    </div>
+  );
+}
+
 function FolderPicker({
   value,
   onChange,
@@ -417,31 +471,26 @@ function FolderPicker({
 
   if (creating) {
     return (
-      <span className="nd-chip" style={{ borderColor: "var(--color-text-muted)" }}>
-        <input
-          autoFocus
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") commit();
-            else if (e.key === "Escape") { setCreating(false); setName(""); }
-          }}
-          onBlur={commit}
-          placeholder="Folder name"
-          className="bg-transparent outline-none w-32 uppercase tracking-[0.08em] text-[11px]"
-          style={{ fontFamily: "var(--font-mono)" }}
-        />
-      </span>
+      <input
+        autoFocus
+        value={name}
+        onChange={(e) => setName(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") commit();
+          else if (e.key === "Escape") { setCreating(false); setName(""); }
+        }}
+        onBlur={commit}
+        placeholder="Folder name"
+        className="bg-transparent outline-none w-40"
+      />
     );
   }
 
   return (
-    <label className="nd-chip cursor-pointer pr-2">
+    <>
       <select
         value={value ?? "__root__"}
         onChange={(e) => handleChange(e.target.value)}
-        className="bg-transparent appearance-none outline-none cursor-pointer uppercase tracking-[0.08em]"
-        style={{ fontFamily: "var(--font-mono)" }}
       >
         <option value="__root__">No folder</option>
         {folders.map((f) => (
@@ -451,8 +500,8 @@ function FolderPicker({
         ))}
         <option value="__new__">+ New folder…</option>
       </select>
-      <span aria-hidden style={{ color: "var(--color-text-muted)" }}>▾</span>
-    </label>
+      <span aria-hidden className="nd-prop-caret">▾</span>
+    </>
   );
 }
 
@@ -466,13 +515,8 @@ function PresetPicker({
   onChange: (v: string) => void;
 }) {
   return (
-    <label className="nd-chip cursor-pointer pr-2">
-      <select
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        className="bg-transparent appearance-none outline-none cursor-pointer uppercase tracking-[0.08em]"
-        style={{ fontFamily: "var(--font-mono)" }}
-      >
+    <>
+      <select value={value} onChange={(e) => onChange(e.target.value)}>
         {SUMMARY_PRESETS.map((p) => (
           <option key={p.value} value={p.value}>
             {presetLabelForLang(p, lang)}
@@ -480,8 +524,8 @@ function PresetPicker({
         ))}
         <option value="custom">{lang === "no" ? "Egendefinert" : "Custom"}</option>
       </select>
-      <span aria-hidden style={{ color: "var(--color-text-muted)" }}>▾</span>
-    </label>
+      <span aria-hidden className="nd-prop-caret">▾</span>
+    </>
   );
 }
 
@@ -493,21 +537,65 @@ function LanguagePicker({
   onChange: (v: string) => void;
 }) {
   return (
-    <label className="nd-chip cursor-pointer pr-2">
-      <select
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        className="bg-transparent appearance-none outline-none cursor-pointer uppercase tracking-[0.08em]"
-        style={{ fontFamily: "var(--font-mono)" }}
-      >
+    <>
+      <select value={value} onChange={(e) => onChange(e.target.value)}>
         {LANGS.map((l) => (
           <option key={l.value} value={l.value}>
             {l.label}
           </option>
         ))}
       </select>
-      <span aria-hidden style={{ color: "var(--color-text-muted)" }}>▾</span>
-    </label>
+      <span aria-hidden className="nd-prop-caret">▾</span>
+    </>
+  );
+}
+
+// Per-note speaker count hint. Sentinel value 0 = "Auto" (let the offline
+// diarizer decide via VBx — default for fresh notes). Any positive integer
+// pins the cluster count, which is the most reliable fix for dominant-
+// speaker conversations where auto-detect collapses to 1 cluster. We expose
+// 1–6 as concrete options; rare edge cases above that get truncated to 6.
+//
+// In remote-call mode the count is *total* including the user — the backend
+// subtracts 1 for the `You:` label before passing to the diarizer.
+const SPEAKER_OPTIONS: { value: number; label: string }[] = [
+  { value: 0, label: "Auto" },
+  { value: 1, label: "1" },
+  { value: 2, label: "2" },
+  { value: 3, label: "3" },
+  { value: 4, label: "4" },
+  { value: 5, label: "5" },
+  { value: 6, label: "6" },
+];
+
+function SpeakersPicker({
+  value,
+  onChange,
+}: {
+  value: number | null;
+  onChange: (n: number | null) => void;
+}) {
+  // Internal sentinel: 0 stands in for `null` (auto) since <select> values
+  // must be strings. Convert at the boundary.
+  const selected = value ?? 0;
+  return (
+    <>
+      <select
+        value={selected}
+        onChange={(e) => {
+          const n = parseInt(e.target.value, 10);
+          onChange(n > 0 ? n : null);
+        }}
+        title="Pin the expected speaker count to help diarization on dominant-speaker recordings. 'Auto' lets the model decide."
+      >
+        {SPEAKER_OPTIONS.map((o) => (
+          <option key={o.value} value={o.value}>
+            {o.label}
+          </option>
+        ))}
+      </select>
+      <span aria-hidden className="nd-prop-caret">▾</span>
+    </>
   );
 }
 
@@ -530,31 +618,34 @@ function SummaryProviderChip({
   const display = effective === "local" ? "Local" : "Cloud";
   // True when the user has explicitly picked something for this note that
   // disagrees with the global Settings — typically a leftover from earlier
-  // testing. Surface it visually so they don't get silent local-LLM routing
-  // when they've set Settings to OpenAI.
+  // testing. Surface the override state with a subtle warning-colored dot
+  // next to the value so the user can spot that "this note is set to
+  // something other than what Settings says" — previously a silent footgun.
   const isOverride = value.length > 0 && value !== globalDefault;
   return (
-    <label
-      className="nd-chip cursor-pointer pr-2"
-      style={isOverride ? { borderColor: "var(--color-warning)" } : undefined}
-      title={
-        isOverride
-          ? `Per-note override active — Settings is set to ${globalLabel}. Pick "From Settings" to defer.`
-          : "Choose where this note's summary runs."
-      }
-    >
+    <>
+      {isOverride && (
+        <span
+          aria-hidden
+          className="inline-block w-1.5 h-1.5 rounded-full"
+          style={{ background: "var(--color-warning)" }}
+        />
+      )}
       <select
         value={value}
         onChange={(e) => onChange(e.target.value)}
-        className="bg-transparent appearance-none outline-none cursor-pointer uppercase tracking-[0.08em]"
-        style={{ fontFamily: "var(--font-mono)" }}
+        title={
+          isOverride
+            ? `Per-note override active — Settings is set to ${globalLabel}. Pick "From Settings" to defer.`
+            : "Choose where this note's summary runs."
+        }
       >
-        <option value="">Summary: {display} · From Settings</option>
-        <option value="openai">Summary: Cloud (override)</option>
-        <option value="local">Summary: Local (override)</option>
+        <option value="">{display} · From Settings</option>
+        <option value="openai">Cloud (override)</option>
+        <option value="local">Local (override)</option>
       </select>
-      <span aria-hidden style={{ color: "var(--color-text-muted)" }}>▾</span>
-    </label>
+      <span aria-hidden className="nd-prop-caret">▾</span>
+    </>
   );
 }
 

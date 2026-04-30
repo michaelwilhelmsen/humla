@@ -17,6 +17,11 @@ export type Note = {
   // Per-note override for summary provider. Empty string = use global
   // setting; same convention as `language`.
   summary_provider: string;
+  // Optional speaker count hint passed to the offline diarizer. `null`
+  // means auto-detect (the default); a positive integer pins the cluster
+  // count via VBx's `withSpeakers(exactly:)`. Most reliable fix for
+  // dominant-speaker conversations where auto collapses to 1 cluster.
+  expected_speakers: number | null;
   created_at: number;
   updated_at: number;
 };
@@ -67,8 +72,10 @@ export const ipc = {
   listNotes: () => invoke<Note[]>("notes_list"),
   getNote: (id: string) => invoke<Note>("notes_get", { id }),
   createNote: () => invoke<Note>("notes_create"),
-  updateNote: (id: string, patch: Partial<Pick<Note, "title" | "body" | "transcript" | "summary" | "summary_preset" | "language" | "summary_provider">>) =>
-    invoke<void>("notes_update", { id, patch }),
+  updateNote: (
+    id: string,
+    patch: Partial<Pick<Note, "title" | "body" | "transcript" | "summary" | "summary_preset" | "language" | "summary_provider" | "expected_speakers">>,
+  ) => invoke<void>("notes_update", { id, patch }),
   deleteNote: (id: string) => invoke<void>("notes_delete", { id }),
   moveNote: (id: string, folderId: string | null) =>
     invoke<void>("notes_move", { id, folderId }),
