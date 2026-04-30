@@ -121,6 +121,12 @@ struct ChatChoice {
 #[derive(Deserialize)]
 struct ChatMessageOwned {
     content: String,
+    // Qwen 3+ via Ollama puts internal reasoning here (extension to the
+    // OpenAI schema). If `content` is empty but this is set, the model
+    // ran out of tokens or context inside the thinking phase and never
+    // produced an answer — surface that as a clear error.
+    #[serde(default)]
+    reasoning_content: Option<String>,
 }
 
 /// Reasoning models: gpt-5.x family and the o-series. They reject the
@@ -166,6 +172,17 @@ pub async fn summarize_with_base(
     transcript: &str,
 ) -> Result<String> {
     let is_local = base_url != BASE;
+    // Qwen 3+ defaults to thinking mode, where the model spends potentially
+    // thousands of tokens reasoning inside <think>...</think> before
+    // answering. For polish/summary work that's pure overhead — multi-minute
+    // latencies and sometimes no final answer at all (we saw 260s →
+    // 0-char output in dev). Appending "/no_think" to the user turn is the
+    // documented way to opt out; non-Qwen models ignore it as plain text.
+    let user_with_no_think = if is_local {
+        format!("{transcript}\n\n/no_think")
+    } else {
+        transcript.to_string()
+    };
     let req = ChatRequest {
         model,
         // Local OpenAI-compat servers accept temperature; reasoning-model
@@ -177,7 +194,7 @@ pub async fn summarize_with_base(
         },
         messages: vec![
             ChatMessage { role: "system", content: system_prompt },
-            ChatMessage { role: "user", content: transcript },
+            ChatMessage { role: "user", content: &user_with_no_think },
         ],
     };
     let http = if is_local { local_client() } else { client() };
@@ -242,14 +259,32 @@ pub async fn summarize_with_base(
             return Err(anyhow!("unexpected response shape from {base_url}: {e}"));
         }
     };
-    let content = body.choices.into_iter().next()
-        .map(|c| c.message.content)
-        .unwrap_or_default();
+    let first = body.choices.into_iter().next();
+    let reasoning_chars = first
+        .as_ref()
+        .and_then(|c| c.message.reasoning_content.as_deref())
+        .map(str::len)
+        .unwrap_or(0);
+    let content = first.map(|c| c.message.content).unwrap_or_default();
     eprintln!(
-        "[llm] success in {:?}, output {} chars",
+        "[llm] success in {:?}, content {} chars, reasoning {} chars",
         started.elapsed(),
-        content.len()
+        content.len(),
+        reasoning_chars
     );
+    if content.trim().is_empty() {
+        // The model returned only reasoning, or nothing at all. Either way
+        // we have no usable answer — surface a clear error rather than
+        // saving an empty summary.
+        if reasoning_chars > 0 {
+            return Err(anyhow!(
+                "{model} produced reasoning but no final answer ({} reasoning chars). \
+                 Try a non-thinking model (e.g. qwen3.5:4b) or shorten the input.",
+                reasoning_chars
+            ));
+        }
+        return Err(anyhow!("{model} returned an empty response"));
+    }
     Ok(content)
 }
 
