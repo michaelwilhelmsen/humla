@@ -5,6 +5,12 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/michaelwilhelmsen/humla/releases/latest">
+    <img alt="Humla — personal meeting notes for macOS" src="docs/screenshot.png" width="900">
+  </a>
+</p>
+
+<p align="center">
   <a href="https://github.com/michaelwilhelmsen/humla/releases/latest">Download</a>
   ·
   <a href="#how-it-works">How it works</a>
