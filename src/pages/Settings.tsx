@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { ipc, onDiarizeDownloadProgress, onLocalLlmProgress, onLocalWhisperProgress, type DiarizeModelStatus, type DiscoveredLlm, type LocalLlmStatus, type LocalWhisperStatus, type SettingsKey } from "../lib/ipc";
+import { ipc, onDiarizeDownloadProgress, onLocalLlmProgress, onLocalWhisperProgress, type DiarizeModelStatus, type DiscoveredLlm, type LocalLlmModelEntry, type LocalLlmStatus, type LocalWhisperStatus, type SettingsKey } from "../lib/ipc";
 import { useThemeStore, type Theme } from "../lib/theme";
 import { Permissions } from "../components/Permissions";
 import { SUMMARY_PRESETS, presetPromptForLang, presetLabelForLang } from "../lib/presets";
@@ -24,7 +24,7 @@ const DEFAULTS: Record<EditableKey, string> = {
   summary_model: "gpt-5.4-mini",
   summary_prompt: SUMMARY_PRESETS[0].prompt_no,
   summary_provider: "openai",
-  summary_local_model: "managed:e4b",
+  summary_local_model: "managed:qwen-4b",
 };
 
 const PROVIDERS_BASE = [
@@ -34,8 +34,23 @@ const LOCAL_PROVIDER = { value: "local", label: "Local (Whisper turbo, on-device
 
 const SUMMARY_PROVIDERS = [
   { value: "openai", label: "Cloud (OpenAI)" },
-  { value: "local", label: "Local (Gemma 4, on-device)" },
+  { value: "local", label: "Local (Gemma / Qwen, on-device)" },
 ];
+
+// Extra hint after the size in the Model dropdown — flags the recommended
+// pick for each tier so users don't have to read all three labels carefully.
+function labelSuffix(variant: string): string {
+  switch (variant) {
+    case "qwen-1.7b":
+      return " · ultra-budget";
+    case "qwen-4b":
+      return " · recommended";
+    case "gemma-e4b":
+      return " · best quality";
+    default:
+      return "";
+  }
+}
 
 const WHISPER_PRESETS = [
   { value: "fast", label: "Fast — lower latency, may drop borderline words" },
@@ -125,7 +140,7 @@ const EMPTY_DIARIZE_STATE: DiarizeState = {
 
 type LlmState = {
   status: LocalLlmStatus | null;
-  downloading: "e2b" | "e4b" | null;
+  downloading: string | null; // variant identifier (e.g. "qwen-4b") or null
   received: number;
   total: number | null;
   scan: DiscoveredLlm[] | null;
@@ -208,34 +223,31 @@ export function Settings() {
     }, 4000);
   }
 
-  async function downloadLlm(variant: "e2b" | "e4b") {
+  async function downloadLlm(variant: string) {
+    const label = llm.status?.models.find((m) => m.variant === variant)?.label ?? variant;
     setLlm((p) => ({ ...p, downloading: variant, received: 0, total: null, error: null, flash: null }));
     try {
       await ipc.localLlmDownload(variant);
       const status = await ipc.localLlmStatus();
       setLlm((p) => ({ ...p, status, downloading: null }));
-      flashMessage(`Gemma 4 ${variant.toUpperCase()} downloaded`);
+      flashMessage(`${label} downloaded`);
     } catch (e) {
       const status = await ipc.localLlmStatus().catch(() => null);
       setLlm((p) => ({ ...p, status, downloading: null, error: String(e) }));
     }
   }
 
-  async function deleteLlm(variant: "e2b" | "e4b") {
-    // Snapshot the path before delete so we can show it in the confirmation —
-    // by the time the toast fires the status has already cleared the field.
-    const beforePath = variant === "e2b"
-      ? llm.status?.e2bPath
-      : llm.status?.e4bPath;
+  async function deleteLlm(variant: string) {
+    // Snapshot before delete so the toast can name what was removed (the
+    // status refresh wipes path/label by the time we'd render).
+    const before = llm.status?.models.find((m) => m.variant === variant);
+    const beforePath = before?.path;
+    const beforeLabel = before?.label ?? variant;
     try {
       await ipc.localLlmDelete(variant);
       const status = await ipc.localLlmStatus();
       setLlm((p) => ({ ...p, status, error: null }));
-      flashMessage(
-        beforePath
-          ? `Deleted ${beforePath}`
-          : `Gemma 4 ${variant.toUpperCase()} deleted`
-      );
+      flashMessage(beforePath ? `Deleted ${beforePath}` : `${beforeLabel} deleted`);
     } catch (e) {
       setLlm((p) => ({ ...p, error: String(e) }));
     }
@@ -527,8 +539,10 @@ export function Settings() {
                     }
                   }}
                   options={[
-                    { value: "managed:e4b", label: "Gemma 4 E4B — ~5.0 GB · recommended (best quality)" },
-                    { value: "managed:e2b", label: "Gemma 4 E2B — ~4.6 GB · faster inference" },
+                    ...(llm.status?.models ?? []).map((m) => ({
+                      value: `managed:${m.variant}`,
+                      label: `${m.label} — ${formatBytes(m.bytesHint)}${labelSuffix(m.variant)}`,
+                    })),
                     ...(llm.scan ?? [])
                       .filter((m) => m.compatible)
                       .map((m) => ({
@@ -537,11 +551,12 @@ export function Settings() {
                       })),
                   ]}
                 />
-                {memoryGb > 0 && memoryGb <= 16 && s.summary_local_model.startsWith("managed:") && (
+                {memoryGb > 0 && memoryGb <= 16 && s.summary_local_model === "managed:gemma-e4b" && (
                   <p className="text-xs text-[var(--color-text-muted)] mt-2">
-                    Heads up: your Mac has {memoryGb} GB of RAM. Both Gemma 4
-                    variants need ~5 GB resident during summary; with Whisper
-                    and your browser already loaded that may swap.
+                    Heads up: your Mac has {memoryGb} GB of RAM. Gemma 4 E4B
+                    uses ~5 GB resident during summary; with Whisper and your
+                    browser already loaded that may swap. Qwen 3 4B is the
+                    safer pick on 16 GB systems.
                   </p>
                 )}
               </Row>
@@ -552,14 +567,6 @@ export function Settings() {
                   onDownload={downloadLlm}
                   onDelete={deleteLlm}
                 />
-                {llm.flash && (
-                  <p
-                    className="text-xs mt-2 px-2 py-1 rounded bg-[var(--color-pill-hover)] inline-block break-all"
-                    role="status"
-                  >
-                    {llm.flash}
-                  </p>
-                )}
               </Row>
               <Row label="Already installed?">
                 <div className="flex flex-col gap-2">
@@ -628,9 +635,9 @@ export function Settings() {
 // LocalModelManager's three states (downloading / installed / not-yet) so
 // the Settings UI feels uniform across Whisper / Diarize / Local LLM.
 //
-// Variants:
-// - "managed:e2b" / "managed:e4b" — show download/delete based on llm.status
-// - "path:..." — show the path with no managed actions (it's the user's file)
+// `selected` is the persisted setting string. Custom paths render a minimal
+// status with no managed actions; managed variants pluck the matching entry
+// out of state.status.models and act on it.
 function LocalLlmModelManager({
   state,
   selected,
@@ -639,35 +646,11 @@ function LocalLlmModelManager({
 }: {
   state: LlmState;
   selected: string;
-  onDownload: (variant: "e2b" | "e4b") => void;
-  onDelete: (variant: "e2b" | "e4b") => void;
+  onDownload: (variant: string) => void;
+  onDelete: (variant: string) => void;
 }) {
-  const isManaged = selected.startsWith("managed:");
-  const variant: "e2b" | "e4b" | null = selected === "managed:e2b" ? "e2b"
-    : selected === "managed:e4b" ? "e4b"
-    : null;
-  const downloaded = variant === "e2b"
-    ? !!state.status?.e2bDownloaded
-    : variant === "e4b"
-    ? !!state.status?.e4bDownloaded
-    : false;
-  const sizeBytes = variant === "e2b"
-    ? state.status?.e2bSizeBytes
-    : variant === "e4b"
-    ? state.status?.e4bSizeBytes
-    : null;
-  const path = variant === "e2b"
-    ? state.status?.e2bPath
-    : variant === "e4b"
-    ? state.status?.e4bPath
-    : null;
-  const total = state.total ?? null;
-  const pct = state.downloading && total
-    ? Math.min(100, (state.received / total) * 100)
-    : null;
-
-  if (!isManaged) {
-    const path = selected.startsWith("path:") ? selected.slice(5) : selected;
+  if (selected.startsWith("path:")) {
+    const path = selected.slice(5);
     return (
       <div className="flex flex-col gap-2">
         <div className="text-sm break-all">Using {path}</div>
@@ -675,6 +658,11 @@ function LocalLlmModelManager({
           External file managed outside Humla. If you remove or rename it,
           summaries will fail until you re-pick a model.
         </p>
+        {state.flash && (
+          <p className="text-xs px-2 py-1 rounded bg-[var(--color-pill-hover)] inline-block break-all" role="status">
+            {state.flash}
+          </p>
+        )}
         {state.error && (
           <p className="text-sm text-red-600 dark:text-red-400 break-all">{state.error}</p>
         )}
@@ -682,11 +670,24 @@ function LocalLlmModelManager({
     );
   }
 
+  const variant = selected.startsWith("managed:") ? selected.slice(8) : null;
+  const entry: LocalLlmModelEntry | undefined =
+    state.status?.models.find((m) => m.variant === variant);
+  if (!variant || !entry) {
+    return (
+      <p className="text-sm text-[var(--color-text-muted)]">
+        Pick a model from the dropdown above.
+      </p>
+    );
+  }
+
   if (state.downloading === variant) {
+    const total = state.total ?? entry.bytesHint;
+    const pct = total ? Math.min(100, (state.received / total) * 100) : null;
     return (
       <div className="flex flex-col gap-2">
         <div className="text-sm">
-          Downloading {variant?.toUpperCase()}{total ? ` ${formatBytes(state.received)} / ${formatBytes(total)}` : ` ${formatBytes(state.received)}`}…
+          Downloading {entry.label}{total ? ` ${formatBytes(state.received)} / ${formatBytes(total)}` : ` ${formatBytes(state.received)}`}…
         </div>
         <div className="h-1.5 rounded bg-[var(--color-pill-hover)] overflow-hidden">
           <div
@@ -698,21 +699,26 @@ function LocalLlmModelManager({
     );
   }
 
-  if (downloaded) {
+  if (entry.downloaded) {
     return (
       <div className="flex flex-col gap-2">
         <div className="text-sm">
-          Downloaded — Gemma 4 {variant?.toUpperCase()}
-          {sizeBytes ? ` (${formatBytes(sizeBytes)})` : ""}
+          Downloaded — {entry.label}
+          {entry.sizeBytes ? ` (${formatBytes(entry.sizeBytes)})` : ""}
         </div>
-        {path && (
+        {entry.path && (
           <div className="text-xs text-[var(--color-text-muted)] font-mono break-all">
-            {path}
+            {entry.path}
           </div>
         )}
         <div className="flex gap-2">
-          <Btn onClick={() => variant && onDelete(variant)}>Delete model</Btn>
+          <Btn onClick={() => onDelete(variant)}>Delete model</Btn>
         </div>
+        {state.flash && (
+          <p className="text-xs px-2 py-1 rounded bg-[var(--color-pill-hover)] inline-block break-all" role="status">
+            {state.flash}
+          </p>
+        )}
         {state.error && (
           <p className="text-sm text-red-600 dark:text-red-400 break-all">{state.error}</p>
         )}
@@ -720,16 +726,20 @@ function LocalLlmModelManager({
     );
   }
 
-  const sizeHint = variant === "e2b" ? "~4.6 GB" : "~5.0 GB";
   return (
     <div className="flex flex-col gap-2">
       <div className="text-sm">
-        Not downloaded. Gemma 4 {variant?.toUpperCase()} is {sizeHint} and runs
+        Not downloaded. {entry.label} is {formatBytes(entry.bytesHint)} and runs
         on-device with Metal.
       </div>
       <div className="flex gap-2">
-        <Btn onClick={() => variant && onDownload(variant)}>Download model</Btn>
+        <Btn onClick={() => onDownload(variant)}>Download model</Btn>
       </div>
+      {state.flash && (
+        <p className="text-xs px-2 py-1 rounded bg-[var(--color-pill-hover)] inline-block break-all" role="status">
+          {state.flash}
+        </p>
+      )}
       {state.error && (
         <p className="text-sm text-red-600 dark:text-red-400 break-all">{state.error}</p>
       )}

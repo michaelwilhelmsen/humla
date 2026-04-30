@@ -330,53 +330,52 @@ fn llm_dir(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(local_llm::managed_dir(&app_data))
 }
 
-fn llm_variant_file(variant: &str) -> Result<&'static str, String> {
-    match variant {
-        "e2b" => Ok(local_llm::E2B_FILE),
-        "e4b" => Ok(local_llm::E4B_FILE),
-        _ => Err(format!("unknown LLM variant: {variant}")),
-    }
+fn llm_spec(variant: &str) -> Result<&'static local_llm::ManagedSpec, String> {
+    local_llm::spec_for_variant(variant)
+        .ok_or_else(|| format!("unknown LLM variant: {variant}"))
 }
 
-fn llm_variant_url(variant: &str) -> Result<&'static str, String> {
-    match variant {
-        "e2b" => Ok(local_llm::E2B_URL),
-        "e4b" => Ok(local_llm::E4B_URL),
-        _ => Err(format!("unknown LLM variant: {variant}")),
-    }
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalLlmModelEntry {
+    variant: String,
+    label: String,
+    bytes_hint: u64,
+    downloaded: bool,
+    size_bytes: Option<u64>,
+    path: Option<String>,
 }
 
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LocalLlmStatus {
-    e2b_downloaded: bool,
-    e2b_size_bytes: Option<u64>,
-    e2b_path: Option<String>,
-    e4b_downloaded: bool,
-    e4b_size_bytes: Option<u64>,
-    e4b_path: Option<String>,
+    models: Vec<LocalLlmModelEntry>,
     managed_dir: String,
 }
 
 #[tauri::command]
 pub fn local_llm_status(app: AppHandle) -> Result<LocalLlmStatus, String> {
     let dir = llm_dir(&app)?;
-    let check = |file: &str| -> (bool, Option<u64>, Option<String>) {
-        let p = dir.join(file);
-        match std::fs::metadata(&p) {
-            Ok(m) if m.is_file() => (true, Some(m.len()), Some(p.display().to_string())),
-            _ => (false, None, None),
-        }
-    };
-    let (e2b_d, e2b_s, e2b_p) = check(local_llm::E2B_FILE);
-    let (e4b_d, e4b_s, e4b_p) = check(local_llm::E4B_FILE);
+    let models = local_llm::ALL_MANAGED
+        .iter()
+        .map(|spec| {
+            let p = dir.join(spec.file);
+            let (downloaded, size_bytes, path) = match std::fs::metadata(&p) {
+                Ok(m) if m.is_file() => (true, Some(m.len()), Some(p.display().to_string())),
+                _ => (false, None, None),
+            };
+            LocalLlmModelEntry {
+                variant: spec.variant.into(),
+                label: spec.label.into(),
+                bytes_hint: spec.bytes_hint,
+                downloaded,
+                size_bytes,
+                path,
+            }
+        })
+        .collect();
     Ok(LocalLlmStatus {
-        e2b_downloaded: e2b_d,
-        e2b_size_bytes: e2b_s,
-        e2b_path: e2b_p,
-        e4b_downloaded: e4b_d,
-        e4b_size_bytes: e4b_s,
-        e4b_path: e4b_p,
+        models,
         managed_dir: dir.display().to_string(),
     })
 }
@@ -391,24 +390,23 @@ struct LlmDownloadProgress {
 
 #[tauri::command]
 pub async fn local_llm_download(app: AppHandle, variant: String) -> Result<(), String> {
-    let file = llm_variant_file(&variant)?;
-    let url = llm_variant_url(&variant)?;
+    let spec = llm_spec(&variant)?;
     let dir = llm_dir(&app)?;
     tokio::fs::create_dir_all(&dir).await.map_err(|e| format!("mkdir: {e}"))?;
-    let final_path = dir.join(file);
-    let tmp_path = dir.join(format!("{file}.partial"));
+    let final_path = dir.join(spec.file);
+    let tmp_path = dir.join(format!("{}.partial", spec.file));
 
     let resp = reqwest::Client::builder()
         // Generous timeout: a 5 GB download on a slow link can take a while.
         .timeout(std::time::Duration::from_secs(60 * 60))
         .build()
         .map_err(|e| format!("client: {e}"))?
-        .get(url)
+        .get(spec.url)
         .send()
         .await
         .map_err(|e| format!("network: {e}"))?;
     if !resp.status().is_success() {
-        return Err(format!("download {url}: HTTP {}", resp.status()));
+        return Err(format!("download {}: HTTP {}", spec.url, resp.status()));
     }
     let total = resp.content_length();
     let _ = app.emit(
@@ -448,10 +446,12 @@ pub async fn local_llm_download(app: AppHandle, variant: String) -> Result<(), S
             return Err(format!("downloaded file failed validation: {e}"));
         }
     };
-    if !info.architecture.starts_with("gemma") {
+    let arch_ok = info.architecture.starts_with("gemma")
+        || info.architecture.starts_with("qwen");
+    if !arch_ok {
         let _ = tokio::fs::remove_file(&tmp_path).await;
         return Err(format!(
-            "expected gemma architecture, got {}",
+            "unexpected architecture {} for variant {variant}",
             info.architecture
         ));
     }
@@ -472,8 +472,8 @@ pub async fn local_llm_delete(
     state: State<'_, AppState>,
     variant: String,
 ) -> Result<(), String> {
-    let file = llm_variant_file(&variant)?;
-    let path = llm_dir(&app)?.join(file);
+    let spec = llm_spec(&variant)?;
+    let path = llm_dir(&app)?.join(spec.file);
 
     // If the loaded model is the one being deleted, drop it from memory first.
     let should_unload = {

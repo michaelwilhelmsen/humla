@@ -94,9 +94,9 @@ export const ipc = {
   diarizeDelete: () => invoke<void>("diarize_delete"),
 
   localLlmStatus: () => invoke<LocalLlmStatus>("local_llm_status"),
-  localLlmDownload: (variant: "e2b" | "e4b") =>
+  localLlmDownload: (variant: string) =>
     invoke<void>("local_llm_download", { variant }),
-  localLlmDelete: (variant: "e2b" | "e4b") =>
+  localLlmDelete: (variant: string) =>
     invoke<void>("local_llm_delete", { variant }),
   localLlmScan: () => invoke<DiscoveredLlm[]>("local_llm_scan"),
   localLlmSelectExisting: (path: string) =>
@@ -132,13 +132,17 @@ export type SummaryEvent = { noteId: string; summary: string };
 export type RecordingPhase = "idle" | "starting" | "recording" | "paused" | "stopping" | "diarizing" | "loading_model" | "polishing" | "summarizing";
 export type SummaryProvider = "openai" | "local";
 
+export type LocalLlmModelEntry = {
+  variant: string;
+  label: string;
+  bytesHint: number;
+  downloaded: boolean;
+  sizeBytes: number | null;
+  path: string | null;
+};
+
 export type LocalLlmStatus = {
-  e2bDownloaded: boolean;
-  e2bSizeBytes: number | null;
-  e2bPath: string | null;
-  e4bDownloaded: boolean;
-  e4bSizeBytes: number | null;
-  e4bPath: string | null;
+  models: LocalLlmModelEntry[];
   managedDir: string;
 };
 
@@ -153,7 +157,7 @@ export type DiscoveredLlm = {
 };
 
 export type LocalLlmProgress = {
-  variant: "e2b" | "e4b";
+  variant: string;
   received: number;
   total: number | null;
 };

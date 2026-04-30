@@ -15,39 +15,70 @@ use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
-// Default download targets. Both are sourced from the canonical ggml-org
-// repos on HuggingFace. E2B has no Q4_K_M published — Q8_0 lands at ~4.6 GB
-// because Gemma 4 E2B is "2.3B effective params" but ~5.1B raw with the
-// embedding tables (per Google's model card). E2B's win over E4B is
-// inference speed, not disk footprint — both Q8 E2B and Q4 E4B are ~5 GB.
-pub const E2B_FILE: &str = "gemma-4-E2B-it-Q8_0.gguf";
-pub const E2B_URL: &str =
-    "https://huggingface.co/ggml-org/gemma-4-E2B-it-GGUF/resolve/main/gemma-4-E2B-it-Q8_0.gguf";
-pub const E2B_BYTES_HINT: u64 = 4_700_000_000;
+// Default download targets. Three managed tiers:
+// - Qwen 3 1.7B Q4_K_M: ~1.1 GB, ultra-budget. Apache 2.0. Multilingual
+//   incl. Bokmål/Nynorsk/Swedish/Danish per the Qwen 3 release notes.
+// - Qwen 3 4B Q4_K_M: ~2.5 GB, the recommended budget tier.
+// - Gemma 4 E4B Q4_K_M: ~5.0 GB, the quality tier. Apache 2.0 since v4.
+//
+// Qwen GGUFs come from unsloth (the closest thing to a canonical Qwen 3 GGUF
+// distribution — the official Qwen org only publishes Q8_0). Sizes verified
+// via HF Content-Length on 2026-04-30.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ManagedSpec {
+    pub variant: &'static str,    // setting/IPC identifier
+    pub label: &'static str,      // human-readable name
+    pub file: &'static str,       // on-disk filename
+    pub url: &'static str,        // download source
+    pub bytes_hint: u64,          // approximate, used as fallback for the progress bar denominator
+}
 
-pub const E4B_FILE: &str = "gemma-4-E4B-it-Q4_K_M.gguf";
-pub const E4B_URL: &str =
-    "https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q4_K_M.gguf";
-pub const E4B_BYTES_HINT: u64 = 5_100_000_000;
+pub const QWEN_1_7B: ManagedSpec = ManagedSpec {
+    variant: "qwen-1.7b",
+    label: "Qwen 3 1.7B",
+    file: "Qwen3-1.7B-Q4_K_M.gguf",
+    url: "https://huggingface.co/unsloth/Qwen3-1.7B-GGUF/resolve/main/Qwen3-1.7B-Q4_K_M.gguf",
+    bytes_hint: 1_107_409_472,
+};
+
+pub const QWEN_4B: ManagedSpec = ManagedSpec {
+    variant: "qwen-4b",
+    label: "Qwen 3 4B",
+    file: "Qwen3-4B-Q4_K_M.gguf",
+    url: "https://huggingface.co/unsloth/Qwen3-4B-GGUF/resolve/main/Qwen3-4B-Q4_K_M.gguf",
+    bytes_hint: 2_497_281_312,
+};
+
+pub const GEMMA_E4B: ManagedSpec = ManagedSpec {
+    variant: "gemma-e4b",
+    label: "Gemma 4 E4B",
+    file: "gemma-4-E4B-it-Q4_K_M.gguf",
+    url: "https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q4_K_M.gguf",
+    bytes_hint: 5_100_000_000,
+};
+
+pub const ALL_MANAGED: &[ManagedSpec] = &[QWEN_1_7B, QWEN_4B, GEMMA_E4B];
+
+pub fn spec_for_variant(variant: &str) -> Option<&'static ManagedSpec> {
+    ALL_MANAGED.iter().find(|s| s.variant == variant)
+}
 
 // What model the user has selected. Persisted to settings as a string in the
-// format "managed:e2b" / "managed:e4b" / "path:/abs/path/to.gguf" so we can
-// round-trip it through the SQLite settings table without a custom encoding.
+// format "managed:<variant>" / "path:/abs/path/to.gguf" so we can round-trip
+// through the SQLite settings table without a custom encoding.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ModelKind {
-    GemmaE2b,
-    GemmaE4b,
+    Managed(&'static ManagedSpec),
     Custom(PathBuf),
 }
 
 impl ModelKind {
     pub fn from_setting(value: &str) -> Option<Self> {
         if let Some(rest) = value.strip_prefix("managed:") {
-            return match rest {
-                "e2b" => Some(ModelKind::GemmaE2b),
-                "e4b" => Some(ModelKind::GemmaE4b),
-                _ => None,
-            };
+            // Backwards compat: "managed:e4b" was the original Gemma E4B
+            // identifier before we added Qwen variants.
+            let normalized = if rest == "e4b" { "gemma-e4b" } else { rest };
+            return spec_for_variant(normalized).map(ModelKind::Managed);
         }
         if let Some(rest) = value.strip_prefix("path:") {
             return Some(ModelKind::Custom(PathBuf::from(rest)));
@@ -57,14 +88,13 @@ impl ModelKind {
 
     pub fn to_setting(&self) -> String {
         match self {
-            ModelKind::GemmaE2b => "managed:e2b".into(),
-            ModelKind::GemmaE4b => "managed:e4b".into(),
+            ModelKind::Managed(spec) => format!("managed:{}", spec.variant),
             ModelKind::Custom(p) => format!("path:{}", p.display()),
         }
     }
 
     pub fn is_managed(&self) -> bool {
-        matches!(self, ModelKind::GemmaE2b | ModelKind::GemmaE4b)
+        matches!(self, ModelKind::Managed(_))
     }
 }
 
@@ -74,8 +104,7 @@ pub fn managed_dir(app_data_dir: &Path) -> PathBuf {
 
 pub fn resolve_path(kind: &ModelKind, app_data_dir: &Path) -> PathBuf {
     match kind {
-        ModelKind::GemmaE2b => managed_dir(app_data_dir).join(E2B_FILE),
-        ModelKind::GemmaE4b => managed_dir(app_data_dir).join(E4B_FILE),
+        ModelKind::Managed(spec) => managed_dir(app_data_dir).join(spec.file),
         ModelKind::Custom(p) => p.clone(),
     }
 }
@@ -250,11 +279,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn round_trip_managed() {
-        let k = ModelKind::GemmaE4b;
-        let s = k.to_setting();
-        assert_eq!(s, "managed:e4b");
-        assert_eq!(ModelKind::from_setting(&s), Some(k));
+    fn round_trip_each_managed() {
+        for spec in ALL_MANAGED {
+            let k = ModelKind::Managed(spec);
+            let s = k.to_setting();
+            assert_eq!(s, format!("managed:{}", spec.variant));
+            assert_eq!(ModelKind::from_setting(&s), Some(k));
+        }
     }
 
     #[test]
@@ -272,10 +303,18 @@ mod tests {
     }
 
     #[test]
+    fn legacy_managed_e4b_maps_to_gemma() {
+        // Older builds persisted "managed:e4b" as the Gemma identifier.
+        // Make sure existing settings keep working after the rename.
+        let k = ModelKind::from_setting("managed:e4b");
+        assert!(matches!(k, Some(ModelKind::Managed(s)) if s.variant == "gemma-e4b"));
+    }
+
+    #[test]
     fn resolve_managed_uses_managed_dir() {
         let base = PathBuf::from("/tmp/humla");
-        let p = resolve_path(&ModelKind::GemmaE4b, &base);
-        assert_eq!(p, base.join("models").join("llm").join(E4B_FILE));
+        let p = resolve_path(&ModelKind::Managed(&GEMMA_E4B), &base);
+        assert_eq!(p, base.join("models").join("llm").join(GEMMA_E4B.file));
     }
 
     #[test]
