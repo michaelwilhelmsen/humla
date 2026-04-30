@@ -141,44 +141,48 @@ export function Note() {
           className="text-5xl font-light tracking-[-0.02em] w-full mb-6 placeholder:text-[var(--color-text-muted)]/50"
         />
 
-        <div className="flex items-center gap-3 mb-10">
-          <span className="nd-chip">{dateChip}</span>
-          <PresetPicker
-            value={draft.summary_preset || "meeting"}
-            lang={uiLang}
-            onChange={(v) => patch("summary_preset", v)}
-          />
-          <LanguagePicker
-            value={draft.language || uiLang}
-            onChange={(v) => patch("language", v)}
-          />
-          <SummaryProviderChip
-            value={draft.summary_provider}
-            globalDefault={globalProvider}
-            onChange={patchProvider}
-          />
-          <FolderPicker
-            value={draft.folder_id}
-            onChange={async (folderId) => {
-              if (!draft) return;
-              const next = { ...draft, folder_id: folderId };
-              setDraft(next);
-              await ipc.moveNote(draft.id, folderId);
-              upsert(next);
-            }}
-          />
-          {(isRecording || isStarting) && (
-            <span className="nd-chip" style={{ color: "var(--color-accent)", borderColor: "var(--color-accent)" }}>
-              <span className="rec-dot inline-block w-1.5 h-1.5 rounded-full" style={{ background: "var(--color-accent)" }} />
-              {isStarting ? "Starting" : "Recording"}
-            </span>
-          )}
-          {isPaused && (
-            <span className="nd-chip">
-              <span className="inline-block w-1.5 h-1.5 rounded-full bg-[var(--color-text-muted)]" />
-              Paused
-            </span>
-          )}
+        <div className="flex flex-col gap-2 mb-10">
+          <div className="flex items-center gap-3 flex-wrap">
+            <span className="nd-chip">{dateChip}</span>
+            <FolderPicker
+              value={draft.folder_id}
+              onChange={async (folderId) => {
+                if (!draft) return;
+                const next = { ...draft, folder_id: folderId };
+                setDraft(next);
+                await ipc.moveNote(draft.id, folderId);
+                upsert(next);
+              }}
+            />
+            {(isRecording || isStarting) && (
+              <span className="nd-chip" style={{ color: "var(--color-accent)", borderColor: "var(--color-accent)" }}>
+                <span className="rec-dot inline-block w-1.5 h-1.5 rounded-full" style={{ background: "var(--color-accent)" }} />
+                {isStarting ? "Starting" : "Recording"}
+              </span>
+            )}
+            {isPaused && (
+              <span className="nd-chip">
+                <span className="inline-block w-1.5 h-1.5 rounded-full bg-[var(--color-text-muted)]" />
+                Paused
+              </span>
+            )}
+          </div>
+          <div className="flex items-center gap-3 flex-wrap">
+            <PresetPicker
+              value={draft.summary_preset || "meeting"}
+              lang={uiLang}
+              onChange={(v) => patch("summary_preset", v)}
+            />
+            <LanguagePicker
+              value={draft.language || uiLang}
+              onChange={(v) => patch("language", v)}
+            />
+            <SummaryProviderChip
+              value={draft.summary_provider}
+              globalDefault={globalProvider}
+              onChange={patchProvider}
+            />
+          </div>
         </div>
 
         <NoteEditor
