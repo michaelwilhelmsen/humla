@@ -188,6 +188,18 @@ export function Settings() {
       const list = await ipc.localLlmListModels(baseUrl);
       list.sort();
       setLlmModels({ list, loading: false, error: null });
+      // Auto-pick the first model when (a) the user hasn't picked anything
+      // yet, or (b) the previously-saved choice is no longer on the server
+      // (they ran `ollama rm` between sessions). Without this, the <select>
+      // shows the first option due to HTML's default-fallback rendering but
+      // s.local_llm_model stays empty — summary calls fail with "model not
+      // configured" even though the dropdown looks fine.
+      if (
+        list.length > 0 &&
+        (!s.local_llm_model || !list.includes(s.local_llm_model))
+      ) {
+        await update("local_llm_model", list[0]);
+      }
     } catch (e) {
       // reqwest's connection-refused error shows up as "error sending request
       // for url (...)" which is opaque to non-technical users. Replace it
