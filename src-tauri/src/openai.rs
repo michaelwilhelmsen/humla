@@ -11,6 +11,19 @@ pub fn client() -> reqwest::Client {
         .expect("reqwest client")
 }
 
+// Local LLM servers (Ollama especially) cold-load the model on first request,
+// which adds 5-15s before any tokens stream. A long-meeting summary can then
+// generate for 30-60s on a 9B model. The 120s default isn't enough headroom
+// for first-call-of-the-day on slower hardware. 5 minutes is a comfortable
+// ceiling that still surfaces a stuck server as an error rather than hanging
+// the UI forever.
+fn local_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build()
+        .expect("reqwest client")
+}
+
 pub async fn ping(api_key: &str) -> Result<bool> {
     let r = client()
         .get(format!("{BASE}/models"))
@@ -152,26 +165,47 @@ pub async fn summarize_with_base(
     system_prompt: &str,
     transcript: &str,
 ) -> Result<String> {
+    let is_local = base_url != BASE;
     let req = ChatRequest {
         model,
         // Local OpenAI-compat servers accept temperature; reasoning-model
         // suppression only applies when the actual server is OpenAI's.
-        temperature: if base_url == BASE && is_reasoning_model(model) {
-            None
-        } else {
+        temperature: if is_local || !is_reasoning_model(model) {
             Some(0.2)
+        } else {
+            None
         },
         messages: vec![
             ChatMessage { role: "system", content: system_prompt },
             ChatMessage { role: "user", content: transcript },
         ],
     };
-    let r = client()
+    let http = if is_local { local_client() } else { client() };
+    let r = http
         .post(format!("{base_url}/chat/completions"))
         .bearer_auth(api_key)
         .json(&req)
         .send()
-        .await?;
+        .await
+        .map_err(|e| {
+            // reqwest's timeout error looks like "request timed out" and
+            // its connect error like "error sending request". Both are
+            // opaque to the user; map to something actionable.
+            if e.is_timeout() {
+                anyhow!(
+                    "Timed out after 5 minutes waiting for {base_url}. \
+                     The local model may be cold-loading or stuck — \
+                     try again, or restart your local-LLM server."
+                )
+            } else if e.is_connect() {
+                anyhow!(
+                    "Couldn't reach {base_url}. Is your local-LLM \
+                     server running? (ollama serve, etc.)"
+                )
+            } else {
+                anyhow!("network error talking to {base_url}: {e}")
+            }
+        })?;
 
     if !r.status().is_success() {
         let s = r.status();
