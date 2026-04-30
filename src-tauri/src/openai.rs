@@ -336,9 +336,15 @@ struct OllamaOptions {
     temperature: f32,
     // Hard cap on generated tokens. Without this, Qwen 3+ thinking mode can
     // burn 5K+ tokens reasoning before answering even on tiny inputs.
-    // 4096 is comfortably enough for thinking + a multi-paragraph summary,
-    // and stops a runaway model from hanging the UI for minutes on end.
     num_predict: i32,
+    // Penalize tokens that appeared in the last N positions, mitigating the
+    // "Okay, let's write. Wait, I need to check the language. Norwegian.
+    //  Okay, let's write. Wait, I need to check the format. Markdown..."
+    // degenerate loop Qwen 3.5:9B falls into during thinking. Default in
+    // Ollama is 1.1 (mild); 1.3 is meaningfully stronger without distorting
+    // normal output. last_n=256 covers a few sentences of context.
+    repeat_penalty: f32,
+    repeat_last_n: i32,
 }
 
 // One JSON object per newline-delimited frame Ollama emits when stream:true.
@@ -392,11 +398,14 @@ where
         think,
         options: OllamaOptions {
             temperature: 0.2,
-            // Thinking mode burns thousands of reasoning tokens before the
-            // final answer; 4096 isn't enough headroom for thinking + reply,
-            // but it is for the fast path. Generous cap when think=true so
-            // a single run can actually complete for comparison.
-            num_predict: if think { 16384 } else { 4096 },
+            // Thinking burns thousands of reasoning tokens before the final
+            // answer; 4096 is enough for the fast path, 8192 gives thinking
+            // headroom while still failing fast on degenerate loops (was
+            // 16384, but a stuck Qwen takes ~9 minutes to hit that — too
+            // long to wait for the timeout to free up Ollama).
+            num_predict: if think { 8192 } else { 4096 },
+            repeat_penalty: 1.3,
+            repeat_last_n: 256,
         },
     };
     let started = std::time::Instant::now();
