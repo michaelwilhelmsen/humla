@@ -479,8 +479,8 @@ export function Settings() {
                     }
                   }}
                   options={[
-                    { value: "managed:e2b", label: "Gemma 4 E2B — ~2.9 GB · faster" },
-                    { value: "managed:e4b", label: "Gemma 4 E4B — ~5.0 GB · recommended" },
+                    { value: "managed:e4b", label: "Gemma 4 E4B — ~5.0 GB · recommended (best quality)" },
+                    { value: "managed:e2b", label: "Gemma 4 E2B — ~4.6 GB · faster inference" },
                     ...(llm.scan ?? [])
                       .filter((m) => m.compatible)
                       .map((m) => ({
@@ -489,12 +489,11 @@ export function Settings() {
                       })),
                   ]}
                 />
-                {memoryGb > 0 && memoryGb <= 16 && s.summary_local_model === "managed:e4b" && (
+                {memoryGb > 0 && memoryGb <= 16 && s.summary_local_model.startsWith("managed:") && (
                   <p className="text-xs text-[var(--color-text-muted)] mt-2">
-                    Heads up: your Mac has {memoryGb} GB of RAM. E4B uses
-                    ~5 GB resident during summary; with Whisper and your
-                    browser already loaded that may swap. E2B is the safer
-                    pick on 16 GB systems.
+                    Heads up: your Mac has {memoryGb} GB of RAM. Both Gemma 4
+                    variants need ~5 GB resident during summary; with Whisper
+                    and your browser already loaded that may swap.
                   </p>
                 )}
               </Row>
@@ -655,7 +654,7 @@ function LocalLlmModelManager({
     );
   }
 
-  const sizeHint = variant === "e2b" ? "~2.9 GB" : "~5.0 GB";
+  const sizeHint = variant === "e2b" ? "~4.6 GB" : "~5.0 GB";
   return (
     <div className="flex flex-col gap-2">
       <div className="text-sm">

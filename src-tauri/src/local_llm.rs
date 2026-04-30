@@ -16,13 +16,14 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 // Default download targets. Both are sourced from the canonical ggml-org
-// repos on HuggingFace. E2B has no Q4_K_M published — Q8_0 of a 2B model is
-// roughly the same disk footprint as Q4 of a 4B and preserves more quality,
-// so we use it as the "small" tier.
+// repos on HuggingFace. E2B has no Q4_K_M published — Q8_0 lands at ~4.6 GB
+// because Gemma 4 E2B is "2.3B effective params" but ~5.1B raw with the
+// embedding tables (per Google's model card). E2B's win over E4B is
+// inference speed, not disk footprint — both Q8 E2B and Q4 E4B are ~5 GB.
 pub const E2B_FILE: &str = "gemma-4-E2B-it-Q8_0.gguf";
 pub const E2B_URL: &str =
     "https://huggingface.co/ggml-org/gemma-4-E2B-it-GGUF/resolve/main/gemma-4-E2B-it-Q8_0.gguf";
-pub const E2B_BYTES_HINT: u64 = 2_900_000_000;
+pub const E2B_BYTES_HINT: u64 = 4_700_000_000;
 
 pub const E4B_FILE: &str = "gemma-4-E4B-it-Q4_K_M.gguf";
 pub const E4B_URL: &str =
