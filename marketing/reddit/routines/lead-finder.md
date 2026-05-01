@@ -68,8 +68,32 @@ Filter:
 - Drop posts in r/selfhosted unless the asker explicitly wants a self-hosted server (Humla is local-desktop, not server)
 
 Find an unanswered reply target (most important filter):
-- For each surviving thread, fetch with `get_post_details` using `comment_depth: 6` and `comment_limit: 100`. The default depth (3) misses sub-thread answers — that's how you accidentally surface threads where the question was already answered in a child comment.
-- Walk the full comment tree, not just top-level comments.
+
+**CRITICAL — the Reddit MCP does NOT return nested replies.** It returns top-level comments only, even with `comment_depth: 6`. To verify threading, you must use Reddit's raw JSON API via Bash:
+
+```bash
+UA="humla-research/0.1 by u/tremendousquotes"
+curl -sL -A "$UA" "https://www.reddit.com/r/SUBREDDIT/comments/POST_ID.json?depth=10&limit=200" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+comments = data[1]['data']['children']
+def walk(c, depth=0):
+    d = c.get('data', {})
+    if c.get('kind') != 't1': return
+    body = d.get('body','').replace(chr(10),' ')[:200]
+    print(f'{\"  \"*depth}- [{d.get(\"id\")}] u/{d.get(\"author\")} [{d.get(\"score\")}↑]: {body}')
+    replies = d.get('replies')
+    if replies and isinstance(replies, dict):
+        for child in replies.get('data',{}).get('children',[]):
+            walk(child, depth+1)
+for c in comments:
+    walk(c)
+"
+```
+
+Use this output as ground truth.
+
+- Walk the full comment tree from the raw JSON, not the MCP top-level list.
 - If OP's question is already answered well by a recommended tool that fits their requirements (and Humla doesn't add a clearly different angle), drop the thread.
 - For any candidate reply target, walk its children before declaring it unanswered:
   - If ANY child substantively answers the question (even imperfectly), the target is answered.
@@ -77,12 +101,12 @@ Find an unanswered reply target (most important filter):
 - Prefer threads where OP hasn't gotten a great answer yet, OR where existing recommendations miss what Humla specifically does (e.g., everyone's recommending bot-based tools when OP wanted no bots).
 - If a sub-comment expresses unmet frustration about an existing recommendation ("I tried that, doesn't work for X"), that's the reply target — provided the frustration itself hasn't been addressed.
 
-Verification before surfacing: for the chosen reply target, you must be able to say one of:
-- "Target has 0 children" (cite parent comment + child count)
-- "Target's children are non-substantive: [quote each child]"
-- "Existing answer is wrong/incomplete for [specific reason]"
+Verification before surfacing: cite the reply target's comment ID from the raw JSON walk above, then say one of:
+- "Comment ID X has 0 children in the raw JSON"
+- "Comment ID X's children are: [list child IDs + quotes]. None substantively answer."
+- "Comment ID X has answer Y but it misses [specific Humla differentiator]"
 
-If you can't honestly fill that in, drop the thread.
+If you can't point to a specific comment ID and quote the tree, drop the thread.
 
 Score intent (0–10):
 - +3 if asking a direct question ("does anyone know X?", "looking for Y")

@@ -68,8 +68,32 @@ Steps:
    - Michael (u/tremendousquotes) has already commented (check authors of all comments)
    - It's about politics, drama, or off-topic for the sub
 6. **Find an unanswered reply target** — this is the most important filter. For each surviving thread:
-   - Fetch the post with `mcp__Reddit_MCP_Buddy__get_post_details` using `comment_depth: 6` and `comment_limit: 100`. The default depth (3) misses sub-thread answers.
-   - Read OP's question and the full comment tree.
+
+   **CRITICAL — the Reddit MCP does NOT return nested replies.** It only gives top-level comments, even with `comment_depth: 6`. To see the actual threaded conversation, you MUST use Reddit's raw JSON API via Bash. Run this for each candidate thread:
+
+   ```bash
+   UA="humla-research/0.1 by u/tremendousquotes"
+   curl -sL -A "$UA" "https://www.reddit.com/r/SUBREDDIT/comments/POST_ID.json?depth=10&limit=200" | python3 -c "
+   import json, sys
+   data = json.load(sys.stdin)
+   comments = data[1]['data']['children']
+   def walk(c, depth=0):
+       d = c.get('data', {})
+       if c.get('kind') != 't1': return
+       body = d.get('body','').replace(chr(10),' ')[:200]
+       print(f'{\"  \"*depth}- [{d.get(\"id\")}] u/{d.get(\"author\")} [{d.get(\"score\")}↑]: {body}')
+       replies = d.get('replies')
+       if replies and isinstance(replies, dict):
+           for child in replies.get('data',{}).get('children',[]):
+               walk(child, depth+1)
+   for c in comments:
+       walk(c)
+   "
+   ```
+
+   This prints the full nested tree with comment IDs, authors, scores, and body excerpts. Use this output as the ground truth for whether a comment has children.
+
+   - Read OP's question and the full comment tree from the raw JSON output.
    - If OP's question is already well-answered (a comment with >5 score that genuinely addresses the question, or OP has marked one as solved), do NOT reply to OP. Question is closed.
    - For any candidate reply target (OP or a specific commenter), **walk into its children before declaring it unanswered**:
      - List the direct child comments of the proposed target
@@ -82,12 +106,12 @@ Steps:
      - A commenter expressing confusion or frustration that nobody addressed
    - If neither OP's question nor any sub-comment is genuinely unanswered AND fits Michael's expertise, drop the thread.
 
-   **Verification before surfacing**: for the chosen reply target, you MUST be able to say one of:
-   - "Reply target has zero direct children" (cite the parent comment + child count from the JSON)
-   - "Reply target's children are non-substantive: [quote of each child]"
-   - "Reply target's existing answer is wrong/incomplete because [specific reason]"
+   **Verification before surfacing**: cite the comment ID of the reply target from the raw JSON output, then say one of:
+   - "Comment ID X has 0 children in the raw JSON tree"
+   - "Comment ID X's children are: [list child IDs + brief quotes from the tree printout above]. None substantively answer the question."
+   - "Comment ID X has a substantive answer (ID Y by u/Z) but it's wrong because [specific]"
 
-   If you cannot honestly fill that in, drop the thread. Do not surface a thread on inferred or assumed reply counts.
+   If you cannot point to a specific comment ID and quote what was or wasn't there, drop the thread. The raw JSON walk above is the ground truth — if the routine surfaces a thread without consulting it, the verification is invalid.
 
 7. Rank surviving threads by: priority sub > recency > unanswered-question potential > expertise match strength.
 8. Pick the top 3–5.
