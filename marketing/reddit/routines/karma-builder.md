@@ -75,15 +75,18 @@ For each surfaced thread, include:
 - Sub + thread title + reddit link
 - Posted Xh ago, current score, current comment count
 - Why it fits Michael's expertise (1 sentence)
-- The specific technical detail Michael should lead with
+- **Reply target** — pick ONE specific spot to comment, not a synthesis. Either:
+  - Reply to OP (the post itself), addressing the post's main question
+  - Reply to a specific commenter (give their username + a short quote of what they asked)
 - Things to avoid in this thread
-- **Your reply** — a full draft comment in Michael's voice that he can paste with minor edits
+- **Your reply** — a draft comment that answers ONLY the reply target above, nothing else
 
 ## Voice guide for "Your reply"
 
 Michael's writing voice on Reddit, distilled from his actual comments:
 
-- **Length: 1–4 sentences. Usually 2.** No 200-word essays. If the answer needs more, the answer is wrong for Reddit.
+- **Length: 1–3 sentences. Usually 2, often 1.** No 200-word essays. If the answer needs more, the answer is wrong for Reddit.
+- **One reply target only.** Answer the OP's question OR one specific commenter's question — never both. Synthesizing across multiple commenters reads as AI. A real person reading the thread picks the one thing they have to say and says it.
 - **Open with action or soft opinion**, not preamble: "Skip making it read all the files." / "I definitely think it's worth it." / "We've slowly started integrating ai automations." / "I only use API for products and integrations."
 - **Frame as opinion, not declaration.** Use: "I've found...", "Worked for me to...", "I'd lean toward...", "My take is...", "Honestly, I'd just...", "From what I've seen...", "Probably...". Avoid: "The actual cause is...", "The real bottleneck is...", "Here's what's happening..."
 - **Lower confidence by default.** Michael isn't a textbook. Add "probably", "usually", "in my case", "from what I've seen" liberally. If a claim isn't certain, hedge — readers trust hedged claims more than confident ones.
@@ -152,11 +155,11 @@ Output: Write the report to marketing/reddit/karma/YYYY-MM-DD.md (use today's UT
 - **Link:** [reddit.com link]
 - **Posted:** Xh ago • [score]↑ • [N] comments
 - **Why this fits:** [1 sentence]
-- **Lead with:** [specific technical detail or angle]
+- **Reply to:** [either "OP" + 1-line quote of the question, or "u/username" + 1-line quote of their comment]
 - **Don't:** [anything to avoid]
 
 **Your reply:**
-> [full draft comment in Michael's voice, 1–4 sentences usually, opinion-framed, no AI-isms]
+> [draft addressing ONLY the reply target above. 1–3 sentences. Opinion-framed. No AI-isms.]
 
 (repeat per surfaced thread)
 

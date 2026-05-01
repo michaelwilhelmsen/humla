@@ -86,7 +86,8 @@ For each surfaced thread:
 
 Michael's writing voice on Reddit:
 
-- **Length: 1–4 sentences.** Usually 2. No essays.
+- **Length: 1–3 sentences.** Usually 2, often 1. No essays.
+- **One reply target only.** Answer the OP's question OR one specific commenter's question — never synthesize across multiple commenters. That's an AI tell. Pick the one thing you'd say if you were skimming the thread.
 - **Open with action or soft opinion**, not preamble: "Skip making it...", "I definitely think...", "We've slowly started..."
 - **Frame as opinion, not declaration.** Use: "I've found...", "Worked for me to...", "I'd lean toward...", "My take is...", "Honestly, I'd just...", "From what I've seen...", "Probably..."
 - **Lower confidence by default.** Hedge liberally. Readers trust hedged claims more than confident ones.
@@ -149,11 +150,12 @@ Output: Write the report to marketing/reddit/leads/YYYY-MM-DD.md (today's UTC da
 - **Intent score:** X/10
 - **What they're asking:** [1 sentence]
 - **Humla fit:** [which differentiator addresses their question]
+- **Reply to:** [either "OP" + 1-line quote, or "u/username" + 1-line quote of their comment]
 - **Asset opportunity:** [Open Recorder clip suggestion if applicable]
 - **DON'T:** [things to avoid]
 
 **Your reply:**
-> [full draft in Michael's voice. Lead with their problem, not the product. One Humla mention with disclosure ("I'm building Humla — local-first meeting notes for mac" or similar). 1–4 sentences. No link in the first comment unless they explicitly asked for tool names.]
+> [draft addressing ONLY the reply target above. Lead with their problem, not the product. One Humla mention with disclosure. 1–3 sentences. No link in the first comment unless they explicitly asked for tool names.]
 
 (repeat)
 
@@ -163,9 +165,10 @@ Output: Write the report to marketing/reddit/leads/YYYY-MM-DD.md (today's UTC da
 - **Sub:** r/...
 - **Link:** ...
 - **Why surface:** valuable thread to comment on for visibility/karma without promo
+- **Reply to:** [OP or u/username + quote]
 
 **Your reply:**
-> [full draft, no Humla mention, pure value-add]
+> [draft addressing only the reply target. No Humla mention. 1–3 sentences.]
 
 (repeat)
 
