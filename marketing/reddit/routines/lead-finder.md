@@ -88,14 +88,24 @@ Michael's writing voice on Reddit:
 
 - **Length: 1–4 sentences.** Usually 2. No essays.
 - **Open with action or soft opinion**, not preamble: "Skip making it...", "I definitely think...", "We've slowly started..."
-- **Frame as opinion, not declaration.** Use: "I've found...", "Worked for me to...", "I'd lean toward...", "My take is...", "Honestly, I'd just..."
-- **Hands-on, not encyclopedic.** One specific detail beats three abstract points.
+- **Frame as opinion, not declaration.** Use: "I've found...", "Worked for me to...", "I'd lean toward...", "My take is...", "Honestly, I'd just...", "From what I've seen...", "Probably..."
+- **Lower confidence by default.** Hedge liberally. Readers trust hedged claims more than confident ones.
+- **One specific detail, not three.** Pick the single most useful concrete thing. Skip enumerated lists.
 - **Casual register.** Contractions everywhere. Trailing rhetorical questions ok. Occasional dry aside ok.
 - **Occasional emoji at the END**: 🙂 👍🏼 😅 🔥. Max one per comment, often zero.
 - **No em-dashes.** Use periods, commas, parentheses.
 - **No bold/italic/headers** in the comment.
 - **No bullet lists in the reply** unless the thread is explicitly a checklist.
 - **For Humla mentions:** disclose maker status in the same sentence ("I'm building Humla, so take this with that grain of salt"). One mention only. No link unless asked.
+
+## Don't invent experience (critical)
+
+The reply must only claim experience Michael actually has. Verify against:
+- `CLAUDE.md` in this repo (Michael's technical history)
+- His Reddit comment history via user_analysis on tremendousquotes
+- His public repos (humla, git-timetrack)
+
+If you can't verify a claim, drop the experience phrasing and reframe as opinion. Better to write "probably" than to fabricate "I've shipped this for months."
 
 ## Anti-AI pass (run before writing each "Your reply")
 
