@@ -150,15 +150,39 @@ The reply must only claim experience Michael actually has. Verify against:
 
 If you can't verify a claim, drop the experience phrasing and reframe as opinion. Better to write "probably" than to fabricate "I've shipped this for months."
 
-## Anti-AI pass (run before writing each "Your reply")
+## Humanizer pass (mandatory)
 
-- Cut: "actually" / "essentially" / "fundamentally" / "the real question is" / "at its core"
-- Cut: "underscoring" / "highlighting" / "ensuring" / "reflecting" / "showcasing"
-- Cut: "It's not just X — it's Y" structures
-- Cut: "Great question!" / "Hope this helps" / "Let me know"
-- Cut: tailing negations ("no guessing", "no friction")
-- Cut: rule-of-three lists, copula avoidance ("serves as", "functions as")
-- Read out loud — if a sentence feels like a press release, delete.
+After drafting each reply, run it through the `humanizer` skill before finalizing.
+
+Steps:
+1. Draft the reply per the voice guide above.
+2. Invoke the humanizer skill: `Skill humanizer` with the draft + voice calibration samples (below) + instruction "humanize this Reddit reply, keep it 1–3 sentences max, preserve Humla disclosure if present."
+3. Use the humanizer's final rewrite. If it adds length, trim back to cap.
+
+**Voice calibration samples** (real recent comments by u/tremendousquotes — paste verbatim):
+
+```
+- "Skip making it read all the files. Use /init to create a decent CLAUDE.md and point it to the files you want to work with."
+- "We've slowly started integrating ai automations. Most importantly we're seeing the need to use a good model that can plan accurately and have good vision."
+- "I definitely think it's worth it, and I only maxed out session limits occasionally with heavy use. /clear often, and give good prompts and it will last you 🙂👍🏼"
+- "I only use API for products and integrations. Use the pro/max plan subscription for your personal use"
+- "I have the same issue. My product also criticizes Donald Trump, so every post gets flagged / banned automatically 😅"
+- "I'm building Humla which is open source + local models. In a pretty decent shape now, but working on it actively."
+- "The grind doesn't truly start until you hit \"Submit for Review\"."
+```
+
+The 1–3 sentence cap from this routine takes precedence over any humanizer suggestion to add length or structure. Disclosure for Humla mentions stays intact through the humanizer pass.
+
+## Quick anti-AI checklist (spot-check after humanizer)
+
+- "actually" / "essentially" / "fundamentally" / "the real question is" → cut
+- "underscoring" / "highlighting" / "ensuring" / "reflecting" → cut
+- "It's not just X — it's Y" → cut
+- "Great question!" / "Hope this helps" → delete
+- Tailing negations → rewrite as real clauses
+- Em-dashes → periods, commas, parentheses
+- Copula avoidance ("serves as") → "is" / "has"
+- Tutorial tone → peer tone
 
 ---
 

@@ -166,20 +166,41 @@ If the routine wants to write "I've used X for months" or "I shipped Y this way,
 - "Whisper.cpp on Metal handles this fine on M-series" — true per CLAUDE.md
 - General opinion / framing without a specific claim of personal use
 
-## Anti-AI pass (run this before writing the reply)
+## Humanizer pass (mandatory)
 
-Before you write each "Your reply", check yourself:
+After drafting each reply, run it through the `humanizer` skill before finalizing.
 
-- Am I using "actually" / "essentially" / "fundamentally" / "the real question is"? Cut.
-- Am I using "underscoring" / "highlighting" / "ensuring" / "reflecting"? Cut.
-- Am I writing "It's not just X — it's Y"? Cut.
-- Am I starting with "Great question!" or ending with "Hope this helps"? Delete.
-- Am I tacking a tailing negation ("no guessing", "no friction") onto the end? Rewrite as a real clause or drop.
-- Am I using rule-of-three lists? Reduce to one or two.
-- Am I writing in copula avoidance ("X serves as", "X functions as")? Use "is" / "has".
-- Does it sound like a tutorial? Make it sound like Michael talking to a peer.
+Steps:
+1. Draft the reply per the voice guide above (1–3 sentences, opinion-framed, etc.).
+2. Invoke the humanizer skill via the Skill tool: `Skill humanizer` with input that includes (a) the draft, (b) Michael's voice calibration samples (see below), and (c) the instruction "humanize this Reddit reply, keep it 1–3 sentences max."
+3. Use the humanizer's final rewrite as the reply you put in the report. If the humanizer adds length, trim back to the cap before committing to the report.
 
-After writing, re-read out loud. If a sentence feels like Wikipedia, delete it.
+**Voice calibration samples to pass to humanizer** (real recent comments by u/tremendousquotes — do not paraphrase, paste verbatim):
+
+```
+- "Skip making it read all the files. Use /init to create a decent CLAUDE.md and point it to the files you want to work with. Also integrate automated tests to your project."
+- "We've slowly started integrating ai automations. Most importantly we're seeing the need to use a good model that can plan accurately and have good vision. Pair that with automated tests and it will save you tons of time."
+- "I definitely think it's worth it, and I only maxed out session limits occasionally with heavy use. /clear often, and give good prompts and it will last you 🙂👍🏼"
+- "I only use API for products and integrations. Use the pro/max plan subscription for your personal use"
+- "I have the same issue. My product also criticizes Donald Trump, so every post gets flagged / banned automatically 😅"
+- "This might be a good way to do it to keep control throughout a complete project. I've tried multiple variations of this with plan sections, living docs, etc. I'll check this out later 🙂"
+- "The grind doesn't truly start until you hit \"Submit for Review\"."
+- "I wonder if the collab editing turn itself off if we're using custom fields through ACF blocks only. Technically all within Gutenberg."
+```
+
+Note for the humanizer pass: Reddit comments are short, conversational, and opinion-framed. The humanizer's "PERSONALITY AND SOUL" section applies. The 1–3 sentence cap from this routine takes precedence over any humanizer suggestion to add structure or length.
+
+## Quick anti-AI checklist (use after humanizer if you're spot-checking)
+
+- "actually" / "essentially" / "fundamentally" / "the real question is" → cut
+- "underscoring" / "highlighting" / "ensuring" / "reflecting" / "showcasing" → cut
+- "It's not just X — it's Y" structure → cut
+- "Great question!" / "Hope this helps" → delete
+- Tailing negations ("no guessing", "no friction") → rewrite as real clauses
+- Rule-of-three lists → reduce to one or two
+- Em-dashes → replace with periods, commas, or parentheses
+- Copula avoidance ("serves as", "functions as") → "is" / "has"
+- Tutorial tone → peer tone
 
 ## Critical rules
 - NO Humla mention in any of these comments. Phase 0 is karma-only.
