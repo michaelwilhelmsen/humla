@@ -5,6 +5,7 @@ description = "Humla — personal meeting notes that hum along"
 authors = ["Michael Wilhelmsen"]
 edition = "2021"
 rust-version = "1.85"
+license = "MIT"
 
 [lib]
 name = "humla_lib"

@@ -2,6 +2,7 @@
   "name": "humla",
   "private": true,
   "version": "0.8.2",
+  "license": "MIT",
   "type": "module",
   "scripts": {
     "dev": "vite",
