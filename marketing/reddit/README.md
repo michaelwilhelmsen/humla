@@ -90,9 +90,11 @@ Practical Reddit unauth limit is ~60 req/min per IP. The cache + sequential call
 
 ## Tracker + reply-watcher (the feedback loop)
 
-`marketing/reddit/intel/tracker.md` is the single record of everything Michael has posted/commented on Reddit through these routines. Karma-builder and lead-finder both generate "Suggested tracker entry" rows in their daily output — Michael copies them into `tracker.md` after he posts.
+`marketing/reddit/intel/tracker.md` is the single record of everything Michael has posted/commented on Reddit through these routines. **It's auto-populated** — the reply-watcher routine fetches Michael's last 50 Reddit comments daily, cross-references against the tracker (skip if already there) and against recent surfaced files in `karma/`, `leads/`, `drafts/`, `intel/` (to identify which routine surfaced the thread), and appends new rows with the right prefix (`K###`, `L###`, `E###`, etc.).
 
-The reply-watcher routine (daily, 10am) reads tracker.md, walks each active row's thread for new child comments under Michael's reply, and drafts follow-ups for any new replies. Output goes to `leads/follow-ups-YYYY-MM-DD.md`.
+If the new comment is a follow-up to one of Michael's existing tracked comments (Reddit `parent_id` matches), the watcher updates the parent row's Status to `engaged` instead of duplicating.
+
+After auto-population, the same routine walks each active row's thread for new child comments under Michael's reply and drafts follow-ups for any new ones. Output goes to `leads/follow-ups-YYYY-MM-DD.md`.
 
 **Status flow:**
 - `waiting` → posted, no replies yet

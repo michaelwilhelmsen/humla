@@ -38,13 +38,75 @@ test -f marketing/reddit/lib/fetch.py && test -f marketing/reddit/intel/tracker.
 
 If PRECONDITION_FAIL, exit with a one-line report explaining which file is missing or whether Reddit is unreachable.
 
-## Step 1 — Read the tracker
+## Step 1 — Auto-populate tracker from comment history
 
-Parse marketing/reddit/intel/tracker.md. Look at the table at the bottom. For each row where Status is in {waiting, replied, engaged}, you'll need to check the thread for new activity.
+Before reading the tracker for active rows, sweep Michael's recent Reddit activity and add any new comments that aren't yet tracked.
 
-Skip rows with Status = closed or archived.
+### 1a. Fetch recent comment history
+
+```bash
+UA="humla-research/0.1 by u/tremendousquotes"
+curl -sL -A "$UA" "https://www.reddit.com/user/tremendousquotes/comments.json?limit=50" \
+  | python3 -m json.tool
+```
+
+For each comment in the response, extract:
+- `id` (Reddit base36 comment id)
+- `permalink` (path; prefix with https://reddit.com to get full URL)
+- `link_permalink` (URL of the parent thread)
+- `subreddit`
+- `body` (first 200 chars enough)
+- `created_utc`
+- `parent_id` (e.g., `t3_abc456` for top-level on post, `t1_xyz789` for reply to another comment)
+
+### 1b. Build the set of already-tracked comment URLs
+
+Read marketing/reddit/intel/tracker.md, parse the table rows, collect the My URL values into a set.
+
+### 1c. Classify each comment
+
+For each comment fetched in 1a, in time order (oldest first):
+
+- **Already tracked** — comment.permalink is in the tracked-URL set → skip.
+
+- **Follow-up to a tracked comment** — `parent_id` starts with `t1_`, and the parent comment's permalink is in the tracked-URL set. To construct the parent's permalink, take `link_permalink` and append the parent comment id (strip the `t1_` prefix from `parent_id`). If that URL matches a tracker row's My URL:
+  - Update that row's Status: anything → `engaged` (Michael posted his follow-up)
+  - Update Last check to today
+  - Do NOT add a new row
+  - Continue
+
+- **New entry** — neither of the above. Add a new tracker row with these field derivations:
+
+  - **Source + ID prefix**: search the union of these files for the comment's parent thread URL (`link_permalink`):
+    - Files modified in last 30 days under `marketing/reddit/karma/` → source=`karma-builder`, prefix=`K`
+    - `marketing/reddit/leads/*.md` (excluding `follow-ups-*.md`) — if the thread appears under `## Top intent: promo-allowed subs` → source=`lead-finder`, prefix=`L`, humla=`yes`; if under `## Engagement-only` → source=`lead-finder`, prefix=`E`, humla=`no`
+    - `marketing/reddit/drafts/*.md` → source=`drafts`, prefix=`D`
+    - `marketing/reddit/intel/historical-scan-*.md` → source=`historical-scan`, prefix=`H`
+    - `marketing/reddit/intel/recurring-asks.md` → source=`recurring-asks`, prefix=`R`
+    - **No match** in any file → source=`manual`, prefix=`M` (Michael commented on a thread the routines never surfaced)
+
+  - **Humla mention** (column `Humla?`): if `body.lower()` contains `humla` → `yes`, else `no`. (For prefix-`L` entries this should be yes by definition; double-check.)
+
+  - **ID number**: scan tracker.md for the highest existing number with this prefix, add 1. So if `K003` is the highest K, the new row is `K004`.
+
+  - **Status**: `waiting` (it's freshly posted)
+
+  - **Last check**: today's UTC date
+
+  - **Notes**: 1-line summary. Pull from the body's first sentence (truncate to ~100 chars), or from the surfaced entry's "What they're asking" field if you can find it. If no source matched (manual entry), use the body excerpt.
+
+### 1d. Write the rows
+
+Append all new rows to the tracker table at the bottom of marketing/reddit/intel/tracker.md. Preserve formatting (one row per line, pipe-delimited).
+
+If you updated existing rows in the follow-up case (1c, t1_ parent), edit those rows in place — change Status and Last check columns only.
+
+Log a one-line summary in the day's follow-up report:
+- "Auto-added N new tracker rows. Updated M existing rows (follow-ups posted)."
 
 ## Step 2 — Check each active row for new replies
+
+Re-read marketing/reddit/intel/tracker.md (it includes the new rows you just added). For each row where Status is in {waiting, replied, engaged}, check the thread for new activity. Skip rows with Status = closed or archived.
 
 For each active tracker row:
 
@@ -53,7 +115,7 @@ For each active tracker row:
 3. Find Michael's comment in the tree (match by URL or by author=tremendousquotes within the relevant branch).
 4. List all child comments of Michael's comment. For each child:
    - Has it been seen before? (Check Last check date in tracker — anything newer is a new reply.)
-   - Is the child by Michael himself? (Skip — that's his own follow-up.)
+   - Is the child by Michael himself? (Skip — that's his own follow-up; the auto-populate step in 1c already handled it.)
 
 For each row, produce:
 - "No new replies since last check" — update Last check to today, no other action

@@ -236,14 +236,9 @@ Output: Write the report to marketing/reddit/karma/YYYY-MM-DD.md (use today's UT
 **Your reply:**
 > [draft addressing ONLY the reply target above. 1–3 sentences. Opinion-framed. No AI-isms.]
 
-**Suggested tracker entry** (copy-paste into `intel/tracker.md` after you post):
-```
-| K[NNN] | YYYY-MM-DD | r/sub | [thread URL] | [your comment URL after posting] | karma-builder | no | waiting | YYYY-MM-DD | [1-line note: technical topic, no Humla mention] |
-```
-
-Prefix `K` for karma-builder entries. Increment from the highest existing `K###` in tracker.md. Date is today.
-
 (repeat per surfaced thread)
+
+> **Tracker is auto-populated.** When you actually post one of these comments on Reddit, the next reply-watcher run (10am daily) will detect it via your comment history and add the row to `intel/tracker.md` with prefix `K###`. No manual copy-paste required.
 
 ## Priority 2: r/ClaudeCode (easy wins)
 
