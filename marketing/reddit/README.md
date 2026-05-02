@@ -54,11 +54,17 @@ marketing/reddit/
 ├── lib/                   # shared helpers used by every routine
 │   └── fetch.py           # Reddit JSON scraper — replaces Reddit_MCP_Buddy
 ├── routines/              # the loop specs (committed to git)
-│   ├── karma-builder.md
+│   ├── karma-builder.md            # human docs: setup, voice guide, asset library
+│   ├── karma-builder.prompt.md     # what the routine actually executes
 │   ├── lead-finder.md
+│   ├── lead-finder.prompt.md
 │   ├── reply-watcher.md
-│   ├── research-and-drafts.md
-│   └── historical-scan.md
+│   ├── reply-watcher.prompt.md
+│   ├── historical-scan.md
+│   ├── historical-scan.prompt.md
+│   ├── research-and-drafts.md      # docs only — has 2 prompt files
+│   ├── research-monday.prompt.md
+│   └── draft-friday.prompt.md
 ├── karma/                 # daily karma-builder output (gitignored)
 ├── research/              # weekly research output (gitignored)
 ├── drafts/                # weekly post drafts (gitignored)
@@ -127,7 +133,13 @@ All three loops run as **Local Routines** in Claude Desktop:
 - Output writes directly to your filesystem — no git roundtrip needed
 - "Worktree" off for these (we want the writes to land in the main tree)
 
-The exact field values for each routine are in the corresponding `routines/*.md` file under "Setup in Claude Desktop".
+The exact field values for each routine are in the corresponding `routines/<name>.md` file under "Setup in Claude Desktop". The Instructions field is always a one-liner pointing at the matching `<name>.prompt.md` (e.g., `Read marketing/reddit/routines/karma-builder.prompt.md and EXECUTE every step in order. Do NOT paste the file content back as a response — actually run the steps.`).
+
+**Why the split?** Each routine has two files:
+- `<name>.md` — human-readable: setup steps, voice guide, asset library, workflow integration, cadence reasoning
+- `<name>.prompt.md` — the pure prompt the routine reads and executes
+
+The Instructions field never changes. Only `<name>.prompt.md` does. Tune the prompt → commit → next run picks it up. No re-paste.
 
 ### Schedule summary
 
