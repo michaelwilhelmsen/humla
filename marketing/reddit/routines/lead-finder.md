@@ -40,6 +40,16 @@ Use the `marketing/reddit/lib/fetch.py` helper for all Reddit calls. Run from th
 
 Output is JSON on stdout for everything except `tree --print`. Pipe to `jq` if you want to filter without parsing in Python. Cache lives at `~/.cache/humla-reddit/` with a 10-min TTL — pass `--no-cache` to bypass when you're verifying something that just changed.
 
+### Pre-flight check
+
+Before any real work, confirm the helper is available and Reddit is reachable:
+
+```bash
+test -f marketing/reddit/lib/fetch.py && python3 marketing/reddit/lib/fetch.py browse AiNoteTaker --sort new --limit 1 > /dev/null && echo OK || echo FETCH_FAIL
+```
+
+If you see `FETCH_FAIL`, abort the routine with a one-line report explaining which precondition failed (file missing, Reddit returning 429, network down). Don't run a full scan against a broken helper.
+
 ## Search strategy
 
 Two lessons from real runs:
@@ -204,11 +214,14 @@ Score intent (0–10):
 - +3 if asking a direct question ("does anyone know X?", "looking for Y")
 - +2 if naming a specific competitor as a frustration ("Granola is too expensive", "Otter sends my data to OpenAI")
 - +2 if mentioning macOS specifically
+- +2 if the thread matches a cluster in `marketing/reddit/intel/recurring-asks.md` (read it at the start of the run; do simple keyword overlap between the thread title/body and each cluster's "Example phrasings" + "Common pain point" — overlap with any cluster = +2)
 - +1 if mentioning "local" / "privacy" / "offline" / "own data"
-- +1 if mentioning a use case Humla nails (1:1s, consulting calls, recurring meetings)
+- +1 if mentioning a use case Humla nails (1:1s, consulting calls, recurring meetings, in-person)
 - +1 if posted by an account with reasonable history (not <7 days old)
 
 Only surface threads scoring ≥ 5.
+
+**Thin-day fallback**: if after applying all filters fewer than 2 leads emerge with score ≥ 5, lower the threshold to ≥ 3 for the rest of this run. Note in the audit trail which threads were surfaced under the lowered threshold so Michael can calibrate. Do not lower below 3.
 
 For each surfaced thread:
 - Verify which sub it's in
@@ -338,8 +351,42 @@ Output: Write the report to marketing/reddit/leads/YYYY-MM-DD.md (today's UTC da
 - Surfaced (promo-allowed): X
 - Surfaced (engagement-only): Y
 - Skipped: Z
+- Thin-day fallback used: yes/no (and threshold dropped to)
 
 End report. Do NOT post comments.
+
+---
+
+### Empty-day report (write this format if 0 leads surfaced)
+
+If after all filters and the thin-day fallback there are still 0 leads to surface, write the report in this format. Do NOT just write a blank file or skip writing — the empty-day audit trail is what tells Michael whether the routine ran cleanly or silently failed.
+
+# Leads — YYYY-MM-DD
+
+## Empty day
+
+No high-intent threads surfaced today. This is normal — the niche genuinely doesn't generate buying-intent threads at a constant rate.
+
+## What was checked
+
+- Subs scanned: [list, with subscriber counts and "Status: ..." from subreddits.md]
+- Total candidates returned by per-sub searches: N
+- Total candidates after intent filter: M
+- Total candidates after de-dup against last 7 days + _seen-permalinks.txt: K
+- Total candidates after Type A/B classification: J
+- Threshold used: 5 (default) or 3 (thin-day fallback)
+
+## Closest near-misses (for tuning)
+
+If any candidate scored 3–4 (below the threshold but worth noting), list the top 3 here with a one-line "almost" reason. This helps Michael spot patterns where the intent filter is too narrow.
+
+- [thread] [sub] — score X/10 — almost: [1 sentence]
+
+## Cluster cross-check
+
+Did any threads from today partially match a recurring-asks cluster but fail other criteria? If yes, list which cluster + why it didn't make it. This helps identify whether the issue is the cluster definition or the intent markers.
+
+End empty-day report.
 ```
 
 ## Open Recorder integration

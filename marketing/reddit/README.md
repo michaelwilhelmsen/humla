@@ -114,7 +114,7 @@ The exact field values for each routine are in the corresponding `routines/*.md`
 
 | Routine | When | UI schedule |
 |---|---|---|
-| `humla-historical-scan` | one-shot bootstrap, then quarterly | Manual |
+| `humla-historical-scan` | quarterly (effective) | Weekly + 85-day skip-guard in prompt |
 | `humla-karma-builder` | daily 9am | Daily at 09:00 |
 | `humla-lead-finder` | daily 12pm | Daily at 12:00 |
 | `humla-research-monday` | Mondays 9am | Weekly → Monday 09:00 |
@@ -156,17 +156,17 @@ Save to `marketing/reddit/intel/assets/` (gitignored). Lead-finder and drafts ro
 
 When drafting a reply or post, lead with the pain point that matches the audience. The mapping below is sourced from the Bucket B clusters in `intel/recurring-asks.md` (refreshed every quarterly historical-scan).
 
-| Pain point recurring on Reddit | Humla's response |
-|---|---|
-| "Subscription too expensive / hit team-plan paywall" (Notion AI, Granola, Otter) | BYO API key. You only pay for the tokens you use. No Humla subscription. |
-| "Can't justify $X/month for the AI features" | Free download, transcript stays on your machine. Cloud transcription optional. |
-| "Otter / Fathom / Fireflies bot showed up uninvited" | No bot. System-audio capture means Humla never has to join the meeting. |
-| "FOSS Granola alternative?" | Source-available on GitHub, local SQLite, plain markdown export. |
-| "Wall of text / can't tell who said what" | Offline diarization on stop. Speaker labels in colored pills. |
-| "Where does my meeting data go?" | Local SQLite. Optional cloud transcription via your own key. Airplane mode supported end-to-end. |
-| "I want this on-device" / "Apple Silicon" | whisper-rs with Metal acceleration; FluidAudio CoreML for diarization. |
-| "Recording in-person meetings" / "around the table" | Mic-only mode auto-detects and diarizes the room. Same pipeline, different branch. |
-| "EU data residency" / "AI Act voice rules" | Built in Norway. Local by default. No US-server dependency unless you opt in via your own OpenAI key. |
+| Pain point recurring on Reddit | Humla's response | Asset clip (Open Recorder) |
+|---|---|---|
+| "Subscription too expensive / hit team-plan paywall" (Notion AI, Granola, Otter) | BYO API key. You only pay for the tokens you use. No Humla subscription. | `humla-byo-key.gif` |
+| "Can't justify $X/month for the AI features" | Free download, transcript stays on your machine. Cloud transcription optional. | `humla-byo-key.gif` |
+| "Otter / Fathom / Fireflies bot showed up uninvited" | No bot. System-audio capture means Humla never has to join the meeting. | `humla-no-bot.gif` |
+| "FOSS Granola alternative?" | Source-available on GitHub, local SQLite, plain markdown export. | `humla-tauri-tray.gif` (general native demo) |
+| "Wall of text / can't tell who said what" | Offline diarization on stop. Speaker labels in colored pills. | `humla-offline-diarize.gif` |
+| "Where does my meeting data go?" | Local SQLite. Optional cloud transcription via your own key. Airplane mode supported end-to-end. | `humla-offline-diarize.gif` (shows airplane mode) |
+| "I want this on-device" / "Apple Silicon" | whisper-rs with Metal acceleration; FluidAudio CoreML for diarization. | `humla-offline-diarize.gif` |
+| "Recording in-person meetings" / "around the table" | Mic-only mode auto-detects and diarizes the room. Same pipeline, different branch. | `humla-mic-sys-parallel.gif` (or in-person variant) |
+| "EU data residency" / "AI Act voice rules" | Built in Norway. Local by default. No US-server dependency unless you opt in via your own OpenAI key. | `humla-offline-diarize.gif` (airplane mode visible) |
 
 Update this table when historical-scan finds new clusters worth addressing.
 

@@ -2,6 +2,8 @@
 
 **Purpose:** Surface 3–5 threads where Michael (`u/tremendousquotes`) can comment with technical substance and earn local karma. **No Humla promo.** Pure helpfulness.
 
+**Scope vs lead-finder:** Karma-builder is intentionally Type A only — it surfaces single-answer technical questions where Michael adds *unique* value. If the question already has a good answer, drop. Recommendation threads ("what tool should I use?") are lead-finder's territory, not karma-builder's. Keep this routine narrow.
+
 **Cadence:** Daily, 9am Europe/Oslo.
 
 **Execution:** Claude Desktop **Local** Routine. Folder: humla project. Uses the local `marketing/reddit/lib/fetch.py` helper for all Reddit calls (Reddit's policy change made the MCP's auth path unusable; we hit reddit.com's `.json` endpoints directly with a UA string + on-disk cache).
