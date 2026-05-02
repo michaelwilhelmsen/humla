@@ -72,8 +72,10 @@ If after per-sub searches you have zero candidates, do a small set of Reddit-wid
 ### Time window
 
 - API search uses `time=week` (7 days)
-- Post-filter to threads created within the last **72h**
-- De-dup against the leads files from the prior 3 days (today-1, today-2, today-3 in `marketing/reddit/leads/`)
+- Post-filter to threads created within the last **7 days** (use the full week — Humla's niche is thin, narrower windows produce empty days)
+- De-dup is what prevents re-surfacing: read the last 7 days of leads files in `marketing/reddit/leads/` AND `marketing/reddit/intel/_seen-permalinks.txt`, drop any candidate whose permalink appears in either source. Append today's surfaced permalinks to `_seen-permalinks.txt` so they don't re-surface tomorrow.
+
+Net effect: each thread has roughly one chance to surface, on its first day inside the 7-day window. After that it's de-duped out unless something changes (e.g., Michael deletes the leads file or removes the entry from _seen-permalinks.txt to deliberately re-surface).
 
 ### Intent post-filter (apply to every candidate)
 
@@ -120,8 +122,8 @@ Filter:
 - Drop posts in r/selfhosted unless the asker explicitly wants a self-hosted server (Humla is local-desktop, not server)
 
 De-dup against recent days + bootstrap list:
-- List the last 3 days of files in `marketing/reddit/leads/` (today minus 1, 2, 3).
-- Also read `marketing/reddit/intel/_seen-permalinks.txt` if it exists (populated by the historical-scan routine).
+- List the last 7 days of files in `marketing/reddit/leads/` (today minus 1 through today minus 7).
+- Also read `marketing/reddit/intel/_seen-permalinks.txt` if it exists (populated by the historical-scan routine, then maintained daily by this routine).
 - For each candidate post, check if its permalink appears in any of those sources. If yes, drop — already seen.
 - Append today's surfaced permalinks to `_seen-permalinks.txt` (deduplicated) so future runs don't re-surface them either.
 
@@ -130,32 +132,73 @@ Empty days are good days:
 - If after filtering there are 0 promo-allowed leads, the report should say so honestly. Do NOT pad with low-intent threads (intent score < 5) just to have something to surface.
 - An empty leads file with a clear audit trail is more useful than a noisy one — it preserves Michael's commenting time for actually-good threads.
 
-Find an unanswered reply target (most important filter):
+## Classify the thread before deciding if it's still open
 
-**Walk the full comment tree before declaring a thread unanswered.** Use the helper:
+This is the most important filter, and it differs from the karma-builder's "answered = stop" rule. Lead-finder is about *recommendations*, not unique answers.
+
+**Walk the full comment tree first** using the helper:
 
 ```bash
 python3 marketing/reddit/lib/fetch.py tree <SUB> <POST_ID> --print
 ```
 
-This prints the full nested tree as `<indent>- [comment_id] u/author [score↑]: body` lines. For programmatic checks (e.g., "does this comment have any children?"), drop `--print` to get a JSON list of `{id, author, score, body, depth, parent_id, num_replies}`.
+This prints the full nested tree as `<indent>- [comment_id] u/author [score↑]: body` lines. For programmatic checks, drop `--print` to get JSON.
 
-Use this output as ground truth.
+### Type A — Single-answer question
 
-- Walk the full comment tree from the helper, not just the post listing.
-- If OP's question is already answered well by a recommended tool that fits their requirements (and Humla doesn't add a clearly different angle), drop the thread.
-- For any candidate reply target, walk its children before declaring it unanswered:
-  - If ANY child substantively answers the question (even imperfectly), the target is answered.
-  - If the asker said "thanks", "saved the post", or otherwise acknowledged an answer, the conversation is closed.
-- Prefer threads where OP hasn't gotten a great answer yet, OR where existing recommendations miss what Humla specifically does (e.g., everyone's recommending bot-based tools when OP wanted no bots).
-- If a sub-comment expresses unmet frustration about an existing recommendation ("I tried that, doesn't work for X"), that's the reply target — provided the frustration itself hasn't been addressed.
+The asker has a specific problem with a correct/incorrect answer:
+- "How do I capture system audio on Mac?" → there's a right answer (ScreenCaptureKit + AVAudioEngine setup)
+- "Is using DMGKit safe with my Apple Developer account?" → yes/no with specifics
+- "Why is my whisper.cpp slower on M1 vs M2?" → factual answer
 
-Verification before surfacing: cite the reply target's comment ID from the helper's tree output, then say one of:
-- "Comment ID X has 0 children in the raw JSON"
-- "Comment ID X's children are: [list child IDs + quotes]. None substantively answer."
-- "Comment ID X has answer Y but it misses [specific Humla differentiator]"
+**Rule for Type A: if the question is well-answered (a comment with >5 score that addresses the question, or OP marked it solved, or OP said "thanks"), drop the thread. The question is closed; another comment is noise.**
 
-If you can't point to a specific comment ID and quote the tree, drop the thread.
+### Type B — Recommendation request (this is where Humla lives)
+
+The asker wants a *tool* or *option*, and the thread is inherently multi-answer:
+- "What's the best meeting notes app for Mac?"
+- "Any FOSS alternatives to Granola?"
+- "Looking for a meeting recorder that doesn't need a bot"
+- "What do you use for transcribing in-person meetings?"
+
+These threads stay valid for as long as they're visible. Adding a recommendation that wasn't yet named — *especially one with a different angle* — is genuinely valuable to the asker and to anyone Googling the same question later.
+
+**Rule for Type B: do NOT drop just because answers exist.** Instead, check whether the existing recommendations cover Humla's specific angle:
+
+- If existing answers are all cloud-based and asker wanted local-first → Humla is a different angle. Surface.
+- If existing answers all need a meeting bot and asker wanted no bot → Humla is a different angle. Surface.
+- If existing answers are all paid SaaS and asker mentioned price concerns → Humla's BYO-key model is a different angle. Surface.
+- If Humla has already been named in the existing answers → drop. Don't dogpile.
+- If 3+ tools matching Humla's angle have already been recommended (e.g., another local-first Mac app + another BYO-key option + another no-bot tool) → drop. The angle is well-covered.
+
+### Acknowledgment is also nuanced
+
+For Type A, "thanks" closes the thread.
+
+For Type B, "thanks" to one specific tool (e.g., "Thanks, I'll try Otter") closes that branch but doesn't close the thread — other readers will still see Humla in the comments. If OP explicitly says "I picked X, thread closed" or similar, drop. Otherwise treat the thread as still open for new options.
+
+### How to classify
+
+Read OP's title and body. Strong signals:
+
+- **Type A**: question word + specific technical setup ("how do I", "why does", "what's wrong with"), single-answer phrasing
+- **Type B**: "what do you use", "any alternatives", "looking for a tool", "best X for Y", "recommendations for", listing of requirements, mentioning specific competitors as a starting point
+
+If ambiguous, default to Type B — Humla's niche is mostly recommendation threads.
+
+### Verification before surfacing
+
+Cite the reply target's comment ID from the helper's tree output. Then say one of:
+
+**For Type A:**
+- "Type A: comment ID X has 0 substantive children — question genuinely unanswered"
+- "Type A: comment ID X has answer Y but it's wrong because [specific]"
+
+**For Type B:**
+- "Type B recommendation thread. Existing recommendations: [list product names from comments]. None cover Humla's [specific differentiator] angle."
+- "Type B recommendation thread. Existing recommendation in comment Z covers cloud option; OP mentioned wanting local-first, which Humla addresses."
+
+If you can't point to specific comment IDs and quote either evidence of unansweredness (Type A) or evidence of an uncovered angle (Type B), drop the thread.
 
 Score intent (0–10):
 - +3 if asking a direct question ("does anyone know X?", "looking for Y")
@@ -178,7 +221,9 @@ Michael's writing voice on Reddit:
 
 - **Length: 1–3 sentences.** Usually 2, often 1. No essays.
 - **One reply target only.** Answer the OP's question OR one specific commenter's question — never synthesize across multiple commenters. That's an AI tell. Pick the one thing you'd say if you were skimming the thread.
-- **Only reply where there's actual value.** If the asker's need is already met by an existing recommendation, skip. Showing up to add a 4th tool to a list of 3 already-recommended tools is noise. Reply only when Humla addresses something the existing answers miss (e.g., "everyone said Otter, but you wanted no bots — Humla doesn't need one because it captures system audio directly").
+- **Only reply where there's actual value.** Two cases to handle differently:
+  - *Single-answer threads (Type A):* if the question is already well-answered, skip. Showing up to repeat the same answer is noise.
+  - *Recommendation threads (Type B):* answers existing in the thread don't close the thread — these are inherently multi-answer. Add Humla *only* if it represents a meaningfully different angle from what's already named (different cost model, different data-residency story, no-bot vs bot, etc.). If Humla is just another name in the same category, skip. If 3+ tools matching Humla's angle have already been listed, skip.
 - **Open with action or soft opinion**, not preamble: "Skip making it...", "I definitely think...", "We've slowly started..."
 - **Frame as opinion, not declaration.** Use: "I've found...", "Worked for me to...", "I'd lean toward...", "My take is...", "Honestly, I'd just...", "From what I've seen...", "Probably..."
 - **Lower confidence by default.** Hedge liberally. Readers trust hedged claims more than confident ones.
@@ -259,7 +304,10 @@ Output: Write the report to marketing/reddit/leads/YYYY-MM-DD.md (today's UTC da
 - **What they're asking:** [1 sentence]
 - **Humla fit:** [which differentiator addresses their question]
 - **Reply to:** [either "OP" + 1-line quote, or "u/username" + 1-line quote of their comment]
-- **Why unanswered:** [evidence-based. Either "Target has 0 children" / "Children are non-substantive: [quote]" / "Existing answer misses [specific Humla differentiator]". Quote actual child comments. If you can't, drop the thread.]
+- **Thread type & why valid:** Either:
+  - "Type A — question genuinely unanswered. [Quote evidence from tree: comment IDs + child counts]"
+  - "Type B — recommendation thread. Existing options: [list]. Humla's angle ([differentiator]) not yet covered." Quote the existing recommendations from the tree.
+  Drop the thread if neither form applies.
 - **Asset opportunity:** [Open Recorder clip suggestion if applicable]
 - **DON'T:** [things to avoid]
 
