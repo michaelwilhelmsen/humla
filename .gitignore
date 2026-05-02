@@ -35,3 +35,6 @@ src-tauri/icons/.app-icon-staged.png
 .env.local
 .env.*.local
 .env.notarise
+
+# Marketing drafts and routines (kept local; not under MIT license)
+marketing/
