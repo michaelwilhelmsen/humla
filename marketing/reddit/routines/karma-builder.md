@@ -236,6 +236,13 @@ Output: Write the report to marketing/reddit/karma/YYYY-MM-DD.md (use today's UT
 **Your reply:**
 > [draft addressing ONLY the reply target above. 1–3 sentences. Opinion-framed. No AI-isms.]
 
+**Suggested tracker entry** (copy-paste into `intel/tracker.md` after you post):
+```
+| K[NNN] | YYYY-MM-DD | r/sub | [thread URL] | [your comment URL after posting] | karma-builder | no | waiting | YYYY-MM-DD | [1-line note: technical topic, no Humla mention] |
+```
+
+Prefix `K` for karma-builder entries. Increment from the highest existing `K###` in tracker.md. Date is today.
+
 (repeat per surfaced thread)
 
 ## Priority 2: r/ClaudeCode (easy wins)

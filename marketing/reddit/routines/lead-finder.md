@@ -327,6 +327,13 @@ Output: Write the report to marketing/reddit/leads/YYYY-MM-DD.md (today's UTC da
 **Your reply:**
 > [draft addressing ONLY the reply target above. Lead with their problem, not the product. One Humla mention with disclosure. 1–3 sentences. No link in the first comment unless they explicitly asked for tool names.]
 
+**Suggested tracker entry** (copy-paste into `intel/tracker.md` after you post):
+```
+| L[NNN] | YYYY-MM-DD | r/sub | [thread URL] | [your comment URL after posting] | lead-finder | yes | waiting | YYYY-MM-DD | [1-line note: pain point + angle used] |
+```
+
+Use prefix `L` for lead-finder entries and increment the number from the highest existing `L###` in tracker.md. Date is today.
+
 (repeat)
 
 ## Engagement-only (no Humla mention)
@@ -339,6 +346,13 @@ Output: Write the report to marketing/reddit/leads/YYYY-MM-DD.md (today's UTC da
 
 **Your reply:**
 > [draft addressing only the reply target. No Humla mention. 1–3 sentences.]
+
+**Suggested tracker entry**:
+```
+| E[NNN] | YYYY-MM-DD | r/sub | [thread URL] | [your comment URL after posting] | lead-finder | no | waiting | YYYY-MM-DD | [1-line note: engagement-only sub, what you commented on] |
+```
+
+Prefix `E` for engagement-only entries.
 
 (repeat)
 

@@ -1,10 +1,11 @@
 # Humla — Reddit Marketing System
 
-A multi-layered set of routines for marketing Humla on Reddit. Built around three loops:
+A multi-layered set of routines for marketing Humla on Reddit. Built around four loops:
 
 1. **Karma loop** — daily, build authentic standing in target subs
 2. **Research + drafting loop** — weekly, monitor competition + produce launch-quality posts
 3. **Lead loop** — daily, surface high-intent threads where Humla genuinely solves the asker's problem
+4. **Reply loop** — daily, watch for new replies on Michael's tracked comments and draft follow-ups
 
 Each loop is a markdown spec in `routines/`. Each is wired up as a **Local Routine** in Claude Desktop (Routines → New routine → Local), pointing at this folder so the local Reddit MCP and project context are available.
 
@@ -52,9 +53,10 @@ marketing/reddit/
 ├── subreddits.md          # central registry — single source of truth for sub list
 ├── lib/                   # shared helpers used by every routine
 │   └── fetch.py           # Reddit JSON scraper — replaces Reddit_MCP_Buddy
-├── routines/              # the four loop specs (committed to git)
+├── routines/              # the loop specs (committed to git)
 │   ├── karma-builder.md
 │   ├── lead-finder.md
+│   ├── reply-watcher.md
 │   ├── research-and-drafts.md
 │   └── historical-scan.md
 ├── karma/                 # daily karma-builder output (gitignored)
@@ -86,6 +88,21 @@ Practical Reddit unauth limit is ~60 req/min per IP. The cache + sequential call
 
 `marketing/.gitignore` keeps the dynamic outputs local. The specs are versioned so you can tune them and see what changed.
 
+## Tracker + reply-watcher (the feedback loop)
+
+`marketing/reddit/intel/tracker.md` is the single record of everything Michael has posted/commented on Reddit through these routines. Karma-builder and lead-finder both generate "Suggested tracker entry" rows in their daily output — Michael copies them into `tracker.md` after he posts.
+
+The reply-watcher routine (daily, 10am) reads tracker.md, walks each active row's thread for new child comments under Michael's reply, and drafts follow-ups for any new replies. Output goes to `leads/follow-ups-YYYY-MM-DD.md`.
+
+**Status flow:**
+- `waiting` → posted, no replies yet
+- `replied` → someone replied; reply-watcher surfaced a follow-up draft for review
+- `engaged` → Michael posted his follow-up; watching for more
+- `closed` → conversation ended (asker thanked, picked another tool)
+- `archived` → 14 days inactive; auto-set by reply-watcher
+
+The tracker is gitignored (it contains live activity records); the reply-watcher routine spec in `routines/reply-watcher.md` is committed.
+
 ## Single source of truth: subreddits.md
 
 `marketing/reddit/subreddits.md` is the registry every routine reads. It defines:
@@ -116,9 +133,16 @@ The exact field values for each routine are in the corresponding `routines/*.md`
 |---|---|---|
 | `humla-historical-scan` | quarterly (effective) | Weekly + 85-day skip-guard in prompt |
 | `humla-karma-builder` | daily 9am | Daily at 09:00 |
+| `humla-reply-watcher` | daily 10am | Daily at 10:00 |
 | `humla-lead-finder` | daily 12pm | Daily at 12:00 |
 | `humla-research-monday` | Mondays 9am | Weekly → Monday 09:00 |
 | `humla-draft-friday` | Fridays 2pm | Weekly → Friday 14:00 |
+
+**Daily flow (intentional ordering):**
+- 09:00 → karma-builder writes today's karma targets
+- 10:00 → reply-watcher checks tracker.md for new replies on yesterday's posts
+- 11:00 → Michael reviews both, posts comments, copies suggested tracker entries
+- 12:00 → lead-finder writes today's leads, fresh queue for the afternoon
 
 Run `humla-historical-scan` first (manually) before enabling the daily routines — it populates `intel/_seen-permalinks.txt` for de-dup and gives the drafts routine pattern intel to work from.
 
