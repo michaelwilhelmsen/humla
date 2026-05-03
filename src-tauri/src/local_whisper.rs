@@ -187,11 +187,37 @@ impl Preset {
     }
 }
 
+/// No-op log callback — installed once on first model load to silence
+/// whisper.cpp's stderr output. The Metal-shader compile path can dump
+/// 50+ lines of `error: use of undeclared identifier 'block_q5_1'` per
+/// chunk on machines where the bundled GGML's Metal shaders fail to
+/// compile against the system Metal version (whisper-rs 0.13 ships an
+/// older GGML that doesn't always cleanly match newer macOS Metal
+/// headers). Whisper.cpp falls back to BLAS automatically — slower but
+/// functional — but the spam is what showed up in the user log.
+unsafe extern "C" fn silent_whisper_log(
+    _level: whisper_rs::whisper_rs_sys::ggml_log_level,
+    _text: *const std::os::raw::c_char,
+    _user_data: *mut std::os::raw::c_void,
+) {
+}
+
+static SILENCE_WHISPER_LOG: std::sync::Once = std::sync::Once::new();
+
+fn install_silent_whisper_log() {
+    SILENCE_WHISPER_LOG.call_once(|| {
+        unsafe {
+            whisper_rs::set_log_callback(Some(silent_whisper_log), std::ptr::null_mut());
+        }
+    });
+}
+
 fn ensure_loaded(
     shared: &SharedContext,
     model_path: &Path,
     use_gpu: bool,
 ) -> Result<Arc<WhisperContext>> {
+    install_silent_whisper_log();
     let mut guard = shared.lock();
     if let Some(loaded) = guard.as_ref() {
         if loaded.path == model_path && loaded.use_gpu == use_gpu {
