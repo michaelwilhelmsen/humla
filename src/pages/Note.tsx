@@ -1141,7 +1141,11 @@ function TranscriptPlayer({
     if (activeIdx < 0 || !containerRef.current) return;
     const el = containerRef.current.querySelector(`[data-idx="${activeIdx}"]`);
     if (el && "scrollIntoView" in el) {
-      (el as HTMLElement).scrollIntoView({ block: "nearest", behavior: "smooth" });
+      // Instant scroll, not smooth: rapid clicks across distant rows
+      // would otherwise pile up smooth-scroll animations that the
+      // compositor tries to interpolate concurrently — measurable
+      // jank, and on long recordings can compound.
+      (el as HTMLElement).scrollIntoView({ block: "nearest" });
     }
   }, [activeIdx]);
 
@@ -1248,7 +1252,12 @@ function TranscriptPlayer({
           ref={audioRef}
           src={playbackUrl}
           controls
-          preload="metadata"
+          // preload="auto" so the whole WAV streams in up-front and
+          // every subsequent seek is in-memory. With "metadata" each
+          // user click triggered a range-request through Tauri's
+          // asset protocol; rapid clicking flooded I/O and on at
+          // least one user's machine made the whole system lag.
+          preload="auto"
           className="flex-1 h-8"
         />
         {!showEditor && !disabled && (
