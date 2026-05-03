@@ -1,6 +1,7 @@
 import { Outlet, useLocation } from "react-router-dom";
 import { useEffect, useState } from "react";
 import { Sidebar } from "./Sidebar";
+import { SidebarCollapsed } from "./SidebarCollapsed";
 import { Toaster } from "./Toaster";
 import { Updater } from "./Updater";
 import { PolishToast } from "./PolishToast";
@@ -57,30 +58,31 @@ export function Layout() {
     <div className="flex h-full">
       <aside
         className={cn(
-          "shrink-0 border-r border-[var(--color-line)] transition-[width] duration-200 overflow-hidden",
-          collapsed ? "w-0" : "w-64"
+          "shrink-0 border-r border-[var(--color-line)] transition-[width] duration-200 overflow-hidden relative",
+          collapsed ? "w-12" : "w-64",
         )}
       >
-        <Sidebar onCollapse={() => setManualCollapsed(true)} />
+        {/* Tauri drag strip aligned with the traffic-light row. Lives
+            inside the sidebar so neither layout state has to leave a
+            gap above the content. */}
+        <div
+          data-tauri-drag-region
+          className="absolute top-0 left-0 right-0 h-9 z-10"
+        />
+        {collapsed ? (
+          <SidebarCollapsed onExpand={() => setManualCollapsed(false)} />
+        ) : (
+          <Sidebar onCollapse={() => setManualCollapsed(true)} />
+        )}
       </aside>
       <main className="flex-1 min-w-0 relative">
-        {/* Window drag strip — Tauri 2's native attribute, not the CSS region.
-            Always present at the top of the main area so the window can be
-            grabbed from any route, and tall enough to clear the traffic-light
-            hot zone. */}
+        {/* Drag strip on the main column too, so users can grab the
+            window from anywhere along the title-bar zone, not just the
+            sidebar. */}
         <div
           data-tauri-drag-region
           className="absolute top-0 left-0 right-0 h-9 z-20"
         />
-        {collapsed && (
-          <button
-            onClick={() => setManualCollapsed(false)}
-            className="no-drag absolute top-3 left-3 z-30 px-2 py-1 rounded-md hover:bg-[var(--color-pill-hover)] text-[var(--color-text-muted)]"
-            aria-label="Open sidebar"
-          >
-            ☰
-          </button>
-        )}
         <ErrorBoundary key={location.pathname}>
           <Outlet />
         </ErrorBoundary>
