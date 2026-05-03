@@ -168,6 +168,7 @@ export function Sidebar({ onCollapse }: { onCollapse: () => void }) {
       <div data-tauri-drag-region className="h-8 flex items-center justify-end">
         <button
           onClick={onCollapse}
+          data-tauri-drag-region="false"
           className="no-drag p-1.5 rounded-md hover:bg-[var(--color-pill-hover)] text-[var(--color-text-muted)] hover:text-[var(--color-text)]"
           aria-label="Collapse sidebar"
           title="⌘\"
