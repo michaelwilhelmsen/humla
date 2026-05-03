@@ -18,6 +18,7 @@ import { SkeletonLines } from "../components/Skeleton";
 import { NoteEditor } from "../components/Editor";
 import { SUMMARY_PRESETS, presetLabel } from "../lib/presets";
 import { LANGUAGES, languageOptionLabel } from "../lib/languages";
+import { useDeveloperMode } from "../lib/useDeveloperMode";
 
 function formatDateChip(ts: number) {
   const d = new Date(ts);
@@ -43,6 +44,7 @@ export function Note() {
   const [contentStream, setContentStream] = useState<string>("");
   const [thinkingExpanded, setThinkingExpanded] = useState<boolean>(true);
   const saveTimer = useRef<number | null>(null);
+  const devMode = useDeveloperMode();
 
   useEffect(() => {
     let cancelled = false;
@@ -417,7 +419,7 @@ export function Note() {
                     patch("transcript", renameSpeakerInTranscript(draft.transcript, oldLabel, newLabel))
                   }
                 />
-                <DiagnosticsLinks noteId={draft.id} />
+                {devMode && <DiagnosticsLinks noteId={draft.id} />}
                 <TranscriptEditor
                   value={draft.transcript}
                   onChange={(v) => patch("transcript", v)}

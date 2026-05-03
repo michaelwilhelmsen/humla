@@ -2,6 +2,7 @@ import { DiarizeModelManager } from "../components/DiarizeModelManager";
 import { LocalModelManager } from "../components/LocalModelManager";
 import { Row, Section } from "../components/Section";
 import { Select } from "../components/Select";
+import { useDeveloperMode } from "../../../lib/useDeveloperMode";
 import {
   LOCAL_PROVIDER,
   PROVIDERS_BASE,
@@ -39,6 +40,7 @@ export function TranscriptionTab({
   | "deleteSortformer"
 >) {
   const provider: Provider = (s.transcribe_provider as Provider) ?? "openai";
+  const devMode = useDeveloperMode();
 
   return (
     <>
@@ -201,7 +203,7 @@ export function TranscriptionTab({
             speakers.
           </p>
         </Row>
-        <Row label="Advanced thresholds">
+        {devMode && <Row label="Advanced thresholds">
           <details className="text-sm">
             <summary className="cursor-pointer text-[var(--color-text-muted)]">
               Tune detection thresholds
@@ -265,7 +267,7 @@ export function TranscriptionTab({
             JSON is dumped per run — open the Note's diagnostics folder
             from its header to inspect where shifts landed.
           </p>
-        </Row>
+        </Row>}
       </Section>
 
       <Section title="Audio retention">

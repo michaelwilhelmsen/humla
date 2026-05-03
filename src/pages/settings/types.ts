@@ -34,6 +34,7 @@ export const DEFAULTS: Record<EditableKey, string> = {
   local_llm_base_url: "http://localhost:11434/v1",
   local_llm_model: "",
   local_llm_think: "false",
+  developer_mode: "false",
 };
 
 export const PROVIDERS_BASE = [{ value: "openai", label: "OpenAI" }];
