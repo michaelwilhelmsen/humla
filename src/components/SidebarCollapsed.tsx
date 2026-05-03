@@ -25,7 +25,7 @@ export function SidebarCollapsed({ onExpand }: { onExpand: () => void }) {
   const onHome = location.pathname === "/";
 
   return (
-    <div className="flex flex-col items-center gap-1 pt-12 pb-3 h-full">
+    <div className="flex flex-col items-center gap-1 pt-14 pb-3 h-full relative z-20">
       <IconBtn label="Open sidebar" onClick={onExpand}>
         <Menu size={18} />
       </IconBtn>
@@ -59,6 +59,7 @@ function IconBtn({
       aria-label={label}
       title={label}
       onClick={onClick}
+      data-tauri-drag-region="false"
       className="no-drag w-9 h-9 flex items-center justify-center rounded-md text-[var(--color-text-muted)] hover:bg-[var(--color-pill-hover)] hover:text-[var(--color-text)]"
     >
       {children}
@@ -82,6 +83,7 @@ function IconLink({
       to={to}
       aria-label={label}
       title={label}
+      data-tauri-drag-region="false"
       className={cn(
         "no-drag w-9 h-9 flex items-center justify-center rounded-md hover:bg-[var(--color-pill-hover)]",
         active
