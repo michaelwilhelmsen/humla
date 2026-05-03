@@ -11,7 +11,6 @@ import {
   Languages,
   Users,
 } from "lucide-react";
-import { open as openExternal } from "@tauri-apps/plugin-shell";
 import { ipc, onSummaryThinkingDelta, onSummaryContentDelta, type Note as TNote, type SummaryPrompt } from "../lib/ipc";
 import { useNotesStore, useRecordingStore } from "../lib/store";
 import { RecordingBar } from "../components/RecordingBar";
@@ -1027,6 +1026,8 @@ function escapeHtml(s: string): string {
 function DiagnosticsLinks({ noteId }: { noteId: string }) {
   const [diagFiles, setDiagFiles] = useState<string[]>([]);
   const [audioFiles, setAudioFiles] = useState<string[]>([]);
+  const [rediarizing, setRediarizing] = useState(false);
+  const [rediarizeError, setRediarizeError] = useState<string | null>(null);
   const phase = useRecordingStore((s) => s.status.phase);
 
   useEffect(() => {
@@ -1048,38 +1049,75 @@ function DiagnosticsLinks({ noteId }: { noteId: string }) {
 
   const hasDiag = diagFiles.length > 0;
   const hasAudio = audioFiles.length > 0;
+  // Re-diarize is only meaningful when both saved audio AND original
+  // chunk timings exist. Hide it otherwise — the backend would reject
+  // with an explanation, but pre-emptively gating keeps the affordance
+  // honest.
+  const canRediarize = hasAudio && hasDiag;
   if (!hasDiag && !hasAudio) return null;
 
   async function openDiag() {
     const dir = await ipc.noteDiagnosticsDir(noteId);
-    await openExternal(dir);
+    await ipc.openInFinder(dir);
   }
   async function openAudio() {
     const dir = await ipc.noteAudioDir(noteId);
-    await openExternal(dir);
+    await ipc.openInFinder(dir);
+  }
+  async function rediarize() {
+    setRediarizing(true);
+    setRediarizeError(null);
+    try {
+      await ipc.rediarizeNote(noteId);
+      // Refresh file lists — a new diagnostic JSON gets written.
+      const next = await ipc.noteDiagnosticsFiles(noteId).catch(() => diagFiles);
+      setDiagFiles(next);
+    } catch (e) {
+      setRediarizeError(String(e));
+    } finally {
+      setRediarizing(false);
+    }
   }
 
   return (
-    <div className="flex items-center gap-3 text-xs text-[var(--color-text-muted)] mb-3">
-      {hasDiag && (
-        <button
-          type="button"
-          onClick={openDiag}
-          className="underline hover:text-[var(--color-text)]"
-          title="Open diagnostics folder in Finder"
-        >
-          Diagnostics ({diagFiles.length})
-        </button>
-      )}
-      {hasAudio && (
-        <button
-          type="button"
-          onClick={openAudio}
-          className="underline hover:text-[var(--color-text)]"
-          title="Open retained audio folder in Finder"
-        >
-          Audio ({audioFiles.length})
-        </button>
+    <div className="flex flex-col gap-1 mb-3">
+      <div className="flex items-center gap-3 text-xs text-[var(--color-text-muted)]">
+        {hasDiag && (
+          <button
+            type="button"
+            onClick={openDiag}
+            className="underline hover:text-[var(--color-text)]"
+            title="Open diagnostics folder in Finder"
+          >
+            Diagnostics ({diagFiles.length})
+          </button>
+        )}
+        {hasAudio && (
+          <button
+            type="button"
+            onClick={openAudio}
+            className="underline hover:text-[var(--color-text)]"
+            title="Open retained audio folder in Finder"
+          >
+            Audio ({audioFiles.length})
+          </button>
+        )}
+        {canRediarize && (
+          <button
+            type="button"
+            onClick={rediarize}
+            disabled={rediarizing}
+            className="underline hover:text-[var(--color-text)] disabled:opacity-50"
+            title="Re-run diarization on the saved audio with the current settings"
+          >
+            {rediarizing ? "Re-diarizing…" : "Re-diarize"}
+          </button>
+        )}
+      </div>
+      {rediarizeError && (
+        <p className="text-xs text-red-600 dark:text-red-400 break-all">
+          {rediarizeError}
+        </p>
       )}
     </div>
   );

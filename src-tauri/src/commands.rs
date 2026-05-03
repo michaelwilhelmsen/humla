@@ -198,6 +198,252 @@ pub fn note_audio_files(app: AppHandle, note_id: String) -> Result<Vec<String>, 
     Ok(out)
 }
 
+/// Open a local path (file or directory) in Finder via macOS's `open`
+/// command. The shell plugin's frontend `open()` is scoped to a few
+/// allowed HTTPS URLs by default; opening arbitrary user-data paths
+/// from the renderer is rejected silently. We bypass that by invoking
+/// the system `open` directly from the backend, matching the pattern
+/// used by `permissions_open_settings`.
+#[tauri::command]
+pub fn open_in_finder(path: String) -> Result<(), String> {
+    std::process::Command::new("open")
+        .arg(&path)
+        .spawn()
+        .map_err(|e| format!("open: {e}"))?;
+    Ok(())
+}
+
+/// Re-run diarization on a note's saved audio with the current settings,
+/// then rebuild and write back the labelled transcript. Lets the user
+/// iterate on diarize_model + thresholds without re-recording.
+///
+/// Requires both `keep_audio` to have been on at recording time (to
+/// have the WAV files) and at least one prior diagnostic dump (to read
+/// the original chunk timings — those are the alignment anchor and
+/// can't be reconstructed from the transcript text alone).
+#[tauri::command]
+pub async fn rediarize_note(app: AppHandle, note_id: String) -> Result<(), String> {
+    let app_dir = app.path().app_data_dir().map_err(err)?;
+    let audio_dir = app_dir.join("recordings").join(&note_id);
+    let mic_path = audio_dir.join("mic.wav");
+    let sys_path = audio_dir.join("sys.wav");
+    let mic_wav = if mic_path.exists() { Some(mic_path) } else { None };
+    let sys_wav = if sys_path.exists() { Some(sys_path) } else { None };
+    if mic_wav.is_none() && sys_wav.is_none() {
+        return Err(
+            "No saved audio for this note. Enable Audio retention in Settings → Transcription before recording, then try again on a new recording."
+                .to_string(),
+        );
+    }
+
+    let diag_dir = app_dir.join("diagnostics").join(&note_id);
+    let chunks = read_chunks_from_diagnostic(&diag_dir).map_err(err)?;
+    if chunks.is_empty() {
+        return Err(
+            "No saved chunk timings for this note. Re-diarize needs the original recording's diagnostic data, which only exists for recordings made on a build that wrote diagnostic JSON."
+                .to_string(),
+        );
+    }
+
+    let state: State<AppState> = app.state();
+    let engine = active_diarize_engine(&state);
+    let thresholds = read_diarize_thresholds(&state);
+    let expected_speakers = {
+        let conn = state.db.lock();
+        db::get_note(&conn, &note_id)
+            .ok()
+            .and_then(|n| n.expected_speakers)
+            .filter(|n| *n > 0)
+    };
+
+    match diarize::status(&app, engine).await {
+        Ok(s) if s.downloaded => {}
+        _ => {
+            return Err(
+                "Diarize model isn't downloaded. Download it in Settings → Transcription → Speaker diarization, then try again."
+                    .to_string(),
+            );
+        }
+    }
+
+    rediarize_apply_to_chunks(
+        app,
+        note_id,
+        mic_wav,
+        sys_wav,
+        chunks,
+        expected_speakers,
+        engine,
+        thresholds,
+    )
+    .await
+    .map_err(err)
+}
+
+/// Read the chunk records from any of the saved diagnostic JSONs for a
+/// note. All dumps for the same note hold the same chunk timings (they
+/// come from the original recording session and don't depend on engine
+/// or threshold), so we just take the first JSON we find.
+fn read_chunks_from_diagnostic(diag_dir: &std::path::Path) -> anyhow::Result<Vec<ChunkRecord>> {
+    if !diag_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let entries = std::fs::read_dir(diag_dir)?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let data = std::fs::read_to_string(&path)?;
+        let v: serde_json::Value = serde_json::from_str(&data)?;
+        let Some(arr) = v.get("chunks").and_then(|c| c.as_array()) else {
+            continue;
+        };
+        let mut out = Vec::with_capacity(arr.len());
+        for c in arr {
+            let source = match c.get("source").and_then(|s| s.as_str()) {
+                Some("mic") => ChunkSource::Mic,
+                Some("sys") => ChunkSource::Sys,
+                _ => continue,
+            };
+            let start_ms = c.get("start_ms").and_then(|s| s.as_u64()).unwrap_or(0);
+            let text = c
+                .get("text")
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string();
+            out.push(ChunkRecord {
+                source,
+                start_ms,
+                text,
+            });
+        }
+        if !out.is_empty() {
+            return Ok(out);
+        }
+    }
+    Ok(Vec::new())
+}
+
+/// Mirror of diarize_and_apply's branching, but operating on caller-
+/// supplied paths + chunks instead of recording-session state. No
+/// snapshot — the transcript is being rebuilt from scratch from the
+/// chunk timings, not appended to an in-flight session.
+async fn rediarize_apply_to_chunks(
+    app: AppHandle,
+    note_id: String,
+    mic_wav: Option<PathBuf>,
+    sys_wav: Option<PathBuf>,
+    chunks: Vec<ChunkRecord>,
+    expected_speakers: Option<i64>,
+    engine: diarize::Engine,
+    thresholds: diarize::Thresholds,
+) -> anyhow::Result<()> {
+    let mic_chunks_present = chunks.iter().any(|c| c.source == ChunkSource::Mic);
+    let sys_chunks_present = chunks.iter().any(|c| c.source == ChunkSource::Sys);
+
+    emit_status(&app, Some(&note_id), Phase::Diarizing);
+
+    type Labeller = dyn Fn(&ChunkRecord) -> Option<String> + Send;
+    let label_for_chunk: Box<Labeller> = match (mic_chunks_present, sys_chunks_present) {
+        (true, false) => {
+            let Some(wav) = mic_wav.clone() else {
+                emit_status(&app, None, Phase::Idle);
+                return Err(anyhow::anyhow!(
+                    "mic chunks present but no saved mic.wav"
+                ));
+            };
+            let segments =
+                diarize::diarize_file(&app, &wav, expected_speakers, engine, thresholds).await?;
+            write_diagnostics_json(&app, &note_id, engine, "mic", &segments, &chunks, &thresholds)
+                .await;
+            if segments.is_empty() {
+                emit_status(&app, None, Phase::Idle);
+                return Err(anyhow::anyhow!("diarize returned no segments"));
+            }
+            let display_map = build_display_map(&chunks, &segments, ChunkSource::Mic);
+            Box::new(move |c: &ChunkRecord| {
+                let sid = assign_speaker(c.start_ms, &segments)?;
+                display_map.get(sid).map(|n| format!("Speaker {n}"))
+            })
+        }
+        (false, true) => {
+            let Some(wav) = sys_wav.clone() else {
+                emit_status(&app, None, Phase::Idle);
+                return Err(anyhow::anyhow!(
+                    "sys chunks present but no saved sys.wav"
+                ));
+            };
+            let segments =
+                diarize::diarize_file(&app, &wav, expected_speakers, engine, thresholds).await?;
+            write_diagnostics_json(&app, &note_id, engine, "sys", &segments, &chunks, &thresholds)
+                .await;
+            if segments.is_empty() {
+                emit_status(&app, None, Phase::Idle);
+                return Err(anyhow::anyhow!("diarize returned no segments"));
+            }
+            let display_map = build_display_map(&chunks, &segments, ChunkSource::Sys);
+            Box::new(move |c: &ChunkRecord| {
+                let sid = assign_speaker(c.start_ms, &segments)?;
+                display_map.get(sid).map(|n| format!("Speaker {n}"))
+            })
+        }
+        (true, true) => {
+            // Hybrid: mic = "You", sys = diarize.
+            let sys_speaker_hint = expected_speakers.map(|n| (n - 1).max(1));
+            let segments = if let Some(p) = sys_wav.as_ref() {
+                diarize::diarize_file(&app, p, sys_speaker_hint, engine, thresholds)
+                    .await
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            write_diagnostics_json(&app, &note_id, engine, "sys", &segments, &chunks, &thresholds)
+                .await;
+            if segments.is_empty() {
+                Box::new(move |c: &ChunkRecord| match c.source {
+                    ChunkSource::Mic => Some("You".to_string()),
+                    ChunkSource::Sys => Some("Speaker 1".to_string()),
+                })
+            } else {
+                let display_map = build_display_map(&chunks, &segments, ChunkSource::Sys);
+                Box::new(move |c: &ChunkRecord| match c.source {
+                    ChunkSource::Mic => Some("You".to_string()),
+                    ChunkSource::Sys => {
+                        let sid = assign_speaker(c.start_ms, &segments)?;
+                        display_map.get(sid).map(|n| format!("Speaker {n}"))
+                    }
+                })
+            }
+        }
+        (false, false) => {
+            emit_status(&app, None, Phase::Idle);
+            return Err(anyhow::anyhow!("no chunks recorded for either source"));
+        }
+    };
+
+    let new_transcript = build_labelled_transcript(&chunks, label_for_chunk.as_ref());
+    if new_transcript.trim().is_empty() {
+        emit_status(&app, None, Phase::Idle);
+        return Err(anyhow::anyhow!("re-diarize produced empty transcript"));
+    }
+
+    {
+        let state: State<AppState> = app.state();
+        let conn = state.db.lock();
+        db::set_transcript(&conn, &note_id, &new_transcript)?;
+    }
+    let _ = app.emit(
+        "transcript_replaced",
+        TranscriptPayload {
+            note_id: note_id.clone(),
+            text: new_transcript,
+        },
+    );
+    emit_status(&app, None, Phase::Idle);
+    Ok(())
+}
+
 /// Lists which diagnostic dumps exist for a note (e.g. ["community1-mic.json",
 /// "sortformer-sys.json"]). Empty vec when no diarize has run yet.
 #[tauri::command]

@@ -137,6 +137,8 @@ export const ipc = {
     invoke<string[]>("note_audio_files", { noteId }),
   noteDiagnosticsFiles: (noteId: string) =>
     invoke<string[]>("note_diagnostics_files", { noteId }),
+  openInFinder: (path: string) => invoke<void>("open_in_finder", { path }),
+  rediarizeNote: (noteId: string) => invoke<void>("rediarize_note", { noteId }),
 
   summaryPromptsList: () => invoke<SummaryPrompt[]>("summary_prompts_list"),
   summaryPromptsCreate: (name: string, content: string) =>
