@@ -1741,43 +1741,6 @@ pub async fn recording_stop(
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), r).await;
     }
 
-    // Drain in-flight transcribe tasks (incl. any final chunk spawned during
-    // the sidecar's shutdown handler). Cap the total drain so a stuck OpenAI
-    // call can't pin us in Stopping forever.
-    let drain = async {
-        loop {
-            let next = inflight.lock().pop();
-            match next {
-                Some(h) => { let _ = h.await; }
-                None => break,
-            }
-        }
-    };
-    let drain_timed_out =
-        tokio::time::timeout(std::time::Duration::from_secs(30), drain).await.is_err();
-
-    // If the drain timed out, abort whatever's still lingering. A stuck
-    // network call (e.g. OpenAI 503 retry) would otherwise keep running
-    // past recording_stop and try to db::append_transcript onto the
-    // post-stop labelled transcript that diarize_and_apply / final_pass_apply
-    // produced — wholesale overwriting the speaker structure with raw chunk
-    // text. The transcribe_chunk session-active guard is the second line of
-    // defence for the one task that was being awaited when the drain future
-    // was dropped (it's detached, not reachable from here).
-    if drain_timed_out {
-        let remaining: Vec<_> = inflight.lock().drain(..).collect();
-        eprintln!(
-            "recording_stop: drain timed out, aborting {} lingering transcribe(s)",
-            remaining.len()
-        );
-        for h in &remaining {
-            h.abort();
-        }
-        for h in remaining {
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), h).await;
-        }
-    }
-
     // Spawn the post-stop processing chain in the background:
     //   Stopping → (Retranscribing | Diarizing) → Polishing → Idle
     // Branch on the `final_pass` setting: when enabled (and provider is
@@ -1797,6 +1760,47 @@ pub async fn recording_stop(
     // AVAudioFile reader). Sequencing cleanup behind the chain ensures the
     // full WAVs survive for as long as any post-stop step needs them.
     tokio::spawn(async move {
+        // Drain in-flight transcribe tasks (incl. any final chunk
+        // spawned during the sidecar's shutdown handler) BEFORE
+        // diarize touches the chunk_log. Done here, not inside
+        // recording_stop, so the user doesn't sit in a Stopping pill
+        // for the duration — the post-stop chain emits Diarizing
+        // shortly after, covering the wait visually.
+        //
+        // Generous timeout (300 s) because Whisper inference can
+        // accumulate Metal slowdown over a long recording, and the
+        // tail chunks queued behind the gate sometimes take much
+        // longer than fresh ones. Aborting them = silently losing
+        // 20–30 s of audio at the end, which is the user-reported
+        // bug. Stuck network calls (OpenAI 503 retry) still hit the
+        // ceiling eventually; the session-active guard inside
+        // transcribe_chunk keeps any aborted task from clobbering
+        // the labelled transcript.
+        let drain = async {
+            loop {
+                let next = inflight.lock().pop();
+                match next {
+                    Some(h) => { let _ = h.await; }
+                    None => break,
+                }
+            }
+        };
+        let drain_timed_out =
+            tokio::time::timeout(std::time::Duration::from_secs(300), drain).await.is_err();
+        if drain_timed_out {
+            let remaining: Vec<_> = inflight.lock().drain(..).collect();
+            eprintln!(
+                "recording_stop: drain timed out, aborting {} lingering transcribe(s)",
+                remaining.len()
+            );
+            for h in &remaining {
+                h.abort();
+            }
+            for h in remaining {
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(2), h).await;
+            }
+        }
+
         // Copy full WAVs to a permanent location FIRST when keep_audio is
         // on. Both diarize_and_apply and final_pass_apply call
         // cleanup_full_wav on the temp paths after they're done with
