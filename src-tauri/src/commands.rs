@@ -2965,6 +2965,43 @@ async fn transcribe_chunk(
         return Ok(());
     }
 
+    // Cross-chunk hallucination loop guard. Whisper occasionally locks
+    // onto a confident-sounding phrase when the audio is low-SNR (e.g.
+    // an internal MacBook mic during silence between sentences). Each
+    // chunk on its own passes the per-chunk repetition-collapse filter
+    // because the phrase appears only once internally — but the same
+    // phrase comes back chunk after chunk, fed forward by the trail
+    // context. Drop a chunk when its tokens are mostly contained in
+    // the previous same-source chunk's tokens. Threshold 0.7 is
+    // stricter than cross-stream dedup (0.6) because we want to catch
+    // near-identical repeats while leaving room for natural sentence-
+    // continuation overlap. Min token length stays at 3 so brief
+    // acks ("yeah", "ok") aren't suppressed across consecutive chunks.
+    {
+        let state: State<AppState> = app.state();
+        let session = state.recording.lock();
+        let log = session.chunk_log.lock();
+        let recent_same_source = log
+            .iter()
+            .rev()
+            .find(|c| c.source == source)
+            .map(|c| c.text.clone());
+        drop(log);
+        drop(session);
+        if let Some(prev) = recent_same_source {
+            let new_tokens = normalize_tokens(&trimmed);
+            if new_tokens.len() >= 3 {
+                let prev_tokens = normalize_tokens(&prev);
+                if token_containment(&new_tokens, &prev_tokens) >= 0.7 {
+                    eprintln!(
+                        "transcribe: dropping cross-chunk repeat (likely hallucination loop): {trimmed}"
+                    );
+                    return Ok(());
+                }
+            }
+        }
+    }
+
     // Speaker prefixes are added by the offline diarization pass on
     // recording_stop, not here. Per-chunk live diarization performed
     // poorly on long recordings (clustering drifts as speaker memory
