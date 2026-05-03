@@ -14,10 +14,11 @@ export function SummaryPromptsManager({ language }: { language: string }) {
   const [prompts, setPrompts] = useState<SummaryPrompt[]>([]);
   const [editing, setEditing] = useState<EditingState | null>(null);
   const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    ipc.summaryPromptsList().then(setPrompts).catch((e) => setError(String(e)));
-  }, []);
+  // Inline two-step delete confirmation. Tauri's webview blocks
+  // window.confirm (it deadlocks the main thread, so the runtime no-ops
+  // it silently), so we keep the confirmed-id in component state and
+  // swap the row's buttons to Cancel + Confirm delete on first click.
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
 
   async function refresh() {
     const next = await ipc.summaryPromptsList();
@@ -53,13 +54,11 @@ export function SummaryPromptsManager({ language }: { language: string }) {
     }
   }
 
-  async function remove(p: SummaryPrompt) {
-    if (!window.confirm(`Delete "${p.name}"? Notes using this prompt will fall back to the legacy custom prompt.`)) {
-      return;
-    }
+  async function confirmRemove(p: SummaryPrompt) {
     try {
       await ipc.summaryPromptsDelete(p.id);
       await refresh();
+      setConfirmDeleteId(null);
     } catch (e) {
       setError(String(e));
     }
@@ -102,23 +101,49 @@ export function SummaryPromptsManager({ language }: { language: string }) {
           </p>
         ) : (
           <div className="flex flex-col gap-2">
-            {prompts.map((p) => (
-              <div
-                key={p.id}
-                className="flex items-center gap-2 px-3 py-2 rounded-md border border-[var(--color-line)]"
-              >
-                <div className="flex-1 min-w-0">
-                  <div className="text-sm font-medium truncate">{p.name}</div>
-                  <p className="text-xs text-[var(--color-text-muted)] truncate font-mono">
-                    {p.content.split("\n")[0].slice(0, 80) || "—"}
-                  </p>
+            {prompts.map((p) => {
+              const isConfirming = confirmDeleteId === p.id;
+              return (
+                <div
+                  key={p.id}
+                  className="flex flex-col gap-2 px-3 py-2 rounded-md border border-[var(--color-line)]"
+                >
+                  <div className="flex items-center gap-2">
+                    <div className="flex-1 min-w-0">
+                      <div className="text-sm font-medium truncate">{p.name}</div>
+                      <p className="text-xs text-[var(--color-text-muted)] truncate font-mono">
+                        {p.content.split("\n")[0].slice(0, 80) || "—"}
+                      </p>
+                    </div>
+                    <div className="flex gap-2">
+                      {isConfirming ? (
+                        <>
+                          <Btn onClick={() => setConfirmDeleteId(null)}>
+                            Cancel
+                          </Btn>
+                          <Btn onClick={() => confirmRemove(p)}>
+                            Confirm delete
+                          </Btn>
+                        </>
+                      ) : (
+                        <>
+                          <Btn onClick={() => startEdit(p)}>Edit</Btn>
+                          <Btn onClick={() => setConfirmDeleteId(p.id)}>
+                            Delete
+                          </Btn>
+                        </>
+                      )}
+                    </div>
+                  </div>
+                  {isConfirming && (
+                    <p className="text-xs text-[var(--color-text-muted)]">
+                      Notes using this prompt will fall back to the legacy
+                      custom prompt.
+                    </p>
+                  )}
                 </div>
-                <div className="flex gap-2">
-                  <Btn onClick={() => startEdit(p)}>Edit</Btn>
-                  <Btn onClick={() => remove(p)}>Delete</Btn>
-                </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         )}
       </div>
