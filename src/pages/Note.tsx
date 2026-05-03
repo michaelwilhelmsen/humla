@@ -11,7 +11,8 @@ import {
   Languages,
   Users,
 } from "lucide-react";
-import { ipc, onSummaryThinkingDelta, onSummaryContentDelta, type Note as TNote, type SummaryPrompt } from "../lib/ipc";
+import { ipc, onSummaryThinkingDelta, onSummaryContentDelta, type Note as TNote, type SummaryPrompt, type TimelineEntry } from "../lib/ipc";
+import { convertFileSrc } from "@tauri-apps/api/core";
 import { useNotesStore, useRecordingStore } from "../lib/store";
 import { RecordingBar } from "../components/RecordingBar";
 import { SkeletonLines } from "../components/Skeleton";
@@ -45,6 +46,13 @@ export function Note() {
   const [thinkingExpanded, setThinkingExpanded] = useState<boolean>(true);
   const saveTimer = useRef<number | null>(null);
   const devMode = useDeveloperMode();
+  // Playback bundle: the mixed WAV path (converted to a tauri:// asset
+  // URL) and the per-turn timeline driving highlight rendering. Both
+  // null/empty means this note pre-dates the playback feature or its
+  // bundle hasn't been written yet — we fall back to the plain
+  // TranscriptEditor in that case.
+  const [playbackUrl, setPlaybackUrl] = useState<string | null>(null);
+  const [timeline, setTimeline] = useState<TimelineEntry[]>([]);
 
   useEffect(() => {
     let cancelled = false;
@@ -187,6 +195,29 @@ export function Note() {
       return { ...d, summary: nextSummary, transcript: nextTranscript };
     });
   }, [note?.transcript, note?.summary, allowTranscriptSync]);
+
+  // Re-fetch the playback bundle whenever the note id or recording
+  // phase changes. The post-stop chain (diarize → polish) writes the
+  // bundle mid-flight, so depending only on draft.id would leave the
+  // player hidden until the user navigates away and back. Stable
+  // recording_phase transitions: stopping → diarizing → polishing →
+  // idle — by the time we land on idle, the bundle exists.
+  useEffect(() => {
+    if (!draft) return;
+    let cancelled = false;
+    (async () => {
+      const [path, tl] = await Promise.all([
+        ipc.notePlaybackPath(draft.id).catch(() => null),
+        ipc.noteTimeline(draft.id).catch((): TimelineEntry[] => []),
+      ]);
+      if (cancelled) return;
+      setPlaybackUrl(path ? convertFileSrc(path) : null);
+      setTimeline(tl);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [draft?.id, recPhase.phase]);
 
   function patch(field: "title" | "body" | "transcript" | "summary_preset" | "language", value: string) {
     if (!draft) return;
@@ -420,11 +451,21 @@ export function Note() {
                   }
                 />
                 {devMode && <DiagnosticsLinks noteId={draft.id} />}
-                <TranscriptEditor
-                  value={draft.transcript}
-                  onChange={(v) => patch("transcript", v)}
-                  disabled={isRecording || isPaused || isStarting || isStopping || isDiarizing || isPolishing}
-                />
+                {playbackUrl && timeline.length > 0 ? (
+                  <TranscriptPlayer
+                    timeline={timeline}
+                    playbackUrl={playbackUrl}
+                    transcript={draft.transcript}
+                    onChange={(v) => patch("transcript", v)}
+                    disabled={isRecording || isPaused || isStarting || isStopping || isDiarizing || isPolishing}
+                  />
+                ) : (
+                  <TranscriptEditor
+                    value={draft.transcript}
+                    onChange={(v) => patch("transcript", v)}
+                    disabled={isRecording || isPaused || isStarting || isStopping || isDiarizing || isPolishing}
+                  />
+                )}
                 {isRecording && <SkeletonLines lines={2} className="mt-3" />}
               </>
             ) : (
@@ -1000,6 +1041,167 @@ function TranscriptView({
           </span>
         );
       })}
+    </div>
+  );
+}
+
+// Playback view. Renders the audio player and the timeline-driven
+// transcript with active-turn highlighting. Each turn is its own button:
+// click to seek + auto-play. The audio element is the source of truth
+// for currentTime; we read it via timeupdate and pick the active turn
+// by binary scan (timeline is small enough that linear is also fine).
+//
+// Edit mode: textarea on the raw note.transcript text, same convention
+// as TranscriptEditor — the timeline isn't kept in sync with edits, so
+// after a manual edit the highlights might mismatch slightly until the
+// next recording or re-diarize regenerates the bundle. Acceptable
+// trade-off for v1; the alternative (chunk-level edit UI) is a much
+// bigger refactor.
+function TranscriptPlayer({
+  timeline,
+  playbackUrl,
+  transcript,
+  onChange,
+  disabled,
+}: {
+  timeline: TimelineEntry[];
+  playbackUrl: string;
+  transcript: string;
+  onChange: (v: string) => void;
+  disabled: boolean;
+}) {
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const [currentMs, setCurrentMs] = useState(0);
+  const [editing, setEditing] = useState(false);
+  const taRef = useRef<HTMLTextAreaElement | null>(null);
+  const containerRef = useRef<HTMLDivElement | null>(null);
+
+  const labels = useMemo(
+    () => Array.from(new Set(timeline.map((t) => t.label).filter(Boolean))),
+    [timeline],
+  );
+  const colors = useMemo(() => speakerColorMap(labels), [labels]);
+
+  // The active turn is the latest one whose start_ms is ≤ currentMs.
+  // Timeline is sorted ascending by start_ms by construction (backend
+  // sorts before serialising), so a linear scan is fine — meetings
+  // rarely have more than a few hundred turns.
+  const activeIdx = useMemo(() => {
+    let idx = -1;
+    for (let i = 0; i < timeline.length; i++) {
+      if (timeline[i].start_ms <= currentMs) idx = i;
+      else break;
+    }
+    return idx;
+  }, [timeline, currentMs]);
+
+  useEffect(() => {
+    if (activeIdx < 0 || !containerRef.current) return;
+    const el = containerRef.current.querySelector(`[data-idx="${activeIdx}"]`);
+    if (el && "scrollIntoView" in el) {
+      (el as HTMLElement).scrollIntoView({ block: "nearest", behavior: "smooth" });
+    }
+  }, [activeIdx]);
+
+  useEffect(() => {
+    if (!editing) return;
+    const el = taRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = el.scrollHeight + "px";
+  }, [editing, transcript]);
+
+  useEffect(() => {
+    if (!editing) return;
+    const el = taRef.current;
+    if (!el) return;
+    el.focus({ preventScroll: true });
+    const len = el.value.length;
+    el.setSelectionRange(len, len);
+  }, [editing]);
+
+  function seek(ms: number) {
+    const a = audioRef.current;
+    if (!a) return;
+    a.currentTime = ms / 1000;
+    a.play().catch(() => {});
+  }
+
+  const showEditor = editing && !disabled;
+
+  return (
+    <div>
+      <div className="flex items-center gap-2 mb-3">
+        <audio
+          ref={audioRef}
+          src={playbackUrl}
+          controls
+          preload="metadata"
+          className="flex-1 h-8"
+          onTimeUpdate={(e) =>
+            setCurrentMs(Math.floor(e.currentTarget.currentTime * 1000))
+          }
+        />
+        {!showEditor && !disabled && (
+          <button
+            type="button"
+            onClick={() => setEditing(true)}
+            className="nd-bare text-xs text-[var(--color-text-muted)] underline hover:text-[var(--color-text)] shrink-0"
+          >
+            Edit
+          </button>
+        )}
+      </div>
+      {showEditor ? (
+        <textarea
+          ref={taRef}
+          value={transcript}
+          onChange={(e) => onChange(e.target.value)}
+          onBlur={() => setEditing(false)}
+          onKeyDown={(e) => {
+            if (e.key === "Escape") {
+              e.preventDefault();
+              setEditing(false);
+            }
+          }}
+          className="nd-bare w-full resize-none text-sm leading-relaxed text-[var(--color-text-muted)] focus:outline-none"
+        />
+      ) : (
+        <div
+          ref={containerRef}
+          className="text-sm leading-relaxed text-[var(--color-text-muted)] flex flex-col gap-1"
+        >
+          {timeline.map((entry, i) => {
+            const isActive = i === activeIdx;
+            const color = entry.label ? colors.get(entry.label) : undefined;
+            return (
+              <button
+                type="button"
+                key={i}
+                data-idx={i}
+                onClick={() => seek(entry.start_ms)}
+                title="Click to play from here"
+                className={
+                  "text-left px-2 py-1 rounded transition-colors " +
+                  (isActive
+                    ? "bg-[var(--color-pill-hover)] text-[var(--color-text)]"
+                    : "hover:bg-[var(--color-pill-hover)]")
+                }
+              >
+                {entry.label && color && (
+                  <span
+                    className="nd-speaker-pill mr-2"
+                    style={{ background: color }}
+                  >
+                    {entry.label}
+                  </span>
+                )}
+                {entry.text}
+              </button>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }

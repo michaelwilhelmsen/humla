@@ -51,3 +51,41 @@ pub async fn read_f32_mono_16k(path: &std::path::Path) -> anyhow::Result<Vec<f32
     }
     Ok(out)
 }
+
+/// Write a Float32 sample buffer out as 16 kHz mono 16-bit PCM WAV.
+/// Used to materialise `playback.wav` for the in-app player. Saturates
+/// at ±1.0 to avoid clip wrap-around when summing the two streams.
+pub async fn write_pcm16_mono_16k(
+    path: &std::path::Path,
+    samples: &[f32],
+) -> anyhow::Result<()> {
+    const SAMPLE_RATE: u32 = 16_000;
+    const CHANNELS: u16 = 1;
+    const BITS: u16 = 16;
+    let byte_rate = SAMPLE_RATE * (CHANNELS as u32) * (BITS as u32 / 8);
+    let block_align = CHANNELS * BITS / 8;
+    let data_len = (samples.len() * 2) as u32;
+    let riff_size = 36u32.saturating_add(data_len);
+
+    let mut out = Vec::with_capacity(44 + samples.len() * 2);
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&riff_size.to_le_bytes());
+    out.extend_from_slice(b"WAVE");
+    out.extend_from_slice(b"fmt ");
+    out.extend_from_slice(&16u32.to_le_bytes()); // fmt chunk size
+    out.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    out.extend_from_slice(&CHANNELS.to_le_bytes());
+    out.extend_from_slice(&SAMPLE_RATE.to_le_bytes());
+    out.extend_from_slice(&byte_rate.to_le_bytes());
+    out.extend_from_slice(&block_align.to_le_bytes());
+    out.extend_from_slice(&BITS.to_le_bytes());
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&data_len.to_le_bytes());
+    for &s in samples {
+        let clamped = s.clamp(-1.0, 1.0);
+        let pcm = (clamped * 32767.0) as i16;
+        out.extend_from_slice(&pcm.to_le_bytes());
+    }
+    tokio::fs::write(path, out).await?;
+    Ok(())
+}

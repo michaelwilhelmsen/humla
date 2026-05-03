@@ -97,6 +97,8 @@ pub fn run() {
             commands::note_audio_dir,
             commands::note_audio_files,
             commands::note_diagnostics_files,
+            commands::note_playback_path,
+            commands::note_timeline,
             commands::open_in_finder,
             commands::rediarize_note,
             commands::summary_prompts_list,

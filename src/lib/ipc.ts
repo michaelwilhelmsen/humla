@@ -109,6 +109,16 @@ export type DiarizeDownloadProgress = {
 
 export type DiarizeEngine = "community1" | "sortformer";
 
+// One per speaker turn; mirrors a single line in the rendered transcript.
+// `start_ms` is the first chunk's start within the turn — drives playback
+// highlighting (active turn = the one whose start_ms ≤ currentTime <
+// next.start_ms).
+export type TimelineEntry = {
+  start_ms: number;
+  label: string;
+  text: string;
+};
+
 export const ipc = {
   listNotes: () => invoke<Note[]>("notes_list"),
   getNote: (id: string) => invoke<Note>("notes_get", { id }),
@@ -138,6 +148,10 @@ export const ipc = {
     invoke<string[]>("note_audio_files", { noteId }),
   noteDiagnosticsFiles: (noteId: string) =>
     invoke<string[]>("note_diagnostics_files", { noteId }),
+  notePlaybackPath: (noteId: string) =>
+    invoke<string | null>("note_playback_path", { noteId }),
+  noteTimeline: (noteId: string) =>
+    invoke<TimelineEntry[]>("note_timeline", { noteId }),
   openInFinder: (path: string) => invoke<void>("open_in_finder", { path }),
   rediarizeNote: (noteId: string) => invoke<void>("rediarize_note", { noteId }),
 

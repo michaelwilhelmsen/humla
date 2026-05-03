@@ -440,8 +440,101 @@ async fn rediarize_apply_to_chunks(
             text: new_transcript,
         },
     );
+
+    // Refresh the playback timeline so highlighting reflects the new
+    // labels. The mixed playback.wav is rebuilt too — cheap, idempotent,
+    // and saves us from having a separate "did the audio change?"
+    // signal. Re-diarize doesn't change audio content, but downstream
+    // assumptions about the bundle being self-consistent survive.
+    let timeline = serialize_timeline(&chunks, label_for_chunk.as_ref());
+    write_playback_assets(
+        &app,
+        &note_id,
+        timeline,
+        mic_wav.as_deref(),
+        sys_wav.as_deref(),
+    )
+    .await;
+
     emit_status(&app, None, Phase::Idle);
     Ok(())
+}
+
+/// Path to the per-note `playback.wav` if it exists. The frontend
+/// converts this to a `tauri://` URL via `convertFileSrc` and feeds it
+/// to an `<audio>` element. Always present for recordings made on
+/// builds that include the playback feature; missing for older notes.
+#[tauri::command]
+pub fn note_playback_path(app: AppHandle, note_id: String) -> Result<Option<String>, String> {
+    let path = app
+        .path()
+        .app_data_dir()
+        .map_err(err)?
+        .join("recordings")
+        .join(&note_id)
+        .join("playback.wav");
+    if !path.exists() {
+        return Ok(None);
+    }
+    Ok(path.to_str().map(|s| s.to_string()))
+}
+
+/// Per-note transcript timeline used to drive playback highlighting.
+/// One entry per speaker turn; same structure as a single line in the
+/// rendered transcript. `start_ms` is the first chunk's start in this
+/// turn (relative to the recording's stream timeline), so the frontend
+/// can map `audio.currentTime` → active turn.
+#[derive(Clone, serde::Serialize)]
+pub struct TimelineEntry {
+    pub start_ms: u64,
+    pub label: String,
+    pub text: String,
+}
+
+/// Read the timeline.jsonl that `write_playback_assets` saved. Returns
+/// an empty vec for older notes / failed reads — the frontend treats
+/// "no timeline" as "no highlighting available" and renders the plain
+/// transcript instead.
+#[tauri::command]
+pub fn note_timeline(app: AppHandle, note_id: String) -> Result<Vec<TimelineEntry>, String> {
+    let path = app
+        .path()
+        .app_data_dir()
+        .map_err(err)?
+        .join("recordings")
+        .join(&note_id)
+        .join("timeline.jsonl");
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let content = std::fs::read_to_string(&path).map_err(|e| format!("read timeline: {e}"))?;
+    let mut out = Vec::new();
+    for line in content.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let v: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("timeline: skip malformed line: {e}");
+                continue;
+            }
+        };
+        out.push(TimelineEntry {
+            start_ms: v.get("start_ms").and_then(|s| s.as_u64()).unwrap_or(0),
+            label: v
+                .get("label")
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string(),
+            text: v
+                .get("text")
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string(),
+        });
+    }
+    Ok(out)
 }
 
 /// Lists which diagnostic dumps exist for a note (e.g. ["community1-mic.json",
@@ -1784,6 +1877,22 @@ async fn diarize_and_apply(app: AppHandle, note_id: String) -> anyhow::Result<()
         },
     );
 
+    // Persist the playback bundle (mixed WAV + per-turn timeline) before
+    // we drop the temp full WAVs. Independent of keep_audio — playback
+    // is a first-class feature, not a debug knob. Best-effort: failures
+    // log to stderr but don't abort the post-stop chain. Compute the
+    // timeline synchronously so the labeller doesn't have to be Send +
+    // Sync to cross the awaits inside write_playback_assets.
+    let timeline = serialize_timeline(&chunks, label_for_chunk.as_ref());
+    write_playback_assets(
+        &app,
+        &note_id,
+        timeline,
+        mic_wav.as_deref(),
+        sys_wav.as_deref(),
+    )
+    .await;
+
     // Free the full.wav files ahead of the temp-dir cleanup. Best-effort.
     if let Some(p) = mic_wav { diarize::cleanup_full_wav(&p).await; }
     if let Some(p) = sys_wav { diarize::cleanup_full_wav(&p).await; }
@@ -2038,6 +2147,18 @@ async fn final_pass_apply(app: AppHandle, note_id: String) -> anyhow::Result<()>
         },
     );
 
+    // Refresh playback bundle from the final-pass transcript. Same
+    // contract as diarize_and_apply.
+    let timeline = serialize_timeline(&chunks, label_for_chunk.as_ref());
+    write_playback_assets(
+        &app,
+        &note_id,
+        timeline,
+        mic_wav.as_deref(),
+        sys_wav.as_deref(),
+    )
+    .await;
+
     if let Some(p) = mic_wav {
         diarize::cleanup_full_wav(&p).await;
     }
@@ -2247,6 +2368,137 @@ fn normalize_tokens(s: &str) -> Vec<String> {
         .filter(|w| w.len() > 1)
         .map(|w| w.to_string())
         .collect()
+}
+
+/// Build the playback-asset bundle for a recording: a single mixed
+/// `playback.wav` plus a `timeline.jsonl` mapping each speaker turn
+/// back to its first-chunk start_ms, so the frontend can render the
+/// transcript with chunk spans and highlight whichever one matches the
+/// audio's current position. Always written when chunks exist —
+/// independent of `keep_audio`, which controls whether the *raw* per-
+/// source WAVs are also retained for re-diarize / debugging.
+async fn write_playback_assets(
+    app: &AppHandle,
+    note_id: &str,
+    timeline: String,
+    mic_wav: Option<&std::path::Path>,
+    sys_wav: Option<&std::path::Path>,
+) {
+    if mic_wav.is_none() && sys_wav.is_none() && timeline.is_empty() {
+        return;
+    }
+    let Ok(app_dir) = app.path().app_data_dir() else {
+        eprintln!("playback: app_data_dir unavailable");
+        return;
+    };
+    let target = app_dir.join("recordings").join(note_id);
+    if let Err(e) = tokio::fs::create_dir_all(&target).await {
+        eprintln!("playback: mkdir {}: {e}", target.display());
+        return;
+    }
+
+    if let Err(e) = build_playback_wav(mic_wav, sys_wav, &target.join("playback.wav")).await {
+        eprintln!("playback: build_playback_wav: {e}");
+    }
+
+    if !timeline.is_empty() {
+        if let Err(e) = tokio::fs::write(target.join("timeline.jsonl"), timeline).await {
+            eprintln!("playback: write timeline.jsonl: {e}");
+        }
+    }
+}
+
+/// Combine the per-source full WAVs into a single mono 16-kHz WAV the
+/// `<audio>` element can play. Mixes equal-weight when both streams are
+/// present; copies the byte stream when only one exists. Equal weight
+/// is the right default — the user is more interested in hearing both
+/// sides at the same level than in any acoustic faithfulness, and the
+/// upstream streams have already gone through their own gain stages.
+async fn build_playback_wav(
+    mic: Option<&std::path::Path>,
+    sys: Option<&std::path::Path>,
+    out: &std::path::Path,
+) -> anyhow::Result<()> {
+    match (mic, sys) {
+        (Some(m), Some(s)) => {
+            let mic_samples = wav::read_f32_mono_16k(m).await?;
+            let sys_samples = wav::read_f32_mono_16k(s).await?;
+            let n = mic_samples.len().max(sys_samples.len());
+            let mut mixed = Vec::with_capacity(n);
+            for i in 0..n {
+                let a = mic_samples.get(i).copied().unwrap_or(0.0);
+                let b = sys_samples.get(i).copied().unwrap_or(0.0);
+                mixed.push((a + b) * 0.5);
+            }
+            wav::write_pcm16_mono_16k(out, &mixed).await?;
+        }
+        (Some(m), None) => {
+            tokio::fs::copy(m, out).await?;
+        }
+        (None, Some(s)) => {
+            tokio::fs::copy(s, out).await?;
+        }
+        (None, None) => {}
+    }
+    Ok(())
+}
+
+/// Serialise the chunk log as a per-turn JSONL. Mirrors how
+/// `build_labelled_transcript` groups chunks: same-label runs collapse
+/// into one entry whose `start_ms` is the first chunk's start. Runs
+/// dedup first so an echoed mic chunk doesn't generate a phantom turn
+/// that would never align with audio.
+fn serialize_timeline(
+    chunks: &[ChunkRecord],
+    label_for: &dyn Fn(&ChunkRecord) -> Option<String>,
+) -> String {
+    let kept = dedup_mic_against_sys(chunks);
+    let mut sorted: Vec<&ChunkRecord> = kept.iter().collect();
+    sorted.sort_by_key(|c| {
+        let source_rank = match c.source {
+            ChunkSource::Mic => 0,
+            ChunkSource::Sys => 1,
+        };
+        (c.start_ms, source_rank)
+    });
+
+    struct Turn {
+        start_ms: u64,
+        label: String,
+        text: String,
+    }
+    let mut turns: Vec<Turn> = Vec::new();
+
+    for chunk in &sorted {
+        let trimmed = chunk.text.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let label = label_for(chunk).unwrap_or_default();
+        match turns.last_mut() {
+            Some(t) if t.label == label => {
+                t.text.push(' ');
+                t.text.push_str(trimmed);
+            }
+            _ => turns.push(Turn {
+                start_ms: chunk.start_ms,
+                label,
+                text: trimmed.to_string(),
+            }),
+        }
+    }
+
+    let mut out = String::new();
+    for t in &turns {
+        let entry = serde_json::json!({
+            "start_ms": t.start_ms,
+            "label": t.label,
+            "text": t.text,
+        });
+        out.push_str(&entry.to_string());
+        out.push('\n');
+    }
+    out
 }
 
 /// Containment coefficient: |A ∩ B| / min(|A|, |B|). 1.0 when A ⊆ B
