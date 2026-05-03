@@ -537,6 +537,111 @@ pub fn note_timeline(app: AppHandle, note_id: String) -> Result<Vec<TimelineEntr
     Ok(out)
 }
 
+/// Override the speaker label for a single chunk in the timeline,
+/// then rebuild `note.transcript` from the updated timeline so the
+/// saved text reflects the change. Used when the user clicks a chunk
+/// pill to cycle through speakers — handles cases where diarize
+/// merged or split turns incorrectly.
+///
+/// `chunk_idx` is the 0-based line index in timeline.jsonl. We
+/// identify by index (not start_ms) because two chunks could in
+/// principle land at the same start_ms, and the file is the source of
+/// truth for ordering anyway.
+#[tauri::command]
+pub fn note_timeline_set_chunk_label(
+    app: AppHandle,
+    note_id: String,
+    chunk_idx: usize,
+    new_label: String,
+) -> Result<(), String> {
+    let path = app
+        .path()
+        .app_data_dir()
+        .map_err(err)?
+        .join("recordings")
+        .join(&note_id)
+        .join("timeline.jsonl");
+    if !path.exists() {
+        return Err("no timeline for this note".to_string());
+    }
+    let content = std::fs::read_to_string(&path).map_err(|e| format!("read timeline: {e}"))?;
+
+    // Parse all entries first so we can rewrite the file atomically
+    // and rebuild the transcript from the same structure. Skip
+    // malformed lines on read so a corrupt entry doesn't poison the
+    // whole rename — they get dropped, not preserved (the alternative
+    // is rendering them in the file but not the transcript, which is
+    // worse).
+    let mut entries: Vec<serde_json::Value> = Vec::new();
+    for line in content.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+            entries.push(v);
+        }
+    }
+    if chunk_idx >= entries.len() {
+        return Err(format!(
+            "chunk_idx {chunk_idx} out of bounds (timeline has {} entries)",
+            entries.len()
+        ));
+    }
+    entries[chunk_idx]["label"] = serde_json::Value::String(new_label);
+
+    // Write timeline back.
+    let mut out = String::with_capacity(content.len());
+    for v in &entries {
+        out.push_str(&v.to_string());
+        out.push('\n');
+    }
+    std::fs::write(&path, out).map_err(|e| format!("write timeline: {e}"))?;
+
+    // Rebuild the DB transcript from the updated timeline. Group
+    // consecutive same-label entries into one line, exactly the way
+    // build_labelled_transcript would. This keeps note.transcript in
+    // sync so summaries + the textarea edit view see the relabel.
+    let mut transcript = String::new();
+    let mut last_label: Option<String> = None;
+    for v in &entries {
+        let label = v
+            .get("label")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string();
+        let text = v.get("text").and_then(|s| s.as_str()).unwrap_or("").trim();
+        if text.is_empty() {
+            continue;
+        }
+        if last_label.as_deref() != Some(label.as_str()) {
+            if !transcript.is_empty() {
+                transcript.push('\n');
+            }
+            if !label.is_empty() {
+                transcript.push_str(&format!("{label}: "));
+            }
+            last_label = Some(label);
+        } else {
+            transcript.push(' ');
+        }
+        transcript.push_str(text);
+    }
+
+    {
+        let state: State<AppState> = app.state();
+        let conn = state.db.lock();
+        db::set_transcript(&conn, &note_id, &transcript).map_err(err)?;
+    }
+    let _ = app.emit(
+        "transcript_replaced",
+        TranscriptPayload {
+            note_id: note_id.clone(),
+            text: transcript,
+        },
+    );
+    Ok(())
+}
+
 /// Rewrite every timeline entry whose label exactly matches `old_label`
 /// to use `new_label` instead. Mirrors the regex line-anchored rename
 /// the frontend already does on `note.transcript`, so the player view's

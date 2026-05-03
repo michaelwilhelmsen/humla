@@ -471,7 +471,9 @@ export function Note() {
                 {devMode && <DiagnosticsLinks noteId={draft.id} />}
                 {playbackUrl && timeline.length > 0 ? (
                   <TranscriptPlayer
+                    noteId={draft.id}
                     timeline={timeline}
+                    setTimeline={setTimeline}
                     playbackUrl={playbackUrl}
                     transcript={draft.transcript}
                     onChange={(v) => patch("transcript", v)}
@@ -1076,13 +1078,17 @@ function TranscriptView({
 // trade-off for v1; the alternative (chunk-level edit UI) is a much
 // bigger refactor.
 function TranscriptPlayer({
+  noteId,
   timeline,
+  setTimeline,
   playbackUrl,
   transcript,
   onChange,
   disabled,
 }: {
+  noteId: string;
   timeline: TimelineEntry[];
+  setTimeline: React.Dispatch<React.SetStateAction<TimelineEntry[]>>;
   playbackUrl: string;
   transcript: string;
   onChange: (v: string) => void;
@@ -1145,6 +1151,30 @@ function TranscriptPlayer({
     a.play().catch(() => {});
   }
 
+  // Click a chunk pill to cycle to the next known speaker. The set
+  // of known speakers is whatever currently appears in the timeline,
+  // so the user can reach any label they've already named without
+  // typing — and after a re-diarize gives them a couple of base
+  // speakers, they can rename one in the chip strip and then cycle
+  // chunks onto it.
+  async function cycleChunkLabel(idx: number) {
+    if (disabled) return;
+    const labels = Array.from(new Set(timeline.map((e) => e.label).filter(Boolean)));
+    if (labels.length < 2) return;
+    const current = timeline[idx].label;
+    const at = labels.indexOf(current);
+    const next = labels[(at + 1) % labels.length] ?? labels[0];
+    if (next === current) return;
+    setTimeline((tl) =>
+      tl.map((e, i) => (i === idx ? { ...e, label: next } : e)),
+    );
+    try {
+      await ipc.noteTimelineSetChunkLabel(noteId, idx, next);
+    } catch (err) {
+      console.error("noteTimelineSetChunkLabel failed", err);
+    }
+  }
+
   const showEditor = editing && !disabled;
 
   return (
@@ -1192,37 +1222,52 @@ function TranscriptPlayer({
           {timeline.map((entry, i) => {
             const isActive = i === activeIdx;
             const color = entry.label ? colors.get(entry.label) : undefined;
-            // Show the speaker pill only when the label changes from
-            // the previous chunk. Per-chunk timeline entries mean a
-            // single speaker turn can span many rows, and repeating
-            // the pill on every row reads as visual noise. The first
-            // row always gets a pill.
-            const prevLabel = i > 0 ? timeline[i - 1].label : null;
-            const showPill = !!entry.label && !!color && entry.label !== prevLabel;
+            const labelCount = new Set(
+              timeline.map((e) => e.label).filter(Boolean),
+            ).size;
+            const cyclable = labelCount >= 2 && !!entry.label;
             return (
-              <button
-                type="button"
+              <div
                 key={i}
                 data-idx={i}
-                onClick={() => seek(entry.start_ms)}
-                title="Click to play from here"
                 className={
-                  "text-left px-2 py-1 rounded transition-colors " +
+                  "flex items-start gap-1 px-2 py-1 rounded transition-colors " +
                   (isActive
                     ? "bg-[var(--color-pill-hover)] text-[var(--color-text)]"
                     : "hover:bg-[var(--color-pill-hover)]")
                 }
               >
-                {showPill && (
-                  <span
-                    className="nd-speaker-pill mr-2"
+                {entry.label && color && (
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      void cycleChunkLabel(i);
+                    }}
+                    disabled={!cyclable || disabled}
+                    title={
+                      cyclable
+                        ? "Click to assign this chunk to the next speaker"
+                        : entry.label
+                    }
+                    className={
+                      "nd-speaker-pill shrink-0 " +
+                      (cyclable ? "cursor-pointer hover:opacity-80" : "cursor-default")
+                    }
                     style={{ background: color }}
                   >
                     {entry.label}
-                  </span>
+                  </button>
                 )}
-                {entry.text}
-              </button>
+                <button
+                  type="button"
+                  onClick={() => seek(entry.start_ms)}
+                  title="Click to play from here"
+                  className="text-left flex-1 nd-bare cursor-text"
+                >
+                  {entry.text}
+                </button>
+              </div>
             );
           })}
         </div>

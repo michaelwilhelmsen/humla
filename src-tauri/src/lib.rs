@@ -100,6 +100,7 @@ pub fn run() {
             commands::note_playback_path,
             commands::note_timeline,
             commands::note_timeline_rename,
+            commands::note_timeline_set_chunk_label,
             commands::open_in_finder,
             commands::rediarize_note,
             commands::summary_prompts_list,
