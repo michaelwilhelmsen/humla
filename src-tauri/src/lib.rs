@@ -81,6 +81,7 @@ pub fn run() {
             commands::folders_delete,
             commands::settings_get,
             commands::settings_set,
+            commands::app_data_dir,
             commands::api_key_get,
             commands::api_key_set,
             commands::api_key_test,

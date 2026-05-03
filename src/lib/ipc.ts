@@ -41,6 +41,7 @@ export type SettingsKey =
   | "local_whisper_model"
   | "local_whisper_use_gpu"
   | "final_pass"
+  | "default_summary_preset"
   | "custom_vocabulary"
   | "summary_model"
   | "summary_prompt"
@@ -105,6 +106,7 @@ export const ipc = {
 
   getSetting: (key: SettingsKey) => invoke<string | null>("settings_get", { key }),
   setSetting: (key: SettingsKey, value: string) => invoke<void>("settings_set", { key, value }),
+  appDataDir: () => invoke<string>("app_data_dir"),
 
   getApiKey: () => invoke<string | null>("api_key_get"),
   setApiKey: (key: string) => invoke<void>("api_key_set", { key }),

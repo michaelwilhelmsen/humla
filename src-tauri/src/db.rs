@@ -129,13 +129,17 @@ pub fn get_note(conn: &Connection, id: &str) -> Result<Note> {
     Ok(n)
 }
 
-pub fn create_note(conn: &Connection, default_language: &str) -> Result<Note> {
+pub fn create_note(
+    conn: &Connection,
+    default_language: &str,
+    default_preset: &str,
+) -> Result<Note> {
     let id = uuid::Uuid::new_v4().to_string();
     let now = now_ms();
     conn.execute(
         "INSERT INTO notes (id, title, body, transcript, summary, audio_path, summary_preset, folder_id, language, summary_provider, expected_speakers, created_at, updated_at)
-         VALUES (?1, '', '', '', '', NULL, 'meeting', NULL, ?2, '', NULL, ?3, ?3)",
-        params![id, default_language, now],
+         VALUES (?1, '', '', '', '', NULL, ?2, NULL, ?3, '', NULL, ?4, ?4)",
+        params![id, default_preset, default_language, now],
     )?;
     get_note(conn, &id)
 }

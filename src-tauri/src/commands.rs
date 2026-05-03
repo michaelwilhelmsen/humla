@@ -91,14 +91,25 @@ pub fn notes_get(state: State<AppState>, id: String) -> Result<Note, String> {
 #[tauri::command]
 pub fn notes_create(state: State<AppState>) -> Result<Note, String> {
     let conn = state.db.lock();
-    // New notes inherit the current global language as their default. The
-    // user can change this per-note from the note view; existing notes
-    // pre-feature have an empty language and fall back to the global at
-    // transcribe / summary time.
+    // New notes inherit the user's defaults for language + summary preset.
+    // Both are overridable per-note from the note view; pre-feature notes
+    // (empty language) fall back at transcribe / summary time.
     let default_language = db::get_setting(&conn, "language")
         .map_err(err)?
         .unwrap_or_else(|| DEFAULT_LANGUAGE.to_string());
-    db::create_note(&conn, &default_language).map_err(err)
+    let default_preset = db::get_setting(&conn, "default_summary_preset")
+        .map_err(err)?
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "meeting".to_string());
+    db::create_note(&conn, &default_language, &default_preset).map_err(err)
+}
+
+#[tauri::command]
+pub fn app_data_dir(app: AppHandle) -> Result<String, String> {
+    let path = app.path().app_data_dir().map_err(err)?;
+    path.to_str()
+        .map(|s| s.to_string())
+        .ok_or_else(|| "non-utf8 path".to_string())
 }
 
 #[tauri::command]
