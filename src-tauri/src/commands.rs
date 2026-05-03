@@ -2323,6 +2323,57 @@ fn dedup_mic_against_sys(chunks: &[ChunkRecord]) -> Vec<ChunkRecord> {
         .filter(|c| c.source == ChunkSource::Sys)
         .collect();
 
+    // Safety brake: if dedup would drop nearly every mic chunk, the
+    // setup violates our assumption (mic = user's voice, sys = remote
+    // side). Common shapes: virtual loopback routing mic → sys,
+    // recording yourself listening to a podcast on speakers loud
+    // enough that the mic doubles as a sys mic, or any other case
+    // where the two streams carry the same source. In those cases
+    // dropping mic throws away the user's voice and labels their
+    // monologue with the diarizer's split of an audio signal that
+    // happens to look like 2 speakers. Better to leave both streams
+    // alone and accept duplicate-turn rendering than to silently drop
+    // the user's voice.
+    const SKIP_DEDUP_DROP_RATIO: f32 = 0.75;
+    let mic_count = chunks.iter().filter(|c| c.source == ChunkSource::Mic).count();
+    let mut would_drop = 0usize;
+    if mic_count >= 4 {
+        for chunk in chunks.iter().filter(|c| c.source == ChunkSource::Mic) {
+            let mic_tokens = normalize_tokens(&chunk.text);
+            if mic_tokens.len() < MIN_MIC_TOKENS {
+                continue;
+            }
+            let lower = chunk.start_ms.saturating_sub(PRE_MS);
+            let upper = chunk.start_ms.saturating_add(POST_MS);
+            let mut sys_window = String::new();
+            for s in &sys_chunks {
+                if s.start_ms >= lower && s.start_ms <= upper {
+                    if !sys_window.is_empty() {
+                        sys_window.push(' ');
+                    }
+                    sys_window.push_str(&s.text);
+                }
+            }
+            if sys_window.is_empty() {
+                continue;
+            }
+            let sim = token_containment(&mic_tokens, &normalize_tokens(&sys_window));
+            if sim >= SIMILARITY_THRESHOLD {
+                would_drop += 1;
+            }
+        }
+        let drop_ratio = would_drop as f32 / mic_count as f32;
+        if drop_ratio >= SKIP_DEDUP_DROP_RATIO {
+            eprintln!(
+                "dedup: would drop {}/{} mic chunks ({:.0}%) — skipping dedup; mic and sys streams appear to carry the same source",
+                would_drop,
+                mic_count,
+                drop_ratio * 100.0,
+            );
+            return chunks.to_vec();
+        }
+    }
+
     let mut kept: Vec<ChunkRecord> = Vec::with_capacity(chunks.len());
     for chunk in chunks {
         if chunk.source != ChunkSource::Mic {
@@ -3784,6 +3835,34 @@ mod diarize_tests {
         let out = build_labelled_transcript(&chunks, &labeller);
         assert!(out.contains("You: the proposal is to extend"));
         assert!(out.contains("Speaker 1: the proposal is to extend"));
+    }
+
+    #[test]
+    fn dedup_skips_when_almost_all_mic_chunks_would_drop() {
+        // The user-reported case: mic and sys streams carry the same source
+        // (loopback / podcast-on-speakers / etc), text is near-identical
+        // across both. Dedup must NOT silently drop every mic chunk —
+        // that throws away the user's voice and labels their monologue
+        // with whatever sortformer found in the sys stream. Safety
+        // brake at 75% drop ratio keeps both streams intact instead.
+        let chunks = vec![
+            mic(0, "this is the first thing I am saying about politics"),
+            sys(20, "this is the first thing I am saying about politics"),
+            mic(3000, "and now the second thing about media coverage"),
+            sys(3020, "and now the second thing about media coverage"),
+            mic(6000, "third point on commentary today"),
+            sys(6020, "third point on commentary today"),
+            mic(9000, "fourth and final remark on the topic"),
+            sys(9020, "fourth and final remark on the topic"),
+        ];
+        let labeller = |c: &ChunkRecord| match c.source {
+            ChunkSource::Mic => Some("You".to_string()),
+            ChunkSource::Sys => Some("Speaker 1".to_string()),
+        };
+        let out = build_labelled_transcript(&chunks, &labeller);
+        // All mic chunks survive — "You" must appear.
+        assert!(out.contains("You: this is the first thing"));
+        assert!(out.contains("You: and now the second thing"));
     }
 
     #[test]
