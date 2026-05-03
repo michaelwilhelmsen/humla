@@ -115,6 +115,7 @@ export function RecordingBar({ noteId }: { noteId: string }) {
 
       {phase === "starting" && <BusyPill label="Starting" />}
       {phase === "stopping" && <BusyPill label="Stopping" />}
+      {phase === "retranscribing" && <BusyPill label="Re-transcribing" />}
       {phase === "diarizing" && <BusyPill label="Diarizing" />}
       {phase === "polishing" && <BusyPill label="Polishing" />}
       {phase === "summarizing" && <BusyPill label="Summarizing" />}

@@ -22,6 +22,7 @@ const DEFAULTS: Record<EditableKey, string> = {
   transcribe_provider: "openai",
   transcribe_model: "whisper-1",
   whisper_preset: "quality",
+  final_pass: "true",
   custom_vocabulary: "",
   summary_model: "gpt-5.4-mini",
   summary_prompt: SUMMARY_PRESETS[0].prompt_no,
@@ -410,6 +411,28 @@ export function Settings() {
                 an aggressive no-speech threshold so almost no segments are
                 silently dropped — best for meetings and dense speech. Fast
                 falls back to greedy decoding for live-caption snappiness.
+              </p>
+            </Row>
+          )}
+          {provider === "local" && (
+            <Row label="Final pass">
+              <label className="flex items-center gap-2 cursor-pointer text-sm">
+                <input
+                  type="checkbox"
+                  checked={s.final_pass === "true"}
+                  onChange={(e) =>
+                    update("final_pass", e.target.checked ? "true" : "false")
+                  }
+                />
+                Re-transcribe the full audio after recording stops
+              </label>
+              <p className="text-xs text-[var(--color-text-muted)] mt-2">
+                When the recording ends, runs Whisper once over the saved
+                audio with its native 30-second sliding window. Removes
+                chunk-boundary cuts and breaks repetition loops that
+                contaminated the live transcript. Local model only — adds
+                roughly 1 minute of post-stop processing per 10 minutes of
+                recording.
               </p>
             </Row>
           )}

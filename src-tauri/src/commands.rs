@@ -19,6 +19,12 @@ const DEFAULT_LANGUAGE: &str = "no";
 const DEFAULT_TRANSCRIBE_PROVIDER: &str = "openai";
 const DEFAULT_TRANSCRIBE_MODEL: &str = "whisper-1";
 const DEFAULT_WHISPER_PRESET: &str = "quality";
+// Final pass: re-transcribe the whole recording from the saved full WAV
+// after stop, instead of trusting the live chunked output. Default ON for
+// new installs because it's the higher-quality path; the user can turn it
+// off in Settings if they're on a slow machine or want immediate transcripts.
+// Local provider only at the moment (cloud gets a no-op).
+const DEFAULT_FINAL_PASS: &str = "true";
 const DEFAULT_SUMMARY_MODEL: &str = "gpt-5.4-mini";
 // Ollama's default port + OpenAI-compat path. Any user running LM Studio,
 // llama-server, or vLLM will override this in Settings.
@@ -754,18 +760,45 @@ pub async fn recording_stop(
     let _ = tokio::time::timeout(std::time::Duration::from_secs(30), drain).await;
 
     // Spawn the post-stop processing chain in the background:
-    //   Stopping → Diarizing → Polishing → Idle
-    // Diarization runs offline on the full recording so FluidAudio can
-    // cluster across the entire audio at once (per-chunk classification
-    // drifted on long recordings). Polish picks up the now-diarized
-    // transcript and gets a strict "preserve speaker labels" rule.
+    //   Stopping → (Retranscribing | Diarizing) → Polishing → Idle
+    // Branch on the `final_pass` setting: when enabled (and provider is
+    // local), retranscribe the full WAV and rebuild the transcript with
+    // segment-level speaker labels. Otherwise apply chunk-level labels
+    // to the live transcript via the original diarize-only path. Polish
+    // runs in either case as a strict typo-and-punctuation cleanup.
     let app_for_post = app.clone();
     let note_for_post = note_id.clone();
     tokio::spawn(async move {
-        if let Err(e) = diarize_and_apply(app_for_post.clone(), note_for_post.clone()).await {
-            // Non-fatal: a diarize failure leaves the plain transcript
-            // intact. Log + surface a soft toast so the user knows why
-            // they don't see speaker labels.
+        let use_final_pass = {
+            let state: State<AppState> = app_for_post.state();
+            let conn = state.db.lock();
+            let enabled = db::get_setting(&conn, "final_pass")
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| DEFAULT_FINAL_PASS.to_string());
+            let provider = db::get_setting(&conn, "transcribe_provider")
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| DEFAULT_TRANSCRIBE_PROVIDER.to_string());
+            enabled == "true" && provider == "local"
+        };
+        if use_final_pass {
+            if let Err(e) = final_pass_apply(app_for_post.clone(), note_for_post.clone()).await {
+                // Final pass failure leaves the live chunked transcript in
+                // place — the user keeps content. Surface a toast and fall
+                // through to chunk-based diarization so they still get
+                // speaker labels.
+                eprintln!("final_pass_apply: {e}");
+                emit_error(
+                    &app_for_post,
+                    Some(&note_for_post),
+                    &format!("Final pass failed (live transcript saved): {e}"),
+                );
+                if let Err(e2) = diarize_and_apply(app_for_post.clone(), note_for_post.clone()).await {
+                    eprintln!("diarize_and_apply (fallback): {e2}");
+                }
+            }
+        } else if let Err(e) = diarize_and_apply(app_for_post.clone(), note_for_post.clone()).await {
             eprintln!("diarize_and_apply: {e}");
             emit_error(
                 &app_for_post,
@@ -1007,6 +1040,256 @@ async fn diarize_and_apply(app: AppHandle, note_id: String) -> anyhow::Result<()
     // Free the full.wav files ahead of the temp-dir cleanup. Best-effort.
     if let Some(p) = mic_wav { diarize::cleanup_full_wav(&p).await; }
     if let Some(p) = sys_wav { diarize::cleanup_full_wav(&p).await; }
+    Ok(())
+}
+
+/// Re-transcribe the saved full WAV(s) end-to-end, then re-label using the
+/// offline diarizer's speaker segments and the new whisper segment
+/// timestamps. Replaces the live chunked transcript wholesale.
+///
+/// Why bother when chunked already produced a transcript: the live path
+/// invokes Whisper once per VAD-bounded chunk (1.0–15s) with the previous
+/// chunks' text fed back as `initial_prompt`. That is necessary for live
+/// UX but two failure modes show up in the saved transcript:
+///   1. Chunk-boundary cuts. A word straddling a 15s boundary gets sliced
+///      and Whisper re-decodes the trailing fragment in the next chunk.
+///   2. Loop amplification. A low-SNR chunk decoding "X X X" pollutes the
+///      trail; the next chunk sees "X X X" as prior context and decodes
+///      more of the same. Repetition collapse can run for the rest of
+///      the recording.
+/// Re-transcribing the full WAV at stop time gives Whisper its native
+/// 30-second sliding window with internal context across the entire
+/// recording. Effectively free on local (large-v3-turbo runs ~10× realtime
+/// on Apple Silicon, so a 30-minute meeting re-transcribes in ~3 minutes
+/// during the existing post-stop window).
+///
+/// Branches the same way as `diarize_and_apply`:
+///   - mic only → diarize mic, label every whisper segment via segment time
+///   - sys only → diarize sys, same pattern
+///   - both → mic segments labelled `You:` (channel attribution); sys
+///     segments diarized for remote-side speakers
+///
+/// No-ops gracefully when the model isn't downloaded, the user disabled
+/// final_pass, the active provider isn't local, or no full WAV survived.
+/// Failure leaves the live (chunked) transcript intact so the user never
+/// loses content — they just don't get the cleanup pass.
+async fn final_pass_apply(app: AppHandle, note_id: String) -> anyhow::Result<()> {
+    // Setting + provider gate. Cloud OpenAI isn't supported yet because the
+    // verbose_json segment-with-timestamp variant needs a separate request
+    // path; planned for a follow-up.
+    let (enabled, provider) = {
+        let state: State<AppState> = app.state();
+        let conn = state.db.lock();
+        let enabled = db::get_setting(&conn, "final_pass")?
+            .unwrap_or_else(|| DEFAULT_FINAL_PASS.to_string());
+        let provider = db::get_setting(&conn, "transcribe_provider")?
+            .unwrap_or_else(|| DEFAULT_TRANSCRIBE_PROVIDER.to_string());
+        (enabled, provider)
+    };
+    if enabled != "true" || provider != "local" {
+        return Ok(());
+    }
+
+    // Pull paths + transcribe config in one DB pass so the long awaits
+    // below don't hold any locks.
+    let (mic_wav, sys_wav, snapshot, expected_speakers, language, whisper_preset, vocabulary) = {
+        let state: State<AppState> = app.state();
+        let session = state.recording.lock();
+        let mic = session.mic_full_wav_path.lock().clone();
+        let sys = session.sys_full_wav_path.lock().clone();
+        let snap = session.transcript_at_start.lock().clone();
+        drop(session);
+        let conn = state.db.lock();
+        let global_language = db::get_setting(&conn, "language")?
+            .unwrap_or_else(|| DEFAULT_LANGUAGE.to_string());
+        let note = db::get_note(&conn, &note_id)?;
+        let lang = if note.language.trim().is_empty() {
+            global_language
+        } else {
+            note.language
+        };
+        let hint = note.expected_speakers.filter(|n| *n > 0);
+        let preset = db::get_setting(&conn, "whisper_preset")?
+            .unwrap_or_else(|| DEFAULT_WHISPER_PRESET.to_string());
+        let vocab = db::get_setting(&conn, "custom_vocabulary")?.unwrap_or_default();
+        (mic, sys, snap, hint, lang, preset, vocab)
+    };
+
+    if mic_wav.is_none() && sys_wav.is_none() {
+        // Sidecar SIGKILL'd before either full WAV got finalized. Live
+        // transcript stays as written.
+        eprintln!("final_pass: no full WAV present, skipping");
+        return Ok(());
+    }
+
+    emit_status(&app, Some(&note_id), Phase::Retranscribing);
+
+    let model_path = local_model_path(&app).map_err(|e| anyhow::anyhow!(e))?;
+    let shared = {
+        let state: State<AppState> = app.state();
+        state.whisper.clone()
+    };
+    let preset = local_whisper::Preset::from_setting(&whisper_preset);
+    // No trail snapshot here — whisper's own 30s sliding window handles
+    // context across the full file, and there's no prior chunk to
+    // condition on.
+    let prompt = build_initial_prompt(&vocabulary, None);
+
+    let mic_segs: Vec<local_whisper::TextSegment> = if let Some(p) = mic_wav.as_ref() {
+        local_whisper::transcribe_file_segments(
+            shared.clone(),
+            model_path.clone(),
+            &language,
+            prompt.as_deref(),
+            preset,
+            p,
+        )
+        .await?
+    } else {
+        Vec::new()
+    };
+    let sys_segs: Vec<local_whisper::TextSegment> = if let Some(p) = sys_wav.as_ref() {
+        local_whisper::transcribe_file_segments(
+            shared.clone(),
+            model_path.clone(),
+            &language,
+            prompt.as_deref(),
+            preset,
+            p,
+        )
+        .await?
+    } else {
+        Vec::new()
+    };
+
+    // Convert whisper segments into ChunkRecord shape so we can reuse
+    // build_labelled_transcript and assign_speaker as-is. Same data flow
+    // as the chunked path; only the source of timing + text differs.
+    let mut chunks: Vec<ChunkRecord> = Vec::with_capacity(mic_segs.len() + sys_segs.len());
+    chunks.extend(mic_segs.into_iter().map(|s| ChunkRecord {
+        source: ChunkSource::Mic,
+        start_ms: s.start_ms,
+        text: s.text,
+    }));
+    chunks.extend(sys_segs.into_iter().map(|s| ChunkRecord {
+        source: ChunkSource::Sys,
+        start_ms: s.start_ms,
+        text: s.text,
+    }));
+
+    if chunks.is_empty() {
+        eprintln!("final_pass: whisper returned zero segments, skipping");
+        return Ok(());
+    }
+
+    let mic_present = chunks.iter().any(|c| c.source == ChunkSource::Mic);
+    let sys_present = chunks.iter().any(|c| c.source == ChunkSource::Sys);
+
+    // Skip diarization gracefully when the model isn't installed — drop to
+    // a single label per stream rather than failing the whole final pass.
+    let diarize_available = matches!(diarize::status(&app).await, Ok(s) if s.downloaded);
+
+    type Labeller = dyn Fn(&ChunkRecord) -> Option<String> + Send;
+    let label_for_chunk: Box<Labeller> = match (mic_present, sys_present) {
+        (true, false) => {
+            if diarize_available {
+                let Some(wav) = mic_wav.clone() else {
+                    eprintln!("final_pass: mic segments present but mic_full.wav missing");
+                    return Ok(());
+                };
+                let segments = diarize::diarize_file(&app, &wav, expected_speakers).await?;
+                if segments.is_empty() {
+                    Box::new(|_: &ChunkRecord| Some("Speaker 1".to_string()))
+                } else {
+                    let display_map = build_display_map(&chunks, &segments, ChunkSource::Mic);
+                    Box::new(move |c: &ChunkRecord| {
+                        let sid = assign_speaker(c.start_ms, &segments)?;
+                        display_map.get(sid).map(|n| format!("Speaker {n}"))
+                    })
+                }
+            } else {
+                Box::new(|_: &ChunkRecord| Some("Speaker 1".to_string()))
+            }
+        }
+        (false, true) => {
+            if diarize_available {
+                let Some(wav) = sys_wav.clone() else {
+                    eprintln!("final_pass: sys segments present but sys_full.wav missing");
+                    return Ok(());
+                };
+                let segments = diarize::diarize_file(&app, &wav, expected_speakers).await?;
+                if segments.is_empty() {
+                    Box::new(|_: &ChunkRecord| Some("Speaker 1".to_string()))
+                } else {
+                    let display_map = build_display_map(&chunks, &segments, ChunkSource::Sys);
+                    Box::new(move |c: &ChunkRecord| {
+                        let sid = assign_speaker(c.start_ms, &segments)?;
+                        display_map.get(sid).map(|n| format!("Speaker {n}"))
+                    })
+                }
+            } else {
+                Box::new(|_: &ChunkRecord| Some("Speaker 1".to_string()))
+            }
+        }
+        (true, true) => {
+            // Remote/hybrid: mic = "You" (channel attribution); sys gets
+            // diarized for remote-side speakers. Same shape as the
+            // chunked path.
+            let sys_speaker_hint = expected_speakers.map(|n| (n - 1).max(1));
+            let sys_segments = if diarize_available {
+                if let Some(p) = sys_wav.as_ref() {
+                    diarize::diarize_file(&app, p, sys_speaker_hint)
+                        .await
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            };
+            if sys_segments.is_empty() {
+                Box::new(move |c: &ChunkRecord| match c.source {
+                    ChunkSource::Mic => Some("You".to_string()),
+                    ChunkSource::Sys => Some("Speaker 1".to_string()),
+                })
+            } else {
+                let sys_display_map = build_display_map(&chunks, &sys_segments, ChunkSource::Sys);
+                Box::new(move |c: &ChunkRecord| match c.source {
+                    ChunkSource::Mic => Some("You".to_string()),
+                    ChunkSource::Sys => {
+                        let sid = assign_speaker(c.start_ms, &sys_segments)?;
+                        sys_display_map.get(sid).map(|n| format!("Speaker {n}"))
+                    }
+                })
+            }
+        }
+        (false, false) => unreachable!("chunks.is_empty() returned earlier"),
+    };
+
+    let new_session = build_labelled_transcript(&chunks, label_for_chunk.as_ref());
+    let combined = combine_with_snapshot(&snapshot, &new_session);
+    if combined.trim().is_empty() {
+        return Ok(());
+    }
+    {
+        let state: State<AppState> = app.state();
+        let conn = state.db.lock();
+        db::set_transcript(&conn, &note_id, &combined)?;
+    }
+    let _ = app.emit(
+        "transcript_replaced",
+        TranscriptPayload {
+            note_id: note_id.clone(),
+            text: combined,
+        },
+    );
+
+    if let Some(p) = mic_wav {
+        diarize::cleanup_full_wav(&p).await;
+    }
+    if let Some(p) = sys_wav {
+        diarize::cleanup_full_wav(&p).await;
+    }
     Ok(())
 }
 
@@ -1299,6 +1582,14 @@ async fn transcribe_chunk(
         }
     };
     if is_likely_hallucination(&text, &cfg.language) {
+        return Ok(());
+    }
+    // Drop chunks dominated by N-gram repetition (Whisper collapse). Letting
+    // them land in the transcript is bad on its own, but worse: the trail-
+    // prompt feeds the loop forward into the next chunk's `initial_prompt`
+    // and the loop self-sustains for the rest of the recording.
+    if is_repetition_collapse(&text) {
+        eprintln!("transcribe: dropping repetition-collapsed chunk");
         return Ok(());
     }
     // Whisper was trained on closed-caption data and frequently appends
@@ -1957,6 +2248,60 @@ fn is_likely_hallucination(text: &str, language: &str) -> bool {
     FRAGMENTS.iter().any(|f| lower.contains(f))
 }
 
+/// Detect a chunk whose output is dominated by N-gram repetition — Whisper's
+/// well-known low-SNR failure mode where one phrase decodes ≥3 consecutive
+/// times. The contaminated chunk should be dropped; if it lands in the
+/// transcript, the trail-prompt mechanism then feeds the loop into the next
+/// chunk and the recording's tail becomes unrecoverable.
+///
+/// Heuristic: scan phrase lengths 1..=7. For each, look for the longest
+/// run of consecutive identical (case-insensitive, punctuation-stripped)
+/// occurrences. Flag the chunk when:
+///   - some phrase repeats ≥4 times in a row, OR
+///   - some phrase repeats ≥3 times AND covers ≥60% of the chunk's words.
+///
+/// The double rule keeps "yes yes yes" or "ja ja ja" mid-conversation from
+/// being dropped — a 3-rep tiny chunk is plausibly real speech, but a 3-rep
+/// run dominating a longer chunk is collapse.
+fn is_repetition_collapse(text: &str) -> bool {
+    let words: Vec<String> = text
+        .split_whitespace()
+        .map(|w| {
+            w.trim_matches(|c: char| !c.is_alphanumeric())
+                .to_lowercase()
+        })
+        .filter(|w| !w.is_empty())
+        .collect();
+    let n = words.len();
+    if n < 6 {
+        return false;
+    }
+    for phrase_len in 1..=7 {
+        if n < phrase_len * 3 {
+            continue;
+        }
+        let mut start = 0;
+        while start + phrase_len <= n {
+            let mut reps = 1;
+            let mut pos = start + phrase_len;
+            while pos + phrase_len <= n
+                && words[pos..pos + phrase_len] == words[start..start + phrase_len]
+            {
+                reps += 1;
+                pos += phrase_len;
+            }
+            if reps >= 4 {
+                return true;
+            }
+            if reps >= 3 && (phrase_len * reps) * 5 >= n * 3 {
+                return true;
+            }
+            start = pos.max(start + 1);
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod diarize_tests {
     use super::*;
@@ -2216,5 +2561,56 @@ mod diarize_tests {
             combine_with_snapshot(snap, new),
             "Michael: prior\nWilma: prior\nSpeaker 1: new"
         );
+    }
+}
+
+#[cfg(test)]
+mod repetition_tests {
+    use super::*;
+
+    #[test]
+    fn collapse_detects_long_phrase_loop() {
+        // The exact pattern from the user-reported screenshot: "Er det en
+        // bok?" repeated dozens of times.
+        let s = "Er det en bok? ".repeat(20);
+        assert!(is_repetition_collapse(&s));
+    }
+
+    #[test]
+    fn collapse_detects_single_word_loop() {
+        let s = "yes yes yes yes yes yes yes yes";
+        assert!(is_repetition_collapse(s));
+    }
+
+    #[test]
+    fn collapse_passes_normal_speech() {
+        // Real-world Norwegian sample with no repetition collapse.
+        let s = "Vi har en avtale i morgen klokken ti om prosjektet vi diskuterte forrige uke.";
+        assert!(!is_repetition_collapse(s));
+    }
+
+    #[test]
+    fn collapse_passes_natural_three_rep_short() {
+        // Three short reps in a 6-word total chunk are below the dominance
+        // threshold (need ≥4 reps OR ≥60% coverage). 6 words, 3 reps × 1
+        // word = 50% coverage — passes.
+        let s = "ja ja ja det stemmer mhm";
+        assert!(!is_repetition_collapse(s));
+    }
+
+    #[test]
+    fn collapse_detects_partial_loop_dominating_chunk() {
+        // 12-word chunk, 4 reps of a 2-word phrase = 8 words = 66% coverage.
+        // Should be flagged.
+        let s = "noe annet skjedde okay test test test test okay noe annet";
+        assert!(is_repetition_collapse(s));
+    }
+
+    #[test]
+    fn collapse_handles_punctuation_and_case() {
+        // Same phrase but mixed case + punctuation differences should still
+        // be matched as identical reps.
+        let s = "Er det en bok? er det en bok! Er Det En Bok? er det en bok.";
+        assert!(is_repetition_collapse(s));
     }
 }

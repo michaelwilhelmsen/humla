@@ -26,6 +26,12 @@ export function PolishToast() {
 }
 
 function messageForPhase(phase: string): { title: string; subtitle: string } | null {
+  if (phase === "retranscribing") {
+    return {
+      title: "Re-transcribing recording…",
+      subtitle: "Running Whisper on the full audio for a higher-quality pass.",
+    };
+  }
   if (phase === "diarizing") {
     return {
       title: "Identifying speakers…",

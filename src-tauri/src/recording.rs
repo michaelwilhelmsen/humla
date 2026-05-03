@@ -33,6 +33,44 @@ impl TranscriptTrail {
             }
             self.words.push_back(w.to_string());
         }
+        self.collapse_trailing_repetition();
+    }
+
+    // Collapse any trailing pair of identical N-grams down to a single copy.
+    // Whisper's repetition pathology produces output like "X? X? X? X? X?",
+    // and feeding that back as `initial_prompt` for the next chunk biases
+    // decoding toward more of the same — the loop becomes self-sustaining.
+    // Iteratively dropping trailing repeats breaks the feedback even if a bad
+    // chunk slipped past the per-chunk repetition filter.
+    fn collapse_trailing_repetition(&mut self) {
+        loop {
+            let mut collapsed = false;
+            for phrase_len in 1..=7 {
+                let n = self.words.len();
+                if n < phrase_len * 2 {
+                    continue;
+                }
+                let mut equal = true;
+                for i in 0..phrase_len {
+                    if self.words[n - phrase_len + i].to_lowercase()
+                        != self.words[n - 2 * phrase_len + i].to_lowercase()
+                    {
+                        equal = false;
+                        break;
+                    }
+                }
+                if equal {
+                    for _ in 0..phrase_len {
+                        self.words.pop_back();
+                    }
+                    collapsed = true;
+                    break;
+                }
+            }
+            if !collapsed {
+                return;
+            }
+        }
     }
 
     pub fn as_prompt(&self) -> Option<String> {
@@ -144,6 +182,7 @@ pub enum Phase {
     Paused,
     Stopping,
     Diarizing,
+    Retranscribing,
     Polishing,
     Summarizing,
 }
@@ -260,5 +299,40 @@ mod tests {
         t.push("hello world");
         t.clear();
         assert_eq!(t.as_prompt(), None);
+    }
+
+    #[test]
+    fn trail_collapses_trailing_word_repetition() {
+        let mut t = TranscriptTrail::new(50);
+        t.push("yes yes yes yes yes");
+        // Five reps of a single-word phrase collapse to one. Otherwise the
+        // next chunk's prompt would be "yes yes yes yes yes" and bias the
+        // decoder toward another "yes" loop.
+        assert_eq!(t.as_prompt(), Some("yes".to_string()));
+    }
+
+    #[test]
+    fn trail_collapses_trailing_phrase_repetition() {
+        let mut t = TranscriptTrail::new(100);
+        t.push("Er det en bok? Er det en bok? Er det en bok?");
+        // The four-word phrase repeats three times → collapse to one copy.
+        assert_eq!(t.as_prompt(), Some("Er det en bok?".to_string()));
+    }
+
+    #[test]
+    fn trail_preserves_unique_repetitions_with_different_words_around() {
+        let mut t = TranscriptTrail::new(50);
+        t.push("hello world hello friend");
+        // Not a contiguous N-gram repeat — leave it alone.
+        assert_eq!(t.as_prompt(), Some("hello world hello friend".to_string()));
+    }
+
+    #[test]
+    fn trail_collapse_is_case_insensitive() {
+        let mut t = TranscriptTrail::new(50);
+        t.push("Yes YES yes");
+        // Casing varies but the words are the same → collapse.
+        // The collapse strips trailing duplicates, leaving the earliest copy.
+        assert_eq!(t.as_prompt(), Some("Yes".to_string()));
     }
 }

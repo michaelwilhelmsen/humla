@@ -135,6 +135,38 @@ pub async fn transcribe_file(
     preset: Preset,
     audio_path: &Path,
 ) -> Result<String> {
+    let segs =
+        transcribe_file_segments(shared, model_path, language, initial_prompt, preset, audio_path)
+            .await?;
+    let mut out = String::new();
+    for seg in segs {
+        if !out.is_empty() && !out.ends_with(' ') {
+            out.push(' ');
+        }
+        out.push_str(seg.text.trim());
+    }
+    Ok(out)
+}
+
+/// One whisper-emitted text segment with its time bounds in milliseconds
+/// relative to the input WAV. Returned by `transcribe_file_segments`; used
+/// by the post-stop final-pass path to align text against the offline
+/// diarizer's speaker segments.
+#[derive(Clone, Debug)]
+pub struct TextSegment {
+    pub text: String,
+    pub start_ms: u64,
+    pub end_ms: u64,
+}
+
+pub async fn transcribe_file_segments(
+    shared: SharedContext,
+    model_path: PathBuf,
+    language: &str,
+    initial_prompt: Option<&str>,
+    preset: Preset,
+    audio_path: &Path,
+) -> Result<Vec<TextSegment>> {
     let samples = wav::read_f32_mono_16k(audio_path).await?;
     let lang = if language == "auto" { None } else { Some(language.to_string()) };
     let prompt = initial_prompt.map(|s| s.to_string());
@@ -142,7 +174,7 @@ pub async fn transcribe_file(
     // whisper-rs is sync and CPU/GPU-bound. Run on a blocking thread so we
     // don't stall the tokio reactor. Each call gets its own state; the
     // underlying model is shared.
-    tokio::task::spawn_blocking(move || -> Result<String> {
+    tokio::task::spawn_blocking(move || -> Result<Vec<TextSegment>> {
         let ctx = ensure_loaded(&shared, &model_path)?;
         let mut state = ctx
             .create_state()
@@ -155,9 +187,6 @@ pub async fn transcribe_file(
         params.set_translate(false);
         params.set_temperature(0.0);
         params.set_no_speech_thold(preset.no_speech_thold());
-        // Default logprob_thold (-1.0) keeps fallback decoding on for
-        // confused segments. Same across all presets — it complements
-        // no_speech rather than substituting for it.
         params.set_logprob_thold(-1.0);
         if let Some(l) = lang.as_deref() {
             params.set_language(Some(l));
@@ -173,15 +202,27 @@ pub async fn transcribe_file(
         let n = state
             .full_n_segments()
             .map_err(|e| anyhow!("n_segments: {e}"))?;
-        let mut out = String::new();
+        let mut out = Vec::with_capacity(n as usize);
         for i in 0..n {
-            let seg = state
+            let text = state
                 .full_get_segment_text(i)
                 .map_err(|e| anyhow!("segment text: {e}"))?;
-            if !out.is_empty() && !out.ends_with(' ') {
-                out.push(' ');
+            // whisper.cpp returns t0/t1 in centiseconds (10ms units).
+            let t0 = state
+                .full_get_segment_t0(i)
+                .map_err(|e| anyhow!("segment t0: {e}"))? as u64;
+            let t1 = state
+                .full_get_segment_t1(i)
+                .map_err(|e| anyhow!("segment t1: {e}"))? as u64;
+            let trimmed = text.trim().to_string();
+            if trimmed.is_empty() {
+                continue;
             }
-            out.push_str(seg.trim());
+            out.push(TextSegment {
+                text: trimmed,
+                start_ms: t0.saturating_mul(10),
+                end_ms: t1.saturating_mul(10),
+            });
         }
         Ok(out)
     })

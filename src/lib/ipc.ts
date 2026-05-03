@@ -38,6 +38,7 @@ export type SettingsKey =
   | "transcribe_provider"
   | "transcribe_model"
   | "whisper_preset"
+  | "final_pass"
   | "custom_vocabulary"
   | "summary_model"
   | "summary_prompt"
@@ -133,7 +134,7 @@ export type PermissionsStatus = {
 export type TranscriptEvent = { noteId: string; text: string };
 export type SummaryEvent = { noteId: string; summary: string };
 export type StreamDeltaEvent = { noteId: string; delta: string };
-export type RecordingPhase = "idle" | "starting" | "recording" | "paused" | "stopping" | "diarizing" | "polishing" | "summarizing";
+export type RecordingPhase = "idle" | "starting" | "recording" | "paused" | "stopping" | "diarizing" | "retranscribing" | "polishing" | "summarizing";
 export type SummaryProvider = "openai" | "local";
 export type RecordingStatus = { noteId: string | null; phase: RecordingPhase };
 export type RecordingError = { noteId: string | null; message: string };
