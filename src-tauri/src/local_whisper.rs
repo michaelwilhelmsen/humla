@@ -395,7 +395,18 @@ pub async fn transcribe_file_segments(
             // have a leading space; continuation tokens don't). Skip
             // tokens whose text starts with "[" or "<|" — those are
             // whisper specials (timestamps, language tags, etc.).
-            let words = extract_words_for_segment(&state, i)?;
+            //
+            // Word extraction is best-effort: BPE can split UTF-8
+            // multibyte characters across tokens, and asking for a
+            // single token's text returns invalid UTF-8 mid-codepoint.
+            // We swallow per-token errors and the whole segment's
+            // failure — losing word timestamps degrades the playback
+            // view to chunk-level highlight, but the transcript text
+            // still saves.
+            let words = extract_words_for_segment(&state, i).unwrap_or_else(|e| {
+                eprintln!("whisper word extraction failed (segment {i}): {e}");
+                Vec::new()
+            });
             out.push(TextSegment {
                 text: trimmed,
                 start_ms: t0.saturating_mul(10),
@@ -422,18 +433,25 @@ fn extract_words_for_segment(
         .map_err(|e| anyhow!("n_tokens: {e}"))?;
     let mut words: Vec<Word> = Vec::new();
     for tok_i in 0..n_tokens {
-        let raw = state
-            .full_get_token_text(seg_i, tok_i)
-            .map_err(|e| anyhow!("token text: {e}"))?;
+        // Per-token text decode can fail with "Invalid UTF-8" when
+        // BPE splits a multibyte character across two tokens. Skip
+        // the offending token entirely — we lose timing for that
+        // half-codepoint, but the surrounding tokens still produce
+        // valid words. Same handling for token-data lookup failures.
+        let raw = match state.full_get_token_text(seg_i, tok_i) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
         // Filter out whisper specials. Empty / whitespace-only fragments
         // aren't useful as standalone words but can be valid
         // continuations within a multi-token word — handled below.
         if raw.starts_with("[_") || raw.starts_with("<|") {
             continue;
         }
-        let data = state
-            .full_get_token_data(seg_i, tok_i)
-            .map_err(|e| anyhow!("token data: {e}"))?;
+        let data = match state.full_get_token_data(seg_i, tok_i) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
         let t0 = (data.t0 as u64).saturating_mul(10);
         let t1 = (data.t1 as u64).saturating_mul(10);
         let starts_word = raw.starts_with(' ') || words.is_empty();
