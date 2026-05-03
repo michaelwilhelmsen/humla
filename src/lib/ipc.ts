@@ -53,6 +53,17 @@ export type SettingsKey =
 
 export type TranscribeProvider = "openai" | "local";
 
+export type SummaryPrompt = {
+  id: string;
+  name: string;
+  content: string;
+  // Snake-case from Rust serde — keep as-is to avoid an extra map step.
+  // The UI rarely needs these timestamps; they're here so we can sort
+  // or display "edited X ago" later if useful.
+  created_at: number;
+  updated_at: number;
+};
+
 export type LocalWhisperModelStatus = {
   id: string;
   label: string;
@@ -107,6 +118,14 @@ export const ipc = {
   getSetting: (key: SettingsKey) => invoke<string | null>("settings_get", { key }),
   setSetting: (key: SettingsKey, value: string) => invoke<void>("settings_set", { key, value }),
   appDataDir: () => invoke<string>("app_data_dir"),
+
+  summaryPromptsList: () => invoke<SummaryPrompt[]>("summary_prompts_list"),
+  summaryPromptsCreate: (name: string, content: string) =>
+    invoke<SummaryPrompt>("summary_prompts_create", { name, content }),
+  summaryPromptsUpdate: (id: string, name: string, content: string) =>
+    invoke<SummaryPrompt>("summary_prompts_update", { id, name, content }),
+  summaryPromptsDelete: (id: string) =>
+    invoke<void>("summary_prompts_delete", { id }),
 
   getApiKey: () => invoke<string | null>("api_key_get"),
   setApiKey: (key: string) => invoke<void>("api_key_set", { key }),

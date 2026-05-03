@@ -73,6 +73,17 @@ pub fn open(path: &Path) -> Result<Connection> {
             key   TEXT PRIMARY KEY,
             value TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS summary_prompts (
+            id          TEXT PRIMARY KEY,
+            name        TEXT NOT NULL,
+            content     TEXT NOT NULL,
+            created_at  INTEGER NOT NULL,
+            updated_at  INTEGER NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_summary_prompts_updated
+            ON summary_prompts(updated_at DESC);
         "#,
     )?;
     // Idempotent migrations for older schemas. ALTER TABLE adds columns
@@ -331,6 +342,112 @@ pub fn set_setting(conn: &Connection, key: &str, value: &str) -> Result<()> {
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         params![key, value],
     )?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SummaryPrompt {
+    pub id: String,
+    pub name: String,
+    pub content: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+pub fn list_summary_prompts(conn: &Connection) -> Result<Vec<SummaryPrompt>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, name, content, created_at, updated_at FROM summary_prompts
+         ORDER BY name COLLATE NOCASE",
+    )?;
+    let rows = stmt
+        .query_map([], map_summary_prompt)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+pub fn get_summary_prompt(conn: &Connection, id: &str) -> Result<SummaryPrompt> {
+    let p = conn.query_row(
+        "SELECT id, name, content, created_at, updated_at FROM summary_prompts WHERE id = ?1",
+        params![id],
+        map_summary_prompt,
+    )?;
+    Ok(p)
+}
+
+pub fn create_summary_prompt(
+    conn: &Connection,
+    name: &str,
+    content: &str,
+) -> Result<SummaryPrompt> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = now_ms();
+    conn.execute(
+        "INSERT INTO summary_prompts (id, name, content, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?4)",
+        params![id, name, content, now],
+    )?;
+    get_summary_prompt(conn, &id)
+}
+
+pub fn update_summary_prompt(
+    conn: &Connection,
+    id: &str,
+    name: &str,
+    content: &str,
+) -> Result<SummaryPrompt> {
+    let now = now_ms();
+    conn.execute(
+        "UPDATE summary_prompts SET name = ?1, content = ?2, updated_at = ?3 WHERE id = ?4",
+        params![name, content, now, id],
+    )?;
+    get_summary_prompt(conn, id)
+}
+
+pub fn delete_summary_prompt(conn: &Connection, id: &str) -> Result<()> {
+    conn.execute("DELETE FROM summary_prompts WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
+fn map_summary_prompt(row: &rusqlite::Row) -> rusqlite::Result<SummaryPrompt> {
+    Ok(SummaryPrompt {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        content: row.get(2)?,
+        created_at: row.get(3)?,
+        updated_at: row.get(4)?,
+    })
+}
+
+/// One-time migration: pull the legacy single `summary_prompt` setting
+/// into a row in `summary_prompts`, then rewrite any note whose preset
+/// is the literal `"custom"` to `"custom:<new-id>"` so it points at
+/// that row. Idempotent — guarded by the `summary_prompts_migrated`
+/// setting flag, which we set once the migration completes (or
+/// trivially completes when the legacy setting is empty).
+///
+/// We deliberately leave the legacy `summary_prompt` setting in place
+/// instead of clearing it. Rolling back to an older app version would
+/// otherwise lose the custom prompt entirely; keeping it around costs
+/// nothing.
+pub fn migrate_summary_prompts(conn: &Connection) -> Result<()> {
+    let already = get_setting(conn, "summary_prompts_migrated")?.unwrap_or_default();
+    if already == "true" {
+        return Ok(());
+    }
+    let legacy = get_setting(conn, "summary_prompt")?.unwrap_or_default();
+    if legacy.trim().is_empty() {
+        // Nothing to migrate, but mark it done so we don't re-check on
+        // every launch.
+        set_setting(conn, "summary_prompts_migrated", "true")?;
+        return Ok(());
+    }
+    let row = create_summary_prompt(conn, "Custom prompt (migrated)", &legacy)?;
+    let new_value = format!("custom:{}", row.id);
+    conn.execute(
+        "UPDATE notes SET summary_preset = ?1 WHERE summary_preset = 'custom'",
+        params![new_value],
+    )?;
+    set_setting(conn, "summary_prompts_migrated", "true")?;
     Ok(())
 }
 

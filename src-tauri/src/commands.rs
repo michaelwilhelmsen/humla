@@ -179,6 +179,49 @@ pub fn settings_set(state: State<AppState>, key: String, value: String) -> Resul
 }
 
 #[tauri::command]
+pub fn summary_prompts_list(
+    state: State<AppState>,
+) -> Result<Vec<db::SummaryPrompt>, String> {
+    let conn = state.db.lock();
+    db::list_summary_prompts(&conn).map_err(err)
+}
+
+#[tauri::command]
+pub fn summary_prompts_create(
+    state: State<AppState>,
+    name: String,
+    content: String,
+) -> Result<db::SummaryPrompt, String> {
+    let trimmed_name = name.trim();
+    if trimmed_name.is_empty() {
+        return Err("Prompt name cannot be empty".into());
+    }
+    let conn = state.db.lock();
+    db::create_summary_prompt(&conn, trimmed_name, &content).map_err(err)
+}
+
+#[tauri::command]
+pub fn summary_prompts_update(
+    state: State<AppState>,
+    id: String,
+    name: String,
+    content: String,
+) -> Result<db::SummaryPrompt, String> {
+    let trimmed_name = name.trim();
+    if trimmed_name.is_empty() {
+        return Err("Prompt name cannot be empty".into());
+    }
+    let conn = state.db.lock();
+    db::update_summary_prompt(&conn, &id, trimmed_name, &content).map_err(err)
+}
+
+#[tauri::command]
+pub fn summary_prompts_delete(state: State<AppState>, id: String) -> Result<(), String> {
+    let conn = state.db.lock();
+    db::delete_summary_prompt(&conn, &id).map_err(err)
+}
+
+#[tauri::command]
 pub fn api_key_get(state: State<AppState>) -> Result<Option<String>, String> {
     Ok(read_secret(&state, API_KEY)?.map(|_| "stored".to_string()))
 }
@@ -2118,9 +2161,23 @@ async fn run_summary(app: AppHandle, note_id: String) -> anyhow::Result<()> {
     if note.transcript.trim().is_empty() && note.body.trim().is_empty() {
         return Ok(());
     }
-    // Resolve the prompt for this note: a named preset, or the user's custom
-    // prompt from Settings if preset == "custom".
-    let prompt = if note.summary_preset == "custom" {
+    // Resolve the prompt for this note. Three cases, in priority order:
+    //   1. `custom:<id>` — a user-defined prompt row. Look it up; if the
+    //      row was deleted out from under us, fall back to the legacy
+    //      single-prompt setting so the summary still runs.
+    //   2. `"custom"` — the legacy single-prompt sentinel from before
+    //      the summary_prompts table. Reads the `summary_prompt` setting.
+    //      Old notes that didn't get migrated land here.
+    //   3. Built-in preset value ("meeting", "lecture", etc.) —
+    //      language-aware via presets::prompt.
+    let prompt = if let Some(id) = note.summary_preset.strip_prefix("custom:") {
+        let state: State<AppState> = app.state();
+        let conn = state.db.lock();
+        match db::get_summary_prompt(&conn, id) {
+            Ok(p) => p.content,
+            Err(_) => custom_prompt,
+        }
+    } else if note.summary_preset == "custom" {
         custom_prompt
     } else {
         presets::prompt(&note.summary_preset, &language)

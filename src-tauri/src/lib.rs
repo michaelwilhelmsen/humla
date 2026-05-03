@@ -66,6 +66,17 @@ pub fn run() {
                 diarize::cleanup_legacy_streaming_models(app.handle(), &conn);
             }
 
+            // One-shot migration of the legacy single-custom-prompt setting
+            // into the summary_prompts table. Same flag-guarded shape as the
+            // diarize cleanup above.
+            {
+                let state: tauri::State<AppState> = app.state();
+                let conn = state.db.lock();
+                if let Err(e) = db::migrate_summary_prompts(&conn) {
+                    eprintln!("migrate_summary_prompts: {e}");
+                }
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -82,6 +93,10 @@ pub fn run() {
             commands::settings_get,
             commands::settings_set,
             commands::app_data_dir,
+            commands::summary_prompts_list,
+            commands::summary_prompts_create,
+            commands::summary_prompts_update,
+            commands::summary_prompts_delete,
             commands::api_key_get,
             commands::api_key_set,
             commands::api_key_test,

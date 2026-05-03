@@ -1,12 +1,11 @@
 import { open as openExternal } from "@tauri-apps/plugin-shell";
-import { SUMMARY_PRESETS, presetPromptForLang, presetLabel } from "../../../lib/presets";
 import { Btn } from "../components/Btn";
 import { Row, Section } from "../components/Section";
 import { Select } from "../components/Select";
+import { SummaryPromptsManager } from "../components/SummaryPromptsManager";
 import {
   SUMMARY_MODELS,
   SUMMARY_PROVIDERS,
-  detectActivePreset,
   inputClass,
 } from "../types";
 import type { SettingsHook } from "../useSettings";
@@ -136,40 +135,8 @@ export function SummaryTab({
         </Section>
       )}
 
-      <Section title="Custom prompt">
-        <Row label="Used when a note is set to Custom">
-          <p className="text-xs text-[var(--color-text-muted)] mb-2">
-            Each note picks a preset (Meeting, 1:1, Lecture, …) from its
-            own header. The text below is only used when a note is set to
-            "Custom". Use the preset menu to seed it with a known template.
-          </p>
-          <div className="flex items-center gap-2 mb-2">
-            <span className="text-xs text-[var(--color-text-muted)]">Seed from preset:</span>
-            <select
-              value={detectActivePreset(s.summary_prompt, s.language)}
-              onChange={(e) => {
-                const preset = SUMMARY_PRESETS.find((p) => p.value === e.target.value);
-                if (preset) update("summary_prompt", presetPromptForLang(preset, s.language));
-              }}
-              className={inputClass + " w-auto py-1 text-xs"}
-            >
-              {SUMMARY_PRESETS.map((p) => (
-                <option key={p.value} value={p.value}>
-                  {presetLabel(p)}
-                </option>
-              ))}
-              <option value="custom" disabled>
-                Custom (edited)
-              </option>
-            </select>
-          </div>
-          <textarea
-            value={s.summary_prompt}
-            onChange={(e) => update("summary_prompt", e.target.value)}
-            rows={10}
-            className={inputClass + " leading-relaxed font-mono text-xs"}
-          />
-        </Row>
+      <Section title="Summary prompts">
+        <SummaryPromptsManager language={s.language} />
       </Section>
     </>
   );

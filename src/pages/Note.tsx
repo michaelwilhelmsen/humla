@@ -11,7 +11,7 @@ import {
   Languages,
   Users,
 } from "lucide-react";
-import { ipc, onSummaryThinkingDelta, onSummaryContentDelta, type Note as TNote } from "../lib/ipc";
+import { ipc, onSummaryThinkingDelta, onSummaryContentDelta, type Note as TNote, type SummaryPrompt } from "../lib/ipc";
 import { useNotesStore, useRecordingStore } from "../lib/store";
 import { RecordingBar } from "../components/RecordingBar";
 import { SkeletonLines } from "../components/Skeleton";
@@ -502,6 +502,20 @@ function PresetPicker({
   value: string;
   onChange: (v: string) => void;
 }) {
+  const [userPrompts, setUserPrompts] = useState<SummaryPrompt[]>([]);
+
+  useEffect(() => {
+    ipc.summaryPromptsList().then(setUserPrompts).catch(() => setUserPrompts([]));
+  }, []);
+
+  // If the note's saved value points at a deleted user prompt, surface a
+  // "(missing)" entry so the user notices and can re-pick. Without this
+  // the dropdown would silently render the first option without changing
+  // the underlying value.
+  const valueIsMissingUserPrompt =
+    value.startsWith("custom:") &&
+    !userPrompts.some((p) => `custom:${p.id}` === value);
+
   return (
     <>
       <select value={value} onChange={(e) => onChange(e.target.value)}>
@@ -510,7 +524,16 @@ function PresetPicker({
             {presetLabel(p)}
           </option>
         ))}
-        <option value="custom">Custom</option>
+        {userPrompts.length > 0 && <option disabled>──────────</option>}
+        {userPrompts.map((p) => (
+          <option key={p.id} value={`custom:${p.id}`}>
+            {p.name}
+          </option>
+        ))}
+        {valueIsMissingUserPrompt && (
+          <option value={value}>(deleted prompt)</option>
+        )}
+        {value === "custom" && <option value="custom">Custom (legacy)</option>}
       </select>
       <span aria-hidden className="nd-prop-caret">▾</span>
     </>
