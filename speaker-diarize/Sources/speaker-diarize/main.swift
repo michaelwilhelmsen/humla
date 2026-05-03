@@ -362,6 +362,22 @@ func runDiarizeSortformer(
         // finalizeOnCompletion=true (its default) confirms everything, but
         // tentative is kept in the union for robustness if that contract
         // ever changes upstream.
+        //
+        // Debug print of the raw slot map to stderr so the developer can
+        // tell whether "only S0 in output" means "the model heard one
+        // speaker" vs. "we dropped slots in the mapping". With Sortformer's
+        // 4-speaker cap, the timeline carries 4 slots regardless of how
+        // many actually fired — slots with zero segments are real signal
+        // (the model was confident enough to leave them empty).
+        writeStderr(
+            "sortformer: timeline.speakers has \(timeline.speakers.count) slot(s)"
+        )
+        for (slot, speaker) in timeline.speakers.sorted(by: { $0.key < $1.key }) {
+            writeStderr(
+                "  slot=\(slot) finalized=\(speaker.finalizedSegments.count) tentative=\(speaker.tentativeSegments.count)"
+            )
+        }
+
         var payload: [[String: Any]] = []
         for (slot, speaker) in timeline.speakers {
             let id = "S\(slot)"
