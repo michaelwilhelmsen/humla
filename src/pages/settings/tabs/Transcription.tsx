@@ -270,6 +270,28 @@ export function TranscriptionTab({
         </Row>}
       </Section>
 
+      <Section title="Post-processing">
+        <Row label="Auto-polish on stop">
+          <label className="flex items-center gap-2 cursor-pointer text-sm">
+            <input
+              type="checkbox"
+              checked={s.auto_polish === "true"}
+              onChange={(e) =>
+                update("auto_polish", e.target.checked ? "true" : "false")
+              }
+            />
+            Run an LLM cleanup pass after every recording
+          </label>
+          <p className="text-xs text-[var(--color-text-muted)] mt-2">
+            Off by default — recent dedup + diarize improvements
+            already produce a clean transcript, and the polish pass
+            adds 30s+ to the post-stop wait. Turn on if you want
+            stricter typo / punctuation correction. The "Polish"
+            button on each note still runs polish on demand.
+          </p>
+        </Row>
+      </Section>
+
       <Section title="Audio retention">
         <Row label="Keep recorded audio">
           <label className="flex items-center gap-2 cursor-pointer text-sm">

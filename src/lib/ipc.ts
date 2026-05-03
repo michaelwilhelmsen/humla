@@ -55,7 +55,8 @@ export type SettingsKey =
   | "local_llm_model"
   | "local_llm_think"
   | "theme"
-  | "developer_mode";
+  | "developer_mode"
+  | "auto_polish";
 
 export type TranscribeProvider = "openai" | "local";
 
@@ -109,14 +110,24 @@ export type DiarizeDownloadProgress = {
 
 export type DiarizeEngine = "community1" | "sortformer";
 
-// One per speaker turn; mirrors a single line in the rendered transcript.
-// `start_ms` is the first chunk's start within the turn — drives playback
-// highlighting (active turn = the one whose start_ms ≤ currentTime <
-// next.start_ms).
+// Word-level timing in stream-absolute milliseconds. Drives the
+// playback view's word-by-word highlight when present. Empty for
+// chunks transcribed via OpenAI's streaming API (no word data
+// exposed) or older recordings made before timestamps were enabled.
+export type TimelineWord = {
+  text: string;
+  start_ms: number;
+  end_ms: number;
+};
+
+// One entry per VAD-bounded chunk. `start_ms` is the chunk's start
+// in the merged playback timeline. `words` (when populated) lets the
+// player highlight each word as audio passes through it.
 export type TimelineEntry = {
   start_ms: number;
   label: string;
   text: string;
+  words: TimelineWord[];
 };
 
 export const ipc = {

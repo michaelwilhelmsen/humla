@@ -312,10 +312,15 @@ fn read_chunks_from_diagnostic(diag_dir: &std::path::Path) -> anyhow::Result<Vec
                 .and_then(|s| s.as_str())
                 .unwrap_or("")
                 .to_string();
+            // Diagnostic-derived chunks don't carry word timings —
+            // re-running diarize from a JSON dump replays the chunk
+            // log, but words were never written into diagnostics.
+            // Frontend gracefully falls back to chunk-level highlight.
             out.push(ChunkRecord {
                 source,
                 start_ms,
                 text,
+                words: Vec::new(),
             });
         }
         if !out.is_empty() {
@@ -479,16 +484,28 @@ pub fn note_playback_path(app: AppHandle, note_id: String) -> Result<Option<Stri
     Ok(path.to_str().map(|s| s.to_string()))
 }
 
+/// One word's text + millisecond bounds in stream-absolute time.
+/// Drives the playback view's karaoke-style word highlight.
+#[derive(Clone, serde::Serialize)]
+pub struct TimelineWord {
+    pub text: String,
+    pub start_ms: u64,
+    pub end_ms: u64,
+}
+
 /// Per-note transcript timeline used to drive playback highlighting.
-/// One entry per speaker turn; same structure as a single line in the
-/// rendered transcript. `start_ms` is the first chunk's start in this
-/// turn (relative to the recording's stream timeline), so the frontend
-/// can map `audio.currentTime` → active turn.
+/// One entry per chunk (~5–15 s VAD-bounded utterance); the frontend
+/// renders each as its own row so the active-chunk highlight can
+/// follow the audio at sentence granularity. `words` may be empty for
+/// chunks whose provider didn't expose token timestamps (current
+/// OpenAI streaming API), in which case the UI degrades to chunk-
+/// level highlight.
 #[derive(Clone, serde::Serialize)]
 pub struct TimelineEntry {
     pub start_ms: u64,
     pub label: String,
     pub text: String,
+    pub words: Vec<TimelineWord>,
 }
 
 /// Read the timeline.jsonl that `write_playback_assets` saved. Returns
@@ -520,6 +537,20 @@ pub fn note_timeline(app: AppHandle, note_id: String) -> Result<Vec<TimelineEntr
                 continue;
             }
         };
+        let words = v
+            .get("words")
+            .and_then(|w| w.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|w| {
+                        let text = w.get("text").and_then(|s| s.as_str())?.to_string();
+                        let start_ms = w.get("start_ms").and_then(|s| s.as_u64())?;
+                        let end_ms = w.get("end_ms").and_then(|s| s.as_u64())?;
+                        Some(TimelineWord { text, start_ms, end_ms })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         out.push(TimelineEntry {
             start_ms: v.get("start_ms").and_then(|s| s.as_u64()).unwrap_or(0),
             label: v
@@ -532,6 +563,7 @@ pub fn note_timeline(app: AppHandle, note_id: String) -> Result<Vec<TimelineEntr
                 .and_then(|s| s.as_str())
                 .unwrap_or("")
                 .to_string(),
+            words,
         });
     }
     Ok(out)
@@ -1803,13 +1835,28 @@ pub async fn recording_stop(
                 &format!("Diarization failed (transcript still saved): {e}"),
             );
         }
-        if let Err(e) = polish_transcript(app_for_post.clone(), note_for_post.clone()).await {
-            eprintln!("polish_transcript: {e}");
-            emit_error(
-                &app_for_post,
-                Some(&note_for_post),
-                &format!("Polish failed: {e}"),
-            );
+        // Auto-polish only runs when the user opts in. Default off:
+        // recent dedup + diarize + word-timestamp work has lifted the
+        // raw transcript quality enough that an LLM cleanup pass adds
+        // a 30s+ delay for marginal benefit. The manual `polish_note`
+        // command still works for users who want it on demand.
+        let auto_polish = {
+            let state: State<AppState> = app_for_post.state();
+            let conn = state.db.lock();
+            db::get_setting(&conn, "auto_polish")
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "false".to_string())
+        };
+        if auto_polish == "true" {
+            if let Err(e) = polish_transcript(app_for_post.clone(), note_for_post.clone()).await {
+                eprintln!("polish_transcript: {e}");
+                emit_error(
+                    &app_for_post,
+                    Some(&note_for_post),
+                    &format!("Polish failed: {e}"),
+                );
+            }
         }
         // Now that every step that needs the WAVs has finished, drop the
         // temp dir. Best-effort: a leftover dir is harmless and gets
@@ -2187,15 +2234,44 @@ async fn final_pass_apply(app: AppHandle, note_id: String) -> anyhow::Result<()>
     // build_labelled_transcript and assign_speaker as-is. Same data flow
     // as the chunked path; only the source of timing + text differs.
     let mut chunks: Vec<ChunkRecord> = Vec::with_capacity(mic_segs.len() + sys_segs.len());
-    chunks.extend(mic_segs.into_iter().map(|s| ChunkRecord {
-        source: ChunkSource::Mic,
-        start_ms: s.start_ms,
-        text: s.text,
+    // Final-pass synthesises chunks from whisper's segment output.
+    // The segments carry word data already; rebase each word's
+    // timestamp from segment-relative to chunk-relative (which is
+    // identical here, since each segment becomes one chunk and the
+    // chunk's start_ms is the segment's start_ms).
+    chunks.extend(mic_segs.into_iter().map(|s| {
+        let seg_start = s.start_ms;
+        ChunkRecord {
+            source: ChunkSource::Mic,
+            start_ms: seg_start,
+            text: s.text,
+            words: s
+                .words
+                .into_iter()
+                .map(|w| crate::recording::ChunkWord {
+                    text: w.text,
+                    start_ms: w.start_ms.saturating_sub(seg_start),
+                    end_ms: w.end_ms.saturating_sub(seg_start),
+                })
+                .collect(),
+        }
     }));
-    chunks.extend(sys_segs.into_iter().map(|s| ChunkRecord {
-        source: ChunkSource::Sys,
-        start_ms: s.start_ms,
-        text: s.text,
+    chunks.extend(sys_segs.into_iter().map(|s| {
+        let seg_start = s.start_ms;
+        ChunkRecord {
+            source: ChunkSource::Sys,
+            start_ms: seg_start,
+            text: s.text,
+            words: s
+                .words
+                .into_iter()
+                .map(|w| crate::recording::ChunkWord {
+                    text: w.text,
+                    start_ms: w.start_ms.saturating_sub(seg_start),
+                    end_ms: w.end_ms.saturating_sub(seg_start),
+                })
+                .collect(),
+        }
     }));
 
     if chunks.is_empty() {
@@ -2633,10 +2709,27 @@ fn serialize_timeline(
             continue;
         }
         let label = label_for(chunk).unwrap_or_default();
+        // Convert word timings to stream-absolute by adding the
+        // chunk's start_ms. The playback view's audio element runs in
+        // the merged playback.wav timeline, where each chunk lives at
+        // its own start_ms; word timestamps inside the chunk are
+        // chunk-relative until we rebase here.
+        let words: Vec<serde_json::Value> = chunk
+            .words
+            .iter()
+            .map(|w| {
+                serde_json::json!({
+                    "text": w.text,
+                    "start_ms": chunk.start_ms.saturating_add(w.start_ms),
+                    "end_ms": chunk.start_ms.saturating_add(w.end_ms),
+                })
+            })
+            .collect();
         let entry = serde_json::json!({
             "start_ms": chunk.start_ms,
             "label": label,
             "text": trimmed,
+            "words": words,
         });
         out.push_str(&entry.to_string());
         out.push('\n');
@@ -2816,7 +2909,11 @@ async fn transcribe_chunk(
     };
     let prompt = build_initial_prompt(&cfg.vocabulary, trail_snapshot);
 
-    let text = match cfg.provider.as_str() {
+    // Words are populated only by the local Whisper path — OpenAI's
+    // streaming transcribe endpoints don't expose word-level
+    // timestamps in the multipart response. Empty words → frontend
+    // falls back to chunk-level highlight for that chunk.
+    let (text, words) = match cfg.provider.as_str() {
         "local" => {
             let model_path = local_model_path(&app, &cfg.language)
                 .map_err(|e| anyhow::anyhow!(e))?;
@@ -2825,7 +2922,7 @@ async fn transcribe_chunk(
                 (state.whisper.clone(), local_whisper_use_gpu_setting(&state))
             };
             let preset = local_whisper::Preset::from_setting(&cfg.whisper_preset);
-            local_whisper::transcribe_file(
+            local_whisper::transcribe_file_with_words(
                 shared,
                 model_path,
                 use_gpu,
@@ -2837,14 +2934,15 @@ async fn transcribe_chunk(
             .await?
         }
         _ => {
-            openai::transcribe_file(
+            let text = openai::transcribe_file(
                 &cfg.api_key,
                 &cfg.openai_model,
                 Some(&cfg.language),
                 prompt.as_deref(),
                 &path,
             )
-            .await?
+            .await?;
+            (text, Vec::<local_whisper::Word>::new())
         }
     };
     if is_likely_hallucination(&text, &cfg.language) {
@@ -2905,10 +3003,24 @@ async fn transcribe_chunk(
             ChunkSource::Sys => session.sys_trail.lock(),
         };
         trail.push(&trimmed);
+        // Words come from local Whisper only and arrive with chunk-
+        // relative timestamps (whisper timed against this chunk's
+        // WAV, which starts at t=0 from its own perspective). That
+        // means we can persist them as-is — the playback view adds
+        // chunk.start_ms back when it needs absolute time.
+        let chunk_words = words
+            .into_iter()
+            .map(|w| crate::recording::ChunkWord {
+                text: w.text,
+                start_ms: w.start_ms,
+                end_ms: w.end_ms,
+            })
+            .collect();
         session.chunk_log.lock().push(ChunkRecord {
             source,
             start_ms,
             text: trimmed.clone(),
+            words: chunk_words,
         });
     }
     let _ = app.emit(
@@ -3605,11 +3717,21 @@ mod diarize_tests {
     }
 
     fn mic(start_ms: u64, text: &str) -> ChunkRecord {
-        ChunkRecord { source: ChunkSource::Mic, start_ms, text: text.to_string() }
+        ChunkRecord {
+            source: ChunkSource::Mic,
+            start_ms,
+            text: text.to_string(),
+            words: Vec::new(),
+        }
     }
 
     fn sys(start_ms: u64, text: &str) -> ChunkRecord {
-        ChunkRecord { source: ChunkSource::Sys, start_ms, text: text.to_string() }
+        ChunkRecord {
+            source: ChunkSource::Sys,
+            start_ms,
+            text: text.to_string(),
+            words: Vec::new(),
+        }
     }
 
     /// Build the same labeller `diarize_and_apply` would build in the

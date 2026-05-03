@@ -253,6 +253,32 @@ pub async fn transcribe_file(
     preset: Preset,
     audio_path: &Path,
 ) -> Result<String> {
+    let (text, _words) = transcribe_file_with_words(
+        shared,
+        model_path,
+        use_gpu,
+        language,
+        initial_prompt,
+        preset,
+        audio_path,
+    )
+    .await?;
+    Ok(text)
+}
+
+/// Variant that returns the joined transcript text *and* a flat list
+/// of word-level timestamps across the whole file. Used by the live
+/// chunk path so each chunk's words can be persisted into
+/// timeline.jsonl for the playback view's karaoke-style highlight.
+pub async fn transcribe_file_with_words(
+    shared: SharedContext,
+    model_path: PathBuf,
+    use_gpu: bool,
+    language: &str,
+    initial_prompt: Option<&str>,
+    preset: Preset,
+    audio_path: &Path,
+) -> Result<(String, Vec<Word>)> {
     let segs = transcribe_file_segments(
         shared,
         model_path,
@@ -263,14 +289,16 @@ pub async fn transcribe_file(
         audio_path,
     )
     .await?;
-    let mut out = String::new();
+    let mut text = String::new();
+    let mut words = Vec::new();
     for seg in segs {
-        if !out.is_empty() && !out.ends_with(' ') {
-            out.push(' ');
+        if !text.is_empty() && !text.ends_with(' ') {
+            text.push(' ');
         }
-        out.push_str(seg.text.trim());
+        text.push_str(seg.text.trim());
+        words.extend(seg.words);
     }
-    Ok(out)
+    Ok((text, words))
 }
 
 /// One whisper-emitted text segment with its time bounds in milliseconds
@@ -279,6 +307,19 @@ pub async fn transcribe_file(
 /// diarizer's speaker segments.
 #[derive(Clone, Debug)]
 pub struct TextSegment {
+    pub text: String,
+    pub start_ms: u64,
+    pub end_ms: u64,
+    pub words: Vec<Word>,
+}
+
+/// One word's display text + millisecond bounds, derived from whisper's
+/// token-level timestamps. Tokens are subword pieces (BPE), so consecutive
+/// tokens are grouped into a single word whenever the next token starts
+/// with a leading space (whisper.cpp's word-boundary convention). Used by
+/// the playback view's karaoke-style highlighting.
+#[derive(Clone, Debug)]
+pub struct Word {
     pub text: String,
     pub start_ms: u64,
     pub end_ms: u64,
@@ -314,6 +355,10 @@ pub async fn transcribe_file_segments(
         params.set_temperature(0.0);
         params.set_no_speech_thold(preset.no_speech_thold());
         params.set_logprob_thold(-1.0);
+        // Token-level timestamps drive the playback view's word-by-word
+        // highlight. Cheap on Apple Silicon (~1% extra) since the model
+        // already produces token logits; this just exposes them.
+        params.set_token_timestamps(true);
         if let Some(l) = lang.as_deref() {
             params.set_language(Some(l));
         }
@@ -344,14 +389,76 @@ pub async fn transcribe_file_segments(
             if trimmed.is_empty() {
                 continue;
             }
+            // Walk this segment's tokens to build word-level timing.
+            // BPE tokens are subword pieces — group them by leading-
+            // space convention (whisper.cpp tokens that begin a word
+            // have a leading space; continuation tokens don't). Skip
+            // tokens whose text starts with "[" or "<|" — those are
+            // whisper specials (timestamps, language tags, etc.).
+            let words = extract_words_for_segment(&state, i)?;
             out.push(TextSegment {
                 text: trimmed,
                 start_ms: t0.saturating_mul(10),
                 end_ms: t1.saturating_mul(10),
+                words,
             });
         }
         Ok(out)
     })
     .await
     .map_err(|e| anyhow!("blocking task: {e}"))?
+}
+
+/// Pull token-level data for one whisper segment and group BPE tokens
+/// into words by the leading-space convention. Token timestamps are in
+/// centiseconds (×10 → ms). Special tokens (`[_BEG_]`, `<|...|>`, etc.)
+/// are skipped — they don't correspond to spoken text.
+fn extract_words_for_segment(
+    state: &whisper_rs::WhisperState,
+    seg_i: i32,
+) -> Result<Vec<Word>> {
+    let n_tokens = state
+        .full_n_tokens(seg_i)
+        .map_err(|e| anyhow!("n_tokens: {e}"))?;
+    let mut words: Vec<Word> = Vec::new();
+    for tok_i in 0..n_tokens {
+        let raw = state
+            .full_get_token_text(seg_i, tok_i)
+            .map_err(|e| anyhow!("token text: {e}"))?;
+        // Filter out whisper specials. Empty / whitespace-only fragments
+        // aren't useful as standalone words but can be valid
+        // continuations within a multi-token word — handled below.
+        if raw.starts_with("[_") || raw.starts_with("<|") {
+            continue;
+        }
+        let data = state
+            .full_get_token_data(seg_i, tok_i)
+            .map_err(|e| anyhow!("token data: {e}"))?;
+        let t0 = (data.t0 as u64).saturating_mul(10);
+        let t1 = (data.t1 as u64).saturating_mul(10);
+        let starts_word = raw.starts_with(' ') || words.is_empty();
+        if starts_word {
+            let trimmed = raw.trim_start().to_string();
+            if trimmed.is_empty() {
+                continue;
+            }
+            words.push(Word {
+                text: trimmed,
+                start_ms: t0,
+                end_ms: t1,
+            });
+        } else if let Some(last) = words.last_mut() {
+            last.text.push_str(&raw);
+            // Extend the word's end time with the continuation token's
+            // upper bound. start stays as the first token's t0.
+            if t1 > last.end_ms {
+                last.end_ms = t1;
+            }
+        }
+    }
+    // Trim residual whitespace + drop empties; punctuation tokens
+    // ("," ".") get glued onto the previous word above so they don't
+    // surface as their own entry, which is what we want for clicking.
+    words.retain(|w| !w.text.trim().is_empty());
+    Ok(words)
 }

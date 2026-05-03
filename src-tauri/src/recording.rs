@@ -117,6 +117,19 @@ impl Default for ChunkSource {
     }
 }
 
+/// Per-chunk word timing relative to the chunk's start. Populated by the
+/// local Whisper path's token-level timestamps; empty when transcribe
+/// came from a provider that doesn't expose word data (current OpenAI
+/// API for the chunk-streaming flow). Word `start_ms` / `end_ms` are
+/// **chunk-relative** — add the parent ChunkRecord's start_ms to map
+/// back into stream-absolute time.
+#[derive(Clone, Debug)]
+pub struct ChunkWord {
+    pub text: String,
+    pub start_ms: u64,
+    pub end_ms: u64,
+}
+
 /// Per-chunk metadata captured during recording. The diarization step needs
 /// to align speaker segments (timestamps relative to the per-source full
 /// recording WAV) against chunk-level transcripts; this log holds the link
@@ -127,6 +140,7 @@ pub struct ChunkRecord {
     pub source: ChunkSource,
     pub start_ms: u64,
     pub text: String,
+    pub words: Vec<ChunkWord>,
 }
 
 #[derive(Default)]
