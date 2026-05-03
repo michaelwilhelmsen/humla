@@ -45,8 +45,27 @@ export function Note() {
   const saveTimer = useRef<number | null>(null);
 
   useEffect(() => {
-    ipc.getSetting("language").then((v) => v && setUiLang(v));
-    ipc.getSetting("summary_provider").then((v) => v && setGlobalProvider(v));
+    let cancelled = false;
+    ipc.getSetting("language").then((v) => {
+      if (!cancelled && v) setUiLang(v);
+    });
+    ipc.getSetting("summary_provider").then((v) => {
+      if (!cancelled && v) setGlobalProvider(v);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Drop any pending debounced save when the component unmounts.
+  // Without this, navigating away within the 300ms patch() window leaks
+  // a setTimeout that fires after unmount with the stale `next` snapshot
+  // and writes it back via ipc.updateNote + upsert(next), clobbering
+  // edits the user made on the next visit to the same note.
+  useEffect(() => {
+    return () => {
+      if (saveTimer.current) window.clearTimeout(saveTimer.current);
+    };
   }, []);
 
   useEffect(() => {

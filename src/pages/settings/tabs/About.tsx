@@ -12,8 +12,24 @@ export function AboutTab() {
   const [dataDir, setDataDir] = useState<string>("");
 
   useEffect(() => {
-    getVersion().then(setVersion).catch(() => setVersion("?"));
-    ipc.appDataDir().then(setDataDir).catch(() => setDataDir(""));
+    let cancelled = false;
+    getVersion()
+      .then((v) => {
+        if (!cancelled) setVersion(v);
+      })
+      .catch(() => {
+        if (!cancelled) setVersion("?");
+      });
+    ipc.appDataDir()
+      .then((d) => {
+        if (!cancelled) setDataDir(d);
+      })
+      .catch(() => {
+        if (!cancelled) setDataDir("");
+      });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   return (

@@ -21,7 +21,17 @@ export function SummaryPromptsManager({ language }: { language: string }) {
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
 
   useEffect(() => {
-    ipc.summaryPromptsList().then(setPrompts).catch((e) => setError(String(e)));
+    let cancelled = false;
+    ipc.summaryPromptsList()
+      .then((next) => {
+        if (!cancelled) setPrompts(next);
+      })
+      .catch((e) => {
+        if (!cancelled) setError(String(e));
+      });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   async function refresh() {

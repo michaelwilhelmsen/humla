@@ -25,12 +25,14 @@ export function useSettings() {
   const [s, setS] = useState<Record<EditableKey, string>>(DEFAULTS);
 
   useEffect(() => {
+    let cancelled = false;
     (async () => {
       const [k1, models, ds] = await Promise.all([
         ipc.getApiKey(),
         ipc.localWhisperModels(),
         ipc.diarizeStatus().catch(() => null),
       ]);
+      if (cancelled) return;
       setOpenaiKey((p) => ({ ...p, hasKey: !!k1 }));
       setLocal((p) => ({ ...p, models }));
       setDiarize((p) => ({ ...p, status: ds }));
@@ -39,8 +41,12 @@ export function useSettings() {
           async (key) => [key, (await ipc.getSetting(key)) ?? DEFAULTS[key]] as const,
         ),
       );
+      if (cancelled) return;
       setS(Object.fromEntries(entries) as Record<EditableKey, string>);
     })();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   // Tauri listen() is async; the .then() can resolve *after* a StrictMode
