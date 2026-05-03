@@ -757,7 +757,30 @@ pub async fn recording_stop(
             }
         }
     };
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(30), drain).await;
+    let drain_timed_out =
+        tokio::time::timeout(std::time::Duration::from_secs(30), drain).await.is_err();
+
+    // If the drain timed out, abort whatever's still lingering. A stuck
+    // network call (e.g. OpenAI 503 retry) would otherwise keep running
+    // past recording_stop and try to db::append_transcript onto the
+    // post-stop labelled transcript that diarize_and_apply / final_pass_apply
+    // produced — wholesale overwriting the speaker structure with raw chunk
+    // text. The transcribe_chunk session-active guard is the second line of
+    // defence for the one task that was being awaited when the drain future
+    // was dropped (it's detached, not reachable from here).
+    if drain_timed_out {
+        let remaining: Vec<_> = inflight.lock().drain(..).collect();
+        eprintln!(
+            "recording_stop: drain timed out, aborting {} lingering transcribe(s)",
+            remaining.len()
+        );
+        for h in &remaining {
+            h.abort();
+        }
+        for h in remaining {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), h).await;
+        }
+    }
 
     // Spawn the post-stop processing chain in the background:
     //   Stopping → (Retranscribing | Diarizing) → Polishing → Idle
@@ -1623,6 +1646,19 @@ async fn transcribe_chunk(
     // the transcript from the chunk log sorted by (source, start_ms) at
     // stop time, so the saved transcript ends up properly ordered.
     let state: State<AppState> = app.state();
+    // Session-active guard. The provider call above (whisper / openai) can
+    // take long enough that recording_stop fires while we're still awaiting
+    // it. If the session has been cleared (note_id taken in recording_stop)
+    // or replaced (user started a new recording), this chunk's text would
+    // append onto a transcript the post-stop chain has already rewritten,
+    // pasting raw text past the labelled output. Bail instead.
+    {
+        let session = state.recording.lock();
+        if session.note_id.as_deref() != Some(&note_id) {
+            eprintln!("transcribe: session no longer active for note, dropping chunk");
+            return Ok(());
+        }
+    }
     let updated_transcript = {
         let conn = state.db.lock();
         db::append_transcript(&conn, &note_id, &trimmed, " ")?
