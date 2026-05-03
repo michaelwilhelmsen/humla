@@ -222,61 +222,112 @@ fn local_model_dir(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
+fn model_path_for(app: &AppHandle, info: &local_whisper::ModelInfo) -> Result<PathBuf, String> {
+    Ok(local_model_dir(app)?.join(info.filename))
+}
+
+/// Resolve the path of the currently selected model. Falls back to the
+/// default model when the setting is empty, points at an unknown id, or
+/// the selected model isn't downloaded — last branch keeps recordings
+/// working when the user deletes their active model and forgets to pick
+/// a new one.
 fn local_model_path(app: &AppHandle) -> Result<PathBuf, String> {
-    Ok(local_model_dir(app)?.join(local_whisper::MODEL_FILE))
+    let state: State<AppState> = app.state();
+    let conn = state.db.lock();
+    let id = db::get_setting(&conn, "local_whisper_model")
+        .map_err(err)?
+        .unwrap_or_default();
+    drop(conn);
+    let info = local_whisper::find_model(&id).unwrap_or_else(local_whisper::default_model);
+    let path = model_path_for(app, info)?;
+    if path.exists() {
+        return Ok(path);
+    }
+    // Selected model not downloaded — try the default. If neither exists,
+    // return the path anyway so the caller surfaces a "not downloaded"
+    // error with a real path the user can recognise.
+    let default = local_whisper::default_model();
+    let default_path = model_path_for(app, default)?;
+    Ok(default_path)
 }
 
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct LocalWhisperStatus {
+pub struct LocalWhisperModelStatus {
+    id: String,
+    label: String,
+    description: String,
+    filename: String,
+    size_bytes_hint: u64,
+    language_filter: Option<String>,
     downloaded: bool,
     size_bytes: Option<u64>,
     path: Option<String>,
 }
 
 #[tauri::command]
-pub fn local_whisper_status(app: AppHandle) -> Result<LocalWhisperStatus, String> {
-    let path = local_model_path(&app)?;
-    if !path.exists() {
-        return Ok(LocalWhisperStatus { downloaded: false, size_bytes: None, path: None });
+pub fn local_whisper_models(app: AppHandle) -> Result<Vec<LocalWhisperModelStatus>, String> {
+    let dir = local_model_dir(&app)?;
+    let mut out = Vec::with_capacity(local_whisper::models().len());
+    for info in local_whisper::models() {
+        let path = dir.join(info.filename);
+        let downloaded = path.exists();
+        let size_bytes = if downloaded {
+            std::fs::metadata(&path).ok().map(|m| m.len())
+        } else {
+            None
+        };
+        out.push(LocalWhisperModelStatus {
+            id: info.id.to_string(),
+            label: info.label.to_string(),
+            description: info.description.to_string(),
+            filename: info.filename.to_string(),
+            size_bytes_hint: info.size_bytes_hint,
+            language_filter: info.language_filter.map(|s| s.to_string()),
+            downloaded,
+            size_bytes,
+            path: if downloaded { path.to_str().map(|s| s.to_string()) } else { None },
+        });
     }
-    let size_bytes = std::fs::metadata(&path).ok().map(|m| m.len());
-    Ok(LocalWhisperStatus {
-        downloaded: true,
-        size_bytes,
-        path: path.to_str().map(|s| s.to_string()),
-    })
+    Ok(out)
 }
 
 #[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DownloadProgress {
+    model_id: String,
     received: u64,
     total: Option<u64>,
 }
 
 #[tauri::command]
-pub async fn local_whisper_download(app: AppHandle) -> Result<(), String> {
+pub async fn local_whisper_download(app: AppHandle, model_id: String) -> Result<(), String> {
+    let info = local_whisper::find_model(&model_id)
+        .ok_or_else(|| format!("unknown model id: {model_id}"))?;
     let dir = local_model_dir(&app)?;
     tokio::fs::create_dir_all(&dir).await.map_err(|e| format!("mkdir: {e}"))?;
-    let final_path = dir.join(local_whisper::MODEL_FILE);
+    let final_path = dir.join(info.filename);
     // Download to a temp file in the same dir, then rename atomically so a
     // crash mid-download never leaves a half-written model in place.
-    let tmp_path = dir.join(format!("{}.partial", local_whisper::MODEL_FILE));
+    let tmp_path = dir.join(format!("{}.partial", info.filename));
 
     let resp = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(60 * 30))
         .build()
         .map_err(|e| format!("client: {e}"))?
-        .get(local_whisper::MODEL_URL)
+        .get(info.url)
         .send()
         .await
         .map_err(|e| format!("network: {e}"))?;
     if !resp.status().is_success() {
-        return Err(format!("download {}: HTTP {}", local_whisper::MODEL_URL, resp.status()));
+        return Err(format!("download {}: HTTP {}", info.url, resp.status()));
     }
     let total = resp.content_length();
-    let _ = app.emit("local_whisper_progress", DownloadProgress { received: 0, total });
+    let _ = app.emit("local_whisper_progress", DownloadProgress {
+        model_id: info.id.to_string(),
+        received: 0,
+        total,
+    });
 
     use tokio::io::AsyncWriteExt;
     let mut file = tokio::fs::File::create(&tmp_path)
@@ -291,7 +342,11 @@ pub async fn local_whisper_download(app: AppHandle) -> Result<(), String> {
         received += bytes.len() as u64;
         // Throttle progress events to ~10/sec; UI doesn't need every chunk.
         if last_emit.elapsed() >= std::time::Duration::from_millis(100) {
-            let _ = app.emit("local_whisper_progress", DownloadProgress { received, total });
+            let _ = app.emit("local_whisper_progress", DownloadProgress {
+                model_id: info.id.to_string(),
+                received,
+                total,
+            });
             last_emit = std::time::Instant::now();
         }
     }
@@ -300,14 +355,27 @@ pub async fn local_whisper_download(app: AppHandle) -> Result<(), String> {
     tokio::fs::rename(&tmp_path, &final_path)
         .await
         .map_err(|e| format!("rename: {e}"))?;
-    let _ = app.emit("local_whisper_progress", DownloadProgress { received, total });
+    let _ = app.emit("local_whisper_progress", DownloadProgress {
+        model_id: info.id.to_string(),
+        received,
+        total,
+    });
     Ok(())
 }
 
 #[tauri::command]
-pub async fn local_whisper_delete(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
-    let path = local_model_path(&app)?;
-    // Drop the loaded model from RAM first so we're not holding the file.
+pub async fn local_whisper_delete(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    model_id: String,
+) -> Result<(), String> {
+    let info = local_whisper::find_model(&model_id)
+        .ok_or_else(|| format!("unknown model id: {model_id}"))?;
+    let path = model_path_for(&app, info)?;
+    // Drop the loaded model from RAM first when it's the one being deleted,
+    // so we're not holding the file. SharedContext keys by path, so it's
+    // safe to call unconditionally; worst case the next transcribe reloads
+    // a model that didn't actually need to be evicted.
     local_whisper::unload(&state.whisper);
     if path.exists() {
         tokio::fs::remove_file(&path).await.map_err(|e| format!("remove: {e}"))?;

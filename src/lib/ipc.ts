@@ -38,6 +38,7 @@ export type SettingsKey =
   | "transcribe_provider"
   | "transcribe_model"
   | "whisper_preset"
+  | "local_whisper_model"
   | "final_pass"
   | "custom_vocabulary"
   | "summary_model"
@@ -50,13 +51,23 @@ export type SettingsKey =
 
 export type TranscribeProvider = "openai" | "local";
 
-export type LocalWhisperStatus = {
+export type LocalWhisperModelStatus = {
+  id: string;
+  label: string;
+  description: string;
+  filename: string;
+  sizeBytesHint: number;
+  languageFilter: string | null;
   downloaded: boolean;
   sizeBytes: number | null;
   path: string | null;
 };
 
-export type LocalWhisperProgress = { received: number; total: number | null };
+export type LocalWhisperProgress = {
+  modelId: string;
+  received: number;
+  total: number | null;
+};
 
 export type DiarizeModelStatus = {
   downloaded: boolean;
@@ -94,10 +105,12 @@ export const ipc = {
   setApiKey: (key: string) => invoke<void>("api_key_set", { key }),
   testApiKey: () => invoke<{ ok: boolean; status: number; error: string | null }>("api_key_test"),
 
-  localWhisperStatus: () =>
-    invoke<LocalWhisperStatus>("local_whisper_status"),
-  localWhisperDownload: () => invoke<void>("local_whisper_download"),
-  localWhisperDelete: () => invoke<void>("local_whisper_delete"),
+  localWhisperModels: () =>
+    invoke<LocalWhisperModelStatus[]>("local_whisper_models"),
+  localWhisperDownload: (modelId: string) =>
+    invoke<void>("local_whisper_download", { modelId }),
+  localWhisperDelete: (modelId: string) =>
+    invoke<void>("local_whisper_delete", { modelId }),
 
   diarizeStatus: () => invoke<DiarizeModelStatus>("diarize_status"),
   diarizeDownload: () => invoke<void>("diarize_download"),

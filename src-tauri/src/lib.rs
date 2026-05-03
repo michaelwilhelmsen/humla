@@ -84,7 +84,7 @@ pub fn run() {
             commands::api_key_get,
             commands::api_key_set,
             commands::api_key_test,
-            commands::local_whisper_status,
+            commands::local_whisper_models,
             commands::local_whisper_download,
             commands::local_whisper_delete,
             commands::local_llm_list_models,

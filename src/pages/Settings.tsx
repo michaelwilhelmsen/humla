@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { open as openExternal } from "@tauri-apps/plugin-shell";
-import { ipc, onDiarizeDownloadProgress, onLocalWhisperProgress, type DiarizeModelStatus, type LocalWhisperStatus, type SettingsKey } from "../lib/ipc";
+import { ipc, onDiarizeDownloadProgress, onLocalWhisperProgress, type DiarizeModelStatus, type LocalWhisperModelStatus, type SettingsKey } from "../lib/ipc";
 import { useThemeStore, type Theme } from "../lib/theme";
 import { Permissions } from "../components/Permissions";
 import { SUMMARY_PRESETS, presetPromptForLang, presetLabelForLang } from "../lib/presets";
@@ -22,6 +22,7 @@ const DEFAULTS: Record<EditableKey, string> = {
   transcribe_provider: "openai",
   transcribe_model: "whisper-1",
   whisper_preset: "quality",
+  local_whisper_model: "large-v3-turbo-q5",
   final_pass: "true",
   custom_vocabulary: "",
   summary_model: "gpt-5.4-mini",
@@ -85,19 +86,20 @@ type KeyState = {
 const EMPTY_KEY_STATE: KeyState = { draft: "", hasKey: false, testing: false, result: null };
 
 type LocalState = {
-  status: LocalWhisperStatus | null;
-  downloading: boolean;
-  received: number;
-  total: number | null;
+  // List of all known models with their per-id download status. Sourced
+  // from the backend registry; the UI filters by language and surfaces
+  // download / delete / select per row.
+  models: LocalWhisperModelStatus[];
+  // Per-model download progress while a download is in flight. Keyed by
+  // model id so two simultaneous downloads (rare) wouldn't fight.
+  downloading: Record<string, { received: number; total: number | null }>;
   error: string | null;
   flash: string | null;
 };
 
 const EMPTY_LOCAL_STATE: LocalState = {
-  status: null,
-  downloading: false,
-  received: 0,
-  total: null,
+  models: [],
+  downloading: {},
   error: null,
   flash: null,
 };
@@ -143,13 +145,13 @@ export function Settings() {
 
   useEffect(() => {
     (async () => {
-      const [k1, lw, ds] = await Promise.all([
+      const [k1, models, ds] = await Promise.all([
         ipc.getApiKey(),
-        ipc.localWhisperStatus(),
+        ipc.localWhisperModels(),
         ipc.diarizeStatus().catch(() => null),
       ]);
       setOpenaiKey((p) => ({ ...p, hasKey: !!k1 }));
-      setLocal((p) => ({ ...p, status: lw }));
+      setLocal((p) => ({ ...p, models }));
       setDiarize((p) => ({ ...p, status: ds }));
       const entries = await Promise.all(
         (Object.keys(DEFAULTS) as EditableKey[]).map(async (key) => [key, (await ipc.getSetting(key)) ?? DEFAULTS[key]] as const)
@@ -165,7 +167,10 @@ export function Settings() {
     let cancelled = false;
     let unlisten: (() => void) | undefined;
     onLocalWhisperProgress((p) => {
-      setLocal((s) => ({ ...s, received: p.received, total: p.total }));
+      setLocal((s) => ({
+        ...s,
+        downloading: { ...s.downloading, [p.modelId]: { received: p.received, total: p.total } },
+      }));
     }).then((u) => {
       if (cancelled) u();
       else unlisten = u;
@@ -240,26 +245,54 @@ export function Settings() {
     }, 4000);
   }
 
-  async function downloadModel() {
-    setLocal({ status: null, downloading: true, received: 0, total: null, error: null, flash: null });
+  async function downloadModel(modelId: string) {
+    setLocal((p) => ({
+      ...p,
+      downloading: { ...p.downloading, [modelId]: { received: 0, total: null } },
+      error: null,
+      flash: null,
+    }));
     try {
-      await ipc.localWhisperDownload();
-      const status = await ipc.localWhisperStatus();
-      setLocal({ status, downloading: false, received: 0, total: null, error: null, flash: null });
-      flashLocal("Whisper model downloaded");
+      await ipc.localWhisperDownload(modelId);
+      const models = await ipc.localWhisperModels();
+      setLocal((p) => {
+        const next = { ...p.downloading };
+        delete next[modelId];
+        return { models, downloading: next, error: null, flash: null };
+      });
+      // First successful download with no active selection → adopt this
+      // model. Skips silently when the user already has one set.
+      if (!s.local_whisper_model || s.local_whisper_model === DEFAULTS.local_whisper_model) {
+        const downloaded = models.filter((m) => m.downloaded);
+        if (downloaded.length === 1) {
+          await update("local_whisper_model", modelId);
+        }
+      }
+      const label = models.find((m) => m.id === modelId)?.label ?? modelId;
+      flashLocal(`${label} downloaded`);
     } catch (e) {
-      const status = await ipc.localWhisperStatus().catch(() => null);
-      setLocal({ status, downloading: false, received: 0, total: null, error: String(e), flash: null });
+      const models = await ipc.localWhisperModels().catch(() => local.models);
+      setLocal((p) => {
+        const next = { ...p.downloading };
+        delete next[modelId];
+        return { models, downloading: next, error: String(e), flash: null };
+      });
     }
   }
 
-  async function deleteModel() {
-    const beforePath = local.status?.path;
+  async function deleteModel(modelId: string) {
+    const before = local.models.find((m) => m.id === modelId);
     try {
-      await ipc.localWhisperDelete();
-      const status = await ipc.localWhisperStatus();
-      setLocal({ status, downloading: false, received: 0, total: null, error: null, flash: null });
-      flashLocal(beforePath ? `Deleted ${beforePath}` : "Whisper model deleted");
+      await ipc.localWhisperDelete(modelId);
+      const models = await ipc.localWhisperModels();
+      setLocal((p) => ({ ...p, models, error: null, flash: null }));
+      flashLocal(before ? `Deleted ${before.label}` : "Whisper model deleted");
+      // If the deleted model was the active one, fall back to the first
+      // still-downloaded model (or the registry default if none).
+      if (s.local_whisper_model === modelId) {
+        const fallback = models.find((m) => m.downloaded)?.id ?? DEFAULTS.local_whisper_model;
+        await update("local_whisper_model", fallback);
+      }
     } catch (e) {
       setLocal((p) => ({ ...p, error: String(e) }));
     }
@@ -364,14 +397,14 @@ export function Settings() {
               value={provider}
               onChange={(v) => update("transcribe_provider", v)}
               options={
-                local.status?.downloaded
+                local.models.some((m) => m.downloaded)
                   ? [...PROVIDERS_BASE, LOCAL_PROVIDER]
                   : PROVIDERS_BASE
               }
             />
-            {provider === "local" && !local.status?.downloaded && (
+            {provider === "local" && !local.models.some((m) => m.downloaded) && (
               <p className="text-xs text-red-600 dark:text-red-400 mt-2">
-                The local model isn't downloaded. Download it below before recording.
+                No local model is downloaded. Download one below before recording.
               </p>
             )}
           </Row>
@@ -436,11 +469,14 @@ export function Settings() {
               </p>
             </Row>
           )}
-          <Row label="Local model">
+          <Row label="Local models">
             <LocalModelManager
               state={local}
+              activeId={s.local_whisper_model}
+              language={s.language}
               onDownload={downloadModel}
               onDelete={deleteModel}
+              onSelect={(id) => update("local_whisper_model", id)}
             />
           </Row>
           <Row label="Speaker diarization">
@@ -673,67 +709,100 @@ function formatBytes(n: number) {
 
 function LocalModelManager({
   state,
+  activeId,
+  language,
   onDownload,
   onDelete,
+  onSelect,
 }: {
   state: LocalState;
-  onDownload: () => void;
-  onDelete: () => void;
+  activeId: string;
+  language: string;
+  onDownload: (id: string) => void;
+  onDelete: (id: string) => void;
+  onSelect: (id: string) => void;
 }) {
-  const total = state.total ?? null;
-  const pct = state.downloading && total ? Math.min(100, (state.received / total) * 100) : null;
-
-  if (state.downloading) {
-    return (
-      <div className="flex flex-col gap-2">
-        <div className="text-sm">
-          Downloading{total ? ` ${formatBytes(state.received)} / ${formatBytes(total)}` : ` ${formatBytes(state.received)}`}…
-        </div>
-        <div className="h-1.5 rounded bg-[var(--color-pill-hover)] overflow-hidden">
-          <div
-            className="h-full bg-[var(--color-text-muted)] transition-[width] duration-150"
-            style={{ width: pct === null ? "30%" : `${pct}%` }}
-          />
-        </div>
-      </div>
-    );
-  }
-
-  if (state.status?.downloaded) {
-    return (
-      <div className="flex flex-col gap-2">
-        <div className="text-sm">
-          Downloaded — Whisper large-v3-turbo Q5_0
-          {state.status.sizeBytes ? ` (${formatBytes(state.status.sizeBytes)})` : ""}
-        </div>
-        {state.status.path && (
-          <div className="text-xs text-[var(--color-text-muted)] font-mono break-all">
-            {state.status.path}
-          </div>
-        )}
-        <div className="flex gap-2">
-          <Btn onClick={onDelete}>Delete model</Btn>
-        </div>
-        {state.flash && (
-          <p className="text-xs px-2 py-1 rounded bg-[var(--color-pill-hover)] inline-block break-all" role="status">
-            {state.flash}
-          </p>
-        )}
-        {state.error && (
-          <p className="text-sm text-red-600 dark:text-red-400 break-all">{state.error}</p>
-        )}
-      </div>
-    );
-  }
+  // Filter out language-specific models when the global language doesn't
+  // match. Currently this only hides NB Whisper Large unless language is
+  // Norwegian, but new specialised checkpoints would slot in here too.
+  const visible = state.models.filter(
+    (m) => m.languageFilter === null || m.languageFilter === language,
+  );
 
   return (
-    <div className="flex flex-col gap-2">
-      <div className="text-sm">
-        Not downloaded. The model is ~547 MB and runs on-device with Metal.
-      </div>
-      <div className="flex gap-2">
-        <Btn onClick={onDownload}>Download model</Btn>
-      </div>
+    <div className="flex flex-col gap-3">
+      <p className="text-xs text-[var(--color-text-muted)]">
+        Pick a model to use for transcription. The first download is auto-
+        selected; afterwards switch with the radio button. All models run
+        on-device via Metal.
+      </p>
+      {visible.map((m) => {
+        const dl = state.downloading[m.id];
+        const isActive = m.id === activeId;
+        return (
+          <div
+            key={m.id}
+            className="flex flex-col gap-2 px-3 py-2 rounded-md border border-[var(--color-line)]"
+          >
+            <div className="flex items-start gap-2">
+              <input
+                type="radio"
+                name="local_whisper_model"
+                checked={isActive}
+                disabled={!m.downloaded}
+                onChange={() => onSelect(m.id)}
+                className="mt-1"
+                aria-label={`Use ${m.label}`}
+              />
+              <div className="flex-1 flex flex-col gap-0.5">
+                <div className="flex items-center gap-2 text-sm">
+                  <span className="font-medium">{m.label}</span>
+                  {m.languageFilter && (
+                    <span className="text-xs px-1.5 py-0.5 rounded bg-[var(--color-pill-hover)] text-[var(--color-text-muted)]">
+                      {m.languageFilter} only
+                    </span>
+                  )}
+                  {isActive && m.downloaded && (
+                    <span className="text-xs text-[var(--color-text-muted)]">· active</span>
+                  )}
+                </div>
+                <p className="text-xs text-[var(--color-text-muted)]">{m.description}</p>
+                <p className="text-xs text-[var(--color-text-muted)]">
+                  {m.downloaded
+                    ? `Downloaded${m.sizeBytes ? ` · ${formatBytes(m.sizeBytes)}` : ""}`
+                    : `Not downloaded · ~${formatBytes(m.sizeBytesHint)}`}
+                </p>
+              </div>
+              <div className="flex gap-2">
+                {!m.downloaded && !dl && (
+                  <Btn onClick={() => onDownload(m.id)}>Download</Btn>
+                )}
+                {m.downloaded && !dl && (
+                  <Btn onClick={() => onDelete(m.id)}>Delete</Btn>
+                )}
+              </div>
+            </div>
+            {dl && (
+              <div className="flex flex-col gap-1 mt-1">
+                <div className="text-xs text-[var(--color-text-muted)]">
+                  Downloading{dl.total ? ` ${formatBytes(dl.received)} / ${formatBytes(dl.total)}` : ` ${formatBytes(dl.received)}`}…
+                </div>
+                <div className="h-1 rounded bg-[var(--color-pill-hover)] overflow-hidden">
+                  <div
+                    className="h-full bg-[var(--color-text-muted)] transition-[width] duration-150"
+                    style={{
+                      width:
+                        dl.total === null
+                          ? "30%"
+                          : `${Math.min(100, (dl.received / dl.total) * 100)}%`,
+                    }}
+                  />
+                </div>
+              </div>
+            )}
+          </div>
+        );
+      })}
       {state.flash && (
         <p className="text-xs px-2 py-1 rounded bg-[var(--color-pill-hover)] inline-block break-all" role="status">
           {state.flash}

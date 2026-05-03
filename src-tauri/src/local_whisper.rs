@@ -6,15 +6,80 @@ use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextPar
 
 use crate::wav;
 
-// Default model: large-v3-turbo Q5_0 (~547 MB). Excellent quality on Apple
-// Silicon with Metal acceleration. Sourced from the canonical whisper.cpp
-// HuggingFace repo.
-pub const MODEL_FILE: &str = "ggml-large-v3-turbo-q5_0.bin";
-pub const MODEL_URL: &str =
-    "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin";
-// Approximate; the HF resolver doesn't always return Content-Length on the
-// first hop. Used as a fallback for the UI progress bar.
-pub const MODEL_BYTES_HINT: u64 = 574_041_600;
+// Catalog of GGML Whisper models the app can download. The first entry is
+// the default — picked at first-run, used as a fallback when the user's
+// selected model isn't downloaded. Sizes are approximate (HF doesn't
+// always return Content-Length on the first hop) and used as the progress
+// bar's pre-stream estimate.
+//
+// `language_filter` hides specialized models from users not on that
+// language. NB Whisper Large is finetuned for Norwegian by Nasjonalbiblioteket
+// and produces noticeably worse output on other languages, so we only
+// surface it when the global language is set to "no". General-purpose
+// Whisper models have `language_filter: None` and show up always.
+#[derive(Clone, Copy, Debug)]
+pub struct ModelInfo {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub filename: &'static str,
+    pub url: &'static str,
+    pub size_bytes_hint: u64,
+    pub description: &'static str,
+    pub language_filter: Option<&'static str>,
+}
+
+pub const DEFAULT_MODEL_ID: &str = "large-v3-turbo-q5";
+
+pub fn models() -> &'static [ModelInfo] {
+    &MODELS
+}
+
+pub fn find_model(id: &str) -> Option<&'static ModelInfo> {
+    MODELS.iter().find(|m| m.id == id)
+}
+
+pub fn default_model() -> &'static ModelInfo {
+    find_model(DEFAULT_MODEL_ID).expect("default model id must be in registry")
+}
+
+const MODELS: &[ModelInfo] = &[
+    ModelInfo {
+        id: "large-v3-turbo-q5",
+        label: "Large v3 Turbo (quantized)",
+        filename: "ggml-large-v3-turbo-q5_0.bin",
+        url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin",
+        size_bytes_hint: 574_041_600,
+        description: "Multilingual. ~10× realtime on Apple Silicon. The recommended default for almost all use.",
+        language_filter: None,
+    },
+    ModelInfo {
+        id: "large-v3-turbo",
+        label: "Large v3 Turbo (full precision)",
+        filename: "ggml-large-v3-turbo.bin",
+        url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin",
+        size_bytes_hint: 1_624_555_275,
+        description: "Multilingual. Full-precision turbo — marginally more accurate than the quantized variant, ~3× the disk.",
+        language_filter: None,
+    },
+    ModelInfo {
+        id: "large-v3-q5",
+        label: "Large v3 (quantized)",
+        filename: "ggml-large-v3-q5_0.bin",
+        url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-q5_0.bin",
+        size_bytes_hint: 1_080_321_088,
+        description: "Multilingual. The non-turbo Large v3 — slowest baseline option but highest accuracy on dense or noisy audio.",
+        language_filter: None,
+    },
+    ModelInfo {
+        id: "nb-whisper-large-q5",
+        label: "NB Whisper Large (Norwegian)",
+        filename: "nb-whisper-large-q5_0.bin",
+        url: "https://huggingface.co/NbAiLab/nb-whisper-large/resolve/main/ggml-model-q5_0.bin",
+        size_bytes_hint: 1_159_237_632,
+        description: "Norwegian-finetuned by Nasjonalbiblioteket. Best for Norwegian audio; do not use for other languages.",
+        language_filter: Some("no"),
+    },
+];
 
 // A loaded WhisperContext is reusable across calls and is the bulk of the
 // startup cost (~1-3s on Apple Silicon). We hold it in AppState so repeated
