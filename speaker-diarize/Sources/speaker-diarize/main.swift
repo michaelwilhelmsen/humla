@@ -68,6 +68,16 @@ func parseEngine(_ args: [String]) -> Engine {
     return .community1
 }
 
+func parseFloatFlag(_ args: [String], _ flag: String) -> Float? {
+    guard let i = args.firstIndex(of: flag), i + 1 < args.count else { return nil }
+    return Float(args[i + 1])
+}
+
+func parseDoubleFlag(_ args: [String], _ flag: String) -> Double? {
+    guard let i = args.firstIndex(of: flag), i + 1 < args.count else { return nil }
+    return Double(args[i + 1])
+}
+
 let engine = parseEngine(args)
 
 // CoreML models are .mlmodelc directories — `.size` on a directory only
@@ -238,24 +248,24 @@ func runDownloadSortformer() async -> Int32 {
 
 // MARK: - Diarize: community1
 
-func runDiarizeCommunity1(audioPath: String, numSpeakers: Int?) async -> Int32 {
+func runDiarizeCommunity1(audioPath: String, numSpeakers: Int?, threshold: Double?) async -> Int32 {
     do {
         // Tuning notes for in-person meetings on a shared mic:
-        //   - clusteringThreshold 0.4 (down from community default 0.6, and
-        //     down from the 0.5 we shipped initially) so similar-sounding
+        //   - clusteringThreshold default 0.4 (down from community default 0.6,
+        //     and down from the 0.5 we shipped initially) so similar-sounding
         //     voices recorded in the same room don't collapse onto one
         //     cluster. Lower = more aggressive separation. The value was
         //     tightened after observing the v0.8.0 build still merging
         //     two-person conversations into a single cluster when one
         //     speaker dominated and the other only dropped short
-        //     interjections.
+        //     interjections. Caller can override via --threshold.
         //   - excludeOverlap stays true (default): when two speakers overlap,
         //     the overlapping frames are masked out before extracting per-
         //     speaker embeddings, so the embedding stays clean.
         //   - exclusiveSegments stays true (default): output is non-overlapping
         //     so each chunk maps to exactly one speaker for the chunk-to-
         //     segment alignment in commands.rs::assign_speaker.
-        var config = OfflineDiarizerConfig(clusteringThreshold: 0.4)
+        var config = OfflineDiarizerConfig(clusteringThreshold: threshold ?? 0.4)
         // Caller-supplied speaker count hint when the user knows the count
         // ahead of time. `withSpeakers(exactly:)` overrides the auto cluster
         // detection inside VBx — without it, VBx is free to pick any
@@ -312,7 +322,11 @@ func runDiarizeCommunity1(audioPath: String, numSpeakers: Int?) async -> Int32 {
 
 // MARK: - Diarize: Sortformer
 
-func runDiarizeSortformer(audioPath: String) async -> Int32 {
+func runDiarizeSortformer(
+    audioPath: String,
+    silenceThreshold: Float?,
+    predScoreThreshold: Float?
+) async -> Int32 {
     do {
         let modelPath = sortformerModelPath()
         guard FileManager.default.fileExists(atPath: modelPath.path) else {
@@ -320,7 +334,13 @@ func runDiarizeSortformer(audioPath: String) async -> Int32 {
             return 1
         }
 
-        let diarizer = SortformerDiarizer(config: sortformerConfig)
+        // SortformerConfig is a struct of `var` thresholds, so we can clone
+        // the highContextV2_1 default and override the two we expose.
+        var config = sortformerConfig
+        if let s = silenceThreshold { config.silenceThreshold = s }
+        if let p = predScoreThreshold { config.predScoreThreshold = p }
+
+        let diarizer = SortformerDiarizer(config: config)
         try await diarizer.initialize(mainModelPath: modelPath)
 
         let url = URL(fileURLWithPath: audioPath)
@@ -389,12 +409,23 @@ default:
        n > 0 {
         numSpeakers = n
     }
+    let clusteringThreshold = parseDoubleFlag(args, "--threshold")
+    let silenceThreshold = parseFloatFlag(args, "--silence-threshold")
+    let predScoreThreshold = parseFloatFlag(args, "--pred-threshold")
     Task {
         switch engine {
         case .community1:
-            exitCode = await runDiarizeCommunity1(audioPath: path, numSpeakers: numSpeakers)
+            exitCode = await runDiarizeCommunity1(
+                audioPath: path,
+                numSpeakers: numSpeakers,
+                threshold: clusteringThreshold
+            )
         case .sortformer:
-            exitCode = await runDiarizeSortformer(audioPath: path)
+            exitCode = await runDiarizeSortformer(
+                audioPath: path,
+                silenceThreshold: silenceThreshold,
+                predScoreThreshold: predScoreThreshold
+            )
         }
         semaphore.signal()
     }

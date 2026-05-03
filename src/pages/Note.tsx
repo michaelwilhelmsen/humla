@@ -11,6 +11,7 @@ import {
   Languages,
   Users,
 } from "lucide-react";
+import { open as openExternal } from "@tauri-apps/plugin-shell";
 import { ipc, onSummaryThinkingDelta, onSummaryContentDelta, type Note as TNote, type SummaryPrompt } from "../lib/ipc";
 import { useNotesStore, useRecordingStore } from "../lib/store";
 import { RecordingBar } from "../components/RecordingBar";
@@ -417,6 +418,7 @@ export function Note() {
                     patch("transcript", renameSpeakerInTranscript(draft.transcript, oldLabel, newLabel))
                   }
                 />
+                <DiagnosticsLinks noteId={draft.id} />
                 <TranscriptEditor
                   value={draft.transcript}
                   onChange={(v) => patch("transcript", v)}
@@ -1008,4 +1010,70 @@ function escapeHtml(s: string): string {
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#39;");
+}
+
+// Small "Diagnostics / Audio" link row under the speaker chips. Each
+// link is hidden until the corresponding files actually exist for this
+// note, so we don't dangle dead links — diagnostics only after a
+// diarize run has dumped its JSON, audio only when keep_audio was on
+// at recording time. Clicks open the folder in Finder via Tauri's
+// shell plugin (works on both files and directories on macOS).
+function DiagnosticsLinks({ noteId }: { noteId: string }) {
+  const [diagFiles, setDiagFiles] = useState<string[]>([]);
+  const [audioFiles, setAudioFiles] = useState<string[]>([]);
+
+  useEffect(() => {
+    let cancelled = false;
+    ipc.noteDiagnosticsFiles(noteId)
+      .then((f) => {
+        if (!cancelled) setDiagFiles(f);
+      })
+      .catch(() => {});
+    ipc.noteAudioFiles(noteId)
+      .then((f) => {
+        if (!cancelled) setAudioFiles(f);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [noteId]);
+
+  const hasDiag = diagFiles.length > 0;
+  const hasAudio = audioFiles.length > 0;
+  if (!hasDiag && !hasAudio) return null;
+
+  async function openDiag() {
+    const dir = await ipc.noteDiagnosticsDir(noteId);
+    await openExternal(dir);
+  }
+  async function openAudio() {
+    const dir = await ipc.noteAudioDir(noteId);
+    await openExternal(dir);
+  }
+
+  return (
+    <div className="flex items-center gap-3 text-xs text-[var(--color-text-muted)] mb-3">
+      {hasDiag && (
+        <button
+          type="button"
+          onClick={openDiag}
+          className="underline hover:text-[var(--color-text)]"
+          title="Open diagnostics folder in Finder"
+        >
+          Diagnostics ({diagFiles.length})
+        </button>
+      )}
+      {hasAudio && (
+        <button
+          type="button"
+          onClick={openAudio}
+          className="underline hover:text-[var(--color-text)]"
+          title="Open retained audio folder in Finder"
+        >
+          Audio ({audioFiles.length})
+        </button>
+      )}
+    </div>
+  );
 }

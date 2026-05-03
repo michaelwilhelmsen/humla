@@ -21,7 +21,7 @@ use tokio::process::Command;
 // 16 kHz mono Float32, and the actual diarization. It writes a single JSON
 // array of segments to stdout and exits.
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Segment {
     pub start_ms: u64,
     pub end_ms: u64,
@@ -39,6 +39,16 @@ pub struct Segment {
 /// (exactly:)`, which is the most reliable fix for dominant-speaker
 /// recordings where VBx auto-detection collapses to one cluster. `None`
 /// leaves auto-detection on.
+/// User-tunable thresholds passed through to the sidecar. `None` for any
+/// field means "use the sidecar's built-in default" — the values that
+/// match what the project shipped before these became settings.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Thresholds {
+    pub community1_clustering: Option<f64>,
+    pub sortformer_silence: Option<f32>,
+    pub sortformer_pred: Option<f32>,
+}
+
 /// Which diarization engine the sidecar should run.
 ///
 /// `Community1` is FluidAudio's `OfflineDiarizerManager` (community-1
@@ -79,6 +89,7 @@ pub async fn diarize_file(
     audio_path: &Path,
     num_speakers: Option<i64>,
     engine: Engine,
+    thresholds: Thresholds,
 ) -> Result<Vec<Segment>> {
     let sidecar = sidecar_path(app)?;
     let path_str = audio_path
@@ -93,6 +104,16 @@ pub async fn diarize_file(
     if engine == Engine::Community1 {
         if let Some(n) = num_speakers.filter(|n| *n > 0) {
             cmd.arg("--num-speakers").arg(n.to_string());
+        }
+        if let Some(t) = thresholds.community1_clustering {
+            cmd.arg("--threshold").arg(format!("{t}"));
+        }
+    } else if engine == Engine::Sortformer {
+        if let Some(t) = thresholds.sortformer_silence {
+            cmd.arg("--silence-threshold").arg(format!("{t}"));
+        }
+        if let Some(t) = thresholds.sortformer_pred {
+            cmd.arg("--pred-threshold").arg(format!("{t}"));
         }
     }
     let output = cmd

@@ -43,6 +43,10 @@ export type SettingsKey =
   | "final_pass"
   | "default_summary_preset"
   | "diarize_model"
+  | "community1_threshold"
+  | "sortformer_silence_threshold"
+  | "sortformer_pred_threshold"
+  | "keep_audio"
   | "custom_vocabulary"
   | "summary_model"
   | "summary_prompt"
@@ -125,6 +129,14 @@ export const ipc = {
   getSetting: (key: SettingsKey) => invoke<string | null>("settings_get", { key }),
   setSetting: (key: SettingsKey, value: string) => invoke<void>("settings_set", { key, value }),
   appDataDir: () => invoke<string>("app_data_dir"),
+  noteDiagnosticsDir: (noteId: string) =>
+    invoke<string>("note_diagnostics_dir", { noteId }),
+  noteAudioDir: (noteId: string) =>
+    invoke<string>("note_audio_dir", { noteId }),
+  noteAudioFiles: (noteId: string) =>
+    invoke<string[]>("note_audio_files", { noteId }),
+  noteDiagnosticsFiles: (noteId: string) =>
+    invoke<string[]>("note_diagnostics_files", { noteId }),
 
   summaryPromptsList: () => invoke<SummaryPrompt[]>("summary_prompts_list"),
   summaryPromptsCreate: (name: string, content: string) =>

@@ -27,6 +27,23 @@ const DEFAULT_WHISPER_PRESET: &str = "quality";
 // they want before recording.
 const DEFAULT_DIARIZE_MODEL: &str = "community1";
 
+// Diarizer threshold defaults — match the sidecar's hardcoded values so
+// "default" in settings produces the same behaviour as the original
+// fixed-knob releases. Users tweak these in Settings → Transcription
+// → Speaker diarization → Advanced when iterating on recordings the
+// stock thresholds get wrong. Stored as strings (settings table is
+// string-keyed); parsed at use site.
+const DEFAULT_COMMUNITY1_THRESHOLD: &str = "0.4";
+const DEFAULT_SORTFORMER_SILENCE_THRESHOLD: &str = "0.2";
+const DEFAULT_SORTFORMER_PRED_THRESHOLD: &str = "0.25";
+
+// Off by default — recordings live in the temp dir for the duration of
+// the post-stop pipeline and are deleted at the end. When this is on,
+// the audio-capture full WAVs are copied to <app_data>/recordings/<note_id>/
+// before cleanup so the user can re-run diarize at different thresholds,
+// or just listen back. Privacy posture stays opt-in.
+const DEFAULT_KEEP_AUDIO: &str = "false";
+
 // Default ON: Apple Silicon Macs have working Metal and the speedup is
 // huge (~10× over BLAS). When `use_gpu` is true and Metal init fails at
 // runtime, whisper.cpp logs the failure and falls back to BLAS — but the
@@ -118,6 +135,94 @@ pub fn app_data_dir(app: AppHandle) -> Result<String, String> {
     path.to_str()
         .map(|s| s.to_string())
         .ok_or_else(|| "non-utf8 path".to_string())
+}
+
+/// Path to the per-note diagnostics directory. Always returns a valid
+/// path (whether or not files actually exist there yet); the frontend
+/// uses it to open the directory in Finder so the user can inspect the
+/// JSON dumps directly.
+#[tauri::command]
+pub fn note_diagnostics_dir(app: AppHandle, note_id: String) -> Result<String, String> {
+    let path = app
+        .path()
+        .app_data_dir()
+        .map_err(err)?
+        .join("diagnostics")
+        .join(&note_id);
+    path.to_str()
+        .map(|s| s.to_string())
+        .ok_or_else(|| "non-utf8 path".to_string())
+}
+
+/// Path to the per-note retained-audio directory. The directory only
+/// exists when `keep_audio` was on at recording time; the frontend
+/// checks via `note_audio_files` first before offering the open
+/// affordance.
+#[tauri::command]
+pub fn note_audio_dir(app: AppHandle, note_id: String) -> Result<String, String> {
+    let path = app
+        .path()
+        .app_data_dir()
+        .map_err(err)?
+        .join("recordings")
+        .join(&note_id);
+    path.to_str()
+        .map(|s| s.to_string())
+        .ok_or_else(|| "non-utf8 path".to_string())
+}
+
+/// Lists which retained audio files exist for a note. Empty vec when
+/// keep_audio was off at recording time, or after a manual cleanup.
+#[tauri::command]
+pub fn note_audio_files(app: AppHandle, note_id: String) -> Result<Vec<String>, String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(err)?
+        .join("recordings")
+        .join(&note_id);
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            if let Some(name) = entry.file_name().to_str() {
+                if name.ends_with(".wav") {
+                    out.push(name.to_string());
+                }
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// Lists which diagnostic dumps exist for a note (e.g. ["community1-mic.json",
+/// "sortformer-sys.json"]). Empty vec when no diarize has run yet.
+#[tauri::command]
+pub fn note_diagnostics_files(app: AppHandle, note_id: String) -> Result<Vec<String>, String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(err)?
+        .join("diagnostics")
+        .join(&note_id);
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            if let Some(name) = entry.file_name().to_str() {
+                if name.ends_with(".json") {
+                    out.push(name.to_string());
+                }
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
 }
 
 #[tauri::command]
@@ -286,6 +391,143 @@ fn active_diarize_engine(state: &State<AppState>) -> diarize::Engine {
         .flatten()
         .unwrap_or_else(|| DEFAULT_DIARIZE_MODEL.to_string());
     diarize::Engine::from_setting(&id)
+}
+
+/// Write a JSON snapshot of one diarize run for inspection. Lands at
+/// <app_data>/diagnostics/<note_id>/<engine>-<source>.json, overwritten
+/// each time the same combination runs (e.g. switching engines or
+/// re-running with different thresholds). Includes the segments, the
+/// chunk timings they were aligned against, and the threshold values
+/// used — enough for the user to eyeball where the engine placed
+/// shifts and decide whether the threshold is too aggressive or too
+/// loose. Best-effort: a write failure logs and proceeds, never breaks
+/// the diarize pipeline.
+async fn write_diagnostics_json(
+    app: &AppHandle,
+    note_id: &str,
+    engine: diarize::Engine,
+    source: &str,
+    segments: &[diarize::Segment],
+    chunks: &[ChunkRecord],
+    thresholds: &diarize::Thresholds,
+) {
+    let Ok(app_dir) = app.path().app_data_dir() else {
+        eprintln!("diagnostics: app_data_dir unavailable, skipping write");
+        return;
+    };
+    let dir = app_dir.join("diagnostics").join(note_id);
+    if let Err(e) = tokio::fs::create_dir_all(&dir).await {
+        eprintln!("diagnostics: mkdir {}: {e}", dir.display());
+        return;
+    }
+    let engine_arg = match engine {
+        diarize::Engine::Community1 => "community1",
+        diarize::Engine::Sortformer => "sortformer",
+    };
+    let path = dir.join(format!("{engine_arg}-{source}.json"));
+
+    let chunk_payload: Vec<_> = chunks
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "source": match c.source { ChunkSource::Mic => "mic", ChunkSource::Sys => "sys" },
+                "start_ms": c.start_ms,
+                "text": c.text,
+            })
+        })
+        .collect();
+    let payload = serde_json::json!({
+        "engine": engine_arg,
+        "source": source,
+        "thresholds": {
+            "community1_clustering": thresholds.community1_clustering,
+            "sortformer_silence": thresholds.sortformer_silence,
+            "sortformer_pred": thresholds.sortformer_pred,
+        },
+        "segments": segments,
+        "chunks": chunk_payload,
+        "created_at": chrono::Utc::now().timestamp_millis(),
+    });
+
+    let json = match serde_json::to_string_pretty(&payload) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("diagnostics: serialize: {e}");
+            return;
+        }
+    };
+    if let Err(e) = tokio::fs::write(&path, json).await {
+        eprintln!("diagnostics: write {}: {e}", path.display());
+    }
+}
+
+/// Copy the temp-dir full WAVs to a permanent location keyed by
+/// note_id when the user has opted into audio retention. Called from
+/// the post-stop chain *before* diarize_and_apply / final_pass_apply
+/// consume and delete the temp files via cleanup_full_wav. Best-effort:
+/// individual copy failures log and proceed.
+async fn maybe_keep_audio(app: &AppHandle, note_id: &str) {
+    let state: State<AppState> = app.state();
+    let keep = {
+        let conn = state.db.lock();
+        db::get_setting(&conn, "keep_audio")
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| DEFAULT_KEEP_AUDIO.to_string())
+    };
+    if keep != "true" {
+        return;
+    }
+    let (mic_wav, sys_wav) = {
+        let session = state.recording.lock();
+        let mic = session.mic_full_wav_path.lock().clone();
+        let sys = session.sys_full_wav_path.lock().clone();
+        (mic, sys)
+    };
+    let Ok(app_dir) = app.path().app_data_dir() else {
+        eprintln!("keep_audio: app_data_dir unavailable");
+        return;
+    };
+    let target = app_dir.join("recordings").join(note_id);
+    if let Err(e) = tokio::fs::create_dir_all(&target).await {
+        eprintln!("keep_audio: mkdir {}: {e}", target.display());
+        return;
+    }
+    if let Some(src) = mic_wav {
+        if let Err(e) = tokio::fs::copy(&src, target.join("mic.wav")).await {
+            eprintln!("keep_audio: copy mic: {e}");
+        }
+    }
+    if let Some(src) = sys_wav {
+        if let Err(e) = tokio::fs::copy(&src, target.join("sys.wav")).await {
+            eprintln!("keep_audio: copy sys: {e}");
+        }
+    }
+}
+
+/// Read the user-tunable diarizer thresholds from settings. Anything
+/// missing or unparseable falls back to None — the sidecar then uses
+/// its built-in defaults. We don't paper over a malformed value because
+/// silently picking 0.4 when the user typed "abc" hides the bug.
+fn read_diarize_thresholds(state: &State<AppState>) -> diarize::Thresholds {
+    let conn = state.db.lock();
+    let community1_clustering = db::get_setting(&conn, "community1_threshold")
+        .ok()
+        .flatten()
+        .and_then(|s| s.parse::<f64>().ok());
+    let sortformer_silence = db::get_setting(&conn, "sortformer_silence_threshold")
+        .ok()
+        .flatten()
+        .and_then(|s| s.parse::<f32>().ok());
+    let sortformer_pred = db::get_setting(&conn, "sortformer_pred_threshold")
+        .ok()
+        .flatten()
+        .and_then(|s| s.parse::<f32>().ok());
+    diarize::Thresholds {
+        community1_clustering,
+        sortformer_silence,
+        sortformer_pred,
+    }
 }
 
 #[tauri::command]
@@ -1009,6 +1251,13 @@ pub async fn recording_stop(
     // AVAudioFile reader). Sequencing cleanup behind the chain ensures the
     // full WAVs survive for as long as any post-stop step needs them.
     tokio::spawn(async move {
+        // Copy full WAVs to a permanent location FIRST when keep_audio is
+        // on. Both diarize_and_apply and final_pass_apply call
+        // cleanup_full_wav on the temp paths after they're done with
+        // them, so retention has to happen before the diarize step
+        // consumes the files.
+        maybe_keep_audio(&app_for_post, &note_for_post).await;
+
         let use_final_pass = {
             let state: State<AppState> = app_for_post.state();
             let conn = state.db.lock();
@@ -1092,7 +1341,7 @@ async fn diarize_and_apply(app: AppHandle, note_id: String) -> anyhow::Result<()
     // guards before the long await on the sidecar. Also read the per-note
     // expected_speakers hint here while we're in the DB — passing the
     // resolved value forward keeps the long-await section free of locks.
-    let (mic_wav, sys_wav, chunks, snapshot, expected_speakers, engine) = {
+    let (mic_wav, sys_wav, chunks, snapshot, expected_speakers, engine, thresholds) = {
         let state: State<AppState> = app.state();
         let session = state.recording.lock();
         let mic = session.mic_full_wav_path.lock().clone();
@@ -1101,12 +1350,13 @@ async fn diarize_and_apply(app: AppHandle, note_id: String) -> anyhow::Result<()
         let snap = session.transcript_at_start.lock().clone();
         drop(session);
         let eng = active_diarize_engine(&state);
+        let thr = read_diarize_thresholds(&state);
         let conn = state.db.lock();
         let hint = db::get_note(&conn, &note_id)
             .ok()
             .and_then(|n| n.expected_speakers)
             .filter(|n| *n > 0);
-        (mic, sys, log, snap, hint, eng)
+        (mic, sys, log, snap, hint, eng, thr)
     };
     if chunks.is_empty() {
         eprintln!("diarize: no chunks captured, skipping");
@@ -1153,7 +1403,8 @@ async fn diarize_and_apply(app: AppHandle, note_id: String) -> anyhow::Result<()
                 );
                 return Ok(());
             };
-            let segments = diarize::diarize_file(&app, &wav, expected_speakers, engine).await?;
+            let segments = diarize::diarize_file(&app, &wav, expected_speakers, engine, thresholds).await?;
+            write_diagnostics_json(&app, &note_id, engine, "mic", &segments, &chunks, &thresholds).await;
             if segments.is_empty() {
                 eprintln!("diarize: no segments returned for mic stream, leaving transcript untagged");
                 return Ok(());
@@ -1176,7 +1427,8 @@ async fn diarize_and_apply(app: AppHandle, note_id: String) -> anyhow::Result<()
                 );
                 return Ok(());
             };
-            let segments = diarize::diarize_file(&app, &wav, expected_speakers, engine).await?;
+            let segments = diarize::diarize_file(&app, &wav, expected_speakers, engine, thresholds).await?;
+            write_diagnostics_json(&app, &note_id, engine, "sys", &segments, &chunks, &thresholds).await;
             if segments.is_empty() {
                 eprintln!("diarize: no segments returned for sys stream, leaving transcript untagged");
                 return Ok(());
@@ -1229,7 +1481,7 @@ async fn diarize_and_apply(app: AppHandle, note_id: String) -> anyhow::Result<()
                     );
                     single_speaker_fallback()
                 }
-                Some(wav) => match diarize::diarize_file(&app, &wav, sys_speaker_hint, engine).await {
+                Some(wav) => match diarize::diarize_file(&app, &wav, sys_speaker_hint, engine, thresholds).await {
                     Err(e) => {
                         eprintln!("diarize: sys diarize failed ({e}), falling back to single-speaker labels");
                         emit_error(
@@ -1244,6 +1496,7 @@ async fn diarize_and_apply(app: AppHandle, note_id: String) -> anyhow::Result<()
                         single_speaker_fallback()
                     }
                     Ok(segments) => {
+                        write_diagnostics_json(&app, &note_id, engine, "sys", &segments, &chunks, &thresholds).await;
                         let display_map = build_display_map(&chunks, &segments, ChunkSource::Sys);
                         Box::new(move |c: &ChunkRecord| match c.source {
                             ChunkSource::Mic => Some("You".to_string()),
@@ -1332,7 +1585,7 @@ async fn final_pass_apply(app: AppHandle, note_id: String) -> anyhow::Result<()>
 
     // Pull paths + transcribe config in one DB pass so the long awaits
     // below don't hold any locks.
-    let (mic_wav, sys_wav, snapshot, expected_speakers, language, whisper_preset, vocabulary, engine) = {
+    let (mic_wav, sys_wav, snapshot, expected_speakers, language, whisper_preset, vocabulary, engine, thresholds) = {
         let state: State<AppState> = app.state();
         let session = state.recording.lock();
         let mic = session.mic_full_wav_path.lock().clone();
@@ -1340,6 +1593,7 @@ async fn final_pass_apply(app: AppHandle, note_id: String) -> anyhow::Result<()>
         let snap = session.transcript_at_start.lock().clone();
         drop(session);
         let eng = active_diarize_engine(&state);
+        let thr = read_diarize_thresholds(&state);
         let conn = state.db.lock();
         let global_language = db::get_setting(&conn, "language")?
             .unwrap_or_else(|| DEFAULT_LANGUAGE.to_string());
@@ -1353,7 +1607,7 @@ async fn final_pass_apply(app: AppHandle, note_id: String) -> anyhow::Result<()>
         let preset = db::get_setting(&conn, "whisper_preset")?
             .unwrap_or_else(|| DEFAULT_WHISPER_PRESET.to_string());
         let vocab = db::get_setting(&conn, "custom_vocabulary")?.unwrap_or_default();
-        (mic, sys, snap, hint, lang, preset, vocab, eng)
+        (mic, sys, snap, hint, lang, preset, vocab, eng, thr)
     };
 
     if mic_wav.is_none() && sys_wav.is_none() {
@@ -1440,7 +1694,8 @@ async fn final_pass_apply(app: AppHandle, note_id: String) -> anyhow::Result<()>
                     eprintln!("final_pass: mic segments present but mic_full.wav missing");
                     return Ok(());
                 };
-                let segments = diarize::diarize_file(&app, &wav, expected_speakers, engine).await?;
+                let segments = diarize::diarize_file(&app, &wav, expected_speakers, engine, thresholds).await?;
+                write_diagnostics_json(&app, &note_id, engine, "mic", &segments, &chunks, &thresholds).await;
                 if segments.is_empty() {
                     Box::new(|_: &ChunkRecord| Some("Speaker 1".to_string()))
                 } else {
@@ -1460,7 +1715,8 @@ async fn final_pass_apply(app: AppHandle, note_id: String) -> anyhow::Result<()>
                     eprintln!("final_pass: sys segments present but sys_full.wav missing");
                     return Ok(());
                 };
-                let segments = diarize::diarize_file(&app, &wav, expected_speakers, engine).await?;
+                let segments = diarize::diarize_file(&app, &wav, expected_speakers, engine, thresholds).await?;
+                write_diagnostics_json(&app, &note_id, engine, "sys", &segments, &chunks, &thresholds).await;
                 if segments.is_empty() {
                     Box::new(|_: &ChunkRecord| Some("Speaker 1".to_string()))
                 } else {
@@ -1481,7 +1737,7 @@ async fn final_pass_apply(app: AppHandle, note_id: String) -> anyhow::Result<()>
             let sys_speaker_hint = expected_speakers.map(|n| (n - 1).max(1));
             let sys_segments = if diarize_available {
                 if let Some(p) = sys_wav.as_ref() {
-                    diarize::diarize_file(&app, p, sys_speaker_hint, engine)
+                    diarize::diarize_file(&app, p, sys_speaker_hint, engine, thresholds)
                         .await
                         .unwrap_or_default()
                 } else {
@@ -1490,6 +1746,7 @@ async fn final_pass_apply(app: AppHandle, note_id: String) -> anyhow::Result<()>
             } else {
                 Vec::new()
             };
+            write_diagnostics_json(&app, &note_id, engine, "sys", &sys_segments, &chunks, &thresholds).await;
             if sys_segments.is_empty() {
                 Box::new(move |c: &ChunkRecord| match c.source {
                     ChunkSource::Mic => Some("You".to_string()),
