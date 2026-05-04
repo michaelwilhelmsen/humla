@@ -3,16 +3,18 @@ import { useRecordingStore } from "../lib/store";
 
 export function Toaster() {
   const errors = useRecordingStore((s) => s.errors);
-  const dismiss = useRecordingStore((s) => s.dismissError);
+  const flashes = useRecordingStore((s) => s.flashes);
+  const dismissError = useRecordingStore((s) => s.dismissError);
+  const dismissFlash = useRecordingStore((s) => s.dismissFlash);
   const navigate = useNavigate();
 
-  if (errors.length === 0) return null;
+  if (errors.length === 0 && flashes.length === 0) return null;
 
   return (
     <div className="no-drag fixed bottom-24 right-6 z-50 flex flex-col gap-2 max-w-sm">
       {errors.map((e) => (
         <div
-          key={e.id}
+          key={`err-${e.id}`}
           className="flex items-start gap-3 px-4 py-3 rounded-lg bg-[var(--color-surface)] border border-[var(--color-line)] shadow-md text-sm"
         >
           <div className="flex-1">
@@ -20,7 +22,7 @@ export function Toaster() {
             <div className="text-[var(--color-text)]">{e.message}</div>
             {e.message.toLowerCase().includes("permission") && (
               <button
-                onClick={() => { navigate("/settings"); dismiss(e.id); }}
+                onClick={() => { navigate("/settings"); dismissError(e.id); }}
                 className="mt-2 text-xs underline text-[var(--color-text-muted)] hover:text-[var(--color-text)]"
               >
                 Open Settings
@@ -28,7 +30,20 @@ export function Toaster() {
             )}
           </div>
           <button
-            onClick={() => dismiss(e.id)}
+            onClick={() => dismissError(e.id)}
+            className="text-[var(--color-text-muted)] hover:text-[var(--color-text)]"
+            aria-label="Dismiss"
+          >×</button>
+        </div>
+      ))}
+      {flashes.map((f) => (
+        <div
+          key={`flash-${f.id}`}
+          className="flex items-center gap-3 px-4 py-2 rounded-lg bg-[var(--color-surface)] border border-[var(--color-line)] shadow-md text-sm text-[var(--color-text)]"
+        >
+          <div className="flex-1">{f.message}</div>
+          <button
+            onClick={() => dismissFlash(f.id)}
             className="text-[var(--color-text-muted)] hover:text-[var(--color-text)]"
             aria-label="Dismiss"
           >×</button>

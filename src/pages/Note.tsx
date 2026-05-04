@@ -1243,6 +1243,7 @@ function TranscriptPlayer({
     setTimeline((tl) => tl.filter((_, i) => i !== idx));
     try {
       await ipc.noteTimelineDeleteChunk(noteId, idx);
+      useRecordingStore.getState().pushFlash("Line deleted");
     } catch (err) {
       console.error("noteTimelineDeleteChunk failed", err);
     }

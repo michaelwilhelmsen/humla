@@ -63,17 +63,23 @@ export const useNotesStore = create<NotesState>((set) => ({
   removeLocal: (id) => set((s) => ({ notes: s.notes.filter((n) => n.id !== id) })),
 }));
 
+export type Flash = { id: number; message: string };
+
 type RecordingState = {
   status: RecordingStatus;
   setStatus: (s: RecordingStatus) => void;
   errors: { id: number; noteId: string | null; message: string }[];
   pushError: (e: { noteId: string | null; message: string }) => void;
   dismissError: (id: number) => void;
+  flashes: Flash[];
+  pushFlash: (message: string) => void;
+  dismissFlash: (id: number) => void;
   diag: RecordingDiagnostic | null;
   setDiag: (d: RecordingDiagnostic | null) => void;
 };
 
 let errorIdSeq = 0;
+let flashIdSeq = 0;
 
 export const useRecordingStore = create<RecordingState>((set, get) => ({
   status: { noteId: null, phase: "idle" },
@@ -92,6 +98,18 @@ export const useRecordingStore = create<RecordingState>((set, get) => ({
     window.setTimeout(() => set((s) => ({ errors: s.errors.filter((x) => x.id !== id) })), 8000);
   },
   dismissError: (id) => set((s) => ({ errors: s.errors.filter((x) => x.id !== id) })),
+  flashes: [],
+  pushFlash: (message) => {
+    const id = ++flashIdSeq;
+    set((s) => ({ flashes: [...s.flashes, { id, message }] }));
+    // Auto-dismiss faster than errors — flashes are positive
+    // confirmations, no action needed from the user.
+    window.setTimeout(
+      () => set((s) => ({ flashes: s.flashes.filter((x) => x.id !== id) })),
+      2500,
+    );
+  },
+  dismissFlash: (id) => set((s) => ({ flashes: s.flashes.filter((x) => x.id !== id) })),
   diag: null,
   setDiag: (d) => set({ diag: d }),
 }));
