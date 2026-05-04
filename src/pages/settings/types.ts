@@ -36,6 +36,7 @@ export const DEFAULTS: Record<EditableKey, string> = {
   local_llm_think: "false",
   developer_mode: "false",
   auto_polish: "false",
+  silence_rms_threshold: "0.008",
 };
 
 export const PROVIDERS_BASE = [{ value: "openai", label: "OpenAI" }];

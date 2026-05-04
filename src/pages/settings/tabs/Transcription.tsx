@@ -260,6 +260,28 @@ export function TranscriptionTab({
                   Default 0.25.
                 </p>
               </div>
+              <div>
+                <label className="text-xs uppercase tracking-wide text-[var(--color-text-muted)] block mb-1">
+                  Silence RMS threshold
+                </label>
+                <input
+                  type="text"
+                  value={s.silence_rms_threshold}
+                  onChange={(e) => update("silence_rms_threshold", e.target.value)}
+                  placeholder="0.008"
+                  className={inputClass + " w-32"}
+                  style={{ fontFamily: "var(--font-mono)" }}
+                />
+                <p className="text-xs text-[var(--color-text-muted)] mt-1">
+                  Chunks with RMS below this are skipped before
+                  Whisper sees them — prevents hallucinations on
+                  near-silence and HVAC / mic-hiss audio. Higher =
+                  drops more borderline chunks (less hallucination,
+                  but quiet speech can be cut). Default 0.008. Pure
+                  silence ≈ 0.0001, room tone ≈ 0.001, soft speech ≈
+                  0.01+.
+                </p>
+              </div>
             </div>
           </details>
           <p className="text-xs text-[var(--color-text-muted)] mt-2">

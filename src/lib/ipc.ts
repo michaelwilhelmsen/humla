@@ -56,7 +56,8 @@ export type SettingsKey =
   | "local_llm_think"
   | "theme"
   | "developer_mode"
-  | "auto_polish";
+  | "auto_polish"
+  | "silence_rms_threshold";
 
 export type TranscribeProvider = "openai" | "local";
 

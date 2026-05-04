@@ -36,6 +36,7 @@ const DEFAULT_DIARIZE_MODEL: &str = "community1";
 const DEFAULT_COMMUNITY1_THRESHOLD: &str = "0.5";
 const DEFAULT_SORTFORMER_SILENCE_THRESHOLD: &str = "0.5";
 const DEFAULT_SORTFORMER_PRED_THRESHOLD: &str = "0.25";
+const DEFAULT_SILENCE_RMS_THRESHOLD: f32 = 0.008;
 
 // Off by default — recordings live in the temp dir for the duration of
 // the post-stop pipeline and are deleted at the end. When this is on,
@@ -2905,11 +2906,24 @@ async fn transcribe_chunk(
     // Skip near-silent chunks. Whisper and gpt-4o-transcribe both hallucinate
     // confident text (often in the wrong language) when fed silence. The WAV
     // chunks are 16kHz mono 16-bit PCM little-endian — read the data section
-    // and compute RMS in [0, 1].
+    // and compute RMS in [0, 1]. Threshold is user-tunable so noisy
+    // environments (HVAC, mic hiss) can crank it up to drop borderline
+    // chunks before they reach Whisper.
+    let rms_floor = {
+        let state: State<AppState> = app.state();
+        let conn = state.db.lock();
+        db::get_setting(&conn, "silence_rms_threshold")
+            .ok()
+            .flatten()
+            .and_then(|s| s.parse::<f32>().ok())
+            .unwrap_or(DEFAULT_SILENCE_RMS_THRESHOLD)
+    };
     if let Ok(rms) = wav::rms(&path).await {
-        // Threshold tuned empirically: pure silence ~0.0001, room tone ~0.001,
-        // soft speech ~0.01+. 0.003 cuts silence/room without clipping speech.
-        if rms < 0.003 {
+        // Pure silence ~0.0001, room tone ~0.001, soft speech ~0.01+.
+        // Default 0.008 (was 0.003) — empirically rejects HVAC / mic
+        // hiss / quiet keyboard background while keeping spoken
+        // utterances. Tunable via the silence_rms_threshold setting.
+        if rms < rms_floor {
             return Ok(());
         }
     }
@@ -3777,10 +3791,15 @@ fn is_likely_hallucination(text: &str, _language: &str) -> bool {
         .join(" ")
         .to_lowercase();
     const SHORT_HALLUCINATIONS: &[&str] = &[
-        // EN
+        // EN greetings / thanks
         "hi", "hello", "bye", "thanks", "thank you", "okay", "yeah",
+        // EN backchannels Whisper hallucinates on noise
+        "mhm", "mhmm", "uh huh", "uhhuh", "mm", "mmm", "hm", "hmm",
+        "ah", "oh", "right", "you",
         // NO/DA/SV
         "hei", "hej", "hallo", "takk", "tak", "tack", "ha det",
+        // NO backchannels
+        "ja vel", "mhm",
         // DE
         "danke", "tschuss", "tschüss",
         // FR
