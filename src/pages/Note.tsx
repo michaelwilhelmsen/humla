@@ -10,6 +10,7 @@ import {
   Folder,
   Languages,
   Users,
+  X,
 } from "lucide-react";
 import { ipc, onSummaryThinkingDelta, onSummaryContentDelta, type Note as TNote, type SummaryPrompt, type TimelineEntry } from "../lib/ipc";
 import { convertFileSrc } from "@tauri-apps/api/core";
@@ -1232,6 +1233,21 @@ function TranscriptPlayer({
     a.play().catch(() => {});
   }
 
+  // Drop a single chunk row. Used to remove off-topic content the
+  // mic / sys captured (unrelated speech, mis-attributed leak, etc.)
+  // without re-recording. Optimistic local update so the row
+  // disappears instantly, then the IPC rebuilds note.transcript
+  // from the surviving entries.
+  async function deleteChunk(idx: number) {
+    if (disabled) return;
+    setTimeline((tl) => tl.filter((_, i) => i !== idx));
+    try {
+      await ipc.noteTimelineDeleteChunk(noteId, idx);
+    } catch (err) {
+      console.error("noteTimelineDeleteChunk failed", err);
+    }
+  }
+
   // Click a chunk pill to cycle to the next known speaker. The set
   // of known speakers is whatever currently appears in the timeline,
   // so the user can reach any label they've already named without
@@ -1314,7 +1330,7 @@ function TranscriptPlayer({
                 key={i}
                 data-idx={i}
                 className={
-                  "flex items-start gap-1 px-2 py-1 rounded transition-colors " +
+                  "group flex items-start gap-1 px-2 py-1 rounded transition-colors " +
                   (isActive
                     ? "bg-[var(--color-pill-hover)] text-[var(--color-text)]"
                     : "hover:bg-[var(--color-pill-hover)]")
@@ -1378,6 +1394,20 @@ function TranscriptPlayer({
                     className="text-left flex-1 nd-bare cursor-text"
                   >
                     {entry.text}
+                  </button>
+                )}
+                {!disabled && (
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      void deleteChunk(i);
+                    }}
+                    title="Delete this line"
+                    aria-label="Delete this line"
+                    className="nd-bare shrink-0 self-start opacity-0 group-hover:opacity-100 transition-opacity p-0.5 rounded text-[var(--color-text-muted)] hover:text-[var(--color-accent)] hover:bg-[var(--color-pill-hover)]"
+                  >
+                    <X size={14} strokeWidth={1.5} />
                   </button>
                 )}
               </div>

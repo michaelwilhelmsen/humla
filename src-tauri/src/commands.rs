@@ -675,6 +675,97 @@ pub fn note_timeline_set_chunk_label(
     Ok(())
 }
 
+/// Drop a single chunk from the timeline by index, then rebuild
+/// `note.transcript` from what's left. Used when the user clicks the
+/// per-row × in the player view to remove an off-topic chunk
+/// (e.g. unrelated speech that bled in from system audio).
+#[tauri::command]
+pub fn note_timeline_delete_chunk(
+    app: AppHandle,
+    note_id: String,
+    chunk_idx: usize,
+) -> Result<(), String> {
+    let path = app
+        .path()
+        .app_data_dir()
+        .map_err(err)?
+        .join("recordings")
+        .join(&note_id)
+        .join("timeline.jsonl");
+    if !path.exists() {
+        return Err("no timeline for this note".to_string());
+    }
+    let content = std::fs::read_to_string(&path).map_err(|e| format!("read timeline: {e}"))?;
+    let mut entries: Vec<serde_json::Value> = Vec::new();
+    for line in content.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+            entries.push(v);
+        }
+    }
+    if chunk_idx >= entries.len() {
+        return Err(format!(
+            "chunk_idx {chunk_idx} out of bounds (timeline has {} entries)",
+            entries.len()
+        ));
+    }
+    entries.remove(chunk_idx);
+
+    // Write back. If we just emptied the file, leave a zero-byte file
+    // so subsequent reads still find it (and produce zero entries).
+    let mut out = String::with_capacity(content.len());
+    for v in &entries {
+        out.push_str(&v.to_string());
+        out.push('\n');
+    }
+    std::fs::write(&path, out).map_err(|e| format!("write timeline: {e}"))?;
+
+    // Rebuild the DB transcript from the surviving entries — same
+    // grouping as note_timeline_set_chunk_label so summaries pick
+    // up the deletion immediately.
+    let mut transcript = String::new();
+    let mut last_label: Option<String> = None;
+    for v in &entries {
+        let label = v
+            .get("label")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string();
+        let text = v.get("text").and_then(|s| s.as_str()).unwrap_or("").trim();
+        if text.is_empty() {
+            continue;
+        }
+        if last_label.as_deref() != Some(label.as_str()) {
+            if !transcript.is_empty() {
+                transcript.push('\n');
+            }
+            if !label.is_empty() {
+                transcript.push_str(&format!("{label}: "));
+            }
+            last_label = Some(label);
+        } else {
+            transcript.push(' ');
+        }
+        transcript.push_str(text);
+    }
+
+    {
+        let state: State<AppState> = app.state();
+        let conn = state.db.lock();
+        db::set_transcript(&conn, &note_id, &transcript).map_err(err)?;
+    }
+    let _ = app.emit(
+        "transcript_replaced",
+        TranscriptPayload {
+            note_id: note_id.clone(),
+            text: transcript,
+        },
+    );
+    Ok(())
+}
+
 /// Rewrite every timeline entry whose label exactly matches `old_label`
 /// to use `new_label` instead. Mirrors the regex line-anchored rename
 /// the frontend already does on `note.transcript`, so the player view's

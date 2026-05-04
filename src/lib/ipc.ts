@@ -168,6 +168,8 @@ export const ipc = {
     invoke<void>("note_timeline_rename", { noteId, oldLabel, newLabel }),
   noteTimelineSetChunkLabel: (noteId: string, chunkIdx: number, newLabel: string) =>
     invoke<void>("note_timeline_set_chunk_label", { noteId, chunkIdx, newLabel }),
+  noteTimelineDeleteChunk: (noteId: string, chunkIdx: number) =>
+    invoke<void>("note_timeline_delete_chunk", { noteId, chunkIdx }),
   openInFinder: (path: string) => invoke<void>("open_in_finder", { path }),
   rediarizeNote: (noteId: string) => invoke<void>("rediarize_note", { noteId }),
 
