@@ -2,7 +2,10 @@ use anyhow::{anyhow, Result};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use parking_lot::Mutex;
-use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
+use whisper_rs::{
+    DtwMode, DtwModelPreset, DtwParameters, FullParams, SamplingStrategy, WhisperContext,
+    WhisperContextParameters,
+};
 
 use crate::wav;
 
@@ -238,6 +241,17 @@ fn ensure_loaded(
     *guard = None;
     let mut params = WhisperContextParameters::default();
     params.use_gpu = use_gpu;
+    // DTW alignment for sharper word timestamps. Model-specific alignment
+    // heads beat the universal TopMost heuristic by ~50 ms median when the
+    // checkpoint matches an OpenAI release exactly; we fall back to TopMost
+    // for fine-tunes (NB Whisper Large is fine-tuned from large-v2 but the
+    // alignment heads can drift during fine-tuning) and unknown filenames.
+    // Detection is filename-only — fine for our packaged registry, less
+    // fine if a user drops in their own ggml file, hence the safe fallback.
+    params.dtw_parameters = DtwParameters {
+        mode: dtw_mode_for_model(model_path),
+        ..DtwParameters::default()
+    };
     let ctx = WhisperContext::new_with_params(
         model_path.to_str().ok_or_else(|| anyhow!("non-utf8 model path"))?,
         params,
@@ -254,6 +268,49 @@ fn ensure_loaded(
 
 pub fn unload(shared: &SharedContext) {
     *shared.lock() = None;
+}
+
+/// Pick the DTW alignment-heads preset that matches the ggml file at
+/// `model_path`. The mapping is filename-pattern → OpenAI checkpoint;
+/// anything that doesn't match (NB-Whisper, user-supplied fine-tunes,
+/// future ggml releases) falls back to `TopMost { n_top: 4 }`, which
+/// works on any whisper architecture but produces slightly looser word
+/// boundaries than a model-specific preset.
+fn dtw_mode_for_model(model_path: &Path) -> DtwMode<'static> {
+    let name = model_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    // Order matters: "large-v3-turbo" must match before the broader
+    // "large-v3" check.
+    if name.contains("large-v3-turbo") {
+        DtwMode::ModelPreset { model_preset: DtwModelPreset::LargeV3Turbo }
+    } else if name.contains("large-v3") {
+        DtwMode::ModelPreset { model_preset: DtwModelPreset::LargeV3 }
+    } else if name.contains("large-v2") {
+        DtwMode::ModelPreset { model_preset: DtwModelPreset::LargeV2 }
+    } else if name.contains("large-v1") {
+        DtwMode::ModelPreset { model_preset: DtwModelPreset::LargeV1 }
+    } else if name.contains("medium.en") {
+        DtwMode::ModelPreset { model_preset: DtwModelPreset::MediumEn }
+    } else if name.contains("medium") {
+        DtwMode::ModelPreset { model_preset: DtwModelPreset::Medium }
+    } else if name.contains("small.en") {
+        DtwMode::ModelPreset { model_preset: DtwModelPreset::SmallEn }
+    } else if name.contains("small") {
+        DtwMode::ModelPreset { model_preset: DtwModelPreset::Small }
+    } else if name.contains("base.en") {
+        DtwMode::ModelPreset { model_preset: DtwModelPreset::BaseEn }
+    } else if name.contains("base") {
+        DtwMode::ModelPreset { model_preset: DtwModelPreset::Base }
+    } else if name.contains("tiny.en") {
+        DtwMode::ModelPreset { model_preset: DtwModelPreset::TinyEn }
+    } else if name.contains("tiny") {
+        DtwMode::ModelPreset { model_preset: DtwModelPreset::Tiny }
+    } else {
+        DtwMode::TopMost { n_top: 4 }
+    }
 }
 
 /// Load the model into memory + Metal context if it isn't already. Cheap
@@ -392,30 +449,35 @@ pub async fn transcribe_file_segments(
             params.set_initial_prompt(p);
         }
 
+        // whisper-rs 0.16: `full` returns `Result<(), _>` (was `Result<c_int, _>`
+        // in 0.13) and segment/token reads moved off WhisperState onto
+        // borrowed `WhisperSegment` / `WhisperToken` accessors.
         state
             .full(params, &samples)
             .map_err(|e| anyhow!("whisper full: {e}"))?;
 
-        let n = state
-            .full_n_segments()
-            .map_err(|e| anyhow!("n_segments: {e}"))?;
+        let n = state.full_n_segments();
         let mut out = Vec::with_capacity(n as usize);
         for i in 0..n {
-            let text = state
-                .full_get_segment_text(i)
+            let Some(seg) = state.get_segment(i) else { continue };
+            // to_str_lossy avoids hard-failing on a UTF-8 split inside a
+            // BPE multibyte character — we'd rather keep the segment with
+            // a substituted replacement char than drop it entirely. The
+            // `Cow` it returns is borrowed when valid UTF-8 already; only
+            // pathological inputs allocate.
+            let text = seg
+                .to_str_lossy()
                 .map_err(|e| anyhow!("segment text: {e}"))?;
             // whisper.cpp returns t0/t1 in centiseconds (10ms units).
-            let t0 = state
-                .full_get_segment_t0(i)
-                .map_err(|e| anyhow!("segment t0: {e}"))? as u64;
-            let t1 = state
-                .full_get_segment_t1(i)
-                .map_err(|e| anyhow!("segment t1: {e}"))? as u64;
+            // Negative values shouldn't occur for valid segments but we
+            // saturate to 0 just in case.
+            let t0 = seg.start_timestamp().max(0) as u64;
+            let t1 = seg.end_timestamp().max(0) as u64;
             // Strip whisper specials like <|nocaptions|>, <|nospeech|>,
             // language tokens, etc. `set_print_special(false)` only
-            // affects the verbose-print path — full_get_segment_text
-            // still embeds these tokens. Run before trim so collapsed
-            // whitespace from removed tokens trims cleanly.
+            // affects the verbose-print path — segment text still embeds
+            // these tokens. Run before trim so collapsed whitespace from
+            // removed tokens trims cleanly.
             let trimmed = strip_whisper_specials(&text).trim().to_string();
             if trimmed.is_empty() {
                 continue;
@@ -434,10 +496,7 @@ pub async fn transcribe_file_segments(
             // failure — losing word timestamps degrades the playback
             // view to chunk-level highlight, but the transcript text
             // still saves.
-            let words = extract_words_for_segment(&state, i).unwrap_or_else(|e| {
-                eprintln!("whisper word extraction failed (segment {i}): {e}");
-                Vec::new()
-            });
+            let words = extract_words_for_segment(&seg);
             out.push(TextSegment {
                 text: trimmed,
                 start_ms: t0.saturating_mul(10),
@@ -482,21 +541,24 @@ fn strip_whisper_specials(s: &str) -> String {
 /// into words by the leading-space convention. Token timestamps are in
 /// centiseconds (×10 → ms). Special tokens (`[_BEG_]`, `<|...|>`, etc.)
 /// are skipped — they don't correspond to spoken text.
-fn extract_words_for_segment(
-    state: &whisper_rs::WhisperState,
-    seg_i: i32,
-) -> Result<Vec<Word>> {
-    let n_tokens = state
-        .full_n_tokens(seg_i)
-        .map_err(|e| anyhow!("n_tokens: {e}"))?;
+///
+/// 0.16 reshapes this off WhisperState onto borrowed segment + token
+/// accessors. The function returns Vec instead of Result because every
+/// failure mode is now per-token (out-of-bounds, UTF-8 split) and
+/// individually recoverable — there's no longer a segment-level call
+/// that can fail.
+fn extract_words_for_segment(seg: &whisper_rs::WhisperSegment<'_>) -> Vec<Word> {
+    let n_tokens = seg.n_tokens();
     let mut words: Vec<Word> = Vec::new();
     for tok_i in 0..n_tokens {
+        let Some(tok) = seg.get_token(tok_i) else { continue };
         // Per-token text decode can fail with "Invalid UTF-8" when
         // BPE splits a multibyte character across two tokens. Skip
         // the offending token entirely — we lose timing for that
         // half-codepoint, but the surrounding tokens still produce
-        // valid words. Same handling for token-data lookup failures.
-        let raw = match state.full_get_token_text(seg_i, tok_i) {
+        // valid words. Same handling for token-data lookup if it
+        // ever surfaces an error.
+        let raw = match tok.to_str() {
             Ok(s) => s,
             Err(_) => continue,
         };
@@ -506,12 +568,9 @@ fn extract_words_for_segment(
         if raw.starts_with("[_") || raw.starts_with("<|") {
             continue;
         }
-        let data = match state.full_get_token_data(seg_i, tok_i) {
-            Ok(d) => d,
-            Err(_) => continue,
-        };
-        let t0 = (data.t0 as u64).saturating_mul(10);
-        let t1 = (data.t1 as u64).saturating_mul(10);
+        let data = tok.token_data();
+        let t0 = (data.t0.max(0) as u64).saturating_mul(10);
+        let t1 = (data.t1.max(0) as u64).saturating_mul(10);
         let starts_word = raw.starts_with(' ') || words.is_empty();
         if starts_word {
             let trimmed = raw.trim_start().to_string();
@@ -524,7 +583,7 @@ fn extract_words_for_segment(
                 end_ms: t1,
             });
         } else if let Some(last) = words.last_mut() {
-            last.text.push_str(&raw);
+            last.text.push_str(raw);
             // Extend the word's end time with the continuation token's
             // upper bound. start stays as the first token's t0.
             if t1 > last.end_ms {
@@ -536,5 +595,5 @@ fn extract_words_for_segment(
     // ("," ".") get glued onto the previous word above so they don't
     // surface as their own entry, which is what we want for clicking.
     words.retain(|w| !w.text.trim().is_empty());
-    Ok(words)
+    words
 }

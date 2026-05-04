@@ -121,11 +121,14 @@ export type TimelineWord = {
   end_ms: number;
 };
 
-// One entry per VAD-bounded chunk. `start_ms` is the chunk's start
-// in the merged playback timeline. `words` (when populated) lets the
+// One entry per VAD-bounded chunk. `start_ms` / `end_ms` are the
+// chunk's bounds in the merged playback timeline; mic and sys chunks
+// can overlap, so the player highlights every chunk whose interval
+// brackets the current playhead. `words` (when populated) lets the
 // player highlight each word as audio passes through it.
 export type TimelineEntry = {
   start_ms: number;
+  end_ms: number;
   label: string;
   text: string;
   words: TimelineWord[];

@@ -1096,15 +1096,22 @@ function TranscriptPlayer({
   disabled: boolean;
 }) {
   const audioRef = useRef<HTMLAudioElement | null>(null);
-  // activeIdx and activeWordIdx are the *only* state derived from
-  // playback position. We deliberately do NOT store currentMs in
+  // The two derived states from playback position: which chunks
+  // currently bracket currentTime (mic + sys can overlap, so this is a
+  // set, not a single index) and which word inside each active chunk
+  // is currently sounding. We deliberately do NOT store currentMs in
   // state: the rAF tick polls audio.currentTime and only calls
-  // setState when one of these two indices actually changes. This
-  // bounds re-render frequency to "transitions per second" (~5–10
-  // Hz on normal speech) instead of the rAF tick rate (60 Hz), so
-  // hundreds of word DOM nodes don't get re-walked every frame.
-  const [activeIdx, setActiveIdx] = useState(-1);
-  const [activeWordIdx, setActiveWordIdx] = useState(-1);
+  // setState when one of these crosses a boundary. This bounds
+  // re-render frequency to "transitions per second" (~5–10 Hz on
+  // normal speech) instead of the rAF tick rate (60 Hz), so hundreds
+  // of word DOM nodes don't get re-walked every frame.
+  const [activeIdxs, setActiveIdxs] = useState<number[]>([]);
+  const [activeWordByIdx, setActiveWordByIdx] = useState<Record<number, number>>({});
+  // The chunk we follow with scrollIntoView. Picking the
+  // most-recently-entered active chunk matches reading flow during
+  // overlap: when a new line lights up, the viewport eases toward it
+  // without losing the prior line's highlight.
+  const [scrollAnchorIdx, setScrollAnchorIdx] = useState(-1);
   const [editing, setEditing] = useState(false);
   const taRef = useRef<HTMLTextAreaElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -1120,8 +1127,8 @@ function TranscriptPlayer({
   const colors = useMemo(() => speakerColorMap(labels), [labels]);
 
   useEffect(() => {
-    if (activeIdx < 0 || !containerRef.current) return;
-    const el = containerRef.current.querySelector(`[data-idx="${activeIdx}"]`);
+    if (scrollAnchorIdx < 0 || !containerRef.current) return;
+    const el = containerRef.current.querySelector(`[data-idx="${scrollAnchorIdx}"]`);
     if (el && "scrollIntoView" in el) {
       // Instant scroll, not smooth: rapid clicks across distant rows
       // would otherwise pile up smooth-scroll animations that the
@@ -1129,51 +1136,81 @@ function TranscriptPlayer({
       // jank, and on long recordings can compound.
       (el as HTMLElement).scrollIntoView({ block: "nearest" });
     }
-  }, [activeIdx]);
+  }, [scrollAnchorIdx]);
 
-  // rAF-driven active-position tracker. The previous version called
-  // setCurrentMs on every tick (60 Hz) and derived active indices via
-  // useMemo, which forced React to walk every word DOM node 60 times
-  // per second. On rapid user clicks the render queue + style recalc
-  // would compound past what the compositor could drain — visible as
-  // the audio player's native controls failing to repaint and the
-  // whole window stalling. Now: compute active chunk + active word
-  // directly inside the tick, only call setState when one of them
-  // crosses a boundary. Steady-state re-renders drop from ~60/s to a
-  // handful per second.
+  // rAF-driven active-position tracker. Compute the active set fresh
+  // each tick but only call setState when something actually changes,
+  // so steady-state re-renders stay at "transitions per second" (~5–10
+  // Hz) instead of the rAF tick rate (60 Hz). The previous version
+  // tracked a single activeIdx and skipped past overlapping mic+sys
+  // chunks: the picker greedily took whichever chunk had the latest
+  // start_ms ≤ currentTime, so a mic interjection mid-sentence
+  // abandoned the still-playing sys line for the rest of its words.
+  // Now: any chunk whose [start_ms, end_ms] brackets currentTime is
+  // "active", and overlapping chunks all stay lit while their audio
+  // is still in the merged playback.
   useEffect(() => {
     const audio = audioRef.current;
     if (!audio) return;
     let raf = 0;
     let stopped = false;
-    let lastChunkIdx = -1;
-    let lastWordIdx = -1;
+    let lastIdxsKey = "";
+    let lastWordsKey = "";
+    let lastAnchor = -1;
 
     const computeAndSync = () => {
       const tl = timelineRef.current;
       const ms = audio.currentTime * 1000;
-      let chunkIdx = -1;
+      const idxs: number[] = [];
+      const wordsByIdx: Record<number, number> = {};
+      let anchor = -1;
+      let anchorStart = -1;
+      // Timeline is sorted by start_ms but spans can overlap, so we
+      // can't break out of the loop early on the first start_ms > ms
+      // — a later chunk on the other source might already have ended.
+      // O(n) per tick; n is one entry per ~5–15 s chunk, so even a
+      // 2-hour recording is < 1500 entries. Cheap.
       for (let i = 0; i < tl.length; i++) {
-        if (tl[i].start_ms <= ms) chunkIdx = i;
-        else break;
-      }
-      let wordIdx = -1;
-      if (chunkIdx >= 0) {
-        const words = tl[chunkIdx].words;
-        if (words && words.length > 0) {
-          for (let i = 0; i < words.length; i++) {
-            if (words[i].start_ms <= ms) wordIdx = i;
+        const e = tl[i];
+        if (e.start_ms > ms) break;
+        if (e.end_ms < ms) continue;
+        idxs.push(i);
+        // Closest start_ms ≤ ms wins the scroll anchor — visually
+        // matches what the user just heard begin.
+        if (e.start_ms > anchorStart) {
+          anchorStart = e.start_ms;
+          anchor = i;
+        }
+        const ws = e.words;
+        if (ws && ws.length > 0) {
+          let wi = -1;
+          for (let j = 0; j < ws.length; j++) {
+            if (ws[j].start_ms <= ms) wi = j;
             else break;
           }
+          if (wi >= 0) wordsByIdx[i] = wi;
         }
       }
-      if (chunkIdx !== lastChunkIdx) {
-        lastChunkIdx = chunkIdx;
-        setActiveIdx(chunkIdx);
+      const idxsKey = idxs.join(",");
+      // Stable key: sort by chunk idx so the same {idx: word} map
+      // serialises identically regardless of insertion order. Cheap
+      // for the small handful of active chunks at any moment (1–3).
+      const wordsKey = Object.keys(wordsByIdx)
+        .map(Number)
+        .sort((a, b) => a - b)
+        .map((k) => `${k}:${wordsByIdx[k]}`)
+        .join(",");
+      if (idxsKey !== lastIdxsKey) {
+        lastIdxsKey = idxsKey;
+        setActiveIdxs(idxs);
       }
-      if (wordIdx !== lastWordIdx) {
-        lastWordIdx = wordIdx;
-        setActiveWordIdx(wordIdx);
+      if (wordsKey !== lastWordsKey) {
+        lastWordsKey = wordsKey;
+        setActiveWordByIdx(wordsByIdx);
+      }
+      if (anchor !== lastAnchor) {
+        lastAnchor = anchor;
+        setScrollAnchorIdx(anchor);
       }
     };
 
@@ -1319,13 +1356,16 @@ function TranscriptPlayer({
           ref={containerRef}
           className="text-sm leading-relaxed text-[var(--color-text-muted)] flex flex-col gap-1"
         >
-          {timeline.map((entry, i) => {
-            const isActive = i === activeIdx;
-            const color = entry.label ? colors.get(entry.label) : undefined;
+          {(() => {
+            const activeSet = new Set(activeIdxs);
             const labelCount = new Set(
               timeline.map((e) => e.label).filter(Boolean),
             ).size;
+            return timeline.map((entry, i) => {
+            const isActive = activeSet.has(i);
+            const color = entry.label ? colors.get(entry.label) : undefined;
             const cyclable = labelCount >= 2 && !!entry.label;
+            const activeWordIdx = isActive ? activeWordByIdx[i] ?? -1 : -1;
             return (
               <div
                 key={i}
@@ -1413,7 +1453,8 @@ function TranscriptPlayer({
                 )}
               </div>
             );
-          })}
+          });
+          })()}
         </div>
       )}
     </div>

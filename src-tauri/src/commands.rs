@@ -498,12 +498,16 @@ pub struct TimelineWord {
 /// One entry per chunk (~5–15 s VAD-bounded utterance); the frontend
 /// renders each as its own row so the active-chunk highlight can
 /// follow the audio at sentence granularity. `words` may be empty for
-/// chunks whose provider didn't expose token timestamps (current
-/// OpenAI streaming API), in which case the UI degrades to chunk-
-/// level highlight.
+/// chunks whose provider didn't expose token timestamps (gpt-4o
+/// transcribe family), in which case the UI degrades to chunk-level
+/// highlight. `end_ms` lets the player render overlapping mic+sys
+/// chunks as both-active simultaneously instead of greedily switching
+/// to whichever started most recently — older timelines (pre-end_ms)
+/// fall back to start-only behavior on read.
 #[derive(Clone, serde::Serialize)]
 pub struct TimelineEntry {
     pub start_ms: u64,
+    pub end_ms: u64,
     pub label: String,
     pub text: String,
     pub words: Vec<TimelineWord>,
@@ -552,8 +556,14 @@ pub fn note_timeline(app: AppHandle, note_id: String) -> Result<Vec<TimelineEntr
                     .collect()
             })
             .unwrap_or_default();
+        let start_ms = v.get("start_ms").and_then(|s| s.as_u64()).unwrap_or(0);
+        // Older timelines (pre-end_ms) didn't write the field. Default to 0
+        // here; the synthesis pass below extends each missing end_ms to the
+        // next chunk's start_ms so chunk-level highlight still works.
+        let end_ms = v.get("end_ms").and_then(|s| s.as_u64()).unwrap_or(0);
         out.push(TimelineEntry {
-            start_ms: v.get("start_ms").and_then(|s| s.as_u64()).unwrap_or(0),
+            start_ms,
+            end_ms,
             label: v
                 .get("label")
                 .and_then(|s| s.as_str())
@@ -566,6 +576,21 @@ pub fn note_timeline(app: AppHandle, note_id: String) -> Result<Vec<TimelineEntr
                 .to_string(),
             words,
         });
+    }
+    // Backfill end_ms for legacy entries: stretch each zero-end entry to the
+    // next entry's start_ms (or +5s if it's the last). The frontend then
+    // gets a usable interval per chunk regardless of when the note was
+    // recorded, without a migration pass.
+    for i in 0..out.len() {
+        if out[i].end_ms <= out[i].start_ms {
+            let fallback = out
+                .iter()
+                .skip(i + 1)
+                .map(|e| e.start_ms)
+                .find(|&s| s > out[i].start_ms)
+                .unwrap_or_else(|| out[i].start_ms.saturating_add(5_000));
+            out[i].end_ms = fallback;
+        }
     }
     Ok(out)
 }
@@ -2809,8 +2834,38 @@ fn serialize_timeline(
         (c.start_ms, source_rank)
     });
 
+    // Estimate per-chunk end_ms before serialising. Three sources, in
+    // priority order:
+    //   1. Word timings: max(w.end_ms) — exact, used whenever the provider
+    //      returned word-level data.
+    //   2. Next-same-source chunk's start_ms: a chunk can't outlast the
+    //      audio that came after it on the same stream. Conservative but
+    //      always available.
+    //   3. Word-count heuristic at ~350 ms/word (typical conversational
+    //      rate), floored at 1 s. Only kicks in for the last chunk on a
+    //      stream when there are no words.
+    //
+    // The end_ms drives the player's overlap rendering: while currentTime
+    // sits inside a chunk's [start_ms, end_ms], that chunk stays "active"
+    // even after a later chunk on the other source has begun. Slight
+    // over-estimation is fine — the worst case is one extra row staying
+    // lit a beat longer; under-estimation is what causes the visible
+    // skip the user reported.
+    let next_same_source_start: Vec<u64> = sorted
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            sorted
+                .iter()
+                .skip(i + 1)
+                .find(|n| n.source == c.source)
+                .map(|n| n.start_ms)
+                .unwrap_or(0)
+        })
+        .collect();
+
     let mut out = String::new();
-    for chunk in &sorted {
+    for (i, chunk) in sorted.iter().enumerate() {
         let trimmed = chunk.text.trim();
         if trimmed.is_empty() {
             continue;
@@ -2832,8 +2887,18 @@ fn serialize_timeline(
                 })
             })
             .collect();
+        let end_ms = if let Some(max_word_end) = chunk.words.iter().map(|w| w.end_ms).max() {
+            chunk.start_ms.saturating_add(max_word_end)
+        } else if next_same_source_start[i] > chunk.start_ms {
+            next_same_source_start[i]
+        } else {
+            let word_count = trimmed.split_whitespace().count() as u64;
+            let estimated = word_count.saturating_mul(350).max(1_000);
+            chunk.start_ms.saturating_add(estimated)
+        };
         let entry = serde_json::json!({
             "start_ms": chunk.start_ms,
+            "end_ms": end_ms,
             "label": label,
             "text": trimmed,
             "words": words,
@@ -3053,10 +3118,12 @@ async fn transcribe_chunk(
     };
     let prompt = build_initial_prompt(&cfg.vocabulary, trail_snapshot);
 
-    // Words are populated only by the local Whisper path — OpenAI's
-    // streaming transcribe endpoints don't expose word-level
-    // timestamps in the multipart response. Empty words → frontend
-    // falls back to chunk-level highlight for that chunk.
+    // Both providers feed the same `Word` shape downstream so the timeline
+    // serialiser can rebase chunk-relative ms onto the playback clock the
+    // same way regardless of source. OpenAI returns words only for
+    // `whisper-1` (verbose_json + timestamp_granularities=word); the
+    // gpt-4o-transcribe family returns plain text and the timeline falls
+    // back to chunk-level highlight for those chunks.
     let (text, words) = match cfg.provider.as_str() {
         "local" => {
             let model_path = local_model_path(&app, &cfg.language)
@@ -3078,7 +3145,7 @@ async fn transcribe_chunk(
             .await?
         }
         _ => {
-            let text = openai::transcribe_file(
+            let (text, ow) = openai::transcribe_file(
                 &cfg.api_key,
                 &cfg.openai_model,
                 Some(&cfg.language),
@@ -3086,7 +3153,15 @@ async fn transcribe_chunk(
                 &path,
             )
             .await?;
-            (text, Vec::<local_whisper::Word>::new())
+            let words: Vec<local_whisper::Word> = ow
+                .into_iter()
+                .map(|w| local_whisper::Word {
+                    text: w.text,
+                    start_ms: w.start_ms,
+                    end_ms: w.end_ms,
+                })
+                .collect();
+            (text, words)
         }
     };
     if is_likely_hallucination(&text, &cfg.language) {

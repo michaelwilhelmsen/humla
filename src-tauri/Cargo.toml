@@ -1,6 +1,6 @@
 [package]
 name = "humla"
-version = "0.16.3"
+version = "0.17.0"
 description = "Humla — personal meeting notes that hum along"
 authors = ["Michael Wilhelmsen"]
 edition = "2021"
@@ -23,7 +23,7 @@ tokio = { version = "1", features = ["full"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 reqwest = { version = "0.12", features = ["json", "multipart", "rustls-tls", "stream"], default-features = false }
 futures-util = "0.3"
-whisper-rs = { version = "0.13", features = ["metal", "raw-api"] }
+whisper-rs = { version = "0.16", features = ["metal", "raw-api"] }
 # Local LLM inference is delegated to whichever OpenAI-compatible HTTP server
 # the user runs (Ollama, LM Studio, llama-server, vLLM, …). We reuse the
 # existing reqwest client; no in-process GGML runtime to avoid the static

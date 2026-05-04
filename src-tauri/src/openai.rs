@@ -38,13 +38,49 @@ struct TranscribeResponse {
     text: String,
 }
 
+#[derive(Deserialize)]
+struct VerboseTranscribeResponse {
+    text: String,
+    #[serde(default)]
+    words: Vec<VerboseWord>,
+}
+
+#[derive(Deserialize)]
+struct VerboseWord {
+    word: String,
+    start: f64,
+    end: f64,
+}
+
+/// One word's display text + chunk-relative ms bounds. Mirrors the local-
+/// Whisper `Word` type so callers can plumb either provider's output through
+/// the same downstream path. Empty for OpenAI models that don't return
+/// word-level timing.
+#[derive(Clone, Debug, Default)]
+pub struct TranscribeWord {
+    pub text: String,
+    pub start_ms: u64,
+    pub end_ms: u64,
+}
+
+/// True iff the OpenAI transcribe model returns word-level timestamps when
+/// asked for `verbose_json` + `timestamp_granularities[]=word`. Only the
+/// classic `whisper-1` endpoint supports that combination — the gpt-4o
+/// transcribe family rejects `verbose_json` outright, and the `-diarize`
+/// variant has its own segment-shaped response. Gating here keeps the cloud
+/// path single-codepath while still extracting word timings when the model
+/// is capable of producing them.
+fn supports_verbose_words(model: &str) -> bool {
+    model == "whisper-1"
+}
+
 pub async fn transcribe_file(
     api_key: &str,
     model: &str,
     language: Option<&str>,
     prompt: Option<&str>,
     audio_path: &Path,
-) -> Result<String> {
+) -> Result<(String, Vec<TranscribeWord>)> {
     let bytes = tokio::fs::read(audio_path).await?;
     let file_name = audio_path
         .file_name()
@@ -55,13 +91,22 @@ pub async fn transcribe_file(
         .file_name(file_name)
         .mime_str("audio/wav")?;
 
+    let want_words = supports_verbose_words(model);
+    let response_format = if want_words { "verbose_json" } else { "json" };
+
     let mut form = reqwest::multipart::Form::new()
         .part("file", part)
         .text("model", model.to_string())
-        .text("response_format", "json".to_string())
+        .text("response_format", response_format.to_string())
         // Force deterministic decoding so Whisper doesn't hallucinate filler
         // phrases and silently drift to a different language on short audio.
         .text("temperature", "0".to_string());
+    if want_words {
+        // The API expects an array — multipart `timestamp_granularities[]`
+        // is the documented name for the per-element field. Word grain
+        // alone is enough; segment grain comes back implicitly.
+        form = form.text("timestamp_granularities[]", "word".to_string());
+    }
     if let Some(l) = language {
         if l != "auto" {
             form = form.text("language", l.to_string());
@@ -86,8 +131,34 @@ pub async fn transcribe_file(
         let body = r.text().await.unwrap_or_default();
         return Err(anyhow!("OpenAI {s}: {body}"));
     }
-    let body: TranscribeResponse = r.json().await?;
-    Ok(body.text)
+
+    if want_words {
+        let body: VerboseTranscribeResponse = r.json().await?;
+        let words = body
+            .words
+            .into_iter()
+            .filter_map(|w| {
+                let text = w.word.trim().to_string();
+                if text.is_empty() {
+                    return None;
+                }
+                // OpenAI returns float seconds; clamp negatives to 0 and saturate
+                // on overflow. Anything > u64::MAX ms is six hundred million
+                // years of audio so the floor is fine.
+                let start_ms = (w.start.max(0.0) * 1000.0).round() as u64;
+                let end_ms = (w.end.max(0.0) * 1000.0).round() as u64;
+                Some(TranscribeWord {
+                    text,
+                    start_ms,
+                    end_ms: end_ms.max(start_ms),
+                })
+            })
+            .collect();
+        Ok((body.text, words))
+    } else {
+        let body: TranscribeResponse = r.json().await?;
+        Ok((body.text, Vec::new()))
+    }
 }
 
 #[derive(Serialize)]
