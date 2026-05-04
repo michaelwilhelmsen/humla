@@ -313,15 +313,31 @@ fn read_chunks_from_diagnostic(diag_dir: &std::path::Path) -> anyhow::Result<Vec
                 .and_then(|s| s.as_str())
                 .unwrap_or("")
                 .to_string();
-            // Diagnostic-derived chunks don't carry word timings —
-            // re-running diarize from a JSON dump replays the chunk
-            // log, but words were never written into diagnostics.
-            // Frontend gracefully falls back to chunk-level highlight.
+            // Word timings are present on diagnostic dumps written by
+            // builds that include word-level diarize splitting; older
+            // dumps stored chunks without them. Empty `words` makes
+            // `split_by_segments` fall back to whole-chunk labelling
+            // (one label per chunk via start_ms), matching pre-split
+            // behaviour for those notes.
+            let words: Vec<crate::recording::ChunkWord> = c
+                .get("words")
+                .and_then(|w| w.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|w| {
+                            let text = w.get("text").and_then(|s| s.as_str())?.to_string();
+                            let ws = w.get("start_ms").and_then(|s| s.as_u64())?;
+                            let we = w.get("end_ms").and_then(|s| s.as_u64())?;
+                            Some(crate::recording::ChunkWord { text, start_ms: ws, end_ms: we })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             out.push(ChunkRecord {
                 source,
                 start_ms,
                 text,
-                words: Vec::new(),
+                words,
             });
         }
         if !out.is_empty() {
@@ -350,8 +366,8 @@ async fn rediarize_apply_to_chunks(
 
     emit_status(&app, Some(&note_id), Phase::Diarizing);
 
-    type Labeller = dyn Fn(&ChunkRecord) -> Option<String> + Send;
-    let label_for_chunk: Box<Labeller> = match (mic_chunks_present, sys_chunks_present) {
+    type Splitter = dyn Fn(&ChunkRecord) -> Vec<LabelledPiece> + Send;
+    let split_chunk: Box<Splitter> = match (mic_chunks_present, sys_chunks_present) {
         (true, false) => {
             let Some(wav) = mic_wav.clone() else {
                 emit_status(&app, None, Phase::Idle);
@@ -368,10 +384,7 @@ async fn rediarize_apply_to_chunks(
                 return Err(anyhow::anyhow!("diarize returned no segments"));
             }
             let display_map = build_display_map(&chunks, &segments, ChunkSource::Mic);
-            Box::new(move |c: &ChunkRecord| {
-                let sid = assign_speaker(c.start_ms, &segments)?;
-                display_map.get(sid).map(|n| format!("Speaker {n}"))
-            })
+            Box::new(move |c: &ChunkRecord| split_by_segments(c, &segments, &display_map))
         }
         (false, true) => {
             let Some(wav) = sys_wav.clone() else {
@@ -389,13 +402,11 @@ async fn rediarize_apply_to_chunks(
                 return Err(anyhow::anyhow!("diarize returned no segments"));
             }
             let display_map = build_display_map(&chunks, &segments, ChunkSource::Sys);
-            Box::new(move |c: &ChunkRecord| {
-                let sid = assign_speaker(c.start_ms, &segments)?;
-                display_map.get(sid).map(|n| format!("Speaker {n}"))
-            })
+            Box::new(move |c: &ChunkRecord| split_by_segments(c, &segments, &display_map))
         }
         (true, true) => {
-            // Hybrid: mic = "You", sys = diarize.
+            // Hybrid: mic = "You", sys = diarize (and split mid-chunk
+            // when sys chunks contain multiple remote speakers).
             let sys_speaker_hint = expected_speakers.map(|n| (n - 1).max(1));
             let segments = if let Some(p) = sys_wav.as_ref() {
                 diarize::diarize_file(&app, p, sys_speaker_hint, engine, thresholds)
@@ -408,17 +419,14 @@ async fn rediarize_apply_to_chunks(
                 .await;
             if segments.is_empty() {
                 Box::new(move |c: &ChunkRecord| match c.source {
-                    ChunkSource::Mic => Some("You".to_string()),
-                    ChunkSource::Sys => Some("Speaker 1".to_string()),
+                    ChunkSource::Mic => single_piece(c, Some("You".to_string())),
+                    ChunkSource::Sys => single_piece(c, Some("Speaker 1".to_string())),
                 })
             } else {
                 let display_map = build_display_map(&chunks, &segments, ChunkSource::Sys);
                 Box::new(move |c: &ChunkRecord| match c.source {
-                    ChunkSource::Mic => Some("You".to_string()),
-                    ChunkSource::Sys => {
-                        let sid = assign_speaker(c.start_ms, &segments)?;
-                        display_map.get(sid).map(|n| format!("Speaker {n}"))
-                    }
+                    ChunkSource::Mic => single_piece(c, Some("You".to_string())),
+                    ChunkSource::Sys => split_by_segments(c, &segments, &display_map),
                 })
             }
         }
@@ -428,7 +436,7 @@ async fn rediarize_apply_to_chunks(
         }
     };
 
-    let new_transcript = build_labelled_transcript(&chunks, label_for_chunk.as_ref());
+    let new_transcript = build_labelled_transcript(&chunks, split_chunk.as_ref());
     if new_transcript.trim().is_empty() {
         emit_status(&app, None, Phase::Idle);
         return Err(anyhow::anyhow!("re-diarize produced empty transcript"));
@@ -452,7 +460,7 @@ async fn rediarize_apply_to_chunks(
     // and saves us from having a separate "did the audio change?"
     // signal. Re-diarize doesn't change audio content, but downstream
     // assumptions about the bundle being self-consistent survive.
-    let timeline = serialize_timeline(&chunks, label_for_chunk.as_ref());
+    let timeline = serialize_timeline(&chunks, split_chunk.as_ref());
     write_playback_assets(
         &app,
         &note_id,
@@ -1073,10 +1081,28 @@ async fn write_diagnostics_json(
     let chunk_payload: Vec<_> = chunks
         .iter()
         .map(|c| {
+            // Persist word timings (chunk-relative) so re-diarize can
+            // do word-level speaker splitting later — without them the
+            // re-diarize path falls back to one label per chunk and a
+            // 15s chunk that contains a back-and-forth gets only one
+            // speaker. Empty when the original transcribe provider
+            // didn't return word data (current OpenAI API).
+            let words: Vec<_> = c
+                .words
+                .iter()
+                .map(|w| {
+                    serde_json::json!({
+                        "text": w.text,
+                        "start_ms": w.start_ms,
+                        "end_ms": w.end_ms,
+                    })
+                })
+                .collect();
             serde_json::json!({
                 "source": match c.source { ChunkSource::Mic => "mic", ChunkSource::Sys => "sys" },
                 "start_ms": c.start_ms,
                 "text": c.text,
+                "words": words,
             })
         })
         .collect();
@@ -2071,8 +2097,8 @@ async fn diarize_and_apply(app: AppHandle, note_id: String) -> anyhow::Result<()
     // below) inside a spawned task, so it has to be `Send`. The captured
     // segments + display map are both Send, so the bound just needs to be
     // declared on the trait object.
-    type Labeller = dyn Fn(&ChunkRecord) -> Option<String> + Send;
-    let label_for_chunk: Box<Labeller> = match (mic_chunks_present, sys_chunks_present) {
+    type Splitter = dyn Fn(&ChunkRecord) -> Vec<LabelledPiece> + Send;
+    let split_chunk: Box<Splitter> = match (mic_chunks_present, sys_chunks_present) {
         (true, false) => {
             // In-person mode: diarize the mic stream, every chunk gets a
             // numbered label from its segment. The per-note expected
@@ -2097,10 +2123,7 @@ async fn diarize_and_apply(app: AppHandle, note_id: String) -> anyhow::Result<()
                 return Ok(());
             }
             let display_map = build_display_map(&chunks, &segments, ChunkSource::Mic);
-            Box::new(move |c: &ChunkRecord| {
-                let sid = assign_speaker(c.start_ms, &segments)?;
-                display_map.get(sid).map(|n| format!("Speaker {n}"))
-            })
+            Box::new(move |c: &ChunkRecord| split_by_segments(c, &segments, &display_map))
         }
         (false, true) => {
             // Edge case: system-only recording. Same as mic-only but on
@@ -2121,10 +2144,7 @@ async fn diarize_and_apply(app: AppHandle, note_id: String) -> anyhow::Result<()
                 return Ok(());
             }
             let display_map = build_display_map(&chunks, &segments, ChunkSource::Sys);
-            Box::new(move |c: &ChunkRecord| {
-                let sid = assign_speaker(c.start_ms, &segments)?;
-                display_map.get(sid).map(|n| format!("Speaker {n}"))
-            })
+            Box::new(move |c: &ChunkRecord| split_by_segments(c, &segments, &display_map))
         }
         (true, true) => {
             // Remote/hybrid call: mic = "You" by channel attribution; the
@@ -2141,21 +2161,21 @@ async fn diarize_and_apply(app: AppHandle, note_id: String) -> anyhow::Result<()
             let sys_speaker_hint = expected_speakers.map(|n| (n - 1).max(1));
             //
             // Three failure modes drop us into the single-speaker fallback
-            // labeller (mic = "You", sys = "Speaker 1"):
+            // splitter (mic = "You", sys = "Speaker 1"):
             //   1. sys_full.wav missing (sidecar SIGKILL'd before close).
             //   2. diarize sidecar errored.
             //   3. diarize returned zero segments.
             //
-            // The fallback assigns sys chunks `Speaker 1` rather than
-            // returning `None`, because a `None` label causes
+            // The fallback assigns sys chunks `Speaker 1` rather than a
+            // None label, because a None label causes
             // `build_labelled_transcript` to glue the chunk's text onto the
             // previous label's line — i.e. remote audio would silently
             // merge into the user's `You:` line. Better to surface a single
             // unlabeled-but-distinct speaker than to lose the boundary.
-            let single_speaker_fallback = || -> Box<Labeller> {
+            let single_speaker_fallback = || -> Box<Splitter> {
                 Box::new(|c: &ChunkRecord| match c.source {
-                    ChunkSource::Mic => Some("You".to_string()),
-                    ChunkSource::Sys => Some("Speaker 1".to_string()),
+                    ChunkSource::Mic => single_piece(c, Some("You".to_string())),
+                    ChunkSource::Sys => single_piece(c, Some("Speaker 1".to_string())),
                 })
             };
             match sys_wav.clone() {
@@ -2186,11 +2206,8 @@ async fn diarize_and_apply(app: AppHandle, note_id: String) -> anyhow::Result<()
                         write_diagnostics_json(&app, &note_id, engine, "sys", &segments, &chunks, &thresholds).await;
                         let display_map = build_display_map(&chunks, &segments, ChunkSource::Sys);
                         Box::new(move |c: &ChunkRecord| match c.source {
-                            ChunkSource::Mic => Some("You".to_string()),
-                            ChunkSource::Sys => {
-                                let sid = assign_speaker(c.start_ms, &segments)?;
-                                display_map.get(sid).map(|n| format!("Speaker {n}"))
-                            }
+                            ChunkSource::Mic => single_piece(c, Some("You".to_string())),
+                            ChunkSource::Sys => split_by_segments(c, &segments, &display_map),
                         })
                     }
                 },
@@ -2199,7 +2216,7 @@ async fn diarize_and_apply(app: AppHandle, note_id: String) -> anyhow::Result<()
         (false, false) => unreachable!("chunks.is_empty() returned earlier"),
     };
 
-    let new_session = build_labelled_transcript(&chunks, label_for_chunk.as_ref());
+    let new_session = build_labelled_transcript(&chunks, split_chunk.as_ref());
     let combined = combine_with_snapshot(&snapshot, &new_session);
     if combined.trim().is_empty() {
         return Ok(());
@@ -2221,9 +2238,9 @@ async fn diarize_and_apply(app: AppHandle, note_id: String) -> anyhow::Result<()
     // we drop the temp full WAVs. Independent of keep_audio — playback
     // is a first-class feature, not a debug knob. Best-effort: failures
     // log to stderr but don't abort the post-stop chain. Compute the
-    // timeline synchronously so the labeller doesn't have to be Send +
+    // timeline synchronously so the splitter doesn't have to be Send +
     // Sync to cross the awaits inside write_playback_assets.
-    let timeline = serialize_timeline(&chunks, label_for_chunk.as_ref());
+    let timeline = serialize_timeline(&chunks, split_chunk.as_ref());
     write_playback_assets(
         &app,
         &note_id,
@@ -2418,8 +2435,8 @@ async fn final_pass_apply(app: AppHandle, note_id: String) -> anyhow::Result<()>
     // a single label per stream rather than failing the whole final pass.
     let diarize_available = matches!(diarize::status(&app, engine).await, Ok(s) if s.downloaded);
 
-    type Labeller = dyn Fn(&ChunkRecord) -> Option<String> + Send;
-    let label_for_chunk: Box<Labeller> = match (mic_present, sys_present) {
+    type Splitter = dyn Fn(&ChunkRecord) -> Vec<LabelledPiece> + Send;
+    let split_chunk: Box<Splitter> = match (mic_present, sys_present) {
         (true, false) => {
             if diarize_available {
                 let Some(wav) = mic_wav.clone() else {
@@ -2429,16 +2446,13 @@ async fn final_pass_apply(app: AppHandle, note_id: String) -> anyhow::Result<()>
                 let segments = diarize::diarize_file(&app, &wav, expected_speakers, engine, thresholds).await?;
                 write_diagnostics_json(&app, &note_id, engine, "mic", &segments, &chunks, &thresholds).await;
                 if segments.is_empty() {
-                    Box::new(|_: &ChunkRecord| Some("Speaker 1".to_string()))
+                    Box::new(|c: &ChunkRecord| single_piece(c, Some("Speaker 1".to_string())))
                 } else {
                     let display_map = build_display_map(&chunks, &segments, ChunkSource::Mic);
-                    Box::new(move |c: &ChunkRecord| {
-                        let sid = assign_speaker(c.start_ms, &segments)?;
-                        display_map.get(sid).map(|n| format!("Speaker {n}"))
-                    })
+                    Box::new(move |c: &ChunkRecord| split_by_segments(c, &segments, &display_map))
                 }
             } else {
-                Box::new(|_: &ChunkRecord| Some("Speaker 1".to_string()))
+                Box::new(|c: &ChunkRecord| single_piece(c, Some("Speaker 1".to_string())))
             }
         }
         (false, true) => {
@@ -2450,16 +2464,13 @@ async fn final_pass_apply(app: AppHandle, note_id: String) -> anyhow::Result<()>
                 let segments = diarize::diarize_file(&app, &wav, expected_speakers, engine, thresholds).await?;
                 write_diagnostics_json(&app, &note_id, engine, "sys", &segments, &chunks, &thresholds).await;
                 if segments.is_empty() {
-                    Box::new(|_: &ChunkRecord| Some("Speaker 1".to_string()))
+                    Box::new(|c: &ChunkRecord| single_piece(c, Some("Speaker 1".to_string())))
                 } else {
                     let display_map = build_display_map(&chunks, &segments, ChunkSource::Sys);
-                    Box::new(move |c: &ChunkRecord| {
-                        let sid = assign_speaker(c.start_ms, &segments)?;
-                        display_map.get(sid).map(|n| format!("Speaker {n}"))
-                    })
+                    Box::new(move |c: &ChunkRecord| split_by_segments(c, &segments, &display_map))
                 }
             } else {
-                Box::new(|_: &ChunkRecord| Some("Speaker 1".to_string()))
+                Box::new(|c: &ChunkRecord| single_piece(c, Some("Speaker 1".to_string())))
             }
         }
         (true, true) => {
@@ -2481,24 +2492,21 @@ async fn final_pass_apply(app: AppHandle, note_id: String) -> anyhow::Result<()>
             write_diagnostics_json(&app, &note_id, engine, "sys", &sys_segments, &chunks, &thresholds).await;
             if sys_segments.is_empty() {
                 Box::new(move |c: &ChunkRecord| match c.source {
-                    ChunkSource::Mic => Some("You".to_string()),
-                    ChunkSource::Sys => Some("Speaker 1".to_string()),
+                    ChunkSource::Mic => single_piece(c, Some("You".to_string())),
+                    ChunkSource::Sys => single_piece(c, Some("Speaker 1".to_string())),
                 })
             } else {
                 let sys_display_map = build_display_map(&chunks, &sys_segments, ChunkSource::Sys);
                 Box::new(move |c: &ChunkRecord| match c.source {
-                    ChunkSource::Mic => Some("You".to_string()),
-                    ChunkSource::Sys => {
-                        let sid = assign_speaker(c.start_ms, &sys_segments)?;
-                        sys_display_map.get(sid).map(|n| format!("Speaker {n}"))
-                    }
+                    ChunkSource::Mic => single_piece(c, Some("You".to_string())),
+                    ChunkSource::Sys => split_by_segments(c, &sys_segments, &sys_display_map),
                 })
             }
         }
         (false, false) => unreachable!("chunks.is_empty() returned earlier"),
     };
 
-    let new_session = build_labelled_transcript(&chunks, label_for_chunk.as_ref());
+    let new_session = build_labelled_transcript(&chunks, split_chunk.as_ref());
     let combined = combine_with_snapshot(&snapshot, &new_session);
     if combined.trim().is_empty() {
         return Ok(());
@@ -2518,7 +2526,7 @@ async fn final_pass_apply(app: AppHandle, note_id: String) -> anyhow::Result<()>
 
     // Refresh playback bundle from the final-pass transcript. Same
     // contract as diarize_and_apply.
-    let timeline = serialize_timeline(&chunks, label_for_chunk.as_ref());
+    let timeline = serialize_timeline(&chunks, split_chunk.as_ref());
     write_playback_assets(
         &app,
         &note_id,
@@ -2537,22 +2545,38 @@ async fn final_pass_apply(app: AppHandle, note_id: String) -> anyhow::Result<()>
     Ok(())
 }
 
-/// Walk the chunks of a given source in order, assigning each a 1-indexed
-/// display number based on the speaker_id its start_ms maps to. The map
-/// is built up-front so the per-chunk label closure is allocation-free
-/// and produces identical numbers on repeated lookups for the same
-/// speaker_id.
+/// Walk the chunks of a given source in time order, assigning each
+/// distinct speaker_id a 1-indexed display number on first encounter.
+/// When a chunk has word timings, each word's absolute midpoint is
+/// looked up so a speaker that only appears mid-chunk still gets a
+/// number — without this, `split_by_segments` would drop their pieces
+/// to `None` (no entry in the map) and their text would silently merge
+/// onto the surrounding speaker's line.
 fn build_display_map(
     chunks: &[ChunkRecord],
     segments: &[diarize::Segment],
     source: ChunkSource,
 ) -> std::collections::HashMap<String, u32> {
     let mut map: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    let record = |sid: &str, map: &mut std::collections::HashMap<String, u32>| {
+        if !map.contains_key(sid) {
+            let n = (map.len() as u32) + 1;
+            map.insert(sid.to_string(), n);
+        }
+    };
     for chunk in chunks.iter().filter(|c| c.source == source) {
-        if let Some(sid) = assign_speaker(chunk.start_ms, segments) {
-            if !map.contains_key(sid) {
-                let n = (map.len() as u32) + 1;
-                map.insert(sid.to_string(), n);
+        if chunk.words.is_empty() {
+            if let Some(sid) = assign_speaker(chunk.start_ms, segments) {
+                record(sid, &mut map);
+            }
+            continue;
+        }
+        for word in &chunk.words {
+            let half = word.end_ms.saturating_sub(word.start_ms) / 2;
+            let mid = word.start_ms.saturating_add(half);
+            let abs = chunk.start_ms.saturating_add(mid);
+            if let Some(sid) = assign_speaker(abs, segments) {
+                record(sid, &mut map);
             }
         }
     }
@@ -2646,6 +2670,85 @@ fn assign_speaker<'a>(chunk_start_ms: u64, segments: &'a [diarize::Segment]) -> 
             }
         })
         .map(|s| s.speaker_id.as_str())
+}
+
+/// One contiguous run of words within a chunk that all belong to the
+/// same speaker. A 15-second VAD chunk that opens with one voice and
+/// ends with another becomes two pieces; a single-voice chunk stays
+/// one piece.
+///
+/// `words` are kept chunk-relative (matching `ChunkWord`'s convention)
+/// so the timeline serialiser can rebase them to stream-absolute the
+/// same way it always has, and may be empty when the underlying chunk
+/// had no word data and we fell back to whole-chunk labelling.
+#[derive(Clone, Debug)]
+struct LabelledPiece {
+    label: Option<String>,
+    text: String,
+    words: Vec<crate::recording::ChunkWord>,
+}
+
+/// Wrap a chunk's full text + words as a single labelled piece. Used by
+/// the paths that don't split (mic = "You" in hybrid mode, single-
+/// speaker fallbacks when diarize returned nothing).
+fn single_piece(c: &ChunkRecord, label: Option<String>) -> Vec<LabelledPiece> {
+    vec![LabelledPiece {
+        label,
+        text: c.text.clone(),
+        words: c.words.clone(),
+    }]
+}
+
+/// Split a chunk into per-speaker pieces by walking its word timings
+/// against the diarizer's segments. Each word's stream-absolute
+/// midpoint (chunk.start_ms + word's chunk-relative midpoint) is looked
+/// up in `segments`; consecutive same-speaker words coalesce into one
+/// piece, and the speaker label changes mid-chunk produce additional
+/// pieces.
+///
+/// We use the word's *midpoint* rather than its `start_ms` so a word
+/// straddling a segment boundary lands on whichever side it spends more
+/// of its duration in — start-only would give the leading word of a
+/// new turn the previous speaker's label.
+///
+/// Falls back to whole-chunk labelling (one piece, label decided by
+/// `chunk.start_ms`) when the chunk has no words. That covers OpenAI
+/// chunks (current API path doesn't expose word timestamps) and
+/// re-diarize from older diagnostic JSONs that didn't persist words.
+fn split_by_segments(
+    c: &ChunkRecord,
+    segments: &[diarize::Segment],
+    display_map: &std::collections::HashMap<String, u32>,
+) -> Vec<LabelledPiece> {
+    let label_for_time = |abs_ms: u64| -> Option<String> {
+        assign_speaker(abs_ms, segments)
+            .and_then(|sid| display_map.get(sid))
+            .map(|n| format!("Speaker {n}"))
+    };
+    if c.words.is_empty() {
+        return single_piece(c, label_for_time(c.start_ms));
+    }
+    let mut pieces: Vec<LabelledPiece> = Vec::new();
+    for word in &c.words {
+        let mid = word.start_ms.saturating_add(word.end_ms.saturating_sub(word.start_ms) / 2);
+        let abs = c.start_ms.saturating_add(mid);
+        let label = label_for_time(abs);
+        match pieces.last_mut() {
+            Some(last) if last.label == label => {
+                last.text.push(' ');
+                last.text.push_str(&word.text);
+                last.words.push(word.clone());
+            }
+            _ => {
+                pieces.push(LabelledPiece {
+                    label,
+                    text: word.text.clone(),
+                    words: vec![word.clone()],
+                });
+            }
+        }
+    }
+    pieces
 }
 
 /// Cross-stream echo dedup. When a meeting plays through laptop speakers,
@@ -2822,7 +2925,7 @@ async fn build_playback_wav(
 /// so echoed mic chunks don't generate phantom entries.
 fn serialize_timeline(
     chunks: &[ChunkRecord],
-    label_for: &dyn Fn(&ChunkRecord) -> Option<String>,
+    split_chunk: &dyn Fn(&ChunkRecord) -> Vec<LabelledPiece>,
 ) -> String {
     let kept = dedup_mic_against_sys(chunks);
     let mut sorted: Vec<&ChunkRecord> = kept.iter().collect();
@@ -2834,76 +2937,110 @@ fn serialize_timeline(
         (c.start_ms, source_rank)
     });
 
-    // Estimate per-chunk end_ms before serialising. Three sources, in
+    // Estimate per-piece end_ms before serialising. Three sources, in
     // priority order:
-    //   1. Word timings: max(w.end_ms) — exact, used whenever the provider
-    //      returned word-level data.
-    //   2. Next-same-source chunk's start_ms: a chunk can't outlast the
-    //      audio that came after it on the same stream. Conservative but
-    //      always available.
+    //   1. Piece's own word timings: max(w.end_ms) — exact, used
+    //      whenever the provider returned word-level data.
+    //   2. Next entry's start: a piece can't outlast whatever audio
+    //      came after it on the same stream. Conservative but always
+    //      available.
     //   3. Word-count heuristic at ~350 ms/word (typical conversational
-    //      rate), floored at 1 s. Only kicks in for the last chunk on a
-    //      stream when there are no words.
+    //      rate), floored at 1 s. Only kicks in for the final piece
+    //      on a stream when there are no words.
     //
     // The end_ms drives the player's overlap rendering: while currentTime
-    // sits inside a chunk's [start_ms, end_ms], that chunk stays "active"
-    // even after a later chunk on the other source has begun. Slight
+    // sits inside a piece's [start_ms, end_ms], that piece stays "active"
+    // even after a later piece on the other source has begun. Slight
     // over-estimation is fine — the worst case is one extra row staying
-    // lit a beat longer; under-estimation is what causes the visible
-    // skip the user reported.
-    let next_same_source_start: Vec<u64> = sorted
+    // lit a beat longer; under-estimation causes a visible skip.
+
+    // First flatten chunks → pieces, tagging each with the source so
+    // the next-same-source lookup works the same way it did per-chunk.
+    struct Entry {
+        source: ChunkSource,
+        start_ms: u64,
+        text: String,
+        label: String,
+        words: Vec<serde_json::Value>,
+        max_word_end_abs: Option<u64>,
+    }
+    let mut entries: Vec<Entry> = Vec::new();
+    for chunk in &sorted {
+        for piece in split_chunk(chunk) {
+            let trimmed = piece.text.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            // Convert word timings to stream-absolute by adding the
+            // chunk's start_ms. The playback view's audio element runs
+            // in the merged playback.wav timeline; word timestamps
+            // inside a chunk are chunk-relative until we rebase here.
+            let words_abs: Vec<serde_json::Value> = piece
+                .words
+                .iter()
+                .map(|w| {
+                    serde_json::json!({
+                        "text": w.text,
+                        "start_ms": chunk.start_ms.saturating_add(w.start_ms),
+                        "end_ms": chunk.start_ms.saturating_add(w.end_ms),
+                    })
+                })
+                .collect();
+            // Piece start: first word's absolute start when present,
+            // else the chunk's start (whole-chunk fallback piece).
+            let start_ms = piece
+                .words
+                .first()
+                .map(|w| chunk.start_ms.saturating_add(w.start_ms))
+                .unwrap_or(chunk.start_ms);
+            let max_word_end_abs = piece
+                .words
+                .iter()
+                .map(|w| chunk.start_ms.saturating_add(w.end_ms))
+                .max();
+            entries.push(Entry {
+                source: chunk.source,
+                start_ms,
+                text: trimmed.to_string(),
+                label: piece.label.clone().unwrap_or_default(),
+                words: words_abs,
+                max_word_end_abs,
+            });
+        }
+    }
+
+    let next_same_source_start: Vec<u64> = entries
         .iter()
         .enumerate()
-        .map(|(i, c)| {
-            sorted
+        .map(|(i, e)| {
+            entries
                 .iter()
                 .skip(i + 1)
-                .find(|n| n.source == c.source)
+                .find(|n| n.source == e.source)
                 .map(|n| n.start_ms)
                 .unwrap_or(0)
         })
         .collect();
 
     let mut out = String::new();
-    for (i, chunk) in sorted.iter().enumerate() {
-        let trimmed = chunk.text.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let label = label_for(chunk).unwrap_or_default();
-        // Convert word timings to stream-absolute by adding the
-        // chunk's start_ms. The playback view's audio element runs in
-        // the merged playback.wav timeline, where each chunk lives at
-        // its own start_ms; word timestamps inside the chunk are
-        // chunk-relative until we rebase here.
-        let words: Vec<serde_json::Value> = chunk
-            .words
-            .iter()
-            .map(|w| {
-                serde_json::json!({
-                    "text": w.text,
-                    "start_ms": chunk.start_ms.saturating_add(w.start_ms),
-                    "end_ms": chunk.start_ms.saturating_add(w.end_ms),
-                })
-            })
-            .collect();
-        let end_ms = if let Some(max_word_end) = chunk.words.iter().map(|w| w.end_ms).max() {
-            chunk.start_ms.saturating_add(max_word_end)
-        } else if next_same_source_start[i] > chunk.start_ms {
+    for (i, entry) in entries.iter().enumerate() {
+        let end_ms = if let Some(max_end) = entry.max_word_end_abs {
+            max_end
+        } else if next_same_source_start[i] > entry.start_ms {
             next_same_source_start[i]
         } else {
-            let word_count = trimmed.split_whitespace().count() as u64;
+            let word_count = entry.text.split_whitespace().count() as u64;
             let estimated = word_count.saturating_mul(350).max(1_000);
-            chunk.start_ms.saturating_add(estimated)
+            entry.start_ms.saturating_add(estimated)
         };
-        let entry = serde_json::json!({
-            "start_ms": chunk.start_ms,
+        let json = serde_json::json!({
+            "start_ms": entry.start_ms,
             "end_ms": end_ms,
-            "label": label,
-            "text": trimmed,
-            "words": words,
+            "label": entry.label,
+            "text": entry.text,
+            "words": entry.words,
         });
-        out.push_str(&entry.to_string());
+        out.push_str(&json.to_string());
         out.push('\n');
     }
     out
@@ -2973,7 +3110,7 @@ fn token_containment(a: &[String], b: &[String]) -> f32 {
 /// see that function for details.
 fn build_labelled_transcript(
     chunks: &[ChunkRecord],
-    label_for_chunk: &(dyn Fn(&ChunkRecord) -> Option<String> + Send),
+    split_chunk: &(dyn Fn(&ChunkRecord) -> Vec<LabelledPiece> + Send),
 ) -> String {
     let kept = dedup_mic_against_sys(chunks);
     let mut sorted: Vec<&ChunkRecord> = kept.iter().collect();
@@ -2989,29 +3126,31 @@ fn build_labelled_transcript(
     let mut last_label: Option<String> = None;
 
     for chunk in sorted {
-        let trimmed = chunk.text.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        match label_for_chunk(chunk) {
-            Some(label) => {
-                if last_label.as_deref() != Some(label.as_str()) {
-                    if !output.is_empty() {
-                        output.push('\n');
+        for piece in split_chunk(chunk) {
+            let trimmed = piece.text.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            match &piece.label {
+                Some(label) => {
+                    if last_label.as_deref() != Some(label.as_str()) {
+                        if !output.is_empty() {
+                            output.push('\n');
+                        }
+                        output.push_str(&format!("{label}: "));
+                        last_label = Some(label.clone());
+                    } else {
+                        output.push(' ');
                     }
-                    output.push_str(&format!("{label}: "));
-                    last_label = Some(label);
-                } else {
-                    output.push(' ');
+                }
+                None => {
+                    if !output.is_empty() {
+                        output.push(' ');
+                    }
                 }
             }
-            None => {
-                if !output.is_empty() {
-                    output.push(' ');
-                }
-            }
+            output.push_str(trimmed);
         }
-        output.push_str(trimmed);
     }
     output
 }
@@ -4064,6 +4203,40 @@ mod diarize_tests {
         }
     }
 
+    /// Build a sys chunk with explicit word timings. Each `(text,
+    /// start_ms, end_ms)` is chunk-relative, matching how the
+    /// transcribe path stores them.
+    fn sys_with_words(
+        start_ms: u64,
+        words: Vec<(&str, u64, u64)>,
+    ) -> ChunkRecord {
+        let text = words.iter().map(|(t, _, _)| *t).collect::<Vec<_>>().join(" ");
+        ChunkRecord {
+            source: ChunkSource::Sys,
+            start_ms,
+            text,
+            words: words
+                .into_iter()
+                .map(|(t, s, e)| crate::recording::ChunkWord {
+                    text: t.to_string(),
+                    start_ms: s,
+                    end_ms: e,
+                })
+                .collect(),
+        }
+    }
+
+    /// Wrap a simple chunk-level labeller as a piece producer that
+    /// emits one whole-chunk piece. Lets the existing tests keep their
+    /// `Fn(&ChunkRecord) -> Option<String>` shape while
+    /// `build_labelled_transcript` consumes the new
+    /// `Fn(&ChunkRecord) -> Vec<LabelledPiece>` signature.
+    fn whole_chunk_pieces<F: Fn(&ChunkRecord) -> Option<String>>(
+        labeller: F,
+    ) -> impl Fn(&ChunkRecord) -> Vec<LabelledPiece> {
+        move |c: &ChunkRecord| single_piece(c, labeller(c))
+    }
+
     /// Build the same labeller `diarize_and_apply` would build in the
     /// mic-only branch: every chunk gets `Speaker N:` from its segment.
     /// Pulled into a test helper so we can exercise `build_labelled_transcript`
@@ -4073,11 +4246,140 @@ mod diarize_tests {
         segments: Vec<Segment>,
     ) -> String {
         let display_map = build_display_map(&chunks, &segments, ChunkSource::Mic);
-        let labeller = move |c: &ChunkRecord| {
+        let pieces = whole_chunk_pieces(move |c: &ChunkRecord| {
             let sid = assign_speaker(c.start_ms, &segments)?;
             display_map.get(sid).map(|n| format!("Speaker {n}"))
-        };
-        build_labelled_transcript(&chunks, &labeller)
+        });
+        build_labelled_transcript(&chunks, &pieces)
+    }
+
+    #[test]
+    fn split_chunk_with_no_words_falls_back_to_whole_chunk() {
+        // The OpenAI / older-diagnostic path: chunk has text but no
+        // word timings. split_by_segments must still emit one piece
+        // labelled by start_ms (matching pre-split behaviour).
+        let chunks = vec![sys(0, "hello world")];
+        let segs = vec![seg(0, 10_000, "A")];
+        let display_map = build_display_map(&chunks, &segs, ChunkSource::Sys);
+        let pieces = split_by_segments(&chunks[0], &segs, &display_map);
+        assert_eq!(pieces.len(), 1);
+        assert_eq!(pieces[0].label.as_deref(), Some("Speaker 1"));
+        assert_eq!(pieces[0].text, "hello world");
+    }
+
+    #[test]
+    fn split_chunk_keeps_single_speaker_as_one_piece() {
+        // All words fall inside the same speaker segment → one piece
+        // covering the whole chunk text.
+        let chunk = sys_with_words(
+            10_000,
+            vec![("hello", 0, 500), ("there", 500, 1000)],
+        );
+        let segs = vec![seg(0, 30_000, "A")];
+        let display_map = build_display_map(
+            std::slice::from_ref(&chunk),
+            &segs,
+            ChunkSource::Sys,
+        );
+        let pieces = split_by_segments(&chunk, &segs, &display_map);
+        assert_eq!(pieces.len(), 1);
+        assert_eq!(pieces[0].label.as_deref(), Some("Speaker 1"));
+        assert_eq!(pieces[0].text, "hello there");
+    }
+
+    #[test]
+    fn split_chunk_breaks_at_speaker_boundary_inside_chunk() {
+        // The reported bug: a 15s VAD chunk that opens with one voice
+        // and closes with another. Words 0–500 ms fall in segment A,
+        // word at 8000 ms falls in segment B. We expect two pieces.
+        // Chunk starts at 10_000 ms absolute, so word abs times are
+        // 10_000, 10_500, 18_000.
+        let chunk = sys_with_words(
+            10_000,
+            vec![
+                ("first", 0, 500),
+                ("second", 500, 1000),
+                ("third", 8000, 8500),
+            ],
+        );
+        let segs = vec![
+            seg(10_000, 15_000, "A"),
+            seg(15_000, 25_000, "B"),
+        ];
+        let display_map = build_display_map(
+            std::slice::from_ref(&chunk),
+            &segs,
+            ChunkSource::Sys,
+        );
+        let pieces = split_by_segments(&chunk, &segs, &display_map);
+        assert_eq!(pieces.len(), 2);
+        assert_eq!(pieces[0].label.as_deref(), Some("Speaker 1"));
+        assert_eq!(pieces[0].text, "first second");
+        assert_eq!(pieces[1].label.as_deref(), Some("Speaker 2"));
+        assert_eq!(pieces[1].text, "third");
+    }
+
+    #[test]
+    fn split_chunk_handles_back_and_forth_within_chunk() {
+        // The exact pattern in the user's screenshot: same chunk
+        // contains alternating speakers. Three pieces: A then B
+        // then A again, mapping to Speaker 1 / Speaker 2 / Speaker 1.
+        let chunk = sys_with_words(
+            0,
+            vec![
+                ("you", 0, 200),
+                ("had", 200, 400),
+                ("the", 400, 600),
+                ("mouth", 600, 900),
+                ("I", 5000, 5100),
+                ("bet", 5100, 5400),
+                ("yes", 9000, 9300),
+                ("I", 9300, 9400),
+                ("did", 9400, 9700),
+            ],
+        );
+        let segs = vec![
+            seg(0, 4_500, "A"),
+            seg(4_500, 8_500, "B"),
+            seg(8_500, 12_000, "A"),
+        ];
+        let display_map = build_display_map(
+            std::slice::from_ref(&chunk),
+            &segs,
+            ChunkSource::Sys,
+        );
+        let pieces = split_by_segments(&chunk, &segs, &display_map);
+        assert_eq!(pieces.len(), 3);
+        assert_eq!(pieces[0].label.as_deref(), Some("Speaker 1"));
+        assert_eq!(pieces[0].text, "you had the mouth");
+        assert_eq!(pieces[1].label.as_deref(), Some("Speaker 2"));
+        assert_eq!(pieces[1].text, "I bet");
+        assert_eq!(pieces[2].label.as_deref(), Some("Speaker 1"));
+        assert_eq!(pieces[2].text, "yes I did");
+    }
+
+    #[test]
+    fn split_chunk_into_transcript_emits_separate_lines_per_speaker() {
+        // End-to-end: a single chunk containing two speakers should
+        // produce two `Speaker N:` lines in the rendered transcript,
+        // not one. This is the user-visible behaviour the whole change
+        // exists for.
+        let chunks = vec![sys_with_words(
+            0,
+            vec![
+                ("hello", 0, 500),
+                ("there", 500, 1000),
+                ("hi", 5000, 5300),
+                ("back", 5300, 5700),
+            ],
+        )];
+        let segs = vec![seg(0, 4_500, "A"), seg(4_500, 10_000, "B")];
+        let display_map = build_display_map(&chunks, &segs, ChunkSource::Sys);
+        let splitter = move |c: &ChunkRecord| split_by_segments(c, &segs, &display_map);
+        assert_eq!(
+            build_labelled_transcript(&chunks, &splitter),
+            "Speaker 1: hello there\nSpeaker 2: hi back"
+        );
     }
 
     #[test]
@@ -4167,7 +4469,7 @@ mod diarize_tests {
                 .and_then(|sid| display_map.get(sid).map(|n| format!("Speaker {n}"))),
         };
         assert_eq!(
-            build_labelled_transcript(&chunks, &labeller),
+            build_labelled_transcript(&chunks, &whole_chunk_pieces(labeller)),
             "You: hi there\nSpeaker 1: hello\nYou: how are you\nSpeaker 1: doing well"
         );
     }
@@ -4190,7 +4492,7 @@ mod diarize_tests {
             ChunkSource::Sys => Some("Speaker 1".to_string()),
         };
         assert_eq!(
-            build_labelled_transcript(&chunks, &labeller),
+            build_labelled_transcript(&chunks, &whole_chunk_pieces(labeller)),
             "You: ok thanks\nSpeaker 1: you got it\nYou: see you tomorrow"
         );
     }
@@ -4210,7 +4512,7 @@ mod diarize_tests {
             ChunkSource::Mic => Some("You".to_string()),
             ChunkSource::Sys => None,
         };
-        let result = build_labelled_transcript(&chunks, &buggy);
+        let result = build_labelled_transcript(&chunks, &whole_chunk_pieces(buggy));
         // This is the pathological output we DO NOT want from the
         // production code; it's only here as a tripwire on the helper.
         assert_eq!(result, "You: ok thanks you got it");
@@ -4230,7 +4532,7 @@ mod diarize_tests {
             ChunkSource::Sys => Some("Speaker 1".to_string()),
         };
         assert_eq!(
-            build_labelled_transcript(&chunks, &labeller),
+            build_labelled_transcript(&chunks, &whole_chunk_pieces(labeller)),
             "You: from mic\nSpeaker 1: from sys"
         );
     }
@@ -4321,7 +4623,7 @@ mod diarize_tests {
             ChunkSource::Mic => Some("You".to_string()),
             ChunkSource::Sys => Some("Speaker 1".to_string()),
         };
-        let out = build_labelled_transcript(&chunks, &labeller);
+        let out = build_labelled_transcript(&chunks, &whole_chunk_pieces(labeller));
         // Mic echo dropped; only the sys content remains.
         assert_eq!(
             out,
@@ -4341,7 +4643,7 @@ mod diarize_tests {
             ChunkSource::Mic => Some("You".to_string()),
             ChunkSource::Sys => Some("Speaker 1".to_string()),
         };
-        let out = build_labelled_transcript(&chunks, &labeller);
+        let out = build_labelled_transcript(&chunks, &whole_chunk_pieces(labeller));
         assert!(out.contains("actually I want to push back"));
         assert!(out.contains("Speaker 1: we should ship"));
     }
@@ -4359,7 +4661,7 @@ mod diarize_tests {
             ChunkSource::Mic => Some("You".to_string()),
             ChunkSource::Sys => Some("Speaker 1".to_string()),
         };
-        let out = build_labelled_transcript(&chunks, &labeller);
+        let out = build_labelled_transcript(&chunks, &whole_chunk_pieces(labeller));
         assert!(out.contains("You: yeah ok"));
     }
 
@@ -4376,7 +4678,7 @@ mod diarize_tests {
             ChunkSource::Mic => Some("You".to_string()),
             ChunkSource::Sys => Some("Speaker 1".to_string()),
         };
-        let out = build_labelled_transcript(&chunks, &labeller);
+        let out = build_labelled_transcript(&chunks, &whole_chunk_pieces(labeller));
         assert!(out.contains("You: the proposal is to extend"));
         assert!(out.contains("Speaker 1: the proposal is to extend"));
     }
@@ -4402,7 +4704,7 @@ mod diarize_tests {
             ChunkSource::Mic => Some("You".to_string()),
             ChunkSource::Sys => Some("Speaker 1".to_string()),
         };
-        let out = build_labelled_transcript(&chunks, &labeller);
+        let out = build_labelled_transcript(&chunks, &whole_chunk_pieces(labeller));
         // No "You:" turns survive — only the sys content is shown.
         assert!(!out.contains("You:"));
         assert!(out.contains("Speaker 1: this is the first thing"));
@@ -4419,7 +4721,7 @@ mod diarize_tests {
             ChunkSource::Mic => Some("Speaker 1".to_string()),
             ChunkSource::Sys => Some("Speaker 2".to_string()),
         };
-        let out = build_labelled_transcript(&chunks, &labeller);
+        let out = build_labelled_transcript(&chunks, &whole_chunk_pieces(labeller));
         assert_eq!(
             out,
             "Speaker 1: this is the first thing I am saying and now the second thing"
