@@ -174,8 +174,25 @@ pub fn run() {
             commands::permissions_request,
             commands::permissions_open_settings,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri app");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri app")
+        .run(|_app_handle, event| {
+            // Bypass C++ static destructors on quit. whisper.cpp's GGML
+            // Metal backend dispatches a background block during init that
+            // polls via usleep; on app exit, the unique_ptr<ggml_metal_device>
+            // destructor (called from atexit via __cxa_finalize_ranges)
+            // runs ggml_metal_rsets_free, which aborts when those rsets are
+            // still owned by the in-flight init block. Result: every
+            // Cmd+Q after a recording reliably crashes inside ggml_abort
+            // and produces a SIGABRT crash dialog. We don't actually need
+            // C++ destructors to run at exit — the OS reclaims Metal
+            // resources, file descriptors, and process memory anyway, and
+            // our DB writes are synced before this point. _exit(0) skips
+            // atexit entirely and lets the process terminate cleanly.
+            if let tauri::RunEvent::Exit = event {
+                unsafe { libc::_exit(0) };
+            }
+        });
 }
 
 fn build_menu(app: &tauri::AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
