@@ -68,7 +68,7 @@ export function SummaryTab({
               >
                 Install Ollama
               </button>
-              , then run <code>ollama pull qwen3:4b</code> (or any model
+              , then run <code>ollama pull qwen3.5:9b</code> (or any model
               you prefer) in a Terminal before recording.
             </p>
           </Row>
@@ -102,7 +102,7 @@ export function SummaryTab({
             {llmModels.list && llmModels.list.length === 0 && (
               <p className="text-xs text-[var(--color-text-muted)] mt-2">
                 Server is reachable but has no models loaded. Run
-                <code> ollama pull qwen3:4b</code> (or similar) first.
+                <code> ollama pull qwen3.5:9b</code> (or similar) first.
               </p>
             )}
           </Row>

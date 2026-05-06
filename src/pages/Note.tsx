@@ -4,6 +4,8 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
   Calendar,
+  ChevronDown,
+  ChevronUp,
   Circle,
   Cloud,
   FileText,
@@ -45,6 +47,8 @@ export function Note() {
   const [thinkingStream, setThinkingStream] = useState<string>("");
   const [contentStream, setContentStream] = useState<string>("");
   const [thinkingExpanded, setThinkingExpanded] = useState<boolean>(true);
+  const [transcriptExpanded, setTranscriptExpanded] = useState<boolean>(false);
+  const [summaryExpanded, setSummaryExpanded] = useState<boolean>(false);
   const saveTimer = useRef<number | null>(null);
   const devMode = useDeveloperMode();
   // Playback bundle: the mixed WAV path (converted to a tauri:// asset
@@ -301,6 +305,11 @@ export function Note() {
   const hasTranscript = draft.transcript.trim().length > 0;
   const showTranscriptSection = hasTranscript || isRecording || isPaused || isStarting || isStopping;
   const showSummarySection = hasSummary || isSummarizing;
+  // Live-feed alignment: while a recording is in flight, pin the
+  // collapsed transcript card to its bottom so newly transcribed
+  // chunks stay visible. After stop / on a saved note the user is
+  // reading from the top, so flip back to top alignment.
+  const transcriptLive = isRecording || isPaused || isStopping || isDiarizing;
 
   return (
     <div className="h-full flex flex-col">
@@ -392,10 +401,14 @@ export function Note() {
 
         {showSummarySection && (
           <Card className="mt-8">
-            <div className="flex items-baseline gap-3 mb-4">
-              <h2 className="nd-label">Summary</h2>
+            <CollapsibleHeader
+              expanded={summaryExpanded}
+              onToggle={() => setSummaryExpanded((v) => !v)}
+              label="summary"
+            >
+              <span>Summary</span>
               {isSummarizing && hasSummary && (
-                <span className="text-xs text-[var(--color-text-muted)] flex items-center gap-1.5">
+                <span className="text-xs text-[var(--color-text-muted)] flex items-center gap-1.5 normal-case tracking-normal">
                   <span
                     className="inline-block w-2 h-2 rounded-full bg-[var(--color-text-muted)] animate-pulse"
                     aria-hidden
@@ -403,7 +416,7 @@ export function Note() {
                   Regenerating…
                 </span>
               )}
-            </div>
+            </CollapsibleHeader>
             {/* Live reasoning trace: shown only on local LLM providers
                 while the model is thinking. Cloud OpenAI doesn't stream
                 a thinking trace through this path (reasoning models keep
@@ -445,27 +458,33 @@ export function Note() {
                 Without the isSummarizing guard, hasSummary would always
                 win and the streaming would be invisible behind the cached
                 summary — minutes of "nothing happening" on local LLMs. */}
-            {isSummarizing && contentStream.length > 0 ? (
-              <div className="prose-summary text-base leading-relaxed">
-                <ReactMarkdown remarkPlugins={[remarkGfm]}>{contentStream}</ReactMarkdown>
-              </div>
-            ) : hasSummary ? (
-              <div className="prose-summary text-base leading-relaxed">
-                <ReactMarkdown remarkPlugins={[remarkGfm]}>{draft.summary}</ReactMarkdown>
-              </div>
-            ) : contentStream.length > 0 ? (
-              <div className="prose-summary text-base leading-relaxed">
-                <ReactMarkdown remarkPlugins={[remarkGfm]}>{contentStream}</ReactMarkdown>
-              </div>
-            ) : (
-              <SkeletonLines lines={5} />
-            )}
+            <CollapsibleScroll expanded={summaryExpanded} bottomAligned={false}>
+              {isSummarizing && contentStream.length > 0 ? (
+                <div className="prose-summary text-base leading-relaxed">
+                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{contentStream}</ReactMarkdown>
+                </div>
+              ) : hasSummary ? (
+                <div className="prose-summary text-base leading-relaxed">
+                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{draft.summary}</ReactMarkdown>
+                </div>
+              ) : contentStream.length > 0 ? (
+                <div className="prose-summary text-base leading-relaxed">
+                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{contentStream}</ReactMarkdown>
+                </div>
+              ) : (
+                <SkeletonLines lines={5} />
+              )}
+            </CollapsibleScroll>
           </Card>
         )}
 
         {showTranscriptSection && (
           <Card className="mt-4 focus-within:border-[var(--color-text)] transition-colors">
-            <h2 className="nd-label mb-4 flex items-center gap-3">
+            <CollapsibleHeader
+              expanded={transcriptExpanded}
+              onToggle={() => setTranscriptExpanded((v) => !v)}
+              label="transcript"
+            >
               <span>Transcript</span>
               {isRecording && (
                 <span className="inline-flex items-end gap-0.5 h-2.5">
@@ -478,7 +497,7 @@ export function Note() {
                   ))}
                 </span>
               )}
-            </h2>
+            </CollapsibleHeader>
             {hasTranscript ? (
               <>
                 <SpeakerLabels
@@ -515,12 +534,16 @@ export function Note() {
                     transcript={draft.transcript}
                     onChange={(v) => patch("transcript", v)}
                     disabled={isRecording || isPaused || isStarting || isStopping || isDiarizing}
+                    expanded={transcriptExpanded}
+                    bottomAligned={transcriptLive}
                   />
                 ) : (
                   <TranscriptEditor
                     value={draft.transcript}
                     onChange={(v) => patch("transcript", v)}
                     disabled={isRecording || isPaused || isStarting || isStopping || isDiarizing}
+                    expanded={transcriptExpanded}
+                    bottomAligned={transcriptLive}
                   />
                 )}
                 {isRecording && <SkeletonLines lines={2} className="mt-3" />}
@@ -815,6 +838,93 @@ function Card({ children, className = "" }: { children: React.ReactNode; classNa
   );
 }
 
+// Max height applied to a collapsed transcript or summary card so a
+// long meeting doesn't push the rest of the page off screen. ~14rem
+// is roughly 7 lines of body text on the default zoom — half of the
+// previous 28rem cap, deliberately compact so a long meeting stays
+// in a fixed footprint and the rest of the note (properties, body
+// editor) stays visible. Click "expand" for the full read.
+const COLLAPSED_MAX_HEIGHT = "14rem";
+
+// Wraps a long content area in a scrollable region capped at
+// `COLLAPSED_MAX_HEIGHT`. When `expanded` is true, no cap. When
+// `bottomAligned` is true and content is shorter than the cap, content
+// pins to the bottom (transcript live-feed UX); the effect also
+// scroll-resets to the bottom whenever `bottomAlignKey` changes, so
+// new chunks landing in the transcript stay visible.
+//
+// Intentionally not used in edit mode: the auto-resizing textarea
+// inside `TranscriptEditor` already grows with its content, and a
+// scroll cap on top of that would fight the user's typing.
+function CollapsibleScroll({
+  expanded,
+  bottomAligned,
+  bottomAlignKey,
+  children,
+}: {
+  expanded: boolean;
+  bottomAligned: boolean;
+  bottomAlignKey?: string | number;
+  children: React.ReactNode;
+}) {
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (expanded || !bottomAligned) return;
+    const el = ref.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+  }, [expanded, bottomAligned, bottomAlignKey]);
+  if (expanded) return <>{children}</>;
+  return (
+    <div
+      ref={ref}
+      className="overflow-y-auto flex flex-col"
+      style={{
+        maxHeight: COLLAPSED_MAX_HEIGHT,
+        justifyContent: bottomAligned ? "flex-end" : "flex-start",
+      }}
+    >
+      {children}
+    </div>
+  );
+}
+
+// Card header that doubles as the expand/collapse trigger — the full
+// width of the title bar is the click target so the hit area can't be
+// missed. The chevron is styled as a light-gray rounded box on hover
+// (matches the sidebar collapse button) so the affordance reads as a
+// real button even though the click surface is the whole row.
+function CollapsibleHeader({
+  expanded,
+  onToggle,
+  label,
+  children,
+}: {
+  expanded: boolean;
+  onToggle: () => void;
+  label: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onToggle}
+      title={expanded ? `Collapse ${label}` : `Expand ${label}`}
+      className="group nd-label mb-4 flex w-full items-center gap-3 cursor-pointer text-left"
+    >
+      {children}
+      <span
+        className="ml-auto p-1.5 rounded-md text-[var(--color-text-muted)] transition-colors group-hover:bg-[var(--color-pill-hover)] group-hover:text-[var(--color-text)]"
+        aria-hidden
+      >
+        {expanded
+          ? <ChevronUp size={16} strokeWidth={1.5} />
+          : <ChevronDown size={16} strokeWidth={1.5} />}
+      </span>
+    </button>
+  );
+}
+
 // Stable colour palette for speaker pills. Pulled from the design tokens so
 // dark mode adapts automatically. The order is intentional: blue first
 // because --color-interactive is the most "neutral" decorative colour we
@@ -972,10 +1082,14 @@ function TranscriptEditor({
   value,
   onChange,
   disabled,
+  expanded,
+  bottomAligned,
 }: {
   value: string;
   onChange: (v: string) => void;
   disabled: boolean;
+  expanded: boolean;
+  bottomAligned: boolean;
 }) {
   const [editing, setEditing] = useState(false);
   const taRef = useRef<HTMLTextAreaElement | null>(null);
@@ -1030,26 +1144,34 @@ function TranscriptEditor({
   }
 
   return (
-    <TranscriptView
-      transcript={value}
-      onClick={() => {
-        if (!disabled) setEditing(true);
-      }}
-      disabled={disabled}
-    />
+    <CollapsibleScroll
+      expanded={expanded}
+      bottomAligned={bottomAligned}
+      bottomAlignKey={value.length}
+    >
+      <TranscriptView
+        transcript={value}
+        onClick={() => {
+          if (!disabled) setEditing(true);
+        }}
+        disabled={disabled}
+      />
+    </CollapsibleScroll>
   );
 }
 
-// Styled transcript reader. Renders the transcript as a single
-// pre-wrapped block so its rendered height matches the textarea exactly —
-// no paragraph margins to add 8 px per line, which was causing the page
-// to jump up when the card shrank into edit mode.
+// Styled transcript reader. Each line is its own block so we can hang
+// a coloured speaker dot in the left gutter (absolute-positioned at
+// `left: -14px` from the line's edge, outside the text flow). The
+// label prefix that the textarea shows as raw text ("Speaker 1: ") is
+// rendered inside the line as transparent — keeps the wrap identical
+// to the textarea so flipping into edit mode doesn't jolt the page
+// height.
 //
-// Speaker labels at line starts ("Label: rest") get replaced with an
-// inline coloured pill plus the rest; everything else flows as plain
-// text with native \n line breaks preserved by white-space: pre-wrap.
 // The whole view is click-to-edit unless `disabled` (recording in
-// flight).
+// flight). The dot's click bubbles up to enter edit mode too — its
+// own purpose is purely visual / a hover affordance, since the rename
+// UI lives in the chip strip above.
 function TranscriptView({
   transcript,
   onClick,
@@ -1068,34 +1190,38 @@ function TranscriptView({
       onClick={onClick}
       title={disabled ? "Editing is paused while recording" : "Click to edit"}
       className={
-        "text-sm leading-relaxed text-[var(--color-text-muted)] whitespace-pre-wrap " +
+        "text-sm leading-relaxed text-[var(--color-text-muted)] " +
         (disabled ? "cursor-default" : "cursor-text")
       }
     >
       {lines.map((line, i) => {
-        const prefix = i > 0 ? "\n" : "";
         const m = line.match(/^(\s*)([^:]{1,40}):\s(.*)$/);
         if (m) {
           const [, lead, label, rest] = m;
-          const color = colors.get(label.trim());
+          const trimmedLabel = label.trim();
+          const color = colors.get(trimmedLabel);
           if (color) {
             return (
-              <span key={i}>
-                {prefix}
-                {lead}
-                <span className="nd-speaker-pill mr-2" style={{ background: color }}>
-                  {label}
+              <div key={i} className="relative whitespace-pre-wrap">
+                <span
+                  className="nd-speaker-dot"
+                  style={{ background: color }}
+                  title={trimmedLabel}
+                  aria-label={`Speaker: ${trimmedLabel}`}
+                />
+                <span aria-hidden className="opacity-0 select-none">
+                  {lead}
+                  {label}:{" "}
                 </span>
-                {rest}
-              </span>
+                {rest || " "}
+              </div>
             );
           }
         }
         return (
-          <span key={i}>
-            {prefix}
-            {line}
-          </span>
+          <div key={i} className="whitespace-pre-wrap">
+            {line || " "}
+          </div>
         );
       })}
     </div>
@@ -1122,6 +1248,8 @@ function TranscriptPlayer({
   transcript,
   onChange,
   disabled,
+  expanded,
+  bottomAligned,
 }: {
   noteId: string;
   timeline: TimelineEntry[];
@@ -1130,6 +1258,8 @@ function TranscriptPlayer({
   transcript: string;
   onChange: (v: string) => void;
   disabled: boolean;
+  expanded: boolean;
+  bottomAligned: boolean;
 }) {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   // The two derived states from playback position: which chunks
@@ -1388,6 +1518,11 @@ function TranscriptPlayer({
           className="nd-bare w-full resize-none text-sm leading-relaxed text-[var(--color-text-muted)] focus:outline-none"
         />
       ) : (
+        <CollapsibleScroll
+          expanded={expanded}
+          bottomAligned={bottomAligned}
+          bottomAlignKey={timeline.length}
+        >
         <div
           ref={containerRef}
           className="text-sm leading-relaxed text-[var(--color-text-muted)] flex flex-col gap-1"
@@ -1414,26 +1549,28 @@ function TranscriptPlayer({
                 }
               >
                 {entry.label && color && (
-                  <button
-                    type="button"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      void cycleChunkLabel(i);
-                    }}
-                    disabled={!cyclable || disabled}
-                    title={
-                      cyclable
-                        ? "Click to assign this chunk to the next speaker"
-                        : entry.label
-                    }
-                    className={
-                      "nd-speaker-pill shrink-0 " +
-                      (cyclable ? "cursor-pointer hover:opacity-80" : "cursor-default")
-                    }
-                    style={{ background: color }}
-                  >
-                    {entry.label}
-                  </button>
+                  <div className="relative w-3 shrink-0 self-stretch">
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        void cycleChunkLabel(i);
+                      }}
+                      disabled={!cyclable || disabled}
+                      title={
+                        cyclable
+                          ? `${entry.label} — click to reassign`
+                          : entry.label
+                      }
+                      className="nd-speaker-dot"
+                      style={{
+                        background: color,
+                        left: 0,
+                        top: "calc(0.5lh - 5px)",
+                      }}
+                      aria-label={`Speaker: ${entry.label}`}
+                    />
+                  </div>
                 )}
                 {entry.words && entry.words.length > 0 ? (
                   <div className="flex-1 nd-bare cursor-text leading-relaxed">
@@ -1492,6 +1629,7 @@ function TranscriptPlayer({
           });
           })()}
         </div>
+        </CollapsibleScroll>
       )}
     </div>
   );

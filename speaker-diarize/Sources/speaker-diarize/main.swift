@@ -264,7 +264,25 @@ func runDiarizeCommunity1(audioPath: String, numSpeakers: Int?, threshold: Doubl
         //   - exclusiveSegments stays true (default): output is non-overlapping
         //     so each chunk maps to exactly one speaker for the chunk-to-
         //     segment alignment in commands.rs::assign_speaker.
-        var config = OfflineDiarizerConfig(clusteringThreshold: threshold ?? 0.5)
+        //   - segmentation.minDurationOn lifted from the community-1 default
+        //     0.0 → 1.0: the segmentation model otherwise emits sub-second
+        //     "speaker B" blips for backchannels ("yeah", "right") inside a
+        //     longer monologue, which break a single sentence across three
+        //     `Speaker N:` lines after word-level alignment in
+        //     commands.rs::split_by_segments. Pyannote's own paper recommends
+        //     ≥1.0 here; the 1.4% DER cost noted in FluidAudio's source is a
+        //     fair trade for fewer fragmented lines in the rendered
+        //     transcript. commands.rs::bridge_short_interjections cleans up
+        //     anything that still slips through.
+        //   - segmentation.minDurationOff lifted 0.0 → 0.5: sub-half-second
+        //     intra-speaker pauses no longer break a turn, which keeps a
+        //     single thought on one line even when the speaker briefly
+        //     breathes mid-sentence.
+        var config = OfflineDiarizerConfig(
+            clusteringThreshold: threshold ?? 0.5,
+            segmentationMinDurationOn: 1.0,
+            segmentationMinDurationOff: 0.5
+        )
         // Caller-supplied speaker count hint when the user knows the count
         // ahead of time. `withSpeakers(exactly:)` overrides the auto cluster
         // detection inside VBx — without it, VBx is free to pick any

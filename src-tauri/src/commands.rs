@@ -1934,11 +1934,54 @@ pub async fn recording_stop(
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), r).await;
     }
 
+    // Drain in-flight transcribe tasks BEFORE snapshotting chunk_log.
+    //
+    // Each transcribe pushes its ChunkRecord to `chunk_log` only after the
+    // provider call (Whisper / OpenAI) returns. If we snapshot before
+    // draining, an in-flight transcribe that completes during the post-stop
+    // chain pushes its chunk to the live `state.recording.chunk_log` —
+    // which is too late: the snapshot already handed to `diarize_and_apply`
+    // is frozen. The user-visible failure is "stopped before the first
+    // chunk's transcript appeared → audio for that chunk is lost", because
+    // `diarize_and_apply` sees an empty chunks list and bails with "no
+    // chunks captured".
+    //
+    // The 300 s ceiling is generous so Whisper inference that's slowed down
+    // (Metal accumulating, queued behind the gate) still gets to finish.
+    // Aborting = silently dropping audio, which is the bug we're avoiding.
+    // The user sees Phase::Stopping during the drain, which can be a few
+    // seconds in the typical case.
+    emit_status(&app, Some(&note_id), Phase::Stopping);
+    let drain = async {
+        loop {
+            let next = inflight.lock().pop();
+            match next {
+                Some(h) => { let _ = h.await; }
+                None => break,
+            }
+        }
+    };
+    let drain_timed_out =
+        tokio::time::timeout(std::time::Duration::from_secs(300), drain).await.is_err();
+    if drain_timed_out {
+        let remaining: Vec<_> = inflight.lock().drain(..).collect();
+        eprintln!(
+            "recording_stop: drain timed out, aborting {} lingering transcribe(s)",
+            remaining.len()
+        );
+        for h in &remaining {
+            h.abort();
+        }
+        for h in remaining {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), h).await;
+        }
+    }
+
     // Snapshot every piece of session-derived state the post-stop chain
-    // needs, NOW — before spawning the background task. Reading from
-    // `state.recording` inside the spawned task would race with a new
-    // `recording_start` (the user can hit ⌘R immediately) and feed the
-    // diarizer the next session's chunks or paths.
+    // needs, NOW — *after* the drain so chunk_log includes every chunk
+    // whose transcribe finished, and before spawning the background task
+    // so it can't race a new `recording_start` (which clears
+    // `state.recording.chunk_log`).
     let post_stop = {
         let s = state.recording.lock();
         let mic_wav = s.mic_full_wav_path.lock().clone();
@@ -1964,51 +2007,10 @@ pub async fn recording_stop(
     // the chain ensures the full WAVs survive for as long as diarize
     // needs them.
     tokio::spawn(async move {
-        // Flip from Stopping → Diarizing immediately so the user
-        // sees a "processing" pill rather than sitting on Stopping
-        // for the whole post-stop chain. Drain is technically not
-        // diarize, but the user-visible UX is "we're chewing on
-        // your recording" — Diarizing is the right label and gets
-        // re-emitted by diarize_and_apply later (idempotent).
+        // Flip from Stopping → Diarizing once we move past the drain
+        // (which already ran synchronously in `recording_stop` so the
+        // chunk_log snapshot is complete).
         emit_status(&app_for_post, Some(&note_for_post), Phase::Diarizing);
-
-        // Drain in-flight transcribe tasks (incl. any final chunk
-        // spawned during the sidecar's shutdown handler) BEFORE
-        // diarize touches the chunk_log.
-        //
-        // Generous timeout (300 s) because Whisper inference can
-        // accumulate Metal slowdown over a long recording, and the
-        // tail chunks queued behind the gate sometimes take much
-        // longer than fresh ones. Aborting them = silently losing
-        // 20–30 s of audio at the end, which is the user-reported
-        // bug. Stuck network calls (OpenAI 503 retry) still hit the
-        // ceiling eventually; the session-active guard inside
-        // transcribe_chunk keeps any aborted task from clobbering
-        // the labelled transcript.
-        let drain = async {
-            loop {
-                let next = inflight.lock().pop();
-                match next {
-                    Some(h) => { let _ = h.await; }
-                    None => break,
-                }
-            }
-        };
-        let drain_timed_out =
-            tokio::time::timeout(std::time::Duration::from_secs(300), drain).await.is_err();
-        if drain_timed_out {
-            let remaining: Vec<_> = inflight.lock().drain(..).collect();
-            eprintln!(
-                "recording_stop: drain timed out, aborting {} lingering transcribe(s)",
-                remaining.len()
-            );
-            for h in &remaining {
-                h.abort();
-            }
-            for h in remaining {
-                let _ = tokio::time::timeout(std::time::Duration::from_secs(2), h).await;
-            }
-        }
 
         // Copy full WAVs to a permanent location FIRST when keep_audio is
         // on. diarize_and_apply calls cleanup_full_wav on the temp paths
@@ -2870,6 +2872,85 @@ fn token_containment(a: &[String], b: &[String]) -> f32 {
     }
 }
 
+/// Maximum word count for a labelled piece to be considered a "short
+/// interjection" eligible for absorption into the surrounding speaker.
+/// Common backchannels are 1–3 words ("yeah", "right", "ok got it",
+/// "mhm").
+const BRIDGE_MAX_WORDS: usize = 3;
+
+/// Maximum acoustic duration for a piece to be considered an
+/// interjection. Word-count alone can't separate "yeah totally" (a
+/// 0.6s backchannel) from "let me check" (a 1.5s real reply); the
+/// acoustic length is what makes them distinguishable. A backchannel
+/// is structurally brief — speakers don't pause to deliver them.
+const BRIDGE_MAX_DURATION_MS: u64 = 1_500;
+
+/// Collapse short cross-speaker interjections into the surrounding
+/// speaker run. The diarizer (FluidAudio community-1 + VBx) sometimes
+/// flips speaker mid-utterance for a brief backchannel — a 0.4 s
+/// "yeah" inside a longer monologue gets its own segment, the
+/// word-level split in `split_by_segments` honours that, and the user
+/// ends up with `Speaker 1: ... Speaker 2: yeah Speaker 1: ...` cut
+/// across three lines. Tuning the diarizer's `minDurationOn` upstream
+/// reduces the noise floor; this pass cleans up what slips through.
+///
+/// Rule: a piece P is rewritten to its neighbours' label when
+///   - P has a label,
+///   - the previous labelled piece and the next labelled piece both
+///     have the same label as each other, different from P's,
+///   - P has word timestamps available (so we can measure duration),
+///   - P's text has at most `BRIDGE_MAX_WORDS` words AND its acoustic
+///     span is at most `BRIDGE_MAX_DURATION_MS`.
+///
+/// Pieces with no word timestamps are skipped: that's the OpenAI
+/// transcribe path and older diagnostic JSONs, where we can't tell a
+/// real short turn from a backchannel and the safer default is to
+/// leave the speaker boundary in place.
+///
+/// Pieces with no label (the graceful-degrade path when diarize emits
+/// nothing) are passed over when finding the "previous"/"next"
+/// labelled neighbour, so they don't break the sandwich pattern.
+fn bridge_short_interjections(pieces: &mut [LabelledPiece]) {
+    if pieces.len() < 3 {
+        return;
+    }
+    for i in 1..pieces.len() - 1 {
+        let cur_label = match &pieces[i].label {
+            Some(l) => l.clone(),
+            None => continue,
+        };
+        if pieces[i].text.split_whitespace().count() > BRIDGE_MAX_WORDS {
+            continue;
+        }
+        let words = &pieces[i].words;
+        if words.is_empty() {
+            continue;
+        }
+        let span_ms = words
+            .last()
+            .map(|w| w.end_ms)
+            .unwrap_or(0)
+            .saturating_sub(words.first().map(|w| w.start_ms).unwrap_or(0));
+        if span_ms > BRIDGE_MAX_DURATION_MS {
+            continue;
+        }
+        let prev_label = pieces[..i]
+            .iter()
+            .rev()
+            .find_map(|p| p.label.clone());
+        let next_label = pieces[i + 1..]
+            .iter()
+            .find_map(|p| p.label.clone());
+        let (Some(prev), Some(next)) = (prev_label, next_label) else {
+            continue;
+        };
+        if prev != next || prev == cur_label {
+            continue;
+        }
+        pieces[i].label = Some(prev);
+    }
+}
+
 /// Rebuild the transcript by walking chunks in chronological order and
 /// emitting each one prefixed with its assigned label. Same-label runs
 /// get a single space between chunks (continuation); label changes get
@@ -2887,7 +2968,9 @@ fn token_containment(a: &[String], b: &[String]) -> f32 {
 /// the threshold a reader would notice.
 ///
 /// Cross-stream echo dedup runs first via `dedup_mic_against_sys` —
-/// see that function for details.
+/// see that function for details. Short cross-speaker interjections
+/// are absorbed into the surrounding speaker via
+/// `bridge_short_interjections` before emit.
 fn build_labelled_transcript(
     chunks: &[ChunkRecord],
     split_chunk: &(dyn Fn(&ChunkRecord) -> Vec<LabelledPiece> + Send),
@@ -2902,37 +2985,144 @@ fn build_labelled_transcript(
         (c.start_ms, source_rank)
     });
 
+    let mut all_pieces: Vec<LabelledPiece> = Vec::new();
+    for chunk in sorted {
+        for piece in split_chunk(chunk) {
+            if piece.text.trim().is_empty() {
+                continue;
+            }
+            all_pieces.push(piece);
+        }
+    }
+    bridge_short_interjections(&mut all_pieces);
+
     let mut output = String::new();
     let mut last_label: Option<String> = None;
 
-    for chunk in sorted {
-        for piece in split_chunk(chunk) {
-            let trimmed = piece.text.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            match &piece.label {
-                Some(label) => {
-                    if last_label.as_deref() != Some(label.as_str()) {
-                        if !output.is_empty() {
-                            output.push('\n');
-                        }
-                        output.push_str(&format!("{label}: "));
-                        last_label = Some(label.clone());
-                    } else {
-                        output.push(' ');
-                    }
-                }
-                None => {
+    for piece in all_pieces {
+        let trimmed = piece.text.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match &piece.label {
+            Some(label) => {
+                if last_label.as_deref() != Some(label.as_str()) {
                     if !output.is_empty() {
-                        output.push(' ');
+                        output.push('\n');
                     }
+                    output.push_str(&format!("{label}: "));
+                    last_label = Some(label.clone());
+                } else {
+                    output.push(' ');
                 }
             }
-            output.push_str(trimmed);
+            None => {
+                if !output.is_empty() {
+                    output.push(' ');
+                }
+            }
+        }
+        output.push_str(trimmed);
+    }
+    merge_run_on_sentences(&output)
+}
+
+/// Maximum word count for either side of a candidate merge to qualify
+/// as a chunk-boundary artefact rather than a real cross-speaker turn.
+/// Two substantial turns (>8 words each) are almost always real;
+/// requiring at least one to be short keeps the heuristic from fusing
+/// genuine back-and-forth into single lines.
+const SENTENCE_MERGE_MAX_WORDS: usize = 8;
+
+/// Strip a leading `<label>: ` from a transcript line, returning the
+/// remainder. Mirrors the format `build_labelled_transcript` emits, so
+/// the merge pass can drop the absorbed line's prefix when joining.
+fn strip_label_prefix(line: &str) -> &str {
+    let trimmed = line.trim_start();
+    if let Some(colon) = trimmed.find(':') {
+        let label = &trimmed[..colon];
+        if !label.is_empty() && label.len() <= 40 && !label.contains('\n') {
+            let rest = &trimmed[colon + 1..];
+            return rest.trim_start();
         }
     }
-    output
+    line
+}
+
+/// Whether `line` ends with a sentence-terminating punctuation mark,
+/// allowing trailing close-quote/close-paren after the terminator
+/// (`he said.` / `(yes!)` / `"done."`). Trailing whitespace is ignored.
+fn ends_sentence(line: &str) -> bool {
+    let trimmed = line.trim_end();
+    let cleaned: String = trimmed
+        .chars()
+        .rev()
+        .take_while(|c| matches!(c, '"' | '\'' | ')' | ']' | '»' | '”' | '’' | ' '))
+        .collect();
+    let len = cleaned.chars().count();
+    let mut chars = trimmed.chars();
+    let total = trimmed.chars().count();
+    if total == 0 {
+        return false;
+    }
+    let target_idx = total.saturating_sub(len + 1);
+    let last_meaningful = chars.nth(target_idx);
+    matches!(last_meaningful, Some('.') | Some('!') | Some('?') | Some(':') | Some(';') | Some('…'))
+}
+
+/// Whether `line` (after any `<label>: ` prefix) begins with a
+/// lowercase letter — the textual cue that this line is the
+/// continuation of the previous line's clause rather than a fresh
+/// sentence. Lines that start with a digit, opening quote, or
+/// punctuation (parenthetical, em-dash) don't qualify; we want a
+/// strong signal.
+fn starts_lowercase(line: &str) -> bool {
+    let body = strip_label_prefix(line);
+    body.chars()
+        .next()
+        .map(|c| c.is_lowercase())
+        .unwrap_or(false)
+}
+
+/// Heuristic chunk-boundary merge: when one transcript line ends
+/// without a sentence terminator and the next line starts with a
+/// lowercase letter, the next line is almost certainly a continuation
+/// of the same sentence (Whisper cut a chunk mid-utterance, or the
+/// diarizer flipped speaker on a single word).
+///
+/// Conservative guards against fusing real turns:
+/// - Either side must be short (≤ `SENTENCE_MERGE_MAX_WORDS`). Two
+///   substantial turns are almost always real even without a
+///   terminator on the first.
+/// - The first line's speaker label is preserved (it owned the start
+///   of the sentence). The second line's label is dropped on merge.
+/// - Lines without speaker labels are passed through unchanged.
+///
+/// This is a textual pass run after `bridge_short_interjections`, so
+/// it catches what the structural sandwich rule can't (e.g. a turn at
+/// the end of the transcript with no following same-speaker neighbour
+/// to bridge through).
+fn merge_run_on_sentences(text: &str) -> String {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let mut merged: Vec<String> = Vec::with_capacity(lines.len());
+    for line in lines {
+        if let Some(prev) = merged.last_mut() {
+            if !ends_sentence(prev) && starts_lowercase(line) {
+                let prev_words = prev.split_whitespace().count();
+                let next_words = line.split_whitespace().count();
+                if prev_words <= SENTENCE_MERGE_MAX_WORDS
+                    || next_words <= SENTENCE_MERGE_MAX_WORDS
+                {
+                    let stripped = strip_label_prefix(line);
+                    prev.push(' ');
+                    prev.push_str(stripped);
+                    continue;
+                }
+            }
+        }
+        merged.push(line.to_string());
+    }
+    merged.join("\n")
 }
 
 async fn transcribe_chunk(
@@ -3885,6 +4075,109 @@ mod diarize_tests {
     }
 
     #[test]
+    fn ends_sentence_recognises_terminators() {
+        assert!(ends_sentence("he said."));
+        assert!(ends_sentence("really?"));
+        assert!(ends_sentence("stop!"));
+        assert!(ends_sentence("note: this matters;"));
+        assert!(ends_sentence("\"done.\""));
+        assert!(ends_sentence("(yes!)"));
+        assert!(ends_sentence("trailing space.   "));
+    }
+
+    #[test]
+    fn ends_sentence_rejects_open_endings() {
+        assert!(!ends_sentence("he said"));
+        assert!(!ends_sentence("I was thinking that"));
+        assert!(!ends_sentence("comma, here"));
+        assert!(!ends_sentence(""));
+    }
+
+    #[test]
+    fn merge_glues_open_clause_to_lowercase_continuation() {
+        let input = "Speaker 1: I was thinking that\nSpeaker 1: we should pivot.";
+        assert_eq!(
+            merge_run_on_sentences(input),
+            "Speaker 1: I was thinking that we should pivot."
+        );
+    }
+
+    #[test]
+    fn merge_drops_label_prefix_from_absorbed_line() {
+        // Even when the absorbed line is a different speaker, the
+        // first speaker keeps the floor — Whisper's mid-utterance
+        // chunk break or a borderline diarizer flip is what produced
+        // this artefact, not a real speaker change.
+        let input = "Speaker 1: anyway the point is\nSpeaker 2: that we are out of time.";
+        assert_eq!(
+            merge_run_on_sentences(input),
+            "Speaker 1: anyway the point is that we are out of time."
+        );
+    }
+
+    #[test]
+    fn merge_keeps_real_turns_when_both_substantial() {
+        // Two long lines with no terminator on the first — could be a
+        // real cross-talk pattern. The word-count guard preserves the
+        // boundary because both sides exceed the threshold.
+        let prev_part = "I really think we should reconsider the entire approach";
+        let next_part = "but the timeline doesnt allow for any major scope changes now";
+        let input = format!("Speaker 1: {prev_part}\nSpeaker 2: {next_part}");
+        let output = merge_run_on_sentences(&input);
+        assert!(output.contains('\n'), "expected boundary preserved: {output}");
+    }
+
+    #[test]
+    fn merge_keeps_lines_that_already_end_in_terminator() {
+        let input = "Speaker 1: hello there.\nSpeaker 2: yes hi.";
+        assert_eq!(merge_run_on_sentences(input), input);
+    }
+
+    #[test]
+    fn merge_keeps_lines_when_next_starts_uppercase() {
+        // No terminator on prev, but next starts with a capital — most
+        // likely a fresh sentence the speaker began. Keep separate.
+        let input = "Speaker 1: I was thinking that\nSpeaker 2: We should pivot.";
+        assert_eq!(merge_run_on_sentences(input), input);
+    }
+
+    #[test]
+    fn merge_handles_norwegian_lowercase_continuation() {
+        // The unicode lowercase check covers non-ASCII letters; common
+        // Humla case for Norwegian recordings.
+        let input = "Speaker 1: vi har snakket om\nSpeaker 1: økonomien lenge.";
+        assert_eq!(
+            merge_run_on_sentences(input),
+            "Speaker 1: vi har snakket om økonomien lenge."
+        );
+    }
+
+    #[test]
+    fn merge_chains_multiple_consecutive_glues() {
+        // Three lines, all open-ended, all start lowercase → collapse
+        // into a single line. The merged line keeps growing under the
+        // word-count guard because we measure prev's length on each
+        // step (it's well past 8 words by line 3 — but next is short).
+        let input = "Speaker 1: so I was thinking\nSpeaker 1: that we should\nSpeaker 1: pivot the strategy.";
+        assert_eq!(
+            merge_run_on_sentences(input),
+            "Speaker 1: so I was thinking that we should pivot the strategy."
+        );
+    }
+
+    #[test]
+    fn merge_passes_through_unlabelled_lines() {
+        // Defensive: lines without `Label:` prefix shouldn't gain one
+        // from the merge pass, and the prefix-stripping helper must
+        // not eat content that isn't actually a label.
+        let input = "first fragment\nsecond piece.";
+        assert_eq!(
+            merge_run_on_sentences(input),
+            "first fragment second piece."
+        );
+    }
+
+    #[test]
     fn split_chunk_with_no_words_falls_back_to_whole_chunk() {
         // The OpenAI / older-diagnostic path: chunk has text but no
         // word timings. split_by_segments must still emit one piece
@@ -3989,19 +4282,193 @@ mod diarize_tests {
         assert_eq!(pieces[2].text, "yes I did");
     }
 
+    /// Build a piece directly without going through chunk splitting,
+    /// with synthetic word timings. Each word is given a 200 ms span
+    /// at `start_ms + i * 250 ms` so the caller can construct short
+    /// (backchannel-shaped) or long pieces by varying word count.
+    /// Pass `words = false` to produce a piece with no timing data,
+    /// modelling the OpenAI / older-diagnostic path.
+    fn piece(label: Option<&str>, text: &str, words: bool) -> LabelledPiece {
+        let word_vec = if words {
+            text.split_whitespace()
+                .enumerate()
+                .map(|(i, w)| crate::recording::ChunkWord {
+                    text: w.to_string(),
+                    start_ms: (i as u64) * 250,
+                    end_ms: (i as u64) * 250 + 200,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        LabelledPiece {
+            label: label.map(str::to_string),
+            text: text.to_string(),
+            words: word_vec,
+        }
+    }
+
+    /// Build a piece with explicit word timings. Useful when the test
+    /// needs a specific acoustic span (e.g. a slow 1-word reply that
+    /// shouldn't bridge).
+    fn piece_with_span(
+        label: Option<&str>,
+        text: &str,
+        start_ms: u64,
+        end_ms: u64,
+    ) -> LabelledPiece {
+        let words: Vec<&str> = text.split_whitespace().collect();
+        let n = words.len().max(1);
+        let step = (end_ms - start_ms) / n as u64;
+        let word_vec = words
+            .iter()
+            .enumerate()
+            .map(|(i, w)| crate::recording::ChunkWord {
+                text: (*w).to_string(),
+                start_ms: start_ms + step * i as u64,
+                end_ms: start_ms + step * (i as u64 + 1),
+            })
+            .collect();
+        LabelledPiece {
+            label: label.map(str::to_string),
+            text: text.to_string(),
+            words: word_vec,
+        }
+    }
+
+    #[test]
+    fn bridge_absorbs_short_sandwiched_interjection() {
+        // The motivating case: Speaker 2 emits one word ("yeah") while
+        // Speaker 1 is talking on either side. Should collapse.
+        let mut pieces = vec![
+            piece(Some("Speaker 1"), "so what I was saying about", true),
+            piece(Some("Speaker 2"), "yeah", true),
+            piece(Some("Speaker 1"), "the migration plan", true),
+        ];
+        bridge_short_interjections(&mut pieces);
+        assert_eq!(pieces[0].label.as_deref(), Some("Speaker 1"));
+        assert_eq!(pieces[1].label.as_deref(), Some("Speaker 1"));
+        assert_eq!(pieces[2].label.as_deref(), Some("Speaker 1"));
+    }
+
+    #[test]
+    fn bridge_keeps_long_reply_distinct() {
+        // A five-word reply exceeds BRIDGE_MAX_WORDS, so the speaker
+        // boundary survives even when sandwiched.
+        let mut pieces = vec![
+            piece(Some("Speaker 1"), "do you have time", true),
+            piece(Some("Speaker 2"), "no I really do not", true),
+            piece(Some("Speaker 1"), "ok let me try later", true),
+        ];
+        bridge_short_interjections(&mut pieces);
+        assert_eq!(pieces[1].label.as_deref(), Some("Speaker 2"));
+    }
+
+    #[test]
+    fn bridge_keeps_short_but_slow_reply_distinct() {
+        // Same speaker on either side, a sandwich, but the middle
+        // piece's acoustic span is 2 s — too long to be a backchannel.
+        // The duration gate is what protects real short turns
+        // ("absolutely" delivered slowly, "no problem at all") from
+        // getting fused into the surrounding speaker.
+        let mut pieces = vec![
+            piece(Some("Speaker 1"), "what do you think", true),
+            piece_with_span(Some("Speaker 2"), "no", 0, 2_000),
+            piece(Some("Speaker 1"), "fair enough", true),
+        ];
+        bridge_short_interjections(&mut pieces);
+        assert_eq!(pieces[1].label.as_deref(), Some("Speaker 2"));
+    }
+
+    #[test]
+    fn bridge_skips_pieces_without_word_timings() {
+        // OpenAI transcribe and older diagnostic JSONs don't carry
+        // per-word timings. We can't tell backchannel from real reply
+        // without duration, so we conservatively leave the boundary.
+        let mut pieces = vec![
+            piece(Some("Speaker 1"), "first turn", false),
+            piece(Some("Speaker 2"), "second turn", false),
+            piece(Some("Speaker 1"), "third turn", false),
+        ];
+        bridge_short_interjections(&mut pieces);
+        assert_eq!(pieces[1].label.as_deref(), Some("Speaker 2"));
+    }
+
+    #[test]
+    fn bridge_does_not_fuse_distinct_neighbours() {
+        // A short piece between two *different* speakers is a real
+        // turn ("ok" between A and B in a back-and-forth), not noise.
+        // The structural sandwich check is what blocks the collapse.
+        let mut pieces = vec![
+            piece(Some("Speaker 1"), "see you tomorrow", true),
+            piece(Some("Speaker 2"), "ok", true),
+            piece(Some("Speaker 3"), "bye both", true),
+        ];
+        bridge_short_interjections(&mut pieces);
+        assert_eq!(pieces[1].label.as_deref(), Some("Speaker 2"));
+    }
+
+    #[test]
+    fn bridge_skips_first_and_last_pieces() {
+        // The boundary pieces have no "prev" or "next" with a different
+        // label, so even short ones stay put. Otherwise the very first
+        // utterance ("hi") of a meeting would get glued onto the
+        // following speaker's first turn.
+        let mut pieces = vec![
+            piece(Some("Speaker 2"), "hi", true),
+            piece(Some("Speaker 1"), "hello there how are you doing", true),
+            piece(Some("Speaker 2"), "ok", true),
+        ];
+        bridge_short_interjections(&mut pieces);
+        assert_eq!(pieces[0].label.as_deref(), Some("Speaker 2"));
+        assert_eq!(pieces[2].label.as_deref(), Some("Speaker 2"));
+    }
+
+    #[test]
+    fn bridge_end_to_end_collapses_three_lines_to_one() {
+        // The user-visible payoff: a chunk that emits three pieces
+        // (Speaker 1 / Speaker 2 / Speaker 1, with the middle being a
+        // brief backchannel) should render as a single Speaker 1 line.
+        let chunk = sys_with_words(
+            0,
+            vec![
+                ("the", 0, 200),
+                ("plan", 200, 400),
+                ("is", 400, 600),
+                ("yeah", 4500, 4900),
+                ("simple", 6000, 6500),
+                ("really", 6500, 6900),
+            ],
+        );
+        let segs = vec![
+            seg(0, 4_400, "A"),
+            seg(4_400, 5_000, "B"),
+            seg(5_000, 10_000, "A"),
+        ];
+        let chunks = vec![chunk];
+        let display_map = build_display_map(&chunks, &segs, ChunkSource::Sys);
+        let splitter = move |c: &ChunkRecord| split_by_segments(c, &segs, &display_map);
+        assert_eq!(
+            build_labelled_transcript(&chunks, &splitter),
+            "Speaker 1: the plan is yeah simple really"
+        );
+    }
+
     #[test]
     fn split_chunk_into_transcript_emits_separate_lines_per_speaker() {
         // End-to-end: a single chunk containing two speakers should
         // produce two `Speaker N:` lines in the rendered transcript,
         // not one. This is the user-visible behaviour the whole change
-        // exists for.
+        // exists for. Sentence terminators on each turn keep the
+        // post-build heuristic merge from collapsing the boundary —
+        // real Whisper output emits these too.
         let chunks = vec![sys_with_words(
             0,
             vec![
                 ("hello", 0, 500),
-                ("there", 500, 1000),
-                ("hi", 5000, 5300),
-                ("back", 5300, 5700),
+                ("there.", 500, 1000),
+                ("Hi", 5000, 5300),
+                ("back.", 5300, 5700),
             ],
         )];
         let segs = vec![seg(0, 4_500, "A"), seg(4_500, 10_000, "B")];
@@ -4009,7 +4476,7 @@ mod diarize_tests {
         let splitter = move |c: &ChunkRecord| split_by_segments(c, &segs, &display_map);
         assert_eq!(
             build_labelled_transcript(&chunks, &splitter),
-            "Speaker 1: hello there\nSpeaker 2: hi back"
+            "Speaker 1: hello there.\nSpeaker 2: Hi back."
         );
     }
 
@@ -4060,16 +4527,16 @@ mod diarize_tests {
     #[test]
     fn build_transcript_speaker_switch_inserts_newline_and_prefix() {
         let chunks = vec![
-            mic(0, "first turn"),
-            mic(3500, "second turn"),
-            mic(7000, "third turn"),
+            mic(0, "First turn."),
+            mic(3500, "Second turn."),
+            mic(7000, "Third turn."),
         ];
         let segs = vec![seg(0, 3000, "A"), seg(3000, 6000, "B"), seg(6000, 9000, "A")];
         // Display numbers assigned in first-encounter order: A=1, B=2.
         // A returns later → "Speaker 1:" again, not a new number.
         assert_eq!(
             mic_only_labeller(chunks, segs),
-            "Speaker 1: first turn\nSpeaker 2: second turn\nSpeaker 1: third turn"
+            "Speaker 1: First turn.\nSpeaker 2: Second turn.\nSpeaker 1: Third turn."
         );
     }
 
@@ -4087,10 +4554,10 @@ mod diarize_tests {
         // Remote-call shape: mic chunks get fixed "You" label; sys chunks
         // get diarized. Ordering by (start_ms, source) interleaves them.
         let chunks = vec![
-            mic(0, "hi there"),
-            sys(500, "hello"),
-            mic(2500, "how are you"),
-            sys(4000, "doing well"),
+            mic(0, "Hi there."),
+            sys(500, "Hello."),
+            mic(2500, "How are you?"),
+            sys(4000, "Doing well."),
         ];
         let sys_segs = vec![seg(0, 10000, "REMOTE_A")];
         let display_map = build_display_map(&chunks, &sys_segs, ChunkSource::Sys);
@@ -4101,7 +4568,7 @@ mod diarize_tests {
         };
         assert_eq!(
             build_labelled_transcript(&chunks, &whole_chunk_pieces(labeller)),
-            "You: hi there\nSpeaker 1: hello\nYou: how are you\nSpeaker 1: doing well"
+            "You: Hi there.\nSpeaker 1: Hello.\nYou: How are you?\nSpeaker 1: Doing well."
         );
     }
 
@@ -4114,9 +4581,9 @@ mod diarize_tests {
         // The single-speaker fallback labels them `Speaker 1` so the
         // boundary survives.
         let chunks = vec![
-            mic(0, "ok thanks"),
-            sys(500, "you got it"),
-            mic(2000, "see you tomorrow"),
+            mic(0, "Ok thanks."),
+            sys(500, "You got it."),
+            mic(2000, "See you tomorrow."),
         ];
         let labeller = |c: &ChunkRecord| match c.source {
             ChunkSource::Mic => Some("You".to_string()),
@@ -4124,7 +4591,7 @@ mod diarize_tests {
         };
         assert_eq!(
             build_labelled_transcript(&chunks, &whole_chunk_pieces(labeller)),
-            "You: ok thanks\nSpeaker 1: you got it\nYou: see you tomorrow"
+            "You: Ok thanks.\nSpeaker 1: You got it.\nYou: See you tomorrow."
         );
     }
 
@@ -4136,8 +4603,8 @@ mod diarize_tests {
         // the reader. Locked into a test so a future "simplification" of
         // the fallback that goes back to None gets caught here.
         let chunks = vec![
-            mic(0, "ok thanks"),
-            sys(500, "you got it"),
+            mic(0, "Ok thanks."),
+            sys(500, "You got it."),
         ];
         let buggy = |c: &ChunkRecord| match c.source {
             ChunkSource::Mic => Some("You".to_string()),
@@ -4146,7 +4613,7 @@ mod diarize_tests {
         let result = build_labelled_transcript(&chunks, &whole_chunk_pieces(buggy));
         // This is the pathological output we DO NOT want from the
         // production code; it's only here as a tripwire on the helper.
-        assert_eq!(result, "You: ok thanks you got it");
+        assert_eq!(result, "You: Ok thanks. You got it.");
     }
 
     #[test]
@@ -4155,8 +4622,8 @@ mod diarize_tests {
         // Reflects the typical UX assumption that the user speaks before
         // they hear a response, and stabilises ordering on tie.
         let chunks = vec![
-            sys(0, "from sys"),
-            mic(0, "from mic"),
+            sys(0, "From sys."),
+            mic(0, "From mic."),
         ];
         let labeller = |c: &ChunkRecord| match c.source {
             ChunkSource::Mic => Some("You".to_string()),
@@ -4164,7 +4631,7 @@ mod diarize_tests {
         };
         assert_eq!(
             build_labelled_transcript(&chunks, &whole_chunk_pieces(labeller)),
-            "You: from mic\nSpeaker 1: from sys"
+            "You: From mic.\nSpeaker 1: From sys."
         );
     }
 
@@ -4282,9 +4749,11 @@ mod diarize_tests {
     #[test]
     fn dedup_keeps_short_mic_acks_even_if_words_appear_in_sys() {
         // "yeah" / "ok" alone shouldn't drop just because those tokens
-        // appear in any sys window; they're valid backchannels.
+        // appear in any sys window; they're valid backchannels. Sys
+        // chunk ends with a terminator so the post-build heuristic
+        // merge doesn't dissolve the speaker boundary.
         let chunks = vec![
-            sys(0, "so the ship date is yeah ok confirmed for Friday"),
+            sys(0, "So the ship date is yeah ok confirmed for Friday."),
             mic(500, "yeah"),
             mic(1000, "ok"),
         ];
