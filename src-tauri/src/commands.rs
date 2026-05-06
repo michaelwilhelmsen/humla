@@ -1826,20 +1826,49 @@ pub async fn recording_start(
         let l = if note_lang.trim().is_empty() { global } else { note_lang };
         (p, l)
     };
-    let pre_err = match provider.as_str() {
+    // Phase 2: each cloud provider has its own Keychain slot. Look up the
+    // right one based on the active provider so the prerequisite check
+    // doesn't pass when (e.g.) the user picked Deepgram but only saved
+    // an OpenAI key.
+    let pre_err: Option<String> = match provider.as_str() {
         "local" => {
             let p = local_model_path(&app, &language).map_err(|e| e.to_string())?;
-            (!p.exists()).then_some(
-                "Local Whisper model not downloaded. Download it in Settings → Transcription.",
-            )
+            if p.exists() {
+                None
+            } else {
+                Some(
+                    "Local Whisper model not downloaded. Download it in Settings → Transcription."
+                        .to_string(),
+                )
+            }
         }
-        _ => read_openai_api_key(&state)?
-            .is_none()
-            .then_some("OpenAI API key not set. Add one in Settings → API keys."),
+        other => {
+            let provider_id = crate::stt::keychain_account_for(other)
+                .and_then(|_| match other {
+                    "openai" => Some("openai"),
+                    "deepgram" => Some("deepgram"),
+                    "groq" => Some("groq"),
+                    _ => None,
+                })
+                .unwrap_or("openai");
+            if read_provider_api_key(&state, provider_id)?.is_none() {
+                let label = match provider_id {
+                    "openai" => "OpenAI",
+                    "deepgram" => "Deepgram",
+                    "groq" => "Groq",
+                    _ => "the selected provider",
+                };
+                Some(format!(
+                    "{label} API key not set. Add one in Settings → API keys."
+                ))
+            } else {
+                None
+            }
+        }
     };
-    if let Some(msg) = pre_err {
+    if let Some(ref msg) = pre_err {
         emit_error(&app, Some(&note_id), msg);
-        return Err(msg.to_string());
+        return Err(msg.clone());
     }
 
     // Race a Whisper model load against the sidecar startup so the first
@@ -3605,14 +3634,20 @@ async fn transcribe_chunk(
             .unwrap_or_default();
         (language, vocabulary)
     };
+    // Look up the API key for the *active* provider, not just OpenAI.
+    // Phase 1 had only one cloud provider so a single Keychain slot was
+    // sufficient; Phase 2 added Deepgram/Groq with their own slots, and
+    // sending OpenAI's key to Deepgram naturally returns 401.
     let api_key = match provider_cfg.provider_id() {
         "local" => None,
-        _ => {
+        provider_id => {
             let state: State<AppState> = app.state();
             Some(
-                read_openai_api_key(&state)
+                read_provider_api_key(&state, provider_id)
                     .map_err(|e| anyhow::anyhow!("{e}"))?
-                    .ok_or_else(|| anyhow::anyhow!("no OpenAI API key"))?,
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("no API key stored for provider '{provider_id}'")
+                    })?,
             )
         }
     };
