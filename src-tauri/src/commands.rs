@@ -1115,6 +1115,94 @@ pub async fn api_key_test(state: State<'_, AppState>) -> Result<TestResult, Stri
     Ok(TestResult { ok: false, status: status.as_u16(), error: Some(snippet) })
 }
 
+/// Persist a typed `ProviderConfig` to settings. Frontend writes this
+/// instead of three separate flat-key updates so the choice is atomic.
+/// `read_provider_config` reads this back in preference to the legacy
+/// `transcribe_provider` / `transcribe_model` / `whisper_preset` keys.
+#[tauri::command]
+pub fn set_provider_config(
+    state: State<AppState>,
+    config: crate::stt::ProviderConfig,
+) -> Result<(), String> {
+    let json = serde_json::to_string(&config).map_err(err)?;
+    let conn = state.db.lock();
+    db::set_setting(&conn, "transcribe_config", &json).map_err(err)
+}
+
+/// Map a frontend-supplied provider string to a static id we trust.
+/// Rejecting unknown ids prevents the frontend from probing arbitrary
+/// Keychain accounts via the Tauri bridge.
+fn canonical_provider_id(s: &str) -> Option<&'static str> {
+    match s {
+        "openai" => Some("openai"),
+        "deepgram" => Some("deepgram"),
+        "groq" => Some("groq"),
+        "local" => Some("local"),
+        _ => None,
+    }
+}
+
+#[tauri::command]
+pub fn provider_key_get(
+    state: State<AppState>,
+    provider: String,
+) -> Result<Option<String>, String> {
+    let id = canonical_provider_id(&provider)
+        .ok_or_else(|| format!("unknown provider: {provider}"))?;
+    Ok(read_provider_api_key(&state, id)?.map(|_| "stored".to_string()))
+}
+
+#[tauri::command]
+pub fn provider_key_set(
+    state: State<AppState>,
+    provider: String,
+    key: String,
+) -> Result<(), String> {
+    let id = canonical_provider_id(&provider)
+        .ok_or_else(|| format!("unknown provider: {provider}"))?;
+    set_provider_api_key(&state, id, &key)
+}
+
+#[tauri::command]
+pub async fn provider_key_test(
+    state: State<'_, AppState>,
+    provider: String,
+) -> Result<TestResult, String> {
+    let id = canonical_provider_id(&provider)
+        .ok_or_else(|| format!("unknown provider: {provider}"))?;
+    let key = read_provider_api_key(&state, id)?
+        .ok_or_else(|| "No API key stored".to_string())?;
+
+    let (url, auth_header) = match id {
+        "openai" => (
+            format!("{}/models", openai::BASE),
+            format!("Bearer {key}"),
+        ),
+        "deepgram" => (
+            "https://api.deepgram.com/v1/projects".to_string(),
+            format!("Token {key}"),
+        ),
+        "groq" => (
+            "https://api.groq.com/openai/v1/models".to_string(),
+            format!("Bearer {key}"),
+        ),
+        _ => return Err(format!("provider {id} doesn't support test")),
+    };
+    let r = openai::client()
+        .get(url)
+        .header("Authorization", auth_header)
+        .send()
+        .await
+        .map_err(|e| format!("network: {e}"))?;
+    let status = r.status();
+    if status.is_success() {
+        return Ok(TestResult { ok: true, status: status.as_u16(), error: None });
+    }
+    let body = r.text().await.unwrap_or_default();
+    let snippet: String = body.chars().take(300).collect();
+    Ok(TestResult { ok: false, status: status.as_u16(), error: Some(snippet) })
+}
+
 // ---- Speaker diarization model management ---------------------------------
 
 fn parse_engine(engine: Option<String>) -> diarize::Engine {
@@ -1386,15 +1474,22 @@ fn local_model_path(app: &AppHandle, language: &str) -> Result<PathBuf, String> 
     Ok(dir.join(local_whisper::default_model().filename))
 }
 
-/// Read the active STT provider config from the legacy flat settings keys
+/// Read the active STT provider config. Prefers the typed
+/// `transcribe_config` JSON (written by `set_provider_config` from the
+/// settings UI). Falls back to the Phase-1 legacy flat keys
 /// (`transcribe_provider`, `transcribe_model`, `local_whisper_model`,
-/// `whisper_preset`, `local_whisper_use_gpu`). Always reconstructs from
-/// legacy keys so settings-UI writes (which still target legacy keys in
-/// Phase 1) are reflected immediately. Phase 2 will move the settings UI
-/// to write `ProviderConfig` directly and this function will prefer the
-/// cached form.
+/// `whisper_preset`, `local_whisper_use_gpu`) when typed config is
+/// missing or corrupt — keeps existing installs working through the
+/// migration window.
 fn read_provider_config(state: &State<AppState>) -> anyhow::Result<crate::stt::ProviderConfig> {
     let conn = state.db.lock();
+    if let Some(json) = db::get_setting(&conn, "transcribe_config")? {
+        if let Ok(cfg) = serde_json::from_str::<crate::stt::ProviderConfig>(&json) {
+            return Ok(cfg);
+        }
+        // Corrupted JSON — fall through to legacy reconstruction so the
+        // user isn't locked out over a malformed cache.
+    }
     let provider = db::get_setting(&conn, "transcribe_provider")?;
     let model = db::get_setting(&conn, "transcribe_model")?;
     let whisper_model = db::get_setting(&conn, "local_whisper_model")?;
