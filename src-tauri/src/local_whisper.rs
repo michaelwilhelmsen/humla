@@ -406,16 +406,12 @@ pub struct TextSegment {
 }
 
 /// One word's display text + millisecond bounds, derived from whisper's
-/// token-level timestamps. Tokens are subword pieces (BPE), so consecutive
-/// tokens are grouped into a single word whenever the next token starts
-/// with a leading space (whisper.cpp's word-boundary convention). Used by
-/// the playback view's karaoke-style highlighting.
-#[derive(Clone, Debug)]
-pub struct Word {
-    pub text: String,
-    pub start_ms: u64,
-    pub end_ms: u64,
-}
+/// token-level timestamps. Re-exported from `stt::Word` so the trait
+/// surface and the downstream playback path share one type. Tokens are
+/// subword pieces (BPE); consecutive tokens are grouped into a single
+/// word whenever the next token starts with a leading space
+/// (whisper.cpp's word-boundary convention).
+pub use crate::stt::Word;
 
 pub async fn transcribe_file_segments(
     shared: SharedContext,

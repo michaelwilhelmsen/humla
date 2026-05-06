@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 
 use crate::local_whisper::{self, SharedContext};
-use crate::stt::adapter::{BatchSttAdapter, TranscribeCtx, TranscribeResult, Word};
+use crate::stt::adapter::{BatchSttAdapter, TranscribeCtx, TranscribeResult};
 
 pub struct LocalWhisperAdapter {
     shared: SharedContext,
@@ -63,14 +63,8 @@ impl BatchSttAdapter for LocalWhisperAdapter {
             audio,
         )
         .await?;
-        let words = words
-            .into_iter()
-            .map(|w| Word {
-                text: w.text,
-                start_ms: w.start_ms,
-                end_ms: w.end_ms,
-            })
-            .collect();
+        // local_whisper::Word is now a re-export of stt::Word so no
+        // conversion is needed.
         Ok(TranscribeResult { text, words })
     }
 }

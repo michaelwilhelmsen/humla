@@ -3706,14 +3706,6 @@ async fn transcribe_chunk(
         base_url: provider_cfg.base_url(),
     };
     let crate::stt::TranscribeResult { text, words } = adapter.transcribe(ctx, &path).await?;
-    let words: Vec<local_whisper::Word> = words
-        .into_iter()
-        .map(|w| local_whisper::Word {
-            text: w.text,
-            start_ms: w.start_ms,
-            end_ms: w.end_ms,
-        })
-        .collect();
     if is_likely_hallucination(&text, &language) {
         return Ok(());
     }
