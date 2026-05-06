@@ -3573,7 +3573,16 @@ async fn transcribe_chunk(
         };
         trail.as_prompt()
     };
-    let prompt = build_initial_prompt(&vocabulary, trail_snapshot);
+    // Vocabulary is stored as a newline-or-comma-separated string. Split
+    // into individual terms for the bias_terms field. Drop short tokens
+    // (< 3 chars) — they create false positives in every provider's
+    // keyword/prompt biaser ("am" appearing where the user said "an"
+    // etc.).
+    let vocab_terms: Vec<&str> = vocabulary
+        .split(|c: char| c == '\n' || c == ',')
+        .map(str::trim)
+        .filter(|s| s.len() >= 3)
+        .collect();
 
     // Build the right STT adapter for this chunk. Local Whisper needs
     // runtime state (shared model context, resolved model file path, GPU
@@ -3596,7 +3605,8 @@ async fn transcribe_chunk(
     let ctx = crate::stt::TranscribeCtx {
         model: provider_cfg.model(),
         language: &language,
-        initial_prompt: prompt.as_deref(),
+        bias_terms: &vocab_terms,
+        prior_context: trail_snapshot.as_deref(),
         api_key: api_key.as_deref(),
         base_url: provider_cfg.base_url(),
     };
@@ -4090,40 +4100,6 @@ fn language_directive(lang: &str) -> String {
             "IMPORTANT: Write the entire response in {}.",
             languages::english_name(other)
         ),
-    }
-}
-
-// Trim and dedupe the user's custom vocabulary into a free-text prompt for
-// Whisper-family models. Whisper treats the prompt as the previous turn it
-// continues from, so a comma-separated list of names/jargon biases decoding
-// toward those tokens. Returns None when the vocabulary is empty.
-fn vocabulary_prompt(raw: &str) -> Option<String> {
-    let items: Vec<&str> = raw
-        .split(|c: char| c == ',' || c == '\n')
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .collect();
-    if items.is_empty() {
-        return None;
-    }
-    Some(items.join(", "))
-}
-
-// Compose the `initial_prompt` for a Whisper-family transcription call out of
-// the user's static vocabulary and the rolling tail of committed transcript
-// from the current session. Either part may be empty; if both are, the
-// caller should pass `None`.
-//
-// Budget note: Whisper's prompt context is ~224 tokens. Vocabulary is
-// typically <50 tokens; the trail is bounded to 150 words (~200 tokens).
-// Slight overflow is tolerated — whisper.cpp truncates internally.
-fn build_initial_prompt(vocabulary: &str, trail: Option<String>) -> Option<String> {
-    let vocab = vocabulary_prompt(vocabulary);
-    match (vocab, trail) {
-        (None, None) => None,
-        (Some(v), None) => Some(v),
-        (None, Some(t)) => Some(t),
-        (Some(v), Some(t)) => Some(format!("{v}\n\n{t}")),
     }
 }
 

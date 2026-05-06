@@ -46,11 +46,12 @@ impl BatchSttAdapter for OpenAiAdapter {
         let api_key = ctx
             .api_key
             .ok_or_else(|| anyhow::anyhow!("OpenAI adapter requires api_key"))?;
+        let prompt = build_whisper_prompt(ctx.bias_terms, ctx.prior_context);
         let (text, words) = openai::transcribe_file(
             api_key,
             ctx.model,
             Some(ctx.language),
-            ctx.initial_prompt,
+            prompt.as_deref(),
             audio,
         )
         .await?;
@@ -63,6 +64,34 @@ impl BatchSttAdapter for OpenAiAdapter {
             })
             .collect();
         Ok(TranscribeResult { text, words })
+    }
+}
+
+/// Glue bias terms + trailing transcript context into Whisper's
+/// `initial_prompt` slot. Vocabulary terms come first (Whisper biases
+/// toward early prompt tokens), then trail context. Returns None when
+/// neither is present so the API call omits the field.
+///
+/// Lives here in Phase 2 Task 3; Task 4 moves it to `openai_compat`
+/// once that module exists.
+pub(crate) fn build_whisper_prompt(
+    bias_terms: &[&str],
+    prior_context: Option<&str>,
+) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if !bias_terms.is_empty() {
+        parts.push(bias_terms.join(", "));
+    }
+    if let Some(ctx) = prior_context {
+        let trimmed = ctx.trim();
+        if !trimmed.is_empty() {
+            parts.push(trimmed.to_string());
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(". "))
     }
 }
 

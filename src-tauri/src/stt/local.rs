@@ -51,12 +51,13 @@ impl BatchSttAdapter for LocalWhisperAdapter {
         ctx: TranscribeCtx<'_>,
         audio: &Path,
     ) -> Result<TranscribeResult> {
+        let prompt = crate::stt::openai::build_whisper_prompt(ctx.bias_terms, ctx.prior_context);
         let (text, words) = local_whisper::transcribe_file_with_words(
             self.shared.clone(),
             self.model_path.clone(),
             self.use_gpu,
             ctx.language,
-            ctx.initial_prompt,
+            prompt.as_deref(),
             self.preset,
             audio,
         )

@@ -32,7 +32,16 @@ pub trait BatchSttAdapter: Send + Sync {
 pub struct TranscribeCtx<'a> {
     pub model: &'a str,
     pub language: &'a str,
-    pub initial_prompt: Option<&'a str>,
+    /// User-supplied vocabulary (proper nouns, tech terms). Maps to
+    /// Whisper's `initial_prompt` for OpenAI/Local/Groq, and to
+    /// Deepgram's `keywords` query param.
+    pub bias_terms: &'a [&'a str],
+    /// Last ~150 transcribed words from this source's stream. Used by
+    /// Whisper-shaped adapters as the trailing portion of `initial_prompt`
+    /// to keep cross-chunk continuity. Ignored by Deepgram (no
+    /// equivalent; Deepgram's keyword bias would actively hurt if fed
+    /// transcript text — it boosts per-token probability, not continuation).
+    pub prior_context: Option<&'a str>,
     pub api_key: Option<&'a str>,
     pub base_url: Option<&'a str>,
 }
