@@ -7,6 +7,7 @@ mod presets;
 mod wav;
 mod recording;
 mod commands;
+mod stt;
 
 use std::sync::Arc;
 use parking_lot::Mutex;
