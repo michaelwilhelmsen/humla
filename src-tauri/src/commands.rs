@@ -36,7 +36,14 @@ const DEFAULT_DIARIZE_MODEL: &str = "community1";
 const DEFAULT_COMMUNITY1_THRESHOLD: &str = "0.5";
 const DEFAULT_SORTFORMER_SILENCE_THRESHOLD: &str = "0.5";
 const DEFAULT_SORTFORMER_PRED_THRESHOLD: &str = "0.25";
-const DEFAULT_SILENCE_RMS_THRESHOLD: f32 = 0.008;
+// Silent-chunk gate. RMS below this is dropped before transcription so
+// Whisper / gpt-4o-transcribe don't hallucinate confident text on silence.
+// Was 0.008 originally — too aggressive for users sitting >40 cm from a
+// MacBook mic at default gain (their soft speech lands at ~0.007). 0.005
+// still rejects pure silence (~0.0001), room tone (~0.001), and mic hiss
+// (~0.003) while admitting normal soft speech. Tunable via the
+// silence_rms_threshold setting for noisy environments.
+const DEFAULT_SILENCE_RMS_THRESHOLD: f32 = 0.005;
 
 // Off by default — recordings live in the temp dir for the duration of
 // the post-stop pipeline and are deleted at the end. When this is on,
@@ -3486,10 +3493,9 @@ async fn transcribe_chunk(
             .unwrap_or(DEFAULT_SILENCE_RMS_THRESHOLD)
     };
     if let Ok(rms) = wav::rms(&path).await {
-        // Pure silence ~0.0001, room tone ~0.001, soft speech ~0.01+.
-        // Default 0.008 (was 0.003) — empirically rejects HVAC / mic
-        // hiss / quiet keyboard background while keeping spoken
-        // utterances. Tunable via the silence_rms_threshold setting.
+        // Pure silence ~0.0001, room tone ~0.001, mic hiss ~0.003,
+        // soft speech 0.005+. Threshold doc lives at the constant
+        // (DEFAULT_SILENCE_RMS_THRESHOLD) — see top of file.
         if rms < rms_floor {
             return Ok(());
         }
