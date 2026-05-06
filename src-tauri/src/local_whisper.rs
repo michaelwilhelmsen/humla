@@ -426,7 +426,18 @@ pub async fn transcribe_file_segments(
     preset: Preset,
     audio_path: &Path,
 ) -> Result<Vec<TextSegment>> {
-    let samples = wav::read_f32_mono_16k(audio_path).await?;
+    let mut samples = wav::read_f32_mono_16k(audio_path).await?;
+    // Workaround for an abort inside whisper.cpp's DTW token-timestamp pass.
+    // `whisper_exp_compute_token_level_timestamps_dtw` runs `median_filter`
+    // with a hard-coded width of 7 over `n_audio_tokens = n_frames/2`. When
+    // the final segment lands within ~140 ms of the audio end,
+    // `WHISPER_ASSERT(filter_width < n_audio_tokens)` fails and the whole
+    // process SIGABRTs from a tokio worker. Appending ~500 ms of silence
+    // pushes `seek_end` past the last real segment so the assertion holds;
+    // whisper has no problem with trailing silence and our existing
+    // hallucination / attribution-tail filters strip any "[BLANK_AUDIO]"
+    // output that occasionally surfaces.
+    samples.resize(samples.len() + 8000, 0.0);
     let lang = if language == "auto" { None } else { Some(language.to_string()) };
     let prompt = initial_prompt.map(|s| s.to_string());
 
