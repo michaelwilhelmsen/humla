@@ -18,6 +18,8 @@ import type { SettingsHook } from "../useSettings";
 export function TranscriptionTab({
   s,
   update,
+  providerConfig,
+  updateProviderConfig,
   local,
   downloadModel,
   deleteModel,
@@ -31,6 +33,8 @@ export function TranscriptionTab({
   SettingsHook,
   | "s"
   | "update"
+  | "providerConfig"
+  | "updateProviderConfig"
   | "local"
   | "downloadModel"
   | "deleteModel"
@@ -41,7 +45,7 @@ export function TranscriptionTab({
   | "downloadSortformer"
   | "deleteSortformer"
 >) {
-  const provider: Provider = (s.transcribe_provider as Provider) ?? "openai";
+  const provider = providerConfig.provider;
   const devMode = useDeveloperMode();
 
   return (
@@ -50,7 +54,28 @@ export function TranscriptionTab({
         <Row label="Source">
           <Select
             value={provider}
-            onChange={(v) => update("transcribe_provider", v)}
+            onChange={(v) => {
+              const p = v as Provider;
+              if (p === "openai") {
+                updateProviderConfig({ provider: "openai", model: "whisper-1" });
+              } else if (p === "local") {
+                updateProviderConfig({
+                  provider: "local",
+                  model_id:
+                    local.models.find((m) => m.kind === "primary" && m.downloaded)
+                      ?.id ?? "large-v3-turbo-q5",
+                  preset: "quality",
+                  use_gpu: true,
+                });
+              } else if (p === "deepgram") {
+                updateProviderConfig({ provider: "deepgram", model: "nova-3" });
+              } else if (p === "groq") {
+                updateProviderConfig({
+                  provider: "groq",
+                  model: "whisper-large-v3-turbo",
+                });
+              }
+            }}
             options={
               local.models.some((m) => m.downloaded)
                 ? [...PROVIDERS_BASE, LOCAL_PROVIDER]
@@ -63,14 +88,16 @@ export function TranscriptionTab({
             </p>
           )}
         </Row>
-        {provider === "openai" && (
+        {providerConfig.provider === "openai" && (
           <Row label="Model">
             <Select
-              value={s.transcribe_model}
-              onChange={(v) => update("transcribe_model", v)}
+              value={providerConfig.model}
+              onChange={(v) =>
+                updateProviderConfig({ provider: "openai", model: v })
+              }
               options={TRANSCRIBE_MODELS.map((m) => ({ value: m, label: m }))}
             />
-            {s.transcribe_model === "gpt-4o-transcribe-diarize" && (
+            {providerConfig.model === "gpt-4o-transcribe-diarize" && (
               <p className="text-xs text-[var(--color-text-muted)] mt-2">
                 Note: <code>gpt-4o-transcribe-diarize</code> treats the
                 language setting as a hint and does not accept a biasing
@@ -80,11 +107,13 @@ export function TranscriptionTab({
             )}
           </Row>
         )}
-        {provider === "deepgram" && (
+        {providerConfig.provider === "deepgram" && (
           <Row label="Model">
             <Select
-              value={s.deepgram_model}
-              onChange={(v) => update("deepgram_model", v)}
+              value={providerConfig.model}
+              onChange={(v) =>
+                updateProviderConfig({ provider: "deepgram", model: v })
+              }
               options={DEEPGRAM_MODELS.map((m) => ({ value: m, label: m }))}
             />
             <p className="text-xs text-[var(--color-text-muted)] mt-2">
@@ -96,11 +125,13 @@ export function TranscriptionTab({
             </p>
           </Row>
         )}
-        {provider === "groq" && (
+        {providerConfig.provider === "groq" && (
           <Row label="Model">
             <Select
-              value={s.groq_model}
-              onChange={(v) => update("groq_model", v)}
+              value={providerConfig.model}
+              onChange={(v) =>
+                updateProviderConfig({ provider: "groq", model: v })
+              }
               options={GROQ_MODELS.map((m) => ({ value: m, label: m }))}
             />
             <p className="text-xs text-[var(--color-text-muted)] mt-2">
@@ -113,12 +144,14 @@ export function TranscriptionTab({
         )}
       </Section>
 
-      {provider === "local" && (
+      {providerConfig.provider === "local" && (
         <Section title="Local model behaviour">
           <Row label="Quality preset">
             <Select
-              value={s.whisper_preset}
-              onChange={(v) => update("whisper_preset", v)}
+              value={providerConfig.preset}
+              onChange={(v) =>
+                updateProviderConfig({ ...providerConfig, preset: v })
+              }
               options={WHISPER_PRESETS}
             />
             <p className="text-xs text-[var(--color-text-muted)] mt-2">
@@ -132,9 +165,12 @@ export function TranscriptionTab({
             <label className="flex items-center gap-2 cursor-pointer text-sm">
               <input
                 type="checkbox"
-                checked={s.local_whisper_use_gpu !== "false"}
+                checked={providerConfig.use_gpu}
                 onChange={(e) =>
-                  update("local_whisper_use_gpu", e.target.checked ? "true" : "false")
+                  updateProviderConfig({
+                    ...providerConfig,
+                    use_gpu: e.target.checked,
+                  })
                 }
               />
               Use Metal (Apple GPU) for Whisper inference
@@ -153,11 +189,24 @@ export function TranscriptionTab({
       <Section title="Local models">
         <LocalModelManager
           state={local}
-          activeId={s.local_whisper_model}
+          activeId={
+            providerConfig.provider === "local" ? providerConfig.model_id : ""
+          }
           language={s.language}
           onDownload={downloadModel}
           onDelete={deleteModel}
-          onSelect={(id) => update("local_whisper_model", id)}
+          onSelect={(id) => {
+            if (providerConfig.provider === "local") {
+              updateProviderConfig({ ...providerConfig, model_id: id });
+            } else {
+              updateProviderConfig({
+                provider: "local",
+                model_id: id,
+                preset: "quality",
+                use_gpu: true,
+              });
+            }
+          }}
         />
       </Section>
 
