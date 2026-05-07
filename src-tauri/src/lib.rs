@@ -132,6 +132,19 @@ pub fn run() {
                 }
             }
 
+            // v0.23 — collapse the legacy flat transcription settings keys
+            // into the typed `transcribe_config` JSON and delete the orphan
+            // rows. Same flag-guarded shape as the migrations above. Safe to
+            // ship indefinitely; the flag check makes it a no-op after
+            // first run.
+            {
+                let state: tauri::State<AppState> = app.state();
+                let conn = state.db.lock();
+                if let Err(e) = db::migrate_transcribe_config(&conn) {
+                    eprintln!("migrate_transcribe_config: {e}");
+                }
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
