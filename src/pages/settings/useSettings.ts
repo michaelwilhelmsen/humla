@@ -200,8 +200,8 @@ export function useSettings() {
       // we don't silently switch them.
       const downloadedInfo = models.find((m) => m.id === modelId);
       if (
-        downloadedInfo?.kind === "primary" &&
-        models.filter((m) => m.kind === "primary" && m.downloaded).length === 1 &&
+        downloadedInfo?.kind === "multilingual" &&
+        models.filter((m) => m.kind === "multilingual" && m.downloaded).length === 1 &&
         providerConfig.provider === "local"
       ) {
         await updateProviderConfig({ ...providerConfig, model_id: modelId });
@@ -233,7 +233,7 @@ export function useSettings() {
         providerConfig.model_id === modelId
       ) {
         const fallback =
-          models.find((m) => m.kind === "primary" && m.downloaded)?.id ??
+          models.find((m) => m.kind === "multilingual" && m.downloaded)?.id ??
           "large-v3-turbo-q5";
         await updateProviderConfig({ ...providerConfig, model_id: fallback });
       }

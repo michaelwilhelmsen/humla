@@ -18,12 +18,12 @@ export function LocalModelManager({
   onDelete: (id: string) => void;
   onSelect: (id: string) => void;
 }) {
-  const primaries = state.models.filter((m) => m.kind === "primary");
+  const primaries = state.models.filter((m) => m.kind === "multilingual");
   // Show an addon row when its language matches the user's global default.
   // It's also always shown when already downloaded so the user can delete
   // it after switching languages.
   const addons = state.models.filter(
-    (m) => m.kind === "addon" && (m.addonLanguage === language || m.downloaded),
+    (m) => m.kind === "language_specific" && (m.specificLanguage === language || m.downloaded),
   );
 
   return (
@@ -126,9 +126,9 @@ function ModelRow({
         <div className="flex-1 flex flex-col gap-0.5">
           <div className="flex items-center gap-2 text-sm">
             <span className="font-medium">{model.label}</span>
-            {model.kind === "addon" && model.addonLanguage && (
+            {model.kind === "language_specific" && model.specificLanguage && (
               <span className="text-xs px-1.5 py-0.5 rounded bg-[var(--color-pill-hover)] text-[var(--color-text-muted)]">
-                {model.addonLanguage} auto
+                {model.specificLanguage} auto
               </span>
             )}
             {isActive && model.downloaded && (

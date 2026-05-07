@@ -1384,38 +1384,32 @@ fn model_path_for(app: &AppHandle, info: &local_whisper::ModelInfo) -> Result<Pa
     Ok(local_model_dir(app)?.join(info.filename))
 }
 
-/// Resolve the model file to use for a recording.
-///
-/// Resolution order:
-///   1. Language addon. If a `LanguageAddon { language }` model matches
-///      the recording's language and is downloaded on disk, use it. NB
-///      Whisper Large takes this slot for Norwegian audio; future
-///      language-specialised models drop in via the same registry hook.
-///      Skips on "auto" — we can't know the language pre-decode.
-///   2. Active primary. The user's selected `local_whisper_model`,
-///      restricted to `Primary`-kind entries (so a stale setting can't
-///      promote an addon to active).
-///   3. Default primary. Fallback when the selection is empty, unknown,
-///      or points at a non-Primary entry.
+/// Resolve the model file path for a `model_id` from `LocalWhisperConfig`.
+/// Caller is responsible for providing the right id — either the user's
+/// default-provider model_id, or one from a per-language override. A
+/// stale id (model removed from the registry) falls through to the
+/// hardcoded default model.
 ///
 /// Returns the resolved path even when the file doesn't exist on disk —
 /// that's how the caller's "not downloaded" error surfaces with a real
 /// path the user can recognise.
+///
+/// `_language` is unused after Phase 4 dropped the auto-route addon
+/// mechanism; kept in the signature so callers don't have to thread it
+/// out (and so a future language-aware behaviour can slot back in
+/// without re-touching every call site).
 fn local_model_path(
     app: &AppHandle,
-    language: &str,
+    _language: &str,
     model_id: &str,
 ) -> Result<PathBuf, String> {
     let dir = local_model_dir(app)?;
-    if let Some(addon) = local_whisper::addon_for_language(language) {
-        let p = dir.join(addon.filename);
-        if p.exists() {
-            return Ok(p);
-        }
-    }
-    let info = local_whisper::find_model(model_id)
-        .filter(|m| m.kind == local_whisper::ModelKind::Primary)
-        .unwrap_or_else(local_whisper::default_model);
+    // Accept any kind — Multilingual is the user's general default; a
+    // LanguageSpecific id is legitimate when it comes from a per-language
+    // override's `model_id`. The fallback to default_model() handles
+    // unknown ids (e.g. a stale config pointing at a removed model).
+    let info =
+        local_whisper::find_model(model_id).unwrap_or_else(local_whisper::default_model);
     let path = dir.join(info.filename);
     if path.exists() {
         return Ok(path);
@@ -1451,13 +1445,14 @@ pub struct LocalWhisperModelStatus {
     description: String,
     filename: String,
     size_bytes_hint: u64,
-    /// "primary" or "addon". Frontend renders addons in a separate group
-    /// without the active-model radio button — they auto-apply via
-    /// addon_language instead of being user-selectable.
+    /// "multilingual" — selectable as the default transcription model.
+    /// "language_specific" — usable only as the model behind a per-
+    /// language override in `transcribe_config.per_language`. Never the
+    /// default.
     kind: &'static str,
-    /// Set for `kind == "addon"`. The recording language that triggers
-    /// this model. None for primaries.
-    addon_language: Option<String>,
+    /// Set for `kind == "language_specific"`. The ISO 639-1 code this
+    /// model is tuned for. None for multilingual models.
+    specific_language: Option<String>,
     downloaded: bool,
     size_bytes: Option<u64>,
     path: Option<String>,
@@ -1475,10 +1470,10 @@ pub fn local_whisper_models(app: AppHandle) -> Result<Vec<LocalWhisperModelStatu
         } else {
             None
         };
-        let (kind, addon_language) = match info.kind {
-            local_whisper::ModelKind::Primary => ("primary", None),
-            local_whisper::ModelKind::LanguageAddon { language } => {
-                ("addon", Some(language.to_string()))
+        let (kind, specific_language) = match info.kind {
+            local_whisper::ModelKind::Multilingual => ("multilingual", None),
+            local_whisper::ModelKind::LanguageSpecific { language } => {
+                ("language_specific", Some(language.to_string()))
             }
         };
         out.push(LocalWhisperModelStatus {
@@ -1488,7 +1483,7 @@ pub fn local_whisper_models(app: AppHandle) -> Result<Vec<LocalWhisperModelStatu
             filename: info.filename.to_string(),
             size_bytes_hint: info.size_bytes_hint,
             kind,
-            addon_language,
+            specific_language,
             downloaded,
             size_bytes,
             path: if downloaded { path.to_str().map(|s| s.to_string()) } else { None },

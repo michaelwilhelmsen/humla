@@ -90,11 +90,11 @@ export type LocalWhisperModelStatus = {
   description: string;
   filename: string;
   sizeBytesHint: number;
-  // "primary" — selectable as the active transcription model.
-  // "addon" — auto-applied for recordings whose language matches
-  // `addonLanguage`; never the active primary.
-  kind: "primary" | "addon";
-  addonLanguage: string | null;
+  // "multilingual" — selectable as the default transcription model.
+  // "language_specific" — usable only as the model behind a per-language
+  // override in `transcribeConfig.per_language`. Never the default.
+  kind: "multilingual" | "language_specific";
+  specificLanguage: string | null;
   downloaded: boolean;
   sizeBytes: number | null;
   path: string | null;

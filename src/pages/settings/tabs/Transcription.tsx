@@ -62,7 +62,7 @@ export function TranscriptionTab({
                 updateProviderConfig({
                   provider: "local",
                   model_id:
-                    local.models.find((m) => m.kind === "primary" && m.downloaded)
+                    local.models.find((m) => m.kind === "multilingual" && m.downloaded)
                       ?.id ?? "large-v3-turbo-q5",
                   preset: "quality",
                   use_gpu: true,
