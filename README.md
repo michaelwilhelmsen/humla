@@ -1,7 +1,8 @@
 <h1 align="center">Humla</h1>
 
 <p align="center">
-  <em>Your meetings, transcribed and summarised on your Mac. Your audio, your keys, your data.</em>
+  <em>Your meetings, transcribed and summarised on your Mac.</em><br>
+  <em>Your audio. Your keys. Your data.</em>
 </p>
 
 <p align="center">
@@ -11,13 +12,15 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/michaelwilhelmsen/humla/releases/latest">Download</a>
+  <a href="https://github.com/michaelwilhelmsen/humla/releases/latest"><strong>Download for macOS</strong></a>
+  ·
+  <a href="#what-it-does">What it does</a>
+  ·
+  <a href="#privacy">Privacy</a>
   ·
   <a href="#how-it-works">How it works</a>
   ·
-  <a href="#features">Features</a>
-  ·
-  <a href="#building-from-source">Build from source</a>
+  <a href="#build-from-source">Build</a>
 </p>
 
 <p align="center">
@@ -31,27 +34,83 @@
 
 ## About
 
-**Humla** is a personal meeting-notes app for macOS, inspired by Granola but built around a simple principle: **your data and keys never leave your machine unless you tell them to**. Everything runs locally — SQLite database, audio capture, transcription, summarisation — with optional cloud APIs you control.
+**Humla** is a meeting-notes app for macOS, inspired by Granola. You take freeform notes during your meeting; Humla records the audio, transcribes it, separates speakers, and produces a structured summary that combines your notes with what was actually said.
 
-Take freeform notes during a meeting. Humla records mic + system audio in parallel, transcribes with Whisper (on-device or OpenAI), separates speakers with an offline diarizer, and produces a structured Markdown summary that fuses your notes with what was actually said.
+Built around one principle: **your audio and your data stay on your machine** unless you explicitly send them to a provider you control. Everything works locally — recording, transcription, speaker identification, even summarisation if you point it at a local LLM.
 
 The name is Norwegian for *bumblebee* — small, hum, personal.
 
 > [!NOTE]
-> Humla is a personal project, not a SaaS. There's no signup, no telemetry, no shared backend. The trade-off: you bring your own model keys (or run locally), and you maintain it yourself.
+> Humla is a personal project, not a SaaS. There's no signup, no telemetry, no shared backend. The trade-off: you bring your own API keys (or run fully local), and you maintain it yourself.
 
-## Features
+## What it does
 
-- **Hybrid audio capture, parallel streams.** Mic input via `AVAudioEngine` and macOS system audio via `ScreenCaptureKit`, kept as **two independent streams** end-to-end. No mixdown — Whisper sees one clean voice per chunk regardless of overlap, and the diarizer can use channel attribution instead of guessing from a blended embedding.
-- **Two transcription providers, your choice per note.** OpenAI cloud (`whisper-1`, `gpt-4o-transcribe`, `gpt-4o-mini-transcribe`, `gpt-4o-transcribe-diarize`) or **on-device Whisper large-v3-turbo Q5_0** running on Apple Silicon via `whisper.cpp` + Metal.
-- **Offline speaker diarization.** Post-stop pass on the full recording using FluidAudio's `OfflineDiarizerManager` (pyannote community-1 + VBx clustering with PLDA, on the Apple Neural Engine). In-person meetings get multi-speaker labels; remote calls label your side as `You:` and diarize remote participants. Per-note hint pins the expected speaker count when you know it.
-- **Two-source summaries.** The model gets your typed notes and the meeting transcript as separate inputs, with a system prompt telling it to favour your notes for intent and the transcript for facts. Per-note presets: Meeting / 1:1 / Lecture / Interview / Brainstorm / Voice memo, or a custom prompt.
-- **Bring your own LLM, including local.** Summaries run on OpenAI's chat completions API or any OpenAI-compatible local server (Ollama, LM Studio, llama.cpp) — including thinking models. Per-note override so a sensitive meeting can stay 100% on-device while everything else uses the cloud.
-- **VAD-bounded chunks with rolling context.** Chunks rotate at natural speech pauses (1.0–15 s, 500 ms silence trigger). Each chunk's transcribe call gets the last ~150 committed words and your custom vocabulary as Whisper's `initial_prompt` — proper-noun spelling stays consistent and silence-driven hallucinations almost vanish.
-- **Auto-polish on stop.** Conservative LLM cleanup pass that fixes typos and chunk-boundary cuts while preserving line structure, filler words, and speaker labels exactly. Skipped automatically when the configured summary provider is local (polish takes minutes on a 9B local model).
-- **Editable transcript with click-to-rename speakers.** Speaker labels render as coloured pills inline; click any pill to rename `Speaker 1` → `Wilma` across the whole transcript. Edits are line-anchored regex rewrites, no metadata table.
-- **Auto-update.** Signed, notarised, Ed25519-stapled updater. Existing installs poll the GitHub releases endpoint on launch.
-- **System-aware light/dark theme.** Nothing-design aesthetic — Space Grotesk + Space Mono, monochrome palette, instrument-panel labels. Obsidian-style properties panel for per-note metadata.
+### Records your meetings, two streams at once
+
+Humla captures your microphone and your computer's audio (Zoom, Meet, Slack huddles, anything) at the same time, kept as two separate streams. That means in a remote call your voice doesn't get mixed with the other person's, so the transcript stays clean and "you said vs. they said" is unambiguous. In an in-person meeting it records your room mic and tags the different voices it hears.
+
+### Transcribes accurately — including in your language
+
+Pick the transcription engine that fits, and you can mix-and-match **per language**:
+
+- **Local Whisper** — runs entirely on your Mac via Apple Silicon's GPU. Free after a one-time download. Multiple multilingual models plus a **Norwegian-tuned model** (NB Whisper Large from Nasjonalbiblioteket).
+- **OpenAI** — `whisper-1`, `gpt-4o-transcribe`, `gpt-4o-mini-transcribe`, `gpt-4o-transcribe-diarize`.
+- **Deepgram** — Nova-3 / Nova-2, native diarization, very strong on conversational English.
+- **Groq** — `whisper-large-v3-turbo` at OpenAI-compatible endpoints — same Whisper quality, ~10× cheaper and faster than OpenAI's hosted Whisper.
+
+Set a **default provider** in Settings, then add **per-language overrides** if you want — e.g. *Norwegian → Local NB Whisper, English → Deepgram, fallback → OpenAI*. Humla picks the right one automatically based on the recording's language.
+
+### Identifies speakers, automatically and offline
+
+When you stop the recording, Humla runs a speaker-identification pass on your Mac (no audio uploaded). It labels each turn with `Speaker 1`, `Speaker 2`, etc. — click any label to rename them ("Speaker 2" → "Wilma") and the change applies across the whole transcript.
+
+Two engines, both free and on-device:
+- **Community-1** — robust default, auto-detects how many speakers are in the room.
+- **Sortformer** — better at rapid back-and-forth, fixed 4-speaker cap.
+
+### Summarises with both your notes and the transcript
+
+When you click *Summarize*, the model gets your typed notes **and** the transcript as separate inputs, with instructions to favour your notes for intent and the transcript for facts. Pick a preset — Meeting / 1:1 / Lecture / Interview / Brainstorm / Voice memo — or write your own.
+
+The summary can run on:
+- **OpenAI** — gpt-5.x reasoning models, gpt-4o, and others.
+- **Any OpenAI-compatible local server** — Ollama, LM Studio, llama.cpp, vLLM. Sensitive meetings can stay 100% on-device.
+
+### Stays out of your way
+
+- **Custom vocabulary** — names, jargon, acronyms biased into the transcription so they spell consistently.
+- **Per-note language** — each note can override the global language for one-off bilingual calls.
+- **Folders + search** — flat folder list with full-text search across titles, bodies, transcripts, and folder names.
+- **Click-to-edit transcript** — coloured speaker pills inline; click anywhere to fix a transcription error.
+- **Auto-update** — signed and notarised; existing installs detect new releases on launch.
+- **System-aware light/dark theme** — Nothing-design aesthetic, Space Grotesk + Space Mono.
+
+## Privacy
+
+The defaults are designed so nothing leaves your machine unless you tell it to.
+
+- **No backend, no telemetry.** Humla doesn't phone home. The only outbound traffic is to the API endpoints you've explicitly configured.
+- **Your notes and transcripts** live in a single SQLite database at `~/Library/Application Support/no.humla.app/`.
+- **Audio chunks** are written to a per-recording temp directory and deleted ~30 seconds after you stop. Optionally keep them via Settings → Audio retention.
+- **API keys** are stored in the macOS **Keychain** (one entry per provider — OpenAI, Deepgram, Groq), not in plaintext on disk.
+- **Model downloads** are one-time fetches from HuggingFace; the files live in `~/Library/Application Support/no.humla.app/models/` and `~/Library/Application Support/FluidAudio/Models/`.
+
+If you use only Local Whisper + Community-1 (or Sortformer) + a local LLM for summaries, **no audio or text ever leaves your Mac**.
+
+## Quick start
+
+1. **Download** the latest signed + notarised DMG from the [Releases page](https://github.com/michaelwilhelmsen/humla/releases/latest).
+2. **Drag Humla** into Applications and open it. macOS Gatekeeper accepts the build directly because it's notarised.
+3. **Grant permissions** on first record: Microphone, and (for capturing system audio) Screen Recording. You'll need to relaunch after granting Screen Recording.
+4. **Pick your providers** in Settings → Transcription:
+   - Local Whisper alone is great if you don't want any cloud calls — click *Download* on a model (~500 MB–1.1 GB depending on which one).
+   - OR add an API key for OpenAI / Deepgram / Groq under Settings → API keys.
+5. *Optional*: download a speaker-diarization model under Settings → Transcription → Speaker diarization (~30 MB).
+6. *Optional*: point Humla at a local LLM server (Ollama / LM Studio / llama.cpp) under Settings → AI Summary if you want fully on-device summaries.
+
+That's it. Click *Record* to start, *Stop* when you're done, *Summarize* when you want notes.
+
+Humla auto-updates: existing installs detect new releases on launch and prompt to install.
 
 ## How it works
 
@@ -73,36 +132,16 @@ The name is Norwegian for *bumblebee* — small, hum, personal.
 │                                                             │
 │  ┌─────────────────────────────────┐  ┌─────────────────┐   │
 │  │ HTTPS clients                   │  │ Local Whisper   │   │
-│  │ OpenAI / OpenAI-compat / HF     │  │ whisper-rs/Metal│   │
+│  │ OpenAI / Deepgram / Groq / HF   │  │ whisper-rs/Metal│   │
 │  └─────────────────────────────────┘  └─────────────────┘   │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-During a recording, the audio-capture sidecar produces two parallel streams: per-source VAD-bounded WAV chunks and per-source full WAVs. Each chunk is transcribed independently (per-source `initial_prompt` context, so the user's side and the remote side don't pollute each other's vocabulary). When you stop, an offline diarization pass runs over the per-source full WAVs, the chunk log is aligned to segment timestamps, and the transcript is rewritten with proper speaker labels. A polish pass cleans up typos and punctuation, then summarisation is one click away.
+In plain language: when you hit Record, a small native Swift helper captures your microphone and your system audio as two separate streams, splits each one into short clips at natural speech pauses, and feeds the clips to whichever transcription engine you picked. Your typed notes are saved continuously alongside the transcript. When you stop, Humla runs speaker identification offline (still no audio leaves your Mac) and labels the transcript. *Summarize* sends your notes + the transcript to your chosen LLM and produces a structured Markdown summary.
 
-For a deep dive into the architecture, see [`CLAUDE.md`](CLAUDE.md).
+For a deep dive into the architecture — module map, data flow, gotchas — see [`CLAUDE.md`](CLAUDE.md).
 
-## Installation
-
-Download the latest signed and notarised DMG from the [Releases page](https://github.com/michaelwilhelmsen/humla/releases/latest), drag Humla into Applications, and open it. macOS Gatekeeper accepts the build directly because it's notarised.
-
-After installing:
-
-1. Add your **OpenAI API key** in Settings → API key (or skip if you want to run fully on-device).
-2. Optionally point Humla at a **local OpenAI-compatible server** (Ollama / LM Studio / llama.cpp) in Settings → Local LLM.
-3. **Download the local Whisper model** (~547 MB) and the **diarizer models** (~30 MB) on first use if you want offline transcription / speaker labels.
-4. Grant **Microphone** and **Screen Recording** permission on first record. You'll need to relaunch after granting Screen Recording.
-
-Humla auto-updates: existing installs detect new releases on launch and prompt to install.
-
-## Privacy
-
-- **No backend, no telemetry.** Humla doesn't phone home. The only outbound traffic is to the API endpoints you've explicitly configured (OpenAI, your local LLM server, HuggingFace for one-time model downloads).
-- **Your data lives in `~/Library/Application Support/no.humla.app/`** — a single SQLite database. Audio chunks are written to a per-recording temp dir and deleted 30 s after stop.
-- **Model files** live next to the database: `models/ggml-large-v3-turbo-q5_0.bin` for local Whisper, and FluidAudio's diarizer models in `~/Library/Application Support/FluidAudio/Models/`.
-- **API keys** are stored in the same SQLite database. They never leave your machine except to reach the provider you configured.
-
-## Building from source
+## Build from source
 
 Requires macOS 13+, Apple Silicon recommended.
 
@@ -128,20 +167,21 @@ pnpm tauri build --debug
 open src-tauri/target/debug/bundle/macos/Humla.app
 ```
 
-For the full release pipeline (signed + notarised DMG + auto-updater payload + GitHub release), see the script in `package.json` and the credentials it reads from `.env.notarise`. This requires an Apple Developer ID and notary key.
+For the full release pipeline (signed + notarised DMG + auto-updater payload + GitHub release), see `scripts/release.sh` and the credentials it reads from `.env.notarise`. Requires an Apple Developer ID, notary key, and a Tauri updater Ed25519 keypair.
 
 ## Project layout
 
 ```
 humla/
-├── src/                        # React frontend
+├── src/                        # React frontend (Tiptap + Zustand)
 ├── src-tauri/                  # Rust backend (Tauri 2)
 │   ├── src/
 │   │   ├── commands.rs         # Tauri commands, recording lifecycle
 │   │   ├── recording.rs        # session state, per-source trails
+│   │   ├── stt/                # STT adapter abstraction (OpenAI/Local/Deepgram/Groq)
 │   │   ├── diarize.rs          # speaker-diarize sidecar wrapper
-│   │   ├── local_whisper.rs    # whisper-rs + Metal
-│   │   └── openai.rs           # cloud + local OpenAI-compatible HTTP
+│   │   ├── local_whisper.rs    # whisper-rs + Metal model registry
+│   │   └── openai.rs           # OpenAI HTTP client + summary endpoint
 │   └── binaries/               # signed sidecar binaries
 ├── audio-capture/              # Swift sidecar: mic + screen audio
 └── speaker-diarize/            # Swift sidecar: offline diarization
@@ -150,17 +190,18 @@ humla/
 ## Tech stack
 
 - **Frontend** — React 19 + Vite 6 + Tailwind v4 + Tiptap + Zustand + react-markdown + lucide-react
-- **App shell** — Tauri 2, Rust (1.85), reqwest with `rustls-tls`, rusqlite (bundled), tokio
-- **Local Whisper** — `whisper-rs` (binds `whisper.cpp`) with the `metal` feature, large-v3-turbo Q5_0
-- **Speaker diarization** — FluidAudio Swift package, pyannote community-1 + VBx clustering with PLDA, CoreML on Apple Neural Engine
-- **Audio capture** — Swift, `AVAudioEngine`, `ScreenCaptureKit`, sandbox-detached via `setsid` so TCC permissions bind to the sidecar binary
+- **App shell** — Tauri 2, Rust 1.85, reqwest (rustls-tls), rusqlite (bundled), tokio
+- **Local Whisper** — `whisper-rs` 0.16 (binds `whisper.cpp`) with the `metal` feature; `large-v3-turbo-q5` default plus alternative multilingual models and NB Whisper Large for Norwegian
+- **Speaker diarization** — FluidAudio Swift package; pyannote community-1 + VBx clustering with PLDA, *or* NVIDIA Sortformer; CoreML on Apple Neural Engine
+- **Audio capture** — Swift, `AVAudioEngine`, `ScreenCaptureKit`; sandbox-detached via `setsid` so TCC permissions bind to the sidecar binary
 
 ## Acknowledgements
 
 Humla stands on the shoulders of:
 
 - [whisper.cpp](https://github.com/ggml-org/whisper.cpp) by Georgi Gerganov — the local transcription engine
-- [FluidAudio](https://github.com/FluidInference/FluidAudio) — the offline diarization pipeline (pyannote community-1 + VBx + PLDA, ported to CoreML)
+- [FluidAudio](https://github.com/FluidInference/FluidAudio) — the offline diarization pipeline (pyannote community-1 + VBx + PLDA, plus Sortformer, ported to CoreML)
+- [NB Whisper Large](https://huggingface.co/NbAiLab/nb-whisper-large) by Nasjonalbiblioteket — Norwegian-tuned Whisper model
 - [Tauri](https://tauri.app) — the native app shell
 - [Tiptap](https://tiptap.dev) — the rich-text editor
 - [Granola](https://granola.ai) — the user-experience inspiration
