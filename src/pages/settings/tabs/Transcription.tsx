@@ -102,6 +102,7 @@ export function TranscriptionTab({
           language={s.language}
           onDownload={downloadModel}
           onDelete={deleteModel}
+          setLanguageOverride={setLanguageOverride}
           onSelect={(id) => {
             // Selecting a local model from the manager pins it as the
             // default's model_id. If currently on a non-local default,

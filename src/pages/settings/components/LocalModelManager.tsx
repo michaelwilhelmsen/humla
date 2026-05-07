@@ -1,4 +1,4 @@
-import type { LocalWhisperModelStatus } from "../../../lib/ipc";
+import type { ProviderConfig, LocalWhisperModelStatus } from "../../../lib/ipc";
 import { LANGUAGES } from "../../../lib/languages";
 import type { LocalState } from "../types";
 import { Btn } from "./Btn";
@@ -16,6 +16,7 @@ export function LocalModelManager({
   onDownload,
   onDelete,
   onSelect,
+  setLanguageOverride,
 }: {
   state: LocalState;
   activeId: string;
@@ -28,6 +29,9 @@ export function LocalModelManager({
   onDownload: (id: string) => void;
   onDelete: (id: string) => void;
   onSelect: (id: string) => void;
+  // Used by the suggest_language_override flash affordance after a
+  // language-specific model is downloaded.
+  setLanguageOverride: (language: string, cfg: ProviderConfig) => Promise<void>;
 }) {
   // One flat list — both kinds rendered together with their language tag.
   // Multilingual models get the radio button (they're candidates for the
@@ -56,12 +60,29 @@ export function LocalModelManager({
         ))}
       </div>
       {state.flash && (
-        <p
-          className="text-xs px-2 py-1 rounded bg-[var(--color-pill-hover)] inline-block break-all"
+        <div
+          className="flex items-center gap-3 px-3 py-2 rounded bg-[var(--color-pill-hover)] text-xs"
           role="status"
         >
-          {state.flash}
-        </p>
+          <span className="break-all">{state.flash.message}</span>
+          {state.flash.kind === "suggest_language_override" && (
+            <button
+              type="button"
+              onClick={() => {
+                if (state.flash?.kind !== "suggest_language_override") return;
+                setLanguageOverride(state.flash.language, {
+                  provider: "local",
+                  model_id: state.flash.modelId,
+                  preset: "quality",
+                  use_gpu: true,
+                });
+              }}
+              className="ml-auto text-xs px-2 py-1 rounded border border-[var(--color-line)] hover:bg-[var(--color-canvas)] whitespace-nowrap"
+            >
+              Add as {languageLabel(state.flash.language)} override
+            </button>
+          )}
+        </div>
       )}
       {state.error && (
         <p className="text-sm text-red-600 dark:text-red-400 break-all">

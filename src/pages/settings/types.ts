@@ -98,6 +98,18 @@ export const EMPTY_KEY_STATE: KeyState = {
   result: null,
 };
 
+/// Flash message shape. `info` is a plain text toast; `suggest_language_override`
+/// renders a one-click "Add as <language> override?" affordance after a
+/// language-specific model is downloaded.
+export type LocalFlash =
+  | { kind: "info"; message: string }
+  | {
+      kind: "suggest_language_override";
+      message: string;
+      language: string;
+      modelId: string;
+    };
+
 export type LocalState = {
   // List of all known models with their per-id download status. Sourced
   // from the backend registry; the UI filters by language and surfaces
@@ -107,7 +119,7 @@ export type LocalState = {
   // model id so two simultaneous downloads (rare) wouldn't fight.
   downloading: Record<string, { received: number; total: number | null }>;
   error: string | null;
-  flash: string | null;
+  flash: LocalFlash | null;
 };
 
 export const EMPTY_LOCAL_STATE: LocalState = {

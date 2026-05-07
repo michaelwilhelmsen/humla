@@ -124,14 +124,16 @@ export function useSettings() {
     };
   }, []);
 
-  // Generic flash helper — schedules a 4s clear that only fires if the same
-  // message is still showing (so a fresh action doesn't get its toast wiped
-  // by a stale timer).
-  function flashLocal(msg: string) {
-    setLocal((p) => ({ ...p, flash: msg }));
+  // Local-model flash helper. 8s clear (instead of the 4s used by other
+  // flashes) — gives the user time to read + act on the
+  // `suggest_language_override` affordance after downloading a
+  // language-specific model. Identity-keyed clear: if a fresh action
+  // replaces the toast, the stale timer doesn't wipe the new one.
+  function flashLocal(flash: NonNullable<LocalState["flash"]>) {
+    setLocal((p) => ({ ...p, flash }));
     window.setTimeout(() => {
-      setLocal((p) => (p.flash === msg ? { ...p, flash: null } : p));
-    }, 4000);
+      setLocal((p) => (p.flash === flash ? { ...p, flash: null } : p));
+    }, 8000);
   }
   function flashDiarize(msg: string) {
     setDiarize((p) => ({ ...p, flash: msg }));
@@ -210,8 +212,26 @@ export function useSettings() {
           model_id: modelId,
         });
       }
-      const label = models.find((m) => m.id === modelId)?.label ?? modelId;
-      flashLocal(`${label} downloaded`);
+      const downloaded = models.find((m) => m.id === modelId);
+      const label = downloaded?.label ?? modelId;
+      // For language-specific models, surface a one-click "Add as
+      // <language> override?" affordance so the user gets the v0.23
+      // auto-apply convenience back without the implicit routing.
+      // Skip when an override for that language already exists.
+      if (
+        downloaded?.kind === "language_specific" &&
+        downloaded.specificLanguage &&
+        !(downloaded.specificLanguage in transcribeConfig.per_language)
+      ) {
+        flashLocal({
+          kind: "suggest_language_override",
+          message: `${label} downloaded.`,
+          language: downloaded.specificLanguage,
+          modelId,
+        });
+      } else {
+        flashLocal({ kind: "info", message: `${label} downloaded` });
+      }
     } catch (e) {
       const models = await ipc.localWhisperModels().catch(() => local.models);
       setLocal((p) => {
@@ -228,7 +248,10 @@ export function useSettings() {
       await ipc.localWhisperDelete(modelId);
       const models = await ipc.localWhisperModels();
       setLocal((p) => ({ ...p, models, error: null, flash: null }));
-      flashLocal(before ? `Deleted ${before.label}` : "Whisper model deleted");
+      flashLocal({
+        kind: "info",
+        message: before ? `Deleted ${before.label}` : "Whisper model deleted",
+      });
       // If the deleted model was the default's model_id, fall back to
       // the first still-downloaded multilingual (or the registry default
       // if none). Language-specific entries aren't candidates here —
