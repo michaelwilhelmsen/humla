@@ -1409,7 +1409,11 @@ fn local_whisper_use_gpu_setting(state: &State<AppState>) -> bool {
         != "false"
 }
 
-fn local_model_path(app: &AppHandle, language: &str) -> Result<PathBuf, String> {
+fn local_model_path(
+    app: &AppHandle,
+    language: &str,
+    model_id: &str,
+) -> Result<PathBuf, String> {
     let dir = local_model_dir(app)?;
     if let Some(addon) = local_whisper::addon_for_language(language) {
         let p = dir.join(addon.filename);
@@ -1417,13 +1421,7 @@ fn local_model_path(app: &AppHandle, language: &str) -> Result<PathBuf, String> 
             return Ok(p);
         }
     }
-    let state: State<AppState> = app.state();
-    let conn = state.db.lock();
-    let id = db::get_setting(&conn, "local_whisper_model")
-        .map_err(err)?
-        .unwrap_or_default();
-    drop(conn);
-    let info = local_whisper::find_model(&id)
+    let info = local_whisper::find_model(model_id)
         .filter(|m| m.kind == local_whisper::ModelKind::Primary)
         .unwrap_or_else(local_whisper::default_model);
     let path = dir.join(info.filename);
@@ -1791,7 +1789,7 @@ pub async fn recording_start(
     // an OpenAI key.
     let pre_err: Option<String> = match provider.as_str() {
         "local" => {
-            let p = local_model_path(&app, &language).map_err(|e| e.to_string())?;
+            let p = local_model_path(&app, &language, "").map_err(|e| e.to_string())?;
             if p.exists() {
                 None
             } else {
@@ -1835,7 +1833,7 @@ pub async fn recording_start(
     // and forget — by the time VAD rotates the first chunk, the model is
     // already in Metal memory and inference is fast.
     if provider == "local" {
-        if let Ok(model_path) = local_model_path(&app, &language) {
+        if let Ok(model_path) = local_model_path(&app, &language, "") {
             let use_gpu = local_whisper_use_gpu_setting(&state);
             let shared = state.whisper.clone();
             tokio::spawn(async move {
@@ -3680,7 +3678,7 @@ async fn transcribe_chunk(
     // downstream so the timeline serialiser can rebase chunk-relative ms
     // onto the playback clock the same way regardless of source.
     let local_deps = if matches!(provider_cfg, crate::stt::ProviderConfig::Local(_)) {
-        let model_path = local_model_path(&app, &language)
+        let model_path = local_model_path(&app, &language, "")
             .map_err(|e| anyhow::anyhow!(e))?;
         let (shared, use_gpu) = {
             let state: State<AppState> = app.state();
