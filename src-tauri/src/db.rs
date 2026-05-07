@@ -528,3 +528,166 @@ fn map_note(row: &rusqlite::Row) -> rusqlite::Result<Note> {
         updated_at: row.get(12)?,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn settings_only_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn settings_keys(conn: &Connection) -> Vec<String> {
+        let mut stmt = conn.prepare("SELECT key FROM settings ORDER BY key").unwrap();
+        let rows: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        rows
+    }
+
+    #[test]
+    fn delete_setting_is_idempotent() {
+        let conn = settings_only_conn();
+        set_setting(&conn, "k", "v").unwrap();
+        assert_eq!(get_setting(&conn, "k").unwrap().as_deref(), Some("v"));
+        delete_setting(&conn, "k").unwrap();
+        assert!(get_setting(&conn, "k").unwrap().is_none());
+        // Second delete on a missing key is a no-op (rusqlite returns
+        // 0 affected rows; we don't surface that as an error).
+        delete_setting(&conn, "k").unwrap();
+    }
+
+    #[test]
+    fn migrate_transcribe_config_v22_user_keeps_typed_drops_legacy() {
+        // Simulates a user upgrading from v0.22.x: typed transcribe_config
+        // already exists (Settings UI was double-writing) AND legacy keys
+        // still present. Migration must keep the typed value untouched
+        // and delete every legacy row.
+        let conn = settings_only_conn();
+        set_setting(
+            &conn,
+            "transcribe_config",
+            r#"{"provider":"deepgram","model":"nova-3"}"#,
+        )
+        .unwrap();
+        set_setting(&conn, "transcribe_provider", "deepgram").unwrap();
+        set_setting(&conn, "transcribe_model", "whisper-1").unwrap();
+        set_setting(&conn, "whisper_preset", "quality").unwrap();
+        set_setting(&conn, "local_whisper_model", "large-v3-turbo-q5").unwrap();
+        set_setting(&conn, "local_whisper_use_gpu", "true").unwrap();
+        set_setting(&conn, "deepgram_model", "nova-3").unwrap();
+        set_setting(&conn, "groq_model", "whisper-large-v3-turbo").unwrap();
+
+        migrate_transcribe_config(&conn).unwrap();
+
+        assert_eq!(
+            settings_keys(&conn),
+            vec![
+                "migrated_transcribe_config_v3".to_string(),
+                "transcribe_config".to_string(),
+            ],
+        );
+        assert_eq!(
+            get_setting(&conn, "transcribe_config").unwrap().unwrap(),
+            r#"{"provider":"deepgram","model":"nova-3"}"#,
+        );
+        assert_eq!(
+            get_setting(&conn, "migrated_transcribe_config_v3")
+                .unwrap()
+                .as_deref(),
+            Some("true"),
+        );
+    }
+
+    #[test]
+    fn migrate_transcribe_config_v21_user_synthesises_typed_then_drops_legacy() {
+        // Simulates a user who upgraded straight from v0.21 to v0.23,
+        // skipping v0.22 entirely. Only legacy keys exist; migration
+        // must build transcribe_config from them, then delete the
+        // legacy rows.
+        let conn = settings_only_conn();
+        set_setting(&conn, "transcribe_provider", "local").unwrap();
+        set_setting(&conn, "local_whisper_model", "large-v3-turbo-q5").unwrap();
+        set_setting(&conn, "whisper_preset", "balanced").unwrap();
+        set_setting(&conn, "local_whisper_use_gpu", "false").unwrap();
+
+        migrate_transcribe_config(&conn).unwrap();
+
+        assert_eq!(
+            settings_keys(&conn),
+            vec![
+                "migrated_transcribe_config_v3".to_string(),
+                "transcribe_config".to_string(),
+            ],
+        );
+        let cfg_json = get_setting(&conn, "transcribe_config").unwrap().unwrap();
+        let cfg: crate::stt::ProviderConfig = serde_json::from_str(&cfg_json).unwrap();
+        match cfg {
+            crate::stt::ProviderConfig::Local(c) => {
+                assert_eq!(c.model_id, "large-v3-turbo-q5");
+                assert_eq!(c.preset, "balanced");
+                assert!(!c.use_gpu);
+            }
+            _ => panic!("expected Local"),
+        }
+    }
+
+    #[test]
+    fn migrate_transcribe_config_fresh_install_writes_default() {
+        // Fresh install: no transcribe_config, no legacy keys at all.
+        // Migration synthesises an OpenAI/whisper-1 default and marks
+        // the flag so subsequent launches no-op.
+        let conn = settings_only_conn();
+        migrate_transcribe_config(&conn).unwrap();
+
+        assert_eq!(
+            settings_keys(&conn),
+            vec![
+                "migrated_transcribe_config_v3".to_string(),
+                "transcribe_config".to_string(),
+            ],
+        );
+        let cfg: crate::stt::ProviderConfig =
+            serde_json::from_str(&get_setting(&conn, "transcribe_config").unwrap().unwrap())
+                .unwrap();
+        match cfg {
+            crate::stt::ProviderConfig::OpenAi(c) => {
+                assert_eq!(c.model, "whisper-1");
+                assert_eq!(c.base_url, None);
+            }
+            _ => panic!("expected OpenAi default"),
+        }
+    }
+
+    #[test]
+    fn migrate_transcribe_config_is_idempotent() {
+        // Running the migration twice must not change state. The flag
+        // short-circuits before any read or write.
+        let conn = settings_only_conn();
+        set_setting(
+            &conn,
+            "transcribe_config",
+            r#"{"provider":"groq","model":"whisper-large-v3-turbo"}"#,
+        )
+        .unwrap();
+        migrate_transcribe_config(&conn).unwrap();
+        let after_first = get_setting(&conn, "transcribe_config").unwrap();
+        // Re-introduce a stray legacy row to prove the second pass
+        // really does no-op (a re-run would otherwise delete it).
+        set_setting(&conn, "transcribe_provider", "openai").unwrap();
+        migrate_transcribe_config(&conn).unwrap();
+        assert_eq!(get_setting(&conn, "transcribe_config").unwrap(), after_first);
+        assert_eq!(
+            get_setting(&conn, "transcribe_provider").unwrap().as_deref(),
+            Some("openai"),
+            "second pass must not touch state — the flag short-circuits before any work",
+        );
+    }
+}
