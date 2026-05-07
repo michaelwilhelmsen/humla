@@ -346,6 +346,12 @@ pub fn set_setting(conn: &Connection, key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn delete_setting(conn: &Connection, key: &str) -> Result<()> {
+    let mut stmt = conn.prepare_cached("DELETE FROM settings WHERE key = ?1")?;
+    stmt.execute(params![key])?;
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SummaryPrompt {
     pub id: String,
@@ -448,6 +454,60 @@ pub fn migrate_summary_prompts(conn: &Connection) -> Result<()> {
         params![new_value],
     )?;
     set_setting(conn, "summary_prompts_migrated", "true")?;
+    Ok(())
+}
+
+/// One-shot v0.23 migration: ensure `transcribe_config` is present (build
+/// from legacy flat keys if missing) and then delete those legacy rows
+/// so they can't drift out of sync with the typed config. Idempotent —
+/// guarded by a flag in the settings table so re-running the app is a
+/// no-op after the first successful run.
+pub fn migrate_transcribe_config(conn: &Connection) -> Result<()> {
+    const FLAG: &str = "migrated_transcribe_config_v3";
+    if get_setting(conn, FLAG)?.as_deref() == Some("true") {
+        return Ok(());
+    }
+
+    // If transcribe_config is absent, synthesise it from whatever legacy
+    // keys exist. v0.22 users already have transcribe_config because the
+    // Settings UI was double-writing; this branch covers v0.21 holdouts
+    // who upgraded straight to v0.23 without ever opening Settings under
+    // v0.22.
+    if get_setting(conn, "transcribe_config")?.is_none() {
+        let provider = get_setting(conn, "transcribe_provider")?;
+        let model = get_setting(conn, "transcribe_model")?;
+        let whisper_model = get_setting(conn, "local_whisper_model")?;
+        let whisper_preset = get_setting(conn, "whisper_preset")?;
+        let whisper_use_gpu = get_setting(conn, "local_whisper_use_gpu")?
+            .and_then(|v| match v.as_str() {
+                "true" => Some(true),
+                "false" => Some(false),
+                _ => None,
+            });
+        let cfg = crate::stt::from_legacy_settings(
+            provider.as_deref(),
+            model.as_deref(),
+            whisper_model.as_deref(),
+            whisper_preset.as_deref(),
+            whisper_use_gpu,
+        );
+        let json = serde_json::to_string(&cfg)
+            .map_err(|e| anyhow::anyhow!("serialize transcribe_config: {e}"))?;
+        set_setting(conn, "transcribe_config", &json)?;
+    }
+
+    for key in [
+        "transcribe_provider",
+        "transcribe_model",
+        "whisper_preset",
+        "local_whisper_model",
+        "local_whisper_use_gpu",
+        "deepgram_model",
+        "groq_model",
+    ] {
+        delete_setting(conn, key)?;
+    }
+    set_setting(conn, FLAG, "true")?;
     Ok(())
 }
 
