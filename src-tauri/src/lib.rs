@@ -145,6 +145,19 @@ pub fn run() {
                 }
             }
 
+            // v0.24 — wrap the v0.23 bare-ProviderConfig transcribe_config row
+            // into the new TranscribeConfig { default, per_language } shape.
+            // Idempotent via parse check; runs after migrate_transcribe_config
+            // so v0.21 → v0.24 users get both legacy collapse AND wrap in one
+            // launch.
+            {
+                let state: tauri::State<AppState> = app.state();
+                let conn = state.db.lock();
+                if let Err(e) = db::migrate_per_language_v4(&conn) {
+                    eprintln!("migrate_per_language_v4: {e}");
+                }
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

@@ -511,6 +511,48 @@ pub fn migrate_transcribe_config(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// One-shot v0.24 migration: wrap a bare `ProviderConfig` JSON in
+/// `transcribe_config` into the new `TranscribeConfig { default,
+/// per_language }` shape. Idempotent via the parse-as-TranscribeConfig
+/// check — running twice is a no-op because the second pass parses
+/// successfully and bails.
+///
+/// Unlike `migrate_transcribe_config`, this migration doesn't need a
+/// flag row: the parse outcome itself encodes whether work is needed.
+/// (v0.23 needed a flag because it deleted seven other rows whose
+/// absence couldn't reliably distinguish "fresh install" from "already
+/// migrated".)
+pub fn migrate_per_language_v4(conn: &Connection) -> Result<()> {
+    let Some(raw) = get_setting(conn, "transcribe_config")? else {
+        // No transcribe_config row at all — fresh install, or v0.21
+        // user who hasn't been touched by migrate_transcribe_config
+        // yet (it runs first). Either way, nothing to wrap. The
+        // read_transcribe_config fallback covers this user when the
+        // app reads.
+        return Ok(());
+    };
+    if serde_json::from_str::<crate::stt::TranscribeConfig>(&raw).is_ok() {
+        // Already in the new shape — second-or-later run, no-op.
+        return Ok(());
+    }
+    let Ok(legacy) = serde_json::from_str::<crate::stt::ProviderConfig>(&raw) else {
+        // Row is neither a TranscribeConfig nor a bare ProviderConfig.
+        // Probably a corrupt write. Don't touch it — leave the
+        // read_transcribe_config fallback to recover. Caller logs.
+        return Err(anyhow::anyhow!(
+            "transcribe_config row is neither TranscribeConfig nor ProviderConfig — leaving untouched"
+        ));
+    };
+    let wrapped = crate::stt::TranscribeConfig {
+        default: legacy,
+        per_language: std::collections::BTreeMap::new(),
+    };
+    let json = serde_json::to_string(&wrapped)
+        .map_err(|e| anyhow::anyhow!("serialize wrapped TranscribeConfig: {e}"))?;
+    set_setting(conn, "transcribe_config", &json)?;
+    Ok(())
+}
+
 fn map_note(row: &rusqlite::Row) -> rusqlite::Result<Note> {
     Ok(Note {
         id: row.get(0)?,
@@ -689,5 +731,78 @@ mod tests {
             Some("openai"),
             "second pass must not touch state — the flag short-circuits before any work",
         );
+    }
+
+    #[test]
+    fn migrate_per_language_v4_wraps_bare_provider_config() {
+        // v0.23 user upgrading: typed transcribe_config exists as a
+        // bare ProviderConfig. Migration wraps into TranscribeConfig.
+        let conn = settings_only_conn();
+        set_setting(
+            &conn,
+            "transcribe_config",
+            r#"{"provider":"deepgram","model":"nova-3"}"#,
+        )
+        .unwrap();
+        migrate_per_language_v4(&conn).unwrap();
+        let after = get_setting(&conn, "transcribe_config").unwrap().unwrap();
+        let parsed: crate::stt::TranscribeConfig = serde_json::from_str(&after).unwrap();
+        assert_eq!(parsed.default.provider_id(), "deepgram");
+        assert!(parsed.per_language.is_empty());
+    }
+
+    #[test]
+    fn migrate_per_language_v4_is_idempotent() {
+        let conn = settings_only_conn();
+        set_setting(
+            &conn,
+            "transcribe_config",
+            r#"{"provider":"openai","model":"whisper-1"}"#,
+        )
+        .unwrap();
+        migrate_per_language_v4(&conn).unwrap();
+        let after_first = get_setting(&conn, "transcribe_config").unwrap();
+        migrate_per_language_v4(&conn).unwrap();
+        let after_second = get_setting(&conn, "transcribe_config").unwrap();
+        assert_eq!(after_first, after_second, "second run must be a no-op");
+    }
+
+    #[test]
+    fn migrate_per_language_v4_skips_when_row_absent() {
+        // Fresh install: no transcribe_config yet. Migration finds
+        // nothing to wrap; the runtime fallback in read_transcribe_config
+        // handles this user.
+        let conn = settings_only_conn();
+        migrate_per_language_v4(&conn).unwrap();
+        assert!(get_setting(&conn, "transcribe_config").unwrap().is_none());
+    }
+
+    #[test]
+    fn migrate_per_language_v4_preserves_existing_overrides_on_rerun() {
+        // v0.24 user re-runs the migration on every launch. The row
+        // already has `per_language` entries; they must survive.
+        let conn = settings_only_conn();
+        set_setting(
+            &conn,
+            "transcribe_config",
+            r#"{"default":{"provider":"openai","model":"whisper-1"},"per_language":{"no":{"provider":"local","model_id":"nb-whisper-large-q5","preset":"quality","use_gpu":true}}}"#,
+        )
+        .unwrap();
+        migrate_per_language_v4(&conn).unwrap();
+        let after = get_setting(&conn, "transcribe_config").unwrap().unwrap();
+        let parsed: crate::stt::TranscribeConfig = serde_json::from_str(&after).unwrap();
+        assert_eq!(parsed.per_language.len(), 1);
+        assert_eq!(parsed.per_language.get("no").unwrap().provider_id(), "local");
+    }
+
+    #[test]
+    fn migrate_per_language_v4_errors_on_garbage_row() {
+        let conn = settings_only_conn();
+        set_setting(&conn, "transcribe_config", r#"{"bogus":true}"#).unwrap();
+        // Not a fatal failure for the user — caller logs and falls
+        // through; read_transcribe_config recovers via its own
+        // fallback. We assert the error type only to document
+        // behaviour, not to require the caller to surface it.
+        assert!(migrate_per_language_v4(&conn).is_err());
     }
 }
