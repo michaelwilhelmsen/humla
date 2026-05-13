@@ -434,6 +434,14 @@ struct OllamaOptions {
     // Hard cap on generated tokens. Without this, Qwen 3+ thinking mode can
     // burn 5K+ tokens reasoning before answering even on tiny inputs.
     num_predict: i32,
+    // Input context window. Ollama's default is 2048 tokens — way too small
+    // for meeting transcripts. Anything longer than ~1500 words is silently
+    // truncated from the front, so the model only summarizes the tail. 65536
+    // handles ~4-5 hour meetings with headroom (rough rate: 150-200 wpm × 1.3
+    // tokens/word ≈ 12K tokens/hour). Ollama allocates KV cache up-front based
+    // on this; for Qwen 3.5 4B that's ~2 GB on top of model weights, which is
+    // fine on 16 GB machines.
+    num_ctx: i32,
 }
 
 // One JSON object per newline-delimited frame Ollama emits when stream:true.
@@ -505,6 +513,7 @@ where
             // 16384, but a stuck Qwen takes ~9 minutes to hit that — too
             // long to wait for the timeout to free up Ollama).
             num_predict: if think { 8192 } else { 4096 },
+            num_ctx: 65536,
         },
     };
     let started = std::time::Instant::now();
