@@ -53,7 +53,7 @@ export function RecordingBar({ noteId }: { noteId: string }) {
       console.log(`[llm] summarize ok in ${Math.round(performance.now() - t0)}ms`);
     } catch (e) {
       console.error(`[llm] summarize failed in ${Math.round(performance.now() - t0)}ms:`, e);
-      useRecordingStore.getState().pushError({ noteId, message: String(e) });
+      useRecordingStore.getState().pushError({ noteId, message: String(e), kind: "summary" });
     }
   }
   const otherNoteRecording = status.noteId !== null && !isThisNote;

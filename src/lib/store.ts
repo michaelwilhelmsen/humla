@@ -74,8 +74,8 @@ type RecordingState = {
   // summary running for that note.
   summarizing: Record<string, boolean>;
   setSummarizing: (noteId: string, active: boolean) => void;
-  errors: { id: number; noteId: string | null; message: string }[];
-  pushError: (e: { noteId: string | null; message: string }) => void;
+  errors: { id: number; noteId: string | null; message: string; kind?: "recording" | "summary" }[];
+  pushError: (e: { noteId: string | null; message: string; kind?: "recording" | "summary" }) => void;
   dismissError: (id: number) => void;
   flashes: Flash[];
   pushFlash: (message: string) => void;

@@ -18,7 +18,9 @@ export function Toaster() {
           className="flex items-start gap-3 px-4 py-3 rounded-lg bg-[var(--color-surface)] border border-[var(--color-line)] shadow-md text-sm"
         >
           <div className="flex-1">
-            <div className="font-medium text-red-600 dark:text-red-400 mb-1">Recording issue</div>
+            <div className="font-medium text-red-600 dark:text-red-400 mb-1">
+              {e.kind === "summary" ? "Summary failed" : "Recording issue"}
+            </div>
             <div className="text-[var(--color-text)]">{e.message}</div>
             {e.message.toLowerCase().includes("permission") && (
               <button

@@ -285,38 +285,61 @@ where
         system_prompt.len(),
         transcript.len()
     );
-    let r = http
-        .post(&url)
-        .bearer_auth(api_key)
-        .json(&req)
-        .send()
-        .await
-        .map_err(|e| {
-            eprintln!(
-                "[llm] send error after {:?}: timeout={} connect={} body={}",
-                started.elapsed(),
-                e.is_timeout(),
-                e.is_connect(),
-                e
-            );
-            // reqwest's timeout error looks like "request timed out" and
-            // its connect error like "error sending request". Both are
-            // opaque to the user; map to something actionable.
-            if e.is_timeout() {
-                anyhow!(
-                    "Timed out after 10 minutes waiting for {base_url}. \
-                     The local model may be stuck — restart your \
-                     local-LLM server (e.g. `pkill ollama && ollama serve`)."
-                )
-            } else if e.is_connect() {
-                anyhow!(
-                    "Couldn't reach {base_url}. Is your local-LLM \
-                     server running? (ollama serve, etc.)"
-                )
-            } else {
-                anyhow!("network error talking to {base_url}: {e}")
+    // One retry on transient send-side errors. reqwest reuses HTTP/2
+    // connections from its pool; OpenAI's edge silently half-closes idle
+    // ones, so a long-running app's first request after a quiet period can
+    // fail with Kind::Request ("error sending request for url") before any
+    // bytes leave the wire. A fresh connection always succeeds. Don't retry
+    // on timeout (genuine slowness — a retry just doubles the wait) or
+    // connect-refused (the server is unreachable, retrying is pointless).
+    let mut attempt: u32 = 0;
+    let r = loop {
+        let send_res = http
+            .post(&url)
+            .bearer_auth(api_key)
+            .json(&req)
+            .send()
+            .await;
+        match send_res {
+            Ok(resp) => break resp,
+            Err(e) => {
+                let retryable = !e.is_timeout() && !e.is_connect() && attempt == 0;
+                eprintln!(
+                    "[llm] send error after {:?}: timeout={} connect={} attempt={} retrying={} body={}",
+                    started.elapsed(),
+                    e.is_timeout(),
+                    e.is_connect(),
+                    attempt,
+                    retryable,
+                    e
+                );
+                if retryable {
+                    attempt += 1;
+                    // Short backoff so we don't immediately reuse the same
+                    // stale pooled connection. reqwest's pool is FIFO-ish;
+                    // by the time we re-enter `.send()` the bad entry is
+                    // typically already discarded by hyper's keepalive
+                    // checker. 500ms is empirically enough.
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    continue;
+                }
+                if e.is_timeout() {
+                    return Err(anyhow!(
+                        "Timed out after 10 minutes waiting for {base_url}. \
+                         The local model may be stuck — restart your \
+                         local-LLM server (e.g. `pkill ollama && ollama serve`)."
+                    ));
+                }
+                if e.is_connect() {
+                    return Err(anyhow!(
+                        "Couldn't reach {base_url}. Is your local-LLM \
+                         server running? (ollama serve, etc.)"
+                    ));
+                }
+                return Err(anyhow!("network error talking to {base_url}: {e}"));
             }
-        })?;
+        }
+    };
 
     let status = r.status();
     eprintln!("[llm] response {status} after {:?}", started.elapsed());
