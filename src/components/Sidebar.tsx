@@ -2,12 +2,9 @@ import { Link, useNavigate, useLocation } from "react-router-dom";
 import { useMemo, useState } from "react";
 import {
   ChevronLeft,
-  ChevronRight,
-  ChevronDown,
   Folder as FolderIcon,
   FolderPlus,
   Home as HomeIcon,
-  Plus,
   Search,
   Settings as SettingsIcon,
   Trash2,
@@ -15,26 +12,28 @@ import {
 import { useNotesStore } from "../lib/store";
 import { ipc, type Folder, type Note } from "../lib/ipc";
 import { cn } from "../lib/cn";
+import { ContextMenu, ContextMenuItem } from "./ContextMenu";
 
-function group(notes: Note[]) {
-  const today = new Date(); today.setHours(0, 0, 0, 0);
-  const yest = new Date(today); yest.setDate(today.getDate() - 1);
-  const week = new Date(today); week.setDate(today.getDate() - 7);
-
-  const groups: { label: string; items: Note[] }[] = [
-    { label: "Today", items: [] },
-    { label: "Yesterday", items: [] },
-    { label: "Earlier this week", items: [] },
-    { label: "Older", items: [] },
-  ];
-  for (const n of notes) {
-    const d = new Date(n.updated_at);
-    if (d >= today) groups[0].items.push(n);
-    else if (d >= yest) groups[1].items.push(n);
-    else if (d >= week) groups[2].items.push(n);
-    else groups[3].items.push(n);
-  }
-  return groups.filter((g) => g.items.length);
+// Humla mark sourced from humla-small.svg — single-path silhouette of
+// the bee's head + antennae arc. Uses currentColor so it inherits text
+// color from its parent (set on the brand row).
+function HumlaMark({ size = 16 }: { size?: number }) {
+  return (
+    <svg
+      width={size}
+      height={(size * 92) / 120}
+      viewBox="0 0 120 92"
+      aria-hidden="true"
+      className="shrink-0"
+    >
+      <path
+        fillRule="evenodd"
+        clipRule="evenodd"
+        d="M20.3123 1.16238C14.6123 4.36238 15.5123 7.96238 23.7123 15.6624C30.1123 21.5624 38.7123 32.4624 37.7123 33.3624C37.5123 33.4624 34.4123 35.1624 30.8123 37.0624C17.0123 44.3624 4.21234 61.7624 0.912338 77.7624C-0.787662 85.8624 -1.08766 85.4624 8.91234 87.3624C40.2123 93.3624 76.5123 93.5624 108.112 87.8624C121.712 85.3624 121.512 85.6624 117.712 73.3624C112.812 57.3624 104.212 46.1624 90.2123 37.6624C86.8123 35.6624 83.5123 33.9624 82.9123 33.9624C82.3123 33.9624 81.8123 33.5624 81.8123 33.0624C81.8123 31.0624 90.9123 19.9624 96.7123 14.9624C103.412 9.06238 104.512 5.66238 100.812 1.96238C97.6123 -1.23762 94.0123 -0.537622 89.5123 4.16238C85.3123 8.56238 74.4123 24.6624 73.3123 27.8624C72.8123 29.4624 71.5123 29.6624 60.2123 29.6624H47.7123L44.2123 23.5624C39.4123 15.4624 31.2123 4.46238 28.1123 1.96238C25.2123 -0.337619 23.2123 -0.537622 20.3123 1.16238Z"
+        fill="currentColor"
+      />
+    </svg>
+  );
 }
 
 export function Sidebar({ onCollapse }: { onCollapse: () => void }) {
@@ -42,26 +41,11 @@ export function Sidebar({ onCollapse }: { onCollapse: () => void }) {
   const location = useLocation();
   const notes = useNotesStore((s) => s.notes);
   const folders = useNotesStore((s) => s.folders);
-  const upsert = useNotesStore((s) => s.upsertLocal);
   const removeLocal = useNotesStore((s) => s.removeLocal);
   const upsertFolder = useNotesStore((s) => s.upsertFolder);
-  const removeFolder = useNotesStore((s) => s.removeFolder);
   const [q, setQ] = useState("");
-  // Folders are closed by default. The set tracks which ones the user has
-  // explicitly expanded. During an active search, folders with matching
-  // notes are force-expanded regardless of this set.
-  const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set());
   const [creatingFolder, setCreatingFolder] = useState(false);
   const [newFolderName, setNewFolderName] = useState("");
-
-  function toggleFolder(id: string) {
-    setExpandedFolders((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
-  }
 
   async function deleteNote(e: React.MouseEvent, id: string) {
     e.preventDefault();
@@ -69,12 +53,6 @@ export function Sidebar({ onCollapse }: { onCollapse: () => void }) {
     await ipc.deleteNote(id);
     removeLocal(id);
     if (location.pathname === `/note/${id}`) navigate("/");
-  }
-
-  async function newNote() {
-    const note = await ipc.createNote();
-    upsert(note);
-    navigate(`/note/${note.id}`);
   }
 
   async function commitNewFolder() {
@@ -93,15 +71,6 @@ export function Sidebar({ onCollapse }: { onCollapse: () => void }) {
     }
   }
 
-  async function deleteFolder(e: React.MouseEvent, id: string) {
-    e.preventDefault();
-    e.stopPropagation();
-    // Notes fall back to root rather than being deleted — recoverable, so
-    // skip the confirm.
-    await ipc.deleteFolder(id);
-    removeFolder(id);
-  }
-
   const needle = q.trim().toLowerCase();
   const searching = needle.length > 0;
 
@@ -110,66 +79,49 @@ export function Sidebar({ onCollapse }: { onCollapse: () => void }) {
     n.body.toLowerCase().includes(needle) ||
     n.transcript.toLowerCase().includes(needle);
 
-  const filteredNotes = useMemo(() => {
-    if (!searching) return notes;
-    return notes.filter(noteMatches);
+  // When searching, surface a flat list of all matching notes regardless
+  // of folder — folder context shows as a small chip on each row. When
+  // not searching, folder rows + root note groups render normally.
+  const searchResults = useMemo(() => {
+    if (!searching) return [] as Note[];
+    return notes
+      .filter(noteMatches)
+      .sort((a, b) => b.updated_at - a.updated_at);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [notes, needle]);
 
-  const rootNotes = filteredNotes.filter((n) => n.folder_id == null);
-  const folderNotes = useMemo(() => {
-    const map = new Map<string, Note[]>();
-    for (const f of folders) map.set(f.id, []);
-    for (const n of filteredNotes) {
-      if (n.folder_id && map.has(n.folder_id)) map.get(n.folder_id)!.push(n);
+  const folderCounts = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const n of notes) {
+      if (n.folder_id) map.set(n.folder_id, (map.get(n.folder_id) ?? 0) + 1);
     }
-    for (const arr of map.values()) arr.sort((a, b) => b.updated_at - a.updated_at);
     return map;
-  }, [filteredNotes, folders]);
+  }, [notes]);
 
-  // During search, hide folders that have no matching notes AND whose name
-  // doesn't match either. Folder name match keeps the folder visible (with
-  // its full contents) so the user can scan inside.
-  const visibleFolders = searching
-    ? folders.filter((f) => {
-        if (f.name.toLowerCase().includes(needle)) return true;
-        return (folderNotes.get(f.id)?.length ?? 0) > 0;
-      })
-    : folders;
+  const folderById = useMemo(() => {
+    const map = new Map<string, Folder>();
+    for (const f of folders) map.set(f.id, f);
+    return map;
+  }, [folders]);
 
-  // Folder is expanded if user opened it OR (during search) it has matches.
-  const isFolderOpen = (f: Folder) => {
-    if (searching) {
-      // Folder name match → show full contents collapsed unless matches.
-      if (f.name.toLowerCase().includes(needle) && (folderNotes.get(f.id)?.length ?? 0) === 0) {
-        return expandedFolders.has(f.id);
-      }
-      return (folderNotes.get(f.id)?.length ?? 0) > 0 || expandedFolders.has(f.id);
-    }
-    return expandedFolders.has(f.id);
-  };
-
-  // For folder-name matches with no matching notes, show the folder's
-  // unfiltered note list when expanded so you can browse inside.
-  const itemsForFolder = (f: Folder): Note[] => {
-    const matched = folderNotes.get(f.id) ?? [];
-    if (searching && matched.length === 0 && f.name.toLowerCase().includes(needle)) {
-      return notes.filter((n) => n.folder_id === f.id).sort((a, b) => b.updated_at - a.updated_at);
-    }
-    return matched;
-  };
-
-  const rootGrouped = group(rootNotes);
-  const empty = folders.length === 0 && rootGrouped.length === 0;
-  const noResults = searching && visibleFolders.length === 0 && rootGrouped.length === 0;
+  const empty = folders.length === 0 && notes.length === 0;
+  const noResults = searching && searchResults.length === 0;
 
   return (
-    <div className="h-full flex flex-col p-3 gap-2">
-      <div data-tauri-drag-region className="h-8 flex items-center justify-end">
+    <div className="h-full flex flex-col px-3 pb-3 gap-2">
+      {/* Title-bar-aligned drag strip — clears the macOS traffic-light row
+          so the brand mark below never sits behind the window controls.
+          Same pattern as SidebarCollapsed. */}
+      <div data-tauri-drag-region className="h-9 w-full shrink-0" />
+      <div data-tauri-drag-region className="h-8 flex items-center justify-between pl-1">
+        <div className="no-drag flex items-center gap-2 select-none text-sm text-[var(--color-text-muted)]">
+          <HumlaMark size={16} />
+          <span>Humla</span>
+        </div>
         <button
           onClick={onCollapse}
           data-tauri-drag-region="false"
-          className="no-drag p-1.5 rounded-md hover:bg-[var(--color-pill-hover)] text-[var(--color-text-muted)] hover:text-[var(--color-text)]"
+          className="no-drag p-1.5 rounded-md hover:bg-[var(--color-sidebar-active)] text-[var(--color-text-muted)] hover:text-[var(--color-text)]"
           aria-label="Collapse sidebar"
           title="⌘\"
         >
@@ -177,7 +129,7 @@ export function Sidebar({ onCollapse }: { onCollapse: () => void }) {
         </button>
       </div>
 
-      <div className="no-drag flex items-center gap-2 pl-3 pr-2 py-2 rounded-md border border-[var(--color-line)] bg-[var(--color-surface)] focus-within:border-[var(--color-text-muted)] transition-colors">
+      <div className="no-drag flex items-center gap-2 pl-2 pr-2 py-2 rounded-md border border-[var(--color-line)] bg-[var(--color-surface)] focus-within:border-[var(--color-text-muted)] transition-colors">
         <Search size={14} strokeWidth={1.5} className="text-[var(--color-text-muted)] shrink-0" />
         <input
           data-search-input
@@ -199,22 +151,13 @@ export function Sidebar({ onCollapse }: { onCollapse: () => void }) {
         className={cn(
           "no-drag flex items-center gap-2 px-2 py-2 rounded-md text-sm transition-colors",
           location.pathname === "/"
-            ? "bg-[var(--color-pill-hover)] text-[var(--color-text)]"
-            : "text-[var(--color-text-muted)] hover:bg-[var(--color-pill-hover)] hover:text-[var(--color-text)]"
+            ? "bg-[var(--color-sidebar-active)] text-[var(--color-text)]"
+            : "text-[var(--color-text-muted)] hover:bg-[var(--color-sidebar-active)] hover:text-[var(--color-text)]"
         )}
       >
         <HomeIcon size={15} strokeWidth={1.5} />
         <span>Home</span>
       </Link>
-
-      <button
-        onClick={newNote}
-        className="no-drag flex items-center gap-2 px-2 py-2 rounded-md text-sm text-left text-[var(--color-text-muted)] hover:bg-[var(--color-pill-hover)] hover:text-[var(--color-text)] transition-colors"
-        title="⌘N"
-      >
-        <Plus size={15} strokeWidth={1.5} />
-        <span>New note</span>
-      </button>
 
       {creatingFolder ? (
         <div className="no-drag flex items-center gap-2 pl-2 pr-2 py-2 rounded-md border border-[var(--color-text-muted)] bg-[var(--color-surface)]">
@@ -238,7 +181,7 @@ export function Sidebar({ onCollapse }: { onCollapse: () => void }) {
       ) : (
         <button
           onClick={() => setCreatingFolder(true)}
-          className="no-drag flex items-center gap-2 px-2 py-2 rounded-md text-sm text-left text-[var(--color-text-muted)] hover:bg-[var(--color-pill-hover)] hover:text-[var(--color-text)] transition-colors"
+          className="no-drag flex items-center gap-2 px-2 py-2 rounded-md text-sm text-left text-[var(--color-text-muted)] hover:bg-[var(--color-sidebar-active)] hover:text-[var(--color-text)] transition-colors"
         >
           <FolderPlus size={15} strokeWidth={1.5} />
           <span>New folder</span>
@@ -246,44 +189,46 @@ export function Sidebar({ onCollapse }: { onCollapse: () => void }) {
       )}
 
       <div className="flex-1 overflow-y-auto -mx-1 px-1 mt-2">
-        {empty && (
+        {empty && !searching && (
           <div className="px-2 py-4 text-sm text-[var(--color-text-muted)]">No notes yet</div>
         )}
         {noResults && (
           <div className="px-2 py-4 text-sm text-[var(--color-text-muted)]">No matches</div>
         )}
 
-        {visibleFolders.map((f) => (
-          <FolderSection
-            key={f.id}
-            folder={f}
-            items={itemsForFolder(f)}
-            collapsed={!isFolderOpen(f)}
-            onToggle={() => toggleFolder(f.id)}
-            onDelete={(e) => deleteFolder(e, f.id)}
-            onDeleteNote={deleteNote}
-            activePath={location.pathname}
-          />
-        ))}
-
-        {rootGrouped.map((g) => (
-          <div key={g.label} className="mb-3">
-            <div className="nd-label px-2 py-1.5">{g.label}</div>
-            {g.items.map((n) => (
+        {searching ? (
+          <div className="mb-3">
+            {searchResults.map((n) => (
               <NoteRow
                 key={n.id}
                 note={n}
                 active={location.pathname === `/note/${n.id}`}
                 onDelete={deleteNote}
+                folderName={n.folder_id ? folderById.get(n.folder_id)?.name : undefined}
               />
             ))}
           </div>
-        ))}
+        ) : (
+          <>
+            {folders.length > 0 && (
+              <div className="nd-label px-2 pt-1 pb-1.5">Folders</div>
+            )}
+
+            {folders.map((f) => (
+              <FolderRow
+                key={f.id}
+                folder={f}
+                count={folderCounts.get(f.id) ?? 0}
+                active={location.pathname === `/folder/${f.id}`}
+              />
+            ))}
+          </>
+        )}
       </div>
 
       <Link
         to="/settings"
-        className="no-drag flex items-center gap-2 px-2 py-2 rounded-md text-sm text-[var(--color-text-muted)] hover:bg-[var(--color-pill-hover)] hover:text-[var(--color-text)] transition-colors"
+        className="no-drag flex items-center gap-2 px-2 py-2 rounded-md text-sm text-[var(--color-text-muted)] hover:bg-[var(--color-sidebar-active)] hover:text-[var(--color-text)] transition-colors"
         title="⌘,"
       >
         <SettingsIcon size={15} strokeWidth={1.5} />
@@ -293,67 +238,110 @@ export function Sidebar({ onCollapse }: { onCollapse: () => void }) {
   );
 }
 
-function FolderSection({
+function FolderRow({
   folder,
-  items,
-  collapsed,
-  onToggle,
-  onDelete,
-  onDeleteNote,
-  activePath,
+  count,
+  active,
 }: {
   folder: Folder;
-  items: Note[];
-  collapsed: boolean;
-  onToggle: () => void;
-  onDelete: (e: React.MouseEvent) => void;
-  onDeleteNote: (e: React.MouseEvent, id: string) => void;
-  activePath: string;
+  count: number;
+  active: boolean;
 }) {
+  const navigate = useNavigate();
+  const location = useLocation();
+  const upsertFolder = useNotesStore((s) => s.upsertFolder);
+  const removeFolder = useNotesStore((s) => s.removeFolder);
+  const [menuPos, setMenuPos] = useState<{ x: number; y: number } | null>(null);
+  const [editing, setEditing] = useState(false);
+  const [draftName, setDraftName] = useState(folder.name);
+
+  function openMenu(e: React.MouseEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+    setMenuPos({ x: e.clientX, y: e.clientY });
+  }
+
+  function startRename() {
+    setMenuPos(null);
+    setDraftName(folder.name);
+    setEditing(true);
+  }
+
+  async function commitRename() {
+    const name = draftName.trim();
+    if (!name || name === folder.name) {
+      setEditing(false);
+      return;
+    }
+    try {
+      await ipc.renameFolder(folder.id, name);
+      upsertFolder({ ...folder, name, updated_at: Date.now() });
+    } finally {
+      setEditing(false);
+    }
+  }
+
+  async function deleteHere() {
+    setMenuPos(null);
+    // Notes fall back to root rather than being deleted — recoverable
+    // so no confirm needed. If we're sitting on this folder's page,
+    // navigate home so we don't end up on a dead route.
+    await ipc.deleteFolder(folder.id);
+    removeFolder(folder.id);
+    if (location.pathname === `/folder/${folder.id}`) navigate("/");
+  }
+
+  if (editing) {
+    return (
+      <div className="no-drag flex items-center gap-2 px-2 py-2 mb-0.5 rounded-md border border-[var(--color-text-muted)] bg-[var(--color-surface)]">
+        <FolderIcon size={15} strokeWidth={1.5} className="shrink-0 text-[var(--color-text-muted)]" />
+        <input
+          autoFocus
+          value={draftName}
+          onChange={(e) => setDraftName(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") commitRename();
+            else if (e.key === "Escape") setEditing(false);
+          }}
+          onBlur={commitRename}
+          className="flex-1 text-sm min-w-0"
+        />
+      </div>
+    );
+  }
+
   return (
-    <div className="mb-3">
-      <button
-        onClick={onToggle}
-        className="no-drag group w-full flex items-center gap-1 pl-1 pr-1 py-1.5 rounded-md text-left text-[var(--color-text-muted)] hover:bg-[var(--color-pill-hover)] hover:text-[var(--color-text)] transition-colors"
+    <>
+      <Link
+        to={`/folder/${folder.id}`}
+        onContextMenu={openMenu}
+        className={cn(
+          "no-drag group flex items-center gap-2 px-2 py-2 mb-0.5 rounded-md text-sm transition-colors",
+          active
+            ? "bg-[var(--color-sidebar-active)] text-[var(--color-text)]"
+            : "text-[var(--color-text-muted)] hover:bg-[var(--color-sidebar-active)] hover:text-[var(--color-text)]",
+        )}
       >
-        <span className="shrink-0 w-4 flex justify-center">
-          {collapsed ? <ChevronRight size={12} strokeWidth={1.5} /> : <ChevronDown size={12} strokeWidth={1.5} />}
-        </span>
-        <FolderIcon size={13} strokeWidth={1.5} className="shrink-0" />
-        <span className="flex-1 truncate text-xs uppercase tracking-[0.06em]" style={{ fontFamily: "var(--font-mono)" }}>
-          {folder.name}
-        </span>
-        {items.length > 0 && (
-          <span className="text-[10px] text-[var(--color-text-disabled)] tabular-nums" style={{ fontFamily: "var(--font-mono)" }}>
-            {items.length}
+        <FolderIcon size={15} strokeWidth={1.5} className="shrink-0" />
+        <span className="flex-1 truncate">{folder.name}</span>
+        {count > 0 && (
+          <span
+            className="text-[11px] text-[var(--color-text-disabled)] tabular-nums"
+            style={{ fontFamily: "var(--font-mono)" }}
+          >
+            {count}
           </span>
         )}
-        <span
-          role="button"
-          aria-label="Delete folder"
-          title="Delete folder"
-          onClick={onDelete}
-          className="opacity-0 group-hover:opacity-100 shrink-0 p-1 rounded text-[var(--color-text-muted)] hover:text-[var(--color-accent)] hover:bg-[var(--color-pill-hover)] transition-colors"
-        >
-          <Trash2 size={12} strokeWidth={1.5} />
-        </span>
-      </button>
-      {!collapsed && items.length > 0 && (
-        <div className="ml-4">
-          {items.map((n) => (
-            <NoteRow
-              key={n.id}
-              note={n}
-              active={activePath === `/note/${n.id}`}
-              onDelete={onDeleteNote}
-            />
-          ))}
-        </div>
+      </Link>
+      {menuPos && (
+        <ContextMenu x={menuPos.x} y={menuPos.y} onClose={() => setMenuPos(null)}>
+          <ContextMenuItem onClick={startRename}>Rename</ContextMenuItem>
+          <ContextMenuItem onClick={deleteHere} danger>
+            Delete
+          </ContextMenuItem>
+        </ContextMenu>
       )}
-      {!collapsed && items.length === 0 && (
-        <div className="ml-4 px-2 py-1.5 text-xs text-[var(--color-text-disabled)] italic">Empty</div>
-      )}
-    </div>
+    </>
   );
 }
 
@@ -361,10 +349,12 @@ function NoteRow({
   note,
   active,
   onDelete,
+  folderName,
 }: {
   note: Note;
   active: boolean;
   onDelete: (e: React.MouseEvent, id: string) => void;
+  folderName?: string;
 }) {
   return (
     <Link
@@ -372,16 +362,23 @@ function NoteRow({
       className={cn(
         "no-drag group flex items-center gap-1 pl-2 pr-1 py-2 rounded-md text-sm transition-colors",
         active
-          ? "bg-[var(--color-pill-hover)] text-[var(--color-text)]"
-          : "text-[var(--color-text-muted)] hover:bg-[var(--color-pill-hover)] hover:text-[var(--color-text)]"
+          ? "bg-[var(--color-sidebar-active)] text-[var(--color-text)]"
+          : "text-[var(--color-text-muted)] hover:bg-[var(--color-sidebar-active)] hover:text-[var(--color-text)]"
       )}
     >
-      <span className="flex-1 truncate">{note.title.trim() || "Untitled"}</span>
+      <span className="flex-1 min-w-0 flex flex-col">
+        <span className="truncate">{note.title.trim() || "Untitled"}</span>
+        {folderName && (
+          <span className="truncate text-[10px] text-[var(--color-text-disabled)] uppercase tracking-[0.06em]" style={{ fontFamily: "var(--font-mono)" }}>
+            {folderName}
+          </span>
+        )}
+      </span>
       <button
         onClick={(e) => onDelete(e, note.id)}
         aria-label="Delete note"
         title="Delete"
-        className="opacity-0 group-hover:opacity-100 focus:opacity-100 shrink-0 p-1 rounded text-[var(--color-text-muted)] hover:text-[var(--color-accent)] hover:bg-[var(--color-pill-hover)] transition-colors"
+        className="opacity-0 group-hover:opacity-100 focus:opacity-100 shrink-0 p-1 rounded text-[var(--color-text-muted)] hover:text-[var(--color-accent)] hover:bg-[var(--color-sidebar-active)] transition-colors"
       >
         <Trash2 size={14} strokeWidth={1.5} />
       </button>

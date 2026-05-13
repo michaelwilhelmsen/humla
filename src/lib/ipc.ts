@@ -49,6 +49,7 @@ export type SettingsKey =
   | "local_llm_model"
   | "local_llm_think"
   | "theme"
+  | "palette"
   | "developer_mode"
   | "silence_rms_threshold";
 

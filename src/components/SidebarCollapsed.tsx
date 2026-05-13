@@ -64,7 +64,7 @@ function IconBtn({
       aria-label={label}
       title={label}
       onClick={onClick}
-      className="no-drag w-9 h-9 flex items-center justify-center rounded-md text-[var(--color-text-muted)] hover:bg-[var(--color-pill-hover)] hover:text-[var(--color-text)]"
+      className="no-drag w-9 h-9 flex items-center justify-center rounded-md text-[var(--color-text-muted)] hover:bg-[var(--color-sidebar-active)] hover:text-[var(--color-text)]"
     >
       {children}
     </button>
@@ -88,9 +88,9 @@ function IconLink({
       aria-label={label}
       title={label}
       className={cn(
-        "no-drag w-9 h-9 flex items-center justify-center rounded-md hover:bg-[var(--color-pill-hover)]",
+        "no-drag w-9 h-9 flex items-center justify-center rounded-md hover:bg-[var(--color-sidebar-active)]",
         active
-          ? "text-[var(--color-text)] bg-[var(--color-pill-hover)]"
+          ? "text-[var(--color-text)] bg-[var(--color-sidebar-active)]"
           : "text-[var(--color-text-muted)] hover:text-[var(--color-text)]",
       )}
     >

@@ -1,15 +1,18 @@
 import { useThemeStore } from "../../../lib/theme";
+import { usePaletteStore } from "../../../lib/palette";
 import { Permissions } from "../../../components/Permissions";
 import { LANGUAGES, languageOptionLabel } from "../../../lib/languages";
 import { SUMMARY_PRESETS, presetLabel } from "../../../lib/presets";
 import { Row, Section } from "../components/Section";
 import { Select } from "../components/Select";
-import { THEMES } from "../types";
+import { PALETTES, THEMES } from "../types";
 import type { SettingsHook } from "../useSettings";
 
 export function GeneralTab({ s, update }: Pick<SettingsHook, "s" | "update">) {
   const theme = useThemeStore((t) => t.theme);
   const setThemePref = useThemeStore((t) => t.setTheme);
+  const palette = usePaletteStore((p) => p.palette);
+  const setPalettePref = usePaletteStore((p) => p.setPalette);
 
   return (
     <>
@@ -47,6 +50,27 @@ export function GeneralTab({ s, update }: Pick<SettingsHook, "s" | "update">) {
       </Section>
 
       <Section title="Appearance">
+        <Row label="Palette">
+          <div className="flex gap-1 p-1 rounded-md border border-[var(--color-line-visible)] bg-[var(--color-surface)] w-fit">
+            {PALETTES.map((p) => (
+              <button
+                key={p.value}
+                onClick={() => setPalettePref(p.value)}
+                className={
+                  "px-3 py-1 rounded text-sm " +
+                  (palette === p.value
+                    ? "bg-[var(--color-pill-hover)] text-[var(--color-text)]"
+                    : "text-[var(--color-text-muted)] hover:text-[var(--color-text)]")
+                }
+              >
+                {p.label}
+              </button>
+            ))}
+          </div>
+          <p className="text-xs text-[var(--color-text-muted)] mt-2">
+            {PALETTES.find((p) => p.value === palette)?.description}
+          </p>
+        </Row>
         <Row label="Theme">
           <div className="flex gap-1 p-1 rounded-md border border-[var(--color-line-visible)] bg-[var(--color-surface)] w-fit">
             {THEMES.map((t) => (
@@ -56,7 +80,7 @@ export function GeneralTab({ s, update }: Pick<SettingsHook, "s" | "update">) {
                 className={
                   "px-3 py-1 rounded text-sm " +
                   (theme === t.value
-                    ? "bg-[var(--color-surface)] shadow-sm"
+                    ? "bg-[var(--color-pill-hover)] text-[var(--color-text)]"
                     : "text-[var(--color-text-muted)] hover:text-[var(--color-text)]")
                 }
               >

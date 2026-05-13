@@ -8,8 +8,9 @@
 import type { DiarizeModelStatus, LocalWhisperModelStatus, SettingsKey } from "../../lib/ipc";
 import { SUMMARY_PRESETS, presetPromptForLang } from "../../lib/presets";
 import type { Theme } from "../../lib/theme";
+import type { Palette } from "../../lib/palette";
 
-export type EditableKey = Exclude<SettingsKey, "theme">;
+export type EditableKey = Exclude<SettingsKey, "theme" | "palette">;
 
 export type Provider = "openai" | "local" | "deepgram" | "groq";
 
@@ -57,6 +58,11 @@ export const THEMES: { value: Theme; label: string }[] = [
   { value: "system", label: "System" },
   { value: "light", label: "Light" },
   { value: "dark", label: "Dark" },
+];
+
+export const PALETTES: { value: Palette; label: string; description: string }[] = [
+  { value: "warm", label: "Warm", description: "Paper-cream surfaces, white sidebar hover." },
+  { value: "nothing", label: "Nothing", description: "Neutral grays, mono-line accents." },
 ];
 
 export const TRANSCRIBE_MODELS = [

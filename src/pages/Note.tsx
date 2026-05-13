@@ -1,4 +1,4 @@
-import { useParams } from "react-router-dom";
+import { Link, useNavigate, useParams } from "react-router-dom";
 import { useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -6,6 +6,7 @@ import {
   Calendar,
   Check,
   ChevronDown,
+  ChevronLeft,
   ChevronUp,
   Circle,
   Cloud,
@@ -13,6 +14,8 @@ import {
   FileText,
   Folder,
   Languages,
+  MoreHorizontal,
+  RefreshCw,
   Users,
   X,
 } from "lucide-react";
@@ -22,6 +25,7 @@ import { useNotesStore, useRecordingStore } from "../lib/store";
 import { RecordingBar } from "../components/RecordingBar";
 import { SkeletonLines } from "../components/Skeleton";
 import { NoteEditor } from "../components/Editor";
+import { ContextMenu, ContextMenuItem } from "../components/ContextMenu";
 import { SUMMARY_PRESETS, presetLabel } from "../lib/presets";
 import { LANGUAGES, languageOptionLabel } from "../lib/languages";
 import { useDeveloperMode } from "../lib/useDeveloperMode";
@@ -323,6 +327,7 @@ export function Note() {
           window-edge scrollbar without making the content full-width. */}
       <div className="flex-1 overflow-y-auto">
         <div className="max-w-3xl mx-auto w-full px-12 pb-32">
+        <NoteHeader noteId={draft.id} folderId={draft.folder_id} summary={draft.summary} body={draft.body} />
         <textarea
           ref={titleRef}
           value={draft.title}
@@ -338,7 +343,7 @@ export function Note() {
           }}
           placeholder="New note"
           rows={1}
-          className="nd-bare block text-5xl font-light tracking-[-0.02em] w-full mb-6 placeholder:text-[var(--color-text-muted)]/50 resize-none overflow-hidden focus:outline-none leading-tight"
+          className="nd-bare block text-5xl font-serif tracking-tight w-full mb-6 placeholder:text-[var(--color-text-muted)]/50 resize-none overflow-hidden focus:outline-none leading-tight"
         />
 
         <div className="nd-prop-table mb-10">
@@ -604,6 +609,117 @@ function PropertyRow({
       </div>
       <div className="nd-prop-value">{children}</div>
     </div>
+  );
+}
+
+function stripHtml(html: string): string {
+  if (!html) return "";
+  const tmp = document.createElement("div");
+  tmp.innerHTML = html;
+  return (tmp.textContent || "").trim();
+}
+
+function NoteHeader({
+  noteId,
+  folderId,
+  summary,
+  body,
+}: {
+  noteId: string;
+  folderId: string | null;
+  summary: string;
+  body: string;
+}) {
+  const navigate = useNavigate();
+  const folders = useNotesStore((s) => s.folders);
+  const removeLocal = useNotesStore((s) => s.removeLocal);
+  const [menuPos, setMenuPos] = useState<{ x: number; y: number } | null>(null);
+  const [copied, setCopied] = useState(false);
+
+  const folder = folderId ? folders.find((f) => f.id === folderId) : null;
+  const backTo = folder ? `/folder/${folder.id}` : "/";
+  const backLabel = folder ? folder.name : "Home";
+  const canCopy = !!(summary?.trim() || stripHtml(body));
+
+  async function onCopy() {
+    const text = summary?.trim() || stripHtml(body);
+    if (!text) return;
+    await navigator.clipboard.writeText(text);
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 1200);
+  }
+
+  async function onResummarize() {
+    await ipc.summarizeNote(noteId);
+  }
+
+  async function onDelete() {
+    setMenuPos(null);
+    await ipc.deleteNote(noteId);
+    removeLocal(noteId);
+    navigate(backTo);
+  }
+
+  function openMenu(e: React.MouseEvent<HTMLButtonElement>) {
+    const rect = e.currentTarget.getBoundingClientRect();
+    // Anchor under the button, right-aligned so the menu doesn't run
+    // off the edge on narrow viewports.
+    setMenuPos({ x: rect.right - 160, y: rect.bottom + 4 });
+  }
+
+  return (
+    <div className="flex items-center justify-between pt-2 mb-10">
+      <Link
+        to={backTo}
+        className="inline-flex items-center gap-1.5 pl-1.5 pr-3 py-1 rounded-md text-sm text-[var(--color-text-muted)] hover:text-[var(--color-text)] hover:bg-[var(--color-sidebar-active)] transition-colors"
+      >
+        <ChevronLeft size={14} strokeWidth={1.5} />
+        <span className="truncate max-w-[200px]">{backLabel}</span>
+      </Link>
+      <div className="flex items-center gap-1">
+        <IconAction onClick={onCopy} disabled={!canCopy} title={copied ? "Copied" : "Copy summary"}>
+          {copied ? <Check size={16} strokeWidth={1.5} /> : <Copy size={16} strokeWidth={1.5} />}
+        </IconAction>
+        <IconAction onClick={onResummarize} title="Re-summarize">
+          <RefreshCw size={16} strokeWidth={1.5} />
+        </IconAction>
+        <IconAction onClick={openMenu} title="More">
+          <MoreHorizontal size={16} strokeWidth={1.5} />
+        </IconAction>
+      </div>
+      {menuPos && (
+        <ContextMenu x={menuPos.x} y={menuPos.y} onClose={() => setMenuPos(null)}>
+          <ContextMenuItem onClick={onDelete} danger>
+            Delete note
+          </ContextMenuItem>
+        </ContextMenu>
+      )}
+    </div>
+  );
+}
+
+function IconAction({
+  onClick,
+  disabled,
+  title,
+  children,
+}: {
+  onClick: (e: React.MouseEvent<HTMLButtonElement>) => void;
+  disabled?: boolean;
+  title: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      title={title}
+      aria-label={title}
+      className="w-8 h-8 flex items-center justify-center rounded-md text-[var(--color-text-muted)] hover:text-[var(--color-text)] hover:bg-[var(--color-sidebar-active)] disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+    >
+      {children}
+    </button>
   );
 }
 

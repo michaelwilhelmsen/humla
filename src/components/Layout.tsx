@@ -2,6 +2,7 @@ import { Outlet, useLocation } from "react-router-dom";
 import { useEffect, useState } from "react";
 import { Sidebar } from "./Sidebar";
 import { SidebarCollapsed } from "./SidebarCollapsed";
+import { TopBar } from "./TopBar";
 import { Toaster } from "./Toaster";
 import { Updater } from "./Updater";
 import { PolishToast } from "./PolishToast";
@@ -58,7 +59,7 @@ export function Layout() {
     <div className="flex h-full">
       <aside
         className={cn(
-          "shrink-0 border-r border-[var(--color-line)] transition-[width] duration-200 overflow-hidden",
+          "shrink-0 border-r border-[var(--color-line)] transition-[width] duration-200 overflow-hidden bg-[var(--color-sidebar-bg)]",
           collapsed ? "w-12" : "w-64",
         )}
       >
@@ -81,6 +82,7 @@ export function Layout() {
           data-tauri-drag-region
           className="absolute top-0 left-0 right-0 h-9 z-20"
         />
+        <TopBar />
         <ErrorBoundary key={location.pathname}>
           <Outlet />
         </ErrorBoundary>

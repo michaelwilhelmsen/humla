@@ -1,50 +1,152 @@
 @import "tailwindcss";
 @import "tippy.js/dist/tippy.css";
 
-/* Nothing-design typography. Space Grotesk for UI text, Space Mono for
-   labels and numeric data. Doto (dot-matrix) intentionally skipped — Space
-   Mono fills the display role on hero moments. */
-@import url("https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;700&family=Space+Mono:wght@400;700&display=swap");
+/* Three-font system. Space Grotesk for UI body, Space Mono for labels
+   and numeric data, Instrument Serif for display titles (note titles,
+   folder names, page headers). */
+@import url("https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Space+Grotesk:wght@300;400;500;700&family=Space+Mono:wght@400;700&display=swap");
 
 @theme {
-  --font-serif: "Space Grotesk", ui-sans-serif, system-ui, sans-serif;
+  --font-serif: "Instrument Serif", ui-serif, Georgia, serif;
   --font-sans: "Space Grotesk", ui-sans-serif, system-ui, sans-serif;
   --font-mono: "Space Mono", ui-monospace, "SF Mono", monospace;
 }
 
-/* Light mode = printed technical manual: warm off-white paper, black ink.
-   Dark mode = instrument panel: OLED black, white data. */
-:root {
-  /* Existing semantic names remap to Nothing tokens so nothing breaks.
-     Light defaults; the dark block below overrides via system + override. */
-  --color-canvas: #f5f5f5;            /* page bg */
+/* Two palettes: "warm" (default) — paper-cream surfaces, distinct sidebar,
+   white sidebar hover/active — and "nothing" (alternative) — neutral grays,
+   Nothing-design aesthetic. Each palette has light and dark variants;
+   data-theme picks light/dark explicitly, otherwise prefers-color-scheme
+   decides. data-palette picks the palette; unset = warm.
+   Two extra tokens beyond the original set:
+     --color-sidebar-bg     — the sidebar column's surface (may differ
+                              from --color-canvas, e.g. cream-on-cream)
+     --color-sidebar-active — bg for hover/active sidebar items (white in
+                              warm light; subtle pill-hover in nothing) */
+
+/* === WARM (default) — light === */
+:root,
+:root[data-palette="warm"] {
+  --color-canvas: #faf9f6;            /* main pane */
   --color-surface: #ffffff;           /* cards, raised surfaces */
-  --color-surface-raised: #f0f0f0;
-  --color-text: #1a1a1a;              /* primary body */
-  --color-text-display: #000000;      /* hero numbers, headlines */
-  --color-text-muted: #666666;        /* labels, captions */
-  --color-text-disabled: #999999;
-  --color-line: #e8e8e8;              /* subtle dividers */
-  --color-line-visible: #cccccc;      /* intentional borders */
-  --color-pill: transparent;          /* chips have no fill in Nothing style */
-  --color-pill-hover: rgba(0, 0, 0, 0.06);
+  --color-surface-raised: #f0eee7;
+  --color-sidebar-bg: #f5f3ed;        /* sidebar column */
+  --color-sidebar-active: #ffffff;    /* sidebar hover/active */
+  --color-text: #1a1a1a;
+  --color-text-display: #000000;
+  --color-text-muted: #7a7a78;
+  --color-text-disabled: #b0aea4;
+  --color-line: #ece8de;
+  --color-line-visible: #d9d4c5;
+  --color-pill: transparent;
+  --color-pill-hover: rgba(0, 0, 0, 0.05);
   --color-input-bg: #ffffff;
-  --color-shadow: transparent;        /* no shadows in Nothing */
-  --color-accent: #d71921;            /* signal red — interrupt only */
+  --color-shadow: transparent;
+  --color-accent: #d71921;
   --color-success: #4a9e5c;
   --color-warning: #d4a843;
-  --color-interactive: #007aff;       /* tappable text */
-  /* Aliases used for backwards compat: ink + ink-muted */
+  --color-interactive: #007aff;
   --color-ink: var(--color-text);
   --color-ink-muted: var(--color-text-muted);
   color-scheme: light;
 }
 
+/* === WARM — dark via system === */
 @media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) {
+  :root:not([data-theme="light"]):not([data-palette="nothing"]),
+  :root[data-palette="warm"]:not([data-theme="light"]) {
+    --color-canvas: #0e0e0e;
+    --color-surface: #1a1a1a;
+    --color-surface-raised: #1f1f1f;
+    --color-sidebar-bg: #0a0a0a;
+    --color-sidebar-active: #1f1f1f;
+    --color-text: #ece8dc;
+    --color-text-display: #ffffff;
+    --color-text-muted: #8a8a86;
+    --color-text-disabled: #555555;
+    --color-line: #1f1f1f;
+    --color-line-visible: #2a2a2a;
+    --color-pill: transparent;
+    --color-pill-hover: rgba(255, 255, 255, 0.06);
+    --color-input-bg: #1a1a1a;
+    --color-shadow: transparent;
+    --color-interactive: #6fa0ff;
+    color-scheme: dark;
+  }
+}
+
+/* === WARM — light explicit === */
+:root[data-theme="light"]:not([data-palette="nothing"]),
+:root[data-palette="warm"][data-theme="light"] {
+  --color-canvas: #faf9f6;
+  --color-surface: #ffffff;
+  --color-surface-raised: #f0eee7;
+  --color-sidebar-bg: #f5f3ed;
+  --color-sidebar-active: #ffffff;
+  --color-text: #1a1a1a;
+  --color-text-display: #000000;
+  --color-text-muted: #7a7a78;
+  --color-text-disabled: #b0aea4;
+  --color-line: #ece8de;
+  --color-line-visible: #d9d4c5;
+  --color-pill: transparent;
+  --color-pill-hover: rgba(0, 0, 0, 0.05);
+  --color-input-bg: #ffffff;
+  --color-shadow: transparent;
+  --color-interactive: #007aff;
+  color-scheme: light;
+}
+
+/* === WARM — dark explicit === */
+:root[data-theme="dark"]:not([data-palette="nothing"]),
+:root[data-palette="warm"][data-theme="dark"] {
+  --color-canvas: #0e0e0e;
+  --color-surface: #1a1a1a;
+  --color-surface-raised: #1f1f1f;
+  --color-sidebar-bg: #0a0a0a;
+  --color-sidebar-active: #1f1f1f;
+  --color-text: #ece8dc;
+  --color-text-display: #ffffff;
+  --color-text-muted: #8a8a86;
+  --color-text-disabled: #555555;
+  --color-line: #1f1f1f;
+  --color-line-visible: #2a2a2a;
+  --color-pill: transparent;
+  --color-pill-hover: rgba(255, 255, 255, 0.06);
+  --color-input-bg: #1a1a1a;
+  --color-shadow: transparent;
+  --color-interactive: #6fa0ff;
+  color-scheme: dark;
+}
+
+/* === NOTHING — light === */
+:root[data-palette="nothing"] {
+  --color-canvas: #f5f5f5;
+  --color-surface: #ffffff;
+  --color-surface-raised: #f0f0f0;
+  --color-sidebar-bg: var(--color-canvas);
+  --color-sidebar-active: var(--color-pill-hover);
+  --color-text: #1a1a1a;
+  --color-text-display: #000000;
+  --color-text-muted: #666666;
+  --color-text-disabled: #999999;
+  --color-line: #e8e8e8;
+  --color-line-visible: #cccccc;
+  --color-pill: transparent;
+  --color-pill-hover: rgba(0, 0, 0, 0.06);
+  --color-input-bg: #ffffff;
+  --color-shadow: transparent;
+  --color-interactive: #007aff;
+  color-scheme: light;
+}
+
+/* === NOTHING — dark via system === */
+@media (prefers-color-scheme: dark) {
+  :root[data-palette="nothing"]:not([data-theme="light"]) {
     --color-canvas: #000000;
     --color-surface: #111111;
     --color-surface-raised: #1a1a1a;
+    --color-sidebar-bg: var(--color-canvas);
+    --color-sidebar-active: var(--color-pill-hover);
     --color-text: #e8e8e8;
     --color-text-display: #ffffff;
     --color-text-muted: #999999;
@@ -60,10 +162,13 @@
   }
 }
 
-:root[data-theme="light"] {
+/* === NOTHING — light explicit === */
+:root[data-palette="nothing"][data-theme="light"] {
   --color-canvas: #f5f5f5;
   --color-surface: #ffffff;
   --color-surface-raised: #f0f0f0;
+  --color-sidebar-bg: var(--color-canvas);
+  --color-sidebar-active: var(--color-pill-hover);
   --color-text: #1a1a1a;
   --color-text-display: #000000;
   --color-text-muted: #666666;
@@ -78,10 +183,13 @@
   color-scheme: light;
 }
 
-:root[data-theme="dark"] {
+/* === NOTHING — dark explicit === */
+:root[data-palette="nothing"][data-theme="dark"] {
   --color-canvas: #000000;
   --color-surface: #111111;
   --color-surface-raised: #1a1a1a;
+  --color-sidebar-bg: var(--color-canvas);
+  --color-sidebar-active: var(--color-pill-hover);
   --color-text: #e8e8e8;
   --color-text-display: #ffffff;
   --color-text-muted: #999999;
