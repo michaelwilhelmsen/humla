@@ -171,14 +171,20 @@ export function useSettings() {
         await update("local_llm_model", list[0]);
       }
     } catch (e) {
-      // reqwest's connection-refused error shows up as "error sending request
-      // for url (...)" which is opaque to non-technical users. Replace it
-      // with a clearer prompt that names the likely cause and the fix.
+      // reqwest's connection-refused error surfaces as "error sending request
+      // for url (...)" — opaque to non-technical users. Classify it into a
+      // structured kind so the Summary tab can render specific guidance
+      // (start Ollama / pull a model) instead of the raw error string.
       const raw = String(e);
-      const friendly = /error sending request|connection refused|failed to connect/i.test(raw)
-        ? `Couldn't reach the server at ${baseUrl}. Is your local-LLM tool running?`
-        : raw;
-      setLlmModels({ list: null, loading: false, error: friendly });
+      const isUnreachable = /error sending request|connection refused|failed to connect/i
+        .test(raw);
+      setLlmModels({
+        list: null,
+        loading: false,
+        error: isUnreachable
+          ? { kind: "unreachable", baseUrl }
+          : { kind: "other", message: raw },
+      });
     }
   }
 

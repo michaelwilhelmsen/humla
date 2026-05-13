@@ -147,10 +147,18 @@ export const EMPTY_DIARIZE_STATE: DiarizeState = {
   flash: null,
 };
 
+// Discriminated so the Summary tab can render guidance tailored to the
+// failure mode. "unreachable" means the local server isn't responding —
+// usually Ollama not running. "other" is the catch-all (HTTP 500, parse
+// failure, etc) where we just show the raw message.
+export type LlmModelsError =
+  | { kind: "unreachable"; baseUrl: string }
+  | { kind: "other"; message: string };
+
 export type LlmModelsState = {
   list: string[] | null;
   loading: boolean;
-  error: string | null;
+  error: LlmModelsError | null;
 };
 
 export const EMPTY_LLM_MODELS_STATE: LlmModelsState = {
