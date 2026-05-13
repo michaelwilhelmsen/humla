@@ -1,7 +1,7 @@
 {
   "name": "humla",
   "private": true,
-  "version": "0.25.0",
+  "version": "0.25.1",
   "license": "MIT",
   "type": "module",
   "scripts": {
@@ -14,6 +14,7 @@
     "release": "scripts/release.sh"
   },
   "dependencies": {
+    "@tanstack/react-virtual": "^3.13.24",
     "@tauri-apps/api": "^2.1.1",
     "@tauri-apps/plugin-process": "~2",
     "@tauri-apps/plugin-shell": "^2.2.0",

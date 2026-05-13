@@ -1,7 +1,8 @@
 import { Link, useNavigate, useParams } from "react-router-dom";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { useVirtualizer } from "@tanstack/react-virtual";
 import {
   Calendar,
   Check,
@@ -29,6 +30,16 @@ import { ContextMenu, ContextMenuItem } from "../components/ContextMenu";
 import { SUMMARY_PRESETS, presetLabel } from "../lib/presets";
 import { LANGUAGES, languageOptionLabel } from "../lib/languages";
 import { useDeveloperMode } from "../lib/useDeveloperMode";
+
+// Memoized Markdown renderer. ReactMarkdown's parse step is O(N) over
+// the source string and we paint summaries that can hit 10K+ chars on
+// long meetings; without memoization, every parent re-render (each
+// body keystroke, each summary delta, each recording tick) re-parses
+// the same string. Wrapping in memo + a stable `source` prop turns
+// that into a single parse per actual content change.
+const Markdown = memo(function Markdown({ source }: { source: string }) {
+  return <ReactMarkdown remarkPlugins={[remarkGfm]}>{source}</ReactMarkdown>;
+});
 
 function formatDateChip(ts: number) {
   const d = new Date(ts);
@@ -254,41 +265,59 @@ export function Note() {
     };
   }, [draft?.id, recPhase.phase]);
 
-  function patch(field: "title" | "body" | "transcript" | "summary_preset" | "language", value: string) {
-    if (!draft) return;
-    const next = { ...draft, [field]: value };
-    setDraft(next);
-    pendingChanges.current = { ...pendingChanges.current, [field]: value };
-    if (saveTimer.current) window.clearTimeout(saveTimer.current);
-    saveTimer.current = window.setTimeout(async () => {
-      saveTimer.current = null;
-      const changes = pendingChanges.current;
-      pendingChanges.current = {};
-      if (Object.keys(changes).length === 0) return;
-      await ipc.updateNote(next.id, changes as Parameters<typeof ipc.updateNote>[1]);
-      const latest = draftRef.current ?? next;
-      upsert({ ...latest, ...changes });
-    }, 300);
-  }
+  // patch / patchProvider intentionally read from `draftRef.current`
+  // rather than the `draft` closure so they can stay stable across
+  // renders — keeps the React.memo on TranscriptEditor / TranscriptView
+  // / TranscriptPlayer effective (otherwise a fresh function ref would
+  // bust the memo on every parent render).
+  const patch = useCallback(
+    (field: "title" | "body" | "transcript" | "summary_preset" | "language", value: string) => {
+      const cur = draftRef.current;
+      if (!cur) return;
+      const next = { ...cur, [field]: value };
+      setDraft(next);
+      pendingChanges.current = { ...pendingChanges.current, [field]: value };
+      if (saveTimer.current) window.clearTimeout(saveTimer.current);
+      saveTimer.current = window.setTimeout(async () => {
+        saveTimer.current = null;
+        const changes = pendingChanges.current;
+        pendingChanges.current = {};
+        if (Object.keys(changes).length === 0) return;
+        await ipc.updateNote(next.id, changes as Parameters<typeof ipc.updateNote>[1]);
+        const latest = draftRef.current ?? next;
+        upsert({ ...latest, ...changes });
+      }, 300);
+    },
+    [upsert],
+  );
 
   // Empty-string-as-null for summary_provider. "" clears the override and
   // lets the global setting kick in; "openai" / "local" sets it explicitly.
-  function patchProvider(value: string) {
-    if (!draft) return;
-    const next = { ...draft, summary_provider: value };
-    setDraft(next);
-    pendingChanges.current = { ...pendingChanges.current, summary_provider: value };
-    if (saveTimer.current) window.clearTimeout(saveTimer.current);
-    saveTimer.current = window.setTimeout(async () => {
-      saveTimer.current = null;
-      const changes = pendingChanges.current;
-      pendingChanges.current = {};
-      if (Object.keys(changes).length === 0) return;
-      await ipc.updateNote(next.id, changes as Parameters<typeof ipc.updateNote>[1]);
-      const latest = draftRef.current ?? next;
-      upsert({ ...latest, ...changes });
-    }, 300);
-  }
+  const patchProvider = useCallback(
+    (value: string) => {
+      const cur = draftRef.current;
+      if (!cur) return;
+      const next = { ...cur, summary_provider: value };
+      setDraft(next);
+      pendingChanges.current = { ...pendingChanges.current, summary_provider: value };
+      if (saveTimer.current) window.clearTimeout(saveTimer.current);
+      saveTimer.current = window.setTimeout(async () => {
+        saveTimer.current = null;
+        const changes = pendingChanges.current;
+        pendingChanges.current = {};
+        if (Object.keys(changes).length === 0) return;
+        await ipc.updateNote(next.id, changes as Parameters<typeof ipc.updateNote>[1]);
+        const latest = draftRef.current ?? next;
+        upsert({ ...latest, ...changes });
+      }, 300);
+    },
+    [upsert],
+  );
+
+  // Stable callbacks for the memoized transcript components. Without
+  // these, fresh arrow refs every parent render would bust React.memo
+  // and re-render the whole transcript on every keystroke elsewhere.
+  const onTranscriptChange = useCallback((v: string) => patch("transcript", v), [patch]);
 
   // Existing notes have plain-text bodies; wrap them in <p> tags so Tiptap
   // renders sensible paragraphs on first load. New bodies are stored as HTML.
@@ -472,7 +501,7 @@ export function Note() {
                     ref={reasoningRef}
                     className="prose-reasoning mt-2 max-h-64 overflow-y-auto"
                   >
-                    <ReactMarkdown remarkPlugins={[remarkGfm]}>{thinkingStream}</ReactMarkdown>
+                    <Markdown source={thinkingStream} />
                   </div>
                 )}
               </div>
@@ -487,15 +516,15 @@ export function Note() {
             <CollapsibleScroll expanded={summaryExpanded} bottomAligned={false}>
               {isSummarizing && contentStream.length > 0 ? (
                 <div className="prose-summary text-base leading-relaxed">
-                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{contentStream}</ReactMarkdown>
+                  <Markdown source={contentStream} />
                 </div>
               ) : hasSummary ? (
                 <div className="prose-summary text-base leading-relaxed">
-                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{draft.summary}</ReactMarkdown>
+                  <Markdown source={draft.summary} />
                 </div>
               ) : contentStream.length > 0 ? (
                 <div className="prose-summary text-base leading-relaxed">
-                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{contentStream}</ReactMarkdown>
+                  <Markdown source={contentStream} />
                 </div>
               ) : (
                 <SkeletonLines lines={5} />
@@ -558,7 +587,7 @@ export function Note() {
                     setTimeline={setTimeline}
                     playbackUrl={playbackUrl}
                     transcript={draft.transcript}
-                    onChange={(v) => patch("transcript", v)}
+                    onChange={onTranscriptChange}
                     disabled={isRecording || isPaused || isStarting || isStopping || isDiarizing}
                     expanded={transcriptExpanded}
                     bottomAligned={transcriptLive}
@@ -566,7 +595,7 @@ export function Note() {
                 ) : (
                   <TranscriptEditor
                     value={draft.transcript}
-                    onChange={(v) => patch("transcript", v)}
+                    onChange={onTranscriptChange}
                     disabled={isRecording || isPaused || isStarting || isStopping || isDiarizing}
                     expanded={transcriptExpanded}
                     bottomAligned={transcriptLive}
@@ -1275,7 +1304,7 @@ function SpeakerChip({
   );
 }
 
-function TranscriptEditor({
+const TranscriptEditor = memo(function TranscriptEditor({
   value,
   onChange,
   disabled,
@@ -1340,22 +1369,22 @@ function TranscriptEditor({
     );
   }
 
+  // TranscriptView owns its own scroll container so the virtualizer can
+  // measure visible items. Bypass CollapsibleScroll here — its
+  // bottomAligned + maxHeight role is taken over by TranscriptView's
+  // built-in scroller.
   return (
-    <CollapsibleScroll
+    <TranscriptView
+      transcript={value}
+      onClick={() => {
+        if (!disabled) setEditing(true);
+      }}
+      disabled={disabled}
       expanded={expanded}
       bottomAligned={bottomAligned}
-      bottomAlignKey={value.length}
-    >
-      <TranscriptView
-        transcript={value}
-        onClick={() => {
-          if (!disabled) setEditing(true);
-        }}
-        disabled={disabled}
-      />
-    </CollapsibleScroll>
+    />
   );
-}
+});
 
 // Styled transcript reader. Each line is its own block so we can hang
 // a coloured speaker dot in the left gutter (absolute-positioned at
@@ -1369,61 +1398,138 @@ function TranscriptEditor({
 // flight). The dot's click bubbles up to enter edit mode too — its
 // own purpose is purely visual / a hover affordance, since the rename
 // UI lives in the chip strip above.
-function TranscriptView({
+// Parse each transcript line once per transcript change. With long
+// recordings (~3-5k lines), running the regex inside render on every
+// parent re-render is a measurable bottleneck. Cache the parsed
+// structure keyed by the transcript string instead.
+type ParsedTranscriptLine =
+  | { kind: "speaker"; lead: string; label: string; trimmedLabel: string; rest: string }
+  | { kind: "plain"; text: string };
+
+function parseTranscriptLines(transcript: string): ParsedTranscriptLine[] {
+  return transcript.split("\n").map((line) => {
+    const m = line.match(/^(\s*)([^:]{1,40}):\s(.*)$/);
+    if (m) {
+      const [, lead, label, rest] = m;
+      return { kind: "speaker", lead, label, trimmedLabel: label.trim(), rest };
+    }
+    return { kind: "plain", text: line };
+  });
+}
+
+const TranscriptView = memo(function TranscriptView({
   transcript,
   onClick,
   disabled,
+  expanded,
+  bottomAligned,
 }: {
   transcript: string;
   onClick: () => void;
   disabled: boolean;
+  expanded: boolean;
+  bottomAligned: boolean;
 }) {
   const labels = useMemo(() => extractSpeakerLabels(transcript), [transcript]);
   const colors = useMemo(() => speakerColorMap(labels), [labels]);
-  const lines = transcript.split("\n");
+  const lines = useMemo(() => parseTranscriptLines(transcript), [transcript]);
+
+  // Virtualize the line list. With long meetings the DOM grows to 3-5k
+  // line nodes; even when memoized, the browser still spends layout +
+  // paint time per scroll frame proportional to that node count. Render
+  // only the visible window + a small buffer instead.
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+  const virtualizer = useVirtualizer({
+    count: lines.length,
+    getScrollElement: () => scrollRef.current,
+    // Slightly higher than the rendered line-height so the first paint
+    // is roughly correct; measureElement corrects after mount.
+    estimateSize: () => 24,
+    overscan: 12,
+  });
+
+  // Live recording: pin to the latest line so newly transcribed chunks
+  // stay visible without manual scrolling. Equivalent to the old
+  // `bottomAligned` flex-end trick, but expressed as a scrollToIndex.
+  useEffect(() => {
+    if (!bottomAligned || lines.length === 0) return;
+    virtualizer.scrollToIndex(lines.length - 1, { align: "end" });
+  }, [bottomAligned, lines.length, virtualizer]);
 
   return (
     <div
+      ref={scrollRef}
       onClick={onClick}
       title={disabled ? "Editing is paused while recording" : "Click to edit"}
       className={
-        "text-sm leading-relaxed text-[var(--color-text-muted)] " +
+        "text-sm leading-relaxed text-[var(--color-text-muted)] overflow-y-auto " +
         (disabled ? "cursor-default" : "cursor-text")
       }
+      style={{ maxHeight: expanded ? "70vh" : "14rem" }}
     >
-      {lines.map((line, i) => {
-        const m = line.match(/^(\s*)([^:]{1,40}):\s(.*)$/);
-        if (m) {
-          const [, lead, label, rest] = m;
-          const trimmedLabel = label.trim();
-          const color = colors.get(trimmedLabel);
-          if (color) {
-            return (
-              <div key={i} className="relative whitespace-pre-wrap">
-                <span
-                  className="nd-speaker-dot"
-                  style={{ background: color }}
-                  title={trimmedLabel}
-                  aria-label={`Speaker: ${trimmedLabel}`}
-                />
-                <span aria-hidden className="opacity-0 select-none">
-                  {lead}
-                  {label}:{" "}
-                </span>
-                {rest || " "}
+      <div
+        style={{
+          height: virtualizer.getTotalSize(),
+          position: "relative",
+          width: "100%",
+        }}
+      >
+        {virtualizer.getVirtualItems().map((vrow) => {
+          const line = lines[vrow.index];
+          let content: React.ReactNode;
+          if (line.kind === "speaker") {
+            const color = colors.get(line.trimmedLabel);
+            if (color) {
+              content = (
+                <div className="relative whitespace-pre-wrap">
+                  <span
+                    className="nd-speaker-dot"
+                    style={{ background: color }}
+                    title={line.trimmedLabel}
+                    aria-label={`Speaker: ${line.trimmedLabel}`}
+                  />
+                  <span aria-hidden className="opacity-0 select-none">
+                    {line.lead}
+                    {line.label}:{" "}
+                  </span>
+                  {line.rest || " "}
+                </div>
+              );
+            } else {
+              content = (
+                <div className="whitespace-pre-wrap">
+                  {`${line.lead}${line.label}: ${line.rest}` || " "}
+                </div>
+              );
+            }
+          } else {
+            content = (
+              <div className="whitespace-pre-wrap">
+                {line.text || " "}
               </div>
             );
           }
-        }
-        return (
-          <div key={i} className="whitespace-pre-wrap">
-            {line || " "}
-          </div>
-        );
-      })}
+          return (
+            <div
+              key={vrow.key}
+              data-index={vrow.index}
+              ref={virtualizer.measureElement}
+              style={{
+                position: "absolute",
+                top: 0,
+                left: 0,
+                width: "100%",
+                transform: `translateY(${vrow.start}px)`,
+              }}
+            >
+              {content}
+            </div>
+          );
+        })}
+      </div>
     </div>
   );
-}
+});
 
 // Playback view. Renders the audio player and the timeline-driven
 // transcript with active-turn highlighting. Each turn is its own button:
@@ -1437,7 +1543,7 @@ function TranscriptView({
 // next recording or re-diarize regenerates the bundle. Acceptable
 // trade-off for v1; the alternative (chunk-level edit UI) is a much
 // bigger refactor.
-function TranscriptPlayer({
+const TranscriptPlayer = memo(function TranscriptPlayer({
   noteId,
   timeline,
   setTimeline,
@@ -1489,17 +1595,33 @@ function TranscriptPlayer({
   );
   const colors = useMemo(() => speakerColorMap(labels), [labels]);
 
+  // Virtualize the chunk rows. Each row also embeds N word <span>s; for
+  // long meetings the total DOM cost is multiplicative (chunks × words)
+  // and dominates scroll/paint frames. Virtualizing collapses it to the
+  // visible window plus a small overscan buffer.
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+  const virtualizer = useVirtualizer({
+    count: timeline.length,
+    getScrollElement: () => scrollRef.current,
+    // Chunks vary in height by word count; estimate is a typical
+    // single-line chunk, measureElement corrects after mount.
+    estimateSize: () => 32,
+    overscan: 8,
+  });
+
   useEffect(() => {
-    if (scrollAnchorIdx < 0 || !containerRef.current) return;
-    const el = containerRef.current.querySelector(`[data-idx="${scrollAnchorIdx}"]`);
-    if (el && "scrollIntoView" in el) {
-      // Instant scroll, not smooth: rapid clicks across distant rows
-      // would otherwise pile up smooth-scroll animations that the
-      // compositor tries to interpolate concurrently — measurable
-      // jank, and on long recordings can compound.
-      (el as HTMLElement).scrollIntoView({ block: "nearest" });
-    }
-  }, [scrollAnchorIdx]);
+    if (scrollAnchorIdx < 0) return;
+    // virtualizer's scrollToIndex handles the "not yet rendered" case
+    // by scrolling first, letting the row mount, then aligning. The
+    // align:"nearest" mirrors the old scrollIntoView semantics.
+    virtualizer.scrollToIndex(scrollAnchorIdx, { align: "auto" });
+  }, [scrollAnchorIdx, virtualizer]);
+
+  // Live recording / live diarize: keep the latest chunk visible.
+  useEffect(() => {
+    if (!bottomAligned || timeline.length === 0) return;
+    virtualizer.scrollToIndex(timeline.length - 1, { align: "end" });
+  }, [bottomAligned, timeline.length, virtualizer]);
 
   // rAF-driven active-position tracker. Compute the active set fresh
   // each tick but only call setState when something actually changes,
@@ -1715,28 +1837,45 @@ function TranscriptPlayer({
           className="nd-bare w-full resize-none text-sm leading-relaxed text-[var(--color-text-muted)] focus:outline-none"
         />
       ) : (
-        <CollapsibleScroll
-          expanded={expanded}
-          bottomAligned={bottomAligned}
-          bottomAlignKey={timeline.length}
+        <div
+          ref={scrollRef}
+          className="text-sm leading-relaxed text-[var(--color-text-muted)] overflow-y-auto"
+          style={{ maxHeight: expanded ? "70vh" : "14rem" }}
         >
         <div
           ref={containerRef}
-          className="text-sm leading-relaxed text-[var(--color-text-muted)] flex flex-col gap-1"
+          style={{
+            height: virtualizer.getTotalSize(),
+            position: "relative",
+            width: "100%",
+          }}
         >
           {(() => {
             const activeSet = new Set(activeIdxs);
             const labelCount = new Set(
               timeline.map((e) => e.label).filter(Boolean),
             ).size;
-            return timeline.map((entry, i) => {
+            return virtualizer.getVirtualItems().map((vrow) => {
+            const i = vrow.index;
+            const entry = timeline[i];
             const isActive = activeSet.has(i);
             const color = entry.label ? colors.get(entry.label) : undefined;
             const cyclable = labelCount >= 2 && !!entry.label;
             const activeWordIdx = isActive ? activeWordByIdx[i] ?? -1 : -1;
             return (
               <div
-                key={i}
+                key={vrow.key}
+                data-index={i}
+                ref={virtualizer.measureElement}
+                style={{
+                  position: "absolute",
+                  top: 0,
+                  left: 0,
+                  width: "100%",
+                  transform: `translateY(${vrow.start}px)`,
+                }}
+              >
+              <div
                 data-idx={i}
                 className={
                   "group flex items-start gap-1 px-2 py-1 rounded transition-colors " +
@@ -1822,15 +1961,16 @@ function TranscriptPlayer({
                   </button>
                 )}
               </div>
+              </div>
             );
           });
           })()}
         </div>
-        </CollapsibleScroll>
+        </div>
       )}
     </div>
   );
-}
+});
 
 function escapeHtml(s: string): string {
   return s
