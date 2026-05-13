@@ -398,6 +398,13 @@ struct OllamaChatRequest<'a> {
     // serde-untagged with both shapes; for Qwen 3.5 / DeepSeek users a
     // bool is correct.
     think: bool,
+    // Seconds to keep the model resident after the response finishes.
+    // 0 = unload immediately; default would be 300 (5 min). With
+    // num_ctx=65536 the KV cache is multi-GB, so leaving it warm pins a
+    // big chunk of RAM and keeps the OS memory compressor busy long
+    // after the summary completes. Trade-off: the next summary in the
+    // same session reloads the model (~5-15s).
+    keep_alive: i32,
     options: OllamaOptions,
 }
 
@@ -493,6 +500,7 @@ where
         ],
         stream: true,
         think,
+        keep_alive: 0,
         options: OllamaOptions {
             // Mode-specific temp + top_p per Qwen team. Higher temp in
             // thinking is counter-intuitive but their reasoning is that
