@@ -466,11 +466,10 @@ struct OllamaOptions {
     num_predict: i32,
     // Input context window. Ollama's default is 2048 tokens — way too small
     // for meeting transcripts. Anything longer than ~1500 words is silently
-    // truncated from the front, so the model only summarizes the tail. 65536
-    // handles ~4-5 hour meetings with headroom (rough rate: 150-200 wpm × 1.3
-    // tokens/word ≈ 12K tokens/hour). Ollama allocates KV cache up-front based
-    // on this; for Qwen 3.5 4B that's ~2 GB on top of model weights, which is
-    // fine on 16 GB machines.
+    // truncated from the front. Sized adaptively at the call site based on
+    // actual prompt length + output budget, bounded [8192, 65536]. Caller
+    // computes the value because too-large a window inflates KV-cache RAM
+    // 2-4 GB and OOMs Ollama on tighter machines.
     num_ctx: i32,
 }
 
@@ -515,6 +514,24 @@ where
     F: FnMut(StreamChunk) + Send,
 {
     let url = format!("{native_base}/chat");
+    let num_predict: i32 = if think { 8192 } else { 4096 };
+    // Adaptive num_ctx: size the KV cache to the actual prompt + output
+    // budget, not a fixed 65536. A flat 65K was killing Ollama on tighter
+    // machines ("model runner has unexpectedly stopped") because the KV
+    // cache for that window can run 2-4 GB on top of model weights — fine
+    // on a 32 GB Mac with nothing else running, OOM otherwise. Rough
+    // estimate: ~4 chars/token for English/Norwegian; round up to the
+    // next power of two for clean Ollama allocation; bound to
+    // [8192, 65536]. A typical 2-hour meeting (~20K input tokens) gets
+    // 32K context — half the RAM of the old fixed value, still 10× more
+    // than Ollama's silent-truncating 2048 default.
+    let approx_input_tokens = (system_prompt.len() + user_message.len()) / 4;
+    let need = approx_input_tokens + (num_predict as usize) + 512;
+    let mut ctx: usize = 8192;
+    while ctx < need && ctx < 65536 {
+        ctx *= 2;
+    }
+    let num_ctx = ctx as i32;
     let req = OllamaChatRequest {
         model,
         messages: vec![
@@ -543,13 +560,13 @@ where
             // headroom while still failing fast on degenerate loops (was
             // 16384, but a stuck Qwen takes ~9 minutes to hit that — too
             // long to wait for the timeout to free up Ollama).
-            num_predict: if think { 8192 } else { 4096 },
-            num_ctx: 65536,
+            num_predict,
+            num_ctx,
         },
     };
     let started = std::time::Instant::now();
     eprintln!(
-        "[llm] POST {url} (ollama-native, streaming) model={model} think={think} system_chars={} user_chars={}",
+        "[llm] POST {url} (ollama-native, streaming) model={model} think={think} system_chars={} user_chars={} num_ctx={num_ctx}",
         system_prompt.len(),
         user_message.len()
     );
