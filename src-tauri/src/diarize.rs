@@ -21,11 +21,136 @@ use tokio::process::Command;
 // 16 kHz mono Float32, and the actual diarization. It writes a single JSON
 // array of segments to stdout and exits.
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Segment {
     pub start_ms: u64,
     pub end_ms: u64,
     pub speaker_id: String,
+}
+
+/// Maximum gap (ms) between two same-speaker segments to merge them
+/// into one continuous turn. Sortformer in particular often slices a
+/// single speaker's turn into multiple sub-segments separated by 100-
+/// 200 ms of model-internal frame boundaries; merging recovers the
+/// natural turn shape.
+const SAME_SPEAKER_MERGE_GAP_MS: u64 = 250;
+
+/// Maximum duration (ms) for a segment to be a candidate for "noise"
+/// dropping. Anything longer is treated as a real turn regardless of
+/// what overlaps it.
+const NOISE_CANDIDATE_MAX_MS: u64 = 600;
+
+/// Minimum fraction of a candidate segment's duration that must be
+/// covered by a longer different-speaker segment for the candidate to
+/// be dropped as noise.
+const NOISE_OVERLAP_THRESHOLD: f64 = 0.80;
+
+/// The containing different-speaker segment must be at least this many
+/// times longer than the candidate. Avoids dropping a 500 ms segment
+/// because a 600 ms different-speaker segment happens to overlap it.
+const NOISE_CONTAINER_LENGTH_RATIO: u64 = 2;
+
+/// Hard floor: any segment under this length is dropped unconditionally.
+/// Below ~150 ms we're well under the duration of a real speech turn —
+/// these are per-frame prediction blips.
+const HARD_FLOOR_MS: u64 = 150;
+
+/// Pre-processing pass over raw diarize output. Sortformer in particular
+/// produces highly fragmented segments — for example a 60-minute
+/// recording yielded 2072 segments with median duration 960 ms, 32%
+/// under 500 ms, and frequent overlap between different-speaker
+/// segments. Without cleaning, walking word-level alignment over this
+/// segment set produces hyper-fragmented `LabelledPiece` sequences
+/// that downstream flicker absorption (`bridge_short_interjections`)
+/// cannot fully rescue.
+///
+/// Three passes, applied in order:
+///   1. Merge adjacent same-speaker segments separated by ≤250 ms gap
+///      or overlapping. Recovers continuous turns Sortformer's
+///      per-frame output sliced into pieces.
+///   2. Drop short segments (<600 ms) that are ≥80% contained inside
+///      a longer (2× or more) different-speaker segment. These are
+///      almost always per-frame prediction blips, not real backchannels.
+///   3. Drop any remaining segment under 150 ms unconditionally.
+///
+/// Idempotent: re-running `clean_segments` on its own output is a no-op.
+pub fn clean_segments(segments: Vec<Segment>) -> Vec<Segment> {
+    let merged = merge_same_speaker(segments);
+    let denoised = drop_contained_noise(merged);
+    drop_subthreshold(denoised)
+}
+
+fn merge_same_speaker(segments: Vec<Segment>) -> Vec<Segment> {
+    if segments.is_empty() {
+        return segments;
+    }
+    // Group by speaker, then within each speaker walk in start order
+    // and merge gap-adjacent or overlapping pairs.
+    let mut by_speaker: std::collections::HashMap<String, Vec<Segment>> =
+        std::collections::HashMap::new();
+    for s in segments {
+        by_speaker.entry(s.speaker_id.clone()).or_default().push(s);
+    }
+    let mut out: Vec<Segment> = Vec::new();
+    for (_, mut segs) in by_speaker {
+        segs.sort_by_key(|s| (s.start_ms, s.end_ms));
+        let mut merged: Vec<Segment> = Vec::new();
+        for s in segs.drain(..) {
+            match merged.last_mut() {
+                Some(last)
+                    if s.start_ms.saturating_sub(last.end_ms) <= SAME_SPEAKER_MERGE_GAP_MS =>
+                {
+                    last.end_ms = last.end_ms.max(s.end_ms);
+                }
+                _ => merged.push(s),
+            }
+        }
+        out.extend(merged);
+    }
+    out.sort_by_key(|s| (s.start_ms, s.end_ms));
+    out
+}
+
+fn drop_contained_noise(segments: Vec<Segment>) -> Vec<Segment> {
+    let n = segments.len();
+    let mut keep = vec![true; n];
+    for i in 0..n {
+        let dur = segments[i].end_ms.saturating_sub(segments[i].start_ms);
+        if dur >= NOISE_CANDIDATE_MAX_MS || dur == 0 {
+            continue;
+        }
+        for j in 0..n {
+            if i == j || segments[j].speaker_id == segments[i].speaker_id {
+                continue;
+            }
+            let other_dur = segments[j].end_ms.saturating_sub(segments[j].start_ms);
+            if other_dur < dur.saturating_mul(NOISE_CONTAINER_LENGTH_RATIO) {
+                continue;
+            }
+            let overlap_start = segments[i].start_ms.max(segments[j].start_ms);
+            let overlap_end = segments[i].end_ms.min(segments[j].end_ms);
+            if overlap_end <= overlap_start {
+                continue;
+            }
+            let overlap = overlap_end - overlap_start;
+            if (overlap as f64 / dur as f64) >= NOISE_OVERLAP_THRESHOLD {
+                keep[i] = false;
+                break;
+            }
+        }
+    }
+    segments
+        .into_iter()
+        .zip(keep)
+        .filter_map(|(s, k)| if k { Some(s) } else { None })
+        .collect()
+}
+
+fn drop_subthreshold(segments: Vec<Segment>) -> Vec<Segment> {
+    segments
+        .into_iter()
+        .filter(|s| s.end_ms.saturating_sub(s.start_ms) >= HARD_FLOOR_MS)
+        .collect()
 }
 
 /// Run speaker diarization on a WAV file by invoking the speaker-diarize
@@ -404,4 +529,105 @@ pub async fn delete(app: &AppHandle, engine: Engine) -> Result<()> {
         return Err(anyhow!("speaker-diarize delete: {stderr}"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn seg(start: u64, end: u64, spk: &str) -> Segment {
+        Segment {
+            start_ms: start,
+            end_ms: end,
+            speaker_id: spk.to_string(),
+        }
+    }
+
+    #[test]
+    fn empty_input_stays_empty() {
+        assert!(clean_segments(vec![]).is_empty());
+    }
+
+    #[test]
+    fn merges_same_speaker_within_gap() {
+        let input = vec![
+            seg(0, 1000, "S0"),
+            seg(1100, 2000, "S0"), // gap 100ms → merge
+            seg(3000, 4000, "S0"), // gap 1000ms → don't merge
+        ];
+        assert_eq!(
+            clean_segments(input),
+            vec![seg(0, 2000, "S0"), seg(3000, 4000, "S0")]
+        );
+    }
+
+    #[test]
+    fn merges_overlapping_same_speaker() {
+        let input = vec![seg(0, 1000, "S0"), seg(500, 1500, "S0")];
+        assert_eq!(clean_segments(input), vec![seg(0, 1500, "S0")]);
+    }
+
+    #[test]
+    fn does_not_merge_across_speakers() {
+        let input = vec![seg(0, 1000, "S0"), seg(1100, 2000, "S1")];
+        assert_eq!(
+            clean_segments(input),
+            vec![seg(0, 1000, "S0"), seg(1100, 2000, "S1")]
+        );
+    }
+
+    #[test]
+    fn drops_contained_noise_sortformer_pattern() {
+        // Classic Sortformer artifact: 81ms S1 sliver fully inside an
+        // 800ms S0 segment. Drop the sliver.
+        let input = vec![seg(480, 1280, "S0"), seg(799, 880, "S1")];
+        assert_eq!(clean_segments(input), vec![seg(480, 1280, "S0")]);
+    }
+
+    #[test]
+    fn keeps_short_segment_when_not_contained_by_other_speaker() {
+        // S1 says something brief BETWEEN two S0 turns — no S0 segment
+        // surrounds it, so it survives as a real turn.
+        let input = vec![
+            seg(0, 1000, "S0"),
+            seg(2000, 2500, "S1"),
+            seg(3500, 4500, "S0"),
+        ];
+        assert_eq!(clean_segments(input.clone()), input);
+    }
+
+    #[test]
+    fn keeps_short_segment_when_container_isnt_twice_as_long() {
+        // 400ms S1 vs 500ms S0 overlap — S0 is only 1.25x longer, not
+        // 2x. Don't drop — could be a genuine short turn.
+        let input = vec![seg(0, 500, "S0"), seg(100, 500, "S1")];
+        // After merge_same_speaker (no-op, different speakers) and
+        // drop_contained_noise (rejected by length ratio), both remain.
+        let out = clean_segments(input);
+        assert_eq!(out.len(), 2);
+        assert!(out.contains(&seg(0, 500, "S0")));
+        assert!(out.contains(&seg(100, 500, "S1")));
+    }
+
+    #[test]
+    fn drops_subthreshold_segments() {
+        let input = vec![
+            seg(0, 100, "S0"),   // 100ms — under 150ms floor → drop
+            seg(200, 500, "S1"), // 300ms — keep
+        ];
+        assert_eq!(clean_segments(input), vec![seg(200, 500, "S1")]);
+    }
+
+    #[test]
+    fn idempotent() {
+        let input = vec![
+            seg(0, 1000, "S0"),
+            seg(1100, 2000, "S0"),
+            seg(2500, 3000, "S1"),
+            seg(799, 880, "S1"), // noise inside S0[0..1000] after merge → drop
+        ];
+        let once = clean_segments(input);
+        let twice = clean_segments(once.clone());
+        assert_eq!(once, twice);
+    }
 }

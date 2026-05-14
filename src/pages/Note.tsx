@@ -1595,33 +1595,93 @@ const TranscriptPlayer = memo(function TranscriptPlayer({
   );
   const colors = useMemo(() => speakerColorMap(labels), [labels]);
 
+  // Collapse consecutive same-speaker timeline entries into a single
+  // rendered "turn". The DB transcript already merges them — the
+  // playback view used to render one row per timeline entry, which
+  // produced fragments like "Duer sjef? Er" / "sjefen?" / "Askep ..."
+  // as three separate blue bullets even though they're one Speaker 1
+  // paragraph in the saved transcript. Grouping at render time keeps
+  // per-chunk audio anchors (each constituent chunk's words stay
+  // distinct for karaoke highlight and click-to-seek) while showing
+  // one bullet per speaker turn.
+  //
+  // `indices` references back into `timeline` so the per-chunk IPCs
+  // (label cycle, delete) still operate on the underlying chunks.
+  // `wordCountByChunk` lets the active-word highlight map an
+  // (active chunk index, active word index in that chunk) pair to a
+  // single position in the flattened `words` array.
+  const groups = useMemo(() => {
+    type Group = {
+      label: string;
+      indices: number[];
+      startMs: number;
+      endMs: number;
+      text: string;
+      words: Array<{ text: string; start_ms: number; end_ms: number }>;
+      wordCountByChunk: number[];
+    };
+    const out: Group[] = [];
+    for (let i = 0; i < timeline.length; i++) {
+      const e = timeline[i];
+      const ws = e.words ?? [];
+      const label = e.label || "";
+      const last = out[out.length - 1];
+      if (last && last.label === label) {
+        last.indices.push(i);
+        last.endMs = Math.max(last.endMs, e.end_ms);
+        last.text = last.text ? `${last.text} ${e.text}` : e.text;
+        last.words.push(...ws);
+        last.wordCountByChunk.push(ws.length);
+      } else {
+        out.push({
+          label,
+          indices: [i],
+          startMs: e.start_ms,
+          endMs: e.end_ms,
+          text: e.text,
+          words: [...ws],
+          wordCountByChunk: [ws.length],
+        });
+      }
+    }
+    return out;
+  }, [timeline]);
+
+  const chunkToGroup = useMemo(() => {
+    const m = new Map<number, number>();
+    groups.forEach((g, gi) => g.indices.forEach((ci) => m.set(ci, gi)));
+    return m;
+  }, [groups]);
+
   // Virtualize the chunk rows. Each row also embeds N word <span>s; for
   // long meetings the total DOM cost is multiplicative (chunks × words)
   // and dominates scroll/paint frames. Virtualizing collapses it to the
   // visible window plus a small overscan buffer.
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const virtualizer = useVirtualizer({
-    count: timeline.length,
+    count: groups.length,
     getScrollElement: () => scrollRef.current,
-    // Chunks vary in height by word count; estimate is a typical
-    // single-line chunk, measureElement corrects after mount.
+    // Turns vary in height by word count; estimate is a typical
+    // single-line turn, measureElement corrects after mount.
     estimateSize: () => 32,
     overscan: 8,
   });
 
   useEffect(() => {
     if (scrollAnchorIdx < 0) return;
-    // virtualizer's scrollToIndex handles the "not yet rendered" case
-    // by scrolling first, letting the row mount, then aligning. The
-    // align:"nearest" mirrors the old scrollIntoView semantics.
-    virtualizer.scrollToIndex(scrollAnchorIdx, { align: "auto" });
-  }, [scrollAnchorIdx, virtualizer]);
+    // The rAF tick still tracks anchor by chunk index (the underlying
+    // playback unit). Translate to the visible group index so the
+    // virtualizer scrolls to the right row.
+    const groupIdx = chunkToGroup.get(scrollAnchorIdx);
+    if (groupIdx === undefined) return;
+    virtualizer.scrollToIndex(groupIdx, { align: "auto" });
+  }, [scrollAnchorIdx, virtualizer, chunkToGroup]);
 
-  // Live recording / live diarize: keep the latest chunk visible.
+  // Live recording / live diarize: keep the latest turn visible.
   useEffect(() => {
-    if (!bottomAligned || timeline.length === 0) return;
-    virtualizer.scrollToIndex(timeline.length - 1, { align: "end" });
-  }, [bottomAligned, timeline.length, virtualizer]);
+    if (!bottomAligned || groups.length === 0) return;
+    virtualizer.scrollToIndex(groups.length - 1, { align: "end" });
+  }, [bottomAligned, groups.length, virtualizer]);
 
   // rAF-driven active-position tracker. Compute the active set fresh
   // each tick but only call setState when something actually changes,
@@ -1760,38 +1820,49 @@ const TranscriptPlayer = memo(function TranscriptPlayer({
   // without re-recording. Optimistic local update so the row
   // disappears instantly, then the IPC rebuilds note.transcript
   // from the surviving entries.
-  async function deleteChunk(idx: number) {
+  async function deleteGroup(g: { indices: number[] }) {
     if (disabled) return;
-    setTimeline((tl) => tl.filter((_, i) => i !== idx));
-    try {
-      await ipc.noteTimelineDeleteChunk(noteId, idx);
-      useRecordingStore.getState().pushFlash("Line deleted");
-    } catch (err) {
-      console.error("noteTimelineDeleteChunk failed", err);
+    const set = new Set(g.indices);
+    // Delete from highest chunk index to lowest so each IPC sees a
+    // valid still-present index in the backend timeline (which the
+    // first delete starts shifting). The optimistic frontend update
+    // operates on the original index set in one shot.
+    const sortedDesc = [...g.indices].sort((a, b) => b - a);
+    setTimeline((tl) => tl.filter((_, i) => !set.has(i)));
+    for (const ci of sortedDesc) {
+      try {
+        await ipc.noteTimelineDeleteChunk(noteId, ci);
+      } catch (err) {
+        console.error("noteTimelineDeleteChunk failed", err);
+      }
     }
+    useRecordingStore
+      .getState()
+      .pushFlash(g.indices.length === 1 ? "Line deleted" : "Turn deleted");
   }
 
-  // Click a chunk pill to cycle to the next known speaker. The set
-  // of known speakers is whatever currently appears in the timeline,
-  // so the user can reach any label they've already named without
-  // typing — and after a re-diarize gives them a couple of base
-  // speakers, they can rename one in the chip strip and then cycle
-  // chunks onto it.
-  async function cycleChunkLabel(idx: number) {
+  // Click a turn's speaker dot to cycle the whole turn to the next
+  // known speaker. The set of known speakers is whatever currently
+  // appears in the timeline, so after a re-diarize gives the user a
+  // couple of base speakers, they can rename one in the chip strip
+  // and then cycle whole turns onto it.
+  async function cycleGroupLabel(g: { label: string; indices: number[] }) {
     if (disabled) return;
     const labels = Array.from(new Set(timeline.map((e) => e.label).filter(Boolean)));
     if (labels.length < 2) return;
-    const current = timeline[idx].label;
-    const at = labels.indexOf(current);
+    const at = labels.indexOf(g.label);
     const next = labels[(at + 1) % labels.length] ?? labels[0];
-    if (next === current) return;
+    if (next === g.label) return;
+    const set = new Set(g.indices);
     setTimeline((tl) =>
-      tl.map((e, i) => (i === idx ? { ...e, label: next } : e)),
+      tl.map((e, i) => (set.has(i) ? { ...e, label: next } : e)),
     );
-    try {
-      await ipc.noteTimelineSetChunkLabel(noteId, idx, next);
-    } catch (err) {
-      console.error("noteTimelineSetChunkLabel failed", err);
+    for (const ci of g.indices) {
+      try {
+        await ipc.noteTimelineSetChunkLabel(noteId, ci, next);
+      } catch (err) {
+        console.error("noteTimelineSetChunkLabel failed", err);
+      }
     }
   }
 
@@ -1851,21 +1922,45 @@ const TranscriptPlayer = memo(function TranscriptPlayer({
           }}
         >
           {(() => {
-            const activeSet = new Set(activeIdxs);
+            const activeChunkSet = new Set(activeIdxs);
             const labelCount = new Set(
               timeline.map((e) => e.label).filter(Boolean),
             ).size;
             return virtualizer.getVirtualItems().map((vrow) => {
-            const i = vrow.index;
-            const entry = timeline[i];
-            const isActive = activeSet.has(i);
-            const color = entry.label ? colors.get(entry.label) : undefined;
-            const cyclable = labelCount >= 2 && !!entry.label;
-            const activeWordIdx = isActive ? activeWordByIdx[i] ?? -1 : -1;
+            const gi = vrow.index;
+            const g = groups[gi];
+            // A turn is active when any of its constituent chunks is.
+            // Mic + sys overlap with the same label is rare after the
+            // bridge, but we still want both to count.
+            const isActive = g.indices.some((ci) => activeChunkSet.has(ci));
+            const color = g.label ? colors.get(g.label) : undefined;
+            const cyclable = labelCount >= 2 && !!g.label;
+            // Map the (chunk idx, word idx within chunk) pair the rAF
+            // tick tracks into the flattened position in g.words. Each
+            // chunk contributes wordCountByChunk[k] words; sum prior
+            // contributions to find the offset of the active chunk
+            // inside the group, then add its in-chunk active word
+            // index. A single audio position can light up at most one
+            // word per active chunk; with non-overlapping turns this is
+            // exactly one word in the group.
+            const activeFlatIdxs = new Set<number>();
+            if (isActive) {
+              let offset = 0;
+              for (let k = 0; k < g.indices.length; k++) {
+                const ci = g.indices[k];
+                if (activeChunkSet.has(ci)) {
+                  const w = activeWordByIdx[ci];
+                  if (w !== undefined && w >= 0) {
+                    activeFlatIdxs.add(offset + w);
+                  }
+                }
+                offset += g.wordCountByChunk[k];
+              }
+            }
             return (
               <div
                 key={vrow.key}
-                data-index={i}
+                data-index={gi}
                 ref={virtualizer.measureElement}
                 style={{
                   position: "absolute",
@@ -1876,7 +1971,7 @@ const TranscriptPlayer = memo(function TranscriptPlayer({
                 }}
               >
               <div
-                data-idx={i}
+                data-idx={gi}
                 className={
                   "group flex items-start gap-1 px-2 py-1 rounded transition-colors " +
                   (isActive
@@ -1884,19 +1979,19 @@ const TranscriptPlayer = memo(function TranscriptPlayer({
                     : "hover:bg-[var(--color-pill-hover)]")
                 }
               >
-                {entry.label && color && (
+                {g.label && color && (
                   <div className="relative w-3 shrink-0 self-stretch">
                     <button
                       type="button"
                       onClick={(e) => {
                         e.stopPropagation();
-                        void cycleChunkLabel(i);
+                        void cycleGroupLabel(g);
                       }}
                       disabled={!cyclable || disabled}
                       title={
                         cyclable
-                          ? `${entry.label} — click to reassign`
-                          : entry.label
+                          ? `${g.label} — click to reassign`
+                          : g.label
                       }
                       className="nd-speaker-dot"
                       style={{
@@ -1904,14 +1999,14 @@ const TranscriptPlayer = memo(function TranscriptPlayer({
                         left: 0,
                         top: "calc(0.5lh - 5px)",
                       }}
-                      aria-label={`Speaker: ${entry.label}`}
+                      aria-label={`Speaker: ${g.label}`}
                     />
                   </div>
                 )}
-                {entry.words && entry.words.length > 0 ? (
+                {g.words.length > 0 ? (
                   <div className="flex-1 nd-bare cursor-text leading-relaxed">
-                    {entry.words.map((w, wi) => {
-                      const wordActive = isActive && wi === activeWordIdx;
+                    {g.words.map((w, wi) => {
+                      const wordActive = activeFlatIdxs.has(wi);
                       return (
                         <span
                           key={wi}
@@ -1939,11 +2034,11 @@ const TranscriptPlayer = memo(function TranscriptPlayer({
                 ) : (
                   <button
                     type="button"
-                    onClick={() => seek(entry.start_ms)}
+                    onClick={() => seek(g.startMs)}
                     title="Click to play from here"
                     className="text-left flex-1 nd-bare cursor-text"
                   >
-                    {entry.text}
+                    {g.text}
                   </button>
                 )}
                 {!disabled && (
@@ -1951,10 +2046,18 @@ const TranscriptPlayer = memo(function TranscriptPlayer({
                     type="button"
                     onClick={(e) => {
                       e.stopPropagation();
-                      void deleteChunk(i);
+                      void deleteGroup(g);
                     }}
-                    title="Delete this line"
-                    aria-label="Delete this line"
+                    title={
+                      g.indices.length === 1
+                        ? "Delete this line"
+                        : "Delete this turn"
+                    }
+                    aria-label={
+                      g.indices.length === 1
+                        ? "Delete this line"
+                        : "Delete this turn"
+                    }
                     className="nd-bare shrink-0 self-start opacity-0 group-hover:opacity-100 transition-opacity p-0.5 rounded text-[var(--color-text-muted)] hover:text-[var(--color-accent)] hover:bg-[var(--color-pill-hover)]"
                   >
                     <X size={14} strokeWidth={1.5} />

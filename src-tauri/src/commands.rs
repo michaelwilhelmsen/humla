@@ -438,7 +438,14 @@ async fn rediarize_apply_to_chunks(
     emit_status(&app, Some(&note_id), Phase::Diarizing);
 
     type Splitter = dyn Fn(&ChunkRecord) -> Vec<LabelledPiece> + Send;
-    let split_chunk: Box<Splitter> = match (mic_chunks_present, sys_chunks_present) {
+    struct DiarizeStage {
+        splitter: Box<Splitter>,
+        // Cloned so the diagnostic dump can resolve per-word speaker IDs
+        // after the original Vec has been moved into the closure.
+        segments_for_dump: Vec<diarize::Segment>,
+        source_tag: &'static str,
+    }
+    let stage: DiarizeStage = match (mic_chunks_present, sys_chunks_present) {
         (true, false) => {
             let Some(wav) = mic_wav.clone() else {
                 emit_status(&app, None, Phase::Idle);
@@ -447,15 +454,27 @@ async fn rediarize_apply_to_chunks(
                 ));
             };
             let segments =
-                diarize::diarize_file(&app, &wav, expected_speakers, engine, thresholds).await?;
-            write_diagnostics_json(&app, &note_id, engine, "mic", &segments, &chunks, &thresholds)
-                .await;
+                diarize_and_maybe_clean(&app, &wav, expected_speakers, engine, thresholds).await?;
             if segments.is_empty() {
+                // No splitter to build → write the bare diagnostic (no
+                // pieces) before bailing so the user can still inspect
+                // "diarize ran but found nothing".
+                write_diagnostics_json(
+                    &app, &note_id, engine, "mic", &segments, &chunks, &thresholds, None, None,
+                )
+                .await;
                 emit_status(&app, None, Phase::Idle);
                 return Err(anyhow::anyhow!("diarize returned no segments"));
             }
+            let segments_for_dump = segments.clone();
             let display_map = build_display_map(&chunks, &segments, ChunkSource::Mic);
-            Box::new(move |c: &ChunkRecord| split_by_segments(c, &segments, &display_map))
+            DiarizeStage {
+                splitter: Box::new(move |c: &ChunkRecord| {
+                    split_by_segments(c, &segments, &display_map)
+                }),
+                segments_for_dump,
+                source_tag: "mic",
+            }
         }
         (false, true) => {
             let Some(wav) = sys_wav.clone() else {
@@ -465,30 +484,38 @@ async fn rediarize_apply_to_chunks(
                 ));
             };
             let segments =
-                diarize::diarize_file(&app, &wav, expected_speakers, engine, thresholds).await?;
-            write_diagnostics_json(&app, &note_id, engine, "sys", &segments, &chunks, &thresholds)
-                .await;
+                diarize_and_maybe_clean(&app, &wav, expected_speakers, engine, thresholds).await?;
             if segments.is_empty() {
+                write_diagnostics_json(
+                    &app, &note_id, engine, "sys", &segments, &chunks, &thresholds, None, None,
+                )
+                .await;
                 emit_status(&app, None, Phase::Idle);
                 return Err(anyhow::anyhow!("diarize returned no segments"));
             }
+            let segments_for_dump = segments.clone();
             let display_map = build_display_map(&chunks, &segments, ChunkSource::Sys);
-            Box::new(move |c: &ChunkRecord| split_by_segments(c, &segments, &display_map))
+            DiarizeStage {
+                splitter: Box::new(move |c: &ChunkRecord| {
+                    split_by_segments(c, &segments, &display_map)
+                }),
+                segments_for_dump,
+                source_tag: "sys",
+            }
         }
         (true, true) => {
             // Hybrid: mic = "You", sys = diarize (and split mid-chunk
             // when sys chunks contain multiple remote speakers).
             let sys_speaker_hint = expected_speakers.map(|n| (n - 1).max(1));
             let segments = if let Some(p) = sys_wav.as_ref() {
-                diarize::diarize_file(&app, p, sys_speaker_hint, engine, thresholds)
+                diarize_and_maybe_clean(&app, p, sys_speaker_hint, engine, thresholds)
                     .await
                     .unwrap_or_default()
             } else {
                 Vec::new()
             };
-            write_diagnostics_json(&app, &note_id, engine, "sys", &segments, &chunks, &thresholds)
-                .await;
-            if segments.is_empty() {
+            let segments_for_dump = segments.clone();
+            let splitter: Box<Splitter> = if segments.is_empty() {
                 Box::new(move |c: &ChunkRecord| match c.source {
                     ChunkSource::Mic => single_piece(c, Some("You".to_string())),
                     ChunkSource::Sys => single_piece(c, Some("Speaker 1".to_string())),
@@ -499,6 +526,11 @@ async fn rediarize_apply_to_chunks(
                     ChunkSource::Mic => single_piece(c, Some("You".to_string())),
                     ChunkSource::Sys => split_by_segments(c, &segments, &display_map),
                 })
+            };
+            DiarizeStage {
+                splitter,
+                segments_for_dump,
+                source_tag: "sys",
             }
         }
         (false, false) => {
@@ -507,6 +539,27 @@ async fn rediarize_apply_to_chunks(
         }
     };
 
+    // Capture the labelled-piece sequence at both the pre- and post-
+    // bridge stages so the diagnostic can show what the sandwich rule
+    // did (or, more interestingly, didn't do) for this run.
+    let pieces_pre = build_pieces_unbridged(&chunks, stage.splitter.as_ref());
+    let mut pieces_post = pieces_pre.clone();
+    bridge_short_interjections(&mut pieces_post);
+    absorb_text_continuation_chains(&mut pieces_post);
+    write_diagnostics_json(
+        &app,
+        &note_id,
+        engine,
+        stage.source_tag,
+        &stage.segments_for_dump,
+        &chunks,
+        &thresholds,
+        Some(&pieces_pre),
+        Some(&pieces_post),
+    )
+    .await;
+
+    let split_chunk = stage.splitter;
     let new_transcript = build_labelled_transcript(&chunks, split_chunk.as_ref());
     if new_transcript.trim().is_empty() {
         emit_status(&app, None, Phase::Idle);
@@ -1184,6 +1237,70 @@ fn active_diarize_engine(state: &State<AppState>) -> diarize::Engine {
     diarize::Engine::from_setting(&id)
 }
 
+/// Whether to run `diarize::clean_segments` over the raw sidecar output
+/// before walking word-level alignment against it. Defaults to true.
+/// Toggle off via `update settings set value='false' where key='diarize_clean_segments'`
+/// to A/B against the raw output for the same recording.
+fn should_clean_diarize_segments(app: &AppHandle) -> bool {
+    let state: State<AppState> = app.state();
+    let conn = state.db.lock();
+    db::get_setting(&conn, "diarize_clean_segments")
+        .ok()
+        .flatten()
+        .map(|s| s != "false")
+        .unwrap_or(true)
+}
+
+/// Drop-in replacement for `diarize::diarize_file` at sites that feed
+/// segments into `split_by_segments`. Runs the diarize sidecar, then
+/// (when enabled) hands the segments through `diarize::clean_segments`
+/// to merge same-speaker fragments, drop contained-inside noise, and
+/// floor sub-150ms artifacts. Logs the pre/post counts so the user can
+/// see the reduction in the dev console.
+async fn diarize_and_maybe_clean(
+    app: &AppHandle,
+    audio_path: &std::path::Path,
+    num_speakers: Option<i64>,
+    engine: diarize::Engine,
+    thresholds: diarize::Thresholds,
+) -> anyhow::Result<Vec<diarize::Segment>> {
+    let raw = diarize::diarize_file(app, audio_path, num_speakers, engine, thresholds).await?;
+    if !should_clean_diarize_segments(app) {
+        return Ok(raw);
+    }
+    let raw_count = raw.len();
+    let cleaned = diarize::clean_segments(raw);
+    eprintln!(
+        "diarize_clean: {raw_count} segments → {} after cleaning",
+        cleaned.len()
+    );
+    Ok(cleaned)
+}
+
+/// Serialize a sequence of `LabelledPiece`s for the diagnostic dump.
+/// Includes the speaker label, the joined text, a word count, the
+/// acoustic span (last word's end - first word's start, chunk-relative),
+/// and the individual word texts so a reader can correlate against the
+/// `chunks` array without having to re-derive the alignment.
+fn pieces_to_json(pieces: &[LabelledPiece]) -> Vec<serde_json::Value> {
+    pieces
+        .iter()
+        .map(|p| {
+            let words_text: Vec<&str> = p.words.iter().map(|w| w.text.as_str()).collect();
+            let first = p.words.first().map(|w| w.start_ms).unwrap_or(0);
+            let last = p.words.last().map(|w| w.end_ms).unwrap_or(0);
+            let span_ms = last.saturating_sub(first);
+            serde_json::json!({
+                "label": p.label,
+                "text": p.text,
+                "word_count": p.text.split_whitespace().count(),
+                "span_ms": span_ms,
+                "words": words_text,
+            })
+        })
+        .collect()
+}
+
 /// Write a JSON snapshot of one diarize run for inspection. Lands at
 /// <app_data>/diagnostics/<note_id>/<engine>-<source>.json, overwritten
 /// each time the same combination runs (e.g. switching engines or
@@ -1193,6 +1310,12 @@ fn active_diarize_engine(state: &State<AppState>) -> diarize::Engine {
 /// shifts and decide whether the threshold is too aggressive or too
 /// loose. Best-effort: a write failure logs and proceeds, never breaks
 /// the diarize pipeline.
+///
+/// `pieces_pre` and `pieces_post` are the labelled-piece sequence the
+/// transcript emitter walks, captured before and after
+/// `bridge_short_interjections` runs. When both are present the dump
+/// also includes a `bridge_changes` diff so flicker-absorption
+/// decisions (and non-decisions) are inspectable.
 async fn write_diagnostics_json(
     app: &AppHandle,
     note_id: &str,
@@ -1201,6 +1324,8 @@ async fn write_diagnostics_json(
     segments: &[diarize::Segment],
     chunks: &[ChunkRecord],
     thresholds: &diarize::Thresholds,
+    pieces_pre: Option<&[LabelledPiece]>,
+    pieces_post: Option<&[LabelledPiece]>,
 ) {
     let Ok(app_dir) = app.path().app_data_dir() else {
         eprintln!("diagnostics: app_data_dir unavailable, skipping write");
@@ -1226,14 +1351,25 @@ async fn write_diagnostics_json(
             // 15s chunk that contains a back-and-forth gets only one
             // speaker. Empty when the original transcribe provider
             // didn't return word data (current OpenAI API).
+            //
+            // `speaker_id` is the raw diarizer output for each word's
+            // absolute-time midpoint — same lookup `split_by_segments`
+            // uses. Surfacing it lets us audit whether word-level
+            // assignment is actually happening, or whether the chunk
+            // fell through to the no-words fallback path.
             let words: Vec<_> = c
                 .words
                 .iter()
                 .map(|w| {
+                    let mid =
+                        w.start_ms.saturating_add(w.end_ms.saturating_sub(w.start_ms) / 2);
+                    let abs = c.start_ms.saturating_add(mid);
+                    let speaker_id = assign_speaker(abs, segments).map(|s| s.to_string());
                     serde_json::json!({
                         "text": w.text,
                         "start_ms": w.start_ms,
                         "end_ms": w.end_ms,
+                        "speaker_id": speaker_id,
                     })
                 })
                 .collect();
@@ -1245,6 +1381,36 @@ async fn write_diagnostics_json(
             })
         })
         .collect();
+
+    // The post-split piece sequence is what `build_labelled_transcript`
+    // emits as `Speaker N: ...` lines. Capturing both the pre- and post-
+    // bridge versions, plus the diff, makes flicker-absorption decisions
+    // (or non-decisions) inspectable: every entry in `bridge_changes`
+    // is a piece the sandwich rule moved; every short A-B-A pattern that
+    // ISN'T in `bridge_changes` is a piece the bridge declined to move,
+    // and the reason is decidable from word count + duration + neighbours.
+    let pieces_pre_json = pieces_pre.map(|pieces| pieces_to_json(pieces));
+    let pieces_post_json = pieces_post.map(|pieces| pieces_to_json(pieces));
+    let bridge_changes = match (pieces_pre, pieces_post) {
+        (Some(pre), Some(post)) if pre.len() == post.len() => pre
+            .iter()
+            .zip(post.iter())
+            .enumerate()
+            .filter_map(|(i, (a, b))| {
+                if a.label != b.label {
+                    Some(serde_json::json!({
+                        "piece_idx": i,
+                        "from": a.label,
+                        "to": b.label,
+                    }))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>(),
+        _ => Vec::new(),
+    };
+
     let payload = serde_json::json!({
         "engine": engine_arg,
         "source": source,
@@ -1255,6 +1421,9 @@ async fn write_diagnostics_json(
         },
         "segments": segments,
         "chunks": chunk_payload,
+        "pieces_before_bridge": pieces_pre_json,
+        "pieces_after_bridge": pieces_post_json,
+        "bridge_changes": bridge_changes,
         "created_at": chrono::Utc::now().timestamp_millis(),
     });
 
@@ -2276,7 +2445,7 @@ async fn diarize_and_apply(
                     );
                     single_speaker_fallback()
                 }
-                Some(wav) => match diarize::diarize_file(&app, &wav, expected_speakers, engine, thresholds).await {
+                Some(wav) => match diarize_and_maybe_clean(&app, &wav, expected_speakers, engine, thresholds).await {
                     Err(e) => {
                         eprintln!("diarize: mic diarize failed ({e}), falling back to single-speaker labels");
                         emit_error(
@@ -2296,7 +2465,7 @@ async fn diarize_and_apply(
                         single_speaker_fallback()
                     }
                     Ok(segments) => {
-                        write_diagnostics_json(&app, &note_id, engine, "mic", &segments, &chunks, &thresholds).await;
+                        write_diagnostics_json(&app, &note_id, engine, "mic", &segments, &chunks, &thresholds, None, None).await;
                         let display_map = build_display_map(&chunks, &segments, ChunkSource::Mic);
                         Box::new(move |c: &ChunkRecord| split_by_segments(c, &segments, &display_map))
                     }
@@ -2319,7 +2488,7 @@ async fn diarize_and_apply(
                     );
                     single_speaker_fallback()
                 }
-                Some(wav) => match diarize::diarize_file(&app, &wav, expected_speakers, engine, thresholds).await {
+                Some(wav) => match diarize_and_maybe_clean(&app, &wav, expected_speakers, engine, thresholds).await {
                     Err(e) => {
                         eprintln!("diarize: sys diarize failed ({e}), falling back to single-speaker labels");
                         emit_error(
@@ -2339,7 +2508,7 @@ async fn diarize_and_apply(
                         single_speaker_fallback()
                     }
                     Ok(segments) => {
-                        write_diagnostics_json(&app, &note_id, engine, "sys", &segments, &chunks, &thresholds).await;
+                        write_diagnostics_json(&app, &note_id, engine, "sys", &segments, &chunks, &thresholds, None, None).await;
                         let display_map = build_display_map(&chunks, &segments, ChunkSource::Sys);
                         Box::new(move |c: &ChunkRecord| split_by_segments(c, &segments, &display_map))
                     }
@@ -2388,7 +2557,7 @@ async fn diarize_and_apply(
                     );
                     single_speaker_fallback()
                 }
-                Some(wav) => match diarize::diarize_file(&app, &wav, sys_speaker_hint, engine, thresholds).await {
+                Some(wav) => match diarize_and_maybe_clean(&app, &wav, sys_speaker_hint, engine, thresholds).await {
                     Err(e) => {
                         eprintln!("diarize: sys diarize failed ({e}), falling back to single-speaker labels");
                         emit_error(
@@ -2403,7 +2572,7 @@ async fn diarize_and_apply(
                         single_speaker_fallback()
                     }
                     Ok(segments) => {
-                        write_diagnostics_json(&app, &note_id, engine, "sys", &segments, &chunks, &thresholds).await;
+                        write_diagnostics_json(&app, &note_id, engine, "sys", &segments, &chunks, &thresholds, None, None).await;
                         let display_map = build_display_map(&chunks, &segments, ChunkSource::Sys);
                         Box::new(move |c: &ChunkRecord| match c.source {
                             ChunkSource::Mic => single_piece(c, Some("You".to_string())),
@@ -2876,6 +3045,17 @@ fn serialize_timeline(
         max_word_end_abs: Option<u64>,
     }
     let mut entries: Vec<Entry> = Vec::new();
+    // Parallel pieces vec used solely as input to
+    // `bridge_short_interjections`, then drained back into `entries`
+    // below. We can't bridge `entries` directly because the bridge's
+    // sandwich rule reads `LabelledPiece.words` for duration; entries
+    // hold absolute-time word JSON. Keeping a parallel `LabelledPiece`
+    // sequence is the minimal way to ensure the timeline emits the
+    // same speaker labels `build_labelled_transcript` does — without
+    // this, the DB transcript collapses correctly but the playback
+    // view (driven by timeline.jsonl) still renders per-chunk
+    // speaker flicker.
+    let mut bridge_pieces: Vec<LabelledPiece> = Vec::new();
     for chunk in &sorted {
         for piece in split_chunk(chunk) {
             let trimmed = piece.text.trim();
@@ -2917,7 +3097,13 @@ fn serialize_timeline(
                 words: words_abs,
                 max_word_end_abs,
             });
+            bridge_pieces.push(piece);
         }
+    }
+    bridge_short_interjections(&mut bridge_pieces);
+    absorb_text_continuation_chains(&mut bridge_pieces);
+    for (entry, bridged) in entries.iter_mut().zip(bridge_pieces.iter()) {
+        entry.label = bridged.label.clone().unwrap_or_default();
     }
 
     let next_same_source_start: Vec<u64> = entries
@@ -3003,16 +3189,23 @@ fn token_containment(a: &[String], b: &[String]) -> f32 {
 
 /// Maximum word count for a labelled piece to be considered a "short
 /// interjection" eligible for absorption into the surrounding speaker.
-/// Common backchannels are 1–3 words ("yeah", "right", "ok got it",
-/// "mhm").
-const BRIDGE_MAX_WORDS: usize = 3;
+/// Bumped from 3 → 6 after the segment-cleaning pass exposed a long
+/// tail of clearly mis-attributed mid-sentence fragments at the
+/// 4–6 word range ("Sjefen over alle sjefer", "Jeg tok det feil. Det er"
+/// etc.) — all sandwich-shaped, all sub-3500ms, all obviously the
+/// surrounding speaker's own words. Real ≥7 word replies, even when
+/// sandwiched, still pass through.
+const BRIDGE_MAX_WORDS: usize = 6;
 
 /// Maximum acoustic duration for a piece to be considered an
 /// interjection. Word-count alone can't separate "yeah totally" (a
 /// 0.6s backchannel) from "let me check" (a 1.5s real reply); the
-/// acoustic length is what makes them distinguishable. A backchannel
-/// is structurally brief — speakers don't pause to deliver them.
-const BRIDGE_MAX_DURATION_MS: u64 = 1_500;
+/// acoustic length is what makes them distinguishable. Bumped from
+/// 1500 → 3500 ms together with `BRIDGE_MAX_WORDS` so a 4-second
+/// "Den er litt sånn …" mid-sentence fragment can be absorbed when
+/// it's clearly the surrounding speaker — without sweeping up true
+/// short replies delivered slowly (those usually run past 3500 ms).
+const BRIDGE_MAX_DURATION_MS: u64 = 3_500;
 
 /// Collapse short cross-speaker interjections into the surrounding
 /// speaker run. The diarizer (FluidAudio community-1 + VBx) sometimes
@@ -3080,6 +3273,144 @@ fn bridge_short_interjections(pieces: &mut [LabelledPiece]) {
     }
 }
 
+/// Maximum chain length to consider for text-continuation absorption.
+/// Bounds the blast radius if the algorithm latches onto a long
+/// legitimate cross-speaker exchange that happens to alternate without
+/// clean punctuation breaks. Six pieces covers every mis-attribution
+/// chain we've observed in dogfooded recordings.
+const CONTINUATION_CHAIN_MAX_LEN: usize = 6;
+
+/// Whether `text`'s last meaningful character is a sentence terminator
+/// (`.!?:;`). Trailing ellipsis ("..." or Unicode "…") is stripped first
+/// because Whisper uses them to mark trailing-off mid-utterance, not
+/// sentence end — a distinction `ends_sentence` deliberately ignores
+/// since its callers (the text-level merge passes) want to be
+/// conservative about fusing across any pause cue.
+fn piece_ends_terminator(text: &str) -> bool {
+    let mut trimmed = text.trim_end();
+    loop {
+        let prev_len = trimmed.len();
+        trimmed = trimmed.trim_end_matches('…').trim_end();
+        if trimmed.ends_with("...") {
+            trimmed = trimmed[..trimmed.len() - 3].trim_end();
+        }
+        if trimmed.len() == prev_len {
+            break;
+        }
+    }
+    let core = trimmed
+        .trim_end_matches(|c: char| matches!(c, '"' | '\'' | ')' | ']' | '»' | '”' | '’'));
+    matches!(
+        core.chars().last(),
+        Some('.') | Some('!') | Some('?') | Some(':') | Some(';')
+    )
+}
+
+/// Whether `text` opens with a continuation cue — lowercase letter or
+/// leading ellipsis. Pairs with `piece_ends_terminator` to detect when
+/// two consecutive pieces are one sentence even though the diarizer
+/// gave them different labels.
+fn piece_starts_continuation(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    if trimmed.starts_with("...") || trimmed.starts_with('…') {
+        return true;
+    }
+    trimmed
+        .chars()
+        .next()
+        .map(|c| c.is_lowercase())
+        .unwrap_or(false)
+}
+
+/// Collapse "text continuation chains" — consecutive pieces where each
+/// pair signals "still one sentence" via text cues (previous ends
+/// without a terminator AND current starts with a lowercase letter or
+/// ellipsis). Within such a chain, if labels disagree, one wins and
+/// the whole chain is relabelled to it.
+///
+/// Winner selection:
+///   1. If the pieces immediately before and after the chain share a
+///      label, AND that label appears somewhere in the chain, use it.
+///      This catches the A-B-A-long-fragment pattern: surrounding
+///      Speaker 1 context outvotes the mis-attributed middle even
+///      when the middle has more words.
+///   2. Otherwise the label with the highest total word count in the
+///      chain wins. The longer text is the more reliably-diarized
+///      side, so when context can't break the tie we trust word
+///      density.
+///
+/// Complements `bridge_short_interjections`, which only fires on
+/// strict A-B-A sandwiches with B short and brief. This rule catches:
+///   - A-B-A with B long (multi-word mid-sentence fragments the
+///     acoustic bridge rejects on word/duration limits)
+///   - A-B-C with no clean acoustic sandwich but clear textual flow
+///   - Longer chains where Sortformer alternated labels piece-by-piece
+///     through a single speaker's utterance
+///
+/// Trades a small risk of merging a legitimate cross-speaker
+/// interruption (the interrupter happens to finish the original
+/// speaker's sentence) for substantial reduction of single-speaker
+/// fragmentation. Acceptable because clean interruptions usually
+/// carry their own punctuation cues; we only act when the text says
+/// "still one sentence."
+fn absorb_text_continuation_chains(pieces: &mut [LabelledPiece]) {
+    if pieces.len() < 2 {
+        return;
+    }
+    let mut i = 0;
+    while i < pieces.len() {
+        let mut end = i;
+        while end + 1 < pieces.len()
+            && end - i + 1 < CONTINUATION_CHAIN_MAX_LEN
+            && !piece_ends_terminator(&pieces[end].text)
+            && piece_starts_continuation(&pieces[end + 1].text)
+        {
+            end += 1;
+        }
+        if end > i {
+            let pre_label = if i > 0 {
+                pieces[i - 1].label.clone()
+            } else {
+                None
+            };
+            let post_label = if end + 1 < pieces.len() {
+                pieces[end + 1].label.clone()
+            } else {
+                None
+            };
+            let mut word_count_by_label: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
+            for k in i..=end {
+                if let Some(label) = &pieces[k].label {
+                    let wc = pieces[k].text.split_whitespace().count();
+                    *word_count_by_label.entry(label.clone()).or_insert(0) += wc;
+                }
+            }
+            if word_count_by_label.len() >= 2 {
+                let chosen = pre_label
+                    .as_ref()
+                    .filter(|l| post_label.as_ref() == Some(l))
+                    .filter(|l| word_count_by_label.contains_key(l.as_str()))
+                    .cloned()
+                    .or_else(|| {
+                        word_count_by_label
+                            .iter()
+                            .max_by_key(|(_, &c)| c)
+                            .map(|(k, _)| k.clone())
+                    });
+                if let Some(winner) = chosen {
+                    for k in i..=end {
+                        if pieces[k].label.is_some() {
+                            pieces[k].label = Some(winner.clone());
+                        }
+                    }
+                }
+            }
+        }
+        i = end + 1;
+    }
+}
+
 /// Rebuild the transcript by walking chunks in chronological order and
 /// emitting each one prefixed with its assigned label. Same-label runs
 /// get a single space between chunks (continuation); label changes get
@@ -3100,10 +3431,14 @@ fn bridge_short_interjections(pieces: &mut [LabelledPiece]) {
 /// see that function for details. Short cross-speaker interjections
 /// are absorbed into the surrounding speaker via
 /// `bridge_short_interjections` before emit.
-fn build_labelled_transcript(
+/// Pure pipeline up to (but not including) `bridge_short_interjections`.
+/// Extracted so the diagnostic dump can capture the same pre-bridge piece
+/// sequence the transcript emitter walks, without duplicating the
+/// dedup/sort/split logic.
+fn build_pieces_unbridged(
     chunks: &[ChunkRecord],
     split_chunk: &(dyn Fn(&ChunkRecord) -> Vec<LabelledPiece> + Send),
-) -> String {
+) -> Vec<LabelledPiece> {
     let kept = dedup_mic_against_sys(chunks);
     let mut sorted: Vec<&ChunkRecord> = kept.iter().collect();
     sorted.sort_by_key(|c| {
@@ -3123,7 +3458,16 @@ fn build_labelled_transcript(
             all_pieces.push(piece);
         }
     }
+    all_pieces
+}
+
+fn build_labelled_transcript(
+    chunks: &[ChunkRecord],
+    split_chunk: &(dyn Fn(&ChunkRecord) -> Vec<LabelledPiece> + Send),
+) -> String {
+    let mut all_pieces = build_pieces_unbridged(chunks, split_chunk);
     bridge_short_interjections(&mut all_pieces);
+    absorb_text_continuation_chains(&mut all_pieces);
 
     let mut output = String::new();
     let mut last_label: Option<String> = None;
@@ -4800,11 +5144,11 @@ mod diarize_tests {
 
     #[test]
     fn bridge_keeps_long_reply_distinct() {
-        // A five-word reply exceeds BRIDGE_MAX_WORDS, so the speaker
-        // boundary survives even when sandwiched.
+        // A seven-word reply exceeds BRIDGE_MAX_WORDS (6), so the
+        // speaker boundary survives even when sandwiched.
         let mut pieces = vec![
             piece(Some("Speaker 1"), "do you have time", true),
-            piece(Some("Speaker 2"), "no I really do not", true),
+            piece(Some("Speaker 2"), "no I really do not have time", true),
             piece(Some("Speaker 1"), "ok let me try later", true),
         ];
         bridge_short_interjections(&mut pieces);
@@ -4814,13 +5158,13 @@ mod diarize_tests {
     #[test]
     fn bridge_keeps_short_but_slow_reply_distinct() {
         // Same speaker on either side, a sandwich, but the middle
-        // piece's acoustic span is 2 s — too long to be a backchannel.
-        // The duration gate is what protects real short turns
-        // ("absolutely" delivered slowly, "no problem at all") from
-        // getting fused into the surrounding speaker.
+        // piece's acoustic span is 4 s — exceeds BRIDGE_MAX_DURATION_MS
+        // (3500). The duration gate is what protects real short turns
+        // delivered slowly ("absolutely" with a long pause-filled
+        // delivery) from getting fused into the surrounding speaker.
         let mut pieces = vec![
             piece(Some("Speaker 1"), "what do you think", true),
-            piece_with_span(Some("Speaker 2"), "no", 0, 2_000),
+            piece_with_span(Some("Speaker 2"), "no", 0, 4_000),
             piece(Some("Speaker 1"), "fair enough", true),
         ];
         bridge_short_interjections(&mut pieces);
@@ -4869,6 +5213,148 @@ mod diarize_tests {
         bridge_short_interjections(&mut pieces);
         assert_eq!(pieces[0].label.as_deref(), Some("Speaker 2"));
         assert_eq!(pieces[2].label.as_deref(), Some("Speaker 2"));
+    }
+
+    #[test]
+    fn continuation_chain_uses_surrounding_label_when_pre_and_post_agree() {
+        // The "Men det jeg kunne / gjort, var jo..." case: the
+        // 16-word mid-sentence fragment exceeds bridge limits but is
+        // clearly the surrounding speaker's continuation. pre and
+        // post both Speaker 1 → Speaker 1 wins despite Speaker 3's
+        // word count dominance inside the chain.
+        let mut pieces = vec![
+            piece(Some("Speaker 1"), "Tidligere noe annet.", true),
+            piece(Some("Speaker 1"), "Men det jeg kunne", true),
+            piece(
+                Some("Speaker 3"),
+                "gjort, var jo å endra det til å komme opp i en slags pop-opp",
+                true,
+            ),
+            piece(Some("Speaker 1"), "Sånn som den legges i lesninga her.", true),
+        ];
+        absorb_text_continuation_chains(&mut pieces);
+        assert_eq!(pieces[1].label.as_deref(), Some("Speaker 1"));
+        assert_eq!(pieces[2].label.as_deref(), Some("Speaker 1"));
+    }
+
+    #[test]
+    fn continuation_chain_picks_longest_when_pre_and_post_disagree() {
+        // "Ja, jeg" (S2) / "skjønner" (S1) / "det. Men jeg så ..."
+        // (S3, dominant): the surrounding labels disagree (pre=S3,
+        // post=S2), so the longest piece's label wins → S3.
+        let mut pieces = vec![
+            piece(
+                Some("Speaker 3"),
+                "Det er så mye rundt at vi så det ikke.",
+                true,
+            ),
+            piece(Some("Speaker 2"), "Ja, jeg", true),
+            piece(Some("Speaker 1"), "skjønner", true),
+            piece(
+                Some("Speaker 3"),
+                "det. Men jeg så vi egentlig snakka om opprinnelig,",
+                true,
+            ),
+            piece(Some("Speaker 2"), "altså, så det er ikke", true),
+        ];
+        absorb_text_continuation_chains(&mut pieces);
+        // The chain extends through pieces 1..=4 (piece 0 ends with
+        // "." → not chain head). pre=S3 (piece 0), post=None (chain
+        // reaches the end → no post). Longest wins: S3 has 9+5=14
+        // words, S2 has 2+5=7, S1 has 1. S3 wins.
+        assert_eq!(pieces[1].label.as_deref(), Some("Speaker 3"));
+        assert_eq!(pieces[2].label.as_deref(), Some("Speaker 3"));
+        assert_eq!(pieces[3].label.as_deref(), Some("Speaker 3"));
+        assert_eq!(pieces[4].label.as_deref(), Some("Speaker 3"));
+        // Outside the chain: untouched.
+        assert_eq!(pieces[0].label.as_deref(), Some("Speaker 3"));
+    }
+
+    #[test]
+    fn continuation_chain_does_nothing_when_single_label() {
+        // Chain spans pieces 0,1 but both already Speaker 1 — no-op.
+        let mut pieces = vec![
+            piece(Some("Speaker 1"), "Men jeg syns det er rart at", true),
+            piece(Some("Speaker 1"), "vi gjør det sånn.", true),
+        ];
+        let before: Vec<_> = pieces.iter().map(|p| p.label.clone()).collect();
+        absorb_text_continuation_chains(&mut pieces);
+        let after: Vec<_> = pieces.iter().map(|p| p.label.clone()).collect();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn continuation_chain_breaks_at_sentence_terminator() {
+        // Prev ends with "." → no chain. Speaker labels untouched.
+        let mut pieces = vec![
+            piece(Some("Speaker 1"), "End of one thought.", true),
+            piece(Some("Speaker 2"), "starts another with lowercase.", true),
+        ];
+        absorb_text_continuation_chains(&mut pieces);
+        assert_eq!(pieces[0].label.as_deref(), Some("Speaker 1"));
+        assert_eq!(pieces[1].label.as_deref(), Some("Speaker 2"));
+    }
+
+    #[test]
+    fn continuation_chain_breaks_at_uppercase_start() {
+        // Prev ends mid-clause, next starts uppercase → next is a new
+        // sentence (a real speaker change). Don't fuse.
+        let mut pieces = vec![
+            piece(Some("Speaker 1"), "He said", true),
+            piece(Some("Speaker 2"), "Hello world.", true),
+        ];
+        absorb_text_continuation_chains(&mut pieces);
+        assert_eq!(pieces[0].label.as_deref(), Some("Speaker 1"));
+        assert_eq!(pieces[1].label.as_deref(), Some("Speaker 2"));
+    }
+
+    #[test]
+    fn continuation_chain_treats_trailing_ellipsis_as_unfinished() {
+        // "I was going to ..." ends with "..." — Whisper's trailing-off
+        // marker, NOT a terminator. The chain should extend.
+        let mut pieces = vec![
+            piece(Some("Speaker 1"), "I was going to ...", true),
+            piece(Some("Speaker 2"), "say something here.", true),
+        ];
+        absorb_text_continuation_chains(&mut pieces);
+        // Both should share a label after absorption.
+        assert_eq!(pieces[0].label, pieces[1].label);
+    }
+
+    #[test]
+    fn continuation_chain_idempotent() {
+        let mut pieces = vec![
+            piece(Some("Speaker 1"), "Hvis du", true),
+            piece(Some("Speaker 2"), "bare klikker på testkurs oppå", true),
+            piece(Some("Speaker 2"), "den gule igjen, da.", true),
+        ];
+        absorb_text_continuation_chains(&mut pieces);
+        let once: Vec<_> = pieces.iter().map(|p| p.label.clone()).collect();
+        absorb_text_continuation_chains(&mut pieces);
+        let twice: Vec<_> = pieces.iter().map(|p| p.label.clone()).collect();
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn piece_ends_terminator_recognises_typical_endings() {
+        assert!(piece_ends_terminator("Hello world."));
+        assert!(piece_ends_terminator("Really?"));
+        assert!(piece_ends_terminator("Stop!"));
+        assert!(piece_ends_terminator("see this:"));
+        assert!(piece_ends_terminator("done.\""));
+        assert!(!piece_ends_terminator("I was going to"));
+        assert!(!piece_ends_terminator("I was going to ..."));
+        assert!(!piece_ends_terminator("Hvis du"));
+        assert!(!piece_ends_terminator("trailing comma,"));
+    }
+
+    #[test]
+    fn piece_starts_continuation_recognises_typical_openings() {
+        assert!(piece_starts_continuation("bare klikker..."));
+        assert!(piece_starts_continuation("...continuation"));
+        assert!(piece_starts_continuation("…og så"));
+        assert!(!piece_starts_continuation("Hello world"));
+        assert!(!piece_starts_continuation("Men hva nå?"));
     }
 
     #[test]

@@ -124,23 +124,27 @@ pub async fn transcribe(
     }
 }
 
-/// Glue bias terms + trailing transcript context into Whisper's
-/// `initial_prompt` slot. Vocabulary terms come first (Whisper biases
-/// toward early prompt tokens), then trail context. Returns None when
-/// neither is present so the API call omits the field.
+/// Glue trailing transcript context + bias terms into Whisper's
+/// `initial_prompt` slot. Prior context comes first, vocabulary last:
+/// Whisper hard-caps the prompt at 224 tokens and keeps only the
+/// *trailing* tokens when over budget, and trailing tokens exert greater
+/// influence on decoding. Putting vocab at the end gives it both the
+/// strongest bias and protection from silent truncation when the rolling
+/// trail is dense (especially in non-English where words tokenize wider).
+/// Returns None when neither is present so the API call omits the field.
 pub fn build_whisper_prompt(
     bias_terms: &[&str],
     prior_context: Option<&str>,
 ) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
-    if !bias_terms.is_empty() {
-        parts.push(bias_terms.join(", "));
-    }
     if let Some(ctx) = prior_context {
         let trimmed = ctx.trim();
         if !trimmed.is_empty() {
             parts.push(trimmed.to_string());
         }
+    }
+    if !bias_terms.is_empty() {
+        parts.push(bias_terms.join(", "));
     }
     if parts.is_empty() {
         None
@@ -180,7 +184,7 @@ mod tests {
     fn vocab_and_trail_join_with_period() {
         assert_eq!(
             build_whisper_prompt(&["Humla"], Some("hello world")),
-            Some("Humla. hello world".to_string())
+            Some("hello world. Humla".to_string())
         );
     }
 }
