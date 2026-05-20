@@ -308,11 +308,10 @@ pub async fn rediarize_note(app: AppHandle, note_id: String) -> Result<(), Strin
         );
     }
 
-    let diag_dir = app_dir.join("diagnostics").join(&note_id);
-    let chunks = read_chunks_from_diagnostic(&diag_dir).map_err(err)?;
+    let chunks = read_chunks_for_note(&app, &note_id).map_err(err)?;
     if chunks.is_empty() {
         return Err(
-            "No saved chunk timings for this note. Re-diarize needs the original recording's diagnostic data, which only exists for recordings made on a build that wrote diagnostic JSON."
+            "No saved chunk timings for this note. Re-diarize needs them to realign speaker labels against the transcript, and they're only written for recordings made with Audio retention enabled. Make a new recording with Audio retention on, then try again."
                 .to_string(),
         );
     }
@@ -352,7 +351,54 @@ pub async fn rediarize_note(app: AppHandle, note_id: String) -> Result<(), Strin
     .map_err(err)
 }
 
-/// Read the chunk records from any of the saved diagnostic JSONs for a
+/// Parse chunk records from a single JSON file matching the shape
+/// `{ "chunks": [{source, start_ms, text, words?}, ...] }`. Used for both
+/// the standalone `chunks.json` written next to retained audio and the
+/// per-engine diagnostic dumps under `diagnostics/<note_id>/`.
+fn parse_chunks_json(path: &std::path::Path) -> anyhow::Result<Vec<ChunkRecord>> {
+    let data = std::fs::read_to_string(path)?;
+    let v: serde_json::Value = serde_json::from_str(&data)?;
+    let Some(arr) = v.get("chunks").and_then(|c| c.as_array()) else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for c in arr {
+        let source = match c.get("source").and_then(|s| s.as_str()) {
+            Some("mic") => ChunkSource::Mic,
+            Some("sys") => ChunkSource::Sys,
+            _ => continue,
+        };
+        let start_ms = c.get("start_ms").and_then(|s| s.as_u64()).unwrap_or(0);
+        let text = c
+            .get("text")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string();
+        // Word timings are present on dumps written by builds that
+        // include word-level diarize splitting; older dumps stored
+        // chunks without them. Empty `words` makes `split_by_segments`
+        // fall back to whole-chunk labelling (one label per chunk via
+        // start_ms), matching pre-split behaviour for those notes.
+        let words: Vec<crate::recording::ChunkWord> = c
+            .get("words")
+            .and_then(|w| w.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|w| {
+                        let text = w.get("text").and_then(|s| s.as_str())?.to_string();
+                        let ws = w.get("start_ms").and_then(|s| s.as_u64())?;
+                        let we = w.get("end_ms").and_then(|s| s.as_u64())?;
+                        Some(crate::recording::ChunkWord { text, start_ms: ws, end_ms: we })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.push(ChunkRecord { source, start_ms, text, words });
+    }
+    Ok(out)
+}
+
+/// Read chunk records from any of the saved diagnostic JSONs for a
 /// note. All dumps for the same note hold the same chunk timings (they
 /// come from the original recording session and don't depend on engine
 /// or threshold), so we just take the first JSON we find.
@@ -360,62 +406,35 @@ fn read_chunks_from_diagnostic(diag_dir: &std::path::Path) -> anyhow::Result<Vec
     if !diag_dir.exists() {
         return Ok(Vec::new());
     }
-    let entries = std::fs::read_dir(diag_dir)?;
-    for entry in entries.flatten() {
+    for entry in std::fs::read_dir(diag_dir)?.flatten() {
         let path = entry.path();
         if path.extension().and_then(|s| s.to_str()) != Some("json") {
             continue;
         }
-        let data = std::fs::read_to_string(&path)?;
-        let v: serde_json::Value = serde_json::from_str(&data)?;
-        let Some(arr) = v.get("chunks").and_then(|c| c.as_array()) else {
-            continue;
-        };
-        let mut out = Vec::with_capacity(arr.len());
-        for c in arr {
-            let source = match c.get("source").and_then(|s| s.as_str()) {
-                Some("mic") => ChunkSource::Mic,
-                Some("sys") => ChunkSource::Sys,
-                _ => continue,
-            };
-            let start_ms = c.get("start_ms").and_then(|s| s.as_u64()).unwrap_or(0);
-            let text = c
-                .get("text")
-                .and_then(|s| s.as_str())
-                .unwrap_or("")
-                .to_string();
-            // Word timings are present on diagnostic dumps written by
-            // builds that include word-level diarize splitting; older
-            // dumps stored chunks without them. Empty `words` makes
-            // `split_by_segments` fall back to whole-chunk labelling
-            // (one label per chunk via start_ms), matching pre-split
-            // behaviour for those notes.
-            let words: Vec<crate::recording::ChunkWord> = c
-                .get("words")
-                .and_then(|w| w.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|w| {
-                            let text = w.get("text").and_then(|s| s.as_str())?.to_string();
-                            let ws = w.get("start_ms").and_then(|s| s.as_u64())?;
-                            let we = w.get("end_ms").and_then(|s| s.as_u64())?;
-                            Some(crate::recording::ChunkWord { text, start_ms: ws, end_ms: we })
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            out.push(ChunkRecord {
-                source,
-                start_ms,
-                text,
-                words,
-            });
-        }
-        if !out.is_empty() {
-            return Ok(out);
+        let chunks = parse_chunks_json(&path)?;
+        if !chunks.is_empty() {
+            return Ok(chunks);
         }
     }
     Ok(Vec::new())
+}
+
+/// Resolve chunk records for a note. Prefers the standalone
+/// `recordings/<note_id>/chunks.json` (written at recording-stop time
+/// alongside retained audio — survives a failed diarize), falls back to
+/// any diagnostic dump for backward compat with notes recorded before
+/// chunks.json existed.
+fn read_chunks_for_note(app: &AppHandle, note_id: &str) -> anyhow::Result<Vec<ChunkRecord>> {
+    let app_dir = app.path().app_data_dir()?;
+    let chunks_path = app_dir.join("recordings").join(note_id).join("chunks.json");
+    if chunks_path.exists() {
+        let chunks = parse_chunks_json(&chunks_path)?;
+        if !chunks.is_empty() {
+            return Ok(chunks);
+        }
+    }
+    let diag_dir = app_dir.join("diagnostics").join(note_id);
+    read_chunks_from_diagnostic(&diag_dir)
 }
 
 /// Mirror of diarize_and_apply's branching, but operating on caller-
@@ -1491,6 +1510,54 @@ async fn maybe_keep_audio(app: &AppHandle, note_id: &str, snapshot: &PostStopSna
         if let Err(e) = tokio::fs::copy(&src, target.join("sys.wav")).await {
             eprintln!("keep_audio: copy sys: {e}");
         }
+    }
+    // Persist chunk timings alongside the audio so re-diarize survives a
+    // failed/skipped diagnostic write. Read back via `read_chunks_for_note`.
+    write_chunks_json(&target, &snapshot.chunks).await;
+}
+
+/// Serialize the recording's chunk log to `<target>/chunks.json` in the
+/// same shape `parse_chunks_json` reads. Best-effort: write failures log
+/// and proceed (the dump is opportunistic — losing it costs re-diarize
+/// for that note but doesn't break anything live).
+async fn write_chunks_json(target: &std::path::Path, chunks: &[ChunkRecord]) {
+    let payload: Vec<serde_json::Value> = chunks
+        .iter()
+        .map(|c| {
+            let source = match c.source {
+                ChunkSource::Mic => "mic",
+                ChunkSource::Sys => "sys",
+            };
+            let words: Vec<_> = c
+                .words
+                .iter()
+                .map(|w| {
+                    serde_json::json!({
+                        "text": w.text,
+                        "start_ms": w.start_ms,
+                        "end_ms": w.end_ms,
+                    })
+                })
+                .collect();
+            serde_json::json!({
+                "source": source,
+                "start_ms": c.start_ms,
+                "text": c.text,
+                "words": words,
+            })
+        })
+        .collect();
+    let doc = serde_json::json!({ "chunks": payload });
+    let body = match serde_json::to_string_pretty(&doc) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("chunks_json: serialize: {e}");
+            return;
+        }
+    };
+    let path = target.join("chunks.json");
+    if let Err(e) = tokio::fs::write(&path, body).await {
+        eprintln!("chunks_json: write {}: {e}", path.display());
     }
 }
 

@@ -579,6 +579,7 @@ export function Note() {
                       );
                   }}
                 />
+                <RediarizeAction noteId={draft.id} />
                 {devMode && <DiagnosticsLinks noteId={draft.id} />}
                 {playbackUrl && timeline.length > 0 ? (
                   <TranscriptPlayer
@@ -2098,8 +2099,6 @@ function escapeHtml(s: string): string {
 function DiagnosticsLinks({ noteId }: { noteId: string }) {
   const [diagFiles, setDiagFiles] = useState<string[]>([]);
   const [audioFiles, setAudioFiles] = useState<string[]>([]);
-  const [rediarizing, setRediarizing] = useState(false);
-  const [rediarizeError, setRediarizeError] = useState<string | null>(null);
   const phase = useRecordingStore((s) => s.status.phase);
 
   useEffect(() => {
@@ -2121,11 +2120,6 @@ function DiagnosticsLinks({ noteId }: { noteId: string }) {
 
   const hasDiag = diagFiles.length > 0;
   const hasAudio = audioFiles.length > 0;
-  // Re-diarize is only meaningful when both saved audio AND original
-  // chunk timings exist. Hide it otherwise — the backend would reject
-  // with an explanation, but pre-emptively gating keeps the affordance
-  // honest.
-  const canRediarize = hasAudio && hasDiag;
   if (!hasDiag && !hasAudio) return null;
 
   async function openDiag() {
@@ -2136,16 +2130,69 @@ function DiagnosticsLinks({ noteId }: { noteId: string }) {
     const dir = await ipc.noteAudioDir(noteId);
     await ipc.openInFinder(dir);
   }
+
+  return (
+    <div className="flex items-center gap-3 text-xs text-[var(--color-text-muted)] mb-3">
+      {hasDiag && (
+        <button
+          type="button"
+          onClick={openDiag}
+          className="underline hover:text-[var(--color-text)]"
+          title="Open diagnostics folder in Finder"
+        >
+          Diagnostics ({diagFiles.length})
+        </button>
+      )}
+      {hasAudio && (
+        <button
+          type="button"
+          onClick={openAudio}
+          className="underline hover:text-[var(--color-text)]"
+          title="Open retained audio folder in Finder"
+        >
+          Audio ({audioFiles.length})
+        </button>
+      )}
+    </div>
+  );
+}
+
+// User-facing "Re-diarize" affordance — visible whenever audio retention
+// produced files for this note, regardless of dev mode. Sits above the
+// transcript player so it's adjacent to the speaker chip strip the user
+// just looked at to realise the speaker count is wrong.
+//
+// Doesn't pre-check chunks.json existence; the backend has a clear error
+// message for notes recorded before chunks were persisted (audio is
+// there, chunks aren't) so we surface that on click rather than hiding
+// the button entirely.
+function RediarizeAction({ noteId }: { noteId: string }) {
+  const [hasAudio, setHasAudio] = useState(false);
+  const [rediarizing, setRediarizing] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const phase = useRecordingStore((s) => s.status.phase);
+
+  useEffect(() => {
+    let cancelled = false;
+    ipc.noteAudioFiles(noteId)
+      .then((f) => {
+        if (!cancelled) setHasAudio(f.length > 0);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [noteId, phase]);
+
+  if (!hasAudio) return null;
+
   async function rediarize() {
     setRediarizing(true);
-    setRediarizeError(null);
+    setError(null);
     try {
       await ipc.rediarizeNote(noteId);
-      // Refresh file lists — a new diagnostic JSON gets written.
-      const next = await ipc.noteDiagnosticsFiles(noteId).catch(() => diagFiles);
-      setDiagFiles(next);
     } catch (e) {
-      setRediarizeError(String(e));
+      setError(String(e));
     } finally {
       setRediarizing(false);
     }
@@ -2153,42 +2200,18 @@ function DiagnosticsLinks({ noteId }: { noteId: string }) {
 
   return (
     <div className="flex flex-col gap-1 mb-3">
-      <div className="flex items-center gap-3 text-xs text-[var(--color-text-muted)]">
-        {hasDiag && (
-          <button
-            type="button"
-            onClick={openDiag}
-            className="underline hover:text-[var(--color-text)]"
-            title="Open diagnostics folder in Finder"
-          >
-            Diagnostics ({diagFiles.length})
-          </button>
-        )}
-        {hasAudio && (
-          <button
-            type="button"
-            onClick={openAudio}
-            className="underline hover:text-[var(--color-text)]"
-            title="Open retained audio folder in Finder"
-          >
-            Audio ({audioFiles.length})
-          </button>
-        )}
-        {canRediarize && (
-          <button
-            type="button"
-            onClick={rediarize}
-            disabled={rediarizing}
-            className="underline hover:text-[var(--color-text)] disabled:opacity-50"
-            title="Re-run diarization on the saved audio with the current settings"
-          >
-            {rediarizing ? "Re-diarizing…" : "Re-diarize"}
-          </button>
-        )}
-      </div>
-      {rediarizeError && (
+      <button
+        type="button"
+        onClick={rediarize}
+        disabled={rediarizing}
+        className="self-start text-xs underline text-[var(--color-text-muted)] hover:text-[var(--color-text)] disabled:opacity-50"
+        title="Re-run speaker detection using the saved audio and the speaker count above"
+      >
+        {rediarizing ? "Re-diarizing…" : "Re-diarize speakers"}
+      </button>
+      {error && (
         <p className="text-xs text-red-600 dark:text-red-400 break-all">
-          {rediarizeError}
+          {error}
         </p>
       )}
     </div>
