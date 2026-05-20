@@ -23,6 +23,17 @@ fn local_client() -> reqwest::Client {
         .expect("reqwest client")
 }
 
+// Cloud OpenAI summary path. Separate from `client()` (which is shared with
+// transcription, ping, list_models — all short ops) because a long meeting
+// transcript through a reasoning model can legitimately need 2–3 minutes,
+// and the default 120s timeout was tripping on those.
+fn summary_cloud_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build()
+        .expect("reqwest client")
+}
+
 pub async fn ping(api_key: &str) -> Result<bool> {
     let r = client()
         .get(format!("{BASE}/models"))
@@ -277,7 +288,7 @@ where
             ChatMessage { role: "user", content: transcript },
         ],
     };
-    let http = if is_local { local_client() } else { client() };
+    let http = if is_local { local_client() } else { summary_cloud_client() };
     let url = format!("{base_url}/chat/completions");
     let started = std::time::Instant::now();
     eprintln!(
@@ -324,16 +335,30 @@ where
                     continue;
                 }
                 if e.is_timeout() {
+                    let secs = started.elapsed().as_secs();
+                    if is_local {
+                        return Err(anyhow!(
+                            "Timed out after {secs}s waiting for {base_url}. \
+                             The local model may be stuck — restart your \
+                             local-LLM server (e.g. `pkill ollama && ollama serve`)."
+                        ));
+                    }
                     return Err(anyhow!(
-                        "Timed out after 10 minutes waiting for {base_url}. \
-                         The local model may be stuck — restart your \
-                         local-LLM server (e.g. `pkill ollama && ollama serve`)."
+                        "Timed out after {secs}s waiting for {base_url}. \
+                         OpenAI's response was unusually slow — try again, \
+                         or switch the summary provider to Local."
                     ));
                 }
                 if e.is_connect() {
+                    if is_local {
+                        return Err(anyhow!(
+                            "Couldn't reach {base_url}. Is your local-LLM \
+                             server running? (ollama serve, etc.)"
+                        ));
+                    }
                     return Err(anyhow!(
-                        "Couldn't reach {base_url}. Is your local-LLM \
-                         server running? (ollama serve, etc.)"
+                        "Couldn't reach {base_url}. Check your internet \
+                         connection and try again."
                     ));
                 }
                 return Err(anyhow!("network error talking to {base_url}: {e}"));
@@ -581,7 +606,8 @@ where
                 started.elapsed(), e.is_timeout(), e.is_connect(), e
             );
             if e.is_timeout() {
-                anyhow!("Timed out after 10 minutes waiting for {url}. Restart Ollama and try again.")
+                let secs = started.elapsed().as_secs();
+                anyhow!("Timed out after {secs}s waiting for {url}. Restart Ollama and try again.")
             } else if e.is_connect() {
                 anyhow!("Couldn't reach {url}. Is `ollama serve` running?")
             } else {
