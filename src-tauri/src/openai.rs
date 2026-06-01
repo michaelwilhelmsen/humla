@@ -4,6 +4,22 @@ use std::path::Path;
 
 pub const BASE: &str = "https://api.openai.com/v1";
 
+// Walk a reqwest::Error's source chain into a single readable string. The
+// outer Display on `Kind::Request` only says "error sending request for url
+// (...)" — the actual cause (DNS, TLS, hyper) is buried in `.source()`.
+fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut parts = vec![err.to_string()];
+    let mut src = err.source();
+    while let Some(e) = src {
+        let s = e.to_string();
+        if !parts.iter().any(|p| p == &s) {
+            parts.push(s);
+        }
+        src = e.source();
+    }
+    parts.join(" -> ")
+}
+
 pub fn client() -> reqwest::Client {
     reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(120))
@@ -296,13 +312,16 @@ where
         system_prompt.len(),
         transcript.len()
     );
-    // One retry on transient send-side errors. reqwest reuses HTTP/2
-    // connections from its pool; OpenAI's edge silently half-closes idle
-    // ones, so a long-running app's first request after a quiet period can
-    // fail with Kind::Request ("error sending request for url") before any
-    // bytes leave the wire. A fresh connection always succeeds. Don't retry
-    // on timeout (genuine slowness — a retry just doubles the wait) or
-    // connect-refused (the server is unreachable, retrying is pointless).
+    // Retry transient send-side errors. reqwest reuses HTTP/2 connections
+    // from its pool; OpenAI's edge silently half-closes idle ones, so a
+    // long-running app's first request after a quiet period can fail with
+    // Kind::Request ("error sending request for url") before any bytes
+    // leave the wire. A fresh connection usually succeeds, but in the wild
+    // we've seen the second attempt also fail (brief DNS / TLS hiccups),
+    // so allow up to two retries. Don't retry on timeout (genuine slowness
+    // — a retry just doubles the wait) or connect-refused (the server is
+    // unreachable, retrying is pointless).
+    const MAX_RETRIES: u32 = 2;
     let mut attempt: u32 = 0;
     let r = loop {
         let send_res = http
@@ -314,24 +333,26 @@ where
         match send_res {
             Ok(resp) => break resp,
             Err(e) => {
-                let retryable = !e.is_timeout() && !e.is_connect() && attempt == 0;
+                let retryable =
+                    !e.is_timeout() && !e.is_connect() && attempt < MAX_RETRIES;
                 eprintln!(
-                    "[llm] send error after {:?}: timeout={} connect={} attempt={} retrying={} body={}",
+                    "[llm] send error after {:?}: timeout={} connect={} attempt={} retrying={} body={} source={}",
                     started.elapsed(),
                     e.is_timeout(),
                     e.is_connect(),
                     attempt,
                     retryable,
-                    e
+                    e,
+                    error_chain(&e),
                 );
                 if retryable {
                     attempt += 1;
-                    // Short backoff so we don't immediately reuse the same
-                    // stale pooled connection. reqwest's pool is FIFO-ish;
-                    // by the time we re-enter `.send()` the bad entry is
-                    // typically already discarded by hyper's keepalive
-                    // checker. 500ms is empirically enough.
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    // Backoff lengthens with each retry so we don't immediately
+                    // reuse the same stale pooled connection and so brief
+                    // network blips have time to clear. 500ms then 1.5s.
+                    let backoff_ms = 500u64.saturating_mul(attempt as u64).max(500);
+                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms))
+                        .await;
                     continue;
                 }
                 if e.is_timeout() {
@@ -361,7 +382,17 @@ where
                          connection and try again."
                     ));
                 }
-                return Err(anyhow!("network error talking to {base_url}: {e}"));
+                let cause = error_chain(&e);
+                if is_local {
+                    return Err(anyhow!(
+                        "Network error talking to {base_url}: {cause}. \
+                         Check that your local-LLM server is reachable."
+                    ));
+                }
+                return Err(anyhow!(
+                    "Network error talking to OpenAI: {cause}. \
+                     Check your internet connection (DNS / VPN / proxy) and try again."
+                ));
             }
         }
     };
