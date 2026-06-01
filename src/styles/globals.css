@@ -765,6 +765,35 @@ select {
   border-left: 3px solid var(--color-line);
   color: var(--color-text-muted);
 }
+/* Tables come through remark-gfm. Tailwind v4 preflight strips default
+   borders and padding, so without these rules the cells collide (the cause
+   of the v0.26.3 styling bug). Wrap in a horizontal scroller in case the
+   model emits a wide table that overflows the card. */
+.prose-summary table {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  overflow-x: auto;
+  border-collapse: collapse;
+  font-size: 0.875em;
+}
+.prose-summary thead th {
+  text-align: left;
+  font-weight: 600;
+  padding: 0.55em 0.85em;
+  border-bottom: 2px solid var(--color-line-visible);
+  white-space: nowrap;
+}
+.prose-summary tbody td {
+  padding: 0.55em 0.85em;
+  border-bottom: 1px solid var(--color-line-visible);
+  vertical-align: top;
+}
+.prose-summary tbody tr:last-child td { border-bottom: 0; }
+.prose-summary th:first-child,
+.prose-summary td:first-child { padding-left: 0; }
+.prose-summary th:last-child,
+.prose-summary td:last-child { padding-right: 0; }
 
 /* Reasoning trace from local LLMs (Qwen 3.5 thinking, etc). Same markdown
    coverage as prose-summary but tuned to feel like a quiet sibling of the
@@ -824,6 +853,32 @@ select {
   border-left: 2px solid var(--color-line);
   color: var(--color-text-muted);
 }
+.prose-reasoning table {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  overflow-x: auto;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+.prose-reasoning thead th {
+  text-align: left;
+  font-weight: 600;
+  padding: 0.4em 0.7em;
+  border-bottom: 2px solid var(--color-line-visible);
+  color: var(--color-text);
+  white-space: nowrap;
+}
+.prose-reasoning tbody td {
+  padding: 0.4em 0.7em;
+  border-bottom: 1px solid var(--color-line-visible);
+  vertical-align: top;
+}
+.prose-reasoning tbody tr:last-child td { border-bottom: 0; }
+.prose-reasoning th:first-child,
+.prose-reasoning td:first-child { padding-left: 0; }
+.prose-reasoning th:last-child,
+.prose-reasoning td:last-child { padding-right: 0; }
 
 .prose-note .is-editor-empty:first-child::before {
   content: attr(data-placeholder);
