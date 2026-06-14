@@ -15,6 +15,21 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
+// Command handlers are split into submodules under `commands/`. Each holds a
+// cohesive group of #[tauri::command] fns and is re-exported with `pub use`
+// so the `commands::<name>` paths in lib.rs's generate_handler! stay unchanged.
+// Shared helpers + constants (err, DEFAULT_*, emit_*, key/config readers,
+// transcript post-processing) stay in this root module and are reached from
+// submodules via `super::` / `crate::`.
+mod folders;
+mod notes;
+mod settings;
+mod summary_prompts;
+pub use folders::*;
+pub use notes::*;
+pub use settings::*;
+pub use summary_prompts::*;
+
 const DEFAULT_LANGUAGE: &str = "no";
 // Default diarization engine. community1 = FluidAudio's
 // OfflineDiarizerManager (the path we shipped through v0.11.0). Existing
@@ -160,34 +175,6 @@ fn set_provider_api_key(
 }
 
 fn err<E: std::fmt::Display>(e: E) -> String { e.to_string() }
-
-#[tauri::command]
-pub fn notes_list(state: State<AppState>) -> Result<Vec<Note>, String> {
-    let conn = state.db.lock();
-    db::list_notes(&conn).map_err(err)
-}
-
-#[tauri::command]
-pub fn notes_get(state: State<AppState>, id: String) -> Result<Note, String> {
-    let conn = state.db.lock();
-    db::get_note(&conn, &id).map_err(err)
-}
-
-#[tauri::command]
-pub fn notes_create(state: State<AppState>) -> Result<Note, String> {
-    let conn = state.db.lock();
-    // New notes inherit the user's defaults for language + summary preset.
-    // Both are overridable per-note from the note view; pre-feature notes
-    // (empty language) fall back at transcribe / summary time.
-    let default_language = db::get_setting(&conn, "language")
-        .map_err(err)?
-        .unwrap_or_else(|| DEFAULT_LANGUAGE.to_string());
-    let default_preset = db::get_setting(&conn, "default_summary_preset")
-        .map_err(err)?
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "meeting".to_string());
-    db::create_note(&conn, &default_language, &default_preset).map_err(err)
-}
 
 #[tauri::command]
 pub fn app_data_dir(app: AppHandle) -> Result<String, String> {
@@ -1025,115 +1012,6 @@ pub fn note_diagnostics_files(app: AppHandle, note_id: String) -> Result<Vec<Str
     }
     out.sort();
     Ok(out)
-}
-
-#[tauri::command]
-pub fn notes_update(state: State<AppState>, id: String, patch: NotePatch) -> Result<(), String> {
-    let conn = state.db.lock();
-    db::update_note(&conn, &id, &patch).map_err(err)
-}
-
-#[tauri::command]
-pub fn notes_delete(state: State<AppState>, id: String) -> Result<(), String> {
-    let conn = state.db.lock();
-    db::delete_note(&conn, &id).map_err(err)
-}
-
-#[tauri::command]
-pub fn notes_move(
-    state: State<AppState>,
-    id: String,
-    folder_id: Option<String>,
-) -> Result<(), String> {
-    let conn = state.db.lock();
-    db::move_note(&conn, &id, folder_id.as_deref()).map_err(err)
-}
-
-#[tauri::command]
-pub fn folders_list(state: State<AppState>) -> Result<Vec<db::Folder>, String> {
-    let conn = state.db.lock();
-    db::list_folders(&conn).map_err(err)
-}
-
-#[tauri::command]
-pub fn folders_create(state: State<AppState>, name: String) -> Result<db::Folder, String> {
-    let trimmed = name.trim();
-    if trimmed.is_empty() {
-        return Err("Folder name cannot be empty".into());
-    }
-    let conn = state.db.lock();
-    db::create_folder(&conn, trimmed).map_err(err)
-}
-
-#[tauri::command]
-pub fn folders_rename(state: State<AppState>, id: String, name: String) -> Result<(), String> {
-    let trimmed = name.trim();
-    if trimmed.is_empty() {
-        return Err("Folder name cannot be empty".into());
-    }
-    let conn = state.db.lock();
-    db::rename_folder(&conn, &id, trimmed).map_err(err)
-}
-
-#[tauri::command]
-pub fn folders_delete(state: State<AppState>, id: String) -> Result<(), String> {
-    let conn = state.db.lock();
-    db::delete_folder(&conn, &id).map_err(err)
-}
-
-#[tauri::command]
-pub fn settings_get(state: State<AppState>, key: String) -> Result<Option<String>, String> {
-    let conn = state.db.lock();
-    db::get_setting(&conn, &key).map_err(err)
-}
-
-#[tauri::command]
-pub fn settings_set(state: State<AppState>, key: String, value: String) -> Result<(), String> {
-    let conn = state.db.lock();
-    db::set_setting(&conn, &key, &value).map_err(err)
-}
-
-#[tauri::command]
-pub fn summary_prompts_list(
-    state: State<AppState>,
-) -> Result<Vec<db::SummaryPrompt>, String> {
-    let conn = state.db.lock();
-    db::list_summary_prompts(&conn).map_err(err)
-}
-
-#[tauri::command]
-pub fn summary_prompts_create(
-    state: State<AppState>,
-    name: String,
-    content: String,
-) -> Result<db::SummaryPrompt, String> {
-    let trimmed_name = name.trim();
-    if trimmed_name.is_empty() {
-        return Err("Prompt name cannot be empty".into());
-    }
-    let conn = state.db.lock();
-    db::create_summary_prompt(&conn, trimmed_name, &content).map_err(err)
-}
-
-#[tauri::command]
-pub fn summary_prompts_update(
-    state: State<AppState>,
-    id: String,
-    name: String,
-    content: String,
-) -> Result<db::SummaryPrompt, String> {
-    let trimmed_name = name.trim();
-    if trimmed_name.is_empty() {
-        return Err("Prompt name cannot be empty".into());
-    }
-    let conn = state.db.lock();
-    db::update_summary_prompt(&conn, &id, trimmed_name, &content).map_err(err)
-}
-
-#[tauri::command]
-pub fn summary_prompts_delete(state: State<AppState>, id: String) -> Result<(), String> {
-    let conn = state.db.lock();
-    db::delete_summary_prompt(&conn, &id).map_err(err)
 }
 
 #[derive(serde::Serialize)]
