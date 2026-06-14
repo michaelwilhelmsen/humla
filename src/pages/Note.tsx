@@ -23,6 +23,7 @@ import {
 import { ipc, onSummaryThinkingDelta, onSummaryContentDelta, type Note as TNote, type SummaryPrompt, type TimelineEntry } from "../lib/ipc";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { useNotesStore, useRecordingStore } from "../lib/store";
+import { extractSpeakerLabels, renameSpeakerInTranscript } from "../lib/speakers";
 import { RecordingBar } from "../components/RecordingBar";
 import { SkeletonLines } from "../components/Skeleton";
 import { NoteEditor } from "../components/Editor";
@@ -1173,37 +1174,8 @@ function speakerColorMap(labels: string[]): Map<string, string> {
   return map;
 }
 
-// Parse the transcript for speaker turn prefixes — any line starting with
-// `<label>: ` (label can be any non-colon text) is treated as a speaker
-// turn. Returns labels in first-encounter order, deduplicated.
-function extractSpeakerLabels(transcript: string): string[] {
-  const seen = new Set<string>();
-  const result: string[] = [];
-  for (const rawLine of transcript.split("\n")) {
-    const line = rawLine.trimStart();
-    const match = line.match(/^([^:]{1,40}):\s/);
-    if (match) {
-      const label = match[1].trim();
-      if (!seen.has(label)) {
-        seen.add(label);
-        result.push(label);
-      }
-    }
-  }
-  return result;
-}
-
-// Rewrite the transcript so every "<oldLabel>: " line start becomes
-// "<newLabel>: ". Anchored to line starts via a multi-line regex; bare
-// occurrences of the label inside text are left alone. Escapes regex
-// metacharacters in oldLabel so renaming to/from values like "Speaker 1?"
-// doesn't break.
-function renameSpeakerInTranscript(transcript: string, oldLabel: string, newLabel: string): string {
-  if (oldLabel === newLabel) return transcript;
-  const escaped = oldLabel.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const re = new RegExp(`^(\\s*)${escaped}: `, "gm");
-  return transcript.replace(re, `$1${newLabel}: `);
-}
+// extractSpeakerLabels / renameSpeakerInTranscript moved to ../lib/speakers
+// (imported above) so they can be unit-tested in isolation — see speakers.test.ts.
 
 function SpeakerLabels({
   transcript,

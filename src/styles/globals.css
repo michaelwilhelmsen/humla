@@ -3,8 +3,9 @@
 
 /* Three-font system. Space Grotesk for UI body, Space Mono for labels
    and numeric data, Instrument Serif for display titles (note titles,
-   folder names, page headers). */
-@import url("https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Space+Grotesk:wght@300;400;500;700&family=Space+Mono:wght@400;700&display=swap");
+   folder names, page headers). Fonts are bundled locally via @fontsource
+   (imported in src/main.tsx) instead of fetched from Google Fonts — the app
+   renders its real fonts offline and the CSP can stay font-src 'self'. */
 
 @theme {
   --font-serif: "Instrument Serif", ui-serif, Georgia, serif;

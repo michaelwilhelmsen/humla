@@ -274,6 +274,13 @@ pub fn note_audio_files(app: AppHandle, note_id: String) -> Result<Vec<String>, 
 pub fn open_in_finder(app: AppHandle, path: String) -> Result<(), String> {
     let app_dir = app.path().app_data_dir().map_err(err)?;
     let app_dir_canon = std::fs::canonicalize(&app_dir).map_err(err)?;
+    // canonicalize() fails with a cryptic raw io error ("No such file or
+    // directory (os error 2)") if the path is gone — which can happen in the
+    // TOCTOU window between the frontend listing the folder and the user
+    // clicking (e.g. a cleanup removed it). Surface a clear message instead.
+    if !std::path::Path::new(&path).exists() {
+        return Err("folder no longer exists".into());
+    }
     let requested = std::fs::canonicalize(&path).map_err(err)?;
     if !requested.starts_with(&app_dir_canon) {
         return Err("path outside app data dir".into());
