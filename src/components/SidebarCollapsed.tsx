@@ -1,5 +1,5 @@
 import { Link, useNavigate, useLocation } from "react-router-dom";
-import { Menu, Plus, Home as HomeIcon, Settings as SettingsIcon } from "lucide-react";
+import { Menu, Plus, Files, Home as HomeIcon, Settings as SettingsIcon } from "lucide-react";
 import { ipc } from "../lib/ipc";
 import { useNotesStore } from "../lib/store";
 import { cn } from "../lib/cn";
@@ -23,6 +23,7 @@ export function SidebarCollapsed({ onExpand }: { onExpand: () => void }) {
 
   const onSettings = location.pathname.startsWith("/settings");
   const onHome = location.pathname === "/";
+  const onAllNotes = location.pathname === "/all-notes";
 
   return (
     <div className="flex flex-col items-center gap-1 pb-3 h-full">
@@ -40,6 +41,9 @@ export function SidebarCollapsed({ onExpand }: { onExpand: () => void }) {
       </IconBtn>
       <IconLink label="Home" to="/" active={onHome}>
         <HomeIcon size={18} />
+      </IconLink>
+      <IconLink label="All notes" to="/all-notes" active={onAllNotes}>
+        <Files size={18} />
       </IconLink>
       <div className="flex-1" />
       <IconLink label="Settings" to="/settings" active={onSettings}>

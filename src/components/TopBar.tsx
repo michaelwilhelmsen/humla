@@ -12,8 +12,9 @@ function resolveEffectiveTheme(theme: "system" | "light" | "dark"): "light" | "d
 
 // Floating action strip in the top-right of the main column. Sits above
 // the Layout drag strip so its buttons are clickable, but only renders on
-// pages without their own top chrome (Home, Folder). Note and Settings
-// pages have their own toolbars and would conflict.
+// list pages without their own top chrome (All notes, Folder). Home has its
+// own centred New note CTA, and Note/Settings have their own toolbars — all
+// would conflict, so we skip them.
 export function TopBar() {
   const location = useLocation();
   const navigate = useNavigate();
@@ -22,7 +23,7 @@ export function TopBar() {
   const setTheme = useThemeStore((s) => s.setTheme);
 
   const path = location.pathname;
-  const visible = path === "/" || path.startsWith("/folder/");
+  const visible = path === "/all-notes" || path.startsWith("/folder/");
   if (!visible) return null;
 
   const effective = resolveEffectiveTheme(theme);

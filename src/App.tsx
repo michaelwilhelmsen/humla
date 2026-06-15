@@ -2,6 +2,7 @@ import { Routes, Route, Navigate } from "react-router-dom";
 import { useEffect } from "react";
 import { Layout } from "./components/Layout";
 import { Home } from "./pages/Home";
+import { AllNotes } from "./pages/AllNotes";
 import { Note } from "./pages/Note";
 import { Folder } from "./pages/Folder";
 import { Settings } from "./pages/Settings";
@@ -24,6 +25,7 @@ export default function App() {
     <Routes>
       <Route element={<Layout />}>
         <Route path="/" element={<Home />} />
+        <Route path="/all-notes" element={<AllNotes />} />
         <Route path="/note/:id" element={<Note />} />
         <Route path="/folder/:id" element={<Folder />} />
         <Route path="/settings" element={<Settings />} />

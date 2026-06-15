@@ -98,7 +98,7 @@ export function Folder() {
                   <div className="max-w-3xl mx-auto w-full px-12">
                     <div className="-mx-4 px-4 py-3.5 rounded-md hover:bg-[var(--color-sidebar-active)] transition-colors flex items-center gap-6">
                       <span
-                        className="w-16 text-sm text-[var(--color-text-muted)] tabular-nums shrink-0"
+                        className="min-w-20 text-sm text-[var(--color-text-muted)] tabular-nums shrink-0 whitespace-nowrap"
                         style={{ fontFamily: "var(--font-mono)" }}
                       >
                         {formatMeetingTime(n.updated_at)}

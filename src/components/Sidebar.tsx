@@ -2,6 +2,7 @@ import { Link, useNavigate, useLocation } from "react-router-dom";
 import { useMemo, useState } from "react";
 import {
   ChevronLeft,
+  Files,
   Folder as FolderIcon,
   FolderPlus,
   Home as HomeIcon,
@@ -52,7 +53,7 @@ export function Sidebar({ onCollapse }: { onCollapse: () => void }) {
     e.stopPropagation();
     await ipc.deleteNote(id);
     removeLocal(id);
-    if (location.pathname === `/note/${id}`) navigate("/");
+    if (location.pathname === `/note/${id}`) navigate("/all-notes");
   }
 
   async function commitNewFolder() {
@@ -157,6 +158,19 @@ export function Sidebar({ onCollapse }: { onCollapse: () => void }) {
       >
         <HomeIcon size={15} strokeWidth={1.5} />
         <span>Home</span>
+      </Link>
+
+      <Link
+        to="/all-notes"
+        className={cn(
+          "no-drag flex items-center gap-2 px-2 py-2 rounded-md text-sm transition-colors",
+          location.pathname === "/all-notes"
+            ? "bg-[var(--color-sidebar-active)] text-[var(--color-text)]"
+            : "text-[var(--color-text-muted)] hover:bg-[var(--color-sidebar-active)] hover:text-[var(--color-text)]"
+        )}
+      >
+        <Files size={15} strokeWidth={1.5} />
+        <span>All notes</span>
       </Link>
 
       {creatingFolder ? (
@@ -288,7 +302,7 @@ function FolderRow({
     // navigate home so we don't end up on a dead route.
     await ipc.deleteFolder(folder.id);
     removeFolder(folder.id);
-    if (location.pathname === `/folder/${folder.id}`) navigate("/");
+    if (location.pathname === `/folder/${folder.id}`) navigate("/all-notes");
   }
 
   if (editing) {
