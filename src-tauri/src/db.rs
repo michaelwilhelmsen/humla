@@ -197,11 +197,24 @@ pub fn rename_folder(conn: &Connection, id: &str, name: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn delete_folder(conn: &Connection, id: &str) -> Result<()> {
-    // Notes in the folder fall back to root (folder_id = NULL), they're not deleted.
-    conn.execute("UPDATE notes SET folder_id = NULL WHERE folder_id = ?1", params![id])?;
+/// Delete a folder. Its notes fall back to root (`folder_id = NULL`) rather
+/// than being deleted; their `updated_at` is bumped so a sync layer re-pushes
+/// them. Returns the ids of the reparented notes so the caller can notify sync.
+pub fn delete_folder(conn: &Connection, id: &str) -> Result<Vec<String>> {
+    let now = now_ms();
+    let reparented: Vec<String> = {
+        let mut stmt = conn.prepare("SELECT id FROM notes WHERE folder_id = ?1")?;
+        let rows = stmt
+            .query_map(params![id], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    conn.execute(
+        "UPDATE notes SET folder_id = NULL, updated_at = ?2 WHERE folder_id = ?1",
+        params![id, now],
+    )?;
     conn.execute("DELETE FROM folders WHERE id = ?1", params![id])?;
-    Ok(())
+    Ok(reparented)
 }
 
 fn map_folder(row: &rusqlite::Row) -> rusqlite::Result<Folder> {

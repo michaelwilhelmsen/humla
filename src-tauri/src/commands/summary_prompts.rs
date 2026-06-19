@@ -29,7 +29,7 @@ pub fn summary_prompts_create(
         let conn = state.db.lock();
         db::create_summary_prompt(&conn, trimmed_name, &content).map_err(err)?
     };
-    state.sync.summary_prompt_changed();
+    state.sync.summary_prompt_upserted(&prompt.id);
     Ok(prompt)
 }
 
@@ -48,7 +48,7 @@ pub fn summary_prompts_update(
         let conn = state.db.lock();
         db::update_summary_prompt(&conn, &id, trimmed_name, &content).map_err(err)?
     };
-    state.sync.summary_prompt_changed();
+    state.sync.summary_prompt_upserted(&prompt.id);
     Ok(prompt)
 }
 
@@ -58,6 +58,6 @@ pub fn summary_prompts_delete(state: State<AppState>, id: String) -> Result<(), 
         let conn = state.db.lock();
         db::delete_summary_prompt(&conn, &id).map_err(err)?;
     }
-    state.sync.summary_prompt_changed();
+    state.sync.summary_prompt_deleted(&id);
     Ok(())
 }

@@ -29,11 +29,17 @@ pub trait SyncObserver: Send + Sync {
     /// the deletion will never propagate to other devices.
     fn note_deleted(&self, _id: &str) {}
 
-    /// A folder was created, renamed, or deleted.
-    fn folder_changed(&self) {}
+    /// A folder was created or renamed. `id` is the folder id.
+    fn folder_upserted(&self, _id: &str) {}
 
-    /// A custom summary prompt was created, updated, or deleted.
-    fn summary_prompt_changed(&self) {}
+    /// A folder was deleted. `id` is the now-removed folder id.
+    fn folder_deleted(&self, _id: &str) {}
+
+    /// A custom summary prompt was created or updated. `id` is the prompt id.
+    fn summary_prompt_upserted(&self, _id: &str) {}
+
+    /// A custom summary prompt was deleted. `id` is the now-removed prompt id.
+    fn summary_prompt_deleted(&self, _id: &str) {}
 }
 
 /// Open-source default: every callback is a no-op.
