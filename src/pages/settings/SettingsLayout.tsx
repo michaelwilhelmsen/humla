@@ -9,6 +9,7 @@
 // what Mac users expect for app-level preferences.
 
 import { useState, type ReactNode } from "react";
+import { useSearchParams } from "react-router-dom";
 
 export type SettingsTab = {
   id: string;
@@ -23,7 +24,11 @@ export function SettingsLayout({
   tabs: SettingsTab[];
   defaultTabId?: string;
 }) {
-  const [activeId, setActiveId] = useState<string>(defaultTabId ?? tabs[0]?.id ?? "");
+  // `?tab=<id>` deep-links a specific tab (e.g. the sidebar's "Sign in" link).
+  const [params, setParams] = useSearchParams();
+  const [activeId, setActiveId] = useState<string>(
+    params.get("tab") ?? defaultTabId ?? tabs[0]?.id ?? "",
+  );
   const active = tabs.find((t) => t.id === activeId) ?? tabs[0];
 
   return (
@@ -40,7 +45,10 @@ export function SettingsLayout({
                 key={tab.id}
                 role="tab"
                 aria-selected={isActive}
-                onClick={() => setActiveId(tab.id)}
+                onClick={() => {
+                  setActiveId(tab.id);
+                  setParams({ tab: tab.id }, { replace: true });
+                }}
                 className={
                   "text-left px-3 py-1.5 rounded-md text-sm transition-colors " +
                   (isActive

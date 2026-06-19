@@ -8,6 +8,7 @@ import { Folder } from "./pages/Folder";
 import { Settings } from "./pages/Settings";
 import { useGlobalShortcuts } from "./lib/shortcuts";
 import { useNotesStore } from "./lib/store";
+import { useCloudStore } from "./lib/cloud";
 import { useThemeBoot } from "./lib/theme";
 import { usePaletteBoot } from "./lib/palette";
 
@@ -16,10 +17,12 @@ export default function App() {
   useThemeBoot();
   usePaletteBoot();
   const refresh = useNotesStore((s) => s.refresh);
+  const refreshCloud = useCloudStore((s) => s.refresh);
 
   useEffect(() => {
     refresh();
-  }, [refresh]);
+    refreshCloud();
+  }, [refresh, refreshCloud]);
 
   return (
     <Routes>

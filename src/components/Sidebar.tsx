@@ -14,6 +14,8 @@ import { useNotesStore } from "../lib/store";
 import { ipc, type Folder, type Note } from "../lib/ipc";
 import { cn } from "../lib/cn";
 import { ContextMenu, ContextMenuItem } from "./ContextMenu";
+import { WorkspaceSwitcher } from "./WorkspaceSwitcher";
+import { useCloudStore } from "../lib/cloud";
 
 // Humla mark sourced from humla-small.svg — single-path silhouette of
 // the bee's head + antennae arc. Uses currentColor so it inherits text
@@ -130,6 +132,8 @@ export function Sidebar({ onCollapse }: { onCollapse: () => void }) {
         </button>
       </div>
 
+      <WorkspaceSwitcher />
+
       <div className="no-drag flex items-center gap-2 pl-2 pr-2 py-2 rounded-md border border-[var(--color-line)] bg-[var(--color-surface)] focus-within:border-[var(--color-text-muted)] transition-colors">
         <Search size={14} strokeWidth={1.5} className="text-[var(--color-text-muted)] shrink-0" />
         <input
@@ -239,6 +243,8 @@ export function Sidebar({ onCollapse }: { onCollapse: () => void }) {
           </>
         )}
       </div>
+
+      <AccountRow />
 
       <Link
         to="/settings"
@@ -396,6 +402,26 @@ function NoteRow({
       >
         <Trash2 size={14} strokeWidth={1.5} />
       </button>
+    </Link>
+  );
+}
+
+// Signed-in profile presence at the bottom of the sidebar. Hidden when signed
+// out (the workspace switcher already offers a sign-in affordance).
+function AccountRow() {
+  const status = useCloudStore((s) => s.status);
+  if (!status.logged_in || !status.user) return null;
+  const u = status.user;
+  return (
+    <Link
+      to="/settings?tab=account"
+      className="no-drag flex items-center gap-2 px-2 py-2 rounded-md text-sm text-[var(--color-text-muted)] hover:bg-[var(--color-sidebar-active)] hover:text-[var(--color-text)] transition-colors"
+      title="Account"
+    >
+      <span className="shrink-0 grid place-items-center w-5 h-5 rounded-full bg-[var(--color-pill-hover)] text-[9px] uppercase">
+        {(u.name || u.email).slice(0, 1)}
+      </span>
+      <span className="flex-1 min-w-0 truncate">{u.name || u.email}</span>
     </Link>
   );
 }

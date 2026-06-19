@@ -4,6 +4,8 @@ import { TranscriptionTab } from "./settings/tabs/Transcription";
 import { SummaryTab } from "./settings/tabs/Summary";
 import { ApiKeysTab } from "./settings/tabs/ApiKeys";
 import { AboutTab } from "./settings/tabs/About";
+import { AccountTab } from "./settings/tabs/Account";
+import { OrganizationTab } from "./settings/tabs/Organization";
 import { useSettings } from "./settings/useSettings";
 
 export function Settings() {
@@ -16,6 +18,16 @@ export function Settings() {
           id: "general",
           label: "General",
           content: <GeneralTab s={settings.s} update={settings.update} />,
+        },
+        {
+          id: "account",
+          label: "Account",
+          content: <AccountTab />,
+        },
+        {
+          id: "organization",
+          label: "Organization",
+          content: <OrganizationTab />,
         },
         {
           id: "transcription",
