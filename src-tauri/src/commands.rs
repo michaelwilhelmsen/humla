@@ -19,6 +19,7 @@ use tokio::process::Command;
 // submodules via `super::` / `crate::`.
 mod api_keys;
 mod assets;
+mod cloud;
 mod folders;
 mod local_llm;
 mod models;
@@ -30,6 +31,7 @@ mod summary_prompts;
 mod transcription_config;
 pub use api_keys::*;
 pub use assets::*;
+pub use cloud::*;
 pub use folders::*;
 pub use local_llm::*;
 pub use models::*;
