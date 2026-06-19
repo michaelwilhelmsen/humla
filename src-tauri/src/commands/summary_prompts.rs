@@ -25,8 +25,12 @@ pub fn summary_prompts_create(
     if trimmed_name.is_empty() {
         return Err("Prompt name cannot be empty".into());
     }
-    let conn = state.db.lock();
-    db::create_summary_prompt(&conn, trimmed_name, &content).map_err(err)
+    let prompt = {
+        let conn = state.db.lock();
+        db::create_summary_prompt(&conn, trimmed_name, &content).map_err(err)?
+    };
+    state.sync.summary_prompt_changed();
+    Ok(prompt)
 }
 
 #[tauri::command]
@@ -40,12 +44,20 @@ pub fn summary_prompts_update(
     if trimmed_name.is_empty() {
         return Err("Prompt name cannot be empty".into());
     }
-    let conn = state.db.lock();
-    db::update_summary_prompt(&conn, &id, trimmed_name, &content).map_err(err)
+    let prompt = {
+        let conn = state.db.lock();
+        db::update_summary_prompt(&conn, &id, trimmed_name, &content).map_err(err)?
+    };
+    state.sync.summary_prompt_changed();
+    Ok(prompt)
 }
 
 #[tauri::command]
 pub fn summary_prompts_delete(state: State<AppState>, id: String) -> Result<(), String> {
-    let conn = state.db.lock();
-    db::delete_summary_prompt(&conn, &id).map_err(err)
+    {
+        let conn = state.db.lock();
+        db::delete_summary_prompt(&conn, &id).map_err(err)?;
+    }
+    state.sync.summary_prompt_changed();
+    Ok(())
 }

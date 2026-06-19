@@ -8,6 +8,7 @@ mod wav;
 mod recording;
 mod commands;
 mod stt;
+pub mod sync;
 
 use std::sync::Arc;
 use parking_lot::Mutex;
@@ -30,15 +31,33 @@ pub struct AppState {
     // `set_provider_api_key` so settings UI writes take effect
     // immediately.
     pub api_key_cache: stt::ApiKeyCache,
+    /// Notified after each successful local write. `NoopSync` in the
+    /// open-source build; a commercial build installs an observer that
+    /// enqueues the change for upload.
+    pub sync: Arc<dyn sync::SyncObserver>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Open-source entry point: sync is a no-op. A commercial build calls
+    // `run_with_sync` instead and injects a real observer.
+    run_with_sync(|_ctx| Arc::new(sync::NoopSync));
+}
+
+/// Entry point that lets a caller inject a sync implementation. `make_sync`
+/// receives a [`sync::SyncContext`] (database handle + `AppHandle`) the moment
+/// those exist during setup, and returns the observer to install on
+/// [`AppState`]. The open-source [`run`] passes a factory that yields
+/// [`sync::NoopSync`].
+pub fn run_with_sync<F>(make_sync: F)
+where
+    F: FnOnce(sync::SyncContext) -> Arc<dyn sync::SyncObserver> + Send + 'static,
+{
     tauri::Builder::default()
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_shell::init())
-        .setup(|app| {
+        .setup(move |app| {
             // Point GGML at our prebuilt default.metallib BEFORE any
             // whisper.cpp init runs. whisper-rs 0.13 ships a vendored
             // ggml whose runtime Metal-source compile path silently
@@ -92,12 +111,21 @@ pub fn run() {
             std::fs::create_dir_all(&app_dir).ok();
             let db_path = app_dir.join("notes.sqlite");
             let conn = db::open(&db_path).expect("open db");
+            let db = Arc::new(Mutex::new(conn));
+            // Build the sync observer now that the db handle and AppHandle
+            // exist. In the open-source build this is `NoopSync` and the
+            // factory ignores the context.
+            let sync = make_sync(sync::SyncContext {
+                db: db.clone(),
+                app: app.handle().clone(),
+            });
             app.manage(AppState {
-                db: Arc::new(Mutex::new(conn)),
+                db,
                 recording: Arc::new(Mutex::new(recording::RecordingSession::default())),
                 whisper: local_whisper::new_shared(),
                 transcribe_gate: Arc::new(tokio::sync::Mutex::new(())),
                 api_key_cache: stt::new_cache(),
+                sync,
             });
 
             let menu = build_menu(app.handle())?;

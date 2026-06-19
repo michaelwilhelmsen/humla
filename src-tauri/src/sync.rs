@@ -1,0 +1,51 @@
+//! Sync seam.
+//!
+//! The note / folder / summary-prompt commands ping a [`SyncObserver`] after
+//! each successful local write. The open-source build installs [`NoopSync`],
+//! so sync is a no-op and the app never touches the network. A commercial
+//! build can install an observer that enqueues the change for upload.
+//!
+//! This mirrors [`crate::stt::BatchSttAdapter`]: the command layer calls the
+//! trait and doesn't care which implementation it got.
+
+use std::sync::Arc;
+
+/// Notified after a successful local write so a sync layer can enqueue the
+/// change for upload.
+///
+/// **Contract.** Callbacks run on the command's thread, *after* the
+/// `AppState::db` guard has been dropped. They must return quickly, never
+/// block, and never re-lock `AppState::db` synchronously — `parking_lot` is
+/// not reentrant, so doing so while a command still held the guard would
+/// deadlock (dropping the guard first removes the hazard, but implementations
+/// should not rely on it). The intended implementation only does a fast
+/// enqueue (a channel send, or an `INSERT` on its own connection) and returns.
+pub trait SyncObserver: Send + Sync {
+    /// A note was created or modified. `id` is the note id.
+    fn note_upserted(&self, _id: &str) {}
+
+    /// A note was deleted. `id` is the now-removed note id. Local deletes are
+    /// hard `DELETE`s, so an implementation must record a tombstone here or
+    /// the deletion will never propagate to other devices.
+    fn note_deleted(&self, _id: &str) {}
+
+    /// A folder was created, renamed, or deleted.
+    fn folder_changed(&self) {}
+
+    /// A custom summary prompt was created, updated, or deleted.
+    fn summary_prompt_changed(&self) {}
+}
+
+/// Open-source default: every callback is a no-op.
+pub struct NoopSync;
+
+impl SyncObserver for NoopSync {}
+
+/// Handed to a sync implementation when it is constructed, after the database
+/// connection and `AppHandle` exist. A real implementation keeps `db` to apply
+/// pulled remote changes to the local store, and `app` to emit refresh events
+/// to the frontend.
+pub struct SyncContext {
+    pub db: Arc<parking_lot::Mutex<rusqlite::Connection>>,
+    pub app: tauri::AppHandle,
+}
