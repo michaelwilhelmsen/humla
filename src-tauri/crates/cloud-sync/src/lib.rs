@@ -40,6 +40,10 @@ use tokio::sync::mpsc;
 /// public core because rusqlite is pinned to the same version.
 pub type Db = Arc<Mutex<Connection>>;
 
+/// Quarantine (drop) an outbox row after this many failed push attempts so one
+/// un-pushable "poison" row can't head-of-line-block every later change forever.
+const MAX_OUTBOX_ATTEMPTS: i64 = 5;
+
 #[derive(Clone)]
 pub struct Config {
     /// PocketBase base URL, e.g. `https://sync.humla.app`.
@@ -188,8 +192,14 @@ impl Worker {
             .optional()?
             .unwrap_or_default()
         };
+        // Coalesce: one pending op per record. A new edit supersedes any
+        // pending op for the same row and resets the retry counter.
         conn.execute(
-            "INSERT INTO sync_outbox (entity, entity_id, op, workspace, enqueued_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO sync_outbox (entity, entity_id, op, workspace, attempts, enqueued_at)
+             VALUES (?1, ?2, ?3, ?4, 0, ?5)
+             ON CONFLICT(entity, entity_id) DO UPDATE SET
+                op = excluded.op, workspace = excluded.workspace,
+                attempts = 0, enqueued_at = excluded.enqueued_at",
             rusqlite::params![entity, entity_id, kind, workspace, now_ms()],
         )?;
         Ok(())
@@ -199,35 +209,64 @@ impl Worker {
     /// row stays queued and ordering is preserved for the next attempt.
     async fn drain_outbox(&self) -> Result<()> {
         loop {
-            let next: Option<(i64, String, String, String, String)> = {
+            let next: Option<(i64, String, String, String, String, i64)> = {
                 let conn = self.db.lock();
                 conn.query_row(
-                    "SELECT seq, entity, entity_id, op, workspace FROM sync_outbox ORDER BY seq LIMIT 1",
+                    "SELECT seq, entity, entity_id, op, workspace, attempts FROM sync_outbox ORDER BY seq LIMIT 1",
                     [],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
                 )
                 .optional()?
             };
-            let Some((seq, entity, entity_id, op, workspace)) = next else {
+            let Some((seq, entity, entity_id, op, workspace, attempts)) = next else {
                 return Ok(());
             };
 
             // Personal / local-only rows ('' workspace) never sync — drop them
-            // without a network call. Otherwise push to the row's OWN workspace.
-            if !workspace.is_empty() {
-                match (entity.as_str(), op.as_str()) {
-                    ("note", "upsert") => self.push_note(&entity_id, &workspace).await?,
-                    ("note", "delete") => self.push_delete("notes", &entity_id, &workspace).await?,
-                    ("folder", "upsert") => self.push_folder(&entity_id, &workspace).await?,
-                    ("folder", "delete") => self.push_delete("folders", &entity_id, &workspace).await?,
-                    ("prompt", "upsert") => self.push_prompt(&entity_id, &workspace).await?,
-                    ("prompt", "delete") => self.push_delete("summary_prompts", &entity_id, &workspace).await?,
-                    _ => eprintln!("cloud-sync: unknown outbox row {entity}/{op}; skipping"),
-                }
+            // without a network call.
+            if workspace.is_empty() {
+                self.db.lock().execute("DELETE FROM sync_outbox WHERE seq = ?1", rusqlite::params![seq])?;
+                continue;
             }
 
-            let conn = self.db.lock();
-            conn.execute("DELETE FROM sync_outbox WHERE seq = ?1", rusqlite::params![seq])?;
+            // Push to the row's OWN workspace.
+            let result = match (entity.as_str(), op.as_str()) {
+                ("note", "upsert") => self.push_note(&entity_id, &workspace).await,
+                ("note", "delete") => self.push_delete("notes", &entity_id, &workspace).await,
+                ("folder", "upsert") => self.push_folder(&entity_id, &workspace).await,
+                ("folder", "delete") => self.push_delete("folders", &entity_id, &workspace).await,
+                ("prompt", "upsert") => self.push_prompt(&entity_id, &workspace).await,
+                ("prompt", "delete") => self.push_delete("summary_prompts", &entity_id, &workspace).await,
+                _ => {
+                    eprintln!("cloud-sync: unknown outbox row {entity}/{op}; dropping");
+                    Ok(())
+                }
+            };
+
+            match result {
+                Ok(()) => {
+                    self.db.lock().execute("DELETE FROM sync_outbox WHERE seq = ?1", rusqlite::params![seq])?;
+                }
+                Err(e) => {
+                    let attempts = attempts + 1;
+                    if attempts >= MAX_OUTBOX_ATTEMPTS {
+                        // Poison row: drop it so it can't block everything behind
+                        // it forever, and keep draining the rest.
+                        eprintln!(
+                            "cloud-sync: giving up on {entity}/{op} {entity_id} after {attempts} attempts (quarantined): {e:#}"
+                        );
+                        self.db.lock().execute("DELETE FROM sync_outbox WHERE seq = ?1", rusqlite::params![seq])?;
+                        continue;
+                    }
+                    // Transient failure: record the attempt and stop draining so
+                    // ordering is preserved; the tick loop retries.
+                    self.db.lock().execute(
+                        "UPDATE sync_outbox SET attempts = ?1 WHERE seq = ?2",
+                        rusqlite::params![attempts, seq],
+                    )?;
+                    return Err(e);
+                }
+            }
         }
     }
 
@@ -309,7 +348,7 @@ impl Worker {
             .json(&json!({ "deleted": true, "client_updated_at": now_ms() }))
             .send()
             .await?;
-        ensure_ok(resp).await
+        self.pb_ok(resp).await.map(|_| ())
     }
 
     /// Create the record, or PATCH it if one with this `client_id` already
@@ -343,7 +382,7 @@ impl Worker {
                     .await?
             }
         };
-        ensure_ok(resp).await
+        self.pb_ok(resp).await.map(|_| ())
     }
 
     async fn find_remote_id(
@@ -361,7 +400,7 @@ impl Worker {
             .query(&[("filter", filter.as_str()), ("perPage", "1"), ("fields", "id")])
             .send()
             .await?;
-        let resp = error_for_pb(resp).await?;
+        let resp = self.pb_ok(resp).await?;
 
         #[derive(Deserialize)]
         struct ListResp {
@@ -418,10 +457,17 @@ impl Worker {
         let mut page: u32 = 1;
 
         loop {
+            // `updated >=` (not `>`): PocketBase timestamps collide when several
+            // records change in the same tick (e.g. folder-delete reparenting
+            // many notes). With strict `>`, siblings sharing the cursor's exact
+            // timestamp get skipped forever. `>=` re-fetches the boundary record
+            // each pull — harmless because apply is idempotent under the LWW
+            // guard — and the cursor only advances on a genuinely newer record,
+            // so this doesn't cause spurious refresh notifications.
             let filter = if cursor.is_empty() {
                 format!("workspace='{}'", self.config.workspace_id)
             } else {
-                format!("workspace='{}' && updated>'{}'", self.config.workspace_id, cursor)
+                format!("workspace='{}' && updated>='{}'", self.config.workspace_id, cursor)
             };
             let page_s = page.to_string();
             let resp = self
@@ -436,7 +482,7 @@ impl Worker {
                 ])
                 .send()
                 .await?;
-            let resp = error_for_pb(resp).await?;
+            let resp = self.pb_ok(resp).await?;
             let list: serde_json::Value = resp.json().await?;
 
             let Some(items) = list.get("items").and_then(|v| v.as_array()) else {
@@ -574,6 +620,18 @@ impl Worker {
         Ok(a)
     }
 
+    /// Like `error_for_pb`, but drops the cached auth on a 401 so the next
+    /// operation re-authenticates instead of looping forever on a stale or
+    /// expired token. The current call still errors and retries with fresh
+    /// credentials (pushes via the outbox, pulls on the next tick) — without
+    /// this, an expired token silently wedges sync until the app restarts.
+    async fn pb_ok(&self, resp: reqwest::Response) -> Result<reqwest::Response> {
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+            *self.auth.lock() = None;
+        }
+        error_for_pb(resp).await
+    }
+
     async fn authenticate(&self) -> Result<Auth> {
         let resp = self
             .http
@@ -581,7 +639,7 @@ impl Worker {
             .json(&json!({ "identity": self.config.email, "password": self.config.password }))
             .send()
             .await?;
-        let resp = error_for_pb(resp).await?;
+        let resp = self.pb_ok(resp).await?;
 
         #[derive(Deserialize)]
         struct AuthResp {
@@ -736,6 +794,7 @@ fn init_tables(db: &Db) -> Result<()> {
             entity_id   TEXT NOT NULL,
             op          TEXT NOT NULL,
             workspace   TEXT NOT NULL DEFAULT '',
+            attempts    INTEGER NOT NULL DEFAULT 0,
             enqueued_at INTEGER NOT NULL
          );
          CREATE TABLE IF NOT EXISTS sync_state (
@@ -743,10 +802,23 @@ fn init_tables(db: &Db) -> Result<()> {
             value TEXT NOT NULL
          );",
     )?;
-    // Idempotent migration for outboxes created before per-row workspace
-    // targeting. Existing queued rows get '' → treated as Personal and dropped
-    // (they'd have pushed to the then-active workspace anyway).
+    // Idempotent migrations for outboxes created before these columns existed.
+    // `workspace`: per-row push target (empty = Personal, dropped). `attempts`:
+    // retry counter for poison-row quarantine.
     let _ = conn.execute("ALTER TABLE sync_outbox ADD COLUMN workspace TEXT NOT NULL DEFAULT ''", []);
+    let _ = conn.execute("ALTER TABLE sync_outbox ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0", []);
+    // Coalesce to at most one pending op per record: drop older duplicates
+    // (keep the newest seq), then enforce it with a unique index that `enqueue`
+    // upserts onto. A burst of edits collapses to a single pending push instead
+    // of one outbox row (and one network round-trip) per keystroke-save.
+    conn.execute(
+        "DELETE FROM sync_outbox WHERE seq NOT IN (SELECT MAX(seq) FROM sync_outbox GROUP BY entity, entity_id)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_outbox_entity ON sync_outbox(entity, entity_id)",
+        [],
+    )?;
     Ok(())
 }
 
@@ -768,9 +840,6 @@ async fn error_for_pb(resp: reqwest::Response) -> Result<reqwest::Response> {
     Err(anyhow!("pocketbase {status}: {body}"))
 }
 
-async fn ensure_ok(resp: reqwest::Response) -> Result<()> {
-    error_for_pb(resp).await.map(|_| ())
-}
 
 #[cfg(test)]
 mod it {
@@ -837,6 +906,48 @@ mod it {
     fn scalar(db: &Db, sql: &str, id: &str) -> Option<String> {
         let conn = db.lock();
         conn.query_row(sql, rusqlite::params![id], |r| r.get(0)).optional().unwrap()
+    }
+
+    fn offline_config(workspace: &str) -> Config {
+        Config {
+            base_url: String::new(),
+            email: String::new(),
+            password: String::new(),
+            workspace_id: workspace.to_string(),
+            poll_interval: Duration::from_secs(60),
+        }
+    }
+
+    /// Outbox coalescing (no network): repeated edits to the same record collapse
+    /// to a single pending op, the latest op wins, and the per-row workspace is
+    /// captured from the note. Guards the P1 churn/head-of-line fixes.
+    #[test]
+    fn outbox_coalesces_per_record() {
+        let db = test_db();
+        let w = worker(db.clone(), offline_config("wsX"));
+        {
+            let conn = db.lock();
+            conn.execute(
+                "INSERT INTO notes (id, workspace_id, created_at, updated_at) VALUES ('n1', 'wsX', 1, 1)",
+                [],
+            )
+            .unwrap();
+        }
+        w.enqueue(Op::Note { id: "n1".into(), delete: false }).unwrap();
+        w.enqueue(Op::Note { id: "n1".into(), delete: false }).unwrap();
+        w.enqueue(Op::Note { id: "n1".into(), delete: true }).unwrap();
+
+        let conn = db.lock();
+        let (count, op, ws): (i64, String, String) = conn
+            .query_row(
+                "SELECT COUNT(*), MAX(op), MAX(workspace) FROM sync_outbox WHERE entity='note' AND entity_id='n1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "three enqueues collapse to one pending row");
+        assert_eq!(op, "delete", "latest op wins");
+        assert_eq!(ws, "wsX", "upsert captured the note's own workspace");
     }
 
     #[tokio::test]

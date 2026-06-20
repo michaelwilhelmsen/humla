@@ -150,6 +150,12 @@ fn clear_creds() {
 
 async fn pb_json(resp: reqwest::Response) -> Result<serde_json::Value, String> {
     let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        // Stale/expired token — drop the cached session so the next command
+        // auto-re-authenticates from the stored credentials (ensure_session)
+        // instead of reusing the dead token.
+        *SESSION.lock().unwrap() = None;
+    }
     let val: serde_json::Value = resp
         .json()
         .await
