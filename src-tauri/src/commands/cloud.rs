@@ -295,12 +295,17 @@ fn derive_role(ws: &serde_json::Value, user_id: &str) -> String {
 }
 
 async fn list_workspaces_inner(base: &str, session: &Session) -> Result<Vec<CloudWorkspace>, String> {
-    let filter = format!("members.id ?= '{}'", session.user_id);
+    // No client-side filter: the workspaces collection listRule is already
+    // `members.id ?= @request.auth.id`, so the server returns exactly the
+    // workspaces this user belongs to. Re-sending `members.id ?= '<id>'` as a
+    // query filter 400s in PocketBase 0.39 — the user-filter's join collides with
+    // the rule's own join on `members` — which `cloud_status` then swallowed into
+    // an empty workspace list (the switcher showed nothing for members/viewers).
     let val = authed_get(
         base,
         &session.token,
         "/api/collections/workspaces/records",
-        &[("filter", filter.as_str()), ("perPage", "200"), ("sort", "name")],
+        &[("perPage", "200"), ("sort", "name")],
     )
     .await?;
     let items = val.get("items").and_then(|v| v.as_array()).cloned().unwrap_or_default();
@@ -333,7 +338,16 @@ pub async fn cloud_status(state: State<'_, AppState>) -> Result<CloudStatus, Str
         });
     };
 
-    let workspaces = list_workspaces_inner(&base_url, &session).await.unwrap_or_default();
+    let workspaces = match list_workspaces_inner(&base_url, &session).await {
+        Ok(ws) => ws,
+        // Don't crash status on a transient list failure, but don't swallow it
+        // silently either — an empty list reads as "no workspaces" and hid a 400
+        // here for a long time.
+        Err(e) => {
+            eprintln!("cloud: failed to list workspaces: {e}");
+            vec![]
+        }
+    };
     let current_id = read_workspace_id(&state);
     let current_workspace = current_id
         .as_ref()
