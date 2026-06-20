@@ -14,7 +14,7 @@ import type { SyncStatus } from "./ipc";
  * Account points here so downloaders don't have to know a URL. Set this to your
  * deployed server's address once Humla Cloud is live.
  */
-export const HUMLA_CLOUD_URL = "https://sync.humla.app";
+export const HUMLA_CLOUD_URL = "https://sync.humla.team";
 
 export type CloudRole = "owner" | "admin" | "member" | "viewer";
 export type PlanStatus = "active" | "trialing" | "past_due" | "canceled" | "none";
