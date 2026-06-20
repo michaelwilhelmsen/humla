@@ -53,6 +53,10 @@ pub struct CloudWorkspace {
     pub id: String,
     pub name: String,
     pub role: String,
+    /// Stripe subscription status for this workspace: "active" / "trialing" /
+    /// "past_due" / "canceled" / "none". Only meaningful when billing is enabled
+    /// on the server; self-host leaves it "none" and the UI ignores it.
+    pub plan_status: String,
 }
 
 #[derive(Serialize)]
@@ -65,6 +69,9 @@ pub struct CloudStatus {
     pub user: Option<CloudUser>,
     pub current_workspace: Option<CloudWorkspace>,
     pub workspaces: Vec<CloudWorkspace>,
+    /// True when the server enforces billing (humla-cloud). Self-host → false, and
+    /// the client hides the billing UI and never treats a workspace as locked.
+    pub billing_enabled: bool,
 }
 
 #[derive(Serialize)]
@@ -161,7 +168,11 @@ async fn pb_json(resp: reqwest::Response) -> Result<serde_json::Value, String> {
         .await
         .map_err(|e| format!("pocketbase: invalid response ({e})"))?;
     if !status.is_success() {
-        let msg = val.get("message").and_then(|m| m.as_str()).unwrap_or("request failed");
+        let msg = val
+            .get("message")
+            .and_then(|m| m.as_str())
+            .or_else(|| val.get("error").and_then(|m| m.as_str()))
+            .unwrap_or("request failed");
         return Err(format!("pocketbase {status}: {msg}"));
     }
     Ok(val)
@@ -309,14 +320,54 @@ async fn list_workspaces_inner(base: &str, session: &Session) -> Result<Vec<Clou
     )
     .await?;
     let items = val.get("items").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+
+    // Per-workspace subscription status. The subscriptions listRule scopes to the
+    // user's memberships, so an unfiltered fetch returns exactly their rows.
+    // Best-effort: any error just leaves statuses "none" (billing_enabled gates
+    // the UI), and self-host servers simply have no rows.
+    let mut status_by_ws: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    if let Ok(subs) =
+        authed_get(base, &session.token, "/api/collections/subscriptions/records", &[("perPage", "200")]).await
+    {
+        if let Some(arr) = subs.get("items").and_then(|v| v.as_array()) {
+            for it in arr {
+                let ws = it.get("workspace").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+                let st = it.get("status").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+                if !ws.is_empty() {
+                    status_by_ws.insert(ws, st);
+                }
+            }
+        }
+    }
+
     Ok(items
         .iter()
-        .map(|it| CloudWorkspace {
-            id: it.get("id").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-            name: it.get("name").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-            role: derive_role(it, &session.user_id),
+        .map(|it| {
+            let id = it.get("id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+            let plan_status = status_by_ws.get(&id).cloned().unwrap_or_else(|| "none".to_string());
+            CloudWorkspace {
+                id,
+                name: it.get("name").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                role: derive_role(it, &session.user_id),
+                plan_status,
+            }
         })
         .collect())
+}
+
+/// Whether the configured server enforces billing (humla-cloud) vs runs free
+/// (self-host). Reads the public `/api/humla/billing/config` flag; any failure
+/// (older server, network) is treated as "not enabled" so the UI degrades to the
+/// free/self-host experience.
+async fn fetch_billing_enabled(base: &str) -> bool {
+    let Ok(resp) = http().get(format!("{base}/api/humla/billing/config")).send().await else {
+        return false;
+    };
+    resp.json::<serde_json::Value>()
+        .await
+        .ok()
+        .and_then(|v| v.get("enabled").and_then(|b| b.as_bool()))
+        .unwrap_or(false)
 }
 
 // ---- commands --------------------------------------------------------------
@@ -335,6 +386,7 @@ pub async fn cloud_status(state: State<'_, AppState>) -> Result<CloudStatus, Str
             user: None,
             current_workspace: None,
             workspaces: vec![],
+            billing_enabled: false,
         });
     };
 
@@ -353,6 +405,7 @@ pub async fn cloud_status(state: State<'_, AppState>) -> Result<CloudStatus, Str
         .as_ref()
         .and_then(|id| workspaces.iter().find(|w| &w.id == id).cloned());
 
+    let billing_enabled = fetch_billing_enabled(&base_url).await;
     Ok(CloudStatus {
         configured: true,
         logged_in: true,
@@ -360,7 +413,45 @@ pub async fn cloud_status(state: State<'_, AppState>) -> Result<CloudStatus, Str
         user: Some(CloudUser { id: session.user_id, email: session.email, name: session.name }),
         current_workspace,
         workspaces,
+        billing_enabled,
     })
+}
+
+/// Start (or resume) a Stripe Checkout for a workspace's team subscription.
+/// Returns a hosted Checkout URL the client opens in the browser. Owner-only +
+/// billing-config checks happen server-side in the billing hook.
+#[tauri::command]
+pub async fn cloud_billing_checkout(state: State<'_, AppState>, workspace_id: String) -> Result<String, String> {
+    let (base, session) = ensure_session(&state).await?;
+    let val = authed_post(
+        &base,
+        &session.token,
+        "/api/humla/billing/checkout",
+        serde_json::json!({ "workspace_id": workspace_id }),
+    )
+    .await?;
+    val.get("url")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .ok_or_else(|| "No checkout URL returned.".to_string())
+}
+
+/// Open the Stripe Customer Portal for a subscribed workspace (manage/cancel).
+/// Returns a hosted portal URL the client opens in the browser.
+#[tauri::command]
+pub async fn cloud_billing_portal(state: State<'_, AppState>, workspace_id: String) -> Result<String, String> {
+    let (base, session) = ensure_session(&state).await?;
+    let val = authed_post(
+        &base,
+        &session.token,
+        "/api/humla/billing/portal",
+        serde_json::json!({ "workspace_id": workspace_id }),
+    )
+    .await?;
+    val.get("url")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .ok_or_else(|| "No portal URL returned.".to_string())
 }
 
 #[tauri::command]
@@ -478,7 +569,7 @@ pub async fn cloud_create_workspace(
         db::set_setting(&conn, SETTING_WORKSPACE, &id).map_err(err)?;
     }
     state.sync.config_changed(); // new workspace selected → (re)start the worker
-    Ok(CloudWorkspace { id, name, role: "owner".into() })
+    Ok(CloudWorkspace { id, name, role: "owner".into(), plan_status: "none".into() })
 }
 
 #[tauri::command]

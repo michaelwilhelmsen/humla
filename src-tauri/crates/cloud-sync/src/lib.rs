@@ -1420,9 +1420,11 @@ mod it {
         for s in [400u16, 403, 404, 405, 422] {
             assert!(perm(s), "status {s} should be permanent");
         }
-        // Transient (keep + retry): auth, timeout, conflict, payload-too-large,
-        // locked, too-early, rate-limit, and all 5xx.
-        for s in [401u16, 408, 409, 413, 423, 425, 429, 500, 502, 503] {
+        // Transient (keep + retry): auth, payment-required (the server billing
+        // gate returns 402 so a queued edit survives a lapse and re-syncs on
+        // resubscribe instead of being dropped), timeout, conflict,
+        // payload-too-large, locked, too-early, rate-limit, and all 5xx.
+        for s in [401u16, 402, 408, 409, 413, 423, 425, 429, 500, 502, 503] {
             assert!(!perm(s), "status {s} should be transient");
         }
         // The body must NEVER flip the verdict: a 5xx whose body echoes a

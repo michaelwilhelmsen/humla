@@ -232,6 +232,8 @@ where
             commands::cloud_invite_member,
             commands::cloud_remove_member,
             commands::cloud_set_member_role,
+            commands::cloud_billing_checkout,
+            commands::cloud_billing_portal,
             commands::app_data_dir,
             commands::note_diagnostics_dir,
             commands::note_audio_dir,

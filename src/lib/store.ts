@@ -136,6 +136,11 @@ let recordingNoteId: string | null = null;
 export function bindBackendListeners() {
   if (listenersBound) return;
   listenersBound = true;
+  // Re-check cloud status when the window regains focus — picks up subscription
+  // changes after the user completes Stripe checkout/portal in their browser.
+  window.addEventListener("focus", () => {
+    void useCloudStore.getState().refresh();
+  });
   onTranscript(({ noteId, text }) => useNotesStore.getState().appendTranscript(noteId, text));
   onTranscriptReplaced(({ noteId, text }) => useNotesStore.getState().replaceTranscript(noteId, text));
   onSummary(({ noteId, summary }) => useNotesStore.getState().setSummary(noteId, summary));

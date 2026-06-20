@@ -10,9 +10,10 @@ import { invoke } from "@tauri-apps/api/core";
 import type { SyncStatus } from "./ipc";
 
 export type CloudRole = "owner" | "admin" | "member" | "viewer";
+export type PlanStatus = "active" | "trialing" | "past_due" | "canceled" | "none";
 
 export type CloudUser = { id: string; email: string; name: string };
-export type CloudWorkspace = { id: string; name: string; role: CloudRole };
+export type CloudWorkspace = { id: string; name: string; role: CloudRole; plan_status: PlanStatus };
 export type CloudMember = { id: string; email: string; name: string; role: CloudRole };
 
 export type CloudStatus = {
@@ -24,6 +25,8 @@ export type CloudStatus = {
   user: CloudUser | null;
   current_workspace: CloudWorkspace | null;
   workspaces: CloudWorkspace[];
+  /** True when the server enforces billing (humla-cloud); false on self-host. */
+  billing_enabled: boolean;
 };
 
 export const cloudApi = {
@@ -56,6 +59,12 @@ export const cloudApi = {
     invoke<void>("cloud_remove_member", { workspaceId, userId }),
   setMemberRole: (workspaceId: string, userId: string, role: CloudRole) =>
     invoke<void>("cloud_set_member_role", { workspaceId, userId, role }),
+  /** Start/resume Stripe Checkout for a workspace; returns a hosted URL to open. */
+  billingCheckout: (workspaceId: string) =>
+    invoke<string>("cloud_billing_checkout", { workspaceId }),
+  /** Open the Stripe Customer Portal for a subscribed workspace; returns a URL. */
+  billingPortal: (workspaceId: string) =>
+    invoke<string>("cloud_billing_portal", { workspaceId }),
 };
 
 export const DISCONNECTED: CloudStatus = {
@@ -65,6 +74,7 @@ export const DISCONNECTED: CloudStatus = {
   user: null,
   current_workspace: null,
   workspaces: [],
+  billing_enabled: false,
 };
 
 type CloudState = {

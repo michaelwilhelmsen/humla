@@ -100,6 +100,34 @@ The defaults are designed so nothing leaves your machine unless you tell it to.
 
 If you use only Local Whisper + Community-1 (or Sortformer) + a local LLM for summaries, **no audio or text ever leaves your Mac**.
 
+## Team sync & self-hosting
+
+Humla is local-first and works fully offline. If you want to **sync across your devices** or **share workspaces with teammates**, point the app at a sync server (Settings → Account → Connect). Two ways to get one:
+
+### Option 1 — Humla Cloud (managed)
+
+The hosted option: sign up in-app, nothing to set up. Team workspaces are a paid subscription (flat monthly per workspace, via Stripe) with a **14-day free trial**; your local/Personal notes are always free. The convenient path — you run no infrastructure.
+
+### Option 2 — Self-host (free)
+
+The sync server is just **[PocketBase](https://pocketbase.io)** (a single Go binary) plus Humla's hooks and migrations. Self-hosted servers have **no paywall** — every team feature is free; you're running your own box.
+
+1. Download the PocketBase binary (v0.39+).
+2. Run it with Humla's server code — the `server/` directory holds the hooks, migrations, and an optional read-only web client:
+
+   ```sh
+   pocketbase serve \
+     --hooksDir=server/pb_hooks \
+     --migrationsDir=server/pb_migrations \
+     --publicDir=server/pb_public
+   ```
+3. Create your account from the PocketBase admin UI at `http://127.0.0.1:8090/_/` (or enable public sign-up).
+4. In Humla: **Settings → Account → Connect**, enter your server URL, and sign in. Notes, folders, summaries, transcripts, audio, and shared workspaces all sync.
+
+For a real deployment, put it behind HTTPS (a reverse proxy) and point PocketBase at S3/R2 storage (Settings → Files) so audio blobs don't fill the local disk.
+
+> **Billing is off by default.** The subscription gate only activates when the server has `STRIPE_SECRET_KEY` set — a self-hosted server never asks anyone to pay.
+
 ## Quick start
 
 1. **Download** the latest signed + notarised DMG from the [Releases page](https://github.com/michaelwilhelmsen/humla/releases/latest).

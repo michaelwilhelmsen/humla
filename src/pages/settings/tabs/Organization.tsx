@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { LogOut, Trash2, UserPlus } from "lucide-react";
+import { open as openExternal } from "@tauri-apps/plugin-shell";
 import {
   cloudApi,
   roleColorVar,
@@ -7,6 +8,7 @@ import {
   useCloudStore,
   type CloudMember,
   type CloudRole,
+  type CloudWorkspace,
 } from "../../../lib/cloud";
 import { useNotesStore } from "../../../lib/store";
 import { Row, Section } from "../components/Section";
@@ -24,6 +26,87 @@ function RolePill({ role }: { role: CloudRole }) {
     >
       {roleLabel(role)}
     </span>
+  );
+}
+
+function planMeta(status: CloudWorkspace["plan_status"]): { label: string; color: string } {
+  switch (status) {
+    case "trialing":
+      return { label: "Free trial", color: "var(--color-success)" };
+    case "active":
+      return { label: "Active", color: "var(--color-success)" };
+    case "past_due":
+      return { label: "Past due", color: "var(--color-warning)" };
+    case "canceled":
+      return { label: "Canceled", color: "var(--color-accent)" };
+    default:
+      return { label: "Not subscribed", color: "var(--color-text-muted)" };
+  }
+}
+
+// Per-workspace billing (shown only when the server enforces billing). The owner
+// starts a 14-day trial / manages the subscription via Stripe (opened in the
+// browser); everyone else sees the status. The server is the source of truth, so
+// this is a thin control surface — status comes from the workspace's plan_status.
+function BillingPanel({ ws, onChanged }: { ws: CloudWorkspace; onChanged: () => void }) {
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const isOwner = ws.role === "owner";
+  const active = ws.plan_status === "active" || ws.plan_status === "trialing";
+  const meta = planMeta(ws.plan_status);
+
+  async function go(kind: "checkout" | "portal") {
+    setBusy(true);
+    setErr(null);
+    try {
+      const url = kind === "checkout" ? await cloudApi.billingCheckout(ws.id) : await cloudApi.billingPortal(ws.id);
+      await openExternal(url);
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="flex flex-col gap-3">
+      <Row label="Plan">
+        <span
+          className="shrink-0 px-2 py-0.5 text-[11px] rounded border"
+          style={{ color: meta.color, borderColor: "var(--color-line)", fontFamily: "var(--font-mono)" }}
+        >
+          {meta.label}
+        </span>
+      </Row>
+      {!active && (
+        <p className="text-xs text-[var(--color-text-muted)] leading-relaxed">
+          This workspace is read-only until it has an active subscription.{" "}
+          {isOwner
+            ? "Start a 14-day free trial to unlock syncing and editing for everyone in it."
+            : "Ask the workspace owner to subscribe."}
+        </p>
+      )}
+      {isOwner && (
+        <div className="flex items-center gap-2">
+          {active ? (
+            <Btn onClick={() => go("portal")} disabled={busy}>
+              {busy ? "Opening…" : "Manage billing"}
+            </Btn>
+          ) : (
+            <Btn onClick={() => go("checkout")} disabled={busy}>
+              {busy ? "Opening…" : "Start 14-day free trial"}
+            </Btn>
+          )}
+          <Btn onClick={onChanged} disabled={busy}>
+            Refresh
+          </Btn>
+        </div>
+      )}
+      {err && <p className="text-xs text-[var(--color-accent)] break-all">{err}</p>}
+      <p className="text-[11px] text-[var(--color-text-muted)]">
+        Billing opens Stripe in your browser. Your plan updates here automatically when you return.
+      </p>
+    </div>
   );
 }
 
@@ -292,6 +375,12 @@ export function OrganizationTab() {
           </div>
         </Row>
       </Section>
+
+      {status.billing_enabled && ws && (
+        <Section title="Billing">
+          <BillingPanel ws={ws} onChanged={refreshCloud} />
+        </Section>
+      )}
 
       <Section title={`Members${members.length ? ` · ${members.length}` : ""}`}>
         {loading && <div className="text-sm text-[var(--color-text-muted)]">Loading…</div>}

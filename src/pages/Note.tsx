@@ -84,9 +84,17 @@ export function Note() {
   // from the note's own workspace_id, not the active workspace — a deep-linked
   // or mid-switch note can belong to a different one).
   const myWorkspaces = useCloudStore((s) => s.status.workspaces);
-  const readOnly =
-    !!draft?.workspace_id &&
-    myWorkspaces.find((w) => w.id === draft.workspace_id)?.role === "viewer";
+  const billingEnabled = useCloudStore((s) => s.status.billing_enabled);
+  const noteWs = draft?.workspace_id
+    ? myWorkspaces.find((w) => w.id === draft.workspace_id)
+    : undefined;
+  const isViewer = noteWs?.role === "viewer";
+  // On humla-cloud, a workspace with no active/trialing subscription is read-only
+  // until it's paid — the server blocks writes, so mirror that in the UI rather
+  // than letting edits look saved locally but silently fail to sync.
+  const lockedByPlan =
+    billingEnabled && !!noteWs && noteWs.plan_status !== "active" && noteWs.plan_status !== "trialing";
+  const readOnly = !!draft?.workspace_id && (isViewer || lockedByPlan);
   // Mirror into a ref so the memoised patch callbacks can gate without changing
   // identity (which would bust the transcript-view memos).
   const readOnlyRef = useRef(readOnly);
@@ -403,7 +411,11 @@ export function Note() {
         {readOnly && (
           <div className="mb-4 flex items-center gap-2 px-3 py-2 rounded-md border border-[var(--color-line)] bg-[var(--color-pill-hover)] text-xs text-[var(--color-text-muted)]">
             <Eye size={13} strokeWidth={1.5} className="shrink-0" />
-            <span>View-only — you have viewer access to this workspace, so this note can’t be edited.</span>
+            <span>
+              {isViewer
+                ? "View-only — you have viewer access to this workspace, so this note can’t be edited."
+                : "Read-only — this workspace needs an active subscription. The owner can start it in Settings → Organization → Billing."}
+            </span>
           </div>
         )}
         <textarea
