@@ -37,6 +37,8 @@ export const cloudApi = {
     invoke<void>("cloud_rename_workspace", { workspaceId, name }),
   deleteWorkspace: (workspaceId: string) =>
     invoke<void>("cloud_delete_workspace", { workspaceId }),
+  leaveWorkspace: (workspaceId: string) =>
+    invoke<void>("cloud_leave_workspace", { workspaceId }),
   workspaceMembers: (workspaceId: string) =>
     invoke<CloudMember[]>("cloud_workspace_members", { workspaceId }),
   addMember: (workspaceId: string, email: string) =>

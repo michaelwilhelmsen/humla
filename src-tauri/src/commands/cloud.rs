@@ -583,3 +583,32 @@ pub async fn cloud_delete_workspace(
     }
     Ok(())
 }
+
+/// Leave a workspace (remove yourself). Goes through the server-side hook
+/// `POST /api/humla/leave-workspace` because the workspaces `updateRule` is
+/// owner/admin-only — a plain member can't PATCH the workspace to drop their own
+/// membership. The hook rejects the owner (who must delete or transfer instead).
+/// If you leave the active workspace, fall back to Personal and stop the worker.
+#[tauri::command]
+pub async fn cloud_leave_workspace(
+    state: State<'_, AppState>,
+    workspace_id: String,
+) -> Result<(), String> {
+    let (base, session) = ensure_session(&state).await?;
+    let resp = http()
+        .post(format!("{base}/api/humla/leave-workspace"))
+        .bearer_auth(&session.token)
+        .json(&serde_json::json!({ "workspace_id": workspace_id }))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    pb_json(resp).await?; // surfaces the hook's message (e.g. owner-can't-leave)
+    if read_workspace_id(&state).as_deref() == Some(workspace_id.as_str()) {
+        {
+            let conn = state.db.lock();
+            db::set_setting(&conn, SETTING_WORKSPACE, "").map_err(err)?;
+        }
+        state.sync.config_changed(); // left the active workspace → stop syncing
+    }
+    Ok(())
+}

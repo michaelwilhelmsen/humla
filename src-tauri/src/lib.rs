@@ -215,6 +215,7 @@ where
             commands::cloud_select_workspace,
             commands::cloud_rename_workspace,
             commands::cloud_delete_workspace,
+            commands::cloud_leave_workspace,
             commands::cloud_workspace_members,
             commands::cloud_add_member,
             commands::cloud_remove_member,

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { Trash2, UserPlus } from "lucide-react";
+import { LogOut, Trash2, UserPlus } from "lucide-react";
 import {
   cloudApi,
   roleColorVar,
@@ -43,12 +43,14 @@ export function OrganizationTab() {
   const [newWs, setNewWs] = useState("");
   const [nameDraft, setNameDraft] = useState("");
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [confirmLeave, setConfirmLeave] = useState(false);
 
-  // Reseed the rename field and reset the delete confirm whenever the active
+  // Reseed the rename field and reset the danger confirms whenever the active
   // workspace (or its name, after a rename) changes.
   useEffect(() => {
     setNameDraft(ws?.name ?? "");
     setConfirmDelete(false);
+    setConfirmLeave(false);
   }, [ws?.id, ws?.name]);
 
   const loadMembers = useCallback(async (id: string) => {
@@ -208,6 +210,22 @@ export function OrganizationTab() {
     }
   }
 
+  async function leaveWorkspace() {
+    if (!ws) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await cloudApi.leaveWorkspace(ws.id);
+      setConfirmLeave(false);
+      await refreshCloud();
+      await refreshNotes();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <>
       <Section title="Workspace">
@@ -349,6 +367,45 @@ export function OrganizationTab() {
               <p className="text-xs text-[var(--color-text-muted)]">
                 Removes the workspace and its notes, folders and prompts from the server for all
                 members. Your local copies stay on this device.
+              </p>
+            </div>
+          </Row>
+        </Section>
+      )}
+
+      {ws.role !== "owner" && (
+        <Section title="Danger zone">
+          <Row label="Leave workspace">
+            <div className="flex flex-col gap-2">
+              {!confirmLeave ? (
+                <button
+                  onClick={() => setConfirmLeave(true)}
+                  disabled={busy}
+                  className="self-start px-3 py-2 rounded-md text-sm border border-[var(--color-accent)] text-[var(--color-accent)] hover:bg-[var(--color-pill-hover)] disabled:opacity-50 transition-colors"
+                >
+                  <span className="inline-flex items-center gap-1.5">
+                    <LogOut size={14} strokeWidth={1.5} /> Leave workspace
+                  </span>
+                </button>
+              ) : (
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-xs text-[var(--color-text-muted)]">Leave “{ws.name}”?</span>
+                  <button
+                    onClick={leaveWorkspace}
+                    disabled={busy}
+                    className="px-3 py-2 rounded-md text-sm border border-[var(--color-accent)] disabled:opacity-50 transition-opacity hover:opacity-90"
+                    style={{ background: "var(--color-accent)", color: "#fff" }}
+                  >
+                    Leave
+                  </button>
+                  <Btn onClick={() => setConfirmLeave(false)} disabled={busy}>
+                    Cancel
+                  </Btn>
+                </div>
+              )}
+              <p className="text-xs text-[var(--color-text-muted)]">
+                You'll lose access to this workspace's shared notes. An admin can re-add you. Your
+                local copies stay on this device.
               </p>
             </div>
           </Row>
