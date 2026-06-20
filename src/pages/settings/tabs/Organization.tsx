@@ -311,20 +311,25 @@ export function OrganizationTab() {
                 {m.name && <div className="text-xs text-[var(--color-text-muted)] truncate">{m.email}</div>}
               </div>
               {canManage && m.role !== "owner" ? (
-                <Select
-                  value={m.role}
-                  onChange={(v) => changeRole(m.id, v as CloudRole)}
-                  options={[
-                    { value: "viewer", label: "Viewer" },
-                    { value: "member", label: "Member" },
-                    // Only the owner can grant admin (the server reverts an
-                    // admin's change to the admins set). Keep the option visible
-                    // when the member already is an admin so it displays.
-                    ...(ws?.role === "owner" || m.role === "admin"
-                      ? [{ value: "admin", label: "Admin" }]
-                      : []),
-                  ]}
-                />
+                // Fixed-width, non-growing slot: the shared Select is `w-full`,
+                // which would otherwise claim the whole row and collapse the
+                // name/email block (it's `flex-1 min-w-0`, so it shrinks to 0).
+                <div className="shrink-0 w-48">
+                  <Select
+                    value={m.role}
+                    onChange={(v) => changeRole(m.id, v as CloudRole)}
+                    options={[
+                      { value: "viewer", label: "Viewer" },
+                      { value: "member", label: "Member" },
+                      // Only the owner can grant admin (the server reverts an
+                      // admin's change to the admins set). Keep the option visible
+                      // when the member already is an admin so it displays.
+                      ...(ws?.role === "owner" || m.role === "admin"
+                        ? [{ value: "admin", label: "Admin" }]
+                        : []),
+                    ]}
+                  />
+                </div>
               ) : (
                 <RolePill role={m.role} />
               )}
