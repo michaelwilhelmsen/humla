@@ -95,6 +95,30 @@ pub fn notes_purge(state: State<AppState>, id: String) -> Result<(), String> {
     db::purge_note(&conn, &id).map_err(err)
 }
 
+/// Saved content revisions for a note, newest first (local version history).
+#[tauri::command]
+pub fn notes_revisions(state: State<AppState>, id: String) -> Result<Vec<db::NoteRevision>, String> {
+    let conn = state.db.lock();
+    db::list_note_revisions(&conn, &id).map_err(err)
+}
+
+/// Restore a note to a saved revision; the current state is snapshotted first so
+/// it's undoable. Syncs the restored content.
+#[tauri::command]
+pub fn notes_restore_revision(
+    state: State<AppState>,
+    id: String,
+    revision_id: String,
+) -> Result<Note, String> {
+    let note = {
+        let conn = state.db.lock();
+        db::restore_note_revision(&conn, &id, &revision_id).map_err(err)?;
+        db::get_note(&conn, &id).map_err(err)?
+    };
+    state.sync.note_upserted(&id);
+    Ok(note)
+}
+
 #[tauri::command]
 pub fn notes_move(
     state: State<AppState>,

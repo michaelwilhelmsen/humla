@@ -6,6 +6,7 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 import {
   Calendar,
   Eye,
+  History,
   Check,
   ChevronDown,
   ChevronLeft,
@@ -22,7 +23,7 @@ import {
   Users,
   X,
 } from "lucide-react";
-import { ipc, onSummaryThinkingDelta, onSummaryContentDelta, type Note as TNote, type SummaryPrompt, type TimelineEntry } from "../lib/ipc";
+import { ipc, onSummaryThinkingDelta, onSummaryContentDelta, type Note as TNote, type NoteRevision, type SummaryPrompt, type TimelineEntry } from "../lib/ipc";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { useNotesStore, useRecordingStore } from "../lib/store";
 import { useOwnerName, useCloudStore } from "../lib/cloud";
@@ -61,6 +62,11 @@ export function Note() {
   const refreshNotes = useNotesStore((s) => s.refresh);
   const note = useNotesStore((s) => s.notes.find((n) => n.id === id));
   const [draft, setDraft] = useState<TNote | null>(null);
+  // Version history panel + a nonce so restoring re-seeds the body editor
+  // (initialBody is memoised on the note id, which doesn't change on restore).
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [revisions, setRevisions] = useState<NoteRevision[]>([]);
+  const [restoreNonce, setRestoreNonce] = useState(0);
   // "Created by" attribution — resolves to a name only when the note was
   // authored by a teammate in the active workspace (null when it's yours,
   // local, or unresolvable). Called unconditionally before the early return.
@@ -356,7 +362,8 @@ export function Note() {
       .split(/\n{2,}/)
       .map((para) => `<p>${escapeHtml(para).replace(/\n/g, "<br />")}</p>`)
       .join("");
-  }, [draft?.id]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [draft?.id, restoreNonce]);
 
   const dateChip = useMemo(() => (draft ? formatDateChip(draft.created_at) : "Today"), [draft]);
 
@@ -508,6 +515,64 @@ export function Note() {
           onChange={(html) => patch("body", html)}
           editable={!readOnly}
         />
+
+        <div className="mt-6 border-t border-[var(--color-line)] pt-3">
+          <button
+            onClick={async () => {
+              const next = !historyOpen;
+              setHistoryOpen(next);
+              if (next) setRevisions(await ipc.noteRevisions(draft.id).catch(() => []));
+            }}
+            className="flex items-center gap-1.5 text-xs text-[var(--color-text-muted)] hover:text-[var(--color-text)] transition-colors"
+          >
+            <History size={13} strokeWidth={1.5} />
+            <span>Version history{revisions.length ? ` · ${revisions.length}` : ""}</span>
+          </button>
+          {historyOpen && (
+            <div className="mt-3 flex flex-col gap-0.5">
+              {revisions.length === 0 ? (
+                <div className="text-xs text-[var(--color-text-muted)]">No earlier versions yet.</div>
+              ) : (
+                revisions.map((rev) => (
+                  <div
+                    key={rev.id}
+                    className="flex items-center gap-3 text-xs px-2 py-1.5 rounded hover:bg-[var(--color-pill-hover)]"
+                  >
+                    <span
+                      className="text-[var(--color-text-muted)] tabular-nums min-w-32 shrink-0"
+                      style={{ fontFamily: "var(--font-mono)" }}
+                    >
+                      {new Date(rev.created_at).toLocaleString(undefined, {
+                        month: "short",
+                        day: "numeric",
+                        hour: "2-digit",
+                        minute: "2-digit",
+                        hour12: false,
+                      })}
+                    </span>
+                    <span className="flex-1 truncate text-[var(--color-text)]">
+                      {rev.title.trim() || "Untitled"}
+                    </span>
+                    {!readOnly && (
+                      <button
+                        onClick={async () => {
+                          const updated = await ipc.restoreNoteRevision(draft.id, rev.id);
+                          setDraft(updated);
+                          upsert(updated);
+                          setRestoreNonce((n) => n + 1);
+                          setRevisions(await ipc.noteRevisions(draft.id).catch(() => []));
+                        }}
+                        className="shrink-0 text-[var(--color-interactive)] hover:underline"
+                      >
+                        Restore
+                      </button>
+                    )}
+                  </div>
+                ))
+              )}
+            </div>
+          )}
+        </div>
 
         {showSummarySection && (
           <Card className="mt-8">

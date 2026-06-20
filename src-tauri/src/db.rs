@@ -1,5 +1,5 @@
 use anyhow::Result;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -102,6 +102,18 @@ pub fn open(path: &Path) -> Result<Connection> {
 
         CREATE INDEX IF NOT EXISTS idx_summary_prompts_updated
             ON summary_prompts(updated_at DESC);
+
+        CREATE TABLE IF NOT EXISTS note_revisions (
+            id          TEXT PRIMARY KEY,
+            note_id     TEXT NOT NULL,
+            title       TEXT NOT NULL DEFAULT '',
+            body        TEXT NOT NULL DEFAULT '',
+            transcript  TEXT NOT NULL DEFAULT '',
+            summary     TEXT NOT NULL DEFAULT '',
+            created_at  INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_note_revisions_note
+            ON note_revisions(note_id, created_at DESC);
         "#,
     )?;
     // Idempotent migrations for older schemas. ALTER TABLE adds columns
@@ -335,6 +347,35 @@ where
 
 pub fn update_note(conn: &Connection, id: &str, patch: &NotePatch) -> Result<()> {
     let now = now_ms();
+    // Snapshot the pre-edit content for version history, but only when a content
+    // field (title/body/transcript/summary) actually changes — skip no-op saves.
+    // Best-effort: history must never break a save.
+    let content_changes = conn
+        .query_row(
+            "SELECT title, body, transcript, summary FROM notes WHERE id = ?1",
+            params![id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .map(|(t, b, tr, s)| {
+            patch.title.as_ref().is_some_and(|v| v != &t)
+                || patch.body.as_ref().is_some_and(|v| v != &b)
+                || patch.transcript.as_ref().is_some_and(|v| v != &tr)
+                || patch.summary.as_ref().is_some_and(|v| v != &s)
+        })
+        .unwrap_or(false);
+    if content_changes {
+        let _ = snapshot_revision(conn, id);
+    }
     if let Some(t) = &patch.title {
         conn.execute("UPDATE notes SET title = ?1, updated_at = ?2 WHERE id = ?3", params![t, now, id])?;
     }
@@ -368,6 +409,97 @@ pub fn update_note(conn: &Connection, id: &str, patch: &NotePatch) -> Result<()>
             params![es, now, id],
         )?;
     }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NoteRevision {
+    pub id: String,
+    pub note_id: String,
+    pub title: String,
+    pub body: String,
+    pub transcript: String,
+    pub summary: String,
+    pub created_at: i64,
+}
+
+/// Save a snapshot of the note's CURRENT content into `note_revisions`, deduped
+/// against the latest snapshot and capped at the newest 30 per note. Called
+/// before an edit applies (so it captures the pre-edit state) and before a
+/// restore (so the restore is itself undoable).
+fn snapshot_revision(conn: &Connection, note_id: &str) -> Result<()> {
+    let cur: Option<(String, String, String, String)> = conn
+        .query_row(
+            "SELECT title, body, transcript, summary FROM notes WHERE id = ?1",
+            params![note_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()?;
+    let Some(cur) = cur else { return Ok(()) };
+    let latest: Option<(String, String, String, String)> = conn
+        .query_row(
+            "SELECT title, body, transcript, summary FROM note_revisions
+             WHERE note_id = ?1 ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            params![note_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()?;
+    if latest.as_ref() == Some(&cur) {
+        return Ok(()); // no-op save — nothing new to record
+    }
+    conn.execute(
+        "INSERT INTO note_revisions (id, note_id, title, body, transcript, summary, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![uuid::Uuid::new_v4().to_string(), note_id, cur.0, cur.1, cur.2, cur.3, now_ms()],
+    )?;
+    conn.execute(
+        "DELETE FROM note_revisions WHERE note_id = ?1 AND id NOT IN
+           (SELECT id FROM note_revisions WHERE note_id = ?1 ORDER BY created_at DESC, rowid DESC LIMIT 30)",
+        params![note_id],
+    )?;
+    Ok(())
+}
+
+pub fn list_note_revisions(conn: &Connection, note_id: &str) -> Result<Vec<NoteRevision>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, note_id, title, body, transcript, summary, created_at FROM note_revisions
+         WHERE note_id = ?1 ORDER BY created_at DESC, rowid DESC",
+    )?;
+    let rows = stmt
+        .query_map(params![note_id], |r| {
+            Ok(NoteRevision {
+                id: r.get(0)?,
+                note_id: r.get(1)?,
+                title: r.get(2)?,
+                body: r.get(3)?,
+                transcript: r.get(4)?,
+                summary: r.get(5)?,
+                created_at: r.get(6)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Restore a note to a saved revision's content. Snapshots the current state
+/// first so the restore is itself undoable, then applies the revision and bumps
+/// `updated_at` (so the restored content syncs).
+pub fn restore_note_revision(conn: &Connection, note_id: &str, revision_id: &str) -> Result<()> {
+    let rev: Option<(String, String, String, String)> = conn
+        .query_row(
+            "SELECT title, body, transcript, summary FROM note_revisions WHERE id = ?1 AND note_id = ?2",
+            params![revision_id, note_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()?;
+    let Some(rev) = rev else {
+        return Err(anyhow::anyhow!("revision not found"));
+    };
+    let _ = snapshot_revision(conn, note_id); // make the restore undoable
+    conn.execute(
+        "UPDATE notes SET title = ?1, body = ?2, transcript = ?3, summary = ?4, updated_at = ?5 WHERE id = ?6",
+        params![rev.0, rev.1, rev.2, rev.3, now_ms(), note_id],
+    )?;
     Ok(())
 }
 
@@ -721,6 +853,37 @@ mod tests {
         assert_eq!(list_folders(&conn, "wsA").unwrap().len(), 1);
         assert_eq!(list_folders(&conn, "").unwrap().len(), 1);
         assert_eq!(list_folders(&conn, "wsB").unwrap().len(), 0);
+    }
+
+    #[test]
+    fn note_revisions_snapshot_dedup_and_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("rev.sqlite")).unwrap();
+        let id = create_note(&conn, "en", "meeting", "").unwrap().id;
+
+        let title = |t: &str| NotePatch { title: Some(t.into()), ..Default::default() };
+        update_note(&conn, &id, &title("v1")).unwrap(); // snapshots the empty pre-edit state
+        update_note(&conn, &id, &title("v2")).unwrap(); // snapshots "v1"
+        update_note(&conn, &id, &title("v2")).unwrap(); // no content change → deduped
+
+        let revs = list_note_revisions(&conn, &id).unwrap();
+        assert_eq!(revs.len(), 2, "two distinct prior states, no dup for the no-op save");
+        assert_eq!(revs[0].title, "v1", "newest revision is the most recent prior state");
+        assert_eq!(revs[1].title, "", "oldest revision is the initial empty state");
+
+        // A non-content edit (language) must not create a revision.
+        update_note(&conn, &id, &NotePatch { language: Some("no".into()), ..Default::default() }).unwrap();
+        assert_eq!(list_note_revisions(&conn, &id).unwrap().len(), 2, "non-content edit doesn't snapshot");
+
+        // Restore to the initial empty state; the current "v2" is snapshotted so
+        // the restore is undoable.
+        let oldest = list_note_revisions(&conn, &id).unwrap().last().unwrap().id.clone();
+        restore_note_revision(&conn, &id, &oldest).unwrap();
+        assert_eq!(get_note(&conn, &id).unwrap().title, "", "note restored to the empty version");
+        assert!(
+            list_note_revisions(&conn, &id).unwrap().iter().any(|r| r.title == "v2"),
+            "pre-restore state is snapshotted (restore is undoable)"
+        );
     }
 
     fn settings_only_conn() -> Connection {

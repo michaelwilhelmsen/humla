@@ -205,6 +205,8 @@ where
             commands::notes_list_trash,
             commands::notes_restore,
             commands::notes_purge,
+            commands::notes_revisions,
+            commands::notes_restore_revision,
             commands::folders_list,
             commands::folders_create,
             commands::folders_rename,

@@ -36,6 +36,16 @@ export type Note = {
   deleted_at?: number | null;
 };
 
+export type NoteRevision = {
+  id: string;
+  note_id: string;
+  title: string;
+  body: string;
+  transcript: string;
+  summary: string;
+  created_at: number;
+};
+
 export type Folder = {
   id: string;
   name: string;
@@ -175,6 +185,10 @@ export const ipc = {
   listTrashedNotes: () => invoke<Note[]>("notes_list_trash"),
   restoreNote: (id: string) => invoke<Note>("notes_restore", { id }),
   purgeNote: (id: string) => invoke<void>("notes_purge", { id }),
+  // Version history (local) — list saved revisions / restore one.
+  noteRevisions: (id: string) => invoke<NoteRevision[]>("notes_revisions", { id }),
+  restoreNoteRevision: (id: string, revisionId: string) =>
+    invoke<Note>("notes_restore_revision", { id, revisionId }),
 
   listFolders: () => invoke<Folder[]>("folders_list"),
   createFolder: (name: string) => invoke<Folder>("folders_create", { name }),
