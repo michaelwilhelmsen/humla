@@ -172,6 +172,16 @@ impl Worker {
         let mut tick = tokio::time::interval(self.config.poll_interval);
         tick.tick().await; // the first tick fires immediately; consume it
 
+        // Realtime: a best-effort SSE listener that nudges us to pull the instant
+        // a record changes server-side, instead of waiting for the next poll. It
+        // only TRIGGERS pulls (never applies data), and the interval poll is the
+        // reliable backstop — so a dropped or failing realtime connection simply
+        // degrades to polling, never to data loss. Owned by this future, so it's
+        // torn down with the worker on restart (no leaked connection).
+        let pull_now = Arc::new(tokio::sync::Notify::new());
+        let mut realtime =
+            Box::pin(realtime_loop(self.config.clone(), self.http.clone(), pull_now.clone()));
+
         loop {
             tokio::select! {
                 op = rx.recv() => {
@@ -192,21 +202,28 @@ impl Worker {
                         None => break, // every sender dropped → shut down
                     }
                 }
-                _ = tick.tick() => {
-                    (self.status)(SyncState::Syncing);
-                    let mut ok = true;
-                    if let Err(e) = self.drain_outbox().await {
-                        eprintln!("cloud-sync: push failed (will retry): {e:#}");
-                        ok = false;
-                    }
-                    if let Err(e) = self.pull().await {
-                        eprintln!("cloud-sync: pull failed (will retry): {e:#}");
-                        ok = false;
-                    }
-                    (self.status)(if ok { SyncState::Idle } else { SyncState::Error });
-                }
+                _ = tick.tick() => self.sync_cycle().await,
+                _ = pull_now.notified() => self.sync_cycle().await,
+                // realtime_loop never returns; this branch just keeps it polled.
+                _ = &mut realtime => {}
             }
         }
+    }
+
+    /// One push-drain + pull cycle with status reporting. Shared by the interval
+    /// tick and the realtime nudge.
+    async fn sync_cycle(&self) {
+        (self.status)(SyncState::Syncing);
+        let mut ok = true;
+        if let Err(e) = self.drain_outbox().await {
+            eprintln!("cloud-sync: push failed (will retry): {e:#}");
+            ok = false;
+        }
+        if let Err(e) = self.pull().await {
+            eprintln!("cloud-sync: pull failed (will retry): {e:#}");
+            ok = false;
+        }
+        (self.status)(if ok { SyncState::Idle } else { SyncState::Error });
     }
 
     /// Persist an op to the durable outbox so a crash between enqueue and push
@@ -982,6 +999,92 @@ async fn error_for_pb(resp: reqwest::Response) -> Result<reqwest::Response> {
     Err(anyhow!("pocketbase {status}: {body}"))
 }
 
+/// Best-effort realtime: keep a PocketBase SSE connection open and, on every
+/// record change in a subscribed collection, nudge `notify` to pull. Reconnects
+/// with a fixed backoff. All failures are non-fatal — the worker's interval poll
+/// is the reliable path; realtime only lowers latency when it's connected.
+async fn realtime_loop(config: Config, http: reqwest::Client, notify: Arc<tokio::sync::Notify>) {
+    loop {
+        if let Err(e) = realtime_once(&config, &http, &notify).await {
+            eprintln!("cloud-sync: realtime disconnected ({e:#}); polling continues");
+        }
+        tokio::time::sleep(Duration::from_secs(15)).await;
+    }
+}
+
+async fn realtime_once(
+    config: &Config,
+    http: &reqwest::Client,
+    notify: &Arc<tokio::sync::Notify>,
+) -> Result<()> {
+    // Auth so the subscription is scoped to records this user can access.
+    let auth = http
+        .post(format!("{}/api/collections/users/auth-with-password", config.base_url))
+        .json(&json!({ "identity": config.email, "password": config.password }))
+        .send()
+        .await?;
+    let auth = error_for_pb(auth).await?.json::<serde_json::Value>().await?;
+    let token = auth.get("token").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+
+    let mut resp = http.get(format!("{}/api/realtime", config.base_url)).send().await?;
+    if !resp.status().is_success() {
+        return Err(anyhow!("realtime connect: {}", resp.status()));
+    }
+
+    let mut buf: Vec<u8> = Vec::new();
+    let mut subscribed = false;
+    // `chunk()` reads the next piece of the streamed body (no StreamExt needed).
+    while let Some(chunk) = resp.chunk().await? {
+        buf.extend_from_slice(&chunk);
+        // SSE events are separated by a blank line.
+        while let Some(idx) = buf.windows(2).position(|w| w == b"\n\n") {
+            let block = String::from_utf8_lossy(&buf[..idx]).to_string();
+            buf.drain(..idx + 2);
+            let (event, data) = parse_sse(&block);
+            match event.as_deref() {
+                Some("PB_CONNECT") => {
+                    let client_id = serde_json::from_str::<serde_json::Value>(&data)
+                        .ok()
+                        .and_then(|v| v.get("clientId").and_then(|c| c.as_str()).map(String::from));
+                    if let Some(client_id) = client_id {
+                        let sub = http
+                            .post(format!("{}/api/realtime", config.base_url))
+                            .bearer_auth(&token)
+                            .json(&json!({
+                                "clientId": client_id,
+                                "subscriptions": ["notes", "folders", "summary_prompts"],
+                            }))
+                            .send()
+                            .await?;
+                        if !sub.status().is_success() {
+                            return Err(anyhow!("realtime subscribe: {}", sub.status()));
+                        }
+                        subscribed = true;
+                    }
+                }
+                // Any record event in a subscribed collection → coalesced pull.
+                Some(_) if subscribed => notify.notify_one(),
+                _ => {}
+            }
+        }
+    }
+    Ok(()) // stream ended → caller reconnects
+}
+
+/// Parse one SSE event block into (event name, data payload).
+fn parse_sse(block: &str) -> (Option<String>, String) {
+    let mut event = None;
+    let mut data = String::new();
+    for line in block.lines() {
+        if let Some(v) = line.strip_prefix("event:") {
+            event = Some(v.trim().to_string());
+        } else if let Some(v) = line.strip_prefix("data:") {
+            data.push_str(v.strip_prefix(' ').unwrap_or(v));
+        }
+    }
+    (event, data)
+}
+
 
 #[cfg(test)]
 mod it {
@@ -1092,6 +1195,19 @@ mod it {
         assert_eq!(count, 1, "three enqueues collapse to one pending row");
         assert_eq!(op, "delete", "latest op wins");
         assert_eq!(ws, "wsX", "upsert captured the note's own workspace");
+    }
+
+    /// SSE block parsing for the realtime listener.
+    #[test]
+    fn parses_sse_event_blocks() {
+        let (e, d) = parse_sse("id:abc\nevent:notes\ndata: {\"id\":\"x\"}");
+        assert_eq!(e.as_deref(), Some("notes"));
+        assert_eq!(d, "{\"id\":\"x\"}", "leading space after data: is stripped");
+        let (e2, d2) = parse_sse("event:PB_CONNECT\ndata:{\"clientId\":\"c1\"}");
+        assert_eq!(e2.as_deref(), Some("PB_CONNECT"));
+        assert!(d2.contains("c1"));
+        // A keepalive/comment block has no event.
+        assert_eq!(parse_sse(":keepalive").0, None);
     }
 
     /// Moving a note across workspaces queues a tombstone in the old workspace
