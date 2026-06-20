@@ -130,6 +130,9 @@ export const useRecordingStore = create<RecordingState>((set, get) => ({
 }));
 
 let listenersBound = false;
+// The note id of the in-flight recording, captured so we can upload its audio
+// once it finishes (the idle status itself doesn't carry the note id).
+let recordingNoteId: string | null = null;
 export function bindBackendListeners() {
   if (listenersBound) return;
   listenersBound = true;
@@ -138,7 +141,20 @@ export function bindBackendListeners() {
   onSummary(({ noteId, summary }) => useNotesStore.getState().setSummary(noteId, summary));
   onRecordingStatus((s) => {
     useRecordingStore.getState().setStatus(s);
-    if (s.phase === "idle") useRecordingStore.getState().setDiag(null);
+    if (s.phase === "idle") {
+      useRecordingStore.getState().setDiag(null);
+      // A recording just finished — if it was a shared (workspace) note, upload
+      // its audio for teammates. The command waits for the post-stop pipeline to
+      // write playback.wav, so fire-and-forget here.
+      if (recordingNoteId) {
+        const id = recordingNoteId;
+        recordingNoteId = null;
+        const note = useNotesStore.getState().notes.find((n) => n.id === id);
+        if (note?.workspace_id) void ipc.uploadNoteAudio(id);
+      }
+    } else if (s.noteId) {
+      recordingNoteId = s.noteId; // an active recording — remember which note
+    }
   });
   onSummaryStatus(({ noteId, active }) => {
     useRecordingStore.getState().setSummarizing(noteId, active);

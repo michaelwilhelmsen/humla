@@ -269,10 +269,15 @@ export function Note() {
     if (!draft) return;
     let cancelled = false;
     (async () => {
-      const [path, tl] = await Promise.all([
+      let [path, tl] = await Promise.all([
         ipc.notePlaybackPath(draft.id).catch(() => null),
         ipc.noteTimeline(draft.id).catch((): TimelineEntry[] => []),
       ]);
+      // No local audio but the note is shared → pull it from the workspace.
+      if (!path && draft.workspace_id) {
+        const got = await ipc.downloadNoteAudio(draft.id).catch(() => false);
+        if (got && !cancelled) path = await ipc.notePlaybackPath(draft.id).catch(() => null);
+      }
       if (cancelled) return;
       setPlaybackUrl(path ? convertFileSrc(path) : null);
       setTimeline(tl);
@@ -280,7 +285,7 @@ export function Note() {
     return () => {
       cancelled = true;
     };
-  }, [draft?.id, recPhase.phase]);
+  }, [draft?.id, draft?.workspace_id, recPhase.phase]);
 
   // patch / patchProvider intentionally read from `draftRef.current`
   // rather than the `draft` closure so they can stay stable across

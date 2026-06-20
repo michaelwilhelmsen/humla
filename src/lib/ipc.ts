@@ -195,6 +195,10 @@ export const ipc = {
     invoke<string[]>("note_diagnostics_files", { noteId }),
   notePlaybackPath: (noteId: string) =>
     invoke<string | null>("note_playback_path", { noteId }),
+  // Cloud audio sync: upload a finished recording to its workspace, or pull a
+  // shared note's audio down for local playback.
+  uploadNoteAudio: (noteId: string) => invoke<void>("cloud_upload_note_audio", { noteId }),
+  downloadNoteAudio: (noteId: string) => invoke<boolean>("cloud_download_note_audio", { noteId }),
   noteTimeline: (noteId: string) =>
     invoke<TimelineEntry[]>("note_timeline", { noteId }),
   noteTimelineRename: (noteId: string, oldLabel: string, newLabel: string) =>

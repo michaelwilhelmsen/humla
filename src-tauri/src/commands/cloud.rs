@@ -21,7 +21,7 @@ use crate::db;
 use crate::AppState;
 use serde::Serialize;
 use std::sync::{LazyLock, Mutex};
-use tauri::State;
+use tauri::{Manager, State};
 
 const CRED_ACCOUNT: &str = "cloud_credentials";
 // `pub(crate)` so the cloud-sync worker glue (`commands::cloud_worker`) can read
@@ -726,6 +726,163 @@ pub async fn cloud_transfer_workspace(
         .map_err(|e| e.to_string())?;
     pb_json(resp).await?; // surfaces the hook's message (e.g. owner-only, not-a-member)
     Ok(())
+}
+
+// ---- audio sync (paid-tier capability) -------------------------------------
+
+/// Resolve a note's remote record (PB id + current audio filename) by its
+/// client_id within a workspace. `None` when it isn't on the server yet.
+async fn find_note_remote(
+    base: &str,
+    token: &str,
+    client_id: &str,
+    workspace: &str,
+) -> Result<Option<(String, String)>, String> {
+    let filter = format!("client_id='{client_id}' && workspace='{workspace}'");
+    let val = authed_get(
+        base,
+        token,
+        "/api/collections/notes/records",
+        &[("filter", filter.as_str()), ("perPage", "1"), ("fields", "id,audio")],
+    )
+    .await?;
+    let item = val.get("items").and_then(|v| v.as_array()).and_then(|a| a.first());
+    Ok(item.map(|it| {
+        (
+            it.get("id").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+            it.get("audio").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+        )
+    }))
+}
+
+fn playback_path(app: &tauri::AppHandle, note_id: &str) -> Result<std::path::PathBuf, String> {
+    Ok(app
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("recordings")
+        .join(note_id)
+        .join("playback.wav"))
+}
+
+/// Upload a finished recording's mixed `playback.wav` to its workspace note
+/// record, so teammates can play it back. No-op for Personal notes or when the
+/// `sync_audio` setting is "false". Waits for the post-stop pipeline to write
+/// the playback file and for the note record to exist on the server (both happen
+/// asynchronously after a recording stops), so the caller can fire-and-forget.
+pub(crate) async fn upload_note_audio(app: &tauri::AppHandle, note_id: &str) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let workspace = {
+        let conn = state.db.lock();
+        if db::get_setting(&conn, "sync_audio").ok().flatten().as_deref() == Some("false") {
+            return Ok(());
+        }
+        db::get_note(&conn, note_id).map_err(err)?.workspace_id
+    };
+    if workspace.is_empty() {
+        return Ok(()); // Personal — never leaves the device
+    }
+
+    // Wait for write_playback_assets to produce the file (post-stop diarize can
+    // take a while on long recordings). Bounded; give up quietly if never ready.
+    let path = playback_path(app, note_id)?;
+    let mut ready = false;
+    for _ in 0..40 {
+        if path.exists() {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    }
+    if !ready {
+        return Ok(());
+    }
+    let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+
+    let (base, session) = ensure_session(&state).await?;
+    // The note record syncs asynchronously post-stop; wait for it to exist.
+    let mut pb_id = None;
+    for _ in 0..20 {
+        if let Some((id, _)) = find_note_remote(&base, &session.token, note_id, &workspace).await? {
+            pb_id = Some(id);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    }
+    let Some(pb_id) = pb_id else {
+        return Ok(()); // note never synced — skip rather than error
+    };
+
+    let part = reqwest::multipart::Part::bytes(bytes)
+        .file_name("playback.wav")
+        .mime_str("audio/wav")
+        .map_err(|e| e.to_string())?;
+    let form = reqwest::multipart::Form::new().part("audio", part);
+    let resp = http()
+        .patch(format!("{base}/api/collections/notes/records/{pb_id}"))
+        .bearer_auth(&session.token)
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    pb_json(resp).await?;
+    Ok(())
+}
+
+/// Download a workspace note's audio to its local playback path so it can be
+/// played back. Returns true if the file is present locally afterwards. No-op
+/// for Personal notes, when local audio already exists, or when the note has no
+/// remote audio. The `audio` field is protected, so it's fetched with a
+/// short-lived file token.
+pub(crate) async fn download_note_audio(app: &tauri::AppHandle, note_id: &str) -> Result<bool, String> {
+    let state = app.state::<AppState>();
+    let workspace = {
+        let conn = state.db.lock();
+        db::get_note(&conn, note_id).map_err(err)?.workspace_id
+    };
+    if workspace.is_empty() {
+        return Ok(false);
+    }
+    let path = playback_path(app, note_id)?;
+    if path.exists() {
+        return Ok(true); // already local
+    }
+    let (base, session) = ensure_session(&state).await?;
+    let Some((pb_id, filename)) = find_note_remote(&base, &session.token, note_id, &workspace).await?
+    else {
+        return Ok(false);
+    };
+    if filename.is_empty() {
+        return Ok(false); // no remote audio
+    }
+    // Protected file → mint a short-lived file token, then fetch.
+    let tok = authed_post(&base, &session.token, "/api/files/token", serde_json::json!({})).await?;
+    let file_token = tok.get("token").and_then(|v| v.as_str()).unwrap_or_default();
+    let resp = http()
+        .get(format!("{base}/api/files/notes/{pb_id}/{filename}"))
+        .query(&[("token", file_token)])
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("audio download failed ({})", resp.status()));
+    }
+    let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+#[tauri::command]
+pub async fn cloud_upload_note_audio(app: tauri::AppHandle, note_id: String) -> Result<(), String> {
+    upload_note_audio(&app, &note_id).await
+}
+
+#[tauri::command]
+pub async fn cloud_download_note_audio(app: tauri::AppHandle, note_id: String) -> Result<bool, String> {
+    download_note_audio(&app, &note_id).await
 }
 
 /// Note ids with an unpushed change queued in the sync outbox — drives a
