@@ -213,6 +213,8 @@ where
             commands::cloud_logout,
             commands::cloud_create_workspace,
             commands::cloud_select_workspace,
+            commands::cloud_rename_workspace,
+            commands::cloud_delete_workspace,
             commands::cloud_workspace_members,
             commands::cloud_add_member,
             commands::cloud_remove_member,

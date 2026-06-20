@@ -41,6 +41,15 @@ export function OrganizationTab() {
   const [addEmail, setAddEmail] = useState("");
   const [busy, setBusy] = useState(false);
   const [newWs, setNewWs] = useState("");
+  const [nameDraft, setNameDraft] = useState("");
+  const [confirmDelete, setConfirmDelete] = useState(false);
+
+  // Reseed the rename field and reset the delete confirm whenever the active
+  // workspace (or its name, after a rename) changes.
+  useEffect(() => {
+    setNameDraft(ws?.name ?? "");
+    setConfirmDelete(false);
+  }, [ws?.id, ws?.name]);
 
   const loadMembers = useCallback(async (id: string) => {
     setLoading(true);
@@ -167,11 +176,61 @@ export function OrganizationTab() {
     }
   }
 
+  async function rename() {
+    if (!ws) return;
+    const name = nameDraft.trim();
+    if (!name || name === ws.name) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await cloudApi.renameWorkspace(ws.id, name);
+      await refreshCloud();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function deleteWorkspace() {
+    if (!ws) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await cloudApi.deleteWorkspace(ws.id);
+      setConfirmDelete(false);
+      await refreshCloud();
+      await refreshNotes();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <>
       <Section title="Workspace">
         <Row label="Name">
-          <div className="text-sm">{ws.name}</div>
+          {canManage ? (
+            <div className="flex gap-2">
+              <input
+                className={inputCls}
+                value={nameDraft}
+                onChange={(e) => setNameDraft(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && rename()}
+                placeholder="Workspace name"
+              />
+              <Btn
+                onClick={rename}
+                disabled={busy || !nameDraft.trim() || nameDraft.trim() === ws.name}
+              >
+                Save
+              </Btn>
+            </div>
+          ) : (
+            <div className="text-sm">{ws.name}</div>
+          )}
         </Row>
         <Row label="Your role">
           <div className="flex items-center gap-2">
@@ -254,6 +313,47 @@ export function OrganizationTab() {
           </Row>
         )}
       </Section>
+
+      {ws.role === "owner" && (
+        <Section title="Danger zone">
+          <Row label="Delete workspace">
+            <div className="flex flex-col gap-2">
+              {!confirmDelete ? (
+                <button
+                  onClick={() => setConfirmDelete(true)}
+                  disabled={busy}
+                  className="self-start px-3 py-2 rounded-md text-sm border border-[var(--color-accent)] text-[var(--color-accent)] hover:bg-[var(--color-pill-hover)] disabled:opacity-50 transition-colors"
+                >
+                  <span className="inline-flex items-center gap-1.5">
+                    <Trash2 size={14} strokeWidth={1.5} /> Delete workspace
+                  </span>
+                </button>
+              ) : (
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-xs text-[var(--color-text-muted)]">
+                    Delete “{ws.name}” for everyone?
+                  </span>
+                  <button
+                    onClick={deleteWorkspace}
+                    disabled={busy}
+                    className="px-3 py-2 rounded-md text-sm border border-[var(--color-accent)] disabled:opacity-50 transition-opacity hover:opacity-90"
+                    style={{ background: "var(--color-accent)", color: "#fff" }}
+                  >
+                    Delete permanently
+                  </button>
+                  <Btn onClick={() => setConfirmDelete(false)} disabled={busy}>
+                    Cancel
+                  </Btn>
+                </div>
+              )}
+              <p className="text-xs text-[var(--color-text-muted)]">
+                Removes the workspace and its notes, folders and prompts from the server for all
+                members. Your local copies stay on this device.
+              </p>
+            </div>
+          </Row>
+        </Section>
+      )}
     </>
   );
 }

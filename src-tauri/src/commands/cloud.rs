@@ -186,6 +186,27 @@ async fn authed_patch(
     pb_json(resp).await
 }
 
+/// DELETE a record. PocketBase returns 204 No Content on success (empty body),
+/// so this checks status directly instead of parsing JSON like `pb_json`.
+async fn authed_delete(base: &str, token: &str, path: &str) -> Result<(), String> {
+    let resp = http()
+        .delete(format!("{base}{path}"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if resp.status().is_success() {
+        return Ok(());
+    }
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    let msg = serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(String::from))
+        .unwrap_or(body);
+    Err(format!("pocketbase {status}: {msg}"))
+}
+
 // ---- auth ------------------------------------------------------------------
 
 async fn login_request(base: &str, email: &str, password: &str) -> Result<Session, String> {
@@ -520,5 +541,45 @@ pub async fn cloud_set_member_role(
         serde_json::json!({ "members": members, "admins": admins }),
     )
     .await?;
+    Ok(())
+}
+
+/// Rename a workspace. The server `updateRule` allows owner or admin.
+#[tauri::command]
+pub async fn cloud_rename_workspace(
+    state: State<'_, AppState>,
+    workspace_id: String,
+    name: String,
+) -> Result<(), String> {
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err("Workspace name cannot be empty".into());
+    }
+    let (base, session) = ensure_session(&state).await?;
+    let path = format!("/api/collections/workspaces/records/{workspace_id}");
+    authed_patch(&base, &session.token, &path, serde_json::json!({ "name": name })).await?;
+    Ok(())
+}
+
+/// Delete a workspace. The server `deleteRule` allows the owner only; the
+/// `workspace` relation cascade-deletes its notes/folders/prompts on the
+/// server. Local copies are left in place (they simply stop syncing). If the
+/// deleted workspace was the active one, fall back to Personal and stop the
+/// sync worker.
+#[tauri::command]
+pub async fn cloud_delete_workspace(
+    state: State<'_, AppState>,
+    workspace_id: String,
+) -> Result<(), String> {
+    let (base, session) = ensure_session(&state).await?;
+    let path = format!("/api/collections/workspaces/records/{workspace_id}");
+    authed_delete(&base, &session.token, &path).await?;
+    if read_workspace_id(&state).as_deref() == Some(workspace_id.as_str()) {
+        {
+            let conn = state.db.lock();
+            db::set_setting(&conn, SETTING_WORKSPACE, "").map_err(err)?;
+        }
+        state.sync.config_changed(); // deleted the active workspace → stop syncing
+    }
     Ok(())
 }
