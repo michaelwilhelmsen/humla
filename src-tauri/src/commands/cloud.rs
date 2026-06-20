@@ -104,6 +104,21 @@ fn cred_entry() -> Result<keyring::Entry, String> {
 }
 
 pub(crate) fn read_creds() -> Option<(String, String)> {
+    // Dev convenience: in debug builds, take credentials from env vars if set,
+    // skipping the Keychain entirely. `tauri dev` re-signs the binary on every
+    // rebuild, so the macOS Keychain "Always Allow" grant never sticks — and
+    // because the sync worker reads creds at boot, that means a prompt on every
+    // relaunch. Setting HUMLA_DEV_SYNC_EMAIL + HUMLA_DEV_SYNC_PASSWORD avoids it.
+    // Release builds are Developer-ID signed (grant sticks) and always use the
+    // Keychain; the env path is compiled out entirely.
+    #[cfg(debug_assertions)]
+    {
+        let email = std::env::var("HUMLA_DEV_SYNC_EMAIL").unwrap_or_default();
+        let password = std::env::var("HUMLA_DEV_SYNC_PASSWORD").unwrap_or_default();
+        if !email.is_empty() && !password.is_empty() {
+            return Some((email, password));
+        }
+    }
     let raw = cred_entry().ok()?.get_password().ok()?;
     let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
     Some((
