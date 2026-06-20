@@ -62,6 +62,8 @@ type CloudState = {
   status: CloudStatus;
   /** First status fetch has completed (so the UI can avoid a flash). */
   ready: boolean;
+  /** Members of the active workspace, keyed by user id — for owner attribution. */
+  members: Record<string, CloudMember>;
   refresh: () => Promise<void>;
   setStatus: (s: CloudStatus) => void;
 };
@@ -69,17 +71,44 @@ type CloudState = {
 export const useCloudStore = create<CloudState>((set) => ({
   status: DISCONNECTED,
   ready: false,
+  members: {},
   setStatus: (status) => set({ status, ready: true }),
   refresh: async () => {
     try {
       const status = await cloudApi.status();
       set({ status, ready: true });
+      // Load the active workspace's members so notes can resolve their owner id
+      // to a display name. Cleared in Personal / signed-out.
+      const wsId = status.current_workspace?.id;
+      if (wsId) {
+        try {
+          const list = await cloudApi.workspaceMembers(wsId);
+          set({ members: Object.fromEntries(list.map((m) => [m.id, m])) });
+        } catch {
+          set({ members: {} });
+        }
+      } else {
+        set({ members: {} });
+      }
     } catch {
       // No Tauri runtime / command unavailable → treat as disconnected.
-      set({ status: DISCONNECTED, ready: true });
+      set({ status: DISCONNECTED, ready: true, members: {} });
     }
   },
 }));
+
+/**
+ * Resolve a note's `owner` id to a display name for "created by" attribution,
+ * using the active workspace's member list. Returns null when the note is
+ * yours, has no owner, or the owner can't be resolved (e.g. a former member) —
+ * callers should render nothing in those cases.
+ */
+export function useOwnerName(ownerId: string | undefined | null): string | null {
+  const me = useCloudStore((s) => s.status.user?.id);
+  const member = useCloudStore((s) => (ownerId ? s.members[ownerId] : undefined));
+  if (!ownerId || ownerId === me) return null;
+  return member ? member.name || member.email : null;
+}
 
 export function roleLabel(role: CloudRole): string {
   return role.charAt(0).toUpperCase() + role.slice(1);

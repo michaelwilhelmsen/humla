@@ -211,10 +211,19 @@ impl Worker {
             return Ok(()); // deleted locally before we got here; nothing to push
         };
         let auth = self.ensure_auth().await?;
+        // Preserve the creator across edits: this device only becomes the owner
+        // when it's creating the note (no owner yet). Editing a teammate's
+        // pulled note (owner already set) must NOT reassign ownership to the
+        // editor.
+        let owner = if note.owner.is_empty() {
+            auth.user_id.clone()
+        } else {
+            note.owner.clone()
+        };
         let body = json!({
             "client_id": uuid,
             "workspace": self.config.workspace_id,
-            "owner": auth.user_id,
+            "owner": owner,
             "title": note.title,
             "body": note.body,
             "transcript": note.transcript,
@@ -463,13 +472,14 @@ impl Worker {
         conn.execute(
             "INSERT INTO notes
                 (id, title, body, transcript, summary, audio_path, summary_preset,
-                 folder_id, language, summary_provider, expected_speakers, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, '', ?9, ?10, ?11)
+                 folder_id, language, summary_provider, expected_speakers, owner, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, '', ?9, ?12, ?10, ?11)
              ON CONFLICT(id) DO UPDATE SET
                 title=excluded.title, body=excluded.body, transcript=excluded.transcript,
                 summary=excluded.summary, summary_preset=excluded.summary_preset,
                 folder_id=excluded.folder_id, language=excluded.language,
-                expected_speakers=excluded.expected_speakers, updated_at=excluded.updated_at
+                expected_speakers=excluded.expected_speakers, owner=excluded.owner,
+                updated_at=excluded.updated_at
              WHERE excluded.updated_at >= notes.updated_at",
             rusqlite::params![
                 n.client_id,
@@ -483,6 +493,7 @@ impl Worker {
                 speakers,
                 n.created_at,
                 n.client_updated_at,
+                n.owner,
             ],
         )?;
         Ok(())
@@ -558,7 +569,7 @@ impl Worker {
         let conn = self.db.lock();
         conn.query_row(
             "SELECT title, body, transcript, summary, language, summary_preset,
-                    folder_id, expected_speakers, created_at, updated_at
+                    folder_id, expected_speakers, created_at, updated_at, owner
              FROM notes WHERE id = ?1",
             rusqlite::params![uuid],
             |r| {
@@ -573,6 +584,7 @@ impl Worker {
                     expected_speakers: r.get(7)?,
                     created_at: r.get(8)?,
                     updated_at: r.get(9)?,
+                    owner: r.get(10)?,
                 })
             },
         )
@@ -633,6 +645,7 @@ struct NoteRow {
     expected_speakers: Option<i64>,
     created_at: i64,
     updated_at: i64,
+    owner: String,
 }
 
 struct FolderRow {
@@ -659,6 +672,7 @@ struct RemoteNote {
     summary_preset: String,
     folder_client_id: String,
     expected_speakers: i64,
+    owner: String,
     created_at: i64,
     client_updated_at: i64,
 }
@@ -753,7 +767,8 @@ mod it {
                 summary TEXT NOT NULL DEFAULT '', audio_path TEXT,
                 summary_preset TEXT NOT NULL DEFAULT 'meeting', folder_id TEXT,
                 language TEXT NOT NULL DEFAULT '', summary_provider TEXT NOT NULL DEFAULT '',
-                expected_speakers INTEGER, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+                expected_speakers INTEGER, owner TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
             );
             CREATE TABLE folders (
                 id TEXT PRIMARY KEY, name TEXT NOT NULL,
@@ -820,6 +835,9 @@ mod it {
         // synced note show an empty transcript/summary).
         assert_eq!(scalar(&db, "SELECT transcript FROM notes WHERE id = ?1", &uuid).as_deref(), Some("tx"));
         assert_eq!(scalar(&db, "SELECT summary FROM notes WHERE id = ?1", &uuid).as_deref(), Some("sm"));
+        // Owner is assigned to the syncing user on first push (the note had no
+        // owner) and round-trips back on pull → drives "created by" attribution.
+        assert_eq!(scalar(&db, "SELECT owner FROM notes WHERE id = ?1", &uuid).as_deref(), Some(auth.user_id.as_str()));
 
         w.push_delete("notes", &uuid).await.expect("delete");
         w.write_state("notes_cursor", "").unwrap();

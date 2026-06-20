@@ -24,6 +24,10 @@ export type Note = {
   expected_speakers: number | null;
   created_at: number;
   updated_at: number;
+  // Cloud sync: PocketBase user id of the note's creator. Empty for
+  // local-only / pre-sync notes. Resolved to a name (via the workspace member
+  // list) for "created by" attribution in shared workspaces.
+  owner: string;
 };
 
 export type Folder = {

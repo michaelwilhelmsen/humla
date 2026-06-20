@@ -29,6 +29,12 @@ pub struct Note {
     pub expected_speakers: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
+    // Cloud sync: the PocketBase user id of the note's creator. Empty for
+    // local-only / pre-sync notes; populated from the server on pull. Used for
+    // "created by" attribution in shared workspaces. Preserved across edits
+    // (the syncing user only becomes owner when creating, never by editing).
+    #[serde(default)]
+    pub owner: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,6 +112,12 @@ pub fn open(path: &Path) -> Result<Connection> {
         "ALTER TABLE notes ADD COLUMN expected_speakers INTEGER",
         [],
     );
+    // Cloud sync: note creator (PocketBase user id). Empty for local/pre-sync
+    // notes; populated from the server on pull.
+    let _ = conn.execute(
+        "ALTER TABLE notes ADD COLUMN owner TEXT NOT NULL DEFAULT ''",
+        [],
+    );
     // Index is created AFTER the ALTERs so it's safe on both fresh DBs and
     // older DBs that needed the column added.
     conn.execute(
@@ -119,7 +131,7 @@ pub fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
-const NOTE_COLS: &str = "id, title, body, transcript, summary, audio_path, summary_preset, folder_id, language, summary_provider, expected_speakers, created_at, updated_at";
+const NOTE_COLS: &str = "id, title, body, transcript, summary, audio_path, summary_preset, folder_id, language, summary_provider, expected_speakers, created_at, updated_at, owner";
 
 pub fn list_notes(conn: &Connection) -> Result<Vec<Note>> {
     let mut stmt = conn.prepare_cached(&format!(
@@ -581,6 +593,7 @@ fn map_note(row: &rusqlite::Row) -> rusqlite::Result<Note> {
         expected_speakers: row.get(10)?,
         created_at: row.get(11)?,
         updated_at: row.get(12)?,
+        owner: row.get(13)?,
     })
 }
 

@@ -17,12 +17,14 @@ import {
   Languages,
   MoreHorizontal,
   RefreshCw,
+  User,
   Users,
   X,
 } from "lucide-react";
 import { ipc, onSummaryThinkingDelta, onSummaryContentDelta, type Note as TNote, type SummaryPrompt, type TimelineEntry } from "../lib/ipc";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { useNotesStore, useRecordingStore } from "../lib/store";
+import { useOwnerName } from "../lib/cloud";
 import { extractSpeakerLabels, renameSpeakerInTranscript } from "../lib/speakers";
 import { RecordingBar } from "../components/RecordingBar";
 import { SkeletonLines } from "../components/Skeleton";
@@ -57,6 +59,10 @@ export function Note() {
   const upsert = useNotesStore((s) => s.upsertLocal);
   const note = useNotesStore((s) => s.notes.find((n) => n.id === id));
   const [draft, setDraft] = useState<TNote | null>(null);
+  // "Created by" attribution — resolves to a name only when the note was
+  // authored by a teammate in the active workspace (null when it's yours,
+  // local, or unresolvable). Called unconditionally before the early return.
+  const ownerName = useOwnerName(draft?.owner ?? null);
   const [uiLang, setUiLang] = useState<string>("no");
   const [globalProvider, setGlobalProvider] = useState<string>("openai");
   // Live reasoning + content streamed from the local LLM. Cleared each time a
@@ -380,6 +386,11 @@ export function Note() {
           <PropertyRow icon={<Calendar size={14} />} label="created">
             <span>{dateChip}</span>
           </PropertyRow>
+          {ownerName && (
+            <PropertyRow icon={<User size={14} />} label="created by">
+              <span>{ownerName}</span>
+            </PropertyRow>
+          )}
           {(isRecording || isStarting || isPaused) && (
             <PropertyRow
               icon={<Circle size={14} fill={isPaused ? "transparent" : "currentColor"} />}
