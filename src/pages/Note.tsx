@@ -700,7 +700,9 @@ export function Note() {
               <>
                 <SpeakerLabels
                   transcript={draft.transcript}
+                  readOnly={readOnly}
                   onRename={(oldLabel, newLabel) => {
+                    if (readOnlyRef.current) return; // viewer: no transcript/timeline edits
                     patch(
                       "transcript",
                       renameSpeakerInTranscript(draft.transcript, oldLabel, newLabel),
@@ -722,7 +724,7 @@ export function Note() {
                       );
                   }}
                 />
-                <RediarizeAction noteId={draft.id} />
+                {!readOnly && <RediarizeAction noteId={draft.id} />}
                 {devMode && <DiagnosticsLinks noteId={draft.id} />}
                 {playbackUrl && timeline.length > 0 ? (
                   <TranscriptPlayer
@@ -1353,9 +1355,11 @@ function speakerColorMap(labels: string[]): Map<string, string> {
 function SpeakerLabels({
   transcript,
   onRename,
+  readOnly,
 }: {
   transcript: string;
   onRename: (oldLabel: string, newLabel: string) => void;
+  readOnly?: boolean;
 }) {
   const labels = useMemo(() => extractSpeakerLabels(transcript), [transcript]);
   const colors = useMemo(() => speakerColorMap(labels), [labels]);
@@ -1370,6 +1374,7 @@ function SpeakerLabels({
           label={label}
           color={colors.get(label) ?? SPEAKER_COLORS[0]}
           onRename={(next) => onRename(label, next)}
+          readOnly={readOnly}
         />
       ))}
     </div>
@@ -1380,10 +1385,12 @@ function SpeakerChip({
   label,
   color,
   onRename,
+  readOnly,
 }: {
   label: string;
   color: string;
   onRename: (next: string) => void;
+  readOnly?: boolean;
 }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(label);
@@ -1408,6 +1415,15 @@ function SpeakerChip({
       return;
     }
     onRename(trimmed);
+  }
+
+  // Read-only (viewer): a static, non-interactive pill — no click-to-rename.
+  if (readOnly) {
+    return (
+      <span className="nd-speaker-pill" style={{ background: color }}>
+        {label}
+      </span>
+    );
   }
 
   if (editing) {

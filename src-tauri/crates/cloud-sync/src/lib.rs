@@ -283,20 +283,27 @@ impl Worker {
         Ok(())
     }
 
-    /// Push pending outbox rows oldest-first. Stops at the first failure so the
-    /// row stays queued and ordering is preserved for the next attempt.
+    /// Push pending outbox rows oldest-first. On an ordinary transient failure it
+    /// stops at the first failing row so ordering is preserved and the next tick
+    /// retries. But a row that has failed `MAX_TRANSIENT_ATTEMPTS` times is
+    /// stepped over (kept queued, retried later) so one persistently-stuck row
+    /// can't head-of-line-block every later change forever.
     async fn drain_outbox(&self) -> Result<()> {
+        // Highest seq we've stepped over THIS pass (persistently-failing but
+        // transient). Starts at -1 each call, so a skipped row is always retried
+        // from the top on the next tick.
+        let mut skip_after: i64 = -1;
         loop {
             let next: Option<(i64, String, String, String, String, i64)> = {
                 let conn = self.db.lock();
                 conn.query_row(
-                    "SELECT seq, entity, entity_id, op, workspace, attempts FROM sync_outbox ORDER BY seq LIMIT 1",
-                    [],
+                    "SELECT seq, entity, entity_id, op, workspace, attempts FROM sync_outbox WHERE seq > ?1 ORDER BY seq LIMIT 1",
+                    rusqlite::params![skip_after],
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
                 )
                 .optional()?
             };
-            let Some((seq, entity, entity_id, op, workspace, _attempts)) = next else {
+            let Some((seq, entity, entity_id, op, workspace, attempts)) = next else {
                 return Ok(());
             };
 
@@ -326,20 +333,34 @@ impl Worker {
                     self.db.lock().execute("DELETE FROM sync_outbox WHERE seq = ?1", rusqlite::params![seq])?;
                 }
                 Err(e) if is_permanent_push_error(&e) => {
-                    // Genuinely un-pushable for this payload (a 4xx: validation,
-                    // forbidden, not-found). Retrying can't help and it would
-                    // head-of-line-block everything behind it, so drop it. We
-                    // never drop on a transient error (see below), so this can't
+                    // Genuinely un-pushable for this payload (a 4xx allow-listed in
+                    // `is_permanent_status`: bad-request / forbidden / not-found /
+                    // validation). Retrying can't help, so drop it. The classifier
+                    // is a strict allow-list keyed on the numeric status, so a
+                    // transient error is never misread as permanent — this can't
                     // silently lose a change that would have eventually synced.
                     eprintln!("cloud-sync: dropping un-pushable {entity}/{op} {entity_id}: {e:#}");
                     self.db.lock().execute("DELETE FROM sync_outbox WHERE seq = ?1", rusqlite::params![seq])?;
                     continue;
                 }
                 Err(e) => {
-                    // Transient failure (network / 5xx / 429 rate-limit): keep the
-                    // row and stop draining so ordering is preserved; the tick
-                    // loop retries indefinitely. A brief outage must never cost a
-                    // real change, so transient failures are NOT quarantined.
+                    // Transient failure (network / 5xx / 401 / 408 / 413 / 429 …):
+                    // never dropped. Record the attempt; once a single row has
+                    // failed too many times, step over it (kept queued, retried
+                    // next tick) so it can't block newer changes indefinitely.
+                    // Otherwise stop draining here to preserve ordering.
+                    let n = attempts + 1;
+                    self.db.lock().execute(
+                        "UPDATE sync_outbox SET attempts = ?2 WHERE seq = ?1",
+                        rusqlite::params![seq, n],
+                    )?;
+                    if n >= MAX_TRANSIENT_ATTEMPTS {
+                        eprintln!(
+                            "cloud-sync: stepping over persistently-failing {entity}/{op} {entity_id} after {n} attempts (kept for retry): {e:#}"
+                        );
+                        skip_after = seq;
+                        continue;
+                    }
                     return Err(e);
                 }
             }
@@ -1039,15 +1060,51 @@ fn is_safe_id(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
 }
 
-/// Classify a push failure as permanent (a 4xx that retrying can't fix) vs
-/// transient (network / 5xx / 429 rate-limit). `error_for_pb` formats PocketBase
-/// failures as "pocketbase {status}: …" where the status Display starts with the
-/// numeric code, so a 4xx surfaces as "pocketbase 4xx"; 429 is excluded because
-/// it clears on its own. Anything else (reqwest transport errors, 5xx) is
-/// transient and must keep retrying — never dropped.
+/// After this many consecutive failed push attempts, a transient-failing outbox
+/// row is stepped over (kept queued and retried on the next tick, NOT dropped) so
+/// one persistently-stuck row can't head-of-line-block every later change. Low
+/// enough that a poison row stops blocking newer edits quickly; an ordinary
+/// outage just waits, because all rows fail together anyway.
+const MAX_TRANSIENT_ATTEMPTS: i64 = 5;
+
+/// A non-2xx response from PocketBase, carrying the numeric HTTP status so a push
+/// failure can be classified on the *status alone* — never by string-matching the
+/// (server-controlled) response body, which could otherwise flip the verdict.
+#[derive(Debug)]
+struct PbError {
+    status: u16,
+    body: String,
+}
+
+impl std::fmt::Display for PbError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "pocketbase {}: {}", self.status, self.body)
+    }
+}
+
+impl std::error::Error for PbError {}
+
+/// True for a 4xx that means "this exact request is malformed/forbidden and will
+/// always be rejected", so dropping the outbox row is safe. This is a strict
+/// allow-list: anything not listed (401 auth-expired, 408/409/413/423/425/429,
+/// every 5xx, transport/timeout errors) is treated as transient and KEPT for
+/// retry — we only ever drop a change when we're certain retrying can't help.
+fn is_permanent_status(status: u16) -> bool {
+    matches!(status, 400 | 403 | 404 | 405 | 422)
+}
+
+/// Classify a push failure as permanent (retrying the same payload can't fix it)
+/// vs transient. Branches ONLY on the numeric status of a typed `PbError`; a
+/// non-HTTP error (reqwest transport, timeout, serde) isn't a `PbError` → treated
+/// as transient.
 fn is_permanent_push_error(e: &anyhow::Error) -> bool {
-    let s = e.to_string();
-    s.contains("pocketbase 4") && !s.contains("pocketbase 429")
+    e.downcast_ref::<PbError>().is_some_and(|pb| is_permanent_status(pb.status))
+}
+
+/// True if the error is a PocketBase 401 (auth/token expired) — the realtime loop
+/// uses this to drop its cached token and re-authenticate.
+fn is_unauthorized(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<PbError>().is_some_and(|pb| pb.status == 401)
 }
 
 fn now_ms() -> i64 {
@@ -1058,14 +1115,15 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// Turn a non-2xx PocketBase response into an error carrying the body text.
+/// Turn a non-2xx PocketBase response into a typed `PbError` carrying the numeric
+/// status and body text.
 async fn error_for_pb(resp: reqwest::Response) -> Result<reqwest::Response> {
     if resp.status().is_success() {
         return Ok(resp);
     }
-    let status = resp.status();
+    let status = resp.status().as_u16();
     let body = resp.text().await.unwrap_or_default();
-    Err(anyhow!("pocketbase {status}: {body}"))
+    Err(anyhow::Error::new(PbError { status, body }))
 }
 
 /// Best-effort realtime: keep a PocketBase SSE connection open and, on every
@@ -1094,7 +1152,7 @@ async fn realtime_loop(config: Config, http: reqwest::Client, notify: Arc<tokio:
         let tok = token.clone().unwrap_or_default();
         if let Err(e) = realtime_once(&config, &http, &tok, &notify).await {
             eprintln!("cloud-sync: realtime disconnected ({e:#}); polling continues");
-            if e.to_string().contains("401") {
+            if is_unauthorized(&e) {
                 token = None; // token died → re-auth next round
             }
         }
@@ -1126,7 +1184,10 @@ async fn realtime_once(
 ) -> Result<()> {
     let mut resp = http.get(format!("{}/api/realtime", config.base_url)).send().await?;
     if !resp.status().is_success() {
-        return Err(anyhow!("realtime connect: {}", resp.status()));
+        return Err(anyhow::Error::new(PbError {
+            status: resp.status().as_u16(),
+            body: "realtime connect".to_string(),
+        }));
     }
 
     let mut buf: Vec<u8> = Vec::new();
@@ -1134,9 +1195,12 @@ async fn realtime_once(
     // `chunk()` reads the next piece of the streamed body (no StreamExt needed).
     while let Some(chunk) = resp.chunk().await? {
         buf.extend_from_slice(&chunk);
-        // Bound memory: a stream that never sends an event delimiter must not
-        // grow the buffer without limit.
-        if buf.len() > 1_000_000 {
+        // Bound memory, but generously: a single SSE event carries a full changed
+        // record, and a long meeting transcript can be hundreds of KB — tearing
+        // down realtime on a legit large note would just bounce the connection
+        // (the interval poll is the correctness backstop regardless). Only a
+        // stream that never sends a delimiter should ever hit this.
+        if buf.len() > 16_000_000 {
             return Err(anyhow!("realtime: event buffer overflow"));
         }
         // SSE events are separated by a blank line — handle both LF and CRLF.
@@ -1160,7 +1224,10 @@ async fn realtime_once(
                             .send()
                             .await?;
                         if !sub.status().is_success() {
-                            return Err(anyhow!("realtime subscribe: {}", sub.status()));
+                            return Err(anyhow::Error::new(PbError {
+                                status: sub.status().as_u16(),
+                                body: "realtime subscribe".to_string(),
+                            }));
                         }
                         subscribed = true;
                     }
@@ -1338,6 +1405,38 @@ mod it {
         assert!(d2.contains("c1"));
         // A keepalive/comment block has no event.
         assert_eq!(parse_sse(":keepalive").0, None);
+    }
+
+    /// Push-error classification: ONLY the allow-listed 4xx are permanent (safe to
+    /// drop); auth-expired, rate-limit, payload-too-large, every 5xx, and non-HTTP
+    /// transport errors are transient (kept for retry). Guards both review
+    /// regressions — a transient failure misread as permanent (silent data loss),
+    /// and the verdict being influenced by the server-controlled response body.
+    #[test]
+    fn classifies_push_errors_by_status_only() {
+        let perm =
+            |s: u16| is_permanent_push_error(&anyhow::Error::new(PbError { status: s, body: String::new() }));
+        // Permanent (drop): malformed / forbidden / not-found / validation.
+        for s in [400u16, 403, 404, 405, 422] {
+            assert!(perm(s), "status {s} should be permanent");
+        }
+        // Transient (keep + retry): auth, timeout, conflict, payload-too-large,
+        // locked, too-early, rate-limit, and all 5xx.
+        for s in [401u16, 408, 409, 413, 423, 425, 429, 500, 502, 503] {
+            assert!(!perm(s), "status {s} should be transient");
+        }
+        // The body must NEVER flip the verdict: a 5xx whose body echoes a
+        // permanent-looking code stays transient.
+        assert!(!is_permanent_push_error(&anyhow::Error::new(PbError {
+            status: 500,
+            body: "pocketbase 400: bad request".to_string(),
+        })));
+        // A non-HTTP error (transport / timeout / serde) is transient.
+        assert!(!is_permanent_push_error(&anyhow!("connection reset by peer")));
+        // 401 is recognised for realtime re-auth — by status, not substring.
+        assert!(is_unauthorized(&anyhow::Error::new(PbError { status: 401, body: String::new() })));
+        assert!(!is_unauthorized(&anyhow::Error::new(PbError { status: 403, body: String::new() })));
+        assert!(!is_unauthorized(&anyhow!("incidental 401 in some message")));
     }
 
     /// Moving a note across workspaces queues a tombstone in the old workspace

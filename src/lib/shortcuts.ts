@@ -2,6 +2,7 @@ import { useEffect } from "react";
 import { useNavigate } from "react-router-dom";
 import { ipc } from "./ipc";
 import { useNotesStore, useRecordingStore } from "./store";
+import { useCloudStore } from "./cloud";
 
 export function useGlobalShortcuts() {
   const navigate = useNavigate();
@@ -29,7 +30,15 @@ export function useGlobalShortcuts() {
         } else if (status.phase === "idle" && status.noteId === null) {
           const path = window.location.pathname;
           const match = path.match(/^\/note\/([^/]+)$/);
-          if (match) await ipc.recordingStart(match[1]);
+          if (match) {
+            // Don't start a recording on a read-only (viewer) note — the record
+            // UI is hidden for viewers, so this keyboard path must be gated too.
+            const note = useNotesStore.getState().notes.find((n) => n.id === match[1]);
+            const role = note?.workspace_id
+              ? useCloudStore.getState().status.workspaces.find((w) => w.id === note.workspace_id)?.role
+              : undefined;
+            if (role !== "viewer") await ipc.recordingStart(match[1]);
+          }
         }
       } else if (e.key === "k") {
         e.preventDefault();
