@@ -93,13 +93,27 @@ enum Op {
 /// caller spawns the future on its runtime. In the Tauri app that means
 /// `tauri::async_runtime::spawn(fut)` — NOT `tokio::spawn`, which panics when
 /// called from Tauri's setup closure (no current runtime there).
-pub fn start<N>(
+/// Coarse, UI-facing sync state, reported via the `status` callback passed to
+/// [`start`]. The app maps these to an indicator (spinner / synced / warning).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyncState {
+    /// A push/pull cycle is in flight.
+    Syncing,
+    /// The last cycle completed successfully.
+    Idle,
+    /// The last cycle failed (will retry).
+    Error,
+}
+
+pub fn start<N, S>(
     db: Db,
     config: Config,
     notify: N,
+    status: S,
 ) -> Result<(Arc<CloudSync>, impl std::future::Future<Output = ()>)>
 where
     N: Fn() + Send + Sync + 'static,
+    S: Fn(SyncState) + Send + Sync + 'static,
 {
     init_tables(&db)?;
     let (tx, rx) = mpsc::unbounded_channel();
@@ -108,6 +122,7 @@ where
         config,
         http: reqwest::Client::new(),
         notify: Arc::new(notify),
+        status: Arc::new(status),
         auth: Mutex::new(None),
     };
     Ok((Arc::new(CloudSync { tx }), worker.run(rx)))
@@ -124,14 +139,20 @@ struct Worker {
     config: Config,
     http: reqwest::Client,
     notify: Arc<dyn Fn() + Send + Sync>,
+    status: Arc<dyn Fn(SyncState) + Send + Sync>,
     auth: Mutex<Option<Auth>>,
 }
 
 impl Worker {
     async fn run(self, mut rx: mpsc::UnboundedReceiver<Op>) {
-        if let Err(e) = self.pull().await {
-            eprintln!("cloud-sync: initial pull failed: {e:#}");
-        }
+        (self.status)(SyncState::Syncing);
+        let ok = self
+            .pull()
+            .await
+            .inspect_err(|e| eprintln!("cloud-sync: initial pull failed: {e:#}"))
+            .is_ok();
+        (self.status)(if ok { SyncState::Idle } else { SyncState::Error });
+
         let mut tick = tokio::time::interval(self.config.poll_interval);
         tick.tick().await; // the first tick fires immediately; consume it
 
@@ -140,23 +161,33 @@ impl Worker {
                 op = rx.recv() => {
                     match op {
                         Some(op) => {
+                            (self.status)(SyncState::Syncing);
+                            let mut ok = true;
                             if let Err(e) = self.enqueue(op) {
                                 eprintln!("cloud-sync: enqueue failed: {e:#}");
+                                ok = false;
                             }
                             if let Err(e) = self.drain_outbox().await {
                                 eprintln!("cloud-sync: push failed (will retry): {e:#}");
+                                ok = false;
                             }
+                            (self.status)(if ok { SyncState::Idle } else { SyncState::Error });
                         }
                         None => break, // every sender dropped → shut down
                     }
                 }
                 _ = tick.tick() => {
+                    (self.status)(SyncState::Syncing);
+                    let mut ok = true;
                     if let Err(e) = self.drain_outbox().await {
                         eprintln!("cloud-sync: push failed (will retry): {e:#}");
+                        ok = false;
                     }
                     if let Err(e) = self.pull().await {
                         eprintln!("cloud-sync: pull failed (will retry): {e:#}");
+                        ok = false;
                     }
+                    (self.status)(if ok { SyncState::Idle } else { SyncState::Error });
                 }
             }
         }
@@ -899,6 +930,7 @@ mod it {
             config,
             http: reqwest::Client::new(),
             notify: Arc::new(|| {}) as Arc<dyn Fn() + Send + Sync>,
+            status: Arc::new(|_| {}) as Arc<dyn Fn(SyncState) + Send + Sync>,
             auth: Mutex::new(None),
         }
     }

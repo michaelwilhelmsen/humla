@@ -1,5 +1,6 @@
 import { create } from "zustand";
-import { ipc, onRecordingDiagnostic, onRecordingError, onRecordingStatus, onSummary, onSummaryStatus, onTranscript, onTranscriptReplaced, onNotesChanged, type Folder, type Note, type RecordingDiagnostic, type RecordingStatus } from "./ipc";
+import { ipc, onRecordingDiagnostic, onRecordingError, onRecordingStatus, onSummary, onSummaryStatus, onTranscript, onTranscriptReplaced, onNotesChanged, onSyncStatus, type Folder, type Note, type RecordingDiagnostic, type RecordingStatus } from "./ipc";
+import { useCloudStore } from "./cloud";
 
 type NotesState = {
   notes: Note[];
@@ -146,4 +147,6 @@ export function bindBackendListeners() {
   onRecordingDiagnostic((d) => useRecordingStore.getState().setDiag(d));
   // Cloud sync applied remote changes → refetch notes + folders.
   onNotesChanged(() => useNotesStore.getState().refresh());
+  // Live sync state → sidebar indicator.
+  onSyncStatus((s) => useCloudStore.getState().setSyncStatus(s));
 }

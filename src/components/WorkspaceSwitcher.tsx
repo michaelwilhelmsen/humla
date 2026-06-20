@@ -1,8 +1,25 @@
 import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { Check, ChevronsUpDown, Plus, User, Users } from "lucide-react";
+import { Check, ChevronsUpDown, Cloud, CloudOff, Plus, RefreshCw, User, Users } from "lucide-react";
 import { cloudApi, roleLabel, useCloudStore, type CloudRole } from "../lib/cloud";
 import { useNotesStore } from "../lib/store";
+import type { SyncStatus } from "../lib/ipc";
+
+// Small sync-state indicator shown next to the active workspace. Surfaces what
+// was previously invisible: whether sync is running, done, or failing.
+function SyncIndicator({ status }: { status: SyncStatus }) {
+  const map = {
+    syncing: { Icon: RefreshCw, cls: "animate-spin text-[var(--color-text-muted)]", title: "Syncing…" },
+    idle: { Icon: Cloud, cls: "text-[var(--color-success)]", title: "Synced" },
+    error: { Icon: CloudOff, cls: "text-[var(--color-accent)]", title: "Sync error — will retry" },
+  }[status];
+  const { Icon } = map;
+  return (
+    <span title={map.title} aria-label={map.title} className="shrink-0 grid place-items-center">
+      <Icon size={13} strokeWidth={1.5} className={map.cls} />
+    </span>
+  );
+}
 
 function RolePill({ role }: { role: CloudRole }) {
   return (
@@ -22,6 +39,7 @@ function RolePill({ role }: { role: CloudRole }) {
 export function WorkspaceSwitcher() {
   const navigate = useNavigate();
   const status = useCloudStore((s) => s.status);
+  const syncStatus = useCloudStore((s) => s.syncStatus);
   const refreshCloud = useCloudStore((s) => s.refresh);
   const refreshNotes = useNotesStore((s) => s.refresh);
   const [open, setOpen] = useState(false);
@@ -91,6 +109,7 @@ export function WorkspaceSwitcher() {
           {current ? <Users size={13} strokeWidth={1.5} /> : <User size={13} strokeWidth={1.5} />}
         </span>
         <span className="flex-1 min-w-0 text-left truncate">{label}</span>
+        {current && syncStatus && <SyncIndicator status={syncStatus} />}
         {current && <RolePill role={current.role} />}
         <ChevronsUpDown size={14} strokeWidth={1.5} className="shrink-0 text-[var(--color-text-muted)]" />
       </button>

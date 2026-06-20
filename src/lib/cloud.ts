@@ -7,6 +7,7 @@
 
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
+import type { SyncStatus } from "./ipc";
 
 export type CloudRole = "owner" | "admin" | "member";
 
@@ -64,15 +65,20 @@ type CloudState = {
   ready: boolean;
   /** Members of the active workspace, keyed by user id — for owner attribution. */
   members: Record<string, CloudMember>;
+  /** Live sync state from the worker; null when not syncing (Personal/signed out). */
+  syncStatus: SyncStatus | null;
   refresh: () => Promise<void>;
   setStatus: (s: CloudStatus) => void;
+  setSyncStatus: (s: SyncStatus | null) => void;
 };
 
 export const useCloudStore = create<CloudState>((set) => ({
   status: DISCONNECTED,
   ready: false,
   members: {},
+  syncStatus: null,
   setStatus: (status) => set({ status, ready: true }),
+  setSyncStatus: (syncStatus) => set({ syncStatus }),
   refresh: async () => {
     try {
       const status = await cloudApi.status();
@@ -88,11 +94,12 @@ export const useCloudStore = create<CloudState>((set) => ({
           set({ members: {} });
         }
       } else {
-        set({ members: {} });
+        // Personal / signed out → no members, no sync indicator.
+        set({ members: {}, syncStatus: null });
       }
     } catch {
       // No Tauri runtime / command unavailable → treat as disconnected.
-      set({ status: DISCONNECTED, ready: true, members: {} });
+      set({ status: DISCONNECTED, ready: true, members: {}, syncStatus: null });
     }
   },
 }));

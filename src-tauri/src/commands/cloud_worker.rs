@@ -89,11 +89,25 @@ impl Manager {
         running.handle = None;
 
         let app = self.app.clone();
-        match cloud_sync::start(self.db.clone(), cfg, move || {
-            // Fired after a pull applied remote changes; the frontend listens
-            // for `notes_changed` and refetches.
-            let _ = app.emit("notes_changed", ());
-        }) {
+        let app_status = self.app.clone();
+        match cloud_sync::start(
+            self.db.clone(),
+            cfg,
+            move || {
+                // Fired after a pull applied remote changes; the frontend
+                // listens for `notes_changed` and refetches.
+                let _ = app.emit("notes_changed", ());
+            },
+            move |state| {
+                // Surface coarse sync state to the UI as a `sync_status` event.
+                let s = match state {
+                    cloud_sync::SyncState::Syncing => "syncing",
+                    cloud_sync::SyncState::Idle => "idle",
+                    cloud_sync::SyncState::Error => "error",
+                };
+                let _ = app_status.emit("sync_status", s);
+            },
+        ) {
             Ok((handle, fut)) => {
                 // MUST be tauri::async_runtime::spawn — a bare tokio::spawn
                 // panics when this runs from the setup closure on first start

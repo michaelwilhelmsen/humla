@@ -314,3 +314,9 @@ export function onDiarizeDownloadProgress(cb: (e: DiarizeDownloadProgress) => vo
 export function onNotesChanged(cb: () => void): Promise<UnlistenFn> {
   return listen("notes_changed", () => cb());
 }
+
+// Coarse sync state from the cloud worker, for the sidebar indicator.
+export type SyncStatus = "syncing" | "idle" | "error";
+export function onSyncStatus(cb: (s: SyncStatus) => void): Promise<UnlistenFn> {
+  return listen<SyncStatus>("sync_status", (e) => cb(e.payload));
+}
