@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { Cloud, CloudOff, LogOut } from "lucide-react";
-import { cloudApi, useCloudStore } from "../../../lib/cloud";
+import { cloudApi, useCloudStore, HUMLA_CLOUD_URL } from "../../../lib/cloud";
 import { Row, Section } from "../components/Section";
 import { Btn } from "../components/Btn";
 
@@ -27,6 +27,22 @@ export function AccountTab() {
     setError(null);
     try {
       await cloudApi.configure(serverUrl.trim());
+      await refresh();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // One-click path for downloaders: point at the hosted Humla Cloud and continue
+  // to sign in / create an account — no URL to type.
+  async function useHumlaCloud() {
+    setBusy(true);
+    setError(null);
+    try {
+      setServerUrl(HUMLA_CLOUD_URL);
+      await cloudApi.configure(HUMLA_CLOUD_URL);
       await refresh();
     } catch (e) {
       setError(String(e));
@@ -178,10 +194,23 @@ export function AccountTab() {
 
   // Not configured -----------------------------------------------------------
   return (
-    <Section title="Connect to Humla Cloud">
+    <Section title="Connect to sync">
       <p className="text-sm text-[var(--color-text-muted)]">
-        Humla works fully offline. Connect a Humla Cloud server to sync your notes across devices
-        and collaborate with a team. You host it yourself — your data, your server.
+        Humla works fully offline. To sync across devices and collaborate with a team, connect to
+        <strong> Humla Cloud</strong> (hosted — easiest) or point Humla at your own server.
+      </p>
+      {error && <div className="text-xs text-[var(--color-accent)]">{error}</div>}
+      <div className="flex items-center gap-2">
+        <Btn onClick={useHumlaCloud} disabled={busy}>
+          <span className="inline-flex items-center gap-1.5">
+            <Cloud size={14} strokeWidth={1.5} /> {busy ? "Connecting…" : "Use Humla Cloud"}
+          </span>
+        </Btn>
+        <span className="text-xs text-[var(--color-text-muted)]">14-day free trial · cancel anytime</span>
+      </div>
+
+      <p className="text-xs text-[var(--color-text-muted)] pt-2">
+        Or connect your own self-hosted server:
       </p>
       <Row label="Server URL">
         <input className={inputCls} type="url" value={serverUrl}
@@ -189,7 +218,6 @@ export function AccountTab() {
           onKeyDown={(e) => e.key === "Enter" && connect()}
           placeholder="https://sync.example.com" />
       </Row>
-      {error && <div className="text-xs text-[var(--color-accent)]">{error}</div>}
       <div>
         <Btn onClick={connect} disabled={busy || !serverUrl.trim()}>
           {busy ? "Connecting…" : "Connect"}
