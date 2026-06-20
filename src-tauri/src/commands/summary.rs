@@ -224,6 +224,7 @@ async fn run_summary(app: AppHandle, note_id: String) -> anyhow::Result<()> {
             ..Default::default()
         })?;
     }
+    state.sync.note_upserted(&note_id); // AI summary written → enqueue a push
     let _ = app.emit("summary_ready", SummaryPayload { note_id, summary });
     Ok(())
 }

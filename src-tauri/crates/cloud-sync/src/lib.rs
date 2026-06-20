@@ -814,6 +814,12 @@ mod it {
         w.write_state("notes_cursor", "").unwrap();
         w.pull_collection("notes", "notes_cursor", &auth.token, |v| w.apply_remote_note_json(v)).await.expect("pull");
         assert_eq!(scalar(&db, "SELECT title FROM notes WHERE id = ?1", &uuid).as_deref(), Some("IT title"));
+        // Transcript + summary must survive the push → PB → pull roundtrip too
+        // (guards against the PB schema dropping those fields, and against a
+        // pull that doesn't restore them — the two things that would make a
+        // synced note show an empty transcript/summary).
+        assert_eq!(scalar(&db, "SELECT transcript FROM notes WHERE id = ?1", &uuid).as_deref(), Some("tx"));
+        assert_eq!(scalar(&db, "SELECT summary FROM notes WHERE id = ?1", &uuid).as_deref(), Some("sm"));
 
         w.push_delete("notes", &uuid).await.expect("delete");
         w.write_state("notes_cursor", "").unwrap();

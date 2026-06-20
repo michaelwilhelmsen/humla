@@ -399,6 +399,7 @@ async fn rediarize_apply_to_chunks(
         let conn = state.db.lock();
         db::set_transcript(&conn, &note_id, &new_transcript)?;
     }
+    note_changed_for_sync(&app, &note_id); // re-diarize rewrote the transcript
     let _ = app.emit(
         "transcript_replaced",
         TranscriptPayload {
@@ -631,6 +632,7 @@ pub fn note_timeline_set_chunk_label(
         let conn = state.db.lock();
         db::set_transcript(&conn, &note_id, &transcript).map_err(err)?;
     }
+    note_changed_for_sync(&app, &note_id); // timeline edit rewrote the transcript
     let _ = app.emit(
         "transcript_replaced",
         TranscriptPayload {
@@ -722,6 +724,7 @@ pub fn note_timeline_delete_chunk(
         let conn = state.db.lock();
         db::set_transcript(&conn, &note_id, &transcript).map_err(err)?;
     }
+    note_changed_for_sync(&app, &note_id); // timeline edit rewrote the transcript
     let _ = app.emit(
         "transcript_replaced",
         TranscriptPayload {
@@ -1635,6 +1638,13 @@ pub async fn recording_stop(
                 &format!("Diarization failed (transcript still saved): {e}"),
             );
         }
+        // The recording pipeline wrote the transcript directly (per-chunk during
+        // capture, then the labelled rewrite on stop), bypassing the notes_*
+        // commands — so push it to the cloud now. Covers every diarize_and_apply
+        // exit path (labelled, single-speaker fallback, model-missing skip, or
+        // error-with-transcript-saved); a truly empty recording just re-pushes
+        // unchanged content, which is harmless.
+        note_changed_for_sync(&app_for_post, &note_for_post);
         // Now that every step that needs the WAVs has finished, drop the
         // temp dir. Best-effort: a leftover dir is harmless and gets
         // collected by macOS's normal /tmp cleanup eventually.
@@ -3485,6 +3495,16 @@ fn emit_error(app: &AppHandle, note_id: Option<&str>, message: &str) {
         note_id: note_id.map(|s| s.to_string()),
         message: message.to_string(),
     });
+}
+
+/// Tell the sync observer a note changed via a backend-driven write — recording
+/// transcript, re-diarize, or a timeline edit — that bypasses the `notes_*`
+/// commands (those ping the observer themselves; the manual transcript/speaker
+/// edits in the UI go through `notes_update`, so they're already covered). This
+/// enqueues a push so the generated transcript/summary actually replicate.
+/// No-op under the open-source `NoopSync`.
+fn note_changed_for_sync(app: &AppHandle, note_id: &str) {
+    app.state::<AppState>().sync.note_upserted(note_id);
 }
 
 fn sidecar_path(_app: &AppHandle) -> Result<PathBuf, String> {
