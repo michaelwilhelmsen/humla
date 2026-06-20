@@ -9,7 +9,8 @@ use tauri::State;
 #[tauri::command]
 pub fn folders_list(state: State<AppState>) -> Result<Vec<db::Folder>, String> {
     let conn = state.db.lock();
-    db::list_folders(&conn).map_err(err)
+    let workspace = super::cloud::active_workspace(&conn);
+    db::list_folders(&conn, &workspace).map_err(err)
 }
 
 #[tauri::command]
@@ -20,7 +21,8 @@ pub fn folders_create(state: State<AppState>, name: String) -> Result<db::Folder
     }
     let folder = {
         let conn = state.db.lock();
-        db::create_folder(&conn, trimmed).map_err(err)?
+        let workspace = super::cloud::active_workspace(&conn);
+        db::create_folder(&conn, trimmed, &workspace).map_err(err)?
     };
     state.sync.folder_upserted(&folder.id);
     Ok(folder)

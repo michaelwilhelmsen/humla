@@ -28,6 +28,10 @@ export type Note = {
   // local-only / pre-sync notes. Resolved to a name (via the workspace member
   // list) for "created by" attribution in shared workspaces.
   owner: string;
+  // Cloud sync: which workspace this note belongs to. Empty = Personal /
+  // local-only (private to this device). Non-empty = shared with that
+  // workspace's members. Note lists are scoped to the active workspace.
+  workspace_id: string;
 };
 
 export type Folder = {

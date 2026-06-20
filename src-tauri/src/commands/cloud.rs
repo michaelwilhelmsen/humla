@@ -97,6 +97,14 @@ fn read_workspace_id(state: &State<'_, AppState>) -> Option<String> {
         .filter(|s| !s.trim().is_empty())
 }
 
+/// The active workspace id (PocketBase workspace), or `""` for Personal /
+/// local-only. Used to stamp new notes/folders and to scope the note/folder
+/// lists. Takes a live connection so callers that already hold the db guard can
+/// reuse it.
+pub(crate) fn active_workspace(conn: &rusqlite::Connection) -> String {
+    db::get_setting(conn, SETTING_WORKSPACE).ok().flatten().unwrap_or_default()
+}
+
 // ---- credentials (Keychain) ------------------------------------------------
 
 fn cred_entry() -> Result<keyring::Entry, String> {

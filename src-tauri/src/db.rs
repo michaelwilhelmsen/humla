@@ -35,6 +35,11 @@ pub struct Note {
     // (the syncing user only becomes owner when creating, never by editing).
     #[serde(default)]
     pub owner: String,
+    // Cloud sync: which workspace this note belongs to (PocketBase workspace
+    // id). Empty = Personal / local-only. Note lists are scoped to the active
+    // workspace by this field.
+    #[serde(default)]
+    pub workspace_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,6 +48,8 @@ pub struct Folder {
     pub name: String,
     pub created_at: i64,
     pub updated_at: i64,
+    #[serde(default)]
+    pub workspace_id: String,
 }
 
 pub fn open(path: &Path) -> Result<Connection> {
@@ -118,10 +125,31 @@ pub fn open(path: &Path) -> Result<Connection> {
         "ALTER TABLE notes ADD COLUMN owner TEXT NOT NULL DEFAULT ''",
         [],
     );
+    // Cloud sync: which workspace a row belongs to (PocketBase workspace id).
+    // Empty string = Personal / local-only (never synced). Existing rows
+    // default to '' so nothing pre-sync silently uploads to a workspace.
+    // Reads (note/folder lists) are scoped to the active workspace by this
+    // column; the sync worker pushes each row to its OWN workspace.
+    let _ = conn.execute(
+        "ALTER TABLE notes ADD COLUMN workspace_id TEXT NOT NULL DEFAULT ''",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE folders ADD COLUMN workspace_id TEXT NOT NULL DEFAULT ''",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE summary_prompts ADD COLUMN workspace_id TEXT NOT NULL DEFAULT ''",
+        [],
+    );
     // Index is created AFTER the ALTERs so it's safe on both fresh DBs and
     // older DBs that needed the column added.
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_notes_folder ON notes(folder_id)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_notes_workspace ON notes(workspace_id)",
         [],
     )?;
     Ok(conn)
@@ -131,14 +159,17 @@ pub fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
-const NOTE_COLS: &str = "id, title, body, transcript, summary, audio_path, summary_preset, folder_id, language, summary_provider, expected_speakers, created_at, updated_at, owner";
+const NOTE_COLS: &str = "id, title, body, transcript, summary, audio_path, summary_preset, folder_id, language, summary_provider, expected_speakers, created_at, updated_at, owner, workspace_id";
 
-pub fn list_notes(conn: &Connection) -> Result<Vec<Note>> {
+/// List notes in the active workspace (`""` = Personal / local-only). Scoping
+/// by workspace is what keeps one workspace's notes from showing up in another
+/// and keeps Personal notes out of a shared view.
+pub fn list_notes(conn: &Connection, workspace: &str) -> Result<Vec<Note>> {
     let mut stmt = conn.prepare_cached(&format!(
-        "SELECT {NOTE_COLS} FROM notes ORDER BY updated_at DESC"
+        "SELECT {NOTE_COLS} FROM notes WHERE workspace_id = ?1 ORDER BY updated_at DESC"
     ))?;
     let rows = stmt
-        .query_map([], map_note)?
+        .query_map(params![workspace], map_note)?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
 }
@@ -155,13 +186,14 @@ pub fn create_note(
     conn: &Connection,
     default_language: &str,
     default_preset: &str,
+    workspace: &str,
 ) -> Result<Note> {
     let id = uuid::Uuid::new_v4().to_string();
     let now = now_ms();
     conn.execute(
-        "INSERT INTO notes (id, title, body, transcript, summary, audio_path, summary_preset, folder_id, language, summary_provider, expected_speakers, created_at, updated_at)
-         VALUES (?1, '', '', '', '', NULL, ?2, NULL, ?3, '', NULL, ?4, ?4)",
-        params![id, default_preset, default_language, now],
+        "INSERT INTO notes (id, title, body, transcript, summary, audio_path, summary_preset, folder_id, language, summary_provider, expected_speakers, created_at, updated_at, workspace_id)
+         VALUES (?1, '', '', '', '', NULL, ?2, NULL, ?3, '', NULL, ?4, ?4, ?5)",
+        params![id, default_preset, default_language, now, workspace],
     )?;
     get_note(conn, &id)
 }
@@ -175,25 +207,25 @@ pub fn move_note(conn: &Connection, id: &str, folder_id: Option<&str>) -> Result
     Ok(())
 }
 
-pub fn list_folders(conn: &Connection) -> Result<Vec<Folder>> {
+pub fn list_folders(conn: &Connection, workspace: &str) -> Result<Vec<Folder>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT id, name, created_at, updated_at FROM folders ORDER BY name COLLATE NOCASE",
+        "SELECT id, name, created_at, updated_at, workspace_id FROM folders WHERE workspace_id = ?1 ORDER BY name COLLATE NOCASE",
     )?;
     let rows = stmt
-        .query_map([], map_folder)?
+        .query_map(params![workspace], map_folder)?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
 }
 
-pub fn create_folder(conn: &Connection, name: &str) -> Result<Folder> {
+pub fn create_folder(conn: &Connection, name: &str, workspace: &str) -> Result<Folder> {
     let id = uuid::Uuid::new_v4().to_string();
     let now = now_ms();
     conn.execute(
-        "INSERT INTO folders (id, name, created_at, updated_at) VALUES (?1, ?2, ?3, ?3)",
-        params![id, name, now],
+        "INSERT INTO folders (id, name, created_at, updated_at, workspace_id) VALUES (?1, ?2, ?3, ?3, ?4)",
+        params![id, name, now, workspace],
     )?;
     conn.query_row(
-        "SELECT id, name, created_at, updated_at FROM folders WHERE id = ?1",
+        "SELECT id, name, created_at, updated_at, workspace_id FROM folders WHERE id = ?1",
         params![id],
         map_folder,
     )
@@ -235,6 +267,7 @@ fn map_folder(row: &rusqlite::Row) -> rusqlite::Result<Folder> {
         name: row.get(1)?,
         created_at: row.get(2)?,
         updated_at: row.get(3)?,
+        workspace_id: row.get(4)?,
     })
 }
 
@@ -384,11 +417,16 @@ pub struct SummaryPrompt {
     pub content: String,
     pub created_at: i64,
     pub updated_at: i64,
+    #[serde(default)]
+    pub workspace_id: String,
 }
 
+// Prompts are reusable config, so reads are intentionally NOT scoped to the
+// active workspace (you can use any custom prompt anywhere). They still carry a
+// workspace_id so the sync worker pushes each to its owning workspace.
 pub fn list_summary_prompts(conn: &Connection) -> Result<Vec<SummaryPrompt>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT id, name, content, created_at, updated_at FROM summary_prompts
+        "SELECT id, name, content, created_at, updated_at, workspace_id FROM summary_prompts
          ORDER BY name COLLATE NOCASE",
     )?;
     let rows = stmt
@@ -399,7 +437,7 @@ pub fn list_summary_prompts(conn: &Connection) -> Result<Vec<SummaryPrompt>> {
 
 pub fn get_summary_prompt(conn: &Connection, id: &str) -> Result<SummaryPrompt> {
     let mut stmt = conn.prepare_cached(
-        "SELECT id, name, content, created_at, updated_at FROM summary_prompts WHERE id = ?1",
+        "SELECT id, name, content, created_at, updated_at, workspace_id FROM summary_prompts WHERE id = ?1",
     )?;
     let p = stmt.query_row(params![id], map_summary_prompt)?;
     Ok(p)
@@ -409,13 +447,14 @@ pub fn create_summary_prompt(
     conn: &Connection,
     name: &str,
     content: &str,
+    workspace: &str,
 ) -> Result<SummaryPrompt> {
     let id = uuid::Uuid::new_v4().to_string();
     let now = now_ms();
     conn.execute(
-        "INSERT INTO summary_prompts (id, name, content, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?4)",
-        params![id, name, content, now],
+        "INSERT INTO summary_prompts (id, name, content, created_at, updated_at, workspace_id)
+         VALUES (?1, ?2, ?3, ?4, ?4, ?5)",
+        params![id, name, content, now, workspace],
     )?;
     get_summary_prompt(conn, &id)
 }
@@ -446,6 +485,7 @@ fn map_summary_prompt(row: &rusqlite::Row) -> rusqlite::Result<SummaryPrompt> {
         content: row.get(2)?,
         created_at: row.get(3)?,
         updated_at: row.get(4)?,
+        workspace_id: row.get(5)?,
     })
 }
 
@@ -472,7 +512,7 @@ pub fn migrate_summary_prompts(conn: &Connection) -> Result<()> {
         set_setting(conn, "summary_prompts_migrated", "true")?;
         return Ok(());
     }
-    let row = create_summary_prompt(conn, "Custom prompt (migrated)", &legacy)?;
+    let row = create_summary_prompt(conn, "Custom prompt (migrated)", &legacy, "")?;
     let new_value = format!("custom:{}", row.id);
     conn.execute(
         "UPDATE notes SET summary_preset = ?1 WHERE summary_preset = 'custom'",
@@ -594,12 +634,35 @@ fn map_note(row: &rusqlite::Row) -> rusqlite::Result<Note> {
         created_at: row.get(11)?,
         updated_at: row.get(12)?,
         owner: row.get(13)?,
+        workspace_id: row.get(14)?,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The core P0 guard: a note created in one workspace must not appear when
+    /// listing another, and Personal ("") is its own bucket.
+    #[test]
+    fn list_notes_is_scoped_to_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("scope.sqlite")).unwrap();
+        create_note(&conn, "en", "meeting", "wsA").unwrap();
+        create_note(&conn, "en", "meeting", "wsA").unwrap();
+        create_note(&conn, "en", "meeting", "").unwrap(); // Personal
+        create_note(&conn, "en", "meeting", "wsB").unwrap();
+
+        assert_eq!(list_notes(&conn, "wsA").unwrap().len(), 2, "wsA sees only its own");
+        assert_eq!(list_notes(&conn, "wsB").unwrap().len(), 1, "wsB sees only its own");
+        assert_eq!(list_notes(&conn, "").unwrap().len(), 1, "Personal sees only local");
+        // Folders scope the same way.
+        create_folder(&conn, "A folder", "wsA").unwrap();
+        create_folder(&conn, "Personal folder", "").unwrap();
+        assert_eq!(list_folders(&conn, "wsA").unwrap().len(), 1);
+        assert_eq!(list_folders(&conn, "").unwrap().len(), 1);
+        assert_eq!(list_folders(&conn, "wsB").unwrap().len(), 0);
+    }
 
     fn settings_only_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();

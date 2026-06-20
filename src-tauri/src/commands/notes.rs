@@ -9,7 +9,10 @@ use tauri::State;
 #[tauri::command]
 pub fn notes_list(state: State<AppState>) -> Result<Vec<Note>, String> {
     let conn = state.db.lock();
-    db::list_notes(&conn).map_err(err)
+    // Scope to the active workspace ("" = Personal) so one workspace's notes
+    // never bleed into another's view.
+    let workspace = super::cloud::active_workspace(&conn);
+    db::list_notes(&conn, &workspace).map_err(err)
 }
 
 #[tauri::command]
@@ -32,7 +35,10 @@ pub fn notes_create(state: State<AppState>) -> Result<Note, String> {
             .map_err(err)?
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| "meeting".to_string());
-        db::create_note(&conn, &default_language, &default_preset).map_err(err)?
+        // Stamp the note with the active workspace so it syncs there (and only
+        // shows there). Personal ("") notes stay local.
+        let workspace = super::cloud::active_workspace(&conn);
+        db::create_note(&conn, &default_language, &default_preset, &workspace).map_err(err)?
     }; // drop the db guard before pinging sync (see SyncObserver contract)
     state.sync.note_upserted(&note.id);
     Ok(note)

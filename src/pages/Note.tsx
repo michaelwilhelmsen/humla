@@ -24,7 +24,7 @@ import {
 import { ipc, onSummaryThinkingDelta, onSummaryContentDelta, type Note as TNote, type SummaryPrompt, type TimelineEntry } from "../lib/ipc";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { useNotesStore, useRecordingStore } from "../lib/store";
-import { useOwnerName } from "../lib/cloud";
+import { useOwnerName, useCloudStore } from "../lib/cloud";
 import { extractSpeakerLabels, renameSpeakerInTranscript } from "../lib/speakers";
 import { RecordingBar } from "../components/RecordingBar";
 import { SkeletonLines } from "../components/Skeleton";
@@ -63,6 +63,10 @@ export function Note() {
   // authored by a teammate in the active workspace (null when it's yours,
   // local, or unresolvable). Called unconditionally before the early return.
   const ownerName = useOwnerName(draft?.owner ?? null);
+  // Name of the workspace this note is shared with (for the visibility row).
+  // Reads are workspace-scoped, so a note with a workspace_id belongs to the
+  // active one. Empty workspace_id = Private / local-only.
+  const sharedWorkspace = useCloudStore((s) => s.status.current_workspace?.name);
   const [uiLang, setUiLang] = useState<string>("no");
   const [globalProvider, setGlobalProvider] = useState<string>("openai");
   // Live reasoning + content streamed from the local LLM. Cleared each time a
@@ -389,6 +393,11 @@ export function Note() {
           {ownerName && (
             <PropertyRow icon={<User size={14} />} label="created by">
               <span>{ownerName}</span>
+            </PropertyRow>
+          )}
+          {draft.workspace_id && (
+            <PropertyRow icon={<Users size={14} />} label="shared with">
+              <span>{sharedWorkspace ?? "your workspace"}</span>
             </PropertyRow>
           )}
           {(isRecording || isStarting || isPaused) && (

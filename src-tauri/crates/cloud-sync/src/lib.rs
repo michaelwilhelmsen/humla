@@ -161,15 +161,36 @@ impl Worker {
     /// Persist an op to the durable outbox so a crash between enqueue and push
     /// doesn't lose the change.
     fn enqueue(&self, op: Op) -> Result<()> {
-        let (entity, entity_id, kind) = match op {
-            Op::Note { id, delete } => ("note", id, if delete { "delete" } else { "upsert" }),
-            Op::Folder { id, delete } => ("folder", id, if delete { "delete" } else { "upsert" }),
-            Op::Prompt { id, delete } => ("prompt", id, if delete { "delete" } else { "upsert" }),
+        let (entity, entity_id, kind, is_delete) = match op {
+            Op::Note { id, delete } => ("note", id, if delete { "delete" } else { "upsert" }, delete),
+            Op::Folder { id, delete } => ("folder", id, if delete { "delete" } else { "upsert" }, delete),
+            Op::Prompt { id, delete } => ("prompt", id, if delete { "delete" } else { "upsert" }, delete),
         };
         let conn = self.db.lock();
+        // Capture which workspace this op targets. Upsert → read the row's own
+        // workspace_id so it pushes to the right tenant even if the active
+        // workspace changes before it drains. Delete → the row is gone, so use
+        // the active workspace (you can only delete what you can see, and reads
+        // are workspace-scoped). Empty workspace = Personal → never pushed.
+        let workspace = if is_delete {
+            self.config.workspace_id.clone()
+        } else {
+            let table = match entity {
+                "note" => "notes",
+                "folder" => "folders",
+                _ => "summary_prompts",
+            };
+            conn.query_row(
+                &format!("SELECT workspace_id FROM {table} WHERE id = ?1"),
+                rusqlite::params![entity_id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+            .unwrap_or_default()
+        };
         conn.execute(
-            "INSERT INTO sync_outbox (entity, entity_id, op, enqueued_at) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![entity, entity_id, kind, now_ms()],
+            "INSERT INTO sync_outbox (entity, entity_id, op, workspace, enqueued_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![entity, entity_id, kind, workspace, now_ms()],
         )?;
         Ok(())
     }
@@ -178,27 +199,31 @@ impl Worker {
     /// row stays queued and ordering is preserved for the next attempt.
     async fn drain_outbox(&self) -> Result<()> {
         loop {
-            let next: Option<(i64, String, String, String)> = {
+            let next: Option<(i64, String, String, String, String)> = {
                 let conn = self.db.lock();
                 conn.query_row(
-                    "SELECT seq, entity, entity_id, op FROM sync_outbox ORDER BY seq LIMIT 1",
+                    "SELECT seq, entity, entity_id, op, workspace FROM sync_outbox ORDER BY seq LIMIT 1",
                     [],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
                 )
                 .optional()?
             };
-            let Some((seq, entity, entity_id, op)) = next else {
+            let Some((seq, entity, entity_id, op, workspace)) = next else {
                 return Ok(());
             };
 
-            match (entity.as_str(), op.as_str()) {
-                ("note", "upsert") => self.push_note(&entity_id).await?,
-                ("note", "delete") => self.push_delete("notes", &entity_id).await?,
-                ("folder", "upsert") => self.push_folder(&entity_id).await?,
-                ("folder", "delete") => self.push_delete("folders", &entity_id).await?,
-                ("prompt", "upsert") => self.push_prompt(&entity_id).await?,
-                ("prompt", "delete") => self.push_delete("summary_prompts", &entity_id).await?,
-                _ => eprintln!("cloud-sync: unknown outbox row {entity}/{op}; skipping"),
+            // Personal / local-only rows ('' workspace) never sync — drop them
+            // without a network call. Otherwise push to the row's OWN workspace.
+            if !workspace.is_empty() {
+                match (entity.as_str(), op.as_str()) {
+                    ("note", "upsert") => self.push_note(&entity_id, &workspace).await?,
+                    ("note", "delete") => self.push_delete("notes", &entity_id, &workspace).await?,
+                    ("folder", "upsert") => self.push_folder(&entity_id, &workspace).await?,
+                    ("folder", "delete") => self.push_delete("folders", &entity_id, &workspace).await?,
+                    ("prompt", "upsert") => self.push_prompt(&entity_id, &workspace).await?,
+                    ("prompt", "delete") => self.push_delete("summary_prompts", &entity_id, &workspace).await?,
+                    _ => eprintln!("cloud-sync: unknown outbox row {entity}/{op}; skipping"),
+                }
             }
 
             let conn = self.db.lock();
@@ -206,7 +231,7 @@ impl Worker {
         }
     }
 
-    async fn push_note(&self, uuid: &str) -> Result<()> {
+    async fn push_note(&self, uuid: &str, workspace: &str) -> Result<()> {
         let Some(note) = self.snapshot_note(uuid)? else {
             return Ok(()); // deleted locally before we got here; nothing to push
         };
@@ -222,7 +247,7 @@ impl Worker {
         };
         let body = json!({
             "client_id": uuid,
-            "workspace": self.config.workspace_id,
+            "workspace": workspace,
             "owner": owner,
             "title": note.title,
             "body": note.body,
@@ -236,45 +261,45 @@ impl Worker {
             "client_updated_at": note.updated_at,
             "deleted": false,
         });
-        self.upsert_record("notes", uuid, &auth.token, body).await
+        self.upsert_record("notes", uuid, workspace, &auth.token, body).await
     }
 
-    async fn push_folder(&self, uuid: &str) -> Result<()> {
+    async fn push_folder(&self, uuid: &str, workspace: &str) -> Result<()> {
         let Some(f) = self.snapshot_folder(uuid)? else {
             return Ok(());
         };
         let auth = self.ensure_auth().await?;
         let body = json!({
             "client_id": uuid,
-            "workspace": self.config.workspace_id,
+            "workspace": workspace,
             "name": f.name,
             "client_updated_at": f.updated_at,
             "deleted": false,
         });
-        self.upsert_record("folders", uuid, &auth.token, body).await
+        self.upsert_record("folders", uuid, workspace, &auth.token, body).await
     }
 
-    async fn push_prompt(&self, uuid: &str) -> Result<()> {
+    async fn push_prompt(&self, uuid: &str, workspace: &str) -> Result<()> {
         let Some(p) = self.snapshot_prompt(uuid)? else {
             return Ok(());
         };
         let auth = self.ensure_auth().await?;
         let body = json!({
             "client_id": uuid,
-            "workspace": self.config.workspace_id,
+            "workspace": workspace,
             "name": p.name,
             "content": p.content,
             "client_updated_at": p.updated_at,
             "deleted": false,
         });
-        self.upsert_record("summary_prompts", uuid, &auth.token, body).await
+        self.upsert_record("summary_prompts", uuid, workspace, &auth.token, body).await
     }
 
     /// Soft-delete (tombstone) a record by `client_id` so other devices pull
     /// the deletion instead of the row reappearing on their next pull.
-    async fn push_delete(&self, collection: &str, uuid: &str) -> Result<()> {
+    async fn push_delete(&self, collection: &str, uuid: &str, workspace: &str) -> Result<()> {
         let auth = self.ensure_auth().await?;
-        let Some(pb_id) = self.find_remote_id(collection, uuid, &auth.token).await? else {
+        let Some(pb_id) = self.find_remote_id(collection, uuid, workspace, &auth.token).await? else {
             return Ok(()); // never synced; nothing to tombstone
         };
         let resp = self
@@ -288,15 +313,16 @@ impl Worker {
     }
 
     /// Create the record, or PATCH it if one with this `client_id` already
-    /// exists in the workspace.
+    /// exists in the given workspace.
     async fn upsert_record(
         &self,
         collection: &str,
         client_id: &str,
+        workspace: &str,
         token: &str,
         body: serde_json::Value,
     ) -> Result<()> {
-        let resp = match self.find_remote_id(collection, client_id, token).await? {
+        let resp = match self.find_remote_id(collection, client_id, workspace, token).await? {
             Some(pb_id) => {
                 self.http
                     .patch(format!(
@@ -324,9 +350,10 @@ impl Worker {
         &self,
         collection: &str,
         client_id: &str,
+        workspace: &str,
         token: &str,
     ) -> Result<Option<String>> {
-        let filter = format!("client_id='{}' && workspace='{}'", client_id, self.config.workspace_id);
+        let filter = format!("client_id='{}' && workspace='{}'", client_id, workspace);
         let resp = self
             .http
             .get(format!("{}/api/collections/{}/records", self.config.base_url, collection))
@@ -383,7 +410,10 @@ impl Worker {
     where
         F: FnMut(&serde_json::Value) -> Result<()>,
     {
-        let cursor = self.read_state(cursor_key)?.unwrap_or_default();
+        // Cursor is per-workspace, so switching workspaces never skips or
+        // re-pulls the wrong tenant's records under a shared cursor.
+        let cursor_key = format!("{}:{}", cursor_key, self.config.workspace_id);
+        let cursor = self.read_state(&cursor_key)?.unwrap_or_default();
         let mut newest = cursor.clone();
         let mut page: u32 = 1;
 
@@ -431,7 +461,7 @@ impl Worker {
         }
 
         if newest != cursor {
-            self.write_state(cursor_key, &newest)?;
+            self.write_state(&cursor_key, &newest)?;
             Ok(true)
         } else {
             Ok(false)
@@ -472,8 +502,8 @@ impl Worker {
         conn.execute(
             "INSERT INTO notes
                 (id, title, body, transcript, summary, audio_path, summary_preset,
-                 folder_id, language, summary_provider, expected_speakers, owner, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, '', ?9, ?12, ?10, ?11)
+                 folder_id, language, summary_provider, expected_speakers, owner, workspace_id, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, '', ?9, ?12, ?13, ?10, ?11)
              ON CONFLICT(id) DO UPDATE SET
                 title=excluded.title, body=excluded.body, transcript=excluded.transcript,
                 summary=excluded.summary, summary_preset=excluded.summary_preset,
@@ -494,6 +524,7 @@ impl Worker {
                 n.created_at,
                 n.client_updated_at,
                 n.owner,
+                self.config.workspace_id,
             ],
         )?;
         Ok(())
@@ -508,11 +539,11 @@ impl Worker {
         // folders has no separate client-created_at column synced; seed it from
         // client_updated_at on first insert.
         conn.execute(
-            "INSERT INTO folders (id, name, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?3)
+            "INSERT INTO folders (id, name, created_at, updated_at, workspace_id)
+             VALUES (?1, ?2, ?3, ?3, ?4)
              ON CONFLICT(id) DO UPDATE SET name=excluded.name, updated_at=excluded.updated_at
              WHERE excluded.updated_at >= folders.updated_at",
-            rusqlite::params![f.client_id, f.name, f.client_updated_at],
+            rusqlite::params![f.client_id, f.name, f.client_updated_at, self.config.workspace_id],
         )?;
         Ok(())
     }
@@ -524,11 +555,11 @@ impl Worker {
             return Ok(());
         }
         conn.execute(
-            "INSERT INTO summary_prompts (id, name, content, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?4)
+            "INSERT INTO summary_prompts (id, name, content, created_at, updated_at, workspace_id)
+             VALUES (?1, ?2, ?3, ?4, ?4, ?5)
              ON CONFLICT(id) DO UPDATE SET name=excluded.name, content=excluded.content, updated_at=excluded.updated_at
              WHERE excluded.updated_at >= summary_prompts.updated_at",
-            rusqlite::params![p.client_id, p.name, p.content, p.client_updated_at],
+            rusqlite::params![p.client_id, p.name, p.content, p.client_updated_at, self.config.workspace_id],
         )?;
         Ok(())
     }
@@ -704,6 +735,7 @@ fn init_tables(db: &Db) -> Result<()> {
             entity      TEXT NOT NULL,
             entity_id   TEXT NOT NULL,
             op          TEXT NOT NULL,
+            workspace   TEXT NOT NULL DEFAULT '',
             enqueued_at INTEGER NOT NULL
          );
          CREATE TABLE IF NOT EXISTS sync_state (
@@ -711,6 +743,10 @@ fn init_tables(db: &Db) -> Result<()> {
             value TEXT NOT NULL
          );",
     )?;
+    // Idempotent migration for outboxes created before per-row workspace
+    // targeting. Existing queued rows get '' → treated as Personal and dropped
+    // (they'd have pushed to the then-active workspace anyway).
+    let _ = conn.execute("ALTER TABLE sync_outbox ADD COLUMN workspace TEXT NOT NULL DEFAULT ''", []);
     Ok(())
 }
 
@@ -768,14 +804,17 @@ mod it {
                 summary_preset TEXT NOT NULL DEFAULT 'meeting', folder_id TEXT,
                 language TEXT NOT NULL DEFAULT '', summary_provider TEXT NOT NULL DEFAULT '',
                 expected_speakers INTEGER, owner TEXT NOT NULL DEFAULT '',
+                workspace_id TEXT NOT NULL DEFAULT '',
                 created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
             );
             CREATE TABLE folders (
                 id TEXT PRIMARY KEY, name TEXT NOT NULL,
+                workspace_id TEXT NOT NULL DEFAULT '',
                 created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
             );
             CREATE TABLE summary_prompts (
                 id TEXT PRIMARY KEY, name TEXT NOT NULL, content TEXT NOT NULL,
+                workspace_id TEXT NOT NULL DEFAULT '',
                 created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
             );",
         )
@@ -808,6 +847,7 @@ mod it {
         };
         let db = test_db();
         let w = worker(db.clone(), config);
+        let ws = w.config.workspace_id.clone();
         let uuid = format!("note-{}", now_ms());
         {
             let conn = db.lock();
@@ -819,9 +859,9 @@ mod it {
             .unwrap();
         }
         let auth = w.ensure_auth().await.expect("auth");
-        w.push_note(&uuid).await.expect("push_note");
+        w.push_note(&uuid, &ws).await.expect("push_note");
         assert!(
-            w.find_remote_id("notes", &uuid, &auth.token).await.expect("find").is_some(),
+            w.find_remote_id("notes", &uuid, &ws, &auth.token).await.expect("find").is_some(),
             "pushed note should exist remotely"
         );
 
@@ -839,7 +879,7 @@ mod it {
         // owner) and round-trips back on pull → drives "created by" attribution.
         assert_eq!(scalar(&db, "SELECT owner FROM notes WHERE id = ?1", &uuid).as_deref(), Some(auth.user_id.as_str()));
 
-        w.push_delete("notes", &uuid).await.expect("delete");
+        w.push_delete("notes", &uuid, &ws).await.expect("delete");
         w.write_state("notes_cursor", "").unwrap();
         w.pull_collection("notes", "notes_cursor", &auth.token, |v| w.apply_remote_note_json(v)).await.expect("pull2");
         assert_eq!(scalar(&db, "SELECT title FROM notes WHERE id = ?1", &uuid), None, "tombstone deletes locally");
@@ -853,18 +893,19 @@ mod it {
         };
         let db = test_db();
         let w = worker(db.clone(), config);
+        let ws = w.config.workspace_id.clone();
         let uuid = format!("folder-{}", now_ms());
         { let conn = db.lock(); conn.execute("INSERT INTO folders (id, name, created_at, updated_at) VALUES (?1, 'Team Folder', 10, 10)", rusqlite::params![uuid]).unwrap(); }
         let auth = w.ensure_auth().await.expect("auth");
-        w.push_folder(&uuid).await.expect("push_folder");
-        assert!(w.find_remote_id("folders", &uuid, &auth.token).await.expect("find").is_some());
+        w.push_folder(&uuid, &ws).await.expect("push_folder");
+        assert!(w.find_remote_id("folders", &uuid, &ws, &auth.token).await.expect("find").is_some());
 
         { let conn = db.lock(); conn.execute("DELETE FROM folders WHERE id = ?1", rusqlite::params![uuid]).unwrap(); }
         w.write_state("folders_cursor", "").unwrap();
         w.pull_collection("folders", "folders_cursor", &auth.token, |v| w.apply_remote_folder_json(v)).await.expect("pull");
         assert_eq!(scalar(&db, "SELECT name FROM folders WHERE id = ?1", &uuid).as_deref(), Some("Team Folder"));
 
-        w.push_delete("folders", &uuid).await.expect("delete");
+        w.push_delete("folders", &uuid, &ws).await.expect("delete");
         w.write_state("folders_cursor", "").unwrap();
         w.pull_collection("folders", "folders_cursor", &auth.token, |v| w.apply_remote_folder_json(v)).await.expect("pull2");
         assert_eq!(scalar(&db, "SELECT name FROM folders WHERE id = ?1", &uuid), None);
@@ -878,18 +919,19 @@ mod it {
         };
         let db = test_db();
         let w = worker(db.clone(), config);
+        let ws = w.config.workspace_id.clone();
         let uuid = format!("prompt-{}", now_ms());
         { let conn = db.lock(); conn.execute("INSERT INTO summary_prompts (id, name, content, created_at, updated_at) VALUES (?1, 'Standup', 'Summarize tersely', 10, 10)", rusqlite::params![uuid]).unwrap(); }
         let auth = w.ensure_auth().await.expect("auth");
-        w.push_prompt(&uuid).await.expect("push_prompt");
-        assert!(w.find_remote_id("summary_prompts", &uuid, &auth.token).await.expect("find").is_some());
+        w.push_prompt(&uuid, &ws).await.expect("push_prompt");
+        assert!(w.find_remote_id("summary_prompts", &uuid, &ws, &auth.token).await.expect("find").is_some());
 
         { let conn = db.lock(); conn.execute("DELETE FROM summary_prompts WHERE id = ?1", rusqlite::params![uuid]).unwrap(); }
         w.write_state("prompts_cursor", "").unwrap();
         w.pull_collection("summary_prompts", "prompts_cursor", &auth.token, |v| w.apply_remote_prompt_json(v)).await.expect("pull");
         assert_eq!(scalar(&db, "SELECT content FROM summary_prompts WHERE id = ?1", &uuid).as_deref(), Some("Summarize tersely"));
 
-        w.push_delete("summary_prompts", &uuid).await.expect("delete");
+        w.push_delete("summary_prompts", &uuid, &ws).await.expect("delete");
         w.write_state("prompts_cursor", "").unwrap();
         w.pull_collection("summary_prompts", "prompts_cursor", &auth.token, |v| w.apply_remote_prompt_json(v)).await.expect("pull2");
         assert_eq!(scalar(&db, "SELECT content FROM summary_prompts WHERE id = ?1", &uuid), None);
