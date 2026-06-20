@@ -57,6 +57,7 @@ function formatDateChip(ts: number) {
 export function Note() {
   const { id } = useParams<{ id: string }>();
   const upsert = useNotesStore((s) => s.upsertLocal);
+  const refreshNotes = useNotesStore((s) => s.refresh);
   const note = useNotesStore((s) => s.notes.find((n) => n.id === id));
   const [draft, setDraft] = useState<TNote | null>(null);
   // "Created by" attribution — resolves to a name only when the note was
@@ -67,6 +68,9 @@ export function Note() {
   // Reads are workspace-scoped, so a note with a workspace_id belongs to the
   // active one. Empty workspace_id = Private / local-only.
   const sharedWorkspace = useCloudStore((s) => s.status.current_workspace?.name);
+  // When signed in, the note's workspace becomes editable (move it between
+  // Personal and any workspace you belong to). Signed out → static row only.
+  const cloudLoggedIn = useCloudStore((s) => s.status.logged_in);
   const [uiLang, setUiLang] = useState<string>("no");
   const [globalProvider, setGlobalProvider] = useState<string>("openai");
   // Live reasoning + content streamed from the local LLM. Cleared each time a
@@ -395,10 +399,27 @@ export function Note() {
               <span>{ownerName}</span>
             </PropertyRow>
           )}
-          {draft.workspace_id && (
-            <PropertyRow icon={<Users size={14} />} label="shared with">
-              <span>{sharedWorkspace ?? "your workspace"}</span>
+          {cloudLoggedIn ? (
+            <PropertyRow icon={<Users size={14} />} label="workspace">
+              <WorkspacePicker
+                value={draft.workspace_id}
+                onChange={async (workspaceId) => {
+                  if (!draft || workspaceId === draft.workspace_id) return;
+                  const next = { ...draft, workspace_id: workspaceId };
+                  setDraft(next);
+                  await ipc.setNoteWorkspace(draft.id, workspaceId);
+                  // Moving out of the active workspace removes it from that
+                  // list — refetch so the sidebar reflects the move.
+                  await refreshNotes();
+                }}
+              />
             </PropertyRow>
+          ) : (
+            draft.workspace_id && (
+              <PropertyRow icon={<Users size={14} />} label="shared with">
+                <span>{sharedWorkspace ?? "your workspace"}</span>
+              </PropertyRow>
+            )
           )}
           {(isRecording || isStarting || isPaused) && (
             <PropertyRow
@@ -842,6 +863,31 @@ function FolderPicker({
           </option>
         ))}
         <option value="__new__">+ New folder…</option>
+      </select>
+      <span aria-hidden className="nd-prop-caret">▾</span>
+    </>
+  );
+}
+
+// Move a note between Personal (local-only) and any workspace you belong to.
+// Only rendered when signed in (workspaces exist).
+function WorkspacePicker({
+  value,
+  onChange,
+}: {
+  value: string;
+  onChange: (workspaceId: string) => void;
+}) {
+  const workspaces = useCloudStore((s) => s.status.workspaces);
+  return (
+    <>
+      <select value={value} onChange={(e) => onChange(e.target.value)}>
+        <option value="">Personal (this device)</option>
+        {workspaces.map((w) => (
+          <option key={w.id} value={w.id}>
+            {w.name}
+          </option>
+        ))}
       </select>
       <span aria-hidden className="nd-prop-caret">▾</span>
     </>

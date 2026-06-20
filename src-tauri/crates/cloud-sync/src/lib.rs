@@ -81,12 +81,22 @@ impl CloudSync {
     pub fn enqueue_prompt_delete(&self, id: &str) {
         let _ = self.tx.send(Op::Prompt { id: id.to_string(), delete: true });
     }
+    /// A note moved between workspaces (either end may be `""` = Personal).
+    /// Tombstones it in `from` and (re)creates it in `to`.
+    pub fn enqueue_note_move(&self, id: &str, from: &str, to: &str) {
+        let _ = self.tx.send(Op::NoteMove {
+            id: id.to_string(),
+            from: from.to_string(),
+            to: to.to_string(),
+        });
+    }
 }
 
 enum Op {
     Note { id: String, delete: bool },
     Folder { id: String, delete: bool },
     Prompt { id: String, delete: bool },
+    NoteMove { id: String, from: String, to: String },
 }
 
 /// Build the sync engine. Returns the handle plus the worker future; the
@@ -196,41 +206,58 @@ impl Worker {
     /// Persist an op to the durable outbox so a crash between enqueue and push
     /// doesn't lose the change.
     fn enqueue(&self, op: Op) -> Result<()> {
-        let (entity, entity_id, kind, is_delete) = match op {
-            Op::Note { id, delete } => ("note", id, if delete { "delete" } else { "upsert" }, delete),
-            Op::Folder { id, delete } => ("folder", id, if delete { "delete" } else { "upsert" }, delete),
-            Op::Prompt { id, delete } => ("prompt", id, if delete { "delete" } else { "upsert" }, delete),
-        };
-        let conn = self.db.lock();
-        // Capture which workspace this op targets. Upsert → read the row's own
-        // workspace_id so it pushes to the right tenant even if the active
-        // workspace changes before it drains. Delete → the row is gone, so use
-        // the active workspace (you can only delete what you can see, and reads
-        // are workspace-scoped). Empty workspace = Personal → never pushed.
-        let workspace = if is_delete {
+        match op {
+            Op::Note { id, delete } => self.enqueue_simple("note", "notes", &id, delete),
+            Op::Folder { id, delete } => self.enqueue_simple("folder", "folders", &id, delete),
+            Op::Prompt { id, delete } => self.enqueue_simple("prompt", "summary_prompts", &id, delete),
+            Op::NoteMove { id, from, to } => {
+                // A move = tombstone in the old workspace + (re)create in the new
+                // one. The two rows differ only by `workspace`, so they don't
+                // coalesce; the lower seq (delete) drains before the upsert.
+                // Personal ('') endpoints skip the network: nothing to tombstone
+                // when leaving Personal, nothing to push when entering it.
+                if !from.is_empty() {
+                    self.enqueue_row("note", &id, "delete", &from)?;
+                }
+                if !to.is_empty() {
+                    self.enqueue_row("note", &id, "upsert", &to)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Enqueue an upsert/delete for a single row, capturing its target workspace.
+    /// Upsert reads the row's own `workspace_id` so it pushes to the right tenant
+    /// even if the active workspace changes before it drains; delete uses the
+    /// active workspace (the row is gone, and reads are workspace-scoped). Empty
+    /// workspace = Personal → dropped without a network call when it drains.
+    fn enqueue_simple(&self, entity: &str, table: &str, id: &str, delete: bool) -> Result<()> {
+        let workspace = if delete {
             self.config.workspace_id.clone()
         } else {
-            let table = match entity {
-                "note" => "notes",
-                "folder" => "folders",
-                _ => "summary_prompts",
-            };
+            let conn = self.db.lock();
             conn.query_row(
                 &format!("SELECT workspace_id FROM {table} WHERE id = ?1"),
-                rusqlite::params![entity_id],
+                rusqlite::params![id],
                 |r| r.get::<_, String>(0),
             )
             .optional()?
             .unwrap_or_default()
         };
-        // Coalesce: one pending op per record. A new edit supersedes any
-        // pending op for the same row and resets the retry counter.
+        self.enqueue_row(entity, id, if delete { "delete" } else { "upsert" }, &workspace)
+    }
+
+    /// Persist one outbox row, coalescing on (entity, entity_id, workspace): a
+    /// fresh op for the same row+workspace supersedes any pending one and resets
+    /// the retry counter. Distinct workspaces (a move) coexist as two rows.
+    fn enqueue_row(&self, entity: &str, entity_id: &str, kind: &str, workspace: &str) -> Result<()> {
+        let conn = self.db.lock();
         conn.execute(
             "INSERT INTO sync_outbox (entity, entity_id, op, workspace, attempts, enqueued_at)
              VALUES (?1, ?2, ?3, ?4, 0, ?5)
-             ON CONFLICT(entity, entity_id) DO UPDATE SET
-                op = excluded.op, workspace = excluded.workspace,
-                attempts = 0, enqueued_at = excluded.enqueued_at",
+             ON CONFLICT(entity, entity_id, workspace) DO UPDATE SET
+                op = excluded.op, attempts = 0, enqueued_at = excluded.enqueued_at",
             rusqlite::params![entity, entity_id, kind, workspace, now_ms()],
         )?;
         Ok(())
@@ -567,7 +594,12 @@ impl Worker {
     fn apply_remote_note(&self, n: &RemoteNote) -> Result<()> {
         let conn = self.db.lock();
         if n.deleted {
-            conn.execute("DELETE FROM notes WHERE id = ?1", rusqlite::params![n.client_id])?;
+            // Scope the delete to the workspace we're pulling: a tombstone from
+            // the old workspace must not wipe a copy the note was just moved to.
+            conn.execute(
+                "DELETE FROM notes WHERE id = ?1 AND workspace_id = ?2",
+                rusqlite::params![n.client_id, self.config.workspace_id],
+            )?;
             return Ok(());
         }
         let folder = if n.folder_client_id.is_empty() {
@@ -610,7 +642,10 @@ impl Worker {
     fn apply_remote_folder(&self, f: &RemoteFolder) -> Result<()> {
         let conn = self.db.lock();
         if f.deleted {
-            conn.execute("DELETE FROM folders WHERE id = ?1", rusqlite::params![f.client_id])?;
+            conn.execute(
+                "DELETE FROM folders WHERE id = ?1 AND workspace_id = ?2",
+                rusqlite::params![f.client_id, self.config.workspace_id],
+            )?;
             return Ok(());
         }
         // folders has no separate client-created_at column synced; seed it from
@@ -628,7 +663,10 @@ impl Worker {
     fn apply_remote_prompt(&self, p: &RemotePrompt) -> Result<()> {
         let conn = self.db.lock();
         if p.deleted {
-            conn.execute("DELETE FROM summary_prompts WHERE id = ?1", rusqlite::params![p.client_id])?;
+            conn.execute(
+                "DELETE FROM summary_prompts WHERE id = ?1 AND workspace_id = ?2",
+                rusqlite::params![p.client_id, self.config.workspace_id],
+            )?;
             return Ok(());
         }
         conn.execute(
@@ -843,11 +881,15 @@ fn init_tables(db: &Db) -> Result<()> {
     // upserts onto. A burst of edits collapses to a single pending push instead
     // of one outbox row (and one network round-trip) per keystroke-save.
     conn.execute(
-        "DELETE FROM sync_outbox WHERE seq NOT IN (SELECT MAX(seq) FROM sync_outbox GROUP BY entity, entity_id)",
+        "DELETE FROM sync_outbox WHERE seq NOT IN (SELECT MAX(seq) FROM sync_outbox GROUP BY entity, entity_id, workspace)",
         [],
     )?;
+    // Older builds keyed the index on (entity, entity_id); replace it with one
+    // that includes workspace so a workspace move (tombstone-in-old +
+    // upsert-in-new for the same note) can hold both rows at once.
+    let _ = conn.execute("DROP INDEX IF EXISTS idx_outbox_entity", []);
     conn.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_outbox_entity ON sync_outbox(entity, entity_id)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_outbox_entity_ws ON sync_outbox(entity, entity_id, workspace)",
         [],
     )?;
     Ok(())
@@ -980,6 +1022,62 @@ mod it {
         assert_eq!(count, 1, "three enqueues collapse to one pending row");
         assert_eq!(op, "delete", "latest op wins");
         assert_eq!(ws, "wsX", "upsert captured the note's own workspace");
+    }
+
+    /// Moving a note across workspaces queues a tombstone in the old workspace
+    /// and an upsert in the new one — two coexisting rows, drained delete-first.
+    #[test]
+    fn note_move_enqueues_tombstone_then_upsert() {
+        let db = test_db();
+        let w = worker(db.clone(), offline_config("wsB"));
+        {
+            let conn = db.lock();
+            conn.execute(
+                "INSERT INTO notes (id, workspace_id, created_at, updated_at) VALUES ('n1', 'wsB', 1, 1)",
+                [],
+            )
+            .unwrap();
+        }
+        w.enqueue(Op::NoteMove { id: "n1".into(), from: "wsA".into(), to: "wsB".into() }).unwrap();
+        let conn = db.lock();
+        let rows: Vec<(String, String)> = conn
+            .prepare("SELECT op, workspace FROM sync_outbox WHERE entity='note' AND entity_id='n1' ORDER BY seq")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(
+            rows,
+            vec![("delete".to_string(), "wsA".to_string()), ("upsert".to_string(), "wsB".to_string())],
+            "move = delete@from then upsert@to"
+        );
+    }
+
+    /// Moving FROM Personal ('') only enqueues the upsert — there's no remote
+    /// row in Personal to tombstone.
+    #[test]
+    fn note_move_from_personal_only_upserts() {
+        let db = test_db();
+        let w = worker(db.clone(), offline_config("wsB"));
+        {
+            let conn = db.lock();
+            conn.execute(
+                "INSERT INTO notes (id, workspace_id, created_at, updated_at) VALUES ('n2', 'wsB', 1, 1)",
+                [],
+            )
+            .unwrap();
+        }
+        w.enqueue(Op::NoteMove { id: "n2".into(), from: "".into(), to: "wsB".into() }).unwrap();
+        let conn = db.lock();
+        let (count, op): (i64, String) = conn
+            .query_row(
+                "SELECT COUNT(*), MAX(op) FROM sync_outbox WHERE entity_id='n2'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((count, op.as_str()), (1, "upsert"));
     }
 
     #[tokio::test]

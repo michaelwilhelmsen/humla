@@ -166,6 +166,9 @@ export const ipc = {
   deleteNote: (id: string) => invoke<void>("notes_delete", { id }),
   moveNote: (id: string, folderId: string | null) =>
     invoke<void>("notes_move", { id, folderId }),
+  // Reassign a note to a workspace ("" = Personal/local-only).
+  setNoteWorkspace: (id: string, workspaceId: string) =>
+    invoke<void>("notes_set_workspace", { id, workspaceId }),
 
   listFolders: () => invoke<Folder[]>("folders_list"),
   createFolder: (name: string) => invoke<Folder>("folders_create", { name }),

@@ -79,3 +79,26 @@ pub fn notes_move(
     state.sync.note_upserted(&id); // move bumps updated_at; treat as an upsert
     Ok(())
 }
+
+/// Move a note to a different workspace (`""` = Personal/local-only). Lets a
+/// note recorded in Personal be shared to a team, or moved between workspaces.
+/// The sync layer tombstones it in the old workspace and recreates it in the new
+/// one (they're distinct remote records keyed on `(workspace, client_id)`).
+#[tauri::command]
+pub fn notes_set_workspace(
+    state: State<AppState>,
+    id: String,
+    workspace_id: String,
+) -> Result<(), String> {
+    let from = {
+        let conn = state.db.lock();
+        let note = db::get_note(&conn, &id).map_err(err)?;
+        if note.workspace_id == workspace_id {
+            return Ok(()); // already there — nothing to do
+        }
+        db::set_note_workspace(&conn, &id, &workspace_id).map_err(err)?;
+        note.workspace_id
+    };
+    state.sync.note_moved(&id, &from, &workspace_id);
+    Ok(())
+}

@@ -207,6 +207,17 @@ pub fn move_note(conn: &Connection, id: &str, folder_id: Option<&str>) -> Result
     Ok(())
 }
 
+/// Reassign a note to a different workspace (`""` = Personal/local-only). Bumps
+/// `updated_at` so the move reads as a fresh write to the sync layer's LWW.
+pub fn set_note_workspace(conn: &Connection, id: &str, workspace: &str) -> Result<()> {
+    let now = now_ms();
+    conn.execute(
+        "UPDATE notes SET workspace_id = ?1, updated_at = ?2 WHERE id = ?3",
+        params![workspace, now, id],
+    )?;
+    Ok(())
+}
+
 pub fn list_folders(conn: &Connection, workspace: &str) -> Result<Vec<Folder>> {
     let mut stmt = conn.prepare_cached(
         "SELECT id, name, created_at, updated_at, workspace_id FROM folders WHERE workspace_id = ?1 ORDER BY name COLLATE NOCASE",

@@ -29,6 +29,12 @@ pub trait SyncObserver: Send + Sync {
     /// the deletion will never propagate to other devices.
     fn note_deleted(&self, _id: &str) {}
 
+    /// A note moved between workspaces. `from`/`to` are workspace ids (`""` =
+    /// Personal/local-only). The sync layer must tombstone the note in `from`
+    /// and (re)create it in `to`, since the two live as separate remote records
+    /// keyed on `(workspace, client_id)`.
+    fn note_moved(&self, _id: &str, _from_workspace: &str, _to_workspace: &str) {}
+
     /// A folder was created or renamed. `id` is the folder id.
     fn folder_upserted(&self, _id: &str) {}
 

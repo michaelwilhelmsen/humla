@@ -172,6 +172,11 @@ impl SyncObserver for CloudObserver {
             h.enqueue_note_delete(id);
         }
     }
+    fn note_moved(&self, id: &str, from: &str, to: &str) {
+        if let Some(h) = self.mgr.handle() {
+            h.enqueue_note_move(id, from, to);
+        }
+    }
     fn folder_upserted(&self, id: &str) {
         if let Some(h) = self.mgr.handle() {
             h.enqueue_folder_upsert(id);

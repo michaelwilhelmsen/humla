@@ -201,6 +201,7 @@ where
             commands::notes_update,
             commands::notes_delete,
             commands::notes_move,
+            commands::notes_set_workspace,
             commands::folders_list,
             commands::folders_create,
             commands::folders_rename,
