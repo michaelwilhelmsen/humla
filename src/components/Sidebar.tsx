@@ -177,6 +177,19 @@ export function Sidebar({ onCollapse }: { onCollapse: () => void }) {
         <span>All notes</span>
       </Link>
 
+      <Link
+        to="/trash"
+        className={cn(
+          "no-drag flex items-center gap-2 px-2 py-2 rounded-md text-sm transition-colors",
+          location.pathname === "/trash"
+            ? "bg-[var(--color-sidebar-active)] text-[var(--color-text)]"
+            : "text-[var(--color-text-muted)] hover:bg-[var(--color-sidebar-active)] hover:text-[var(--color-text)]"
+        )}
+      >
+        <Trash2 size={15} strokeWidth={1.5} />
+        <span>Trash</span>
+      </Link>
+
       {creatingFolder ? (
         <div className="no-drag flex items-center gap-2 pl-2 pr-2 py-2 rounded-md border border-[var(--color-text-muted)] bg-[var(--color-surface)]">
           <FolderPlus size={15} strokeWidth={1.5} className="text-[var(--color-text-muted)] shrink-0" />

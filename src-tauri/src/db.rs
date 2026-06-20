@@ -40,6 +40,11 @@ pub struct Note {
     // workspace by this field.
     #[serde(default)]
     pub workspace_id: String,
+    // Soft-delete timestamp (ms). NULL = live; set = in Trash (recoverable).
+    // Deleting a note sets this instead of dropping the row, so an accidental
+    // delete can be restored; a remote tombstone also lands here.
+    #[serde(default)]
+    pub deleted_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -142,6 +147,10 @@ pub fn open(path: &Path) -> Result<Connection> {
         "ALTER TABLE summary_prompts ADD COLUMN workspace_id TEXT NOT NULL DEFAULT ''",
         [],
     );
+    // Soft-delete (Trash). NULL = live, set (ms) = trashed. Deleting sets this
+    // instead of dropping the row so it's recoverable; remote tombstones land
+    // here too. Note lists filter `deleted_at IS NULL`.
+    let _ = conn.execute("ALTER TABLE notes ADD COLUMN deleted_at INTEGER", []);
     // Index is created AFTER the ALTERs so it's safe on both fresh DBs and
     // older DBs that needed the column added.
     conn.execute(
@@ -159,14 +168,25 @@ pub fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
-const NOTE_COLS: &str = "id, title, body, transcript, summary, audio_path, summary_preset, folder_id, language, summary_provider, expected_speakers, created_at, updated_at, owner, workspace_id";
+const NOTE_COLS: &str = "id, title, body, transcript, summary, audio_path, summary_preset, folder_id, language, summary_provider, expected_speakers, created_at, updated_at, owner, workspace_id, deleted_at";
 
-/// List notes in the active workspace (`""` = Personal / local-only). Scoping
-/// by workspace is what keeps one workspace's notes from showing up in another
-/// and keeps Personal notes out of a shared view.
+/// List live notes in the active workspace (`""` = Personal / local-only).
+/// Excludes trashed notes (`deleted_at` set). Scoping by workspace keeps one
+/// workspace's notes out of another's view and Personal out of a shared view.
 pub fn list_notes(conn: &Connection, workspace: &str) -> Result<Vec<Note>> {
     let mut stmt = conn.prepare_cached(&format!(
-        "SELECT {NOTE_COLS} FROM notes WHERE workspace_id = ?1 ORDER BY updated_at DESC"
+        "SELECT {NOTE_COLS} FROM notes WHERE workspace_id = ?1 AND deleted_at IS NULL ORDER BY updated_at DESC"
+    ))?;
+    let rows = stmt
+        .query_map(params![workspace], map_note)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// List trashed notes in the active workspace, most-recently-deleted first.
+pub fn list_trashed_notes(conn: &Connection, workspace: &str) -> Result<Vec<Note>> {
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {NOTE_COLS} FROM notes WHERE workspace_id = ?1 AND deleted_at IS NOT NULL ORDER BY deleted_at DESC"
     ))?;
     let rows = stmt
         .query_map(params![workspace], map_note)?
@@ -388,7 +408,31 @@ pub fn set_transcript(conn: &Connection, id: &str, text: &str) -> Result<()> {
     Ok(())
 }
 
+/// Soft-delete: move a note to the Trash (recoverable) and bump `updated_at` so
+/// the change syncs (as a tombstone). The row is kept so it can be restored.
 pub fn delete_note(conn: &Connection, id: &str) -> Result<()> {
+    let now = now_ms();
+    conn.execute(
+        "UPDATE notes SET deleted_at = ?1, updated_at = ?1 WHERE id = ?2",
+        params![now, id],
+    )?;
+    Ok(())
+}
+
+/// Restore a note from the Trash. Bumps `updated_at` so a re-pushed (un-deleted)
+/// version wins LWW and the note reappears for teammates too.
+pub fn restore_note(conn: &Connection, id: &str) -> Result<()> {
+    let now = now_ms();
+    conn.execute(
+        "UPDATE notes SET deleted_at = NULL, updated_at = ?1 WHERE id = ?2",
+        params![now, id],
+    )?;
+    Ok(())
+}
+
+/// Permanently delete a note (hard DELETE) — removes the local row for good.
+/// The server copy is already tombstoned from the soft-delete.
+pub fn purge_note(conn: &Connection, id: &str) -> Result<()> {
     conn.execute("DELETE FROM notes WHERE id = ?1", params![id])?;
     Ok(())
 }
@@ -649,6 +693,7 @@ fn map_note(row: &rusqlite::Row) -> rusqlite::Result<Note> {
         updated_at: row.get(12)?,
         owner: row.get(13)?,
         workspace_id: row.get(14)?,
+        deleted_at: row.get(15)?,
     })
 }
 

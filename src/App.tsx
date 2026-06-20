@@ -5,6 +5,7 @@ import { Home } from "./pages/Home";
 import { AllNotes } from "./pages/AllNotes";
 import { Note } from "./pages/Note";
 import { Folder } from "./pages/Folder";
+import { Trash } from "./pages/Trash";
 import { Settings } from "./pages/Settings";
 import { useGlobalShortcuts } from "./lib/shortcuts";
 import { useNotesStore } from "./lib/store";
@@ -31,6 +32,7 @@ export default function App() {
         <Route path="/all-notes" element={<AllNotes />} />
         <Route path="/note/:id" element={<Note />} />
         <Route path="/folder/:id" element={<Folder />} />
+        <Route path="/trash" element={<Trash />} />
         <Route path="/settings" element={<Settings />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Route>

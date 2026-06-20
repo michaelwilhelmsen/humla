@@ -32,6 +32,8 @@ export type Note = {
   // local-only (private to this device). Non-empty = shared with that
   // workspace's members. Note lists are scoped to the active workspace.
   workspace_id: string;
+  // Soft-delete timestamp (ms) when the note is in the Trash; null/absent = live.
+  deleted_at?: number | null;
 };
 
 export type Folder = {
@@ -169,6 +171,10 @@ export const ipc = {
   // Reassign a note to a workspace ("" = Personal/local-only).
   setNoteWorkspace: (id: string, workspaceId: string) =>
     invoke<void>("notes_set_workspace", { id, workspaceId }),
+  // Trash (soft-delete) — list / restore / permanently delete.
+  listTrashedNotes: () => invoke<Note[]>("notes_list_trash"),
+  restoreNote: (id: string) => invoke<Note>("notes_restore", { id }),
+  purgeNote: (id: string) => invoke<void>("notes_purge", { id }),
 
   listFolders: () => invoke<Folder[]>("folders_list"),
   createFolder: (name: string) => invoke<Folder>("folders_create", { name }),

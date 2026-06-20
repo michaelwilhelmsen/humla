@@ -600,11 +600,16 @@ impl Worker {
     fn apply_remote_note(&self, n: &RemoteNote) -> Result<()> {
         let conn = self.db.lock();
         if n.deleted {
-            // Scope the delete to the workspace we're pulling: a tombstone from
-            // the old workspace must not wipe a copy the note was just moved to.
+            // Soft-delete (move to Trash) rather than dropping the row: the
+            // deletion stays recoverable, and re-pulling our own tombstone is
+            // idempotent (it won't purge the local Trash entry). Scoped to the
+            // pulled workspace (a tombstone from the old workspace mustn't touch
+            // a copy just moved elsewhere) and LWW-guarded (a newer local edit
+            // wins over the delete).
             conn.execute(
-                "DELETE FROM notes WHERE id = ?1 AND workspace_id = ?2",
-                rusqlite::params![n.client_id, self.config.workspace_id],
+                "UPDATE notes SET deleted_at = ?3, updated_at = ?3
+                 WHERE id = ?1 AND workspace_id = ?2 AND ?3 >= updated_at",
+                rusqlite::params![n.client_id, self.config.workspace_id, n.client_updated_at],
             )?;
             return Ok(());
         }
@@ -1010,7 +1015,7 @@ mod it {
                 summary_preset TEXT NOT NULL DEFAULT 'meeting', folder_id TEXT,
                 language TEXT NOT NULL DEFAULT '', summary_provider TEXT NOT NULL DEFAULT '',
                 expected_speakers INTEGER, owner TEXT NOT NULL DEFAULT '',
-                workspace_id TEXT NOT NULL DEFAULT '',
+                workspace_id TEXT NOT NULL DEFAULT '', deleted_at INTEGER,
                 created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
             );
             CREATE TABLE folders (
@@ -1247,7 +1252,11 @@ mod it {
         w.push_delete("notes", &uuid, &ws).await.expect("delete");
         w.write_state("notes_cursor", "").unwrap();
         w.pull_collection("notes", "notes_cursor", &auth.token, |v| w.apply_remote_note_json(v)).await.expect("pull2");
-        assert_eq!(scalar(&db, "SELECT title FROM notes WHERE id = ?1", &uuid), None, "tombstone deletes locally");
+        assert_eq!(
+            scalar(&db, "SELECT title FROM notes WHERE id = ?1 AND deleted_at IS NULL", &uuid),
+            None,
+            "tombstone moves the note to Trash (out of the live set)"
+        );
     }
 
     #[tokio::test]

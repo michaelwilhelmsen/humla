@@ -60,10 +60,39 @@ pub fn notes_delete(state: State<AppState>, id: String) -> Result<(), String> {
         let conn = state.db.lock();
         db::delete_note(&conn, &id).map_err(err)?;
     }
-    // delete_note is a hard DELETE — the sync layer records a tombstone so the
-    // deletion propagates instead of the row silently reappearing on next pull.
+    // Soft-delete (Trash): the row stays for restore, but the sync layer records
+    // a tombstone so the deletion still propagates to other devices.
     state.sync.note_deleted(&id);
     Ok(())
+}
+
+/// Notes in the Trash for the active workspace (soft-deleted, recoverable).
+#[tauri::command]
+pub fn notes_list_trash(state: State<AppState>) -> Result<Vec<Note>, String> {
+    let conn = state.db.lock();
+    let workspace = super::cloud::active_workspace(&conn);
+    db::list_trashed_notes(&conn, &workspace).map_err(err)
+}
+
+/// Restore a note from the Trash. Re-pushes it (un-tombstone) so it also
+/// reappears for teammates.
+#[tauri::command]
+pub fn notes_restore(state: State<AppState>, id: String) -> Result<Note, String> {
+    let note = {
+        let conn = state.db.lock();
+        db::restore_note(&conn, &id).map_err(err)?;
+        db::get_note(&conn, &id).map_err(err)?
+    };
+    state.sync.note_upserted(&id);
+    Ok(note)
+}
+
+/// Permanently delete a note from the Trash (hard delete, not recoverable). The
+/// server copy is already tombstoned from the soft-delete, so this is local-only.
+#[tauri::command]
+pub fn notes_purge(state: State<AppState>, id: String) -> Result<(), String> {
+    let conn = state.db.lock();
+    db::purge_note(&conn, &id).map_err(err)
 }
 
 #[tauri::command]
