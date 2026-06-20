@@ -44,6 +44,8 @@ export function OrganizationTab() {
   const [nameDraft, setNameDraft] = useState("");
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [confirmLeave, setConfirmLeave] = useState(false);
+  const [transferTo, setTransferTo] = useState("");
+  const [confirmTransfer, setConfirmTransfer] = useState(false);
 
   // Reseed the rename field and reset the danger confirms whenever the active
   // workspace (or its name, after a rename) changes.
@@ -51,6 +53,8 @@ export function OrganizationTab() {
     setNameDraft(ws?.name ?? "");
     setConfirmDelete(false);
     setConfirmLeave(false);
+    setTransferTo("");
+    setConfirmTransfer(false);
   }, [ws?.id, ws?.name]);
 
   const loadMembers = useCallback(async (id: string) => {
@@ -187,6 +191,24 @@ export function OrganizationTab() {
     try {
       await cloudApi.renameWorkspace(ws.id, name);
       await refreshCloud();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function transferOwnership() {
+    if (!ws || !transferTo) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await cloudApi.transferWorkspace(ws.id, transferTo);
+      setTransferTo("");
+      setConfirmTransfer(false);
+      // Roles changed (owner → admin for us), so refresh status + roster.
+      await refreshCloud();
+      await loadMembers(ws.id);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -331,6 +353,53 @@ export function OrganizationTab() {
           </Row>
         )}
       </Section>
+
+      {ws.role === "owner" && members.some((m) => m.id !== status.user?.id) && (
+        <Section title="Ownership">
+          <Row label="Transfer ownership">
+            <div className="flex flex-col gap-2">
+              <div className="flex flex-wrap items-center gap-2">
+                <Select
+                  value={transferTo}
+                  onChange={(v) => {
+                    setTransferTo(v);
+                    setConfirmTransfer(false);
+                  }}
+                  options={[
+                    { value: "", label: "Choose a member…" },
+                    ...members
+                      .filter((m) => m.id !== status.user?.id)
+                      .map((m) => ({ value: m.id, label: m.name || m.email })),
+                  ]}
+                />
+                {!confirmTransfer ? (
+                  <Btn onClick={() => setConfirmTransfer(true)} disabled={busy || !transferTo}>
+                    Transfer
+                  </Btn>
+                ) : (
+                  <>
+                    <button
+                      onClick={transferOwnership}
+                      disabled={busy}
+                      className="px-3 py-2 rounded-md text-sm border border-[var(--color-accent)] disabled:opacity-50 transition-opacity hover:opacity-90"
+                      style={{ background: "var(--color-accent)", color: "#fff" }}
+                    >
+                      Confirm transfer
+                    </button>
+                    <Btn onClick={() => setConfirmTransfer(false)} disabled={busy}>
+                      Cancel
+                    </Btn>
+                  </>
+                )}
+              </div>
+              <p className="text-xs text-[var(--color-text-muted)]">
+                Makes the selected member the owner. You'll stay on as an admin — only the owner can
+                delete the workspace or transfer it again.
+              </p>
+            </div>
+          </Row>
+        </Section>
+      )}
 
       {ws.role === "owner" && (
         <Section title="Danger zone">

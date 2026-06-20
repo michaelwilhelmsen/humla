@@ -31,6 +31,8 @@ export const cloudApi = {
   configure: (baseUrl: string) => invoke<void>("cloud_configure", { baseUrl }),
   login: (email: string, password: string) =>
     invoke<CloudStatus>("cloud_login", { email, password }),
+  signup: (email: string, password: string, name: string) =>
+    invoke<CloudStatus>("cloud_signup", { email, password, name }),
   logout: () => invoke<void>("cloud_logout"),
   createWorkspace: (name: string) => invoke<CloudWorkspace>("cloud_create_workspace", { name }),
   selectWorkspace: (id: string) => invoke<void>("cloud_select_workspace", { id }),
@@ -40,6 +42,8 @@ export const cloudApi = {
     invoke<void>("cloud_delete_workspace", { workspaceId }),
   leaveWorkspace: (workspaceId: string) =>
     invoke<void>("cloud_leave_workspace", { workspaceId }),
+  transferWorkspace: (workspaceId: string, newOwnerId: string) =>
+    invoke<void>("cloud_transfer_workspace", { workspaceId, newOwnerId }),
   workspaceMembers: (workspaceId: string) =>
     invoke<CloudMember[]>("cloud_workspace_members", { workspaceId }),
   addMember: (workspaceId: string, email: string) =>

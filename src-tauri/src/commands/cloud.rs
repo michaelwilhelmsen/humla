@@ -373,6 +373,63 @@ pub async fn cloud_login(
     cloud_status(state).await
 }
 
+/// Create a new account on the configured server, then sign in. Public sign-up
+/// is enabled server-side (`users.createRule = ""`, humla-cloud migration
+/// 1718900100). `emailVisibility` is set so workspace co-members can see the
+/// email in the roster.
+#[tauri::command]
+pub async fn cloud_signup(
+    state: State<'_, AppState>,
+    email: String,
+    password: String,
+    name: String,
+) -> Result<CloudStatus, String> {
+    let base = read_base_url(&state).ok_or("Cloud isn't configured — set the server URL first.")?;
+    let email = email.trim();
+    let name = name.trim();
+    if email.is_empty() || password.is_empty() {
+        return Err("Email and password are required.".into());
+    }
+
+    let resp = http()
+        .post(format!("{base}/api/collections/users/records"))
+        .json(&serde_json::json!({
+            "email": email,
+            "password": password,
+            "passwordConfirm": password,
+            "name": name,
+            "emailVisibility": true,
+        }))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let status = resp.status();
+    let val: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("pocketbase: invalid response ({e})"))?;
+    if !status.is_success() {
+        // PocketBase puts per-field validation errors under `data` (e.g. email
+        // already in use, password too short) — surface the first one, which is
+        // far more useful than the generic top-level message.
+        let detail = val
+            .get("data")
+            .and_then(|d| d.as_object())
+            .and_then(|o| o.values().find_map(|v| v.get("message").and_then(|m| m.as_str())));
+        let msg = detail
+            .or_else(|| val.get("message").and_then(|m| m.as_str()))
+            .unwrap_or("sign-up failed");
+        return Err(msg.to_string());
+    }
+
+    // Account created → sign in and persist credentials, mirroring cloud_login.
+    let session = login_request(&base, email, &password).await?;
+    write_creds(email, &password)?;
+    *SESSION.lock().unwrap() = Some(session);
+    state.sync.config_changed();
+    cloud_status(state).await
+}
+
 #[tauri::command]
 pub fn cloud_logout(state: State<'_, AppState>) -> Result<(), String> {
     clear_creds();
@@ -643,5 +700,30 @@ pub async fn cloud_leave_workspace(
         }
         state.sync.config_changed(); // left the active workspace → stop syncing
     }
+    Ok(())
+}
+
+/// Transfer workspace ownership to another member. Goes through the server-side
+/// hook `POST /api/humla/transfer-workspace` because `owner` is immutable via
+/// the normal API (an admin must not be able to seize it). The hook enforces
+/// owner-only, requires the new owner to already be a member, promotes them to
+/// admin, and keeps the outgoing owner on as an admin. The active workspace is
+/// unchanged (still syncing), but the caller should refresh cloud status since
+/// their own role drops from owner → admin.
+#[tauri::command]
+pub async fn cloud_transfer_workspace(
+    state: State<'_, AppState>,
+    workspace_id: String,
+    new_owner_id: String,
+) -> Result<(), String> {
+    let (base, session) = ensure_session(&state).await?;
+    let resp = http()
+        .post(format!("{base}/api/humla/transfer-workspace"))
+        .bearer_auth(&session.token)
+        .json(&serde_json::json!({ "workspace_id": workspace_id, "new_owner_id": new_owner_id }))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    pb_json(resp).await?; // surfaces the hook's message (e.g. owner-only, not-a-member)
     Ok(())
 }

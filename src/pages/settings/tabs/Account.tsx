@@ -15,6 +15,8 @@ export function AccountTab() {
   const refresh = useCloudStore((s) => s.refresh);
 
   const [serverUrl, setServerUrl] = useState(status.base_url);
+  const [mode, setMode] = useState<"signin" | "signup">("signin");
+  const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
@@ -38,6 +40,20 @@ export function AccountTab() {
     setError(null);
     try {
       await cloudApi.login(email.trim(), password);
+      setPassword("");
+      await refresh();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function signUp() {
+    setBusy(true);
+    setError(null);
+    try {
+      await cloudApi.signup(email.trim(), password, name.trim());
       setPassword("");
       await refresh();
     } catch (e) {
@@ -114,26 +130,47 @@ export function AccountTab() {
 
   // Configured but signed out ------------------------------------------------
   if (status.configured) {
+    const isSignup = mode === "signup";
+    const submit = isSignup ? signUp : signIn;
+    const canSubmit = !!email.trim() && !!password && (!isSignup || !!name.trim());
+    const toggleMode = () => {
+      setMode(isSignup ? "signin" : "signup");
+      setError(null);
+    };
     return (
-      <Section title="Sign in">
+      <Section title={isSignup ? "Create account" : "Sign in"}>
         <Row label="Server">
           <div className="text-sm text-[var(--color-text-muted)] break-all">{status.base_url}</div>
         </Row>
+        {isSignup && (
+          <Row label="Name">
+            <input className={inputCls} type="text" autoComplete="name" value={name}
+              onChange={(e) => setName(e.target.value)} placeholder="Your name" />
+          </Row>
+        )}
         <Row label="Email">
           <input className={inputCls} type="email" autoComplete="username" value={email}
             onChange={(e) => setEmail(e.target.value)} placeholder="you@example.com" />
         </Row>
         <Row label="Password">
-          <input className={inputCls} type="password" autoComplete="current-password" value={password}
+          <input className={inputCls} type="password"
+            autoComplete={isSignup ? "new-password" : "current-password"} value={password}
             onChange={(e) => setPassword(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && signIn()} placeholder="••••••••" />
+            onKeyDown={(e) => e.key === "Enter" && canSubmit && submit()}
+            placeholder={isSignup ? "At least 8 characters" : "••••••••"} />
         </Row>
         {error && <div className="text-xs text-[var(--color-accent)]">{error}</div>}
         <div className="flex gap-2">
-          <Btn onClick={signIn} disabled={busy || !email.trim() || !password}>
-            {busy ? "Signing in…" : "Sign in"}
+          <Btn onClick={submit} disabled={busy || !canSubmit}>
+            {busy ? (isSignup ? "Creating…" : "Signing in…") : isSignup ? "Create account" : "Sign in"}
           </Btn>
           <Btn onClick={disconnect} disabled={busy}>Change server</Btn>
+        </div>
+        <div>
+          <button type="button" onClick={toggleMode}
+            className="text-xs text-[var(--color-interactive)] hover:underline">
+            {isSignup ? "Already have an account? Sign in" : "Need an account? Create one"}
+          </button>
         </div>
       </Section>
     );
