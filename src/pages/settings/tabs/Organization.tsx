@@ -38,6 +38,7 @@ export function OrganizationTab() {
   const [members, setMembers] = useState<CloudMember[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const [addEmail, setAddEmail] = useState("");
   const [busy, setBusy] = useState(false);
   const [newWs, setNewWs] = useState("");
@@ -149,9 +150,15 @@ export function OrganizationTab() {
     if (!email || !ws) return;
     setBusy(true);
     setError(null);
+    setNotice(null);
     try {
-      await cloudApi.addMember(ws.id, email);
+      const status = await cloudApi.inviteMember(ws.id, email);
       setAddEmail("");
+      setNotice(
+        status === "invited"
+          ? `Invited ${email} — they'll join automatically when they sign up.`
+          : `Added ${email} to the workspace.`,
+      );
       await loadMembers(ws.id);
     } catch (e) {
       setError(String(e));
@@ -343,12 +350,14 @@ export function OrganizationTab() {
               />
               <Btn onClick={addMember} disabled={busy || !addEmail.trim()}>
                 <span className="inline-flex items-center gap-1.5">
-                  <UserPlus size={14} strokeWidth={1.5} /> Add
+                  <UserPlus size={14} strokeWidth={1.5} /> Invite
                 </span>
               </Btn>
             </div>
+            {notice && <p className="text-xs text-[var(--color-success)] mt-2">{notice}</p>}
             <p className="text-xs text-[var(--color-text-muted)] mt-2">
-              They need a Humla account on this server. Email invites for new people are coming soon.
+              If they already have an account they're added right away; otherwise they're invited and
+              join automatically when they sign up on this server.
             </p>
           </Row>
         )}

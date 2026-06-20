@@ -571,6 +571,33 @@ pub async fn cloud_add_member(
     Ok(())
 }
 
+/// Invite someone to a workspace by email. If they already have an account they
+/// are added immediately (returns "added"); otherwise a pending invite is
+/// recorded and they auto-join on sign-up (returns "invited"). Owner/admin only
+/// (enforced by the hook). Supersedes `cloud_add_member` for the UI.
+#[tauri::command]
+pub async fn cloud_invite_member(
+    state: State<'_, AppState>,
+    workspace_id: String,
+    email: String,
+    role: String,
+) -> Result<String, String> {
+    let (base, session) = ensure_session(&state).await?;
+    let resp = http()
+        .post(format!("{base}/api/humla/invite"))
+        .bearer_auth(&session.token)
+        .json(&serde_json::json!({
+            "workspace_id": workspace_id,
+            "email": email.trim(),
+            "role": role,
+        }))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let val = pb_json(resp).await?;
+    Ok(val.get("status").and_then(|v| v.as_str()).unwrap_or("invited").to_string())
+}
+
 #[tauri::command]
 pub async fn cloud_remove_member(
     state: State<'_, AppState>,

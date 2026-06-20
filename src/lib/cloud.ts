@@ -49,6 +49,9 @@ export const cloudApi = {
   pendingNoteIds: () => invoke<string[]>("cloud_pending_note_ids"),
   addMember: (workspaceId: string, email: string) =>
     invoke<void>("cloud_add_member", { workspaceId, email }),
+  /** Invite by email. Returns "added" (had an account) or "invited" (pending). */
+  inviteMember: (workspaceId: string, email: string, role: CloudRole = "member") =>
+    invoke<string>("cloud_invite_member", { workspaceId, email, role }),
   removeMember: (workspaceId: string, userId: string) =>
     invoke<void>("cloud_remove_member", { workspaceId, userId }),
   setMemberRole: (workspaceId: string, userId: string, role: CloudRole) =>
