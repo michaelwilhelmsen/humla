@@ -178,6 +178,16 @@ pub struct RecordingSession {
     // instead of clobbering it. Empty string means "fresh recording, no
     // prior content."
     pub transcript_at_start: Arc<Mutex<String>>,
+    // Cloud recording-lock bookkeeping for shared (workspace) notes. `lock_id`
+    // is the PocketBase `note_locks` record we hold while recording, so two
+    // teammates can't record the same note at once (their transcripts would
+    // clobber each other under last-write-wins sync). `lock_heartbeat` is the
+    // task that keeps the lock's `expires` fresh; it MUST be aborted on stop /
+    // crash or it would keep a dead recording's lock alive. Both `None` for
+    // Personal notes or when the cloud is unreachable (recording proceeds
+    // unlocked — a flaky network shouldn't block capture).
+    pub lock_id: Option<String>,
+    pub lock_heartbeat: Option<JoinHandle<()>>,
 }
 
 #[derive(Clone, Serialize)]

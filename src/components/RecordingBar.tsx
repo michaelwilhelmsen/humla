@@ -4,7 +4,7 @@ import { ipc } from "../lib/ipc";
 import { useNotesStore, useRecordingStore } from "../lib/store";
 import { cn } from "../lib/cn";
 
-export function RecordingBar({ noteId }: { noteId: string }) {
+export function RecordingBar({ noteId, lockedByName }: { noteId: string; lockedByName?: string | null }) {
   const status = useRecordingStore((s) => s.status);
   const isThisNote = status.noteId === noteId;
   const phase = isThisNote ? status.phase : "idle";
@@ -74,15 +74,25 @@ export function RecordingBar({ noteId }: { noteId: string }) {
 
       {phase === "idle" && (
         <>
-          <button
-            onClick={start}
-            disabled={otherNoteRecording}
-            className="nd-action no-drag"
-            title="⌘R"
-          >
-            <Circle size={11} fill="currentColor" strokeWidth={0} className="text-[var(--color-accent)]" />
-            <span>Record</span>
-          </button>
+          {lockedByName ? (
+            <div
+              className="shrink-0 whitespace-nowrap flex items-center gap-2 px-4 py-2 rounded-full bg-[var(--color-surface)] border border-[var(--color-line-visible)] text-xs text-[var(--color-text-muted)] cursor-default"
+              title={`${lockedByName} is recording this note — only one person can record a shared note at a time.`}
+            >
+              <Circle size={9} fill="currentColor" strokeWidth={0} className="rec-dot text-[var(--color-accent)]" />
+              <span>{lockedByName} is recording…</span>
+            </div>
+          ) : (
+            <button
+              onClick={start}
+              disabled={otherNoteRecording}
+              className="nd-action no-drag"
+              title="⌘R"
+            >
+              <Circle size={11} fill="currentColor" strokeWidth={0} className="text-[var(--color-accent)]" />
+              <span>Record</span>
+            </button>
+          )}
           {hasTranscript && (
             <button
               onClick={summarize}

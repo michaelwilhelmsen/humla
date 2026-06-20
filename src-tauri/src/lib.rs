@@ -228,6 +228,7 @@ where
             commands::cloud_pending_note_ids,
             commands::cloud_upload_note_audio,
             commands::cloud_download_note_audio,
+            commands::cloud_note_recording_status,
             commands::cloud_add_member,
             commands::cloud_invite_member,
             commands::cloud_remove_member,

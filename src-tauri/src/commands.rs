@@ -1308,6 +1308,23 @@ pub async fn recording_start(
         }
     }
 
+    // Shared-note recording lock. For a workspace note, claim it before we
+    // start capturing so two teammates can't record the same note at once —
+    // their transcripts would otherwise clobber each other under last-write-wins
+    // sync. Server-arbitrated via a unique index; Personal notes and an
+    // unreachable cloud return `Skipped` and record unlocked.
+    let claimed_lock_id = match cloud::claim_recording_lock(&app, &note_id).await {
+        cloud::LockClaim::Held(who) => {
+            let msg = format!(
+                "{who} is recording this note — only one person can record a shared note at a time."
+            );
+            emit_error(&app, Some(&note_id), &msg);
+            return Err(msg);
+        }
+        cloud::LockClaim::Granted(id) => Some(id),
+        cloud::LockClaim::Skipped => None,
+    };
+
     emit_status(&app, Some(&note_id), Phase::Starting);
 
     let temp_dir = std::env::temp_dir().join(format!("notes-app-{}", note_id));
@@ -1334,7 +1351,16 @@ pub async fn recording_start(
         });
     }
 
-    let mut child = cmd.spawn().map_err(|e| format!("spawn audio-capture: {e}"))?;
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            // Don't leak the lock we just claimed if the sidecar won't start.
+            if let Some(id) = &claimed_lock_id {
+                cloud::release_recording_lock(&app, id.clone()).await;
+            }
+            return Err(format!("spawn audio-capture: {e}"));
+        }
+    };
     let stdout = child.stdout.take().ok_or("no stdout")?;
     let stderr = child.stderr.take().ok_or("no stderr")?;
 
@@ -1469,7 +1495,7 @@ pub async fn recording_start(
         // without us asking — i.e. a crash. Clean up and notify the UI so
         // the user isn't pinned in a stale "recording" state.
         let state: tauri::State<AppState> = app_clone.state();
-        let was_active = {
+        let (was_active, lock_id, lock_heartbeat) = {
             let mut s = state.recording.lock();
             if s.note_id.as_deref() == Some(&note_id_clone) {
                 s.note_id = None;
@@ -1477,11 +1503,23 @@ pub async fn recording_start(
                 s.temp_dir = None;
                 s.reader = None;
                 s.inflight = Arc::new(parking_lot::Mutex::new(Vec::new()));
-                true
+                (true, s.lock_id.take(), s.lock_heartbeat.take())
             } else {
-                false
+                (false, None, None)
             }
         };
+        // Sidecar died without recording_stop — drop the lock so the note isn't
+        // pinned until the TTL lapses (the heartbeat would otherwise keep a dead
+        // recording's lock alive).
+        if let Some(hb) = lock_heartbeat {
+            hb.abort();
+        }
+        if let Some(id) = lock_id {
+            let app_rel = app_clone.clone();
+            tokio::spawn(async move {
+                cloud::release_recording_lock(&app_rel, id).await;
+            });
+        }
         if was_active {
             let _ = app_clone.emit("recording_status", RecordingStatus { note_id: None, phase: Phase::Idle });
             let _ = app_clone.emit("recording_error", ErrorPayload {
@@ -1493,6 +1531,16 @@ pub async fn recording_start(
 
     state.recording.lock().reader = Some(reader_handle);
 
+    // Attach the shared-note lock to the live session + start its heartbeat so a
+    // long meeting keeps the lock fresh. Stored on the session so recording_stop
+    // and the crash-recovery path can abort the heartbeat and release the lock.
+    if let Some(id) = claimed_lock_id {
+        let hb = cloud::spawn_lock_heartbeat(app.clone(), id.clone());
+        let mut s = state.recording.lock();
+        s.lock_id = Some(id);
+        s.lock_heartbeat = Some(hb);
+    }
+
     emit_status(&app, Some(&note_id), Phase::Recording);
     Ok(())
 }
@@ -1502,7 +1550,7 @@ pub async fn recording_stop(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let (child, note_id, temp_dir, inflight, reader) = {
+    let (child, note_id, temp_dir, inflight, reader, lock_id, lock_heartbeat) = {
         let mut s = state.recording.lock();
         let note_id = s.note_id.take().ok_or("not recording")?;
         let child = s.child.take();
@@ -1512,8 +1560,23 @@ pub async fn recording_stop(
         // list to keep `s` self-consistent for the next session.
         let inflight = std::mem::replace(&mut s.inflight, Arc::new(parking_lot::Mutex::new(Vec::new())));
         let reader = s.reader.take();
-        (child, note_id, temp_dir, inflight, reader)
+        let lock_id = s.lock_id.take();
+        let lock_heartbeat = s.lock_heartbeat.take();
+        (child, note_id, temp_dir, inflight, reader, lock_id, lock_heartbeat)
     };
+
+    // Stop heartbeating and release the shared-note lock immediately, so a
+    // teammate can record next without waiting out the TTL. Best-effort: a
+    // missed release just lets the lock expire on its own.
+    if let Some(hb) = lock_heartbeat {
+        hb.abort();
+    }
+    if let Some(id) = lock_id {
+        let app_release = app.clone();
+        tokio::spawn(async move {
+            cloud::release_recording_lock(&app_release, id).await;
+        });
+    }
 
     emit_status(&app, Some(&note_id), Phase::Stopping);
 

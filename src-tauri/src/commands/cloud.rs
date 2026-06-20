@@ -1043,6 +1043,279 @@ pub async fn cloud_download_note_audio(app: tauri::AppHandle, note_id: String) -
     download_note_audio(&app, &note_id).await
 }
 
+// ---- recording lock (shared-note mutual exclusion) -------------------------
+//
+// Two teammates recording the same workspace note at once would clobber each
+// other: each pushes a whole-note last-write-wins record carrying only its own
+// transcript, so one stream wins and the other is scattered into conflict
+// copies. We prevent it server-side with a `note_locks` collection whose `note`
+// field carries a UNIQUE index — the atomic mutex. The first claimant's INSERT
+// wins; a concurrent second INSERT is rejected by the index. A crashed
+// recorder's lock is reaped via the delete rule (`expires < @now`), so nothing
+// stays locked forever. See `docs/cloud/note-locks.md` for the exact schema.
+//
+// Strength vs. cost: the claim is decided by the server at INSERT time, not
+// optimistically per-client and reconciled later. The only soft edge is that an
+// unreachable server degrades to recording UNLOCKED (a flaky network must never
+// block capture) — but when the server is unreachable, sync is down anyway.
+
+/// Seconds a lock stays valid without a heartbeat. Long enough to ride out a
+/// brief network stall, short enough that a crashed recorder frees the note
+/// quickly.
+const LOCK_TTL_SECS: i64 = 45;
+/// Heartbeat cadence — comfortably under `LOCK_TTL_SECS` so two missed pings in
+/// a row still don't expire a live lock.
+const LOCK_HEARTBEAT_SECS: u64 = 15;
+
+/// The teammate currently recording a note. Returned to the UI so it can show
+/// "X is recording…" and disable Record. `holder_id` lets the client tell when
+/// the lock is its own (during local recording) and skip the banner.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingLockStatus {
+    pub holder_id: String,
+    pub holder_name: String,
+}
+
+/// Outcome of a claim attempt. `Skipped` = no lock was needed (Personal note)
+/// or the cloud was unreachable → record unlocked.
+pub(crate) enum LockClaim {
+    Granted(String),
+    Held(String),
+    Skipped,
+}
+
+enum LockError {
+    /// The unique index rejected the create — the note is already locked.
+    Conflict,
+    Other(String),
+}
+
+struct ExistingLock {
+    id: String,
+    holder_id: String,
+    holder_name: String,
+}
+
+/// PocketBase's canonical datetime format, in UTC (e.g. `2026-06-20 12:34:56.789Z`).
+fn lock_expiry_value() -> String {
+    let at = chrono::Utc::now() + chrono::Duration::seconds(LOCK_TTL_SECS);
+    at.format("%Y-%m-%d %H:%M:%S%.3fZ").to_string()
+}
+
+fn display_name(s: &Session) -> String {
+    if !s.name.trim().is_empty() {
+        s.name.clone()
+    } else if let Some(local) = s.email.split('@').next().filter(|p| !p.is_empty()) {
+        local.to_string()
+    } else {
+        "a teammate".to_string()
+    }
+}
+
+/// POST a fresh lock. `Err(Conflict)` means the unique index rejected it (note
+/// already locked); other non-2xx → `Err(Other)`.
+async fn create_lock(
+    base: &str,
+    token: &str,
+    note: &str,
+    workspace: &str,
+    holder_id: &str,
+    holder_name: &str,
+) -> Result<String, LockError> {
+    let body = serde_json::json!({
+        "note": note,
+        "workspace": workspace,
+        "holder": holder_id,
+        "holder_name": holder_name,
+        "expires": lock_expiry_value(),
+    });
+    let resp = http()
+        .post(format!("{base}/api/collections/note_locks/records"))
+        .bearer_auth(token)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| LockError::Other(e.to_string()))?;
+    let status = resp.status();
+    if status.is_success() {
+        let v: serde_json::Value =
+            resp.json().await.map_err(|e| LockError::Other(e.to_string()))?;
+        return Ok(v.get("id").and_then(|x| x.as_str()).unwrap_or_default().to_string());
+    }
+    let text = resp.text().await.unwrap_or_default();
+    // A uniqueness violation on `note` is PocketBase's `validation_not_unique`.
+    // That — and only that — is a real "someone else holds it" conflict; any
+    // other 4xx (e.g. a createRule rejection for a non-member) falls through to
+    // Other and degrades to recording unlocked rather than falsely blocking.
+    if status == reqwest::StatusCode::BAD_REQUEST && text.contains("validation_not_unique") {
+        return Err(LockError::Conflict);
+    }
+    Err(LockError::Other(format!("note_locks create {status}: {text}")))
+}
+
+/// Fetch the current lock for a note (regardless of expiry), or `None`.
+async fn get_lock(base: &str, token: &str, note: &str) -> Result<Option<ExistingLock>, String> {
+    let filter = format!("note='{note}'");
+    let v = authed_get(
+        base,
+        token,
+        "/api/collections/note_locks/records",
+        &[("filter", filter.as_str()), ("perPage", "1"), ("fields", "id,holder,holder_name")],
+    )
+    .await?;
+    let item = v.get("items").and_then(|a| a.as_array()).and_then(|a| a.first());
+    Ok(item.map(|it| ExistingLock {
+        id: it.get("id").and_then(|x| x.as_str()).unwrap_or_default().to_string(),
+        holder_id: it.get("holder").and_then(|x| x.as_str()).unwrap_or_default().to_string(),
+        holder_name: it.get("holder_name").and_then(|x| x.as_str()).unwrap_or_default().to_string(),
+    }))
+}
+
+/// Try to claim the recording lock for `note_id`. Never errors: any cloud
+/// failure resolves to `Skipped` so a flaky network can't stop a recording.
+pub(crate) async fn claim_recording_lock(app: &tauri::AppHandle, note_id: &str) -> LockClaim {
+    let state = app.state::<AppState>();
+    let workspace = {
+        let conn = state.db.lock();
+        db::get_note(&conn, note_id).map(|n| n.workspace_id).unwrap_or_default()
+    };
+    if workspace.is_empty() {
+        return LockClaim::Skipped; // Personal note — no coordination needed
+    }
+    if read_base_url(&state).is_none() {
+        return LockClaim::Skipped; // cloud not configured
+    }
+    match try_claim(&state, note_id, &workspace).await {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            eprintln!("recording lock: claim skipped ({e})");
+            LockClaim::Skipped
+        }
+    }
+}
+
+async fn try_claim(
+    state: &State<'_, AppState>,
+    note_id: &str,
+    workspace: &str,
+) -> Result<LockClaim, String> {
+    let (base, session) = ensure_session(state).await?;
+    let holder_name = display_name(&session);
+    match create_lock(&base, &session.token, note_id, workspace, &session.user_id, &holder_name)
+        .await
+    {
+        Ok(id) => return Ok(LockClaim::Granted(id)),
+        Err(LockError::Conflict) => {}
+        Err(LockError::Other(e)) => return Err(e),
+    }
+    // Locked. Reuse our own (a leftover from a failed start), else best-effort
+    // reap a stale one and retry once. The server's delete rule (`expires <
+    // @now`) is what makes the reap safe: a still-valid lock won't delete, so
+    // the retry conflicts again and we report the real holder.
+    let Some(existing) = get_lock(&base, &session.token, note_id).await? else {
+        // Vanished between the conflict and the lookup — race; one clean retry.
+        return match create_lock(
+            &base, &session.token, note_id, workspace, &session.user_id, &holder_name,
+        )
+        .await
+        {
+            Ok(id) => Ok(LockClaim::Granted(id)),
+            Err(LockError::Conflict) => Ok(LockClaim::Held("a teammate".to_string())),
+            Err(LockError::Other(e)) => Err(e),
+        };
+    };
+    if existing.holder_id == session.user_id {
+        return Ok(LockClaim::Granted(existing.id)); // already ours → reuse
+    }
+    let _ = authed_delete(
+        &base,
+        &session.token,
+        &format!("/api/collections/note_locks/records/{}", existing.id),
+    )
+    .await;
+    match create_lock(&base, &session.token, note_id, workspace, &session.user_id, &holder_name)
+        .await
+    {
+        Ok(id) => Ok(LockClaim::Granted(id)),
+        Err(LockError::Conflict) => Ok(LockClaim::Held(existing.holder_name)),
+        Err(LockError::Other(e)) => Err(e),
+    }
+}
+
+/// Release a held lock on stop. Best-effort: a missed delete just lets the lock
+/// expire on its own.
+pub(crate) async fn release_recording_lock(app: &tauri::AppHandle, lock_id: String) {
+    let state = app.state::<AppState>();
+    if let Ok((base, session)) = ensure_session(&state).await {
+        let _ = authed_delete(
+            &base,
+            &session.token,
+            &format!("/api/collections/note_locks/records/{lock_id}"),
+        )
+        .await;
+    }
+}
+
+/// Keep a held lock alive by extending `expires` on a cadence. Runs until
+/// aborted (recording_stop / crash cleanup own the handle).
+pub(crate) fn spawn_lock_heartbeat(
+    app: tauri::AppHandle,
+    lock_id: String,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick =
+            tokio::time::interval(std::time::Duration::from_secs(LOCK_HEARTBEAT_SECS));
+        tick.tick().await; // the first tick fires immediately; consume it
+        loop {
+            tick.tick().await;
+            let state = app.state::<AppState>();
+            let Ok((base, session)) = ensure_session(&state).await else { continue };
+            let body = serde_json::json!({ "expires": lock_expiry_value() });
+            let _ = authed_patch(
+                &base,
+                &session.token,
+                &format!("/api/collections/note_locks/records/{lock_id}"),
+                body,
+            )
+            .await;
+        }
+    })
+}
+
+/// Who, if anyone, is currently recording `note_id`. Returns `None` for
+/// Personal notes, an unconfigured cloud, or no live lock. The `expires > @now`
+/// filter makes the server drop stale locks, so the client never trusts its own
+/// clock. Drives the Note view's "X is recording…" banner + disabled Record.
+#[tauri::command]
+pub async fn cloud_note_recording_status(
+    app: tauri::AppHandle,
+    note_id: String,
+) -> Result<Option<RecordingLockStatus>, String> {
+    let state = app.state::<AppState>();
+    let workspace = {
+        let conn = state.db.lock();
+        db::get_note(&conn, &note_id).map(|n| n.workspace_id).unwrap_or_default()
+    };
+    if workspace.is_empty() || read_base_url(&state).is_none() {
+        return Ok(None);
+    }
+    let (base, session) = ensure_session(&state).await?;
+    let filter = format!("note='{note_id}' && expires > @now");
+    let v = authed_get(
+        &base,
+        &session.token,
+        "/api/collections/note_locks/records",
+        &[("filter", filter.as_str()), ("perPage", "1"), ("fields", "holder,holder_name")],
+    )
+    .await?;
+    let item = v.get("items").and_then(|a| a.as_array()).and_then(|a| a.first());
+    Ok(item.map(|it| RecordingLockStatus {
+        holder_id: it.get("holder").and_then(|x| x.as_str()).unwrap_or_default().to_string(),
+        holder_name: it.get("holder_name").and_then(|x| x.as_str()).unwrap_or_default().to_string(),
+    }))
+}
+
 /// Note ids with an unpushed change queued in the sync outbox — drives a
 /// per-note "syncing…" indicator. Returns empty when cloud sync isn't running
 /// (the `sync_outbox` table won't exist), so the UI just shows nothing.

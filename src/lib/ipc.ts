@@ -213,6 +213,11 @@ export const ipc = {
   // shared note's audio down for local playback.
   uploadNoteAudio: (noteId: string) => invoke<void>("cloud_upload_note_audio", { noteId }),
   downloadNoteAudio: (noteId: string) => invoke<boolean>("cloud_download_note_audio", { noteId }),
+  // Who (if anyone) is currently recording a shared note. null = nobody, a
+  // Personal note, or the cloud isn't configured. Drives the recording-lock
+  // banner + disabled Record button so teammates don't record the same note.
+  noteRecordingStatus: (noteId: string) =>
+    invoke<RecordingLockStatus | null>("cloud_note_recording_status", { noteId }),
   noteTimeline: (noteId: string) =>
     invoke<TimelineEntry[]>("note_timeline", { noteId }),
   noteTimelineRename: (noteId: string, oldLabel: string, newLabel: string) =>
@@ -301,6 +306,8 @@ export type RecordingDiagnostic = {
   micPeak: number;
   sysPeak: number;
 };
+// The teammate currently holding a shared note's recording lock.
+export type RecordingLockStatus = { holderId: string; holderName: string };
 
 export function onTranscript(cb: (e: TranscriptEvent) => void): Promise<UnlistenFn> {
   return listen<TranscriptEvent>("transcript_appended", (e) => cb(e.payload));

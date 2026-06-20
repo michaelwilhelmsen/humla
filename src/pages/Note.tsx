@@ -85,6 +85,8 @@ export function Note() {
   // or mid-switch note can belong to a different one).
   const myWorkspaces = useCloudStore((s) => s.status.workspaces);
   const billingEnabled = useCloudStore((s) => s.status.billing_enabled);
+  // Our own user id — to distinguish our recording lock from a teammate's.
+  const myUserId = useCloudStore((s) => s.status.user?.id);
   const noteWs = draft?.workspace_id
     ? myWorkspaces.find((w) => w.id === draft.workspace_id)
     : undefined;
@@ -200,6 +202,35 @@ export function Note() {
   const isStarting = isThisNoteActive && recPhase.phase === "starting";
   const isStopping = isThisNoteActive && recPhase.phase === "stopping";
   const isDiarizing = isThisNoteActive && recPhase.phase === "diarizing";
+
+  // Recording lock for shared notes: poll who is recording this note so we can
+  // show "X is recording…" and disable Record. Skipped for Personal notes and
+  // while WE are the active recorder (we hold the lock then, so the backend
+  // would just report ourselves). Cleared on any error → never blocks recording.
+  const [lockedBy, setLockedBy] = useState<{ holderId: string; holderName: string } | null>(null);
+  const noteWsId = draft?.workspace_id;
+  useEffect(() => {
+    if (!id || !noteWsId || isThisNoteActive) {
+      setLockedBy(null);
+      return;
+    }
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const s = await ipc.noteRecordingStatus(id);
+        if (cancelled) return;
+        setLockedBy(s && s.holderId !== myUserId ? s : null);
+      } catch {
+        if (!cancelled) setLockedBy(null);
+      }
+    };
+    poll();
+    const t = window.setInterval(poll, 10000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(t);
+    };
+  }, [id, noteWsId, isThisNoteActive, myUserId]);
 
   // Subscribe once per note id. Only append a delta if it belongs to this
   // note — defensive in case multiple summary calls are interleaved.
@@ -415,6 +446,14 @@ export function Note() {
               {isViewer
                 ? "View-only — you have viewer access to this workspace, so this note can’t be edited."
                 : "Read-only — this workspace needs an active subscription. The owner can start it in Settings → Organization → Billing."}
+            </span>
+          </div>
+        )}
+        {!readOnly && lockedBy && (
+          <div className="mb-4 flex items-center gap-2 px-3 py-2 rounded-md border border-[var(--color-line)] bg-[var(--color-pill-hover)] text-xs text-[var(--color-text-muted)]">
+            <Circle size={9} fill="currentColor" strokeWidth={0} className="shrink-0 rec-dot text-[var(--color-accent)]" />
+            <span>
+              <strong className="font-medium text-[var(--color-text)]">{lockedBy.holderName}</strong> is recording this note. Only one person can record a shared note at a time — the transcript will sync here when they stop.
             </span>
           </div>
         )}
@@ -769,7 +808,7 @@ export function Note() {
         </div>
       </div>
 
-      {!readOnly && <RecordingBar noteId={draft.id} />}
+      {!readOnly && <RecordingBar noteId={draft.id} lockedByName={lockedBy?.holderName ?? null} />}
     </div>
   );
 }
