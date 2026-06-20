@@ -274,7 +274,7 @@ pub async fn diarize_file(
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let segments: Vec<Segment> = serde_json::from_str(stdout.trim())
+    let segments = parse_segment_payload(&stdout)
         .map_err(|e| anyhow!("parse segments JSON: {e} -- {stdout}"))?;
     // Echo to stderr for live debugging — visible in `pnpm tauri dev`'s
     // terminal. Cheap to leave on; segments are typically small.
@@ -288,6 +288,38 @@ pub async fn diarize_file(
             .join(" ")
     );
     Ok(segments)
+}
+
+/// Extract the segment array from the sidecar's stdout.
+///
+/// We can't assume stdout is exactly one JSON value. The sidecar writes the
+/// payload as a single compact JSON line through `FileHandle.standardOutput`
+/// (an unbuffered write straight to fd 1), but the vendored FluidAudio package
+/// can emit unrelated text to stdout around it. The subtle part: Swift's
+/// `print()` is stdio-buffered, so a stray `print()` elsewhere in FluidAudio
+/// flushes only at process exit — *after* our unbuffered payload write — and
+/// lands as a trailing line. `serde_json::from_str` over the whole buffer then
+/// fails with "trailing characters at line 2 column 1" and diarization dies,
+/// surfacing the raw parse error where the transcript should be. (Seen on the
+/// Sortformer engine, whose vendored diarizer leaks such a line.)
+///
+/// So scan for the line that actually parses as a segment array rather than
+/// trusting the whole buffer. The payload is always a single line
+/// (JSONSerialization emits compact, newline-free JSON), so the real array
+/// never spans lines and stray log lines never parse as `Vec<Segment>`.
+/// Mirrors the stderr noise-filtering in `diarize_file`. Falls back to the
+/// whole trimmed buffer so a genuinely malformed payload still surfaces
+/// serde's diagnostic to the caller.
+fn parse_segment_payload(stdout: &str) -> serde_json::Result<Vec<Segment>> {
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            if let Ok(segments) = serde_json::from_str::<Vec<Segment>>(line) {
+                return Ok(segments);
+            }
+        }
+    }
+    serde_json::from_str::<Vec<Segment>>(stdout.trim())
 }
 
 /// Mirror of audio-capture sidecar resolution: bundle path in production,
@@ -629,5 +661,53 @@ mod tests {
         let once = clean_segments(input);
         let twice = clean_segments(once.clone());
         assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn payload_parses_clean_single_line() {
+        let stdout = r#"[{"start_ms":0,"end_ms":1000,"speaker_id":"S0"}]"#;
+        assert_eq!(
+            parse_segment_payload(stdout).unwrap(),
+            vec![seg(0, 1000, "S0")]
+        );
+    }
+
+    #[test]
+    fn payload_ignores_trailing_noise_line() {
+        // The regression: FluidAudio's stdio-buffered `print()` flushes at
+        // process exit, *after* the sidecar's unbuffered payload write, so a
+        // stray line trails the JSON array. The old `from_str(stdout.trim())`
+        // died here with "trailing characters at line 2 column 1".
+        let stdout = "[{\"start_ms\":0,\"end_ms\":1000,\"speaker_id\":\"S0\"},\
+            {\"start_ms\":1000,\"end_ms\":2000,\"speaker_id\":\"S1\"}]\n\
+            [DEBUG] Phase 2 complete: diarizerChunks=42, totalProbs=1680, totalFrames=420\n";
+        assert_eq!(
+            parse_segment_payload(stdout).unwrap(),
+            vec![seg(0, 1000, "S0"), seg(1000, 2000, "S1")]
+        );
+    }
+
+    #[test]
+    fn payload_ignores_leading_noise_line() {
+        // A `[`-prefixed log line ahead of the array must not false-match —
+        // it doesn't parse as a segment array, so the scan moves on.
+        let stdout = "[DEBUG] Phase 2 complete: diarizerChunks=42\n\
+            [{\"start_ms\":0,\"end_ms\":1000,\"speaker_id\":\"S0\"}]\n";
+        assert_eq!(
+            parse_segment_payload(stdout).unwrap(),
+            vec![seg(0, 1000, "S0")]
+        );
+    }
+
+    #[test]
+    fn payload_parses_empty_array() {
+        // noSpeechDetected emits a bare `[]` — must round-trip to no segments,
+        // not an error.
+        assert!(parse_segment_payload("[]\n").unwrap().is_empty());
+    }
+
+    #[test]
+    fn payload_errors_when_no_array_present() {
+        assert!(parse_segment_payload("humla-error: something went wrong\n").is_err());
     }
 }
