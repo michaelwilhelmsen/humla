@@ -898,6 +898,16 @@ pub(crate) async fn download_note_audio(app: &tauri::AppHandle, note_id: &str) -
     if filename.is_empty() {
         return Ok(false); // no remote audio
     }
+    // `pb_id` and `filename` are server-controlled and go into the request path.
+    // The local write target is the fixed playback.wav, so there's no local
+    // traversal — but treat them as opaque segments and reject anything that
+    // could traverse or rewrite the URL, in case the server is hostile.
+    let safe_seg = |s: &str| {
+        !s.is_empty() && s.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'-'))
+    };
+    if !safe_seg(&pb_id) || !safe_seg(&filename) || filename.contains("..") {
+        return Err("audio download: unexpected server file reference".into());
+    }
     // Protected file → mint a short-lived file token, then fetch.
     let tok = authed_post(&base, &session.token, "/api/files/token", serde_json::json!({})).await?;
     let file_token = tok.get("token").and_then(|v| v.as_str()).unwrap_or_default();
