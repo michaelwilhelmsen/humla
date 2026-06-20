@@ -24,8 +24,10 @@ use std::sync::{LazyLock, Mutex};
 use tauri::State;
 
 const CRED_ACCOUNT: &str = "cloud_credentials";
-const SETTING_BASE_URL: &str = "cloud_base_url";
-const SETTING_WORKSPACE: &str = "cloud_workspace_id";
+// `pub(crate)` so the cloud-sync worker glue (`commands::cloud_worker`) can read
+// the same persisted config keys + credentials instead of duplicating them.
+pub(crate) const SETTING_BASE_URL: &str = "cloud_base_url";
+pub(crate) const SETTING_WORKSPACE: &str = "cloud_workspace_id";
 
 #[derive(Clone, Default)]
 struct Session {
@@ -101,7 +103,7 @@ fn cred_entry() -> Result<keyring::Entry, String> {
     keyring::Entry::new(crate::stt::KEYCHAIN_SERVICE, CRED_ACCOUNT).map_err(|e| e.to_string())
 }
 
-fn read_creds() -> Option<(String, String)> {
+pub(crate) fn read_creds() -> Option<(String, String)> {
     let raw = cred_entry().ok()?.get_password().ok()?;
     let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
     Some((
@@ -302,6 +304,7 @@ pub fn cloud_configure(state: State<'_, AppState>, base_url: String) -> Result<(
         db::set_setting(&conn, SETTING_BASE_URL, &trimmed).map_err(err)?;
     }
     *SESSION.lock().unwrap() = None; // a server change invalidates any session
+    state.sync.config_changed();
     Ok(())
 }
 
@@ -316,13 +319,15 @@ pub async fn cloud_login(
     let session = login_request(&base, email.trim(), &password).await?;
     write_creds(email.trim(), &password)?;
     *SESSION.lock().unwrap() = Some(session);
+    state.sync.config_changed(); // creds now present → start the sync worker
     cloud_status(state).await
 }
 
 #[tauri::command]
-pub fn cloud_logout(_state: State<'_, AppState>) -> Result<(), String> {
+pub fn cloud_logout(state: State<'_, AppState>) -> Result<(), String> {
     clear_creds();
     *SESSION.lock().unwrap() = None;
+    state.sync.config_changed(); // creds gone → stop the sync worker
     Ok(())
 }
 
@@ -348,13 +353,21 @@ pub async fn cloud_create_workspace(
         let conn = state.db.lock();
         db::set_setting(&conn, SETTING_WORKSPACE, &id).map_err(err)?;
     }
+    state.sync.config_changed(); // new workspace selected → (re)start the worker
     Ok(CloudWorkspace { id, name, role: "owner".into() })
 }
 
 #[tauri::command]
 pub fn cloud_select_workspace(state: State<'_, AppState>, id: String) -> Result<(), String> {
-    let conn = state.db.lock();
-    db::set_setting(&conn, SETTING_WORKSPACE, &id).map_err(err)
+    {
+        let conn = state.db.lock();
+        db::set_setting(&conn, SETTING_WORKSPACE, &id).map_err(err)?;
+    }
+    // Drop the db guard before notifying — the observer contract forbids
+    // re-locking the db while a guard is held. Switching to "" (Personal) makes
+    // `read_config` return None, which stops the worker.
+    state.sync.config_changed();
+    Ok(())
 }
 
 #[tauri::command]

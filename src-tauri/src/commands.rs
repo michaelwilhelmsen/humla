@@ -20,6 +20,11 @@ use tokio::process::Command;
 mod api_keys;
 mod assets;
 mod cloud;
+// Live cloud-sync worker glue. Behind the `cloud` feature; `pub` so `run()` can
+// reach `cloud_worker::install`. Not a #[tauri::command] group, so no glob
+// re-export below.
+#[cfg(feature = "cloud")]
+pub mod cloud_worker;
 mod folders;
 mod local_llm;
 mod models;

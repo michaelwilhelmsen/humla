@@ -393,6 +393,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "cloud-sync"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "parking_lot",
+ "reqwest 0.12.28",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "cmake"
 version = "0.1.58"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1523,6 +1536,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "cloud-sync",
  "dirs 5.0.1",
  "futures-util",
  "keyring",

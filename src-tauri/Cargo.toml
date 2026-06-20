@@ -11,6 +11,14 @@ license = "MIT"
 name = "humla_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+# cloud-sync joins this package's workspace as a sibling member so the live sync
+# engine builds from source in-tree (it was extracted from the private
+# humla-cloud repo when the client was consolidated into the public app). Its
+# rusqlite is pinned to 0.32 to match the core — the Arc<Mutex<Connection>>
+# handed across the sync seam must unify to the same concrete type.
+[workspace]
+members = ["crates/cloud-sync"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
@@ -41,11 +49,22 @@ tauri-plugin-process = "2"
 # / linux-keyutils transitive deps). Migration from the legacy SQLite
 # row is one-shot inside read_openai_api_key.
 keyring = { version = "3", default-features = false, features = ["apple-native"] }
+# Live cloud-sync engine (PocketBase-backed, framework-agnostic). In-tree at
+# crates/cloud-sync. Optional + behind the `cloud` feature so a pure local-only
+# build can drop it (and all sync networking) entirely. Its deps are a strict
+# subset of the core's, so enabling it adds no new transitive crates.
+cloud-sync = { path = "crates/cloud-sync", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
 
 [features]
+default = ["cloud"]
+# Live cloud sync. Pulls in the `cloud-sync` engine and activates the worker
+# glue in `commands::cloud_worker` (started/restarted on login + workspace
+# select). Disable with `--no-default-features` for a local-only build: the
+# teams UI stays present but inert — no sync worker, no sync networking.
+cloud = ["dep:cloud-sync"]
 custom-protocol = ["tauri/custom-protocol"]
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]

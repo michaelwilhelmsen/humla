@@ -40,6 +40,17 @@ pub trait SyncObserver: Send + Sync {
 
     /// A custom summary prompt was deleted. `id` is the now-removed prompt id.
     fn summary_prompt_deleted(&self, _id: &str) {}
+
+    /// Cloud configuration changed — the server URL, the stored credentials, or
+    /// the selected workspace. A sync implementation should re-evaluate whether
+    /// it can run (all of base URL + credentials + workspace present) and
+    /// start, stop, or restart its worker to match.
+    ///
+    /// Called from the cloud commands after they mutate that state (configure,
+    /// login, logout, create/select workspace), on the command thread with no
+    /// `AppState::db` guard held — same fast, non-blocking contract as the
+    /// other callbacks. No-op in the open-source build.
+    fn config_changed(&self) {}
 }
 
 /// Open-source default: every callback is a no-op.

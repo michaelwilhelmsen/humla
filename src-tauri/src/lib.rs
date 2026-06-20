@@ -39,8 +39,14 @@ pub struct AppState {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Open-source entry point: sync is a no-op. A commercial build calls
-    // `run_with_sync` instead and injects a real observer.
+    // With the `cloud` feature (default), install the live cloud-sync observer:
+    // it starts the worker once configured + signed in and restarts it on
+    // login / workspace switch. Without the feature, sync is a no-op and the
+    // app never touches the network for sync.
+    #[cfg(feature = "cloud")]
+    run_with_sync(commands::cloud_worker::install);
+
+    #[cfg(not(feature = "cloud"))]
     run_with_sync(|_ctx| Arc::new(sync::NoopSync));
 }
 

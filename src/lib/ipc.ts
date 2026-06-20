@@ -301,8 +301,8 @@ export function onDiarizeDownloadProgress(cb: (e: DiarizeDownloadProgress) => vo
   return listen<DiarizeDownloadProgress>("diarize_download_progress", (e) => cb(e.payload));
 }
 // Emitted by the cloud sync worker after it applies pulled remote changes to
-// the local store, so the UI refetches. (No-op until the sync worker is wired
-// into the running app — see the humla-cloud repo.)
+// the local store, so the UI refetches. Fires only when sync is active (cloud
+// feature + signed in + a workspace selected); inert otherwise.
 export function onNotesChanged(cb: () => void): Promise<UnlistenFn> {
   return listen("notes_changed", () => cb());
 }
