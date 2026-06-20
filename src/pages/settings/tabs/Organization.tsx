@@ -317,7 +317,12 @@ export function OrganizationTab() {
                   options={[
                     { value: "viewer", label: "Viewer" },
                     { value: "member", label: "Member" },
-                    { value: "admin", label: "Admin" },
+                    // Only the owner can grant admin (the server reverts an
+                    // admin's change to the admins set). Keep the option visible
+                    // when the member already is an admin so it displays.
+                    ...(ws?.role === "owner" || m.role === "admin"
+                      ? [{ value: "admin", label: "Admin" }]
+                      : []),
                   ]}
                 />
               ) : (

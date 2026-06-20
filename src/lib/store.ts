@@ -180,11 +180,17 @@ export function bindBackendListeners() {
   // that newly appear and that you didn't create (role !== owner) — i.e. an
   // admin added you — and flash it, since otherwise it's silent.
   let knownWorkspaceIds: Set<string> | null = null;
+  let knownUserId: string | null = null;
   useCloudStore.subscribe((s) => {
     if (!s.ready) return;
+    const uid = s.status.user?.id ?? null;
     const ids = new Set(s.status.workspaces.map((w) => w.id));
-    if (knownWorkspaceIds === null) {
-      knownWorkspaceIds = ids; // first ready snapshot is the baseline — don't flash
+    // Re-baseline (no flash) on the first snapshot AND whenever the signed-in
+    // user changes (login / logout / account switch) — otherwise the next
+    // session's workspaces would all spuriously flash "Added to…".
+    if (knownWorkspaceIds === null || uid !== knownUserId) {
+      knownUserId = uid;
+      knownWorkspaceIds = ids;
       return;
     }
     for (const w of s.status.workspaces) {

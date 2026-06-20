@@ -80,9 +80,17 @@ export function Note() {
   const cloudLoggedIn = useCloudStore((s) => s.status.logged_in);
   // Per-note sync state: true while this note has an unpushed change queued.
   const notePending = useCloudStore((s) => (draft ? s.pendingNoteIds.has(draft.id) : false));
-  // Read-only when you're a viewer in the note's (shared) workspace.
-  const workspaceRole = useCloudStore((s) => s.status.current_workspace?.role);
-  const readOnly = !!draft?.workspace_id && workspaceRole === "viewer";
+  // Read-only when you're a viewer in THIS NOTE's workspace (derive the role
+  // from the note's own workspace_id, not the active workspace — a deep-linked
+  // or mid-switch note can belong to a different one).
+  const myWorkspaces = useCloudStore((s) => s.status.workspaces);
+  const readOnly =
+    !!draft?.workspace_id &&
+    myWorkspaces.find((w) => w.id === draft.workspace_id)?.role === "viewer";
+  // Mirror into a ref so the memoised patch callbacks can gate without changing
+  // identity (which would bust the transcript-view memos).
+  const readOnlyRef = useRef(readOnly);
+  readOnlyRef.current = readOnly;
   const [uiLang, setUiLang] = useState<string>("no");
   const [globalProvider, setGlobalProvider] = useState<string>("openai");
   // Live reasoning + content streamed from the local LLM. Cleared each time a
@@ -306,6 +314,7 @@ export function Note() {
     (field: "title" | "body" | "transcript" | "summary_preset" | "language", value: string) => {
       const cur = draftRef.current;
       if (!cur) return;
+      if (readOnlyRef.current) return; // viewer: no local edits (server rejects too)
       const next = { ...cur, [field]: value };
       setDraft(next);
       pendingChanges.current = { ...pendingChanges.current, [field]: value };
@@ -329,6 +338,7 @@ export function Note() {
     (value: string) => {
       const cur = draftRef.current;
       if (!cur) return;
+      if (readOnlyRef.current) return; // viewer: read-only
       const next = { ...cur, summary_provider: value };
       setDraft(next);
       pendingChanges.current = { ...pendingChanges.current, summary_provider: value };
@@ -389,7 +399,7 @@ export function Note() {
           window-edge scrollbar without making the content full-width. */}
       <div className="flex-1 overflow-y-auto">
         <div className="max-w-3xl mx-auto w-full px-12 pb-32">
-        <NoteHeader noteId={draft.id} folderId={draft.folder_id} summary={draft.summary} body={draft.body} />
+        <NoteHeader noteId={draft.id} folderId={draft.folder_id} summary={draft.summary} body={draft.body} readOnly={readOnly} />
         {readOnly && (
           <div className="mb-4 flex items-center gap-2 px-3 py-2 rounded-md border border-[var(--color-line)] bg-[var(--color-pill-hover)] text-xs text-[var(--color-text-muted)]">
             <Eye size={13} strokeWidth={1.5} className="shrink-0" />
@@ -430,7 +440,7 @@ export function Note() {
                 <WorkspacePicker
                   value={draft.workspace_id}
                   onChange={async (workspaceId) => {
-                    if (!draft || workspaceId === draft.workspace_id) return;
+                    if (!draft || readOnly || workspaceId === draft.workspace_id) return;
                     const next = { ...draft, workspace_id: workspaceId };
                     setDraft(next);
                     await ipc.setNoteWorkspace(draft.id, workspaceId);
@@ -468,7 +478,7 @@ export function Note() {
             <FolderPicker
               value={draft.folder_id}
               onChange={async (folderId) => {
-                if (!draft) return;
+                if (!draft || readOnly) return;
                 const next = { ...draft, folder_id: folderId };
                 setDraft(next);
                 await ipc.moveNote(draft.id, folderId);
@@ -492,7 +502,7 @@ export function Note() {
             <SpeakersPicker
               value={draft.expected_speakers}
               onChange={async (n) => {
-                if (!draft) return;
+                if (!draft || readOnly) return;
                 const next = { ...draft, expected_speakers: n };
                 setDraft(next);
                 await ipc.updateNote(draft.id, { expected_speakers: n });
@@ -722,7 +732,7 @@ export function Note() {
                     playbackUrl={playbackUrl}
                     transcript={draft.transcript}
                     onChange={onTranscriptChange}
-                    disabled={isRecording || isPaused || isStarting || isStopping || isDiarizing}
+                    disabled={readOnly || isRecording || isPaused || isStarting || isStopping || isDiarizing}
                     expanded={transcriptExpanded}
                     bottomAligned={transcriptLive}
                   />
@@ -730,7 +740,7 @@ export function Note() {
                   <TranscriptEditor
                     value={draft.transcript}
                     onChange={onTranscriptChange}
-                    disabled={isRecording || isPaused || isStarting || isStopping || isDiarizing}
+                    disabled={readOnly || isRecording || isPaused || isStarting || isStopping || isDiarizing}
                     expanded={transcriptExpanded}
                     bottomAligned={transcriptLive}
                   />
@@ -787,11 +797,13 @@ function NoteHeader({
   folderId,
   summary,
   body,
+  readOnly,
 }: {
   noteId: string;
   folderId: string | null;
   summary: string;
   body: string;
+  readOnly: boolean;
 }) {
   const navigate = useNavigate();
   const folders = useNotesStore((s) => s.folders);
@@ -843,12 +855,16 @@ function NoteHeader({
         <IconAction onClick={onCopy} disabled={!canCopy} title={copied ? "Copied" : "Copy summary"}>
           {copied ? <Check size={16} strokeWidth={1.5} /> : <Copy size={16} strokeWidth={1.5} />}
         </IconAction>
-        <IconAction onClick={onResummarize} title="Re-summarize">
-          <RefreshCw size={16} strokeWidth={1.5} />
-        </IconAction>
-        <IconAction onClick={openMenu} title="More">
-          <MoreHorizontal size={16} strokeWidth={1.5} />
-        </IconAction>
+        {!readOnly && (
+          <IconAction onClick={onResummarize} title="Re-summarize">
+            <RefreshCw size={16} strokeWidth={1.5} />
+          </IconAction>
+        )}
+        {!readOnly && (
+          <IconAction onClick={openMenu} title="More">
+            <MoreHorizontal size={16} strokeWidth={1.5} />
+          </IconAction>
+        )}
       </div>
       {menuPos && (
         <ContextMenu x={menuPos.x} y={menuPos.y} onClose={() => setMenuPos(null)}>
