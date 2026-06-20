@@ -71,6 +71,8 @@ export function Note() {
   // When signed in, the note's workspace becomes editable (move it between
   // Personal and any workspace you belong to). Signed out → static row only.
   const cloudLoggedIn = useCloudStore((s) => s.status.logged_in);
+  // Per-note sync state: true while this note has an unpushed change queued.
+  const notePending = useCloudStore((s) => (draft ? s.pendingNoteIds.has(draft.id) : false));
   const [uiLang, setUiLang] = useState<string>("no");
   const [globalProvider, setGlobalProvider] = useState<string>("openai");
   // Live reasoning + content streamed from the local LLM. Cleared each time a
@@ -401,18 +403,25 @@ export function Note() {
           )}
           {cloudLoggedIn ? (
             <PropertyRow icon={<Users size={14} />} label="workspace">
-              <WorkspacePicker
-                value={draft.workspace_id}
-                onChange={async (workspaceId) => {
-                  if (!draft || workspaceId === draft.workspace_id) return;
-                  const next = { ...draft, workspace_id: workspaceId };
-                  setDraft(next);
-                  await ipc.setNoteWorkspace(draft.id, workspaceId);
-                  // Moving out of the active workspace removes it from that
-                  // list — refetch so the sidebar reflects the move.
-                  await refreshNotes();
-                }}
-              />
+              <span className="inline-flex items-center gap-2">
+                <WorkspacePicker
+                  value={draft.workspace_id}
+                  onChange={async (workspaceId) => {
+                    if (!draft || workspaceId === draft.workspace_id) return;
+                    const next = { ...draft, workspace_id: workspaceId };
+                    setDraft(next);
+                    await ipc.setNoteWorkspace(draft.id, workspaceId);
+                    // Moving out of the active workspace removes it from that
+                    // list — refetch so the sidebar reflects the move.
+                    await refreshNotes();
+                  }}
+                />
+                {draft.workspace_id && (
+                  <span className="text-xs text-[var(--color-text-muted)] whitespace-nowrap">
+                    {notePending ? "· syncing…" : "· synced"}
+                  </span>
+                )}
+              </span>
             </PropertyRow>
           ) : (
             draft.workspace_id && (

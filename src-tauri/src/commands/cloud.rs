@@ -727,3 +727,19 @@ pub async fn cloud_transfer_workspace(
     pb_json(resp).await?; // surfaces the hook's message (e.g. owner-only, not-a-member)
     Ok(())
 }
+
+/// Note ids with an unpushed change queued in the sync outbox — drives a
+/// per-note "syncing…" indicator. Returns empty when cloud sync isn't running
+/// (the `sync_outbox` table won't exist), so the UI just shows nothing.
+#[tauri::command]
+pub fn cloud_pending_note_ids(state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    let conn = state.db.lock();
+    let ids = conn
+        .prepare("SELECT DISTINCT entity_id FROM sync_outbox WHERE entity = 'note'")
+        .and_then(|mut stmt| {
+            stmt.query_map([], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .unwrap_or_default();
+    Ok(ids)
+}

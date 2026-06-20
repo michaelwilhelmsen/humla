@@ -223,6 +223,7 @@ where
             commands::cloud_leave_workspace,
             commands::cloud_transfer_workspace,
             commands::cloud_workspace_members,
+            commands::cloud_pending_note_ids,
             commands::cloud_add_member,
             commands::cloud_remove_member,
             commands::cloud_set_member_role,

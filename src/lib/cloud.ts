@@ -46,6 +46,7 @@ export const cloudApi = {
     invoke<void>("cloud_transfer_workspace", { workspaceId, newOwnerId }),
   workspaceMembers: (workspaceId: string) =>
     invoke<CloudMember[]>("cloud_workspace_members", { workspaceId }),
+  pendingNoteIds: () => invoke<string[]>("cloud_pending_note_ids"),
   addMember: (workspaceId: string, email: string) =>
     invoke<void>("cloud_add_member", { workspaceId, email }),
   removeMember: (workspaceId: string, userId: string) =>
@@ -71,9 +72,12 @@ type CloudState = {
   members: Record<string, CloudMember>;
   /** Live sync state from the worker; null when not syncing (Personal/signed out). */
   syncStatus: SyncStatus | null;
+  /** Note ids with an unpushed change queued — for a per-note "syncing…" hint. */
+  pendingNoteIds: Set<string>;
   refresh: () => Promise<void>;
   setStatus: (s: CloudStatus) => void;
   setSyncStatus: (s: SyncStatus | null) => void;
+  refreshPending: () => Promise<void>;
 };
 
 export const useCloudStore = create<CloudState>((set) => ({
@@ -81,8 +85,16 @@ export const useCloudStore = create<CloudState>((set) => ({
   ready: false,
   members: {},
   syncStatus: null,
+  pendingNoteIds: new Set(),
   setStatus: (status) => set({ status, ready: true }),
   setSyncStatus: (syncStatus) => set({ syncStatus }),
+  refreshPending: async () => {
+    try {
+      set({ pendingNoteIds: new Set(await cloudApi.pendingNoteIds()) });
+    } catch {
+      set({ pendingNoteIds: new Set() });
+    }
+  },
   refresh: async () => {
     try {
       const status = await cloudApi.status();

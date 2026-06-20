@@ -147,8 +147,12 @@ export function bindBackendListeners() {
   onRecordingDiagnostic((d) => useRecordingStore.getState().setDiag(d));
   // Cloud sync applied remote changes → refetch notes + folders.
   onNotesChanged(() => useNotesStore.getState().refresh());
-  // Live sync state → sidebar indicator.
-  onSyncStatus((s) => useCloudStore.getState().setSyncStatus(s));
+  // Live sync state → sidebar indicator. Also refresh the per-note pending set,
+  // since a syncing→idle transition brackets the outbox drain.
+  onSyncStatus((s) => {
+    useCloudStore.getState().setSyncStatus(s);
+    void useCloudStore.getState().refreshPending();
+  });
   // A sync conflict preserved local edits as a copy → tell the user where it went.
   onSyncConflict((title) =>
     useRecordingStore.getState().pushError({
@@ -156,4 +160,22 @@ export function bindBackendListeners() {
       message: `"${title}" changed on the server — your unsynced edits were saved as a "(conflict copy)" note.`,
     }),
   );
+  // "Added to a workspace" notification. Watch the cloud status for workspaces
+  // that newly appear and that you didn't create (role !== owner) — i.e. an
+  // admin added you — and flash it, since otherwise it's silent.
+  let knownWorkspaceIds: Set<string> | null = null;
+  useCloudStore.subscribe((s) => {
+    if (!s.ready) return;
+    const ids = new Set(s.status.workspaces.map((w) => w.id));
+    if (knownWorkspaceIds === null) {
+      knownWorkspaceIds = ids; // first ready snapshot is the baseline — don't flash
+      return;
+    }
+    for (const w of s.status.workspaces) {
+      if (!knownWorkspaceIds.has(w.id) && w.role !== "owner") {
+        useRecordingStore.getState().pushFlash(`Added to "${w.name}"`);
+      }
+    }
+    knownWorkspaceIds = ids;
+  });
 }
