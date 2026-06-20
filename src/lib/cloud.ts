@@ -9,7 +9,7 @@ import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
 import type { SyncStatus } from "./ipc";
 
-export type CloudRole = "owner" | "admin" | "member";
+export type CloudRole = "owner" | "admin" | "member" | "viewer";
 
 export type CloudUser = { id: string; email: string; name: string };
 export type CloudWorkspace = { id: string; name: string; role: CloudRole };

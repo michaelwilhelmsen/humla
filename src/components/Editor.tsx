@@ -9,9 +9,15 @@ type Props = {
   initialHTML: string;
   onChange: (html: string) => void;
   placeholder?: string;
+  editable?: boolean;
 };
 
-export function NoteEditor({ initialHTML, onChange, placeholder = "Write your notes here…" }: Props) {
+export function NoteEditor({
+  initialHTML,
+  onChange,
+  placeholder = "Write your notes here…",
+  editable = true,
+}: Props) {
   const onChangeRef = useRef(onChange);
   onChangeRef.current = onChange;
 
@@ -30,6 +36,7 @@ export function NoteEditor({ initialHTML, onChange, placeholder = "Write your no
       }),
     ],
     content: initialHTML || "",
+    editable,
     editorProps: {
       attributes: {
         class: "prose-note focus:outline-none",
@@ -39,6 +46,12 @@ export function NoteEditor({ initialHTML, onChange, placeholder = "Write your no
       onChangeRef.current(editor.getHTML());
     },
   });
+
+  // Toggle editability live (e.g. when the active workspace role changes to/from
+  // read-only viewer).
+  useEffect(() => {
+    if (editor) editor.setEditable(editable);
+  }, [editor, editable]);
 
   // Re-sync content if the note id changes (parent passes a new initialHTML).
   useEffect(() => {

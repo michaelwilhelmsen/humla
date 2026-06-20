@@ -5,6 +5,7 @@ import remarkGfm from "remark-gfm";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
   Calendar,
+  Eye,
   Check,
   ChevronDown,
   ChevronLeft,
@@ -73,6 +74,9 @@ export function Note() {
   const cloudLoggedIn = useCloudStore((s) => s.status.logged_in);
   // Per-note sync state: true while this note has an unpushed change queued.
   const notePending = useCloudStore((s) => (draft ? s.pendingNoteIds.has(draft.id) : false));
+  // Read-only when you're a viewer in the note's (shared) workspace.
+  const workspaceRole = useCloudStore((s) => s.status.current_workspace?.role);
+  const readOnly = !!draft?.workspace_id && workspaceRole === "viewer";
   const [uiLang, setUiLang] = useState<string>("no");
   const [globalProvider, setGlobalProvider] = useState<string>("openai");
   // Live reasoning + content streamed from the local LLM. Cleared each time a
@@ -379,10 +383,17 @@ export function Note() {
       <div className="flex-1 overflow-y-auto">
         <div className="max-w-3xl mx-auto w-full px-12 pb-32">
         <NoteHeader noteId={draft.id} folderId={draft.folder_id} summary={draft.summary} body={draft.body} />
+        {readOnly && (
+          <div className="mb-4 flex items-center gap-2 px-3 py-2 rounded-md border border-[var(--color-line)] bg-[var(--color-pill-hover)] text-xs text-[var(--color-text-muted)]">
+            <Eye size={13} strokeWidth={1.5} className="shrink-0" />
+            <span>View-only — you have viewer access to this workspace, so this note can’t be edited.</span>
+          </div>
+        )}
         <textarea
           ref={titleRef}
           value={draft.title}
           onChange={(e) => patch("title", e.target.value)}
+          readOnly={readOnly}
           onKeyDown={(e) => {
             // Block Enter so the title behaves like a single-line conceptual
             // field — text still wraps when wider than the column, but the
@@ -495,6 +506,7 @@ export function Note() {
           key={draft.id}
           initialHTML={initialBody}
           onChange={(html) => patch("body", html)}
+          editable={!readOnly}
         />
 
         {showSummarySection && (
@@ -668,7 +680,7 @@ export function Note() {
         </div>
       </div>
 
-      <RecordingBar noteId={draft.id} />
+      {!readOnly && <RecordingBar noteId={draft.id} />}
     </div>
   );
 }

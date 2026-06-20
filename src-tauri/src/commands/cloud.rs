@@ -288,6 +288,9 @@ fn derive_role(ws: &serde_json::Value, user_id: &str) -> String {
     if ids(ws, "admins").iter().any(|a| a == user_id) {
         return "admin".into();
     }
+    if ids(ws, "viewers").iter().any(|a| a == user_id) {
+        return "viewer".into();
+    }
     "member".into()
 }
 
@@ -488,6 +491,7 @@ pub async fn cloud_workspace_members(
 
     let owner_id = val.get("owner").and_then(|v| v.as_str()).unwrap_or_default().to_string();
     let admin_ids = ids(&val, "admins");
+    let viewer_ids = ids(&val, "viewers");
     let members = val
         .get("expand")
         .and_then(|e| e.get("members"))
@@ -503,6 +507,8 @@ pub async fn cloud_workspace_members(
                 "owner"
             } else if admin_ids.contains(&id) {
                 "admin"
+            } else if viewer_ids.contains(&id) {
+                "viewer"
             } else {
                 "member"
             };
@@ -516,15 +522,15 @@ pub async fn cloud_workspace_members(
         .collect())
 }
 
-/// Fetch the workspace's current `members` + `admins` id arrays.
+/// Fetch the workspace's current `members` + `admins` + `viewers` id arrays.
 async fn fetch_relations(
     base: &str,
     token: &str,
     workspace_id: &str,
-) -> Result<(Vec<String>, Vec<String>), String> {
+) -> Result<(Vec<String>, Vec<String>, Vec<String>), String> {
     let path = format!("/api/collections/workspaces/records/{workspace_id}");
     let val = authed_get(base, token, &path, &[]).await?;
-    Ok((ids(&val, "members"), ids(&val, "admins")))
+    Ok((ids(&val, "members"), ids(&val, "admins"), ids(&val, "viewers")))
 }
 
 #[tauri::command]
@@ -562,7 +568,7 @@ pub async fn cloud_add_member(
         .map(String::from)
         .ok_or("find-user returned no id")?;
 
-    let (mut members, _admins) = fetch_relations(&base, &session.token, &workspace_id).await?;
+    let (mut members, _admins, _viewers) = fetch_relations(&base, &session.token, &workspace_id).await?;
     if !members.contains(&user_id) {
         members.push(user_id);
         let path = format!("/api/collections/workspaces/records/{workspace_id}");
@@ -605,21 +611,25 @@ pub async fn cloud_remove_member(
     user_id: String,
 ) -> Result<(), String> {
     let (base, session) = ensure_session(&state).await?;
-    let (mut members, mut admins) = fetch_relations(&base, &session.token, &workspace_id).await?;
+    let (mut members, mut admins, mut viewers) =
+        fetch_relations(&base, &session.token, &workspace_id).await?;
     members.retain(|m| m != &user_id);
     admins.retain(|a| a != &user_id);
+    viewers.retain(|v| v != &user_id);
     let path = format!("/api/collections/workspaces/records/{workspace_id}");
     authed_patch(
         &base,
         &session.token,
         &path,
-        serde_json::json!({ "members": members, "admins": admins }),
+        serde_json::json!({ "members": members, "admins": admins, "viewers": viewers }),
     )
     .await?;
     Ok(())
 }
 
-/// Set a member's role to `admin` or `member` (owner is immutable here).
+/// Set a member's role to `admin`, `member`, or `viewer` (read-only). Owner is
+/// immutable here (transfer ownership separately). Admins and viewers are kept
+/// in `members` (which drives read access); the roles are mutually exclusive.
 #[tauri::command]
 pub async fn cloud_set_member_role(
     state: State<'_, AppState>,
@@ -628,34 +638,40 @@ pub async fn cloud_set_member_role(
     role: String,
 ) -> Result<(), String> {
     let (base, session) = ensure_session(&state).await?;
-    let (members, mut admins) = fetch_relations(&base, &session.token, &workspace_id).await?;
+    let (members, mut admins, mut viewers) =
+        fetch_relations(&base, &session.token, &workspace_id).await?;
     match role.as_str() {
         "admin" => {
             if !admins.contains(&user_id) {
-                admins.push(user_id);
+                admins.push(user_id.clone());
             }
+            viewers.retain(|v| v != &user_id);
         }
-        "member" => admins.retain(|a| a != &user_id),
+        "viewer" => {
+            if !viewers.contains(&user_id) {
+                viewers.push(user_id.clone());
+            }
+            admins.retain(|a| a != &user_id);
+        }
+        "member" => {
+            admins.retain(|a| a != &user_id);
+            viewers.retain(|v| v != &user_id);
+        }
         other => return Err(format!("unknown role: {other}")),
     }
-    // Ensure an admin is also a member.
-    let members = if admins.iter().all(|a| members.contains(a)) {
-        members
-    } else {
-        let mut m = members;
-        for a in &admins {
-            if !m.contains(a) {
-                m.push(a.clone());
-            }
+    // Admins + viewers must also be members (members drives read access).
+    let mut members = members;
+    for id in admins.iter().chain(viewers.iter()) {
+        if !members.contains(id) {
+            members.push(id.clone());
         }
-        m
-    };
+    }
     let path = format!("/api/collections/workspaces/records/{workspace_id}");
     authed_patch(
         &base,
         &session.token,
         &path,
-        serde_json::json!({ "members": members, "admins": admins }),
+        serde_json::json!({ "members": members, "admins": admins, "viewers": viewers }),
     )
     .await?;
     Ok(())

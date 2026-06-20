@@ -315,6 +315,7 @@ export function OrganizationTab() {
                   value={m.role}
                   onChange={(v) => changeRole(m.id, v as CloudRole)}
                   options={[
+                    { value: "viewer", label: "Viewer" },
                     { value: "member", label: "Member" },
                     { value: "admin", label: "Admin" },
                   ]}
