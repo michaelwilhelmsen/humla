@@ -479,27 +479,31 @@ pub async fn cloud_add_member(
     let (base, session) = ensure_session(&state).await?;
     let email = email.trim();
 
-    // Look up the user by email (requires the relaxed users list rule).
-    let filter = format!("email='{email}'");
-    let found = authed_get(
+    // Resolve email → user id via the server-side superuser hook, so the client
+    // needs no read access to the users collection (the list/view rules are
+    // locked down to prevent enumeration — see humla-cloud migration
+    // 1718900000_tighten_users). The hook returns 404 when no account exists.
+    let found = match authed_post(
         &base,
         &session.token,
-        "/api/collections/users/records",
-        &[("filter", filter.as_str()), ("perPage", "1")],
+        "/api/humla/find-user",
+        serde_json::json!({ "email": email }),
     )
-    .await?;
-    let user_id = found
-        .get("items")
-        .and_then(|v| v.as_array())
-        .and_then(|a| a.first())
-        .and_then(|u| u.get("id"))
-        .and_then(|v| v.as_str())
-        .map(String::from);
-    let Some(user_id) = user_id else {
-        return Err(format!(
-            "No Humla account found for {email}. Email invites aren't wired up yet — ask them to sign up first."
-        ));
+    .await
+    {
+        Ok(v) => v,
+        Err(e) if e.contains("404") => {
+            return Err(format!(
+                "No Humla account found for {email}. Email invites aren't wired up yet — ask them to sign up first."
+            ));
+        }
+        Err(e) => return Err(e),
     };
+    let user_id = found
+        .get("id")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .ok_or("find-user returned no id")?;
 
     let (mut members, _admins) = fetch_relations(&base, &session.token, &workspace_id).await?;
     if !members.contains(&user_id) {
