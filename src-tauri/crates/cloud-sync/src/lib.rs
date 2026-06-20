@@ -115,15 +115,17 @@ pub enum SyncState {
     Error,
 }
 
-pub fn start<N, S>(
+pub fn start<N, S, C>(
     db: Db,
     config: Config,
     notify: N,
     status: S,
+    conflict: C,
 ) -> Result<(Arc<CloudSync>, impl std::future::Future<Output = ()>)>
 where
     N: Fn() + Send + Sync + 'static,
     S: Fn(SyncState) + Send + Sync + 'static,
+    C: Fn(&str) + Send + Sync + 'static,
 {
     init_tables(&db)?;
     let (tx, rx) = mpsc::unbounded_channel();
@@ -133,6 +135,7 @@ where
         http: reqwest::Client::new(),
         notify: Arc::new(notify),
         status: Arc::new(status),
+        conflict: Arc::new(conflict),
         auth: Mutex::new(None),
     };
     Ok((Arc::new(CloudSync { tx }), worker.run(rx)))
@@ -150,6 +153,9 @@ struct Worker {
     http: reqwest::Client,
     notify: Arc<dyn Fn() + Send + Sync>,
     status: Arc<dyn Fn(SyncState) + Send + Sync>,
+    /// Fired (with the note title) when a pull preserved local edits as a
+    /// conflict copy instead of silently overwriting them.
+    conflict: Arc<dyn Fn(&str) + Send + Sync>,
     auth: Mutex<Option<Auth>>,
 }
 
@@ -602,6 +608,60 @@ impl Worker {
             )?;
             return Ok(());
         }
+
+        // Conflict guard. If this device has an unpushed local edit for the note
+        // (a pending outbox upsert) AND the incoming server version is newer,
+        // applying it below would silently wipe the user's in-progress edits.
+        // Preserve them first as a local-only "(conflict copy)" — Dropbox-style,
+        // nothing is lost — and let the server version become canonical.
+        let conflict_title: Option<String> = {
+            let local: Option<(i64, String)> = conn
+                .query_row(
+                    "SELECT updated_at, title FROM notes WHERE id = ?1",
+                    rusqlite::params![n.client_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            match local {
+                Some((local_updated, title)) if n.client_updated_at > local_updated => {
+                    let has_pending = conn
+                        .query_row(
+                            "SELECT 1 FROM sync_outbox WHERE entity='note' AND entity_id=?1 AND op='upsert' LIMIT 1",
+                            rusqlite::params![n.client_id],
+                            |_| Ok(()),
+                        )
+                        .optional()?
+                        .is_some();
+                    if has_pending {
+                        let copy_id = format!("{}-conflict-{}", n.client_id, now_ms());
+                        // Copy every field from the current local row; mark it
+                        // Personal (workspace '') so the copy never syncs back.
+                        conn.execute(
+                            "INSERT INTO notes
+                                (id, title, body, transcript, summary, audio_path, summary_preset,
+                                 folder_id, language, summary_provider, expected_speakers, owner,
+                                 workspace_id, created_at, updated_at)
+                             SELECT ?1, title || ' (conflict copy)', body, transcript, summary,
+                                 audio_path, summary_preset, folder_id, language, summary_provider,
+                                 expected_speakers, '', '', created_at, ?2
+                             FROM notes WHERE id = ?3",
+                            rusqlite::params![copy_id, now_ms(), n.client_id],
+                        )?;
+                        // Drop the queued push for the original — we're taking
+                        // the server's version, so it would just echo back.
+                        conn.execute(
+                            "DELETE FROM sync_outbox WHERE entity='note' AND entity_id=?1 AND op='upsert'",
+                            rusqlite::params![n.client_id],
+                        )?;
+                        Some(title)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            }
+        };
+
         let folder = if n.folder_client_id.is_empty() {
             None
         } else {
@@ -636,6 +696,10 @@ impl Worker {
                 self.config.workspace_id,
             ],
         )?;
+        drop(conn); // release before firing the callback
+        if let Some(title) = conflict_title {
+            (self.conflict)(&title);
+        }
         Ok(())
     }
 
@@ -973,6 +1037,7 @@ mod it {
             http: reqwest::Client::new(),
             notify: Arc::new(|| {}) as Arc<dyn Fn() + Send + Sync>,
             status: Arc::new(|_| {}) as Arc<dyn Fn(SyncState) + Send + Sync>,
+            conflict: Arc::new(|_: &str| {}) as Arc<dyn Fn(&str) + Send + Sync>,
             auth: Mutex::new(None),
         }
     }
@@ -1078,6 +1143,65 @@ mod it {
             )
             .unwrap();
         assert_eq!((count, op.as_str()), (1, "upsert"));
+    }
+
+    /// A pull that would overwrite an unpushed local edit preserves the local
+    /// version as a local-only "(conflict copy)", takes the server version as
+    /// canonical, drops the now-stale pending push, and fires the callback.
+    #[test]
+    fn conflict_preserves_local_as_copy() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let db = test_db();
+        let fired = Arc::new(AtomicBool::new(false));
+        let f = fired.clone();
+        let w = Worker {
+            db: db.clone(),
+            config: offline_config("wsA"),
+            http: reqwest::Client::new(),
+            notify: Arc::new(|| {}),
+            status: Arc::new(|_| {}),
+            conflict: Arc::new(move |_: &str| f.store(true, Ordering::SeqCst)),
+            auth: Mutex::new(None),
+        };
+        {
+            let conn = db.lock();
+            conn.execute(
+                "INSERT INTO notes (id, title, body, workspace_id, created_at, updated_at) VALUES ('n1','mine','local body','wsA',1,100)",
+                [],
+            )
+            .unwrap();
+        }
+        w.enqueue(Op::Note { id: "n1".into(), delete: false }).unwrap(); // pending unpushed edit
+        let remote = RemoteNote {
+            client_id: "n1".into(),
+            title: "theirs".into(),
+            client_updated_at: 200,
+            ..Default::default()
+        };
+        w.apply_remote_note(&remote).unwrap();
+
+        let conn = db.lock();
+        let title: String =
+            conn.query_row("SELECT title FROM notes WHERE id='n1'", [], |r| r.get(0)).unwrap();
+        assert_eq!(title, "theirs", "server version becomes canonical");
+        let (copies, body): (i64, String) = conn
+            .query_row(
+                "SELECT COUNT(*), MAX(body) FROM notes WHERE title LIKE '%(conflict copy)' AND workspace_id=''",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(copies, 1, "local edit preserved as a local-only copy");
+        assert_eq!(body, "local body");
+        let pending: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_outbox WHERE entity_id='n1' AND op='upsert'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending, 0, "stale pending push dropped");
+        assert!(fired.load(Ordering::SeqCst), "conflict callback fired");
     }
 
     #[tokio::test]

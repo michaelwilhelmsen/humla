@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { ipc, onRecordingDiagnostic, onRecordingError, onRecordingStatus, onSummary, onSummaryStatus, onTranscript, onTranscriptReplaced, onNotesChanged, onSyncStatus, type Folder, type Note, type RecordingDiagnostic, type RecordingStatus } from "./ipc";
+import { ipc, onRecordingDiagnostic, onRecordingError, onRecordingStatus, onSummary, onSummaryStatus, onTranscript, onTranscriptReplaced, onNotesChanged, onSyncStatus, onSyncConflict, type Folder, type Note, type RecordingDiagnostic, type RecordingStatus } from "./ipc";
 import { useCloudStore } from "./cloud";
 
 type NotesState = {
@@ -149,4 +149,11 @@ export function bindBackendListeners() {
   onNotesChanged(() => useNotesStore.getState().refresh());
   // Live sync state → sidebar indicator.
   onSyncStatus((s) => useCloudStore.getState().setSyncStatus(s));
+  // A sync conflict preserved local edits as a copy → tell the user where it went.
+  onSyncConflict((title) =>
+    useRecordingStore.getState().pushError({
+      noteId: null,
+      message: `"${title}" changed on the server — your unsynced edits were saved as a "(conflict copy)" note.`,
+    }),
+  );
 }

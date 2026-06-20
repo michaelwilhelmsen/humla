@@ -90,6 +90,7 @@ impl Manager {
 
         let app = self.app.clone();
         let app_status = self.app.clone();
+        let app_conflict = self.app.clone();
         match cloud_sync::start(
             self.db.clone(),
             cfg,
@@ -106,6 +107,11 @@ impl Manager {
                     cloud_sync::SyncState::Error => "error",
                 };
                 let _ = app_status.emit("sync_status", s);
+            },
+            move |title| {
+                // A pull preserved local edits as a conflict copy → toast it so
+                // the user knows their version was kept and the note also changed.
+                let _ = app_conflict.emit("sync_conflict", title);
             },
         ) {
             Ok((handle, fut)) => {

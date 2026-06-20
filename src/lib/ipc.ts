@@ -323,3 +323,9 @@ export type SyncStatus = "syncing" | "idle" | "error";
 export function onSyncStatus(cb: (s: SyncStatus) => void): Promise<UnlistenFn> {
   return listen<SyncStatus>("sync_status", (e) => cb(e.payload));
 }
+
+// A pull preserved local edits as a "(conflict copy)" instead of overwriting
+// them. Payload is the note title. The UI toasts it so the user can find the copy.
+export function onSyncConflict(cb: (title: string) => void): Promise<UnlistenFn> {
+  return listen<string>("sync_conflict", (e) => cb(e.payload));
+}
