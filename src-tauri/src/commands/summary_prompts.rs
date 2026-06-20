@@ -12,7 +12,8 @@ pub fn summary_prompts_list(
     state: State<AppState>,
 ) -> Result<Vec<db::SummaryPrompt>, String> {
     let conn = state.db.lock();
-    db::list_summary_prompts(&conn).map_err(err)
+    let workspace = super::cloud::active_workspace(&conn);
+    db::list_summary_prompts(&conn, &workspace).map_err(err)
 }
 
 #[tauri::command]

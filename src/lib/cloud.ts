@@ -117,8 +117,13 @@ export const useCloudStore = create<CloudState>((set) => ({
 export function useOwnerName(ownerId: string | undefined | null): string | null {
   const me = useCloudStore((s) => s.status.user?.id);
   const member = useCloudStore((s) => (ownerId ? s.members[ownerId] : undefined));
+  const rosterLoaded = useCloudStore((s) => Object.keys(s.members).length > 0);
   if (!ownerId || ownerId === me) return null;
-  return member ? member.name || member.email : null;
+  if (member) return member.name || member.email;
+  // Owner isn't in the current roster. If the roster is loaded, they've left the
+  // workspace — label it rather than rendering nothing (which would read as
+  // "yours"). If the roster isn't loaded yet, don't guess.
+  return rosterLoaded ? "Former member" : null;
 }
 
 export function roleLabel(role: CloudRole): string {

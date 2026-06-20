@@ -432,16 +432,19 @@ pub struct SummaryPrompt {
     pub workspace_id: String,
 }
 
-// Prompts are reusable config, so reads are intentionally NOT scoped to the
-// active workspace (you can use any custom prompt anywhere). They still carry a
-// workspace_id so the sync worker pushes each to its owning workspace.
-pub fn list_summary_prompts(conn: &Connection) -> Result<Vec<SummaryPrompt>> {
+// Prompts are scoped to the active workspace PLUS your personal ('') ones:
+// personal prompts are always available as your reusable toolkit, while a
+// workspace's shared prompts only appear in that workspace (so a teammate's
+// custom prompt doesn't leak into everyone else's list). Each carries a
+// workspace_id so the sync worker pushes it to its owning workspace.
+pub fn list_summary_prompts(conn: &Connection, workspace: &str) -> Result<Vec<SummaryPrompt>> {
     let mut stmt = conn.prepare_cached(
         "SELECT id, name, content, created_at, updated_at, workspace_id FROM summary_prompts
+         WHERE workspace_id = ?1 OR workspace_id = ''
          ORDER BY name COLLATE NOCASE",
     )?;
     let rows = stmt
-        .query_map([], map_summary_prompt)?
+        .query_map(params![workspace], map_summary_prompt)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
 }
