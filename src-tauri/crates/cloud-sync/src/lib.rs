@@ -40,9 +40,6 @@ use tokio::sync::mpsc;
 /// public core because rusqlite is pinned to the same version.
 pub type Db = Arc<Mutex<Connection>>;
 
-/// Quarantine (drop) an outbox row after this many failed push attempts so one
-/// un-pushable "poison" row can't head-of-line-block every later change forever.
-const MAX_OUTBOX_ATTEMPTS: i64 = 5;
 
 #[derive(Clone)]
 pub struct Config {
@@ -299,7 +296,7 @@ impl Worker {
                 )
                 .optional()?
             };
-            let Some((seq, entity, entity_id, op, workspace, attempts)) = next else {
+            let Some((seq, entity, entity_id, op, workspace, _attempts)) = next else {
                 return Ok(());
             };
 
@@ -328,23 +325,21 @@ impl Worker {
                 Ok(()) => {
                     self.db.lock().execute("DELETE FROM sync_outbox WHERE seq = ?1", rusqlite::params![seq])?;
                 }
+                Err(e) if is_permanent_push_error(&e) => {
+                    // Genuinely un-pushable for this payload (a 4xx: validation,
+                    // forbidden, not-found). Retrying can't help and it would
+                    // head-of-line-block everything behind it, so drop it. We
+                    // never drop on a transient error (see below), so this can't
+                    // silently lose a change that would have eventually synced.
+                    eprintln!("cloud-sync: dropping un-pushable {entity}/{op} {entity_id}: {e:#}");
+                    self.db.lock().execute("DELETE FROM sync_outbox WHERE seq = ?1", rusqlite::params![seq])?;
+                    continue;
+                }
                 Err(e) => {
-                    let attempts = attempts + 1;
-                    if attempts >= MAX_OUTBOX_ATTEMPTS {
-                        // Poison row: drop it so it can't block everything behind
-                        // it forever, and keep draining the rest.
-                        eprintln!(
-                            "cloud-sync: giving up on {entity}/{op} {entity_id} after {attempts} attempts (quarantined): {e:#}"
-                        );
-                        self.db.lock().execute("DELETE FROM sync_outbox WHERE seq = ?1", rusqlite::params![seq])?;
-                        continue;
-                    }
-                    // Transient failure: record the attempt and stop draining so
-                    // ordering is preserved; the tick loop retries.
-                    self.db.lock().execute(
-                        "UPDATE sync_outbox SET attempts = ?1 WHERE seq = ?2",
-                        rusqlite::params![attempts, seq],
-                    )?;
+                    // Transient failure (network / 5xx / 429 rate-limit): keep the
+                    // row and stop draining so ordering is preserved; the tick
+                    // loop retries indefinitely. A brief outage must never cost a
+                    // real change, so transient failures are NOT quarantined.
                     return Err(e);
                 }
             }
@@ -355,6 +350,24 @@ impl Worker {
         let Some(note) = self.snapshot_note(uuid)? else {
             return Ok(()); // deleted locally before we got here; nothing to push
         };
+        // If the note has since moved to a different workspace, don't push its
+        // current content into the stale (outbox-captured) workspace — that would
+        // briefly leak content to the old workspace's members. The move enqueued
+        // a tombstone for the old workspace + an upsert for the new one, which
+        // place the note correctly.
+        {
+            let conn = self.db.lock();
+            let current_ws: Option<String> = conn
+                .query_row(
+                    "SELECT workspace_id FROM notes WHERE id = ?1",
+                    rusqlite::params![uuid],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if current_ws.as_deref() != Some(workspace) {
+                return Ok(());
+            }
+        }
         let auth = self.ensure_auth().await?;
         // Preserve the creator across edits: this device only becomes the owner
         // when it's creating the note (no owner yet). Editing a teammate's
@@ -531,24 +544,37 @@ impl Worker {
         F: FnMut(&serde_json::Value) -> Result<()>,
     {
         // Cursor is per-workspace, so switching workspaces never skips or
-        // re-pulls the wrong tenant's records under a shared cursor.
+        // re-pulls the wrong tenant's records under a shared cursor. It's a
+        // composite "<updated>|<id>": a strict `(updated, id)` watermark. This
+        // advances past every applied record WITHOUT re-fetching the boundary
+        // tick each poll (the old `updated >=` did), while the `id` tiebreak
+        // means same-millisecond siblings are never skipped.
         let cursor_key = format!("{}:{}", cursor_key, self.config.workspace_id);
-        let cursor = self.read_state(&cursor_key)?.unwrap_or_default();
-        let mut newest = cursor.clone();
+        let raw = self.read_state(&cursor_key)?.unwrap_or_default();
+        let (mut cur_ts, mut cur_id) = match raw.split_once('|') {
+            Some((t, i)) => (t.to_string(), i.to_string()),
+            None => (raw, String::new()), // legacy bare "<updated>" cursor
+        };
+        // Defensive: a value that could break the interpolated filter (only
+        // possible from a misbehaving/hostile server) resets the cursor.
+        if cur_ts.contains('\'') || cur_id.contains('\'') {
+            cur_ts.clear();
+            cur_id.clear();
+        }
+
+        let ws = self.config.workspace_id.as_str();
+        let mut newest_ts = cur_ts.clone();
+        let mut newest_id = cur_id.clone();
         let mut page: u32 = 1;
 
         loop {
-            // `updated >=` (not `>`): PocketBase timestamps collide when several
-            // records change in the same tick (e.g. folder-delete reparenting
-            // many notes). With strict `>`, siblings sharing the cursor's exact
-            // timestamp get skipped forever. `>=` re-fetches the boundary record
-            // each pull — harmless because apply is idempotent under the LWW
-            // guard — and the cursor only advances on a genuinely newer record,
-            // so this doesn't cause spurious refresh notifications.
-            let filter = if cursor.is_empty() {
-                format!("workspace='{}'", self.config.workspace_id)
+            let filter = if cur_ts.is_empty() {
+                format!("workspace='{}'", ws)
             } else {
-                format!("workspace='{}' && updated>='{}'", self.config.workspace_id, cursor)
+                format!(
+                    "workspace='{}' && (updated > '{}' || (updated = '{}' && id > '{}'))",
+                    ws, cur_ts, cur_ts, cur_id
+                )
             };
             let page_s = page.to_string();
             let resp = self
@@ -557,7 +583,7 @@ impl Worker {
                 .bearer_auth(token)
                 .query(&[
                     ("filter", filter.as_str()),
-                    ("sort", "updated"),
+                    ("sort", "updated,id"),
                     ("perPage", "200"),
                     ("page", page_s.as_str()),
                 ])
@@ -574,10 +600,11 @@ impl Worker {
             }
             for item in items {
                 apply(item)?;
-                if let Some(u) = item.get("updated").and_then(|v| v.as_str()) {
-                    if u > newest.as_str() {
-                        newest = u.to_string();
-                    }
+                let u = item.get("updated").and_then(|v| v.as_str()).unwrap_or_default();
+                let id = item.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+                if (u, id) > (newest_ts.as_str(), newest_id.as_str()) {
+                    newest_ts = u.to_string();
+                    newest_id = id.to_string();
                 }
             }
             let total_pages = list.get("totalPages").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
@@ -587,8 +614,8 @@ impl Worker {
             page += 1;
         }
 
-        if newest != cursor {
-            self.write_state(&cursor_key, &newest)?;
+        if newest_ts != cur_ts || newest_id != cur_id {
+            self.write_state(&cursor_key, &format!("{}|{}", newest_ts, newest_id))?;
             Ok(true)
         } else {
             Ok(false)
@@ -615,6 +642,15 @@ impl Worker {
     /// `updated_at` (NOT now()), with a last-write-wins guard so a stale pull
     /// can't clobber a newer local edit.
     fn apply_remote_note(&self, n: &RemoteNote) -> Result<()> {
+        // Reject a non-UUID client_id from the server: it would become a local
+        // primary key and later be interpolated into PocketBase filters. Our
+        // client only ever creates UUID ids, so anything else is malformed or
+        // hostile — skip it (closes both the filter-injection and the
+        // find_remote_id-misses → duplicate-create failure mode).
+        if !is_safe_id(&n.client_id) {
+            eprintln!("cloud-sync: skipping pulled note with unsafe client_id");
+            return Ok(());
+        }
         let conn = self.db.lock();
         if n.deleted {
             // Soft-delete (move to Trash) rather than dropping the row: the
@@ -636,11 +672,15 @@ impl Worker {
         // applying it below would silently wipe the user's in-progress edits.
         // Preserve them first as a local-only "(conflict copy)" — Dropbox-style,
         // nothing is lost — and let the server version become canonical.
+        // All queries are scoped to the pulled workspace (`ws`): the local row,
+        // its pending push, and the drop must all concern THIS workspace's copy,
+        // never a same-client_id row that was moved to another workspace.
+        let ws = self.config.workspace_id.as_str();
         let conflict_title: Option<String> = {
             let local: Option<(i64, String)> = conn
                 .query_row(
-                    "SELECT updated_at, title FROM notes WHERE id = ?1",
-                    rusqlite::params![n.client_id],
+                    "SELECT updated_at, title FROM notes WHERE id = ?1 AND workspace_id = ?2",
+                    rusqlite::params![n.client_id, ws],
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .optional()?;
@@ -648,8 +688,8 @@ impl Worker {
                 Some((local_updated, title)) if n.client_updated_at > local_updated => {
                     let has_pending = conn
                         .query_row(
-                            "SELECT 1 FROM sync_outbox WHERE entity='note' AND entity_id=?1 AND op='upsert' LIMIT 1",
-                            rusqlite::params![n.client_id],
+                            "SELECT 1 FROM sync_outbox WHERE entity='note' AND entity_id=?1 AND op='upsert' AND workspace=?2 LIMIT 1",
+                            rusqlite::params![n.client_id, ws],
                             |_| Ok(()),
                         )
                         .optional()?
@@ -669,11 +709,11 @@ impl Worker {
                              FROM notes WHERE id = ?3",
                             rusqlite::params![copy_id, now_ms(), n.client_id],
                         )?;
-                        // Drop the queued push for the original — we're taking
-                        // the server's version, so it would just echo back.
+                        // Drop the queued push for the original (this workspace) —
+                        // we're taking the server's version, so it would just echo.
                         conn.execute(
-                            "DELETE FROM sync_outbox WHERE entity='note' AND entity_id=?1 AND op='upsert'",
-                            rusqlite::params![n.client_id],
+                            "DELETE FROM sync_outbox WHERE entity='note' AND entity_id=?1 AND op='upsert' AND workspace=?2",
+                            rusqlite::params![n.client_id, ws],
                         )?;
                         Some(title)
                     } else {
@@ -700,7 +740,7 @@ impl Worker {
                 summary=excluded.summary, summary_preset=excluded.summary_preset,
                 folder_id=excluded.folder_id, language=excluded.language,
                 expected_speakers=excluded.expected_speakers, owner=excluded.owner,
-                updated_at=excluded.updated_at
+                updated_at=excluded.updated_at, deleted_at=NULL
              WHERE excluded.updated_at >= notes.updated_at",
             rusqlite::params![
                 n.client_id,
@@ -726,6 +766,10 @@ impl Worker {
     }
 
     fn apply_remote_folder(&self, f: &RemoteFolder) -> Result<()> {
+        if !is_safe_id(&f.client_id) {
+            eprintln!("cloud-sync: skipping pulled folder with unsafe client_id");
+            return Ok(());
+        }
         let conn = self.db.lock();
         if f.deleted {
             conn.execute(
@@ -747,6 +791,10 @@ impl Worker {
     }
 
     fn apply_remote_prompt(&self, p: &RemotePrompt) -> Result<()> {
+        if !is_safe_id(&p.client_id) {
+            eprintln!("cloud-sync: skipping pulled prompt with unsafe client_id");
+            return Ok(());
+        }
         let conn = self.db.lock();
         if p.deleted {
             conn.execute(
@@ -981,6 +1029,27 @@ fn init_tables(db: &Db) -> Result<()> {
     Ok(())
 }
 
+/// True if `s` is a safe local id: non-empty and only `[A-Za-z0-9_-]`. Our client
+/// only mints such ids (UUIDs), so rejecting anything else stops a server-sent
+/// `client_id` from carrying PocketBase filter metacharacters (quotes, operators,
+/// whitespace) — it becomes a local primary key and is later interpolated into a
+/// filter string on push. Closes both the filter-injection and the
+/// find_remote_id-misses → spurious-duplicate-create failure mode.
+fn is_safe_id(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+}
+
+/// Classify a push failure as permanent (a 4xx that retrying can't fix) vs
+/// transient (network / 5xx / 429 rate-limit). `error_for_pb` formats PocketBase
+/// failures as "pocketbase {status}: …" where the status Display starts with the
+/// numeric code, so a 4xx surfaces as "pocketbase 4xx"; 429 is excluded because
+/// it clears on its own. Anything else (reqwest transport errors, 5xx) is
+/// transient and must keep retrying — never dropped.
+fn is_permanent_push_error(e: &anyhow::Error) -> bool {
+    let s = e.to_string();
+    s.contains("pocketbase 4") && !s.contains("pocketbase 429")
+}
+
 fn now_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -1000,32 +1069,61 @@ async fn error_for_pb(resp: reqwest::Response) -> Result<reqwest::Response> {
 }
 
 /// Best-effort realtime: keep a PocketBase SSE connection open and, on every
-/// record change in a subscribed collection, nudge `notify` to pull. Reconnects
-/// with a fixed backoff. All failures are non-fatal — the worker's interval poll
-/// is the reliable path; realtime only lowers latency when it's connected.
+/// record change in a subscribed collection, nudge `notify` to pull. The token
+/// is reused across reconnects (re-auth only on a 401), and reconnects use
+/// exponential backoff capped at 5 minutes — so a persistently-broken realtime
+/// endpoint can't hammer the login endpoint (and trip its rate-limit) every few
+/// seconds. All failures are non-fatal: the worker's interval poll is the
+/// reliable path; realtime only lowers latency when it's connected.
 async fn realtime_loop(config: Config, http: reqwest::Client, notify: Arc<tokio::sync::Notify>) {
+    let mut backoff_secs = 1u64;
+    let mut token: Option<String> = None;
     loop {
-        if let Err(e) = realtime_once(&config, &http, &notify).await {
-            eprintln!("cloud-sync: realtime disconnected ({e:#}); polling continues");
+        if token.is_none() {
+            match realtime_auth(&config, &http).await {
+                Ok(t) => token = Some(t),
+                Err(e) => {
+                    eprintln!("cloud-sync: realtime auth failed ({e:#}); polling continues");
+                    tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                    backoff_secs = (backoff_secs * 2).min(300);
+                    continue;
+                }
+            }
         }
-        tokio::time::sleep(Duration::from_secs(15)).await;
+        let started = now_ms();
+        let tok = token.clone().unwrap_or_default();
+        if let Err(e) = realtime_once(&config, &http, &tok, &notify).await {
+            eprintln!("cloud-sync: realtime disconnected ({e:#}); polling continues");
+            if e.to_string().contains("401") {
+                token = None; // token died → re-auth next round
+            }
+        }
+        // A connection that stayed up a while was healthy → reset the backoff.
+        if now_ms() - started > 60_000 {
+            backoff_secs = 1;
+        }
+        tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+        backoff_secs = (backoff_secs * 2).min(300);
     }
 }
 
-async fn realtime_once(
-    config: &Config,
-    http: &reqwest::Client,
-    notify: &Arc<tokio::sync::Notify>,
-) -> Result<()> {
-    // Auth so the subscription is scoped to records this user can access.
+/// Authenticate for realtime, returning a token to reuse across reconnects.
+async fn realtime_auth(config: &Config, http: &reqwest::Client) -> Result<String> {
     let auth = http
         .post(format!("{}/api/collections/users/auth-with-password", config.base_url))
         .json(&json!({ "identity": config.email, "password": config.password }))
         .send()
         .await?;
     let auth = error_for_pb(auth).await?.json::<serde_json::Value>().await?;
-    let token = auth.get("token").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    Ok(auth.get("token").and_then(|v| v.as_str()).unwrap_or_default().to_string())
+}
 
+async fn realtime_once(
+    config: &Config,
+    http: &reqwest::Client,
+    token: &str,
+    notify: &Arc<tokio::sync::Notify>,
+) -> Result<()> {
     let mut resp = http.get(format!("{}/api/realtime", config.base_url)).send().await?;
     if !resp.status().is_success() {
         return Err(anyhow!("realtime connect: {}", resp.status()));
@@ -1036,10 +1134,15 @@ async fn realtime_once(
     // `chunk()` reads the next piece of the streamed body (no StreamExt needed).
     while let Some(chunk) = resp.chunk().await? {
         buf.extend_from_slice(&chunk);
-        // SSE events are separated by a blank line.
-        while let Some(idx) = buf.windows(2).position(|w| w == b"\n\n") {
+        // Bound memory: a stream that never sends an event delimiter must not
+        // grow the buffer without limit.
+        if buf.len() > 1_000_000 {
+            return Err(anyhow!("realtime: event buffer overflow"));
+        }
+        // SSE events are separated by a blank line — handle both LF and CRLF.
+        while let Some((idx, delim)) = find_event_end(&buf) {
             let block = String::from_utf8_lossy(&buf[..idx]).to_string();
-            buf.drain(..idx + 2);
+            buf.drain(..idx + delim);
             let (event, data) = parse_sse(&block);
             match event.as_deref() {
                 Some("PB_CONNECT") => {
@@ -1049,7 +1152,7 @@ async fn realtime_once(
                     if let Some(client_id) = client_id {
                         let sub = http
                             .post(format!("{}/api/realtime", config.base_url))
-                            .bearer_auth(&token)
+                            .bearer_auth(token)
                             .json(&json!({
                                 "clientId": client_id,
                                 "subscriptions": ["notes", "folders", "summary_prompts"],
@@ -1069,6 +1172,21 @@ async fn realtime_once(
         }
     }
     Ok(()) // stream ended → caller reconnects
+}
+
+/// Find the end of the first complete SSE event in `buf`, returning the index
+/// where the delimiter starts and its length. Handles both LF (`\n\n`) and CRLF
+/// (`\r\n\r\n`) so a proxy that rewrites line endings doesn't silently break
+/// realtime, picking whichever delimiter comes first.
+fn find_event_end(buf: &[u8]) -> Option<(usize, usize)> {
+    let lf = buf.windows(2).position(|w| w == b"\n\n").map(|i| (i, 2));
+    let crlf = buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| (i, 4));
+    match (lf, crlf) {
+        (Some(a), Some(b)) => Some(if a.0 <= b.0 { a } else { b }),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
 }
 
 /// Parse one SSE event block into (event name, data payload).
@@ -1195,6 +1313,18 @@ mod it {
         assert_eq!(count, 1, "three enqueues collapse to one pending row");
         assert_eq!(op, "delete", "latest op wins");
         assert_eq!(ws, "wsX", "upsert captured the note's own workspace");
+    }
+
+    /// Ingest id safety: real UUIDs + plain test ids pass; filter-metacharacter
+    /// ids (the injection vector) are rejected.
+    #[test]
+    fn rejects_unsafe_client_ids() {
+        assert!(is_safe_id("550e8400-e29b-41d4-a716-446655440000"));
+        assert!(is_safe_id("note-123"));
+        assert!(!is_safe_id(""));
+        assert!(!is_safe_id("x' || workspace!='"));
+        assert!(!is_safe_id("a b"));
+        assert!(!is_safe_id("a=b"));
     }
 
     /// SSE block parsing for the realtime listener.
@@ -1338,9 +1468,9 @@ mod it {
         {
             let conn = db.lock();
             conn.execute(
-                "INSERT INTO notes (id, title, body, transcript, summary, summary_preset, language, created_at, updated_at)
-                 VALUES (?1, 'IT title', '<p>b</p>', 'tx', 'sm', 'meeting', 'en', 10, 10)",
-                rusqlite::params![uuid],
+                "INSERT INTO notes (id, title, body, transcript, summary, summary_preset, language, workspace_id, created_at, updated_at)
+                 VALUES (?1, 'IT title', '<p>b</p>', 'tx', 'sm', 'meeting', 'en', ?2, 10, 10)",
+                rusqlite::params![uuid, ws],
             )
             .unwrap();
         }
