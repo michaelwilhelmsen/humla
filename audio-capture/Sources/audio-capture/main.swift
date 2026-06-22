@@ -374,18 +374,11 @@ func makeBuffer(_ samples: [Float]) -> AVAudioPCMBuffer? {
 
 let engine = AVAudioEngine()
 var micConverter: AVAudioConverter?
-do {
-    let input = engine.inputNode
-    // NOTE: do NOT call `input.setVoiceProcessingEnabled(true)`. It enables
-    // hardware AEC, but the voice-processing IO unit takes over the audio
-    // device for *both* directions, which ducks the system output (you
-    // can't hear the other person on a call). Echo-cancel the mic in a
-    // post-stop dedup pass instead — see commands.rs.
-    let inFormat = input.inputFormat(forBus: 0)
-    if inFormat.sampleRate == 0 || inFormat.channelCount == 0 {
-        emitError("Microphone input format invalid (sampleRate=\(inFormat.sampleRate), channels=\(inFormat.channelCount)). Dev binaries without an Info.plist may be silently denied audio. Try running 'pnpm tauri build --debug' and launching the .app instead of 'pnpm tauri dev'.")
-        throw NSError(domain: "audio-capture", code: 1, userInfo: [NSLocalizedDescriptionKey: "invalid input format"])
-    }
+
+// Build the mic converter for `inFormat` and install the capture tap. Factored
+// out so both initial setup and post-device-change recovery install an
+// identical tap against whatever the current input format happens to be.
+func installMicTap(_ input: AVAudioInputNode, format inFormat: AVAudioFormat) {
     micConverter = AVAudioConverter(from: inFormat, to: targetFormat)
     input.installTap(onBus: 0, bufferSize: 4096, format: inFormat) { buffer, _ in
         guard let conv = micConverter else { return }
@@ -414,6 +407,21 @@ do {
             }
         }
     }
+}
+
+do {
+    let input = engine.inputNode
+    // NOTE: do NOT call `input.setVoiceProcessingEnabled(true)`. It enables
+    // hardware AEC, but the voice-processing IO unit takes over the audio
+    // device for *both* directions, which ducks the system output (you
+    // can't hear the other person on a call). Echo-cancel the mic in a
+    // post-stop dedup pass instead — see commands.rs.
+    let inFormat = input.inputFormat(forBus: 0)
+    if inFormat.sampleRate == 0 || inFormat.channelCount == 0 {
+        emitError("Microphone input format invalid (sampleRate=\(inFormat.sampleRate), channels=\(inFormat.channelCount)). Dev binaries without an Info.plist may be silently denied audio. Try running 'pnpm tauri build --debug' and launching the .app instead of 'pnpm tauri dev'.")
+        throw NSError(domain: "audio-capture", code: 1, userInfo: [NSLocalizedDescriptionKey: "invalid input format"])
+    }
+    installMicTap(input, format: inFormat)
     engine.prepare()
     try engine.start()
 } catch {
@@ -694,6 +702,49 @@ pauseSrc.setEventHandler { pauseCapture() }
 resumeSrc.setEventHandler { resumeCapture() }
 pauseSrc.resume()
 resumeSrc.resume()
+
+// MARK: - Audio device / configuration change recovery
+//
+// Re-establish mic capture after an audio device or format change mid-recording
+// (e.g. plugging in HDMI, a USB interface, or AirPods). On a configuration
+// change AVAudioEngine stops itself and the input format can change out from
+// under the existing tap; without re-reading the format, re-tapping, and
+// restarting, the mic tap silently stops firing for the rest of the session
+// while ScreenCaptureKit (system audio) keeps running — the failure that
+// produced a 3-minute mic stream alongside an 85-minute system stream. The
+// notification's object is our engine; `.main` delivery serialises recovery
+// with pause/resume/shutdown.
+func reconfigureMicAfterDeviceChange() {
+    let input = engine.inputNode
+    input.removeTap(onBus: 0)
+    let newFormat = input.inputFormat(forBus: 0)
+    guard newFormat.sampleRate > 0, newFormat.channelCount > 0 else {
+        emitError("Audio device changed but the new microphone format is unavailable; mic capture did not resume.")
+        return
+    }
+    installMicTap(input, format: newFormat)
+    // While paused the engine is intentionally stopped — resumeCapture() starts
+    // it later, now against the freshly-installed tap. Only restart here if we
+    // were actively recording when the device changed.
+    if !paused {
+        do {
+            engine.prepare()
+            try engine.start()
+        } catch {
+            emitError("Failed to restart microphone after device change: \(error.localizedDescription)")
+            return
+        }
+    }
+    emit(["event": "diagnostic", "message": "Audio input device changed; microphone capture resumed on the new device."])
+}
+
+NotificationCenter.default.addObserver(
+    forName: .AVAudioEngineConfigurationChange,
+    object: engine,
+    queue: .main
+) { _ in
+    reconfigureMicAfterDeviceChange()
+}
 
 // MARK: - Parent-death watchdog
 //

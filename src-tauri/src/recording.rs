@@ -288,6 +288,12 @@ pub enum SidecarEvent {
         mic_peak: f32,
         sys_peak: f32,
     },
+    // Non-fatal notice from the sidecar — e.g. it recovered mic capture after
+    // an audio device change mid-recording. Surfaced to the user as a transient
+    // toast (see the reader loop in commands.rs).
+    Diagnostic {
+        message: String,
+    },
 }
 
 #[derive(Clone, Serialize)]
@@ -368,5 +374,19 @@ mod tests {
         // Casing varies but the words are the same → collapse.
         // The collapse strips trailing duplicates, leaving the earliest copy.
         assert_eq!(t.as_prompt(), Some("Yes".to_string()));
+    }
+
+    #[test]
+    fn sidecar_event_deserializes_diagnostic() {
+        // The sidecar emits {"event":"diagnostic","message":"..."} when it
+        // recovers mic capture after an audio device change. `rename_all =
+        // "snake_case"` must map the `Diagnostic` variant to the "diagnostic"
+        // tag — lock that contract so a rename on either side can't silently
+        // drop the notice.
+        let json = r#"{"event":"diagnostic","message":"device changed"}"#;
+        match serde_json::from_str::<SidecarEvent>(json).unwrap() {
+            SidecarEvent::Diagnostic { message } => assert_eq!(message, "device changed"),
+            _ => panic!("expected Diagnostic variant"),
+        }
     }
 }

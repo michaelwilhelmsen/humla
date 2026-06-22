@@ -1487,6 +1487,18 @@ pub async fn recording_start(
                         sys_peak,
                     });
                 }
+                Ok(SidecarEvent::Diagnostic { message }) => {
+                    // Non-fatal sidecar notice (e.g. mic capture recovered after
+                    // an audio device change). Reuse the recording_error channel
+                    // — on the frontend it's a transient, auto-dismissing toast —
+                    // so the user gets a heads-up without it reading as a hard
+                    // failure.
+                    eprintln!("sidecar diagnostic: {message}");
+                    let _ = app_clone.emit("recording_error", ErrorPayload {
+                        note_id: Some(note_id_clone.clone()),
+                        message,
+                    });
+                }
                 Err(e) => eprintln!("bad sidecar line: {e} -- {line}"),
             }
         }
