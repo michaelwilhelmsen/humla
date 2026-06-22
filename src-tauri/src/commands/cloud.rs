@@ -35,6 +35,7 @@ struct Session {
     user_id: String,
     email: String,
     name: String,
+    verified: bool,
 }
 
 /// Process-lifetime auth cache. Kept out of `AppState` so the whole cloud layer
@@ -46,6 +47,9 @@ pub struct CloudUser {
     pub id: String,
     pub email: String,
     pub name: String,
+    /// Whether the user has confirmed their email. Drives the Account tab's
+    /// "verify your email / resend" banner.
+    pub verified: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -266,6 +270,28 @@ async fn login_request(base: &str, email: &str, password: &str) -> Result<Sessio
         user_id: record.and_then(|r| r.get("id")).and_then(|v| v.as_str()).unwrap_or_default().to_string(),
         email: record.and_then(|r| r.get("email")).and_then(|v| v.as_str()).unwrap_or_default().to_string(),
         name: record.and_then(|r| r.get("name")).and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+        verified: record.and_then(|r| r.get("verified")).and_then(|v| v.as_bool()).unwrap_or(false),
+    })
+}
+
+/// Refresh the signed-in user's record (to pick up `verified` after they click
+/// the email link) and rotate the auth token. Best-effort, used by `cloud_status`.
+async fn auth_refresh(base: &str, token: &str) -> Result<Session, String> {
+    let resp = http()
+        .post(format!("{base}/api/collections/users/auth-refresh"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let val = pb_json(resp).await?;
+    let new_token = val.get("token").and_then(|v| v.as_str()).unwrap_or(token).to_string();
+    let record = val.get("record");
+    Ok(Session {
+        token: new_token,
+        user_id: record.and_then(|r| r.get("id")).and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+        email: record.and_then(|r| r.get("email")).and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+        name: record.and_then(|r| r.get("name")).and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+        verified: record.and_then(|r| r.get("verified")).and_then(|v| v.as_bool()).unwrap_or(false),
     })
 }
 
@@ -390,6 +416,17 @@ pub async fn cloud_status(state: State<'_, AppState>) -> Result<CloudStatus, Str
         });
     };
 
+    // The cached session's `verified` can be stale (the user may have clicked the
+    // verification link since login). Refresh the record + rotate the token,
+    // best-effort — fall back to the cached session on any failure.
+    let session = match auth_refresh(&base_url, &session.token).await {
+        Ok(s) => {
+            *SESSION.lock().unwrap() = Some(s.clone());
+            s
+        }
+        Err(_) => session,
+    };
+
     let workspaces = match list_workspaces_inner(&base_url, &session).await {
         Ok(ws) => ws,
         // Don't crash status on a transient list failure, but don't swallow it
@@ -410,7 +447,12 @@ pub async fn cloud_status(state: State<'_, AppState>) -> Result<CloudStatus, Str
         configured: true,
         logged_in: true,
         base_url,
-        user: Some(CloudUser { id: session.user_id, email: session.email, name: session.name }),
+        user: Some(CloudUser {
+            id: session.user_id,
+            email: session.email,
+            name: session.name,
+            verified: session.verified,
+        }),
         current_workspace,
         workspaces,
         billing_enabled,
@@ -536,6 +578,29 @@ pub async fn cloud_signup(
     *SESSION.lock().unwrap() = Some(session);
     state.sync.config_changed();
     cloud_status(state).await
+}
+
+/// Resend the email-verification message to the signed-in user's address. Uses
+/// PocketBase's public `request-verification` endpoint (it no-ops server-side if
+/// already verified). Surfaced in the Account tab when the user is unverified.
+#[tauri::command]
+pub async fn cloud_resend_verification(state: State<'_, AppState>) -> Result<(), String> {
+    let (base, session) = ensure_session(&state).await?;
+    if session.email.is_empty() {
+        return Err("Not signed in.".into());
+    }
+    let resp = http()
+        .post(format!("{base}/api/collections/users/request-verification"))
+        .json(&serde_json::json!({ "email": session.email }))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if resp.status().is_success() {
+        return Ok(()); // 204 No Content
+    }
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    Err(format!("couldn't resend verification ({status}): {body}"))
 }
 
 #[tauri::command]

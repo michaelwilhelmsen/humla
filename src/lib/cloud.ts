@@ -19,7 +19,7 @@ export const HUMLA_CLOUD_URL = "https://sync.humla.team";
 export type CloudRole = "owner" | "admin" | "member" | "viewer";
 export type PlanStatus = "active" | "trialing" | "past_due" | "canceled" | "none";
 
-export type CloudUser = { id: string; email: string; name: string };
+export type CloudUser = { id: string; email: string; name: string; verified: boolean };
 export type CloudWorkspace = { id: string; name: string; role: CloudRole; plan_status: PlanStatus };
 export type CloudMember = { id: string; email: string; name: string; role: CloudRole };
 
@@ -43,6 +43,8 @@ export const cloudApi = {
     invoke<CloudStatus>("cloud_login", { email, password }),
   signup: (email: string, password: string, name: string) =>
     invoke<CloudStatus>("cloud_signup", { email, password, name }),
+  /** Resend the email-verification message to the signed-in user. */
+  resendVerification: () => invoke<void>("cloud_resend_verification"),
   logout: () => invoke<void>("cloud_logout"),
   createWorkspace: (name: string) => invoke<CloudWorkspace>("cloud_create_workspace", { name }),
   selectWorkspace: (id: string) => invoke<void>("cloud_select_workspace", { id }),
