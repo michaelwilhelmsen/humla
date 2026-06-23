@@ -1,6 +1,7 @@
 import { useMemo } from "react";
 import { Link, useParams, useNavigate } from "react-router-dom";
 import { Folder as FolderIcon } from "lucide-react";
+import { type Note } from "../lib/ipc";
 import { useNotesStore } from "../lib/store";
 
 function formatMeetingTime(ts: number): string {
@@ -25,6 +26,45 @@ function formatMeetingTime(ts: number): string {
   });
 }
 
+function groupByDate(notes: Note[]) {
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const yest = new Date(today);
+  yest.setDate(today.getDate() - 1);
+  const weekStart = new Date(today);
+  weekStart.setDate(today.getDate() - 7);
+
+  const groups: { label: string; items: Note[] }[] = [
+    { label: "Today", items: [] },
+    { label: "Yesterday", items: [] },
+    { label: "Earlier this week", items: [] },
+    { label: "Older", items: [] },
+  ];
+  for (const n of notes) {
+    const d = new Date(n.updated_at);
+    if (d >= today) groups[0].items.push(n);
+    else if (d >= yest) groups[1].items.push(n);
+    else if (d >= weekStart) groups[2].items.push(n);
+    else groups[3].items.push(n);
+  }
+  return groups.filter((g) => g.items.length > 0);
+}
+
+// One-line snippet for a row: strip the Tiptap body HTML (textContent only —
+// the element is never inserted live, so no script runs), falling back to the
+// transcript for pure voice memos.
+function notePreview(n: Note): string {
+  let text = "";
+  const html = n.body?.trim();
+  if (html) {
+    const el = document.createElement("div");
+    el.innerHTML = html;
+    text = el.textContent || "";
+  }
+  if (!text.trim() && n.transcript) text = n.transcript;
+  return text.replace(/\s+/g, " ").trim();
+}
+
 export function Folder() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
@@ -32,7 +72,6 @@ export function Folder() {
   const notes = useNotesStore((s) => s.notes);
 
   const folder = useMemo(() => folders.find((f) => f.id === id), [folders, id]);
-
   const folderNotes = useMemo(
     () =>
       notes
@@ -40,12 +79,13 @@ export function Folder() {
         .sort((a, b) => b.updated_at - a.updated_at),
     [notes, id],
   );
+  const groups = useMemo(() => groupByDate(folderNotes), [folderNotes]);
 
   if (!folder) {
     return (
       <div className="h-full flex flex-col items-center justify-center gap-3">
         <div className="text-[var(--color-text-muted)]">Folder not found</div>
-        <button onClick={() => navigate("/")} className="nd-action">
+        <button onClick={() => navigate("/")} className="nd-btn no-drag">
           Go home
         </button>
       </div>
@@ -53,68 +93,73 @@ export function Folder() {
   }
 
   const count = folderNotes.length;
-  const countLabel = count === 1 ? "1 note" : `${count} notes`;
 
   return (
     <div className="h-full flex flex-col overflow-hidden">
-      <div className="max-w-3xl mx-auto w-full px-12 pt-16 pb-6 flex items-center justify-between gap-6">
-        <div className="flex items-center gap-4 min-w-0">
-          <div className="w-12 h-12 rounded-md bg-[var(--color-surface)] flex items-center justify-center text-[var(--color-text-muted)] shrink-0">
-            <FolderIcon size={26} strokeWidth={1.2} />
+      {/* New note + theme toggle live in the floating TopBar (top-right). */}
+      <div className="shrink-0">
+        <div className="max-w-[880px] mx-auto w-full px-8 pt-14">
+          <div className="flex items-center gap-3 px-2">
+            <span className="shrink-0 grid place-items-center w-8 h-8 rounded-[9px] bg-[var(--color-surface-raised)] border border-[var(--color-line-visible)] text-[var(--color-text-muted)]">
+              <FolderIcon size={16} strokeWidth={1.7} />
+            </span>
+            <h1 className="text-[25px] font-semibold tracking-[-0.022em] truncate">{folder.name}</h1>
+            <span className="text-[14px] text-[var(--color-text-disabled)] tabular-nums shrink-0">{count}</span>
           </div>
-          <h1 className="text-5xl font-serif tracking-tight truncate">
-            {folder.name}
-          </h1>
-        </div>
-        <div className="text-sm text-[var(--color-text-muted)] shrink-0">
-          {countLabel}
-        </div>
-      </div>
-
-      <div className="max-w-3xl mx-auto w-full px-12">
-        <div className="-mx-4 px-4 pt-4 pb-3 flex items-baseline gap-2 border-b border-[var(--color-line)]">
-          <span className="text-sm font-medium text-[var(--color-text)]">
-            Notes
-          </span>
-          <span
-            className="text-xs text-[var(--color-text-muted)] tabular-nums"
-            style={{ fontFamily: "var(--font-mono)" }}
-          >
-            {count}
-          </span>
         </div>
       </div>
 
       <div className="flex-1 overflow-y-auto">
         {count === 0 ? (
-          <div className="max-w-3xl mx-auto w-full px-12 py-10 text-sm text-[var(--color-text-muted)]">
+          <div className="max-w-[880px] mx-auto w-full px-8 pt-16 text-center text-sm text-[var(--color-text-muted)]">
             No notes in this folder yet.
           </div>
         ) : (
-          <ul className="pt-2">
-            {folderNotes.map((n) => (
-              <li key={n.id}>
-                <Link to={`/note/${n.id}`} className="group block">
-                  <div className="max-w-3xl mx-auto w-full px-12">
-                    <div className="-mx-4 px-4 py-3.5 rounded-md hover:bg-[var(--color-sidebar-active)] transition-colors flex items-center gap-6">
-                      <span
-                        className="min-w-20 text-sm text-[var(--color-text-muted)] tabular-nums shrink-0 whitespace-nowrap"
-                        style={{ fontFamily: "var(--font-mono)" }}
-                      >
-                        {formatMeetingTime(n.updated_at)}
-                      </span>
-                      <span className="flex-1 truncate text-sm text-[var(--color-text)]">
-                        {n.title.trim() || "Untitled"}
-                      </span>
-                      {/* Duration column reserved for Slice 4 (duration_ms). */}
-                    </div>
+          <div className="pb-20">
+            {groups.map((g) => (
+              <section key={g.label}>
+                <div className="sticky top-0 z-10 bg-[var(--color-canvas)]">
+                  <div className="max-w-[880px] mx-auto w-full px-8 pt-5 pb-1">
+                    <span className="block px-3 nd-label">{g.label}</span>
                   </div>
-                </Link>
-              </li>
+                </div>
+                <ul>
+                  {g.items.map((n) => (
+                    <NoteRow key={n.id} note={n} />
+                  ))}
+                </ul>
+              </section>
             ))}
-          </ul>
+          </div>
         )}
       </div>
     </div>
+  );
+}
+
+function NoteRow({ note }: { note: Note }) {
+  const preview = notePreview(note);
+  return (
+    <li>
+      <Link to={`/note/${note.id}`} className="group block">
+        <div className="max-w-[880px] mx-auto w-full px-8">
+          <div className="flex items-start gap-3 p-3 rounded-[11px] hover:bg-[var(--color-pill-hover)] transition-colors">
+            <div className="flex-1 min-w-0">
+              <div className="text-[14.5px] font-medium text-[var(--color-text)] truncate">
+                {note.title.trim() || "Untitled"}
+              </div>
+              {preview && (
+                <div className="mt-0.5 text-[13px] text-[var(--color-text-muted)] truncate">
+                  {preview}
+                </div>
+              )}
+            </div>
+            <span className="shrink-0 pt-px text-[12px] text-[var(--color-text-disabled)] tabular-nums whitespace-nowrap">
+              {formatMeetingTime(note.updated_at)}
+            </span>
+          </div>
+        </div>
+      </Link>
+    </li>
   );
 }

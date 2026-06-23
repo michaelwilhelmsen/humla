@@ -68,7 +68,8 @@ export function GeneralTab({ s, update }: Pick<SettingsHook, "s" | "update">) {
             ))}
           </div>
           <p className="text-xs text-[var(--color-text-muted)] mt-2">
-            {PALETTES.find((p) => p.value === palette)?.description}
+            Humla now ships a single refined palette that adapts to light and
+            dark. This preference is kept for a future return of variants.
           </p>
         </Row>
         <Row label="Theme">

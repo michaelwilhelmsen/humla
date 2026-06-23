@@ -605,6 +605,20 @@ select {
   animation: recording-bar 1s ease-in-out infinite;
 }
 
+/* Floating recording-bar pills (status · controls · busy). A soft drop
+   shadow lifts them off the note body; in dark they step one rung up the
+   elevation ladder to --color-surface-raised so they stay distinct from
+   the canvas behind them. */
+.nd-recpill {
+  background: var(--color-surface);
+  box-shadow: 0 14px 36px -18px rgba(0, 0, 0, 0.42),
+              0 2px 6px -4px rgba(0, 0, 0, 0.18);
+}
+:root[data-theme="dark"] .nd-recpill { background: var(--color-surface-raised); }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .nd-recpill { background: var(--color-surface-raised); }
+}
+
 /* ------------------------------------------------------------------ */
 /* Prose styles for the Tiptap note editor + read-only blocks         */
 /* ------------------------------------------------------------------ */

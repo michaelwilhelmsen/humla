@@ -883,6 +883,8 @@ export function Note() {
                   />
                 </div>
 
+                {(isRecording || isPaused) && <ListeningHeader noteId={draft.id} />}
+
                 {hasTranscript ? (
                   <>
                     <div className="shrink-0">
@@ -934,12 +936,74 @@ export function Note() {
                     text="No transcript yet. Start a recording from the toolbar to capture and transcribe audio."
                   />
                 )}
+
+                {(isRecording || isPaused) && <LiveHint />}
               </div>
             )}
           </div>
         </aside>
     </div>
   );
+}
+
+// Live "listening" banner shown at the top of the Transcript tab while a
+// recording is in flight. Mirrors the floating bar's status (mic/sys
+// seconds, chunk count, elapsed) but in-context, so the panel reads as
+// actively capturing even before the first words land. Self-subscribes to
+// the recording store so the parent Note doesn't re-render on every
+// diagnostic tick.
+function ListeningHeader({ noteId }: { noteId: string }) {
+  const status = useRecordingStore((s) => s.status);
+  const phase = status.noteId === noteId ? status.phase : "idle";
+  const diag = useRecordingStore((s) => s.diag);
+  const showDiag = !!diag && diag.noteId === noteId;
+  const paused = phase === "paused";
+
+  const [elapsed, setElapsed] = useState(0);
+  useEffect(() => {
+    if (phase !== "recording" && phase !== "paused") {
+      setElapsed(0);
+      return;
+    }
+    if (phase === "paused") return; // hold the timer while paused
+    const start = Date.now() - elapsed * 1000;
+    const t = window.setInterval(() => setElapsed(Math.floor((Date.now() - start) / 1000)), 250);
+    return () => window.clearInterval(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [phase]);
+
+  return (
+    <div className="shrink-0 mb-4 flex items-center gap-3 px-3 py-2.5 rounded-[var(--radius)] border border-[var(--color-line)] bg-[var(--color-surface-2)]">
+      <span className="inline-flex items-center gap-[7px] shrink-0 text-[12.5px] font-semibold text-[var(--color-record)] whitespace-nowrap">
+        <span className={cn("inline-block w-2 h-2 rounded-full bg-[var(--color-record)]", !paused && "rec-dot")} />
+        {paused ? "Paused" : "Recording"}
+      </span>
+      {showDiag && (
+        <span className="min-w-0 truncate text-[12px] text-[var(--color-text-muted)] tabular-nums">
+          mic {(diag.micFrames / 16000).toFixed(0)}s · sys {(diag.sysFrames / 16000).toFixed(0)}s · {diag.chunks} chunk{diag.chunks === 1 ? "" : "s"}
+        </span>
+      )}
+      <span className="ml-auto shrink-0 text-[11px] text-[var(--color-text-disabled)] tabular-nums">{formatElapsed(elapsed)}</span>
+    </div>
+  );
+}
+
+// Footer note under the live transcript — sets the expectation that speaker
+// labels only appear after the post-stop diarize pass (during recording the
+// lines arrive plain, in capture order).
+function LiveHint() {
+  return (
+    <div className="shrink-0 mt-3 flex items-center gap-1.5 text-[12px] text-[var(--color-text-disabled)]">
+      <Users size={13} strokeWidth={1.6} />
+      Speakers are identified when you stop.
+    </div>
+  );
+}
+
+function formatElapsed(s: number) {
+  const m = Math.floor(s / 60);
+  const r = s % 60;
+  return `${m}:${r.toString().padStart(2, "0")}`;
 }
 
 // Note toolbar — back link, primary actions (Record / Summarize), the

@@ -1,12 +1,15 @@
 import { useEffect, useState } from "react";
-import { Circle, Pause, Play, Square } from "lucide-react";
+import { Pause, Play, Square } from "lucide-react";
 import { ipc } from "../lib/ipc";
 import { useRecordingStore } from "../lib/store";
 import { cn } from "../lib/cn";
 
 // Floating recording controls. Record / Summarize live in the note toolbar
 // now; this bar surfaces only the in-flight states (starting / recording /
-// paused / stopping / diarizing / summarizing).
+// paused / stopping / diarizing / summarizing). Two pills: a neutral status
+// pill (mic/sys seconds + chunk count) and a red-outlined timer/controls
+// pill. No audio visualizer — the status pill's live dots carry "is it
+// hearing me?" instead.
 export function RecordingBar({ noteId }: { noteId: string }) {
   const status = useRecordingStore((s) => s.status);
   const isThisNote = status.noteId === noteId;
@@ -43,64 +46,70 @@ export function RecordingBar({ noteId }: { noteId: string }) {
     catch (e) { useRecordingStore.getState().pushError({ noteId, message: String(e) }); }
   }
 
+  const recording = phase === "recording";
+  // The control pill's inner dividers + button hovers tint red while live,
+  // neutral while paused — keeps the red reserved for the active state.
+  const ctrlEdge = recording
+    ? "border-[color-mix(in_srgb,var(--color-record)_32%,transparent)] hover:bg-[color-mix(in_srgb,var(--color-record)_9%,transparent)]"
+    : "border-[var(--color-line-visible)] hover:bg-[var(--color-pill-hover)]";
+
   return (
-    <div className="absolute bottom-6 left-1/2 -translate-x-1/2 flex items-center gap-2">
+    <div className="absolute bottom-6 left-1/2 -translate-x-1/2 z-30 flex items-center gap-2.5">
       {showDiag && (
-        <div className="shrink-0 whitespace-nowrap flex items-center gap-2 px-3 py-1.5 rounded-full bg-[var(--color-surface)] border border-[var(--color-line)] text-xs text-[var(--color-text-muted)] tabular-nums">
-          <span className="flex items-center gap-1 whitespace-nowrap">
+        <div className="nd-recpill shrink-0 whitespace-nowrap flex items-center gap-[15px] h-[38px] px-4 rounded-full border border-[var(--color-line-visible)] text-[13px] text-[var(--color-text-muted)] tabular-nums">
+          <span className="inline-flex items-center gap-[7px]">
             <Dot active={micActive} /> mic {(diag.micFrames / 16000).toFixed(0)}s
           </span>
-          <span className="flex items-center gap-1 whitespace-nowrap">
+          <span className="inline-flex items-center gap-[7px]">
             <Dot active={sysActive} /> sys {(diag.sysFrames / 16000).toFixed(0)}s
           </span>
-          <span className="whitespace-nowrap">· {diag.chunks} chunk{diag.chunks === 1 ? "" : "s"}</span>
+          <span className="text-[var(--color-text-disabled)]">· {diag.chunks} chunk{diag.chunks === 1 ? "" : "s"}</span>
         </div>
       )}
 
-      {phase === "starting" && <BusyPill label="Starting" />}
-      {phase === "stopping" && <BusyPill label="Stopping" />}
-      {phase === "diarizing" && <BusyPill label="Diarizing" />}
-      {isSummarizing && <BusyPill label="Summarizing" />}
+      {phase === "starting" && <BusyPill label="Starting…" />}
+      {phase === "stopping" && <BusyPill label="Stopping…" />}
+      {phase === "diarizing" && <BusyPill label="Identifying speakers…" />}
+      {isSummarizing && <BusyPill label="Summarizing…" />}
 
       {(phase === "recording" || phase === "paused") && (
         <div
           className={cn(
-            "no-drag shrink-0 whitespace-nowrap flex items-stretch rounded-full overflow-hidden bg-[var(--color-surface)] border",
-            phase === "recording" ? "border-[var(--color-record)]" : "border-[var(--color-line-visible)]"
+            "nd-recpill no-drag shrink-0 whitespace-nowrap flex items-stretch h-[38px] rounded-full overflow-hidden border",
+            recording ? "border-[var(--color-record)]" : "border-[var(--color-line-visible)]"
           )}
         >
           <div
             className={cn(
-              "flex items-center gap-2 pl-4 pr-3 py-2 tabular-nums",
-              phase === "recording" ? "text-[var(--color-record)]" : "text-[var(--color-text-muted)]"
+              "flex items-center gap-[9px] px-4 text-[15px] font-semibold tabular-nums",
+              recording ? "text-[var(--color-record)]" : "text-[var(--color-text-muted)]"
             )}
-            style={{ fontFamily: "var(--font-mono)", fontSize: "12px", letterSpacing: "0.06em" }}
           >
-            {phase === "recording"
-              ? <Circle size={9} fill="currentColor" strokeWidth={0} className="rec-dot" />
-              : <Pause size={11} strokeWidth={1.5} />}
+            {recording
+              ? <span className="rec-dot inline-block w-[9px] h-[9px] rounded-full bg-[var(--color-record)]" />
+              : <Pause size={12} strokeWidth={1.8} />}
             <span>{formatTime(elapsed)}</span>
-            {phase === "paused" && <span className="uppercase tracking-[0.08em] text-[10px]">Paused</span>}
+            {phase === "paused" && (
+              <span className="uppercase tracking-[0.08em] text-[10px] font-medium">Paused</span>
+            )}
           </div>
-          <span className="w-px self-stretch bg-[var(--color-line-visible)]" />
           <button
-            onClick={phase === "recording" ? pause : resume}
-            className="no-drag flex items-center px-3 hover:bg-[var(--color-pill-hover)] text-[var(--color-text)] transition-colors"
-            title={phase === "recording" ? "Pause (⌘R)" : "Resume (⌘R)"}
-            aria-label={phase === "recording" ? "Pause" : "Resume"}
+            onClick={recording ? pause : resume}
+            className={cn("no-drag grid place-items-center w-[46px] border-l text-[var(--color-text)] transition-colors", ctrlEdge)}
+            title={recording ? "Pause (⌘R)" : "Resume (⌘R)"}
+            aria-label={recording ? "Pause" : "Resume"}
           >
-            {phase === "recording"
-              ? <Pause size={13} strokeWidth={1.5} />
-              : <Play size={13} strokeWidth={1.5} />}
+            {recording
+              ? <Pause size={16} strokeWidth={1.6} />
+              : <Play size={16} strokeWidth={1.6} />}
           </button>
-          <span className="w-px self-stretch bg-[var(--color-line-visible)]" />
           <button
             onClick={stop}
-            className="no-drag flex items-center px-3 text-[var(--color-record)] hover:bg-[var(--color-record)]/10 transition-colors"
+            className={cn("no-drag grid place-items-center w-[46px] border-l text-[var(--color-record)] transition-colors", ctrlEdge)}
             title="Stop"
             aria-label="Stop"
           >
-            <Square size={13} fill="currentColor" strokeWidth={0} />
+            <Square size={15} fill="currentColor" strokeWidth={0} />
           </button>
         </div>
       )}
@@ -116,11 +125,8 @@ function formatTime(s: number) {
 
 function BusyPill({ label }: { label: string }) {
   return (
-    <div
-      className="no-drag flex items-center gap-2 px-4 py-2 rounded-full bg-[var(--color-surface)] border border-[var(--color-line-visible)] text-[var(--color-text-muted)] uppercase tracking-[0.08em]"
-      style={{ fontFamily: "var(--font-mono)", fontSize: "11px" }}
-    >
-      <span className="w-2.5 h-2.5 rounded-full border-2 border-current border-t-transparent animate-spin" />
+    <div className="nd-recpill no-drag shrink-0 flex items-center gap-2 h-[38px] px-4 rounded-full border border-[var(--color-line-visible)] text-[13px] font-medium text-[var(--color-text-muted)]">
+      <span className="w-3 h-3 rounded-full border-2 border-current border-t-transparent animate-spin" />
       <span>{label}</span>
     </div>
   );
@@ -130,10 +136,9 @@ function Dot({ active }: { active: boolean }) {
   return (
     <span
       className={cn(
-        "inline-block w-1.5 h-1.5 rounded-full",
-        active ? "bg-green-500" : "bg-[var(--color-text-muted)]/40"
+        "inline-block w-[7px] h-[7px] rounded-full",
+        active ? "bg-[var(--color-success)]" : "bg-[var(--color-text-muted)]/40"
       )}
     />
   );
 }
-

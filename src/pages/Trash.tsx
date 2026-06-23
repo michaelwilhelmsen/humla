@@ -66,24 +66,21 @@ export function Trash() {
 
   return (
     <div className="h-full flex flex-col overflow-hidden">
-      <div className="max-w-3xl mx-auto w-full px-12 pt-16 pb-6 flex items-center justify-between gap-6">
-        <h1 className="text-5xl font-serif tracking-tight truncate">Trash</h1>
-        <div className="text-sm text-[var(--color-text-muted)] shrink-0">
-          {count === 1 ? "1 note" : `${count} notes`}
-        </div>
-      </div>
-
-      <div className="max-w-3xl mx-auto w-full px-12">
-        <div className="-mx-4 px-4 pt-4 pb-3 border-b border-[var(--color-line)]">
-          <span className="text-sm text-[var(--color-text-muted)]">
+      <div className="shrink-0">
+        <div className="max-w-[880px] mx-auto w-full px-8 pt-14">
+          <div className="flex items-center gap-3 px-2">
+            <h1 className="text-[25px] font-semibold tracking-[-0.022em] truncate">Trash</h1>
+            <span className="text-[14px] text-[var(--color-text-disabled)] tabular-nums shrink-0">{count}</span>
+          </div>
+          <p className="px-2 pt-2 text-[13px] text-[var(--color-text-muted)]">
             Deleted notes are kept here. Restore them, or delete permanently.
-          </span>
+          </p>
         </div>
       </div>
 
       <div className="flex-1 overflow-y-auto">
         {loading ? (
-          <div className="max-w-3xl mx-auto w-full px-12 pt-8 text-sm text-[var(--color-text-muted)]">
+          <div className="max-w-[880px] mx-auto w-full px-8 pt-8 text-sm text-[var(--color-text-muted)]">
             Loading…
           </div>
         ) : count === 0 ? (
@@ -91,42 +88,41 @@ export function Trash() {
             Trash is empty
           </div>
         ) : (
-          <ul className="pb-6 pt-2">
-            {trashed.map((n) => (
-              <li key={n.id}>
-                <div className="max-w-3xl mx-auto w-full px-12">
-                  <div className="-mx-4 px-4 py-3.5 rounded-md hover:bg-[var(--color-sidebar-active)] transition-colors flex items-center gap-4">
-                    <span
-                      className="min-w-28 text-xs text-[var(--color-text-muted)] tabular-nums shrink-0 whitespace-nowrap"
-                      style={{ fontFamily: "var(--font-mono)" }}
-                    >
-                      {formatDeleted(n.deleted_at)}
-                    </span>
-                    <span className="flex-1 truncate text-sm text-[var(--color-text)]">
-                      {n.title.trim() || "Untitled"}
-                    </span>
-                    <button
-                      onClick={() => restore(n.id)}
-                      disabled={busy === n.id}
-                      title="Restore"
-                      className="shrink-0 inline-flex items-center gap-1.5 px-2 py-1 rounded text-xs text-[var(--color-text-muted)] hover:text-[var(--color-text)] hover:bg-[var(--color-pill-hover)] transition-colors disabled:opacity-50"
-                    >
-                      <RotateCcw size={14} strokeWidth={1.5} /> Restore
-                    </button>
-                    <button
-                      onClick={() => purge(n.id)}
-                      disabled={busy === n.id}
-                      title="Delete permanently"
-                      aria-label="Delete permanently"
-                      className="shrink-0 p-1.5 rounded text-[var(--color-text-muted)] hover:text-[var(--color-danger)] hover:bg-[var(--color-pill-hover)] transition-colors disabled:opacity-50"
-                    >
-                      <Trash2 size={14} strokeWidth={1.5} />
-                    </button>
+          <div className="pt-3 pb-20">
+            <ul>
+              {trashed.map((n) => (
+                <li key={n.id}>
+                  <div className="max-w-[880px] mx-auto w-full px-8">
+                    <div className="flex items-center gap-3 p-3 rounded-[11px] hover:bg-[var(--color-pill-hover)] transition-colors">
+                      <span className="flex-1 truncate text-[14.5px] text-[var(--color-text)]">
+                        {n.title.trim() || "Untitled"}
+                      </span>
+                      <span className="shrink-0 text-[12px] text-[var(--color-text-disabled)] tabular-nums whitespace-nowrap">
+                        {formatDeleted(n.deleted_at)}
+                      </span>
+                      <button
+                        onClick={() => restore(n.id)}
+                        disabled={busy === n.id}
+                        title="Restore"
+                        className="shrink-0 inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[12px] text-[var(--color-text-muted)] hover:text-[var(--color-text)] hover:bg-[var(--color-surface-raised)] transition-colors disabled:opacity-50"
+                      >
+                        <RotateCcw size={14} strokeWidth={1.6} /> Restore
+                      </button>
+                      <button
+                        onClick={() => purge(n.id)}
+                        disabled={busy === n.id}
+                        title="Delete permanently"
+                        aria-label="Delete permanently"
+                        className="shrink-0 grid place-items-center w-7 h-7 rounded-md text-[var(--color-text-muted)] hover:text-[var(--color-danger)] hover:bg-[var(--color-pill-hover)] transition-colors disabled:opacity-50"
+                      >
+                        <Trash2 size={14} strokeWidth={1.6} />
+                      </button>
+                    </div>
                   </div>
-                </div>
-              </li>
-            ))}
-          </ul>
+                </li>
+              ))}
+            </ul>
+          </div>
         )}
       </div>
     </div>
