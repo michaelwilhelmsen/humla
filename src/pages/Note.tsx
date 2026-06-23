@@ -1,4 +1,4 @@
-import { Link, useNavigate, useParams } from "react-router-dom";
+import { Link, useNavigate, useOutletContext, useParams } from "react-router-dom";
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -31,6 +31,7 @@ import { useNotesStore, useRecordingStore } from "../lib/store";
 import { useOwnerName, useCloudStore } from "../lib/cloud";
 import { extractSpeakerLabels, renameSpeakerInTranscript } from "../lib/speakers";
 import { RecordingBar } from "../components/RecordingBar";
+import type { LayoutOutletContext } from "../components/Layout";
 import { SkeletonLines } from "../components/Skeleton";
 import { NoteEditor } from "../components/Editor";
 import { ContextMenu, ContextMenuItem } from "../components/ContextMenu";
@@ -61,6 +62,7 @@ function formatDateChip(ts: number) {
 
 export function Note() {
   const { id } = useParams<{ id: string }>();
+  const { sidebarCollapsed } = useOutletContext<LayoutOutletContext>();
   const upsert = useNotesStore((s) => s.upsertLocal);
   const refreshNotes = useNotesStore((s) => s.refresh);
   const folders = useNotesStore((s) => s.folders);
@@ -523,6 +525,7 @@ export function Note() {
           canRecord={!otherActiveRecording && !lockedBy}
           panelOpen={panelOpen}
           onTogglePanel={() => setPanelOpen((v) => !v)}
+          sidebarCollapsed={sidebarCollapsed}
         />
         <div className="flex-1 overflow-y-auto">
           <div
@@ -1021,6 +1024,7 @@ function NoteToolbar({
   canRecord,
   panelOpen,
   onTogglePanel,
+  sidebarCollapsed,
 }: {
   noteId: string;
   backTo: string;
@@ -1030,6 +1034,7 @@ function NoteToolbar({
   canRecord: boolean;
   panelOpen: boolean;
   onTogglePanel: () => void;
+  sidebarCollapsed: boolean;
 }) {
   const navigate = useNavigate();
   const removeLocal = useNotesStore((s) => s.removeLocal);
@@ -1061,7 +1066,7 @@ function NoteToolbar({
   }
 
   return (
-    <div data-tauri-drag-region className="relative z-30 h-12 shrink-0 flex items-center gap-2 px-3">
+    <div data-tauri-drag-region className={cn("relative z-30 h-12 shrink-0 flex items-center gap-2 pr-3", sidebarCollapsed ? "pl-[116px]" : "pl-3")}>
       <Link
         to={backTo}
         className="no-drag inline-flex items-center gap-1.5 pl-1.5 pr-2.5 py-1.5 rounded-[var(--radius)] text-[13px] text-[var(--color-text-muted)] hover:text-[var(--color-text)] hover:bg-[var(--color-pill-hover)] transition-colors"

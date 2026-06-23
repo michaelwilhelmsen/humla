@@ -41,7 +41,7 @@ export function TopBar() {
   }
 
   return (
-    <div className="absolute top-2 right-4 z-30 flex items-center gap-2">
+    <div className="absolute top-1.5 right-4 z-30 flex items-center gap-2">
       <button
         type="button"
         onClick={flipTheme}
