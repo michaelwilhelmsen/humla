@@ -239,13 +239,18 @@ pub fn move_note(conn: &Connection, id: &str, folder_id: Option<&str>) -> Result
     Ok(())
 }
 
-/// Reassign a note to a different workspace (`""` = Personal/local-only). Bumps
-/// `updated_at` so the move reads as a fresh write to the sync layer's LWW.
+/// Reassign a note to a different workspace (`""` = Personal/local-only).
+///
+/// Deliberately does NOT bump `updated_at`: a workspace move is not a content
+/// edit, so the note keeps its place in the activity-sorted lists instead of
+/// jumping to "Today". The sync layer still propagates the move (an explicit
+/// tombstone-in-old + upsert-in-new), and the push is resurrect-aware
+/// (`cloud_sync`'s `push_note`) so moving a note back into a workspace still
+/// wins last-write-wins over an earlier tombstone without a bumped timestamp.
 pub fn set_note_workspace(conn: &Connection, id: &str, workspace: &str) -> Result<()> {
-    let now = now_ms();
     conn.execute(
-        "UPDATE notes SET workspace_id = ?1, updated_at = ?2 WHERE id = ?3",
-        params![workspace, now, id],
+        "UPDATE notes SET workspace_id = ?1 WHERE id = ?2",
+        params![workspace, id],
     )?;
     Ok(())
 }

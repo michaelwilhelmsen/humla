@@ -418,6 +418,19 @@ export function Note() {
 
   if (!draft) return null;
 
+  // Who may move this note to another workspace: its creator, or a workspace
+  // owner/admin (who can reorganize). A plain member can't move a teammate's
+  // note out from under them (a move tombstones the shared copy for everyone).
+  // `owner` is empty for local/unsynced notes you just made — those are yours.
+  const noteWsRole = draft.workspace_id
+    ? myWorkspaces.find((w) => w.id === draft.workspace_id)?.role
+    : undefined;
+  const canMoveWorkspace =
+    !draft.owner ||
+    draft.owner === myUserId ||
+    noteWsRole === "owner" ||
+    noteWsRole === "admin";
+
   const hasSummary = draft.summary.trim().length > 0;
   const hasTranscript = draft.transcript.trim().length > 0;
   const showTranscriptSection = hasTranscript || isRecording || isPaused || isStarting || isStopping;
@@ -490,8 +503,9 @@ export function Note() {
               <span className="inline-flex items-center gap-2">
                 <WorkspacePicker
                   value={draft.workspace_id}
+                  disabled={readOnly || !canMoveWorkspace}
                   onChange={async (workspaceId) => {
-                    if (!draft || readOnly || workspaceId === draft.workspace_id) return;
+                    if (!draft || readOnly || !canMoveWorkspace || workspaceId === draft.workspace_id) return;
                     const next = { ...draft, workspace_id: workspaceId };
                     setDraft(next);
                     await ipc.setNoteWorkspace(draft.id, workspaceId);
@@ -1034,11 +1048,29 @@ function FolderPicker({
 function WorkspacePicker({
   value,
   onChange,
+  disabled = false,
 }: {
   value: string;
   onChange: (workspaceId: string) => void;
+  disabled?: boolean;
 }) {
   const workspaces = useCloudStore((s) => s.status.workspaces);
+  // Locked: show the workspace as plain text rather than an editable dropdown.
+  // Used when the current user isn't allowed to move this note (not its creator
+  // and not a workspace admin) or the note is otherwise read-only.
+  if (disabled) {
+    const name = value
+      ? (workspaces.find((w) => w.id === value)?.name ?? "a workspace")
+      : "Personal (this device)";
+    return (
+      <span
+        className="text-[var(--color-text-muted)]"
+        title="Only the note’s creator or a workspace admin can move it to another workspace."
+      >
+        {name}
+      </span>
+    );
+  }
   return (
     <>
       <select value={value} onChange={(e) => onChange(e.target.value)}>

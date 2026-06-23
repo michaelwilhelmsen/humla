@@ -399,6 +399,20 @@ impl Worker {
         } else {
             note.owner.clone()
         };
+        // Look up any existing remote record for this (client_id, workspace).
+        let remote = self.find_remote_id("notes", uuid, workspace, &auth.token).await?;
+        // LWW timestamp for this push. Normally the note's own `updated_at`, so a
+        // pure workspace move — which deliberately does NOT bump `updated_at`
+        // (`db::set_note_workspace`) — doesn't make the note read as
+        // freshly-modified on any device. The exception: if the target workspace
+        // still holds a *newer* tombstone for this note (it was moved out of here
+        // earlier), the un-bumped value would lose the server's last-write-wins
+        // and the move would silently re-delete the note — so step one past the
+        // tombstone to win and resurrect it.
+        let client_updated_at = match &remote {
+            Some((_, true, remote_cua)) if note.updated_at <= *remote_cua => *remote_cua + 1,
+            _ => note.updated_at,
+        };
         let body = json!({
             "client_id": uuid,
             "workspace": workspace,
@@ -412,10 +426,28 @@ impl Worker {
             "folder_client_id": note.folder_id.unwrap_or_default(),
             "expected_speakers": note.expected_speakers.unwrap_or(0),
             "created_at": note.created_at,
-            "client_updated_at": note.updated_at,
+            "client_updated_at": client_updated_at,
             "deleted": false,
         });
-        self.upsert_record("notes", uuid, workspace, &auth.token, body).await
+        let resp = match &remote {
+            Some((pb_id, _, _)) => {
+                self.http
+                    .patch(format!("{}/api/collections/notes/records/{}", self.config.base_url, pb_id))
+                    .bearer_auth(&auth.token)
+                    .json(&body)
+                    .send()
+                    .await?
+            }
+            None => {
+                self.http
+                    .post(format!("{}/api/collections/notes/records", self.config.base_url))
+                    .bearer_auth(&auth.token)
+                    .json(&body)
+                    .send()
+                    .await?
+            }
+        };
+        self.pb_ok(resp).await.map(|_| ())
     }
 
     async fn push_folder(&self, uuid: &str, workspace: &str) -> Result<()> {
@@ -453,7 +485,7 @@ impl Worker {
     /// the deletion instead of the row reappearing on their next pull.
     async fn push_delete(&self, collection: &str, uuid: &str, workspace: &str) -> Result<()> {
         let auth = self.ensure_auth().await?;
-        let Some(pb_id) = self.find_remote_id(collection, uuid, workspace, &auth.token).await? else {
+        let Some((pb_id, _, _)) = self.find_remote_id(collection, uuid, workspace, &auth.token).await? else {
             return Ok(()); // never synced; nothing to tombstone
         };
         let resp = self
@@ -477,7 +509,7 @@ impl Worker {
         body: serde_json::Value,
     ) -> Result<()> {
         let resp = match self.find_remote_id(collection, client_id, workspace, token).await? {
-            Some(pb_id) => {
+            Some((pb_id, _, _)) => {
                 self.http
                     .patch(format!(
                         "{}/api/collections/{}/records/{}",
@@ -500,19 +532,27 @@ impl Worker {
         self.pb_ok(resp).await.map(|_| ())
     }
 
+    /// Locate the remote record for `(client_id, workspace)`, returning its PB
+    /// id plus its current tombstone state and LWW timestamp — callers need the
+    /// latter two to decide whether a push must step past an existing tombstone
+    /// (see `push_note`'s resurrect logic).
     async fn find_remote_id(
         &self,
         collection: &str,
         client_id: &str,
         workspace: &str,
         token: &str,
-    ) -> Result<Option<String>> {
+    ) -> Result<Option<(String, bool, i64)>> {
         let filter = format!("client_id='{}' && workspace='{}'", client_id, workspace);
         let resp = self
             .http
             .get(format!("{}/api/collections/{}/records", self.config.base_url, collection))
             .bearer_auth(token)
-            .query(&[("filter", filter.as_str()), ("perPage", "1"), ("fields", "id")])
+            .query(&[
+                ("filter", filter.as_str()),
+                ("perPage", "1"),
+                ("fields", "id,deleted,client_updated_at"),
+            ])
             .send()
             .await?;
         let resp = self.pb_ok(resp).await?;
@@ -521,12 +561,15 @@ impl Worker {
         struct ListResp {
             items: Vec<Item>,
         }
-        #[derive(Deserialize)]
+        #[derive(Deserialize, Default)]
+        #[serde(default)]
         struct Item {
             id: String,
+            deleted: bool,
+            client_updated_at: i64,
         }
         let list: ListResp = resp.json().await?;
-        Ok(list.items.into_iter().next().map(|i| i.id))
+        Ok(list.items.into_iter().next().map(|i| (i.id, i.deleted, i.client_updated_at)))
     }
 
     /// Pull every entity changed since its cursor and apply locally.
