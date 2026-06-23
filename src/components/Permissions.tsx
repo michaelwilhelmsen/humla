@@ -100,13 +100,13 @@ export function Permissions() {
                       s.tone === "ok"
                         ? "var(--color-success)"
                         : s.tone === "bad"
-                        ? "var(--color-accent)"
+                        ? "var(--color-danger)"
                         : "var(--color-text-muted)",
                     borderColor:
                       s.tone === "ok"
                         ? "var(--color-success)"
                         : s.tone === "bad"
-                        ? "var(--color-accent)"
+                        ? "var(--color-danger)"
                         : "var(--color-line-visible)",
                   }}
                 >

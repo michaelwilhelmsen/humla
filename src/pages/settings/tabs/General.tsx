@@ -59,7 +59,7 @@ export function GeneralTab({ s, update }: Pick<SettingsHook, "s" | "update">) {
                 className={
                   "px-3 py-1 rounded text-sm " +
                   (palette === p.value
-                    ? "bg-[var(--color-pill-hover)] text-[var(--color-text)]"
+                    ? "bg-[var(--color-accent-soft)] text-[var(--color-accent-text)]"
                     : "text-[var(--color-text-muted)] hover:text-[var(--color-text)]")
                 }
               >
@@ -68,7 +68,8 @@ export function GeneralTab({ s, update }: Pick<SettingsHook, "s" | "update">) {
             ))}
           </div>
           <p className="text-xs text-[var(--color-text-muted)] mt-2">
-            {PALETTES.find((p) => p.value === palette)?.description}
+            Humla now ships a single refined palette that adapts to light and
+            dark. This preference is kept for a future return of variants.
           </p>
         </Row>
         <Row label="Theme">
@@ -80,7 +81,7 @@ export function GeneralTab({ s, update }: Pick<SettingsHook, "s" | "update">) {
                 className={
                   "px-3 py-1 rounded text-sm " +
                   (theme === t.value
-                    ? "bg-[var(--color-pill-hover)] text-[var(--color-text)]"
+                    ? "bg-[var(--color-accent-soft)] text-[var(--color-accent-text)]"
                     : "text-[var(--color-text-muted)] hover:text-[var(--color-text)]")
                 }
               >

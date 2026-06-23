@@ -16,9 +16,7 @@
     "release": "scripts/release.sh"
   },
   "dependencies": {
-    "@fontsource/instrument-serif": "^5.2.8",
-    "@fontsource/space-grotesk": "^5.2.10",
-    "@fontsource/space-mono": "^5.2.9",
+    "@fontsource/hanken-grotesk": "^5.2.8",
     "@tanstack/react-virtual": "^3.13.24",
     "@tauri-apps/api": "^2.1.1",
     "@tauri-apps/plugin-process": "~2",

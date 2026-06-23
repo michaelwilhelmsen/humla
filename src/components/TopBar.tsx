@@ -1,5 +1,5 @@
 import { useNavigate, useLocation } from "react-router-dom";
-import { Moon, PenLine, Sun } from "lucide-react";
+import { Moon, Plus, Sun } from "lucide-react";
 import { ipc } from "../lib/ipc";
 import { useNotesStore } from "../lib/store";
 import { useThemeStore } from "../lib/theme";
@@ -41,7 +41,7 @@ export function TopBar() {
   }
 
   return (
-    <div className="absolute top-2 right-4 z-30 flex items-center gap-2">
+    <div className="absolute top-1.5 right-4 z-30 flex items-center gap-2">
       <button
         type="button"
         onClick={flipTheme}
@@ -59,9 +59,9 @@ export function TopBar() {
         type="button"
         onClick={newNote}
         title="⌘N"
-        className="no-drag inline-flex items-center gap-2 pl-3 pr-4 py-1.5 rounded-full border border-[var(--color-line-visible)] bg-[var(--color-surface)] text-[var(--color-text)] text-sm hover:border-[var(--color-text)] transition-colors"
+        className="nd-btn nd-btn-primary no-drag"
       >
-        <PenLine size={14} strokeWidth={1.5} />
+        <Plus size={15} strokeWidth={1.8} />
         <span>New note</span>
       </button>
     </div>

@@ -204,7 +204,7 @@ export function AccountTab() {
             onKeyDown={(e) => e.key === "Enter" && canSubmit && submit()}
             placeholder={isSignup ? "At least 8 characters" : "••••••••"} />
         </Row>
-        {error && <div className="text-xs text-[var(--color-accent)]">{error}</div>}
+        {error && <div className="text-xs text-[var(--color-danger)]">{error}</div>}
         <div className="flex gap-2">
           <Btn onClick={submit} disabled={busy || !canSubmit}>
             {busy ? (isSignup ? "Creating…" : "Signing in…") : isSignup ? "Create account" : "Sign in"}
@@ -228,7 +228,7 @@ export function AccountTab() {
         Humla works fully offline. To sync across devices and collaborate with a team, connect to
         <strong> Humla Cloud</strong> (hosted — easiest) or point Humla at your own server.
       </p>
-      {error && <div className="text-xs text-[var(--color-accent)]">{error}</div>}
+      {error && <div className="text-xs text-[var(--color-danger)]">{error}</div>}
       <div className="flex items-center gap-2">
         <Btn onClick={useHumlaCloud} disabled={busy}>
           <span className="inline-flex items-center gap-1.5">

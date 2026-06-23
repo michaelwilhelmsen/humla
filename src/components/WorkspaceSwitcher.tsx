@@ -11,7 +11,7 @@ function SyncIndicator({ status }: { status: SyncStatus }) {
   const map = {
     syncing: { Icon: RefreshCw, cls: "animate-spin text-[var(--color-text-muted)]", title: "Syncing…" },
     idle: { Icon: Cloud, cls: "text-[var(--color-success)]", title: "Synced" },
-    error: { Icon: CloudOff, cls: "text-[var(--color-accent)]", title: "Sync error — will retry" },
+    error: { Icon: CloudOff, cls: "text-[var(--color-danger)]", title: "Sync error — will retry" },
   }[status];
   const { Icon } = map;
   return (
@@ -25,7 +25,6 @@ function RolePill({ role }: { role: CloudRole }) {
   return (
     <span
       className="shrink-0 px-1 text-[9px] uppercase tracking-[0.08em] rounded border border-[var(--color-line)] text-[var(--color-text-muted)]"
-      style={{ fontFamily: "var(--font-mono)" }}
     >
       {roleLabel(role)}
     </span>
@@ -103,7 +102,7 @@ export function WorkspaceSwitcher() {
     <div className="no-drag relative" ref={ref}>
       <button
         onClick={() => setOpen((v) => !v)}
-        className="w-full flex items-center gap-2 px-2 py-1.5 rounded-md text-sm border border-[var(--color-line)] bg-[var(--color-surface)] hover:border-[var(--color-text-muted)] transition-colors"
+        className="w-full flex items-center gap-2 px-2 h-9 rounded-md text-sm border border-[var(--color-line)] bg-[var(--color-surface)] hover:border-[var(--color-text-muted)] transition-colors"
       >
         <span className="shrink-0 grid place-items-center w-5 h-5 rounded bg-[var(--color-pill-hover)] text-[var(--color-text-muted)]">
           {current ? <Users size={13} strokeWidth={1.5} /> : <User size={13} strokeWidth={1.5} />}

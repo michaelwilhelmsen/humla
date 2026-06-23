@@ -1,14 +1,18 @@
 import { Outlet, useLocation } from "react-router-dom";
 import { useEffect, useState } from "react";
+import { PanelLeft } from "lucide-react";
 import { Sidebar } from "./Sidebar";
-import { SidebarCollapsed } from "./SidebarCollapsed";
 import { TopBar } from "./TopBar";
 import { Toaster } from "./Toaster";
 import { Updater } from "./Updater";
 import { PolishToast } from "./PolishToast";
 import { ErrorBoundary } from "./ErrorBoundary";
 import { bindBackendListeners } from "../lib/store";
-import { cn } from "../lib/cn";
+
+// Passed down to routed pages via <Outlet context>. The Note toolbar uses it
+// to inset its top-left content clear of the floating expand button + the
+// macOS traffic lights when the sidebar is collapsed (no nav card to host them).
+export type LayoutOutletContext = { sidebarCollapsed: boolean };
 
 // Below this width (px) the main app sidebar + Settings inner sidebar +
 // content all fight for room and the right-hand column starts wrapping
@@ -56,24 +60,18 @@ export function Layout() {
   const collapsed = manualCollapsed !== null ? manualCollapsed : shouldAutoCollapse;
 
   return (
-    <div className="flex h-full">
-      <aside
-        className={cn(
-          "shrink-0 border-r border-[var(--color-line)] transition-[width] duration-200 overflow-hidden bg-[var(--color-sidebar-bg)]",
-          collapsed ? "w-12" : "w-64",
-        )}
-      >
-        {/* Each variant of the sidebar provides its own drag strip
-            below — Sidebar via its h-8 header div, SidebarCollapsed
-            via the dedicated drag area. Putting another absolute
-            drag strip here would sit on top of Sidebar's collapse
-            button and intercept clicks. */}
-        {collapsed ? (
-          <SidebarCollapsed onExpand={() => setManualCollapsed(false)} />
-        ) : (
+    <div className="flex h-full p-1.5 gap-1.5 bg-[var(--color-canvas)]">
+      {/* Left nav is an inset rounded card floating on the canvas. The macOS
+          traffic lights land in its top-left corner; the Sidebar's own top
+          padding clears them. When collapsed the card is removed entirely —
+          a sliver would be narrower than the traffic-light row and they'd
+          overflow it — and a floating expand button beside the window
+          controls takes over. */}
+      {!collapsed && (
+        <aside className="shrink-0 w-64 overflow-hidden rounded-[var(--radius-card)] bg-[var(--color-sidebar-bg)] shadow-[var(--shadow-card)]">
           <Sidebar onCollapse={() => setManualCollapsed(true)} />
-        )}
-      </aside>
+        </aside>
+      )}
       <main className="flex-1 min-w-0 relative">
         {/* Drag strip on the main column too, so users can grab the
             window from anywhere along the title-bar zone, not just the
@@ -82,9 +80,23 @@ export function Layout() {
           data-tauri-drag-region
           className="absolute top-0 left-0 right-0 h-9 z-20"
         />
+        {/* Collapsed → expand toggle in the title-bar zone, just right of
+            the traffic lights (Claude-desktop style). */}
+        {collapsed && (
+          <button
+            type="button"
+            onClick={() => setManualCollapsed(false)}
+            data-tauri-drag-region="false"
+            aria-label="Open sidebar"
+            title="Open sidebar"
+            className="no-drag absolute top-1.5 left-[72px] z-40 grid place-items-center w-9 h-9 rounded-full text-[var(--color-text-muted)] hover:bg-[var(--color-pill-hover)] hover:text-[var(--color-text)] transition-colors"
+          >
+            <PanelLeft size={17} strokeWidth={1.7} />
+          </button>
+        )}
         <TopBar />
         <ErrorBoundary key={location.pathname}>
-          <Outlet />
+          <Outlet context={{ sidebarCollapsed: collapsed }} />
         </ErrorBoundary>
       </main>
       <Toaster />

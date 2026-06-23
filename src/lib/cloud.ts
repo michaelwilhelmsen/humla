@@ -168,9 +168,9 @@ export function roleLabel(role: CloudRole): string {
 export function roleColorVar(role: CloudRole): string {
   switch (role) {
     case "owner":
-      return "var(--color-accent)";
+      return "var(--color-accent-text)";
     case "admin":
-      return "var(--color-warning)";
+      return "var(--color-warning-text)";
     default:
       return "var(--color-text-muted)";
   }
