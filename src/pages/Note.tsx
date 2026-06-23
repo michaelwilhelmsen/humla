@@ -5,21 +5,23 @@ import remarkGfm from "remark-gfm";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
   Calendar,
+  CircleCheck,
   Eye,
   History,
   Check,
   ChevronDown,
   ChevronLeft,
-  ChevronUp,
   Circle,
   Cloud,
   Copy,
   FileText,
   Folder,
   Languages,
+  MessageSquare,
   MoreHorizontal,
+  PanelRight,
   RefreshCw,
-  User,
+  Sparkles,
   Users,
   X,
 } from "lucide-react";
@@ -35,6 +37,7 @@ import { ContextMenu, ContextMenuItem } from "../components/ContextMenu";
 import { SUMMARY_PRESETS, presetLabel } from "../lib/presets";
 import { LANGUAGES, languageOptionLabel } from "../lib/languages";
 import { useDeveloperMode } from "../lib/useDeveloperMode";
+import { cn } from "../lib/cn";
 
 // Memoized Markdown renderer. ReactMarkdown's parse step is O(N) over
 // the source string and we paint summaries that can hit 10K+ chars on
@@ -60,6 +63,7 @@ export function Note() {
   const { id } = useParams<{ id: string }>();
   const upsert = useNotesStore((s) => s.upsertLocal);
   const refreshNotes = useNotesStore((s) => s.refresh);
+  const folders = useNotesStore((s) => s.folders);
   const note = useNotesStore((s) => s.notes.find((n) => n.id === id));
   const [draft, setDraft] = useState<TNote | null>(null);
   // Version history panel + a nonce so restoring re-seeds the body editor
@@ -87,6 +91,7 @@ export function Note() {
   const billingEnabled = useCloudStore((s) => s.status.billing_enabled);
   // Our own user id — to distinguish our recording lock from a teammate's.
   const myUserId = useCloudStore((s) => s.status.user?.id);
+  const myName = useCloudStore((s) => s.status.user?.name ?? null);
   const noteWs = draft?.workspace_id
     ? myWorkspaces.find((w) => w.id === draft.workspace_id)
     : undefined;
@@ -109,8 +114,13 @@ export function Note() {
   const [thinkingStream, setThinkingStream] = useState<string>("");
   const [contentStream, setContentStream] = useState<string>("");
   const [thinkingExpanded, setThinkingExpanded] = useState<boolean>(true);
-  const [transcriptExpanded, setTranscriptExpanded] = useState<boolean>(false);
-  const [summaryExpanded, setSummaryExpanded] = useState<boolean>(false);
+  const [panelOpen, setPanelOpen] = useState<boolean>(true);
+  const [activeTab, setActiveTab] = useState<"summary" | "transcript">("summary");
+  const [panelWidth, setPanelWidth] = useState<number>(() => {
+    const saved = typeof localStorage !== "undefined" ? Number(localStorage.getItem("humla.panelWidth")) : NaN;
+    return saved >= 320 && saved <= 720 ? saved : 440;
+  });
+  const [resizing, setResizing] = useState<boolean>(false);
   const saveTimer = useRef<number | null>(null);
   const devMode = useDeveloperMode();
   // Playback bundle: the mixed WAV path (converted to a tauri:// asset
@@ -202,6 +212,54 @@ export function Note() {
   const isStarting = isThisNoteActive && recPhase.phase === "starting";
   const isStopping = isThisNoteActive && recPhase.phase === "stopping";
   const isDiarizing = isThisNoteActive && recPhase.phase === "diarizing";
+  const recActive = isStarting || isRecording || isPaused || isStopping || isDiarizing;
+
+  // When a recording starts on this note, surface the live transcript: open
+  // the context panel and switch to its Transcript tab.
+  useEffect(() => {
+    if (isStarting || isRecording) {
+      setPanelOpen(true);
+      setActiveTab("transcript");
+    }
+  }, [isStarting, isRecording]);
+
+  // Drag-to-resize for the context panel. A handle on the panel's left edge
+  // adjusts its width (clamped 320–720); persisted to localStorage. The
+  // width transition is suppressed mid-drag so it tracks the cursor.
+  const panelWidthRef = useRef(panelWidth);
+  panelWidthRef.current = panelWidth;
+  const resizeStartRef = useRef<{ x: number; w: number } | null>(null);
+  const beginResize = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    resizeStartRef.current = { x: e.clientX, w: panelWidthRef.current };
+    setResizing(true);
+  }, []);
+  useEffect(() => {
+    if (!resizing) return;
+    const onMove = (e: MouseEvent) => {
+      const s = resizeStartRef.current;
+      if (!s) return;
+      setPanelWidth(Math.min(720, Math.max(320, s.w + (s.x - e.clientX))));
+    };
+    const onUp = () => {
+      setResizing(false);
+      try {
+        localStorage.setItem("humla.panelWidth", String(panelWidthRef.current));
+      } catch {
+        /* ignore */
+      }
+    };
+    document.body.style.userSelect = "none";
+    document.body.style.cursor = "col-resize";
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    return () => {
+      document.body.style.userSelect = "";
+      document.body.style.cursor = "";
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+  }, [resizing]);
 
   // Recording lock for shared notes: poll who is recording this note so we can
   // show "X is recording…" and disable Record. Skipped for Personal notes and
@@ -433,25 +491,46 @@ export function Note() {
 
   const hasSummary = draft.summary.trim().length > 0;
   const hasTranscript = draft.transcript.trim().length > 0;
-  const showTranscriptSection = hasTranscript || isRecording || isPaused || isStarting || isStopping;
-  const showSummarySection = hasSummary || isSummarizing;
   // Live-feed alignment: while a recording is in flight, pin the
   // collapsed transcript card to its bottom so newly transcribed
   // chunks stay visible. After stop / on a saved note the user is
   // reading from the top, so flip back to top alignment.
   const transcriptLive = isRecording || isPaused || isStopping || isDiarizing;
 
+  const folder = draft.folder_id ? folders.find((f) => f.id === draft.folder_id) : null;
+  const backTo = folder ? `/folder/${folder.id}` : "/";
+  const backLabel = folder ? folder.name : "Home";
+  const otherActiveRecording = recPhase.noteId !== null && recPhase.noteId !== draft.id;
+  const authorName = ownerName ?? myName ?? null;
+  const authorInitial = (authorName ?? "?").slice(0, 1).toUpperCase();
+  const noteWsName = draft.workspace_id
+    ? (noteWs?.name ?? sharedWorkspace ?? "Workspace")
+    : "Personal";
+  const wsInitial = noteWsName.slice(0, 1).toUpperCase();
+
   return (
-    <div className="h-full flex flex-col">
-      <div data-tauri-drag-region className="h-10 shrink-0" />
-      {/* Two-layer scroll: the outer div is the full-width viewport that
-          owns the scrollbar (so it sits flush with the right edge of
-          the window). The inner div carries the centered max-w-3xl
-          content column. Splitting them is the only way to get a
-          window-edge scrollbar without making the content full-width. */}
-      <div className="flex-1 overflow-y-auto">
-        <div className="max-w-3xl mx-auto w-full px-12 pb-32">
-        <NoteHeader noteId={draft.id} folderId={draft.folder_id} summary={draft.summary} body={draft.body} readOnly={readOnly} />
+    <div className="h-full flex min-h-0">
+      {/* Body column — toolbar + scrollable writing area. The context
+          panel is a sibling card to the right; closing it widens the body
+          into a focus-writing mode. */}
+      <div className="flex-1 min-w-0 flex flex-col relative">
+        <NoteToolbar
+          noteId={draft.id}
+          backTo={backTo}
+          backLabel={backLabel}
+          readOnly={readOnly}
+          recActive={recActive}
+          canRecord={!otherActiveRecording && !lockedBy}
+          panelOpen={panelOpen}
+          onTogglePanel={() => setPanelOpen((v) => !v)}
+        />
+        <div className="flex-1 overflow-y-auto">
+          <div
+            className={cn(
+              "mx-auto w-full px-12 pt-3 pb-32 transition-[max-width] duration-300",
+              panelOpen ? "max-w-[640px]" : "max-w-[760px]",
+            )}
+          >
         {readOnly && (
           <div className="mb-4 flex items-center gap-2 px-3 py-2 rounded-md border border-[var(--color-line)] bg-[var(--color-pill-hover)] text-xs text-[var(--color-text-muted)]">
             <Eye size={13} strokeWidth={1.5} className="shrink-0" />
@@ -464,7 +543,7 @@ export function Note() {
         )}
         {!readOnly && lockedBy && (
           <div className="mb-4 flex items-center gap-2 px-3 py-2 rounded-md border border-[var(--color-line)] bg-[var(--color-pill-hover)] text-xs text-[var(--color-text-muted)]">
-            <Circle size={9} fill="currentColor" strokeWidth={0} className="shrink-0 rec-dot text-[var(--color-accent)]" />
+            <Circle size={9} fill="currentColor" strokeWidth={0} className="shrink-0 rec-dot text-[var(--color-record)]" />
             <span>
               <strong className="font-medium text-[var(--color-text)]">{lockedBy.holderName}</strong> is recording this note. Only one person can record a shared note at a time — the transcript will sync here when they stop.
             </span>
@@ -486,60 +565,62 @@ export function Note() {
           }}
           placeholder="New note"
           rows={1}
-          className="nd-bare block text-5xl font-serif tracking-tight w-full mb-6 placeholder:text-[var(--color-text-muted)]/50 resize-none overflow-hidden focus:outline-none leading-tight"
+          className="nd-bare block w-full mb-4 text-[30px] font-semibold leading-[1.18] tracking-[-0.022em] placeholder:text-[var(--color-text-muted)]/50 resize-none overflow-hidden focus:outline-none"
         />
 
-        <div className="nd-prop-table mb-10">
-          <PropertyRow icon={<Calendar size={14} />} label="created">
-            <span>{dateChip}</span>
-          </PropertyRow>
-          {ownerName && (
-            <PropertyRow icon={<User size={14} />} label="created by">
-              <span>{ownerName}</span>
-            </PropertyRow>
+        <div className="flex flex-wrap items-center gap-1 mb-8 pb-4 border-b border-[var(--color-line)]">
+          {authorName && (
+            <span className="nd-meta" style={{ color: "var(--color-text)" }}>
+              <span
+                className="grid place-items-center w-[18px] h-[18px] rounded-full text-[9.5px] font-semibold"
+                style={{ background: "var(--color-accent)", color: "var(--color-on-accent)" }}
+              >
+                {authorInitial}
+              </span>
+              <span className="font-medium">{authorName}</span>
+            </span>
           )}
           {cloudLoggedIn ? (
-            <PropertyRow icon={<Users size={14} />} label="workspace">
-              <span className="inline-flex items-center gap-2">
-                <WorkspacePicker
-                  value={draft.workspace_id}
-                  disabled={readOnly || !canMoveWorkspace}
-                  onChange={async (workspaceId) => {
-                    if (!draft || readOnly || !canMoveWorkspace || workspaceId === draft.workspace_id) return;
-                    const next = { ...draft, workspace_id: workspaceId };
-                    setDraft(next);
-                    await ipc.setNoteWorkspace(draft.id, workspaceId);
-                    // Moving out of the active workspace removes it from that
-                    // list — refetch so the sidebar reflects the move.
-                    await refreshNotes();
-                  }}
-                />
-                {draft.workspace_id && (
-                  <span className="text-xs text-[var(--color-text-muted)] whitespace-nowrap">
-                    {notePending ? "· syncing…" : "· synced"}
-                  </span>
-                )}
+            <span className="nd-meta is-interactive relative">
+              <span
+                className="grid place-items-center w-[17px] h-[17px] rounded-[5px] text-[9px] font-semibold"
+                style={{ background: "var(--color-surface-raised)", color: "var(--color-text)" }}
+              >
+                {wsInitial}
               </span>
-            </PropertyRow>
+              <WorkspacePicker
+                value={draft.workspace_id}
+                disabled={readOnly || !canMoveWorkspace}
+                onChange={async (workspaceId) => {
+                  if (!draft || readOnly || !canMoveWorkspace || workspaceId === draft.workspace_id) return;
+                  const next = { ...draft, workspace_id: workspaceId };
+                  setDraft(next);
+                  await ipc.setNoteWorkspace(draft.id, workspaceId);
+                  // Moving out of the active workspace removes it from that
+                  // list — refetch so the sidebar reflects the move.
+                  await refreshNotes();
+                }}
+              />
+            </span>
           ) : (
             draft.workspace_id && (
-              <PropertyRow icon={<Users size={14} />} label="shared with">
+              <span className="nd-meta">
+                <span
+                  className="grid place-items-center w-[17px] h-[17px] rounded-[5px] text-[9px] font-semibold"
+                  style={{ background: "var(--color-surface-raised)", color: "var(--color-text)" }}
+                >
+                  {wsInitial}
+                </span>
                 <span>{sharedWorkspace ?? "your workspace"}</span>
-              </PropertyRow>
+              </span>
             )
           )}
-          {(isRecording || isStarting || isPaused) && (
-            <PropertyRow
-              icon={<Circle size={14} fill={isPaused ? "transparent" : "currentColor"} />}
-              label="status"
-              accent={isRecording || isStarting ? "var(--color-accent)" : undefined}
-            >
-              <span style={{ color: isRecording || isStarting ? "var(--color-accent)" : undefined }}>
-                {isStarting ? "Starting" : isPaused ? "Paused" : "Recording"}
-              </span>
-            </PropertyRow>
-          )}
-          <PropertyRow icon={<Folder size={14} />} label="folder">
+          <span className="nd-meta">
+            <Calendar size={14} strokeWidth={1.7} />
+            {dateChip}
+          </span>
+          <span className="nd-meta is-interactive relative">
+            <Folder size={14} strokeWidth={1.6} />
             <FolderPicker
               value={draft.folder_id}
               onChange={async (folderId) => {
@@ -550,38 +631,32 @@ export function Note() {
                 upsert(next);
               }}
             />
-          </PropertyRow>
-          <PropertyRow icon={<FileText size={14} />} label="preset">
-            <PresetPicker
-              value={draft.summary_preset || "meeting"}
-              onChange={(v) => patch("summary_preset", v)}
-            />
-          </PropertyRow>
-          <PropertyRow icon={<Languages size={14} />} label="language">
-            <LanguagePicker
-              value={draft.language || uiLang}
-              onChange={(v) => patch("language", v)}
-            />
-          </PropertyRow>
-          <PropertyRow icon={<Users size={14} />} label="speakers">
-            <SpeakersPicker
-              value={draft.expected_speakers}
-              onChange={async (n) => {
-                if (!draft || readOnly) return;
-                const next = { ...draft, expected_speakers: n };
-                setDraft(next);
-                await ipc.updateNote(draft.id, { expected_speakers: n });
-                upsert(next);
-              }}
-            />
-          </PropertyRow>
-          <PropertyRow icon={<Cloud size={14} />} label="summary">
-            <SummaryProviderChip
-              value={draft.summary_provider}
-              globalDefault={globalProvider}
-              onChange={patchProvider}
-            />
-          </PropertyRow>
+          </span>
+          {recActive ? (
+            <span className="nd-meta" style={{ color: "var(--color-record)", fontWeight: 500 }}>
+              <span
+                className={cn("w-[7px] h-[7px] rounded-full", !isPaused && "rec-dot")}
+                style={{
+                  background: isPaused ? "transparent" : "var(--color-record)",
+                  border: isPaused ? "1.5px solid var(--color-record)" : undefined,
+                }}
+              />
+              {isStarting
+                ? "Starting"
+                : isPaused
+                ? "Paused"
+                : isStopping
+                ? "Stopping"
+                : isDiarizing
+                ? "Identifying speakers"
+                : "Recording"}
+            </span>
+          ) : draft.workspace_id ? (
+            <span className="nd-meta" style={{ color: "var(--color-success)" }}>
+              <CircleCheck size={14} strokeWidth={1.7} style={{ opacity: 1 }} />
+              {notePending ? "Syncing…" : "Synced"}
+            </span>
+          ) : null}
         </div>
 
         <NoteEditor
@@ -649,290 +724,312 @@ export function Note() {
           )}
         </div>
 
-        {showSummarySection && (
-          <Card className="mt-8">
-            <CollapsibleHeader
-              expanded={summaryExpanded}
-              onToggle={() => setSummaryExpanded((v) => !v)}
-              label="summary"
-              actions={
-                hasSummary ? (
-                  <CopyButton
-                    label="Summary"
-                    // Prefer the saved summary; if a regen is mid-stream and
-                    // the saved version is stale, copy reads the cached
-                    // value the user can see (the streaming view replaces
-                    // it visually but `draft.summary` is the source of
-                    // truth until commit).
-                    getText={() => draft.summary}
-                  />
-                ) : undefined
-              }
+          </div>
+        </div>
+        {!readOnly && <RecordingBar noteId={draft.id} />}
+      </div>
+
+      <aside
+        style={{ width: panelOpen ? panelWidth : 0 }}
+        className={cn(
+          "shrink-0 flex flex-col overflow-hidden rounded-[var(--radius-card)] border border-[var(--color-card-border)] bg-[var(--color-surface)] shadow-[var(--shadow-card)] relative z-30",
+          !resizing && "transition-[width,opacity] duration-300 ease-[cubic-bezier(0.4,0,0.2,1)]",
+          panelOpen ? "opacity-100 ml-1.5" : "opacity-0 border-0 pointer-events-none",
+        )}
+        aria-hidden={!panelOpen}
+      >
+          {panelOpen && (
+            <div
+              onMouseDown={beginResize}
+              title="Drag to resize"
+              className="group absolute left-0 top-0 bottom-0 z-40 w-2 cursor-col-resize"
             >
-              <span>Summary</span>
-              {isSummarizing && hasSummary && (
-                <span className="text-xs text-[var(--color-text-muted)] flex items-center gap-1.5 normal-case tracking-normal">
-                  <span
-                    className="inline-block w-2 h-2 rounded-full bg-[var(--color-text-muted)] animate-pulse"
-                    aria-hidden
+              <div className="absolute left-0 top-0 bottom-0 w-px bg-[var(--color-line-visible)] opacity-0 group-hover:opacity-100 transition-opacity" />
+            </div>
+          )}
+          {/* Tabs + close */}
+          <div className="h-12 shrink-0 flex items-center gap-1 pl-2 pr-1.5 border-b border-[var(--color-line)]">
+            <div className="flex-1 flex gap-1">
+              <button
+                type="button"
+                onClick={() => setActiveTab("summary")}
+                className={cn(
+                  "inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-[var(--radius)] text-[13px] font-medium transition-colors",
+                  activeTab === "summary"
+                    ? "bg-[var(--color-accent-soft)] text-[var(--color-accent)]"
+                    : "text-[var(--color-text-disabled)] hover:text-[var(--color-text-muted)]",
+                )}
+              >
+                <FileText size={14} strokeWidth={1.6} />
+                Summary
+              </button>
+              <button
+                type="button"
+                onClick={() => setActiveTab("transcript")}
+                className={cn(
+                  "inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-[var(--radius)] text-[13px] font-medium transition-colors",
+                  activeTab === "transcript"
+                    ? "bg-[var(--color-accent-soft)] text-[var(--color-accent)]"
+                    : "text-[var(--color-text-disabled)] hover:text-[var(--color-text-muted)]",
+                )}
+              >
+                <MessageSquare size={14} strokeWidth={1.6} />
+                Transcript
+              </button>
+            </div>
+            <button
+              type="button"
+              onClick={() => setPanelOpen(false)}
+              title="Close panel"
+              aria-label="Close panel"
+              className="w-8 h-8 grid place-items-center rounded-[var(--radius)] text-[var(--color-text-disabled)] hover:bg-[var(--color-pill-hover)] hover:text-[var(--color-text)] transition-colors"
+            >
+              <X size={16} strokeWidth={1.6} />
+            </button>
+          </div>
+
+          <div className="flex-1 min-h-0 flex flex-col">
+            {activeTab === "summary" ? (
+              <div className="flex-1 min-h-0 overflow-y-auto px-4 py-4">
+                <div className="flex flex-wrap items-center gap-2 mb-4">
+                  <PresetPicker
+                    value={draft.summary_preset || "meeting"}
+                    onChange={(v) => patch("summary_preset", v)}
                   />
-                  Regenerating…
-                </span>
-              )}
-            </CollapsibleHeader>
-            {/* Live reasoning trace: shown only on local LLM providers
-                while the model is thinking. Cloud OpenAI doesn't stream
-                a thinking trace through this path (reasoning models keep
-                their chain-of-thought server-side), so showing the panel
-                there is just a permanent "waiting for the model…"
-                placeholder. Rendered ChatGPT-style — small muted text
-                directly under the header, no inner border or panel, with
-                full markdown formatting since Qwen-class models emit
-                their thoughts as markdown. Once the final summary lands
-                the trace starts collapsed so it doesn't dominate. */}
-            {isLocalProvider && (thinkingStream.length > 0 || (isSummarizing && contentStream.length === 0)) && (
-              <div className="mb-6">
-                <button
-                  type="button"
-                  onClick={() => setThinkingExpanded((v) => !v)}
-                  className="flex items-center gap-1.5 text-xs text-[var(--color-text-muted)] hover:text-[var(--color-text)] transition-colors"
-                >
-                  <span>
-                    Reasoning
-                    {thinkingStream.length > 0 && ` · ${thinkingStream.length.toLocaleString()} chars`}
-                    {isSummarizing && thinkingStream.length === 0 && " · waiting for the model…"}
-                  </span>
-                  <span aria-hidden className="inline-block w-3 text-center">{thinkingExpanded ? "▾" : "▸"}</span>
-                </button>
-                {thinkingExpanded && thinkingStream.length > 0 && (
-                  <div
-                    ref={reasoningRef}
-                    className="prose-reasoning mt-2 max-h-64 overflow-y-auto"
-                  >
-                    <Markdown source={thinkingStream} />
+                  <SummaryProviderChip
+                    value={draft.summary_provider}
+                    globalDefault={globalProvider}
+                    onChange={patchProvider}
+                  />
+                  <div className="ml-auto flex items-center gap-0.5">
+                    {hasSummary && <CopyButton label="Summary" getText={() => draft.summary} />}
+                    {!readOnly && (
+                      <button
+                        type="button"
+                        onClick={() => ipc.summarizeNote(draft.id)}
+                        title="Regenerate summary"
+                        aria-label="Regenerate summary"
+                        className="p-1.5 rounded-md text-[var(--color-text-muted)] hover:bg-[var(--color-pill-hover)] hover:text-[var(--color-text)] transition-colors"
+                      >
+                        <RefreshCw size={15} strokeWidth={1.6} />
+                      </button>
+                    )}
                   </div>
+                </div>
+
+                {/* Live reasoning trace (local LLM only). Cloud OpenAI keeps
+                    its chain-of-thought server-side, so the panel there would
+                    be a permanent "waiting…" placeholder. */}
+                {isLocalProvider && (thinkingStream.length > 0 || (isSummarizing && contentStream.length === 0)) && (
+                  <div className="mb-5">
+                    <button
+                      type="button"
+                      onClick={() => setThinkingExpanded((v) => !v)}
+                      className="flex items-center gap-1.5 text-xs text-[var(--color-text-muted)] hover:text-[var(--color-text)] transition-colors"
+                    >
+                      <span>
+                        Reasoning
+                        {thinkingStream.length > 0 && ` · ${thinkingStream.length.toLocaleString()} chars`}
+                        {isSummarizing && thinkingStream.length === 0 && " · waiting for the model…"}
+                      </span>
+                      <span aria-hidden className="inline-block w-3 text-center">{thinkingExpanded ? "▾" : "▸"}</span>
+                    </button>
+                    {thinkingExpanded && thinkingStream.length > 0 && (
+                      <div ref={reasoningRef} className="prose-reasoning mt-2 max-h-56 overflow-y-auto">
+                        <Markdown source={thinkingStream} />
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* Render priority: streaming while summarizing, then the
+                    saved summary, then streaming as a first-time fallback,
+                    then a skeleton; finally the empty state. */}
+                {isSummarizing && contentStream.length > 0 ? (
+                  <div className="prose-summary text-sm leading-relaxed"><Markdown source={contentStream} /></div>
+                ) : hasSummary ? (
+                  <div className="prose-summary text-sm leading-relaxed"><Markdown source={draft.summary} /></div>
+                ) : contentStream.length > 0 ? (
+                  <div className="prose-summary text-sm leading-relaxed"><Markdown source={contentStream} /></div>
+                ) : isSummarizing ? (
+                  <SkeletonLines lines={5} />
+                ) : (
+                  <PanelEmpty
+                    icon={<Sparkles size={22} strokeWidth={1.5} />}
+                    text={
+                      recActive
+                        ? "The summary is generated after you stop the recording."
+                        : "No summary yet. Use Summarize in the toolbar to generate one from your notes and transcript."
+                    }
+                  />
+                )}
+              </div>
+            ) : (
+              <div className="flex-1 min-h-0 flex flex-col px-4 py-4">
+                <div className="flex flex-wrap items-center gap-2 mb-4 shrink-0">
+                  <LanguagePicker
+                    value={draft.language || uiLang}
+                    onChange={(v) => patch("language", v)}
+                  />
+                  <SpeakersPicker
+                    value={draft.expected_speakers}
+                    onChange={async (n) => {
+                      if (!draft || readOnly) return;
+                      const next = { ...draft, expected_speakers: n };
+                      setDraft(next);
+                      await ipc.updateNote(draft.id, { expected_speakers: n });
+                      upsert(next);
+                    }}
+                  />
+                </div>
+
+                {hasTranscript ? (
+                  <>
+                    <div className="shrink-0">
+                      <SpeakerLabels
+                        transcript={draft.transcript}
+                        readOnly={readOnly}
+                        onRename={(oldLabel, newLabel) => {
+                          if (readOnlyRef.current) return;
+                          patch("transcript", renameSpeakerInTranscript(draft.transcript, oldLabel, newLabel));
+                          setTimeline((tl) =>
+                            tl.map((e) => (e.label === oldLabel ? { ...e, label: newLabel } : e)),
+                          );
+                          ipc
+                            .noteTimelineRename(draft.id, oldLabel, newLabel)
+                            .catch((err) => console.error("noteTimelineRename failed", err));
+                        }}
+                      />
+                      {!readOnly && <RediarizeAction noteId={draft.id} />}
+                      {devMode && <DiagnosticsLinks noteId={draft.id} />}
+                    </div>
+                    {playbackUrl && timeline.length > 0 ? (
+                      <TranscriptPlayer
+                        noteId={draft.id}
+                        timeline={timeline}
+                        setTimeline={setTimeline}
+                        playbackUrl={playbackUrl}
+                        transcript={draft.transcript}
+                        onChange={onTranscriptChange}
+                        disabled={readOnly || recActive}
+                        fill
+                        bottomAligned={transcriptLive}
+                      />
+                    ) : (
+                      <TranscriptEditor
+                        value={draft.transcript}
+                        onChange={onTranscriptChange}
+                        disabled={readOnly || recActive}
+                        fill
+                        bottomAligned={transcriptLive}
+                      />
+                    )}
+                    {isRecording && <SkeletonLines lines={2} className="mt-3 shrink-0" />}
+                  </>
+                ) : recActive ? (
+                  <SkeletonLines lines={4} />
+                ) : (
+                  <PanelEmpty
+                    icon={<MessageSquare size={22} strokeWidth={1.5} />}
+                    text="No transcript yet. Start a recording from the toolbar to capture and transcribe audio."
+                  />
                 )}
               </div>
             )}
-            {/* Render priority: streaming first while summarizing (so the
-                user sees the model working when re-running on a note that
-                already has a saved summary), then the saved summary, then
-                the streaming as a first-time fallback, then a skeleton.
-                Without the isSummarizing guard, hasSummary would always
-                win and the streaming would be invisible behind the cached
-                summary — minutes of "nothing happening" on local LLMs. */}
-            <CollapsibleScroll expanded={summaryExpanded} bottomAligned={false}>
-              {isSummarizing && contentStream.length > 0 ? (
-                <div className="prose-summary text-base leading-relaxed">
-                  <Markdown source={contentStream} />
-                </div>
-              ) : hasSummary ? (
-                <div className="prose-summary text-base leading-relaxed">
-                  <Markdown source={draft.summary} />
-                </div>
-              ) : contentStream.length > 0 ? (
-                <div className="prose-summary text-base leading-relaxed">
-                  <Markdown source={contentStream} />
-                </div>
-              ) : (
-                <SkeletonLines lines={5} />
-              )}
-            </CollapsibleScroll>
-          </Card>
-        )}
-
-        {showTranscriptSection && (
-          <Card className="mt-4 focus-within:border-[var(--color-text)] transition-colors">
-            <CollapsibleHeader
-              expanded={transcriptExpanded}
-              onToggle={() => setTranscriptExpanded((v) => !v)}
-              label="transcript"
-            >
-              <span>Transcript</span>
-              {isRecording && (
-                <span className="inline-flex items-end gap-0.5 h-2.5">
-                  {[0, 1, 2, 3].map((i) => (
-                    <span
-                      key={i}
-                      className="rec-bar inline-block w-0.5 rounded-full h-full"
-                      style={{ animationDelay: `${i * 130}ms`, background: "var(--color-accent)" }}
-                    />
-                  ))}
-                </span>
-              )}
-            </CollapsibleHeader>
-            {hasTranscript ? (
-              <>
-                <SpeakerLabels
-                  transcript={draft.transcript}
-                  readOnly={readOnly}
-                  onRename={(oldLabel, newLabel) => {
-                    if (readOnlyRef.current) return; // viewer: no transcript/timeline edits
-                    patch(
-                      "transcript",
-                      renameSpeakerInTranscript(draft.transcript, oldLabel, newLabel),
-                    );
-                    // Mirror the rename into the timeline so the
-                    // playback view's chunk highlights pick up the new
-                    // label without a re-diarize. Local state update
-                    // gives an instant repaint; the backend rewrite
-                    // persists the change so it survives reload.
-                    setTimeline((tl) =>
-                      tl.map((e) =>
-                        e.label === oldLabel ? { ...e, label: newLabel } : e,
-                      ),
-                    );
-                    ipc
-                      .noteTimelineRename(draft.id, oldLabel, newLabel)
-                      .catch((err) =>
-                        console.error("noteTimelineRename failed", err),
-                      );
-                  }}
-                />
-                {!readOnly && <RediarizeAction noteId={draft.id} />}
-                {devMode && <DiagnosticsLinks noteId={draft.id} />}
-                {playbackUrl && timeline.length > 0 ? (
-                  <TranscriptPlayer
-                    noteId={draft.id}
-                    timeline={timeline}
-                    setTimeline={setTimeline}
-                    playbackUrl={playbackUrl}
-                    transcript={draft.transcript}
-                    onChange={onTranscriptChange}
-                    disabled={readOnly || isRecording || isPaused || isStarting || isStopping || isDiarizing}
-                    expanded={transcriptExpanded}
-                    bottomAligned={transcriptLive}
-                  />
-                ) : (
-                  <TranscriptEditor
-                    value={draft.transcript}
-                    onChange={onTranscriptChange}
-                    disabled={readOnly || isRecording || isPaused || isStarting || isStopping || isDiarizing}
-                    expanded={transcriptExpanded}
-                    bottomAligned={transcriptLive}
-                  />
-                )}
-                {isRecording && <SkeletonLines lines={2} className="mt-3" />}
-              </>
-            ) : (
-              <SkeletonLines lines={4} />
-            )}
-          </Card>
-        )}
-        </div>
-      </div>
-
-      {!readOnly && <RecordingBar noteId={draft.id} lockedByName={lockedBy?.holderName ?? null} />}
+          </div>
+        </aside>
     </div>
   );
 }
 
-/// One row in the Note's properties panel: icon + label on the left,
-/// child editor on the right. Hover/focus styling and the dropdown caret
-/// reveal are handled by the surrounding `.nd-prop-table` CSS.
-function PropertyRow({
-  icon,
-  label,
-  children,
-  accent,
-}: {
-  icon: React.ReactNode;
-  label: string;
-  children: React.ReactNode;
-  accent?: string;
-}) {
-  return (
-    <div className="nd-prop-row">
-      <div className="nd-prop-label" style={accent ? { color: accent } : undefined}>
-        {icon}
-        <span>{label}</span>
-      </div>
-      <div className="nd-prop-value">{children}</div>
-    </div>
-  );
-}
-
-function stripHtml(html: string): string {
-  if (!html) return "";
-  const tmp = document.createElement("div");
-  tmp.innerHTML = html;
-  return (tmp.textContent || "").trim();
-}
-
-function NoteHeader({
+// Note toolbar — back link, primary actions (Record / Summarize), the
+// context-panel toggle, and an overflow menu. Replaces the old cryptic
+// copy/refresh/more icon row. Record + Summarize appear only when idle
+// (not readOnly); during a recording the floating bar takes over.
+function NoteToolbar({
   noteId,
-  folderId,
-  summary,
-  body,
+  backTo,
+  backLabel,
   readOnly,
+  recActive,
+  canRecord,
+  panelOpen,
+  onTogglePanel,
 }: {
   noteId: string;
-  folderId: string | null;
-  summary: string;
-  body: string;
+  backTo: string;
+  backLabel: string;
   readOnly: boolean;
+  recActive: boolean;
+  canRecord: boolean;
+  panelOpen: boolean;
+  onTogglePanel: () => void;
 }) {
   const navigate = useNavigate();
-  const folders = useNotesStore((s) => s.folders);
   const removeLocal = useNotesStore((s) => s.removeLocal);
   const [menuPos, setMenuPos] = useState<{ x: number; y: number } | null>(null);
-  const [copied, setCopied] = useState(false);
 
-  const folder = folderId ? folders.find((f) => f.id === folderId) : null;
-  const backTo = folder ? `/folder/${folder.id}` : "/";
-  const backLabel = folder ? folder.name : "Home";
-  const canCopy = !!(summary?.trim() || stripHtml(body));
-
-  async function onCopy() {
-    const text = summary?.trim() || stripHtml(body);
-    if (!text) return;
-    await navigator.clipboard.writeText(text);
-    setCopied(true);
-    window.setTimeout(() => setCopied(false), 1200);
+  async function record() {
+    try {
+      await ipc.recordingStart(noteId);
+    } catch (e) {
+      useRecordingStore.getState().pushError({ noteId, message: String(e) });
+    }
   }
-
-  async function onResummarize() {
-    await ipc.summarizeNote(noteId);
+  async function summarize() {
+    try {
+      await ipc.summarizeNote(noteId);
+    } catch (e) {
+      useRecordingStore.getState().pushError({ noteId, message: String(e), kind: "summary" });
+    }
   }
-
   async function onDelete() {
     setMenuPos(null);
     await ipc.deleteNote(noteId);
     removeLocal(noteId);
     navigate(backTo);
   }
-
   function openMenu(e: React.MouseEvent<HTMLButtonElement>) {
     const rect = e.currentTarget.getBoundingClientRect();
-    // Anchor under the button, right-aligned so the menu doesn't run
-    // off the edge on narrow viewports.
     setMenuPos({ x: rect.right - 160, y: rect.bottom + 4 });
   }
 
   return (
-    <div className="flex items-center justify-between pt-2 mb-10">
+    <div data-tauri-drag-region className="relative z-30 h-12 shrink-0 flex items-center gap-2 px-3">
       <Link
         to={backTo}
-        className="inline-flex items-center gap-1.5 pl-1.5 pr-3 py-1 rounded-md text-sm text-[var(--color-text-muted)] hover:text-[var(--color-text)] hover:bg-[var(--color-sidebar-active)] transition-colors"
+        className="no-drag inline-flex items-center gap-1.5 pl-1.5 pr-2.5 py-1.5 rounded-[var(--radius)] text-[13px] text-[var(--color-text-muted)] hover:text-[var(--color-text)] hover:bg-[var(--color-pill-hover)] transition-colors"
       >
-        <ChevronLeft size={14} strokeWidth={1.5} />
-        <span className="truncate max-w-[200px]">{backLabel}</span>
+        <ChevronLeft size={15} strokeWidth={1.6} />
+        <span className="truncate max-w-[180px]">{backLabel}</span>
       </Link>
-      <div className="flex items-center gap-1">
-        <IconAction onClick={onCopy} disabled={!canCopy} title={copied ? "Copied" : "Copy summary"}>
-          {copied ? <Check size={16} strokeWidth={1.5} /> : <Copy size={16} strokeWidth={1.5} />}
-        </IconAction>
-        {!readOnly && (
-          <IconAction onClick={onResummarize} title="Re-summarize">
-            <RefreshCw size={16} strokeWidth={1.5} />
-          </IconAction>
-        )}
-        {!readOnly && (
-          <IconAction onClick={openMenu} title="More">
-            <MoreHorizontal size={16} strokeWidth={1.5} />
-          </IconAction>
-        )}
-      </div>
+      <div className="flex-1" />
+      {!readOnly && !recActive && (
+        <>
+          <button onClick={record} disabled={!canRecord} className="no-drag nd-btn" title="Record (⌘R)">
+            <Circle size={10} fill="currentColor" strokeWidth={0} className="text-[var(--color-record)]" />
+            <span>Record</span>
+          </button>
+          <button onClick={summarize} className="no-drag nd-btn nd-btn-primary" title="Summarize">
+            <Sparkles size={15} strokeWidth={1.6} />
+            <span>Summarize</span>
+          </button>
+        </>
+      )}
+      <button
+        onClick={onTogglePanel}
+        className={cn("no-drag nd-btn-icon", panelOpen && "is-active")}
+        title="Toggle context panel"
+        aria-label="Toggle context panel"
+        aria-pressed={panelOpen}
+      >
+        <PanelRight size={16} strokeWidth={1.7} />
+      </button>
+      {!readOnly && (
+        <button onClick={openMenu} className="no-drag nd-btn-icon" title="More" aria-label="More">
+          <MoreHorizontal size={16} strokeWidth={1.7} />
+        </button>
+      )}
       {menuPos && (
         <ContextMenu x={menuPos.x} y={menuPos.y} onClose={() => setMenuPos(null)}>
           <ContextMenuItem onClick={onDelete} danger>
@@ -944,28 +1041,51 @@ function NoteHeader({
   );
 }
 
-function IconAction({
-  onClick,
-  disabled,
+// Centered empty-state for a panel tab (no summary / no transcript yet).
+function PanelEmpty({ icon, text }: { icon: React.ReactNode; text: string }) {
+  return (
+    <div className="flex flex-col items-center text-center gap-3 px-6 py-12 text-[var(--color-text-disabled)]">
+      <span aria-hidden>{icon}</span>
+      <p className="text-[13px] leading-relaxed max-w-[240px]">{text}</p>
+    </div>
+  );
+}
+
+// A chip-friendly <select> that sizes to the SELECTED option, not the widest
+// one. WKWebView ignores `field-sizing: content` on <select>, so we render the
+// current label as visible text (which sizes the chip) and overlay a
+// transparent native <select> across the whole chip for interaction.
+function CtlSelect({
+  icon,
+  extra,
+  label,
+  value,
+  onChange,
   title,
   children,
 }: {
-  onClick: (e: React.MouseEvent<HTMLButtonElement>) => void;
-  disabled?: boolean;
-  title: string;
+  icon: React.ReactNode;
+  extra?: React.ReactNode;
+  label: string;
+  value: string;
+  onChange: (v: string) => void;
+  title?: string;
   children: React.ReactNode;
 }) {
   return (
-    <button
-      type="button"
-      onClick={onClick}
-      disabled={disabled}
-      title={title}
-      aria-label={title}
-      className="w-8 h-8 flex items-center justify-center rounded-md text-[var(--color-text-muted)] hover:text-[var(--color-text)] hover:bg-[var(--color-sidebar-active)] disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
-    >
-      {children}
-    </button>
+    <span className="nd-ctl relative" title={title}>
+      {icon}
+      {extra}
+      <span className="truncate" style={{ maxWidth: 160 }}>{label}</span>
+      <ChevronDown size={12} strokeWidth={2} />
+      <select
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        className="absolute inset-0 h-full w-full cursor-pointer opacity-0"
+      >
+        {children}
+      </select>
+    </span>
   );
 }
 
@@ -1026,9 +1146,13 @@ function FolderPicker({
 
   return (
     <>
+      <span className="truncate" style={{ maxWidth: 150 }}>
+        {(value ? folders.find((f) => f.id === value)?.name : null) ?? "No folder"}
+      </span>
       <select
         value={value ?? "__root__"}
         onChange={(e) => handleChange(e.target.value)}
+        className="absolute inset-0 h-full w-full cursor-pointer opacity-0"
       >
         <option value="__root__">No folder</option>
         {folders.map((f) => (
@@ -1038,7 +1162,6 @@ function FolderPicker({
         ))}
         <option value="__new__">+ New folder…</option>
       </select>
-      <span aria-hidden className="nd-prop-caret">▾</span>
     </>
   );
 }
@@ -1073,7 +1196,14 @@ function WorkspacePicker({
   }
   return (
     <>
-      <select value={value} onChange={(e) => onChange(e.target.value)}>
+      <span className="truncate" style={{ maxWidth: 150 }}>
+        {value ? (workspaces.find((w) => w.id === value)?.name ?? "Workspace") : "Personal (this device)"}
+      </span>
+      <select
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        className="absolute inset-0 h-full w-full cursor-pointer opacity-0"
+      >
         <option value="">Personal (this device)</option>
         {workspaces.map((w) => (
           <option key={w.id} value={w.id}>
@@ -1081,7 +1211,6 @@ function WorkspacePicker({
           </option>
         ))}
       </select>
-      <span aria-hidden className="nd-prop-caret">▾</span>
     </>
   );
 }
@@ -1107,27 +1236,39 @@ function PresetPicker({
     value.startsWith("custom:") &&
     !userPrompts.some((p) => `custom:${p.id}` === value);
 
+  const builtin = SUMMARY_PRESETS.find((p) => p.value === value);
+  const customPrompt = userPrompts.find((p) => `custom:${p.id}` === value);
+  const label = builtin
+    ? presetLabel(builtin)
+    : customPrompt
+    ? customPrompt.name
+    : value === "custom"
+    ? "Custom (legacy)"
+    : value.startsWith("custom:")
+    ? "(deleted prompt)"
+    : value;
   return (
-    <>
-      <select value={value} onChange={(e) => onChange(e.target.value)}>
-        {SUMMARY_PRESETS.map((p) => (
-          <option key={p.value} value={p.value}>
-            {presetLabel(p)}
-          </option>
-        ))}
-        {userPrompts.length > 0 && <option disabled>──────────</option>}
-        {userPrompts.map((p) => (
-          <option key={p.id} value={`custom:${p.id}`}>
-            {p.name}
-          </option>
-        ))}
-        {valueIsMissingUserPrompt && (
-          <option value={value}>(deleted prompt)</option>
-        )}
-        {value === "custom" && <option value="custom">Custom (legacy)</option>}
-      </select>
-      <span aria-hidden className="nd-prop-caret">▾</span>
-    </>
+    <CtlSelect
+      icon={<FileText size={14} strokeWidth={1.6} />}
+      label={label}
+      value={value}
+      onChange={onChange}
+      title="Summary preset"
+    >
+      {SUMMARY_PRESETS.map((p) => (
+        <option key={p.value} value={p.value}>
+          {presetLabel(p)}
+        </option>
+      ))}
+      {userPrompts.length > 0 && <option disabled>──────────</option>}
+      {userPrompts.map((p) => (
+        <option key={p.id} value={`custom:${p.id}`}>
+          {p.name}
+        </option>
+      ))}
+      {valueIsMissingUserPrompt && <option value={value}>(deleted prompt)</option>}
+      {value === "custom" && <option value="custom">Custom (legacy)</option>}
+    </CtlSelect>
   );
 }
 
@@ -1138,17 +1279,21 @@ function LanguagePicker({
   value: string;
   onChange: (v: string) => void;
 }) {
+  const current = LANGUAGES.find((l) => l.value === value);
   return (
-    <>
-      <select value={value} onChange={(e) => onChange(e.target.value)}>
-        {LANGUAGES.map((l) => (
-          <option key={l.value} value={l.value}>
-            {languageOptionLabel(l)}
-          </option>
-        ))}
-      </select>
-      <span aria-hidden className="nd-prop-caret">▾</span>
-    </>
+    <CtlSelect
+      icon={<Languages size={14} strokeWidth={1.6} />}
+      label={current ? languageOptionLabel(current) : value}
+      value={value}
+      onChange={onChange}
+      title="Transcription language"
+    >
+      {LANGUAGES.map((l) => (
+        <option key={l.value} value={l.value}>
+          {languageOptionLabel(l)}
+        </option>
+      ))}
+    </CtlSelect>
   );
 }
 
@@ -1181,31 +1326,27 @@ function SpeakersPicker({
   // must be strings. Convert at the boundary.
   const selected = value ?? 0;
   return (
-    <>
-      <select
-        value={selected}
-        onChange={(e) => {
-          const n = parseInt(e.target.value, 10);
-          onChange(n > 0 ? n : null);
-        }}
-        title="Pin the expected speaker count to help diarization on dominant-speaker recordings. 'Auto' lets the model decide."
-      >
-        {SPEAKER_OPTIONS.map((o) => (
-          <option key={o.value} value={o.value}>
-            {o.label}
-          </option>
-        ))}
-      </select>
-      <span aria-hidden className="nd-prop-caret">▾</span>
-    </>
+    <CtlSelect
+      icon={<Users size={14} strokeWidth={1.6} />}
+      label={selected === 0 ? "Auto" : `${selected} speakers`}
+      value={String(selected)}
+      onChange={(v) => {
+        const n = parseInt(v, 10);
+        onChange(n > 0 ? n : null);
+      }}
+      title="Expected speakers — diarization hint. 'Auto' lets the model decide."
+    >
+      {SPEAKER_OPTIONS.map((o) => (
+        <option key={o.value} value={o.value}>
+          {o.label === "Auto" ? "Auto" : `${o.label} speakers`}
+        </option>
+      ))}
+    </CtlSelect>
   );
 }
 
-// Per-note summary provider override. The "auto" option (empty string) clears
-// the override so the global Settings setting kicks in. When the per-note
-// override differs from the global default, the chip border switches to the
-// warning colour so the user can spot that "this note is set to something
-// other than what Settings says" — which was previously a silent footgun.
+// Per-note summary provider — a simple Cloud / Local toggle. Defaults to the
+// global Settings value when the note has no explicit choice (value === "").
 function SummaryProviderChip({
   value,
   globalDefault,
@@ -1215,172 +1356,23 @@ function SummaryProviderChip({
   globalDefault: string;
   onChange: (v: string) => void;
 }) {
-  const globalLabel = globalDefault === "local" ? "Local" : "Cloud";
   const effective = value.length > 0 ? value : globalDefault;
-  const display = effective === "local" ? "Local" : "Cloud";
-  // True when the user has explicitly picked something for this note that
-  // disagrees with the global Settings — typically a leftover from earlier
-  // testing. Surface the override state with a subtle warning-colored dot
-  // next to the value so the user can spot that "this note is set to
-  // something other than what Settings says" — previously a silent footgun.
-  const isOverride = value.length > 0 && value !== globalDefault;
+  const label = effective === "local" ? "Local" : "Cloud";
   return (
-    <>
-      {isOverride && (
-        <span
-          aria-hidden
-          className="inline-block w-1.5 h-1.5 rounded-full"
-          style={{ background: "var(--color-warning)" }}
-        />
-      )}
-      <select
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        title={
-          isOverride
-            ? `Per-note override active — Settings is set to ${globalLabel}. Pick "From Settings" to defer.`
-            : "Choose where this note's summary runs."
-        }
-      >
-        <option value="">{display} · From Settings</option>
-        <option value="openai">Cloud (override)</option>
-        <option value="local">Local (override)</option>
-      </select>
-      <span aria-hidden className="nd-prop-caret">▾</span>
-    </>
-  );
-}
-
-function Card({ children, className = "" }: { children: React.ReactNode; className?: string }) {
-  return (
-    <section
-      className={
-        "rounded-xl bg-[var(--color-surface)] border border-[var(--color-line)] " +
-        "px-6 py-5 " +
-        className
-      }
+    <CtlSelect
+      icon={<Cloud size={14} strokeWidth={1.6} />}
+      label={label}
+      value={effective}
+      onChange={onChange}
+      title="Where this note's summary runs"
     >
-      {children}
-    </section>
+      <option value="openai">Cloud</option>
+      <option value="local">Local</option>
+    </CtlSelect>
   );
 }
 
-// Max height applied to a collapsed transcript or summary card so a
-// long meeting doesn't push the rest of the page off screen. ~14rem
-// is roughly 7 lines of body text on the default zoom — half of the
-// previous 28rem cap, deliberately compact so a long meeting stays
-// in a fixed footprint and the rest of the note (properties, body
-// editor) stays visible. Click "expand" for the full read.
-const COLLAPSED_MAX_HEIGHT = "14rem";
-
-// Wraps a long content area in a scrollable region capped at
-// `COLLAPSED_MAX_HEIGHT`. When `expanded` is true, no cap. When
-// `bottomAligned` is true and content is shorter than the cap, content
-// pins to the bottom (transcript live-feed UX); the effect also
-// scroll-resets to the bottom whenever `bottomAlignKey` changes, so
-// new chunks landing in the transcript stay visible.
-//
-// Intentionally not used in edit mode: the auto-resizing textarea
-// inside `TranscriptEditor` already grows with its content, and a
-// scroll cap on top of that would fight the user's typing.
-function CollapsibleScroll({
-  expanded,
-  bottomAligned,
-  bottomAlignKey,
-  children,
-}: {
-  expanded: boolean;
-  bottomAligned: boolean;
-  bottomAlignKey?: string | number;
-  children: React.ReactNode;
-}) {
-  const ref = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    if (expanded || !bottomAligned) return;
-    const el = ref.current;
-    if (!el) return;
-    el.scrollTop = el.scrollHeight;
-  }, [expanded, bottomAligned, bottomAlignKey]);
-  if (expanded) return <>{children}</>;
-  return (
-    <div
-      ref={ref}
-      className="overflow-y-auto flex flex-col"
-      style={{
-        maxHeight: COLLAPSED_MAX_HEIGHT,
-        justifyContent: bottomAligned ? "flex-end" : "flex-start",
-      }}
-    >
-      {children}
-    </div>
-  );
-}
-
-// Card header that doubles as the expand/collapse trigger — the full
-// width of the title bar is the click target so the hit area can't be
-// missed. The chevron is styled as a light-gray rounded box on hover
-// (matches the sidebar collapse button) so the affordance reads as a
-// real button even though the click surface is the whole row.
-function CollapsibleHeader({
-  expanded,
-  onToggle,
-  label,
-  children,
-  actions,
-}: {
-  expanded: boolean;
-  onToggle: () => void;
-  label: string;
-  children: React.ReactNode;
-  // Optional trailing-actions slot rendered between the title content and
-  // the chevron. Use this for buttons that act on the card's content
-  // (e.g. copy summary). The slot is a `<div>`, not a button — pass real
-  // <button>s as children. Nested-button avoidance is why this row uses
-  // role=button on a <div> rather than a true <button> element.
-  actions?: React.ReactNode;
-}) {
-  return (
-    <div
-      role="button"
-      tabIndex={0}
-      onClick={onToggle}
-      onKeyDown={(e) => {
-        // Only fire for keys hitting the header itself, not actions
-        // nested inside (which handle their own Enter/Space natively).
-        if (e.target !== e.currentTarget) return;
-        if (e.key === "Enter" || e.key === " ") {
-          e.preventDefault();
-          onToggle();
-        }
-      }}
-      title={expanded ? `Collapse ${label}` : `Expand ${label}`}
-      className="group nd-label mb-4 flex w-full items-center gap-3 cursor-pointer text-left"
-    >
-      {children}
-      {actions && (
-        <div className="peer ml-auto flex items-center">
-          {actions}
-        </div>
-      )}
-      <span
-        className={
-          (actions ? "" : "ml-auto ") +
-          // peer-hover overrides suppress the row's group-hover styling
-          // when the copy/actions slot is the actual hover target —
-          // otherwise both buttons light up at once.
-          "p-1.5 rounded-md text-[var(--color-text-muted)] transition-colors group-hover:bg-[var(--color-pill-hover)] group-hover:text-[var(--color-text)] peer-hover:!bg-transparent peer-hover:!text-[var(--color-text-muted)]"
-        }
-        aria-hidden
-      >
-        {expanded
-          ? <ChevronUp size={16} strokeWidth={1.5} />
-          : <ChevronDown size={16} strokeWidth={1.5} />}
-      </span>
-    </div>
-  );
-}
-
-// Small copy-to-clipboard button rendered in the Summary card header.
+// Small copy-to-clipboard button rendered in the Summary panel header.
 // 1.5s "Copied" feedback via a Check icon swap. stopPropagation keeps
 // the click from toggling the surrounding header row's collapse state.
 function CopyButton({ getText, label }: { getText: () => string; label: string }) {
@@ -1414,14 +1406,14 @@ function CopyButton({ getText, label }: { getText: () => string; label: string }
 // Stable colour palette for speaker pills. Pulled from the design tokens so
 // dark mode adapts automatically. The order is intentional: blue first
 // because --color-interactive is the most "neutral" decorative colour we
-// have; red (--color-accent) last because the design language reserves it
+// have; red (--color-speaker-4) last because the design language reserves it
 // for "interrupt only" — a five-speaker meeting will still get red, but
 // for the common 2–3 speaker case it stays out of the way.
 const SPEAKER_COLORS = [
   "var(--color-interactive)",
   "var(--color-success)",
   "var(--color-warning)",
-  "var(--color-accent)",
+  "var(--color-speaker-4)",
 ];
 
 function speakerColorMap(labels: string[]): Map<string, string> {
@@ -1553,13 +1545,13 @@ const TranscriptEditor = memo(function TranscriptEditor({
   value,
   onChange,
   disabled,
-  expanded,
+  fill,
   bottomAligned,
 }: {
   value: string;
   onChange: (v: string) => void;
   disabled: boolean;
-  expanded: boolean;
+  fill?: boolean;
   bottomAligned: boolean;
 }) {
   const [editing, setEditing] = useState(false);
@@ -1570,12 +1562,12 @@ const TranscriptEditor = memo(function TranscriptEditor({
   // effect resets the cursor to the end every time the user types one
   // character (because the effect re-runs on each value change).
   useEffect(() => {
-    if (!editing) return;
+    if (!editing || fill) return;
     const el = taRef.current;
     if (!el) return;
     el.style.height = "auto";
     el.style.height = el.scrollHeight + "px";
-  }, [editing, value]);
+  }, [editing, value, fill]);
 
   // Focus + park cursor at end ONLY on the editing-mode transition. No
   // `value` dependency — re-running this on each keystroke is what caused
@@ -1609,7 +1601,10 @@ const TranscriptEditor = memo(function TranscriptEditor({
             setEditing(false);
           }
         }}
-        className="nd-bare w-full resize-none text-sm leading-relaxed text-[var(--color-text-muted)] focus:outline-none"
+        className={cn(
+          "nd-bare w-full resize-none text-sm leading-relaxed text-[var(--color-text-muted)] focus:outline-none",
+          fill && "flex-1 min-h-0 overflow-y-auto",
+        )}
       />
     );
   }
@@ -1625,7 +1620,7 @@ const TranscriptEditor = memo(function TranscriptEditor({
         if (!disabled) setEditing(true);
       }}
       disabled={disabled}
-      expanded={expanded}
+      fill={fill}
       bottomAligned={bottomAligned}
     />
   );
@@ -1666,13 +1661,13 @@ const TranscriptView = memo(function TranscriptView({
   transcript,
   onClick,
   disabled,
-  expanded,
+  fill,
   bottomAligned,
 }: {
   transcript: string;
   onClick: () => void;
   disabled: boolean;
-  expanded: boolean;
+  fill?: boolean;
   bottomAligned: boolean;
 }) {
   const labels = useMemo(() => extractSpeakerLabels(transcript), [transcript]);
@@ -1708,9 +1703,10 @@ const TranscriptView = memo(function TranscriptView({
       title={disabled ? "Editing is paused while recording" : "Click to edit"}
       className={
         "text-sm leading-relaxed text-[var(--color-text-muted)] overflow-y-auto " +
+        (fill ? "flex-1 min-h-0 " : "") +
         (disabled ? "cursor-default" : "cursor-text")
       }
-      style={{ maxHeight: expanded ? "70vh" : "14rem" }}
+      style={fill ? undefined : { maxHeight: "14rem" }}
     >
       <div
         style={{
@@ -1796,7 +1792,7 @@ const TranscriptPlayer = memo(function TranscriptPlayer({
   transcript,
   onChange,
   disabled,
-  expanded,
+  fill,
   bottomAligned,
 }: {
   noteId: string;
@@ -1806,7 +1802,7 @@ const TranscriptPlayer = memo(function TranscriptPlayer({
   transcript: string;
   onChange: (v: string) => void;
   disabled: boolean;
-  expanded: boolean;
+  fill?: boolean;
   bottomAligned: boolean;
 }) {
   const audioRef = useRef<HTMLAudioElement | null>(null);
@@ -2037,12 +2033,12 @@ const TranscriptPlayer = memo(function TranscriptPlayer({
   }, []);
 
   useEffect(() => {
-    if (!editing) return;
+    if (!editing || fill) return;
     const el = taRef.current;
     if (!el) return;
     el.style.height = "auto";
     el.style.height = el.scrollHeight + "px";
-  }, [editing, transcript]);
+  }, [editing, transcript, fill]);
 
   useEffect(() => {
     if (!editing) return;
@@ -2114,8 +2110,8 @@ const TranscriptPlayer = memo(function TranscriptPlayer({
   const showEditor = editing && !disabled;
 
   return (
-    <div>
-      <div className="flex items-center gap-2 mb-3">
+    <div className={fill ? "flex flex-col min-h-0 flex-1" : undefined}>
+      <div className={cn("flex items-center gap-2 mb-3", fill && "shrink-0")}>
         <audio
           ref={audioRef}
           src={playbackUrl}
@@ -2150,13 +2146,19 @@ const TranscriptPlayer = memo(function TranscriptPlayer({
               setEditing(false);
             }
           }}
-          className="nd-bare w-full resize-none text-sm leading-relaxed text-[var(--color-text-muted)] focus:outline-none"
+          className={cn(
+            "nd-bare w-full resize-none text-sm leading-relaxed text-[var(--color-text-muted)] focus:outline-none",
+            fill && "flex-1 min-h-0 overflow-y-auto",
+          )}
         />
       ) : (
         <div
           ref={scrollRef}
-          className="text-sm leading-relaxed text-[var(--color-text-muted)] overflow-y-auto"
-          style={{ maxHeight: expanded ? "70vh" : "14rem" }}
+          className={cn(
+            "text-sm leading-relaxed text-[var(--color-text-muted)] overflow-y-auto",
+            fill && "flex-1 min-h-0",
+          )}
+          style={fill ? undefined : { maxHeight: "14rem" }}
         >
         <div
           ref={containerRef}
@@ -2303,7 +2305,7 @@ const TranscriptPlayer = memo(function TranscriptPlayer({
                         ? "Delete this line"
                         : "Delete this turn"
                     }
-                    className="nd-bare shrink-0 self-start opacity-0 group-hover:opacity-100 transition-opacity p-0.5 rounded text-[var(--color-text-muted)] hover:text-[var(--color-accent)] hover:bg-[var(--color-pill-hover)]"
+                    className="nd-bare shrink-0 self-start opacity-0 group-hover:opacity-100 transition-opacity p-0.5 rounded text-[var(--color-text-muted)] hover:text-[var(--color-danger)] hover:bg-[var(--color-pill-hover)]"
                   >
                     <X size={14} strokeWidth={1.5} />
                   </button>

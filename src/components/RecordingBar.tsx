@@ -1,16 +1,17 @@
 import { useEffect, useState } from "react";
-import { Circle, Pause, Play, Square, Sparkles } from "lucide-react";
+import { Circle, Pause, Play, Square } from "lucide-react";
 import { ipc } from "../lib/ipc";
-import { useNotesStore, useRecordingStore } from "../lib/store";
+import { useRecordingStore } from "../lib/store";
 import { cn } from "../lib/cn";
 
-export function RecordingBar({ noteId, lockedByName }: { noteId: string; lockedByName?: string | null }) {
+// Floating recording controls. Record / Summarize live in the note toolbar
+// now; this bar surfaces only the in-flight states (starting / recording /
+// paused / stopping / diarizing / summarizing).
+export function RecordingBar({ noteId }: { noteId: string }) {
   const status = useRecordingStore((s) => s.status);
   const isThisNote = status.noteId === noteId;
   const phase = isThisNote ? status.phase : "idle";
   const isSummarizing = useRecordingStore((s) => !!s.summarizing[noteId]);
-  const transcript = useNotesStore((s) => s.notes.find((n) => n.id === noteId)?.transcript ?? "");
-  const hasTranscript = transcript.trim().length > 0;
   const diag = useRecordingStore((s) => s.diag);
   const showDiag = (phase === "recording" || phase === "paused") && diag && diag.noteId === noteId;
   const micActive = phase === "recording" && !!showDiag && diag.micPeak > 0.001;
@@ -29,10 +30,6 @@ export function RecordingBar({ noteId, lockedByName }: { noteId: string; lockedB
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [phase]);
 
-  async function start() {
-    try { await ipc.recordingStart(noteId); }
-    catch (e) { useRecordingStore.getState().pushError({ noteId, message: String(e) }); }
-  }
   async function pause() {
     try { await ipc.recordingPause(); }
     catch (e) { useRecordingStore.getState().pushError({ noteId, message: String(e) }); }
@@ -45,18 +42,6 @@ export function RecordingBar({ noteId, lockedByName }: { noteId: string; lockedB
     try { await ipc.recordingStop(); }
     catch (e) { useRecordingStore.getState().pushError({ noteId, message: String(e) }); }
   }
-  async function summarize() {
-    const t0 = performance.now();
-    console.log(`[llm] summarize click note=${noteId}`);
-    try {
-      await ipc.summarizeNote(noteId);
-      console.log(`[llm] summarize ok in ${Math.round(performance.now() - t0)}ms`);
-    } catch (e) {
-      console.error(`[llm] summarize failed in ${Math.round(performance.now() - t0)}ms:`, e);
-      useRecordingStore.getState().pushError({ noteId, message: String(e), kind: "summary" });
-    }
-  }
-  const otherNoteRecording = status.noteId !== null && !isThisNote;
 
   return (
     <div className="absolute bottom-6 left-1/2 -translate-x-1/2 flex items-center gap-2">
@@ -72,40 +57,6 @@ export function RecordingBar({ noteId, lockedByName }: { noteId: string; lockedB
         </div>
       )}
 
-      {phase === "idle" && (
-        <>
-          {lockedByName ? (
-            <div
-              className="shrink-0 whitespace-nowrap flex items-center gap-2 px-4 py-2 rounded-full bg-[var(--color-surface)] border border-[var(--color-line-visible)] text-xs text-[var(--color-text-muted)] cursor-default"
-              title={`${lockedByName} is recording this note — only one person can record a shared note at a time.`}
-            >
-              <Circle size={9} fill="currentColor" strokeWidth={0} className="rec-dot text-[var(--color-accent)]" />
-              <span>{lockedByName} is recording…</span>
-            </div>
-          ) : (
-            <button
-              onClick={start}
-              disabled={otherNoteRecording}
-              className="nd-action no-drag"
-              title="⌘R"
-            >
-              <Circle size={11} fill="currentColor" strokeWidth={0} className="text-[var(--color-accent)]" />
-              <span>Record</span>
-            </button>
-          )}
-          {hasTranscript && (
-            <button
-              onClick={summarize}
-              className="nd-action no-drag"
-              title="Summarize transcript"
-            >
-              <Sparkles size={13} strokeWidth={1.5} />
-              <span>Summarize</span>
-            </button>
-          )}
-        </>
-      )}
-
       {phase === "starting" && <BusyPill label="Starting" />}
       {phase === "stopping" && <BusyPill label="Stopping" />}
       {phase === "diarizing" && <BusyPill label="Diarizing" />}
@@ -115,13 +66,13 @@ export function RecordingBar({ noteId, lockedByName }: { noteId: string; lockedB
         <div
           className={cn(
             "no-drag shrink-0 whitespace-nowrap flex items-stretch rounded-full overflow-hidden bg-[var(--color-surface)] border",
-            phase === "recording" ? "border-[var(--color-accent)]" : "border-[var(--color-line-visible)]"
+            phase === "recording" ? "border-[var(--color-record)]" : "border-[var(--color-line-visible)]"
           )}
         >
           <div
             className={cn(
               "flex items-center gap-2 pl-4 pr-3 py-2 tabular-nums",
-              phase === "recording" ? "text-[var(--color-accent)]" : "text-[var(--color-text-muted)]"
+              phase === "recording" ? "text-[var(--color-record)]" : "text-[var(--color-text-muted)]"
             )}
             style={{ fontFamily: "var(--font-mono)", fontSize: "12px", letterSpacing: "0.06em" }}
           >
@@ -145,7 +96,7 @@ export function RecordingBar({ noteId, lockedByName }: { noteId: string; lockedB
           <span className="w-px self-stretch bg-[var(--color-line-visible)]" />
           <button
             onClick={stop}
-            className="no-drag flex items-center px-3 text-[var(--color-accent)] hover:bg-[var(--color-accent)]/10 transition-colors"
+            className="no-drag flex items-center px-3 text-[var(--color-record)] hover:bg-[var(--color-record)]/10 transition-colors"
             title="Stop"
             aria-label="Stop"
           >

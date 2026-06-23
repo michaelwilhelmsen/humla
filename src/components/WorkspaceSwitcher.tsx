@@ -11,7 +11,7 @@ function SyncIndicator({ status }: { status: SyncStatus }) {
   const map = {
     syncing: { Icon: RefreshCw, cls: "animate-spin text-[var(--color-text-muted)]", title: "Syncing…" },
     idle: { Icon: Cloud, cls: "text-[var(--color-success)]", title: "Synced" },
-    error: { Icon: CloudOff, cls: "text-[var(--color-accent)]", title: "Sync error — will retry" },
+    error: { Icon: CloudOff, cls: "text-[var(--color-danger)]", title: "Sync error — will retry" },
   }[status];
   const { Icon } = map;
   return (

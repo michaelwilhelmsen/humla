@@ -1,207 +1,160 @@
 @import "tailwindcss";
 @import "tippy.js/dist/tippy.css";
 
-/* Three-font system. Space Grotesk for UI body, Space Mono for labels
-   and numeric data, Instrument Serif for display titles (note titles,
-   folder names, page headers). Fonts are bundled locally via @fontsource
-   (imported in src/main.tsx) instead of fetched from Google Fonts — the app
-   renders its real fonts offline and the CSP can stay font-src 'self'. */
+/* One typeface — Hanken Grotesk — used throughout; hierarchy comes from
+   size + weight only. Bundled locally via @fontsource (imported in
+   src/main.tsx) so the app renders offline and the CSP stays font-src
+   'self'. --font-serif and --font-mono are transition aliases pointing at
+   the same Hanken stack so any lingering `font-serif` / `font-mono` class
+   or `var(--font-*)` ref renders Hanken; they get swept out per phase.
+   Genuine code blocks use --font-code (a real monospace stack). */
 
 @theme {
-  --font-serif: "Instrument Serif", ui-serif, Georgia, serif;
-  --font-sans: "Space Grotesk", ui-sans-serif, system-ui, sans-serif;
-  --font-mono: "Space Mono", ui-monospace, "SF Mono", monospace;
+  --font-sans: "Hanken Grotesk", ui-sans-serif, system-ui, sans-serif;
+  --font-serif: "Hanken Grotesk", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "Hanken Grotesk", ui-sans-serif, system-ui, sans-serif;
+  --font-code: ui-monospace, "SF Mono", SFMono-Regular, Menlo, monospace;
+  --radius-card: 14px;
 }
 
-/* Two palettes: "warm" (default) — paper-cream surfaces, distinct sidebar,
-   white sidebar hover/active — and "nothing" (alternative) — neutral grays,
-   Nothing-design aesthetic. Each palette has light and dark variants;
-   data-theme picks light/dark explicitly, otherwise prefers-color-scheme
-   decides. data-palette picks the palette; unset = warm.
-   Two extra tokens beyond the original set:
-     --color-sidebar-bg     — the sidebar column's surface (may differ
-                              from --color-canvas, e.g. cream-on-cream)
-     --color-sidebar-active — bg for hover/active sidebar items (white in
-                              warm light; subtle pill-hover in nothing) */
+/* Single warm-paper palette, light + dark. data-theme picks light/dark
+   explicitly; otherwise prefers-color-scheme decides. The Settings palette
+   picker still writes data-palette, but every value now renders this one
+   design (no palette-specific overrides remain).
 
-/* === WARM (default) — light === */
+   Elevation ladder (dark especially): canvas (darkest) → sidebar/card bg →
+   surface (pills) → raised, with a visible warm --color-card-border on the
+   inset cards so the layers stay distinct.
+
+   Accent is INK, not red: dark ink in light mode, inverting to light ink in
+   dark mode so filled-accent elements stay visible on the dark canvas.
+   Text/icons placed on a filled accent use --color-on-accent. Red is
+   reserved for recording (--color-record) and destructive actions
+   (--color-danger). */
+
+/* === LIGHT === */
 :root,
-:root[data-palette="warm"] {
-  --color-canvas: #faf9f6;            /* main pane */
-  --color-surface: #ffffff;           /* cards, raised surfaces */
-  --color-surface-raised: #f0eee7;
-  --color-sidebar-bg: #f5f3ed;        /* sidebar column */
-  --color-sidebar-active: #ffffff;    /* sidebar hover/active */
-  --color-text: #1a1a1a;
-  --color-text-display: #000000;
-  --color-text-muted: #7a7a78;
-  --color-text-disabled: #b0aea4;
-  --color-line: #ece8de;
-  --color-line-visible: #d9d4c5;
+:root[data-theme="light"] {
+  --color-canvas: #faf8f2;            /* main writing pane + gutter */
+  --color-sidebar-bg: #f1ece1;        /* inset cards: nav + right panel */
+  --color-surface: #fffef9;           /* pills, content surfaces */
+  --color-surface-2: #f4efe4;         /* recessed chips, scrubber */
+  --color-surface-raised: #ebe5d6;    /* hover, avatars */
+  --color-sidebar-active: var(--color-surface);
+  --color-text: #211e17;
+  --color-text-display: #211e17;
+  --color-text-muted: #6d695e;
+  --color-text-disabled: #a7a08f;
+  --color-line: #e9e3d4;              /* hairline dividers */
+  --color-line-visible: #ddd5c2;
+  --color-card-border: #ddd5c2;       /* inset-card border */
   --color-pill: transparent;
-  --color-pill-hover: rgba(0, 0, 0, 0.05);
-  --color-input-bg: #ffffff;
+  --color-pill-hover: rgba(33, 30, 23, 0.05);
+  --color-input-bg: #fffef9;
   --color-shadow: transparent;
-  --color-accent: #d71921;
-  --color-success: #4a9e5c;
-  --color-warning: #d4a843;
-  --color-interactive: #007aff;
+
+  --color-accent: #1c1a14;            /* ink — primary action / active */
+  --color-accent-2: #39342a;          /* ink hover */
+  --color-accent-soft: #e8e3d6;       /* tinted fill behind active states */
+  --color-on-accent: #ffffff;         /* text/icon on a filled accent */
+
+  --color-record: #cf352c;            /* red — recording indicators only */
+  --color-danger: #c4362e;            /* red — destructive actions */
+
+  --color-interactive: #2f6fb0;       /* speaker blue + links */
+  --color-success: #5b8a45;           /* speaker green + synced */
+  --color-warning: #bd962f;           /* speaker gold + override */
+  --color-speaker-4: #c0463f;         /* speaker red (4th, cycling) */
+
   --color-ink: var(--color-text);
   --color-ink-muted: var(--color-text-muted);
+
+  --radius: 9px;
+  --shadow-card: 0 1px 2px rgba(60, 46, 18, 0.04), 0 4px 14px -10px rgba(60, 46, 18, 0.18);
   color-scheme: light;
 }
 
-/* === WARM — dark via system === */
+/* === DARK via system === */
 @media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]):not([data-palette="nothing"]),
-  :root[data-palette="warm"]:not([data-theme="light"]) {
-    --color-canvas: #0e0e0e;
-    --color-surface: #1a1a1a;
-    --color-surface-raised: #1f1f1f;
-    --color-sidebar-bg: #0a0a0a;
-    --color-sidebar-active: #1f1f1f;
-    --color-text: #ece8dc;
-    --color-text-display: #ffffff;
-    --color-text-muted: #8a8a86;
-    --color-text-disabled: #555555;
-    --color-line: #1f1f1f;
-    --color-line-visible: #2a2a2a;
+  :root:not([data-theme="light"]) {
+    --color-canvas: #0e0c08;
+    --color-sidebar-bg: #1d1912;
+    --color-surface: #2a2418;
+    --color-surface-2: #241f16;
+    --color-surface-raised: #342d20;
+    --color-sidebar-active: var(--color-surface);
+    --color-text: #ece5d6;
+    --color-text-display: #ece5d6;
+    --color-text-muted: #9c968a;
+    --color-text-disabled: #6a655b;
+    --color-line: #322c22;
+    --color-line-visible: #423a27;
+    --color-card-border: #423a27;
     --color-pill: transparent;
-    --color-pill-hover: rgba(255, 255, 255, 0.06);
-    --color-input-bg: #1a1a1a;
+    --color-pill-hover: rgba(236, 229, 214, 0.06);
+    --color-input-bg: #2a2418;
     --color-shadow: transparent;
-    --color-interactive: #6fa0ff;
+
+    --color-accent: #ece5d6;          /* light ink (inverted) */
+    --color-accent-2: #f7f3ea;
+    --color-accent-soft: #352f23;
+    --color-on-accent: #1a1407;       /* dark text on the light accent */
+
+    --color-record: #e5544b;
+    --color-danger: #e0564d;
+
+    --color-interactive: #6aa3e0;
+    --color-success: #8cc06f;
+    --color-warning: #ddb255;
+    --color-speaker-4: #e07a72;
+
+    --color-ink: var(--color-text);
+    --color-ink-muted: var(--color-text-muted);
+
+    --radius: 9px;
+    --shadow-card: 0 10px 28px -14px rgba(0, 0, 0, 0.7);
     color-scheme: dark;
   }
 }
 
-/* === WARM — light explicit === */
-:root[data-theme="light"]:not([data-palette="nothing"]),
-:root[data-palette="warm"][data-theme="light"] {
-  --color-canvas: #faf9f6;
-  --color-surface: #ffffff;
-  --color-surface-raised: #f0eee7;
-  --color-sidebar-bg: #f5f3ed;
-  --color-sidebar-active: #ffffff;
-  --color-text: #1a1a1a;
-  --color-text-display: #000000;
-  --color-text-muted: #7a7a78;
-  --color-text-disabled: #b0aea4;
-  --color-line: #ece8de;
-  --color-line-visible: #d9d4c5;
+/* === DARK explicit === */
+:root[data-theme="dark"] {
+  --color-canvas: #0e0c08;
+  --color-sidebar-bg: #1d1912;
+  --color-surface: #2a2418;
+  --color-surface-2: #241f16;
+  --color-surface-raised: #342d20;
+  --color-sidebar-active: var(--color-surface);
+  --color-text: #ece5d6;
+  --color-text-display: #ece5d6;
+  --color-text-muted: #9c968a;
+  --color-text-disabled: #6a655b;
+  --color-line: #322c22;
+  --color-line-visible: #423a27;
+  --color-card-border: #423a27;
   --color-pill: transparent;
-  --color-pill-hover: rgba(0, 0, 0, 0.05);
-  --color-input-bg: #ffffff;
+  --color-pill-hover: rgba(236, 229, 214, 0.06);
+  --color-input-bg: #2a2418;
   --color-shadow: transparent;
-  --color-interactive: #007aff;
-  color-scheme: light;
-}
 
-/* === WARM — dark explicit === */
-:root[data-theme="dark"]:not([data-palette="nothing"]),
-:root[data-palette="warm"][data-theme="dark"] {
-  --color-canvas: #0e0e0e;
-  --color-surface: #1a1a1a;
-  --color-surface-raised: #1f1f1f;
-  --color-sidebar-bg: #0a0a0a;
-  --color-sidebar-active: #1f1f1f;
-  --color-text: #ece8dc;
-  --color-text-display: #ffffff;
-  --color-text-muted: #8a8a86;
-  --color-text-disabled: #555555;
-  --color-line: #1f1f1f;
-  --color-line-visible: #2a2a2a;
-  --color-pill: transparent;
-  --color-pill-hover: rgba(255, 255, 255, 0.06);
-  --color-input-bg: #1a1a1a;
-  --color-shadow: transparent;
-  --color-interactive: #6fa0ff;
-  color-scheme: dark;
-}
+  --color-accent: #ece5d6;            /* light ink (inverted) */
+  --color-accent-2: #f7f3ea;
+  --color-accent-soft: #352f23;
+  --color-on-accent: #1a1407;         /* dark text on the light accent */
 
-/* === NOTHING — light === */
-:root[data-palette="nothing"] {
-  --color-canvas: #f5f5f5;
-  --color-surface: #ffffff;
-  --color-surface-raised: #f0f0f0;
-  --color-sidebar-bg: var(--color-canvas);
-  --color-sidebar-active: var(--color-pill-hover);
-  --color-text: #1a1a1a;
-  --color-text-display: #000000;
-  --color-text-muted: #666666;
-  --color-text-disabled: #999999;
-  --color-line: #e8e8e8;
-  --color-line-visible: #cccccc;
-  --color-pill: transparent;
-  --color-pill-hover: rgba(0, 0, 0, 0.06);
-  --color-input-bg: #ffffff;
-  --color-shadow: transparent;
-  --color-interactive: #007aff;
-  color-scheme: light;
-}
+  --color-record: #e5544b;
+  --color-danger: #e0564d;
 
-/* === NOTHING — dark via system === */
-@media (prefers-color-scheme: dark) {
-  :root[data-palette="nothing"]:not([data-theme="light"]) {
-    --color-canvas: #000000;
-    --color-surface: #111111;
-    --color-surface-raised: #1a1a1a;
-    --color-sidebar-bg: var(--color-canvas);
-    --color-sidebar-active: var(--color-pill-hover);
-    --color-text: #e8e8e8;
-    --color-text-display: #ffffff;
-    --color-text-muted: #999999;
-    --color-text-disabled: #666666;
-    --color-line: #222222;
-    --color-line-visible: #333333;
-    --color-pill: transparent;
-    --color-pill-hover: rgba(255, 255, 255, 0.08);
-    --color-input-bg: #111111;
-    --color-shadow: transparent;
-    --color-interactive: #5b9bf6;
-    color-scheme: dark;
-  }
-}
+  --color-interactive: #6aa3e0;
+  --color-success: #8cc06f;
+  --color-warning: #ddb255;
+  --color-speaker-4: #e07a72;
 
-/* === NOTHING — light explicit === */
-:root[data-palette="nothing"][data-theme="light"] {
-  --color-canvas: #f5f5f5;
-  --color-surface: #ffffff;
-  --color-surface-raised: #f0f0f0;
-  --color-sidebar-bg: var(--color-canvas);
-  --color-sidebar-active: var(--color-pill-hover);
-  --color-text: #1a1a1a;
-  --color-text-display: #000000;
-  --color-text-muted: #666666;
-  --color-text-disabled: #999999;
-  --color-line: #e8e8e8;
-  --color-line-visible: #cccccc;
-  --color-pill: transparent;
-  --color-pill-hover: rgba(0, 0, 0, 0.06);
-  --color-input-bg: #ffffff;
-  --color-shadow: transparent;
-  --color-interactive: #007aff;
-  color-scheme: light;
-}
+  --color-ink: var(--color-text);
+  --color-ink-muted: var(--color-text-muted);
 
-/* === NOTHING — dark explicit === */
-:root[data-palette="nothing"][data-theme="dark"] {
-  --color-canvas: #000000;
-  --color-surface: #111111;
-  --color-surface-raised: #1a1a1a;
-  --color-sidebar-bg: var(--color-canvas);
-  --color-sidebar-active: var(--color-pill-hover);
-  --color-text: #e8e8e8;
-  --color-text-display: #ffffff;
-  --color-text-muted: #999999;
-  --color-text-disabled: #666666;
-  --color-line: #222222;
-  --color-line-visible: #333333;
-  --color-pill: transparent;
-  --color-pill-hover: rgba(255, 255, 255, 0.08);
-  --color-input-bg: #111111;
-  --color-shadow: transparent;
-  --color-interactive: #5b9bf6;
+  --radius: 9px;
+  --shadow-card: 0 10px 28px -14px rgba(0, 0, 0, 0.7);
   color-scheme: dark;
 }
 
@@ -272,16 +225,18 @@ input::placeholder, textarea::placeholder {
   color: var(--color-text-muted);
 }
 
-/* Nothing-design helpers ---------------------------------------------------
-   Use .nd-label for the "instrument panel" caption (Space Mono ALL CAPS,
-   tight letter-spacing). Use .nd-chip for tags, statuses, and pickers — a
-   1px-bordered pill with no fill. */
+/* UI helpers ---------------------------------------------------------------
+   Use .nd-label for section/group micro-labels (Hanken 600, lightly tracked
+   uppercase — the "FOLDERS" / "TODAY" caption style from the prototype). Use
+   .nd-chip for tags, statuses, and pickers — a 1px-bordered pill with no
+   fill. */
 .nd-label {
-  font-family: var(--font-mono);
+  font-family: var(--font-sans);
   font-size: 11px;
-  letter-spacing: 0.08em;
+  font-weight: 600;
+  letter-spacing: 0.05em;
   text-transform: uppercase;
-  color: var(--color-text-muted);
+  color: var(--color-text-disabled);
   line-height: 1.2;
 }
 
@@ -490,6 +445,82 @@ input::placeholder, textarea::placeholder {
   cursor: not-allowed;
 }
 
+/* Solid action buttons — the redesign's primary chrome (note toolbar, list
+   headers). .nd-btn = secondary (surface + hairline border); .nd-btn-primary
+   = ink fill (inverts in dark via the accent token); .nd-btn-icon = square
+   icon button with an active (accent-soft) state. */
+.nd-btn {
+  display: inline-flex; align-items: center; gap: 7px;
+  font-size: 13px; font-weight: 500; line-height: 1.2;
+  padding: 7px 13px; border-radius: var(--radius);
+  border: 1px solid var(--color-line-visible);
+  background: var(--color-surface); color: var(--color-text);
+  cursor: pointer; white-space: nowrap; flex-shrink: 0;
+  transition: border-color 140ms cubic-bezier(0.25,0.1,0.25,1),
+              background-color 140ms cubic-bezier(0.25,0.1,0.25,1),
+              opacity 140ms cubic-bezier(0.25,0.1,0.25,1);
+}
+.nd-btn:hover:not(:disabled) { border-color: var(--color-text-muted); }
+.nd-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.nd-btn-primary {
+  background: var(--color-accent); border-color: var(--color-accent);
+  color: var(--color-on-accent);
+}
+.nd-btn-primary:hover:not(:disabled) {
+  background: var(--color-accent-2); border-color: var(--color-accent-2);
+}
+.nd-btn-icon {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 33px; height: 33px; padding: 0; border-radius: var(--radius);
+  border: 1px solid transparent; background: transparent;
+  color: var(--color-text-muted); cursor: pointer; flex-shrink: 0;
+  transition: color 140ms, background-color 140ms, border-color 140ms;
+}
+.nd-btn-icon:hover { background: var(--color-pill-hover); color: var(--color-text); }
+.nd-btn-icon.is-active {
+  background: var(--color-accent-soft); border-color: transparent;
+  color: var(--color-accent);
+}
+
+/* Meta-bar item (note identity row) — borderless, icon + label, hover tint
+   on the interactive ones (folder, workspace pickers). */
+.nd-meta {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 12.5px; color: var(--color-text-muted);
+  padding: 5px 8px; border-radius: var(--radius);
+  white-space: nowrap;
+  transition: background-color 120ms, color 120ms;
+}
+.nd-meta.is-interactive { cursor: pointer; }
+.nd-meta.is-interactive:hover { background: var(--color-pill-hover); color: var(--color-text); }
+.nd-meta > svg { opacity: 0.72; flex-shrink: 0; }
+
+/* Panel control chip — bordered surface-2 pill wrapping a borderless select,
+   used by the Summary (preset/provider) and Transcript (language/speakers)
+   tabs. */
+.nd-ctl {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 12px; font-weight: 500; color: var(--color-text);
+  padding: 5px 9px; border: 1px solid var(--color-line-visible);
+  border-radius: 8px; background: var(--color-surface-2);
+  cursor: pointer; white-space: nowrap; transition: border-color 120ms;
+}
+.nd-ctl:hover { border-color: var(--color-text-muted); }
+.nd-ctl > svg { opacity: 0.72; flex-shrink: 0; }
+
+/* Borderless selects inside meta items / control chips — strip the global
+   <select> chrome (native arrow + right padding) so the wrapper owns the
+   look and our own chevron (or none) shows instead. */
+.nd-meta select, .nd-ctl select {
+  -webkit-appearance: none !important;
+  appearance: none !important;
+  background-image: none !important;
+  background: transparent; border: none;
+  padding: 0 !important; border-radius: 0;
+  font: inherit; color: inherit; cursor: pointer;
+}
+.nd-meta select:focus, .nd-ctl select:focus { outline: none; }
+
 /* WebKit on macOS sometimes ignores `appearance: none` on <select>, leaking
    the native arrow. Force it off everywhere we render a custom caret. */
 .nd-chip select,
@@ -579,8 +610,8 @@ select {
 /* ------------------------------------------------------------------ */
 
 .prose-note {
-  font-size: 16px;
-  line-height: 1.65;
+  font-size: 15.5px;
+  line-height: 1.5;
   color: var(--color-text);
 }
 
@@ -622,41 +653,41 @@ select {
 .prose-note hr + p,
 .prose-note hr + ul,
 .prose-note hr + ol {
-  margin-top: 1em;
+  margin-top: 0.68em;
 }
 
 /* Headings: generous top margin so sections feel distinct, modest bottom
    margin so the heading breathes from the body that follows. The :first-child
    override prevents an awkward leading gap when a note opens with a heading. */
 .prose-note h1 {
-  font-family: var(--font-serif);
-  font-size: 2rem;
-  line-height: 1.2;
-  font-weight: 600;
-  margin-top: 1.8em;
-  margin-bottom: 0.5em;
-}
-.prose-note h2 {
-  font-family: var(--font-serif);
-  font-size: 1.5rem;
+  font-size: 1.55rem;
   line-height: 1.25;
   font-weight: 600;
-  margin-top: 1.6em;
-  margin-bottom: 0.4em;
-}
-.prose-note h3 {
-  font-size: 1.2rem;
-  line-height: 1.3;
-  font-weight: 600;
+  letter-spacing: -0.014em;
   margin-top: 1.4em;
   margin-bottom: 0.35em;
 }
-.prose-note h4 {
+.prose-note h2 {
+  font-size: 1.2rem;
+  line-height: 1.3;
+  font-weight: 600;
+  letter-spacing: -0.012em;
+  margin-top: 1.3em;
+  margin-bottom: 0.3em;
+}
+.prose-note h3 {
   font-size: 1.05rem;
   line-height: 1.35;
   font-weight: 600;
-  margin-top: 1.2em;
+  margin-top: 1.15em;
   margin-bottom: 0.3em;
+}
+.prose-note h4 {
+  font-size: 0.95rem;
+  line-height: 1.4;
+  font-weight: 600;
+  margin-top: 1em;
+  margin-bottom: 0.25em;
 }
 .prose-note > :first-child {
   margin-top: 0;
@@ -678,7 +709,7 @@ select {
   font-style: italic;
 }
 .prose-note code {
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-family: var(--font-code);
   font-size: 0.9em;
   /* `--color-pill` is transparent by design (Nothing-style chips); use
      `--color-pill-hover`'s subtle fill so inline code/pre actually
@@ -688,7 +719,7 @@ select {
   border-radius: 4px;
 }
 .prose-note pre {
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-family: var(--font-code);
   background: var(--color-pill-hover);
   padding: 0.75em 1em;
   border-radius: 8px;
@@ -743,7 +774,7 @@ select {
 .prose-summary h3 { font-size: 1.1rem; }
 .prose-summary h4 { font-size: 1rem; }
 .prose-summary code {
-  font-family: var(--font-mono);
+  font-family: var(--font-code);
 }
 .prose-summary ul,
 .prose-summary ol {
@@ -755,7 +786,7 @@ select {
 .prose-summary ol li { padding-left: 0.25em; }
 .prose-summary li + li { margin-top: 0.25em; }
 .prose-summary code {
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-family: var(--font-code);
   font-size: 0.9em;
   padding: 0.1em 0.35em;
   border-radius: 4px;
@@ -833,14 +864,14 @@ select {
 .prose-reasoning ol { list-style: decimal; }
 .prose-reasoning li + li { margin-top: 0.2em; }
 .prose-reasoning code {
-  font-family: var(--font-mono);
+  font-family: var(--font-code);
   font-size: 0.9em;
   padding: 0.1em 0.3em;
   border-radius: 3px;
   background: var(--color-pill-hover);
 }
 .prose-reasoning pre {
-  font-family: var(--font-mono);
+  font-family: var(--font-code);
   font-size: 11px;
   line-height: 1.4;
   white-space: pre-wrap;

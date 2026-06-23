@@ -56,15 +56,19 @@ export function Layout() {
   const collapsed = manualCollapsed !== null ? manualCollapsed : shouldAutoCollapse;
 
   return (
-    <div className="flex h-full">
+    <div className="flex h-full p-1.5 gap-1.5 bg-[var(--color-canvas)]">
+      {/* Left nav is an inset rounded card floating on the canvas with an
+          equal ~6px gutter on all sides. The macOS traffic lights land in
+          its top-left corner; the Sidebar's own top padding clears them. */}
       <aside
         className={cn(
-          "shrink-0 border-r border-[var(--color-line)] transition-[width] duration-200 overflow-hidden bg-[var(--color-sidebar-bg)]",
+          "shrink-0 overflow-hidden rounded-[var(--radius-card)] transition-[width] duration-300 ease-[cubic-bezier(0.4,0,0.2,1)]",
+          "border border-[var(--color-card-border)] bg-[var(--color-sidebar-bg)] shadow-[var(--shadow-card)]",
           collapsed ? "w-12" : "w-64",
         )}
       >
         {/* Each variant of the sidebar provides its own drag strip
-            below — Sidebar via its h-8 header div, SidebarCollapsed
+            below — Sidebar via its top header div, SidebarCollapsed
             via the dedicated drag area. Putting another absolute
             drag strip here would sit on top of Sidebar's collapse
             button and intercept clicks. */}

@@ -118,7 +118,7 @@ export function Trash() {
                       disabled={busy === n.id}
                       title="Delete permanently"
                       aria-label="Delete permanently"
-                      className="shrink-0 p-1.5 rounded text-[var(--color-text-muted)] hover:text-[var(--color-accent)] hover:bg-[var(--color-pill-hover)] transition-colors disabled:opacity-50"
+                      className="shrink-0 p-1.5 rounded text-[var(--color-text-muted)] hover:text-[var(--color-danger)] hover:bg-[var(--color-pill-hover)] transition-colors disabled:opacity-50"
                     >
                       <Trash2 size={14} strokeWidth={1.5} />
                     </button>

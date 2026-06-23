@@ -38,7 +38,7 @@ function planMeta(status: CloudWorkspace["plan_status"]): { label: string; color
     case "past_due":
       return { label: "Past due", color: "var(--color-warning)" };
     case "canceled":
-      return { label: "Canceled", color: "var(--color-accent)" };
+      return { label: "Canceled", color: "var(--color-danger)" };
     default:
       return { label: "Not subscribed", color: "var(--color-text-muted)" };
   }
@@ -102,7 +102,7 @@ function BillingPanel({ ws, onChanged }: { ws: CloudWorkspace; onChanged: () => 
           </Btn>
         </div>
       )}
-      {err && <p className="text-xs text-[var(--color-accent)] break-all">{err}</p>}
+      {err && <p className="text-xs text-[var(--color-danger)] break-all">{err}</p>}
       <p className="text-[11px] text-[var(--color-text-muted)]">
         Billing opens Stripe in your browser. Your plan updates here automatically when you return.
       </p>
@@ -384,7 +384,7 @@ export function OrganizationTab() {
 
       <Section title={`Members${members.length ? ` · ${members.length}` : ""}`}>
         {loading && <div className="text-sm text-[var(--color-text-muted)]">Loading…</div>}
-        {error && <div className="text-xs text-[var(--color-accent)]">{error}</div>}
+        {error && <div className="text-xs text-[var(--color-danger)]">{error}</div>}
 
         <div className="flex flex-col gap-1">
           {members.map((m) => (
@@ -428,7 +428,7 @@ export function OrganizationTab() {
                   disabled={busy}
                   aria-label="Remove member"
                   title="Remove from workspace"
-                  className="shrink-0 p-1.5 rounded text-[var(--color-text-muted)] hover:text-[var(--color-accent)] hover:bg-[var(--color-pill-hover)] transition-colors"
+                  className="shrink-0 p-1.5 rounded text-[var(--color-text-muted)] hover:text-[var(--color-danger)] hover:bg-[var(--color-pill-hover)] transition-colors"
                 >
                   <Trash2 size={14} strokeWidth={1.5} />
                 </button>
@@ -490,8 +490,8 @@ export function OrganizationTab() {
                     <button
                       onClick={transferOwnership}
                       disabled={busy}
-                      className="px-3 py-2 rounded-md text-sm border border-[var(--color-accent)] disabled:opacity-50 transition-opacity hover:opacity-90"
-                      style={{ background: "var(--color-accent)", color: "#fff" }}
+                      className="px-3 py-2 rounded-md text-sm border border-[var(--color-danger)] disabled:opacity-50 transition-opacity hover:opacity-90"
+                      style={{ background: "var(--color-danger)", color: "#fff" }}
                     >
                       Confirm transfer
                     </button>
@@ -518,7 +518,7 @@ export function OrganizationTab() {
                 <button
                   onClick={() => setConfirmDelete(true)}
                   disabled={busy}
-                  className="self-start px-3 py-2 rounded-md text-sm border border-[var(--color-accent)] text-[var(--color-accent)] hover:bg-[var(--color-pill-hover)] disabled:opacity-50 transition-colors"
+                  className="self-start px-3 py-2 rounded-md text-sm border border-[var(--color-danger)] text-[var(--color-danger)] hover:bg-[var(--color-pill-hover)] disabled:opacity-50 transition-colors"
                 >
                   <span className="inline-flex items-center gap-1.5">
                     <Trash2 size={14} strokeWidth={1.5} /> Delete workspace
@@ -532,8 +532,8 @@ export function OrganizationTab() {
                   <button
                     onClick={deleteWorkspace}
                     disabled={busy}
-                    className="px-3 py-2 rounded-md text-sm border border-[var(--color-accent)] disabled:opacity-50 transition-opacity hover:opacity-90"
-                    style={{ background: "var(--color-accent)", color: "#fff" }}
+                    className="px-3 py-2 rounded-md text-sm border border-[var(--color-danger)] disabled:opacity-50 transition-opacity hover:opacity-90"
+                    style={{ background: "var(--color-danger)", color: "#fff" }}
                   >
                     Delete permanently
                   </button>
@@ -559,7 +559,7 @@ export function OrganizationTab() {
                 <button
                   onClick={() => setConfirmLeave(true)}
                   disabled={busy}
-                  className="self-start px-3 py-2 rounded-md text-sm border border-[var(--color-accent)] text-[var(--color-accent)] hover:bg-[var(--color-pill-hover)] disabled:opacity-50 transition-colors"
+                  className="self-start px-3 py-2 rounded-md text-sm border border-[var(--color-danger)] text-[var(--color-danger)] hover:bg-[var(--color-pill-hover)] disabled:opacity-50 transition-colors"
                 >
                   <span className="inline-flex items-center gap-1.5">
                     <LogOut size={14} strokeWidth={1.5} /> Leave workspace
@@ -571,8 +571,8 @@ export function OrganizationTab() {
                   <button
                     onClick={leaveWorkspace}
                     disabled={busy}
-                    className="px-3 py-2 rounded-md text-sm border border-[var(--color-accent)] disabled:opacity-50 transition-opacity hover:opacity-90"
-                    style={{ background: "var(--color-accent)", color: "#fff" }}
+                    className="px-3 py-2 rounded-md text-sm border border-[var(--color-danger)] disabled:opacity-50 transition-opacity hover:opacity-90"
+                    style={{ background: "var(--color-danger)", color: "#fff" }}
                   >
                     Leave
                   </button>

@@ -6,6 +6,7 @@ import {
   Folder as FolderIcon,
   FolderPlus,
   Home as HomeIcon,
+  Plus,
   Search,
   Settings as SettingsIcon,
   Trash2,
@@ -20,7 +21,7 @@ import { useCloudStore } from "../lib/cloud";
 // Humla mark sourced from humla-small.svg — single-path silhouette of
 // the bee's head + antennae arc. Uses currentColor so it inherits text
 // color from its parent (set on the brand row).
-function HumlaMark({ size = 16 }: { size?: number }) {
+function HumlaMark({ size = 18 }: { size?: number }) {
   return (
     <svg
       width={size}
@@ -111,20 +112,24 @@ export function Sidebar({ onCollapse }: { onCollapse: () => void }) {
   const noResults = searching && searchResults.length === 0;
 
   return (
-    <div className="h-full flex flex-col px-3 pb-3 gap-2">
-      {/* Title-bar-aligned drag strip — clears the macOS traffic-light row
-          so the brand mark below never sits behind the window controls.
-          Same pattern as SidebarCollapsed. */}
-      <div data-tauri-drag-region className="h-9 w-full shrink-0" />
-      <div data-tauri-drag-region className="h-8 flex items-center justify-between pl-1">
-        <div className="no-drag flex items-center gap-2 select-none text-sm text-[var(--color-text-muted)]">
-          <HumlaMark size={16} />
-          <span>Humla</span>
+    <div className="h-full flex flex-col px-2.5 pb-2.5">
+      {/* Traffic-light clearance + window drag handle — the macOS lights
+          sit over this strip in the nav card's top-left. */}
+      <div data-tauri-drag-region className="h-[34px] w-full shrink-0" />
+
+      {/* Brand */}
+      <div
+        data-tauri-drag-region
+        className="flex items-center justify-between px-2 pb-3"
+      >
+        <div className="no-drag flex items-center gap-2 select-none text-[var(--color-text)]">
+          <HumlaMark size={18} />
+          <span className="text-[15px] font-semibold tracking-[-0.01em]">Humla</span>
         </div>
         <button
           onClick={onCollapse}
           data-tauri-drag-region="false"
-          className="no-drag p-1.5 rounded-md hover:bg-[var(--color-sidebar-active)] text-[var(--color-text-muted)] hover:text-[var(--color-text)]"
+          className="no-drag p-1.5 rounded-[var(--radius)] hover:bg-[var(--color-pill-hover)] text-[var(--color-text-muted)] hover:text-[var(--color-text)] transition-colors"
           aria-label="Collapse sidebar"
           title="⌘\"
         >
@@ -134,101 +139,39 @@ export function Sidebar({ onCollapse }: { onCollapse: () => void }) {
 
       <WorkspaceSwitcher />
 
-      <div className="no-drag flex items-center gap-2 pl-2 pr-2 py-2 rounded-md border border-[var(--color-line)] bg-[var(--color-surface)] focus-within:border-[var(--color-text-muted)] transition-colors">
+      <div className="no-drag mt-2.5 flex items-center gap-2 px-2.5 py-2 rounded-[var(--radius)] border border-[var(--color-line-visible)] bg-[var(--color-surface)] focus-within:border-[var(--color-text-muted)] transition-colors">
         <Search size={14} strokeWidth={1.5} className="text-[var(--color-text-muted)] shrink-0" />
         <input
           data-search-input
           value={q}
           onChange={(e) => setQ(e.target.value)}
-          placeholder="Search"
-          className="flex-1 text-sm min-w-0"
+          placeholder="Search notes"
+          className="flex-1 text-sm min-w-0 bg-transparent"
         />
-        <kbd
-          className="shrink-0 px-1.5 py-0.5 text-[10px] text-[var(--color-text-muted)] border border-[var(--color-line)] rounded tracking-[0.04em]"
-          style={{ fontFamily: "var(--font-mono)" }}
-        >
+        <kbd className="shrink-0 px-1.5 py-0.5 text-[10px] text-[var(--color-text-disabled)] border border-[var(--color-line-visible)] rounded tabular-nums">
           ⌘K
         </kbd>
       </div>
 
-      <Link
-        to="/"
-        className={cn(
-          "no-drag flex items-center gap-2 px-2 py-2 rounded-md text-sm transition-colors",
-          location.pathname === "/"
-            ? "bg-[var(--color-sidebar-active)] text-[var(--color-text)]"
-            : "text-[var(--color-text-muted)] hover:bg-[var(--color-sidebar-active)] hover:text-[var(--color-text)]"
-        )}
-      >
-        <HomeIcon size={15} strokeWidth={1.5} />
-        <span>Home</span>
-      </Link>
-
-      <Link
-        to="/all-notes"
-        className={cn(
-          "no-drag flex items-center gap-2 px-2 py-2 rounded-md text-sm transition-colors",
-          location.pathname === "/all-notes"
-            ? "bg-[var(--color-sidebar-active)] text-[var(--color-text)]"
-            : "text-[var(--color-text-muted)] hover:bg-[var(--color-sidebar-active)] hover:text-[var(--color-text)]"
-        )}
-      >
-        <Files size={15} strokeWidth={1.5} />
-        <span>All notes</span>
-      </Link>
-
-      <Link
-        to="/trash"
-        className={cn(
-          "no-drag flex items-center gap-2 px-2 py-2 rounded-md text-sm transition-colors",
-          location.pathname === "/trash"
-            ? "bg-[var(--color-sidebar-active)] text-[var(--color-text)]"
-            : "text-[var(--color-text-muted)] hover:bg-[var(--color-sidebar-active)] hover:text-[var(--color-text)]"
-        )}
-      >
-        <Trash2 size={15} strokeWidth={1.5} />
-        <span>Trash</span>
-      </Link>
-
-      {creatingFolder ? (
-        <div className="no-drag flex items-center gap-2 pl-2 pr-2 py-2 rounded-md border border-[var(--color-text-muted)] bg-[var(--color-surface)]">
-          <FolderPlus size={15} strokeWidth={1.5} className="text-[var(--color-text-muted)] shrink-0" />
-          <input
-            autoFocus
-            value={newFolderName}
-            onChange={(e) => setNewFolderName(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") commitNewFolder();
-              else if (e.key === "Escape") {
-                setCreatingFolder(false);
-                setNewFolderName("");
-              }
-            }}
-            onBlur={commitNewFolder}
-            placeholder="Folder name"
-            className="flex-1 text-sm min-w-0"
+      {/* Scrollable nav body: primary links → Folders section (or search
+          results when searching). */}
+      <div className="flex-1 overflow-y-auto -mx-1 px-1 mt-3.5">
+        <div className="flex flex-col gap-px">
+          <NavItem to="/" icon={HomeIcon} label="Home" active={location.pathname === "/"} />
+          <NavItem
+            to="/all-notes"
+            icon={Files}
+            label="All notes"
+            active={location.pathname === "/all-notes"}
+            count={notes.length}
           />
         </div>
-      ) : (
-        <button
-          onClick={() => setCreatingFolder(true)}
-          className="no-drag flex items-center gap-2 px-2 py-2 rounded-md text-sm text-left text-[var(--color-text-muted)] hover:bg-[var(--color-sidebar-active)] hover:text-[var(--color-text)] transition-colors"
-        >
-          <FolderPlus size={15} strokeWidth={1.5} />
-          <span>New folder</span>
-        </button>
-      )}
-
-      <div className="flex-1 overflow-y-auto -mx-1 px-1 mt-2">
-        {empty && !searching && (
-          <div className="px-2 py-4 text-sm text-[var(--color-text-muted)]">No notes yet</div>
-        )}
-        {noResults && (
-          <div className="px-2 py-4 text-sm text-[var(--color-text-muted)]">No matches</div>
-        )}
 
         {searching ? (
-          <div className="mb-3">
+          <div className="mt-3">
+            {noResults && (
+              <div className="px-2 py-4 text-sm text-[var(--color-text-muted)]">No matches</div>
+            )}
             {searchResults.map((n) => (
               <NoteRow
                 key={n.id}
@@ -241,33 +184,113 @@ export function Sidebar({ onCollapse }: { onCollapse: () => void }) {
           </div>
         ) : (
           <>
-            {folders.length > 0 && (
-              <div className="nd-label px-2 pt-1 pb-1.5">Folders</div>
+            <Divider />
+            <div className="nd-label flex items-center justify-between px-2 pb-1.5">
+              <span>Folders</span>
+              <button
+                onClick={() => setCreatingFolder(true)}
+                aria-label="New folder"
+                title="New folder"
+                className="opacity-70 hover:opacity-100 hover:text-[var(--color-text)] transition-opacity"
+              >
+                <Plus size={14} strokeWidth={2} />
+              </button>
+            </div>
+
+            {creatingFolder && (
+              <div className="flex items-center gap-2 px-2 py-2 mb-0.5 rounded-[var(--radius)] border border-[var(--color-text-muted)] bg-[var(--color-surface)]">
+                <FolderPlus size={15} strokeWidth={1.5} className="shrink-0 text-[var(--color-text-muted)]" />
+                <input
+                  autoFocus
+                  value={newFolderName}
+                  onChange={(e) => setNewFolderName(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") commitNewFolder();
+                    else if (e.key === "Escape") {
+                      setCreatingFolder(false);
+                      setNewFolderName("");
+                    }
+                  }}
+                  onBlur={commitNewFolder}
+                  placeholder="Folder name"
+                  className="flex-1 text-sm min-w-0 bg-transparent"
+                />
+              </div>
             )}
 
-            {folders.map((f) => (
-              <FolderRow
-                key={f.id}
-                folder={f}
-                count={folderCounts.get(f.id) ?? 0}
-                active={location.pathname === `/folder/${f.id}`}
-              />
-            ))}
+            {empty && !creatingFolder ? (
+              <div className="px-2 py-4 text-sm text-[var(--color-text-muted)]">No notes yet</div>
+            ) : folders.length === 0 && !creatingFolder ? (
+              <div className="px-2 py-3 text-xs text-[var(--color-text-disabled)]">No folders yet</div>
+            ) : (
+              folders.map((f) => (
+                <FolderRow
+                  key={f.id}
+                  folder={f}
+                  count={folderCounts.get(f.id) ?? 0}
+                  active={location.pathname === `/folder/${f.id}`}
+                />
+              ))
+            )}
           </>
         )}
       </div>
 
-      <AccountRow />
-
-      <Link
+      {/* Pinned footer */}
+      <Divider />
+      <NavItem to="/trash" icon={Trash2} label="Trash" active={location.pathname === "/trash"} />
+      <NavItem
         to="/settings"
-        className="no-drag flex items-center gap-2 px-2 py-2 rounded-md text-sm text-[var(--color-text-muted)] hover:bg-[var(--color-sidebar-active)] hover:text-[var(--color-text)] transition-colors"
+        icon={SettingsIcon}
+        label="Settings"
+        active={location.pathname.startsWith("/settings")}
         title="⌘,"
-      >
-        <SettingsIcon size={15} strokeWidth={1.5} />
-        <span>Settings</span>
-      </Link>
+      />
+      <AccountRow />
     </div>
+  );
+}
+
+// Hairline divider between nav groups. 0.5px reads as a crisp warm line on
+// the card surface in both themes.
+function Divider() {
+  return <div className="h-px bg-[var(--color-line)] mx-1.5 my-3" />;
+}
+
+// A primary / footer nav row: leading icon, label, optional trailing count.
+// Active = surface lift (sits above the card); hover = a faint tint.
+function NavItem({
+  to,
+  icon: Icon,
+  label,
+  active,
+  count,
+  title,
+}: {
+  to: string;
+  icon: typeof HomeIcon;
+  label: string;
+  active: boolean;
+  count?: number;
+  title?: string;
+}) {
+  return (
+    <Link
+      to={to}
+      title={title}
+      className={cn(
+        "no-drag flex items-center gap-2.5 px-2.5 py-2 rounded-[var(--radius)] text-[13.5px] transition-colors",
+        active
+          ? "bg-[var(--color-sidebar-active)] text-[var(--color-text)] font-medium shadow-[0_1px_2px_rgba(0,0,0,0.05)]"
+          : "text-[var(--color-text-muted)] hover:bg-[var(--color-pill-hover)] hover:text-[var(--color-text)]",
+      )}
+    >
+      <Icon size={16} strokeWidth={1.6} className="shrink-0 opacity-85" />
+      <span className="flex-1 truncate">{label}</span>
+      {count !== undefined && count > 0 && (
+        <span className="text-[11px] text-[var(--color-text-disabled)] tabular-nums">{count}</span>
+      )}
+    </Link>
   );
 }
 
@@ -326,7 +349,7 @@ function FolderRow({
 
   if (editing) {
     return (
-      <div className="no-drag flex items-center gap-2 px-2 py-2 mb-0.5 rounded-md border border-[var(--color-text-muted)] bg-[var(--color-surface)]">
+      <div className="no-drag flex items-center gap-2 px-2.5 py-2 mb-0.5 rounded-[var(--radius)] border border-[var(--color-text-muted)] bg-[var(--color-surface)]">
         <FolderIcon size={15} strokeWidth={1.5} className="shrink-0 text-[var(--color-text-muted)]" />
         <input
           autoFocus
@@ -337,7 +360,7 @@ function FolderRow({
             else if (e.key === "Escape") setEditing(false);
           }}
           onBlur={commitRename}
-          className="flex-1 text-sm min-w-0"
+          className="flex-1 text-sm min-w-0 bg-transparent"
         />
       </div>
     );
@@ -349,19 +372,16 @@ function FolderRow({
         to={`/folder/${folder.id}`}
         onContextMenu={openMenu}
         className={cn(
-          "no-drag group flex items-center gap-2 px-2 py-2 mb-0.5 rounded-md text-sm transition-colors",
+          "no-drag group flex items-center gap-2.5 px-2.5 py-2 mb-0.5 rounded-[var(--radius)] text-[13.5px] transition-colors",
           active
-            ? "bg-[var(--color-sidebar-active)] text-[var(--color-text)]"
-            : "text-[var(--color-text-muted)] hover:bg-[var(--color-sidebar-active)] hover:text-[var(--color-text)]",
+            ? "bg-[var(--color-sidebar-active)] text-[var(--color-text)] font-medium shadow-[0_1px_2px_rgba(0,0,0,0.05)]"
+            : "text-[var(--color-text-muted)] hover:bg-[var(--color-pill-hover)] hover:text-[var(--color-text)]",
         )}
       >
-        <FolderIcon size={15} strokeWidth={1.5} className="shrink-0" />
+        <FolderIcon size={16} strokeWidth={1.6} className="shrink-0 opacity-85" />
         <span className="flex-1 truncate">{folder.name}</span>
         {count > 0 && (
-          <span
-            className="text-[11px] text-[var(--color-text-disabled)] tabular-nums"
-            style={{ fontFamily: "var(--font-mono)" }}
-          >
+          <span className="text-[11px] text-[var(--color-text-disabled)] tabular-nums">
             {count}
           </span>
         )}
@@ -393,16 +413,16 @@ function NoteRow({
     <Link
       to={`/note/${note.id}`}
       className={cn(
-        "no-drag group flex items-center gap-1 pl-2 pr-1 py-2 rounded-md text-sm transition-colors",
+        "no-drag group flex items-center gap-1 pl-2.5 pr-1 py-2 rounded-[var(--radius)] text-[13.5px] transition-colors",
         active
           ? "bg-[var(--color-sidebar-active)] text-[var(--color-text)]"
-          : "text-[var(--color-text-muted)] hover:bg-[var(--color-sidebar-active)] hover:text-[var(--color-text)]"
+          : "text-[var(--color-text-muted)] hover:bg-[var(--color-pill-hover)] hover:text-[var(--color-text)]"
       )}
     >
       <span className="flex-1 min-w-0 flex flex-col">
         <span className="truncate">{note.title.trim() || "Untitled"}</span>
         {folderName && (
-          <span className="truncate text-[10px] text-[var(--color-text-disabled)] uppercase tracking-[0.06em]" style={{ fontFamily: "var(--font-mono)" }}>
+          <span className="truncate text-[10px] text-[var(--color-text-disabled)]">
             {folderName}
           </span>
         )}
@@ -411,7 +431,7 @@ function NoteRow({
         onClick={(e) => onDelete(e, note.id)}
         aria-label="Delete note"
         title="Delete"
-        className="opacity-0 group-hover:opacity-100 focus:opacity-100 shrink-0 p-1 rounded text-[var(--color-text-muted)] hover:text-[var(--color-accent)] hover:bg-[var(--color-sidebar-active)] transition-colors"
+        className="opacity-0 group-hover:opacity-100 focus:opacity-100 shrink-0 p-1 rounded text-[var(--color-text-muted)] hover:text-[var(--color-danger)] hover:bg-[var(--color-pill-hover)] transition-colors"
       >
         <Trash2 size={14} strokeWidth={1.5} />
       </button>
@@ -419,8 +439,8 @@ function NoteRow({
   );
 }
 
-// Signed-in profile presence at the bottom of the sidebar. Hidden when signed
-// out (the workspace switcher already offers a sign-in affordance).
+// Signed-in profile presence pinned at the bottom of the nav. Hidden when
+// signed out (the workspace switcher already offers a sign-in affordance).
 function AccountRow() {
   const status = useCloudStore((s) => s.status);
   if (!status.logged_in || !status.user) return null;
@@ -428,13 +448,18 @@ function AccountRow() {
   return (
     <Link
       to="/settings?tab=account"
-      className="no-drag flex items-center gap-2 px-2 py-2 rounded-md text-sm text-[var(--color-text-muted)] hover:bg-[var(--color-sidebar-active)] hover:text-[var(--color-text)] transition-colors"
+      className="no-drag flex items-center gap-2.5 mt-1 px-2 py-2 rounded-[var(--radius)] hover:bg-[var(--color-pill-hover)] transition-colors"
       title="Account"
     >
-      <span className="shrink-0 grid place-items-center w-5 h-5 rounded-full bg-[var(--color-pill-hover)] text-[9px] uppercase">
-        {(u.name || u.email).slice(0, 1)}
+      <span className="shrink-0 grid place-items-center w-6 h-6 rounded-full bg-[var(--color-surface-raised)] text-[11px] font-semibold text-[var(--color-text)]">
+        {(u.name || u.email).slice(0, 1).toUpperCase()}
       </span>
-      <span className="flex-1 min-w-0 truncate">{u.name || u.email}</span>
+      <span className="flex-1 min-w-0 flex flex-col leading-tight">
+        <span className="truncate text-[13px] text-[var(--color-text)]">{u.name || u.email}</span>
+        {u.name && (
+          <span className="truncate text-[11px] text-[var(--color-text-disabled)]">{u.email}</span>
+        )}
+      </span>
     </Link>
   );
 }
