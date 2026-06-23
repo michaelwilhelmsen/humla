@@ -59,7 +59,7 @@ export function GeneralTab({ s, update }: Pick<SettingsHook, "s" | "update">) {
                 className={
                   "px-3 py-1 rounded text-sm " +
                   (palette === p.value
-                    ? "bg-[var(--color-pill-hover)] text-[var(--color-text)]"
+                    ? "bg-[var(--color-accent-soft)] text-[var(--color-accent-text)]"
                     : "text-[var(--color-text-muted)] hover:text-[var(--color-text)]")
                 }
               >
@@ -81,7 +81,7 @@ export function GeneralTab({ s, update }: Pick<SettingsHook, "s" | "update">) {
                 className={
                   "px-3 py-1 rounded text-sm " +
                   (theme === t.value
-                    ? "bg-[var(--color-pill-hover)] text-[var(--color-text)]"
+                    ? "bg-[var(--color-accent-soft)] text-[var(--color-accent-text)]"
                     : "text-[var(--color-text-muted)] hover:text-[var(--color-text)]")
                 }
               >

@@ -67,6 +67,7 @@
   --color-interactive: #2f6fb0;       /* speaker blue + links */
   --color-success: #5b8a45;           /* speaker green + synced */
   --color-warning: #bd962f;           /* speaker gold + override */
+  --color-warning-text: #8a6a1a;      /* readable gold for warning-as-text (light) */
   --color-speaker-4: #c0463f;         /* speaker red (4th, cycling) */
 
   --color-ink: var(--color-text);
@@ -110,6 +111,7 @@
     --color-interactive: #6aa3e0;
     --color-success: #8cc06f;
     --color-warning: #ddb255;
+    --color-warning-text: #ddb255;
     --color-speaker-4: #e07a72;
 
     --color-ink: var(--color-text);
@@ -153,6 +155,7 @@
   --color-interactive: #6aa3e0;
   --color-success: #8cc06f;
   --color-warning: #ddb255;
+  --color-warning-text: #ddb255;
   --color-speaker-4: #e07a72;
 
   --color-ink: var(--color-text);
@@ -334,122 +337,6 @@ input::placeholder, textarea::placeholder {
   border-color: var(--color-text-display);
 }
 
-/* Properties panel — Obsidian-style two-column metadata block. Used by
-   the Note header to surface per-note settings (folder, preset, language,
-   speakers, etc.) without the chip pile-up. The label column is fixed-
-   width monospace; the value column is borderless picker text that
-   reveals its dropdown affordance only on hover. */
-.nd-prop-table {
-  display: grid;
-  grid-template-columns: 132px 1fr;
-  row-gap: 2px;
-  column-gap: 12px;
-  align-items: center;
-}
-
-.nd-prop-row {
-  display: contents;
-}
-
-.nd-prop-row > .nd-prop-label,
-.nd-prop-row > .nd-prop-value {
-  padding: 6px 8px;
-  border-radius: 6px;
-  transition: background-color 150ms cubic-bezier(0.25, 0.1, 0.25, 1);
-}
-
-.nd-prop-row:hover > .nd-prop-label,
-.nd-prop-row:hover > .nd-prop-value,
-.nd-prop-row:focus-within > .nd-prop-label,
-.nd-prop-row:focus-within > .nd-prop-value {
-  background: var(--color-surface-raised);
-}
-
-.nd-prop-label {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  font-family: var(--font-mono);
-  font-size: 11px;
-  letter-spacing: 0.04em;
-  color: var(--color-text-muted);
-  user-select: none;
-}
-
-.nd-prop-label > svg {
-  flex-shrink: 0;
-  opacity: 0.7;
-}
-
-.nd-prop-value {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 13px;
-  color: var(--color-text);
-  min-height: 28px;
-}
-
-/* Selects living inside .nd-prop-value drop their default form-control
-   chrome — they should look like plain inline text until interacted with.
-   The select itself sits on the row's hover background. */
-.nd-prop-value select {
-  background: transparent;
-  border: none;
-  padding: 0;
-  border-radius: 0;
-  font-family: inherit;
-  font-size: inherit;
-  color: inherit;
-  cursor: pointer;
-}
-
-.nd-prop-value select:focus {
-  outline: none;
-  border: none;
-}
-
-.nd-prop-value .nd-prop-caret {
-  color: var(--color-text-muted);
-  opacity: 0;
-  transition: opacity 150ms cubic-bezier(0.25, 0.1, 0.25, 1);
-}
-
-.nd-prop-row:hover .nd-prop-caret,
-.nd-prop-row:focus-within .nd-prop-caret {
-  opacity: 1;
-}
-
-/* Primary action pill — Nothing-style: white surface, mono caps label,
-   visible border, mechanical feel. Used by Record / Summarize / etc. */
-.nd-action {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  padding: 10px 18px;
-  border: 1px solid var(--color-line-visible);
-  border-radius: 999px;
-  background: var(--color-surface);
-  color: var(--color-text);
-  font-family: var(--font-mono);
-  font-size: 11px;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  line-height: 1.2;
-  cursor: pointer;
-  transition: border-color 200ms cubic-bezier(0.25, 0.1, 0.25, 1),
-              background-color 200ms cubic-bezier(0.25, 0.1, 0.25, 1);
-}
-
-.nd-action:hover:not(:disabled) {
-  border-color: var(--color-text);
-}
-
-.nd-action:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
 /* Solid action buttons — the redesign's primary chrome (note toolbar, list
    headers). .nd-btn = secondary (surface + hairline border); .nd-btn-primary
    = ink fill (inverts in dark via the accent token); .nd-btn-icon = square
@@ -486,6 +373,8 @@ input::placeholder, textarea::placeholder {
   background: var(--color-accent-soft); border-color: transparent;
   color: var(--color-accent-text);
 }
+/* Smaller icon-button variant for secondary/inline affordances. */
+.nd-btn-icon-sm { width: 28px; height: 28px; }
 
 /* Meta-bar item (note identity row) — borderless, icon + label, hover tint
    on the interactive ones (folder, workspace pickers). */
@@ -528,8 +417,7 @@ input::placeholder, textarea::placeholder {
 
 /* WebKit on macOS sometimes ignores `appearance: none` on <select>, leaking
    the native arrow. Force it off everywhere we render a custom caret. */
-.nd-chip select,
-.nd-select {
+.nd-chip select {
   -webkit-appearance: none !important;
   -moz-appearance: none !important;
   appearance: none !important;
@@ -598,16 +486,6 @@ select {
 
 .rec-dot {
   animation: recording-pulse 1.2s ease-in-out infinite;
-}
-
-@keyframes recording-bar {
-  0%, 100% { transform: scaleY(0.4); }
-  50%      { transform: scaleY(1); }
-}
-
-.rec-bar {
-  transform-origin: center;
-  animation: recording-bar 1s ease-in-out infinite;
 }
 
 /* Floating recording-bar pills (status · controls · busy). A soft drop

@@ -170,7 +170,7 @@ export function roleColorVar(role: CloudRole): string {
     case "owner":
       return "var(--color-accent-text)";
     case "admin":
-      return "var(--color-warning)";
+      return "var(--color-warning-text)";
     default:
       return "var(--color-text-muted)";
   }

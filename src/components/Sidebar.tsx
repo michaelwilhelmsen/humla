@@ -131,7 +131,7 @@ export function Sidebar({ onCollapse }: { onCollapse: () => void }) {
           data-tauri-drag-region="false"
           className="no-drag p-1.5 rounded-[var(--radius)] hover:bg-[var(--color-pill-hover)] text-[var(--color-text-muted)] hover:text-[var(--color-text)] transition-colors"
           aria-label="Collapse sidebar"
-          title="⌘\"
+          title="Collapse sidebar"
         >
           <ChevronLeft size={16} strokeWidth={1.5} />
         </button>

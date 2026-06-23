@@ -1,69 +1,9 @@
 import { useMemo } from "react";
-import { Link, useParams, useNavigate } from "react-router-dom";
+import { useParams, useNavigate } from "react-router-dom";
 import { Folder as FolderIcon } from "lucide-react";
-import { type Note } from "../lib/ipc";
 import { useNotesStore } from "../lib/store";
-
-function formatMeetingTime(ts: number): string {
-  const d = new Date(ts);
-  const now = new Date();
-  const sameDay =
-    d.getFullYear() === now.getFullYear() &&
-    d.getMonth() === now.getMonth() &&
-    d.getDate() === now.getDate();
-  if (sameDay) {
-    return d.toLocaleTimeString(undefined, {
-      hour: "2-digit",
-      minute: "2-digit",
-      hour12: false,
-    });
-  }
-  const sameYear = d.getFullYear() === now.getFullYear();
-  return d.toLocaleDateString(undefined, {
-    month: "short",
-    day: "numeric",
-    ...(sameYear ? {} : { year: "numeric" }),
-  });
-}
-
-function groupByDate(notes: Note[]) {
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-  const yest = new Date(today);
-  yest.setDate(today.getDate() - 1);
-  const weekStart = new Date(today);
-  weekStart.setDate(today.getDate() - 7);
-
-  const groups: { label: string; items: Note[] }[] = [
-    { label: "Today", items: [] },
-    { label: "Yesterday", items: [] },
-    { label: "Earlier this week", items: [] },
-    { label: "Older", items: [] },
-  ];
-  for (const n of notes) {
-    const d = new Date(n.updated_at);
-    if (d >= today) groups[0].items.push(n);
-    else if (d >= yest) groups[1].items.push(n);
-    else if (d >= weekStart) groups[2].items.push(n);
-    else groups[3].items.push(n);
-  }
-  return groups.filter((g) => g.items.length > 0);
-}
-
-// One-line snippet for a row: strip the Tiptap body HTML (textContent only —
-// the element is never inserted live, so no script runs), falling back to the
-// transcript for pure voice memos.
-function notePreview(n: Note): string {
-  let text = "";
-  const html = n.body?.trim();
-  if (html) {
-    const el = document.createElement("div");
-    el.innerHTML = html;
-    text = el.textContent || "";
-  }
-  if (!text.trim() && n.transcript) text = n.transcript;
-  return text.replace(/\s+/g, " ").trim();
-}
+import { groupByDate } from "../lib/noteList";
+import { NoteListRow } from "../components/NoteListRow";
 
 export function Folder() {
   const { id } = useParams<{ id: string }>();
@@ -125,7 +65,7 @@ export function Folder() {
                 </div>
                 <ul>
                   {g.items.map((n) => (
-                    <NoteRow key={n.id} note={n} />
+                    <NoteListRow key={n.id} note={n} />
                   ))}
                 </ul>
               </section>
@@ -134,32 +74,5 @@ export function Folder() {
         )}
       </div>
     </div>
-  );
-}
-
-function NoteRow({ note }: { note: Note }) {
-  const preview = notePreview(note);
-  return (
-    <li>
-      <Link to={`/note/${note.id}`} className="group block">
-        <div className="max-w-[880px] mx-auto w-full px-8">
-          <div className="flex items-start gap-3 p-3 rounded-[11px] hover:bg-[var(--color-pill-hover)] transition-colors">
-            <div className="flex-1 min-w-0">
-              <div className="text-[14.5px] font-medium text-[var(--color-text)] truncate">
-                {note.title.trim() || "Untitled"}
-              </div>
-              {preview && (
-                <div className="mt-0.5 text-[13px] text-[var(--color-text-muted)] truncate">
-                  {preview}
-                </div>
-              )}
-            </div>
-            <span className="shrink-0 pt-px text-[12px] text-[var(--color-text-disabled)] tabular-nums whitespace-nowrap">
-              {formatMeetingTime(note.updated_at)}
-            </span>
-          </div>
-        </div>
-      </Link>
-    </li>
   );
 }

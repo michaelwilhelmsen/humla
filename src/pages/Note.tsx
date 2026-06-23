@@ -693,10 +693,7 @@ export function Note() {
                     key={rev.id}
                     className="flex items-center gap-3 text-xs px-2 py-1.5 rounded hover:bg-[var(--color-pill-hover)]"
                   >
-                    <span
-                      className="text-[var(--color-text-muted)] tabular-nums min-w-32 shrink-0"
-                      style={{ fontFamily: "var(--font-mono)" }}
-                    >
+                    <span className="text-[var(--color-text-muted)] tabular-nums min-w-32 shrink-0">
                       {new Date(rev.created_at).toLocaleString(undefined, {
                         month: "short",
                         day: "numeric",
@@ -787,7 +784,7 @@ export function Note() {
               onClick={() => setPanelOpen(false)}
               title="Close panel"
               aria-label="Close panel"
-              className="w-8 h-8 grid place-items-center rounded-[var(--radius)] text-[var(--color-text-disabled)] hover:bg-[var(--color-pill-hover)] hover:text-[var(--color-text)] transition-colors"
+              className="nd-btn-icon"
             >
               <X size={16} strokeWidth={1.6} />
             </button>
@@ -814,7 +811,7 @@ export function Note() {
                         onClick={() => ipc.summarizeNote(draft.id)}
                         title="Regenerate summary"
                         aria-label="Regenerate summary"
-                        className="p-1.5 rounded-md text-[var(--color-text-muted)] hover:bg-[var(--color-pill-hover)] hover:text-[var(--color-text)] transition-colors"
+                        className="nd-btn-icon nd-btn-icon-sm"
                       >
                         <RefreshCw size={15} strokeWidth={1.6} />
                       </button>
@@ -1152,6 +1149,7 @@ function CtlSelect({
       <select
         value={value}
         onChange={(e) => onChange(e.target.value)}
+        aria-label={title ?? label}
         className="absolute inset-0 h-full w-full cursor-pointer opacity-0"
       >
         {children}
@@ -1223,6 +1221,7 @@ function FolderPicker({
       <select
         value={value ?? "__root__"}
         onChange={(e) => handleChange(e.target.value)}
+        aria-label="Folder"
         className="absolute inset-0 h-full w-full cursor-pointer opacity-0"
       >
         <option value="__root__">No folder</option>
@@ -1273,6 +1272,7 @@ function WorkspacePicker({
       <select
         value={value}
         onChange={(e) => onChange(e.target.value)}
+        aria-label="Workspace"
         className="absolute inset-0 h-full w-full cursor-pointer opacity-0"
       >
         <option value="">Personal (this device)</option>

@@ -22,7 +22,7 @@ function RolePill({ role }: { role: CloudRole }) {
   return (
     <span
       className="shrink-0 px-1.5 py-0.5 text-[10px] uppercase tracking-[0.06em] rounded border"
-      style={{ fontFamily: "var(--font-mono)", color: roleColorVar(role), borderColor: "var(--color-line)" }}
+      style={{ color: roleColorVar(role), borderColor: "var(--color-line)" }}
     >
       {roleLabel(role)}
     </span>

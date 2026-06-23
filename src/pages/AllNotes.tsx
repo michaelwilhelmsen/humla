@@ -1,80 +1,11 @@
 import { useMemo, useState } from "react";
-import { Link, useNavigate } from "react-router-dom";
-import { Folder as FolderIcon, Plus } from "lucide-react";
-import { ipc, type Folder, type Note } from "../lib/ipc";
+import { useNavigate } from "react-router-dom";
+import { Plus } from "lucide-react";
+import { ipc, type Folder } from "../lib/ipc";
 import { useNotesStore } from "../lib/store";
 import { cn } from "../lib/cn";
-
-function formatMeetingTime(ts: number): string {
-  const d = new Date(ts);
-  const now = new Date();
-  const sameDay =
-    d.getFullYear() === now.getFullYear() &&
-    d.getMonth() === now.getMonth() &&
-    d.getDate() === now.getDate();
-  if (sameDay) {
-    return d.toLocaleTimeString(undefined, {
-      hour: "2-digit",
-      minute: "2-digit",
-      hour12: false,
-    });
-  }
-  const sameYear = d.getFullYear() === now.getFullYear();
-  return d.toLocaleDateString(undefined, {
-    month: "short",
-    day: "numeric",
-    ...(sameYear ? {} : { year: "numeric" }),
-  });
-}
-
-function groupByDate(notes: Note[]) {
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-  const yest = new Date(today);
-  yest.setDate(today.getDate() - 1);
-  const weekStart = new Date(today);
-  weekStart.setDate(today.getDate() - 7);
-
-  const groups: { label: string; items: Note[] }[] = [
-    { label: "Today", items: [] },
-    { label: "Yesterday", items: [] },
-    { label: "Earlier this week", items: [] },
-    { label: "Older", items: [] },
-  ];
-  for (const n of notes) {
-    const d = new Date(n.updated_at);
-    if (d >= today) groups[0].items.push(n);
-    else if (d >= yest) groups[1].items.push(n);
-    else if (d >= weekStart) groups[2].items.push(n);
-    else groups[3].items.push(n);
-  }
-  return groups.filter((g) => g.items.length > 0);
-}
-
-// A note counts as "recorded" once it has any transcript text (Recorded
-// filter); "summarized" once a summary has been generated (Summarized filter).
-function isRecorded(n: Note): boolean {
-  return n.transcript.trim().length > 0;
-}
-
-function isSummarized(n: Note): boolean {
-  return n.summary.trim().length > 0;
-}
-
-// One-line snippet for the row. The body is Tiptap HTML, so strip tags via a
-// detached element (textContent only — never inserted live, so no script
-// runs); fall back to the transcript for pure voice memos.
-function notePreview(n: Note): string {
-  let text = "";
-  const html = n.body?.trim();
-  if (html) {
-    const el = document.createElement("div");
-    el.innerHTML = html;
-    text = el.textContent || "";
-  }
-  if (!text.trim() && n.transcript) text = n.transcript;
-  return text.replace(/\s+/g, " ").trim();
-}
+import { groupByDate, isRecorded, isSummarized } from "../lib/noteList";
+import { NoteListRow } from "../components/NoteListRow";
 
 type FilterKey = "all" | "recorded" | "summarized" | "no-folder";
 
@@ -143,7 +74,7 @@ export function AllNotes() {
                   className={cn(
                     "no-drag text-[12.5px] px-3 py-[5px] rounded-full border transition-colors",
                     filter === f.key
-                      ? "bg-[var(--color-accent)] text-[var(--color-on-accent)] border-[var(--color-accent)]"
+                      ? "bg-[var(--color-accent-soft)] text-[var(--color-accent-text)] border-transparent"
                       : "text-[var(--color-text-muted)] border-[var(--color-line-visible)] hover:text-[var(--color-text)]",
                   )}
                 >
@@ -188,7 +119,7 @@ export function AllNotes() {
                 </div>
                 <ul>
                   {g.items.map((n) => (
-                    <NoteRow
+                    <NoteListRow
                       key={n.id}
                       note={n}
                       folder={n.folder_id ? folderById.get(n.folder_id) : undefined}
@@ -201,40 +132,5 @@ export function AllNotes() {
         )}
       </div>
     </div>
-  );
-}
-
-function NoteRow({ note, folder }: { note: Note; folder?: Folder }) {
-  const preview = notePreview(note);
-  return (
-    <li>
-      <Link to={`/note/${note.id}`} className="group block">
-        <div className="max-w-[880px] mx-auto w-full px-8">
-          <div className="flex items-start gap-3 p-3 rounded-[11px] hover:bg-[var(--color-pill-hover)] transition-colors">
-            <div className="flex-1 min-w-0">
-              <div className="text-[14.5px] font-medium text-[var(--color-text)] truncate">
-                {note.title.trim() || "Untitled"}
-              </div>
-              {preview && (
-                <div className="mt-0.5 text-[13px] text-[var(--color-text-muted)] truncate">
-                  {preview}
-                </div>
-              )}
-            </div>
-            <div className="shrink-0 flex flex-col items-end gap-1.5 pt-px">
-              <span className="text-[12px] text-[var(--color-text-disabled)] tabular-nums whitespace-nowrap">
-                {formatMeetingTime(note.updated_at)}
-              </span>
-              {folder && (
-                <span className="inline-flex items-center gap-1.5 max-w-[12rem] text-[11.5px] text-[var(--color-text-muted)] border border-[var(--color-line-visible)] rounded-md px-1.5 py-0.5">
-                  <FolderIcon size={12} strokeWidth={1.6} className="shrink-0 opacity-70" />
-                  <span className="truncate">{folder.name}</span>
-                </span>
-              )}
-            </div>
-          </div>
-        </div>
-      </Link>
-    </li>
   );
 }
