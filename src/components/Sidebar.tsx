@@ -120,7 +120,7 @@ export function Sidebar({ onCollapse }: { onCollapse: () => void }) {
       {/* Brand */}
       <div
         data-tauri-drag-region
-        className="flex items-center justify-between px-2 pb-3"
+        className="flex items-center justify-between pl-2 pr-0 pb-3"
       >
         <div className="no-drag flex items-center gap-2 select-none text-[var(--color-text)]">
           <HumlaMark size={18} />
@@ -139,7 +139,7 @@ export function Sidebar({ onCollapse }: { onCollapse: () => void }) {
 
       <WorkspaceSwitcher />
 
-      <div className="no-drag mt-2.5 flex items-center gap-2 px-2.5 py-2 rounded-[var(--radius)] border border-[var(--color-line-visible)] bg-[var(--color-surface)] focus-within:border-[var(--color-text-muted)] transition-colors">
+      <div className="no-drag mt-2.5 flex items-center gap-2 px-2.5 h-9 rounded-[var(--radius)] border border-[var(--color-line-visible)] bg-[var(--color-surface)] focus-within:border-[var(--color-text-muted)] transition-colors">
         <Search size={14} strokeWidth={1.5} className="text-[var(--color-text-muted)] shrink-0" />
         <input
           data-search-input
@@ -191,7 +191,7 @@ export function Sidebar({ onCollapse }: { onCollapse: () => void }) {
                 onClick={() => setCreatingFolder(true)}
                 aria-label="New folder"
                 title="New folder"
-                className="opacity-70 hover:opacity-100 hover:text-[var(--color-text)] transition-opacity"
+                className="grid place-items-center w-5 h-5 rounded-full text-[var(--color-text-muted)] hover:text-[var(--color-text)] hover:bg-[var(--color-pill-hover)] transition-colors"
               >
                 <Plus size={14} strokeWidth={2} />
               </button>

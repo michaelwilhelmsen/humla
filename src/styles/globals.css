@@ -26,11 +26,13 @@
    surface (pills) → raised, with a visible warm --color-card-border on the
    inset cards so the layers stay distinct.
 
-   Accent is INK, not red: dark ink in light mode, inverting to light ink in
-   dark mode so filled-accent elements stay visible on the dark canvas.
-   Text/icons placed on a filled accent use --color-on-accent. Red is
-   reserved for recording (--color-record) and destructive actions
-   (--color-danger). */
+   Accent is Humla gold (#ffdc6c) — the logo yellow, the SAME value in both
+   themes (gold reads on light and dark alike, so no inversion). Text/icons
+   placed ON a filled-gold surface use --color-on-accent (dark ink). For
+   accent-COLOURED text/icons/links sitting on a normal surface, use
+   --color-accent-text (a readable amber) — raw gold is too light to read as
+   text. Red is reserved for recording (--color-record) and destructive
+   actions (--color-danger). */
 
 /* === LIGHT === */
 :root,
@@ -53,10 +55,11 @@
   --color-input-bg: #fffef9;
   --color-shadow: transparent;
 
-  --color-accent: #1c1a14;            /* ink — primary action / active */
-  --color-accent-2: #39342a;          /* ink hover */
-  --color-accent-soft: #e8e3d6;       /* tinted fill behind active states */
-  --color-on-accent: #ffffff;         /* text/icon on a filled accent */
+  --color-accent: #ffdc6c;            /* Humla gold — fill for primary action / active */
+  --color-accent-2: #f3cb4d;          /* gold hover (slightly deeper) */
+  --color-accent-soft: #fbeecb;       /* gold tint behind active states */
+  --color-on-accent: #2a2206;         /* dark ink on a filled-gold surface */
+  --color-accent-text: #7a5a12;       /* readable amber for accent text/icons/links */
 
   --color-record: #cf352c;            /* red — recording indicators only */
   --color-danger: #c4362e;            /* red — destructive actions */
@@ -95,10 +98,11 @@
     --color-input-bg: #2a2418;
     --color-shadow: transparent;
 
-    --color-accent: #ece5d6;          /* light ink (inverted) */
-    --color-accent-2: #f7f3ea;
-    --color-accent-soft: #352f23;
-    --color-on-accent: #1a1407;       /* dark text on the light accent */
+    --color-accent: #ffdc6c;          /* Humla gold — same value in dark (no inversion) */
+    --color-accent-2: #f3cb4d;
+    --color-accent-soft: #38301a;     /* gold-tinted dark */
+    --color-on-accent: #2a2206;       /* dark ink on filled gold */
+    --color-accent-text: #f3d178;     /* readable amber on dark surfaces */
 
     --color-record: #e5544b;
     --color-danger: #e0564d;
@@ -137,10 +141,11 @@
   --color-input-bg: #2a2418;
   --color-shadow: transparent;
 
-  --color-accent: #ece5d6;            /* light ink (inverted) */
-  --color-accent-2: #f7f3ea;
-  --color-accent-soft: #352f23;
-  --color-on-accent: #1a1407;         /* dark text on the light accent */
+  --color-accent: #ffdc6c;            /* Humla gold — same value in dark (no inversion) */
+  --color-accent-2: #f3cb4d;
+  --color-accent-soft: #38301a;       /* gold-tinted dark */
+  --color-on-accent: #2a2206;         /* dark ink on filled gold */
+  --color-accent-text: #f3d178;       /* readable amber on dark surfaces */
 
   --color-record: #e5544b;
   --color-danger: #e0564d;
@@ -452,7 +457,7 @@ input::placeholder, textarea::placeholder {
 .nd-btn {
   display: inline-flex; align-items: center; gap: 7px;
   font-size: 13px; font-weight: 500; line-height: 1.2;
-  padding: 7px 13px; border-radius: var(--radius);
+  padding: 7px 14px; border-radius: 999px;
   border: 1px solid var(--color-line-visible);
   background: var(--color-surface); color: var(--color-text);
   cursor: pointer; white-space: nowrap; flex-shrink: 0;
@@ -471,7 +476,7 @@ input::placeholder, textarea::placeholder {
 }
 .nd-btn-icon {
   display: inline-flex; align-items: center; justify-content: center;
-  width: 33px; height: 33px; padding: 0; border-radius: var(--radius);
+  width: 33px; height: 33px; padding: 0; border-radius: 999px;
   border: 1px solid transparent; background: transparent;
   color: var(--color-text-muted); cursor: pointer; flex-shrink: 0;
   transition: color 140ms, background-color 140ms, border-color 140ms;
@@ -479,7 +484,7 @@ input::placeholder, textarea::placeholder {
 .nd-btn-icon:hover { background: var(--color-pill-hover); color: var(--color-text); }
 .nd-btn-icon.is-active {
   background: var(--color-accent-soft); border-color: transparent;
-  color: var(--color-accent);
+  color: var(--color-accent-text);
 }
 
 /* Meta-bar item (note identity row) — borderless, icon + label, hover tint

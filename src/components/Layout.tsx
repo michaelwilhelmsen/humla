@@ -63,7 +63,7 @@ export function Layout() {
       <aside
         className={cn(
           "shrink-0 overflow-hidden rounded-[var(--radius-card)] transition-[width] duration-300 ease-[cubic-bezier(0.4,0,0.2,1)]",
-          "border border-[var(--color-card-border)] bg-[var(--color-sidebar-bg)] shadow-[var(--shadow-card)]",
+          "bg-[var(--color-sidebar-bg)] shadow-[var(--shadow-card)]",
           collapsed ? "w-12" : "w-64",
         )}
       >

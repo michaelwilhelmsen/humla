@@ -568,7 +568,8 @@ export function Note() {
           className="nd-bare block w-full mb-4 text-[30px] font-semibold leading-[1.18] tracking-[-0.022em] placeholder:text-[var(--color-text-muted)]/50 resize-none overflow-hidden focus:outline-none"
         />
 
-        <div className="flex flex-wrap items-center gap-1 mb-8 pb-4 border-b border-[var(--color-line)]">
+        <div className="mb-8 pb-4 border-b border-[var(--color-line)]">
+          <div className="flex flex-wrap items-center gap-1 -mx-2">
           {authorName && (
             <span className="nd-meta" style={{ color: "var(--color-text)" }}>
               <span
@@ -657,6 +658,7 @@ export function Note() {
               {notePending ? "Syncing…" : "Synced"}
             </span>
           ) : null}
+          </div>
         </div>
 
         <NoteEditor
@@ -732,9 +734,9 @@ export function Note() {
       <aside
         style={{ width: panelOpen ? panelWidth : 0 }}
         className={cn(
-          "shrink-0 flex flex-col overflow-hidden rounded-[var(--radius-card)] border border-[var(--color-card-border)] bg-[var(--color-surface)] shadow-[var(--shadow-card)] relative z-30",
+          "shrink-0 flex flex-col overflow-hidden rounded-[var(--radius-card)] bg-[var(--color-surface)] shadow-[var(--shadow-card)] relative z-30",
           !resizing && "transition-[width,opacity] duration-300 ease-[cubic-bezier(0.4,0,0.2,1)]",
-          panelOpen ? "opacity-100 ml-1.5" : "opacity-0 border-0 pointer-events-none",
+          panelOpen ? "opacity-100 ml-1.5" : "opacity-0 pointer-events-none",
         )}
         aria-hidden={!panelOpen}
       >
@@ -756,7 +758,7 @@ export function Note() {
                 className={cn(
                   "inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-[var(--radius)] text-[13px] font-medium transition-colors",
                   activeTab === "summary"
-                    ? "bg-[var(--color-accent-soft)] text-[var(--color-accent)]"
+                    ? "bg-[var(--color-accent-soft)] text-[var(--color-accent-text)]"
                     : "text-[var(--color-text-disabled)] hover:text-[var(--color-text-muted)]",
                 )}
               >
@@ -769,7 +771,7 @@ export function Note() {
                 className={cn(
                   "inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-[var(--radius)] text-[13px] font-medium transition-colors",
                   activeTab === "transcript"
-                    ? "bg-[var(--color-accent-soft)] text-[var(--color-accent)]"
+                    ? "bg-[var(--color-accent-soft)] text-[var(--color-accent-text)]"
                     : "text-[var(--color-text-disabled)] hover:text-[var(--color-text-muted)]",
                 )}
               >
