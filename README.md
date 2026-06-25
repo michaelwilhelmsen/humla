@@ -7,7 +7,7 @@
 
 <p align="center">
   <a href="https://github.com/michaelwilhelmsen/humla/releases/latest">
-    <img alt="Humla — personal meeting notes for macOS" src="docs/screenshot.png" width="900">
+    <img alt="Humla — your notes and an AI summary side by side" src="docs/screenshot-summary.png" width="900">
   </a>
 </p>
 
@@ -28,6 +28,16 @@
   <a href="#license"><img alt="MIT" src="https://img.shields.io/badge/license-MIT-black?style=flat-square"></a>
   <img alt="macOS" src="https://img.shields.io/badge/macOS-13%2B-black?style=flat-square">
   <img alt="Apple Silicon" src="https://img.shields.io/badge/Apple%20Silicon-recommended-black?style=flat-square">
+</p>
+
+<p align="center">
+  <img alt="Recording a meeting with a live transcript" src="docs/screenshot-recording.png" width="46%">
+  &nbsp;
+  <img alt="Your notes library" src="docs/screenshot-home.png" width="46%">
+</p>
+
+<p align="center">
+  <sub><em>Notes and a live transcript while you record · your library</em></sub>
 </p>
 
 <h1></h1>
