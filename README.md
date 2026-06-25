@@ -30,16 +30,6 @@
   <img alt="Apple Silicon" src="https://img.shields.io/badge/Apple%20Silicon-recommended-black?style=flat-square">
 </p>
 
-<p align="center">
-  <img alt="Recording a meeting with a live transcript" src="docs/screenshot-recording.png" width="46%">
-  &nbsp;
-  <img alt="Your notes library" src="docs/screenshot-home.png" width="46%">
-</p>
-
-<p align="center">
-  <sub><em>Notes and a live transcript while you record · your library</em></sub>
-</p>
-
 <h1></h1>
 
 ## About
