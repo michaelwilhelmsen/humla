@@ -16,7 +16,7 @@ export function Folder() {
     () =>
       notes
         .filter((n) => n.folder_id === id)
-        .sort((a, b) => b.updated_at - a.updated_at),
+        .sort((a, b) => b.created_at - a.created_at),
     [notes, id],
   );
   const groups = useMemo(() => groupByDate(folderNotes), [folderNotes]);

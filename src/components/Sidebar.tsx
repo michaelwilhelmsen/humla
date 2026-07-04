@@ -90,7 +90,7 @@ export function Sidebar({ onCollapse }: { onCollapse: () => void }) {
     if (!searching) return [] as Note[];
     return notes
       .filter(noteMatches)
-      .sort((a, b) => b.updated_at - a.updated_at);
+      .sort((a, b) => b.created_at - a.created_at);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [notes, needle]);
 

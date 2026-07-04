@@ -4,7 +4,7 @@ import { type Folder, type Note } from "../lib/ipc";
 import { formatMeetingTime, notePreview } from "../lib/noteList";
 
 // One row in a note-list view (All notes, Folder). Title + one-line snippet on
-// the left; updated-time and an optional folder chip on the right. The folder
+// the left; created-time and an optional folder chip on the right. The folder
 // chip is omitted inside a folder view (where it would be redundant).
 export function NoteListRow({ note, folder }: { note: Note; folder?: Folder }) {
   const preview = notePreview(note);
@@ -25,7 +25,7 @@ export function NoteListRow({ note, folder }: { note: Note; folder?: Folder }) {
             </div>
             <div className="shrink-0 flex flex-col items-end gap-1.5 pt-px">
               <span className="text-[12px] text-[var(--color-text-disabled)] tabular-nums whitespace-nowrap">
-                {formatMeetingTime(note.updated_at)}
+                {formatMeetingTime(note.created_at)}
               </span>
               {folder && (
                 <span className="inline-flex items-center gap-1.5 max-w-[12rem] text-[11.5px] text-[var(--color-text-muted)] border border-[var(--color-line-visible)] rounded-md px-1.5 py-0.5">

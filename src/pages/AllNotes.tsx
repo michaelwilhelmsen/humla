@@ -24,7 +24,7 @@ export function AllNotes() {
   const [filter, setFilter] = useState<FilterKey>("all");
 
   const sorted = useMemo(
-    () => [...notes].sort((a, b) => b.updated_at - a.updated_at),
+    () => [...notes].sort((a, b) => b.created_at - a.created_at),
     [notes],
   );
   const folderById = useMemo(() => {

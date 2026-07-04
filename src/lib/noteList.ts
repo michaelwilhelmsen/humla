@@ -26,8 +26,9 @@ export function formatMeetingTime(ts: number): string {
   });
 }
 
-// Bucket notes into Today / Yesterday / Earlier this week / Older, dropping
-// empty buckets. Input should already be sorted newest-first.
+// Bucket notes into Today / Yesterday / Earlier this week / Older by their
+// creation date (not last-modified), dropping empty buckets. Input should
+// already be sorted newest-first.
 export function groupByDate(notes: Note[]) {
   const today = new Date();
   today.setHours(0, 0, 0, 0);
@@ -43,7 +44,7 @@ export function groupByDate(notes: Note[]) {
     { label: "Older", items: [] },
   ];
   for (const n of notes) {
-    const d = new Date(n.updated_at);
+    const d = new Date(n.created_at);
     if (d >= today) groups[0].items.push(n);
     else if (d >= yest) groups[1].items.push(n);
     else if (d >= weekStart) groups[2].items.push(n);
