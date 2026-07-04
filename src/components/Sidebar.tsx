@@ -16,6 +16,7 @@ import { ipc, type Folder, type Note } from "../lib/ipc";
 import { cn } from "../lib/cn";
 import { ContextMenu, ContextMenuItem } from "./ContextMenu";
 import { WorkspaceSwitcher } from "./WorkspaceSwitcher";
+import { SetupNag } from "./SetupNag";
 import { useCloudStore } from "../lib/cloud";
 
 // Humla mark sourced from humla-small.svg — single-path silhouette of
@@ -239,6 +240,9 @@ export function Sidebar({ onCollapse }: { onCollapse: () => void }) {
       {/* Pinned footer */}
       <Divider />
       <NavItem to="/trash" icon={Trash2} label="Trash" active={location.pathname === "/trash"} />
+      {/* Setup nag — renders only while the recording pipeline isn't functional
+          (shared predicate). Sits above Settings; self-hides when all set. */}
+      <SetupNag />
       <NavItem
         to="/settings"
         icon={SettingsIcon}

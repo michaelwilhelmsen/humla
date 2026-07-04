@@ -192,6 +192,22 @@ where
                 }
             }
 
+            // v0.31 — grandfather existing installs past the new first-run
+            // onboarding wizard. Marks `onboarding_completed=true` when the DB
+            // has notes or a local Whisper model is present on disk, so nobody
+            // already using Humla ever sees the wizard. Deliberately does NOT
+            // read the Keychain (a startup Keychain read can trigger a macOS
+            // prompt). Idempotent via the presence of the setting.
+            {
+                let state: tauri::State<AppState> = app.state();
+                let conn = state.db.lock();
+                if let Err(e) =
+                    db::migrate_grandfather_onboarding(&conn, &app_dir.join("models"))
+                {
+                    eprintln!("migrate_grandfather_onboarding: {e}");
+                }
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -237,6 +253,7 @@ where
             commands::cloud_billing_checkout,
             commands::cloud_billing_portal,
             commands::app_data_dir,
+            commands::system_arch,
             commands::note_diagnostics_dir,
             commands::note_audio_dir,
             commands::note_audio_files,

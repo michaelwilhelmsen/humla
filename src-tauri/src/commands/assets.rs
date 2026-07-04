@@ -14,6 +14,15 @@ pub fn app_data_dir(app: AppHandle) -> Result<String, String> {
         .ok_or_else(|| "non-utf8 path".to_string())
 }
 
+/// CPU architecture of the running process (`std::env::consts::ARCH`,
+/// e.g. "aarch64" or "x86_64"). The onboarding Transcription step reads
+/// this to flip the "recommended" badge from on-device to cloud on Intel
+/// Macs, where local Whisper inference is markedly slower.
+#[tauri::command]
+pub fn system_arch() -> String {
+    std::env::consts::ARCH.to_string()
+}
+
 /// Path to the per-note diagnostics directory. Always returns a valid
 /// path (whether or not files actually exist there yet); the frontend
 /// uses it to open the directory in Finder so the user can inspect the

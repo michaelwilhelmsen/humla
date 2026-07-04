@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { ipc, onRecordingDiagnostic, onRecordingError, onRecordingStatus, onSummary, onSummaryStatus, onTranscript, onTranscriptReplaced, onNotesChanged, onSyncStatus, onSyncConflict, type Folder, type Note, type RecordingDiagnostic, type RecordingStatus } from "./ipc";
+import { ipc, onRecordingDiagnostic, onRecordingError, onRecordingStatus, onSummary, onSummaryStatus, onTranscript, onTranscriptReplaced, onNotesChanged, onSyncStatus, onSyncConflict, onLocalWhisperProgress, type Folder, type Note, type RecordingDiagnostic, type RecordingStatus } from "./ipc";
 import { useCloudStore } from "./cloud";
 
 type NotesState = {
@@ -83,6 +83,25 @@ type RecordingState = {
   dismissFlash: (id: number) => void;
   diag: RecordingDiagnostic | null;
   setDiag: (d: RecordingDiagnostic | null) => void;
+  // Live audio-level (peak) for the meter in the recording bar. Fed off the
+  // sidecar heartbeat (every ~2s) and decayed toward zero between beats by the
+  // bar itself so it reads as a meter, not a stutter. 0..~1.
+  micLevel: number;
+  sysLevel: number;
+  setLevels: (mic: number, sys: number) => void;
+  // No-audio safety net. Tracks, per recording, whether real mic audio has ever
+  // arrived and how long the recording has been actively capturing (pauses
+  // excluded), so the bar can warn after ~10s of silence. Reset when a
+  // recording starts; `micHeard` latches true the moment audio arrives.
+  micHeard: boolean;
+  // Wall-clock ms when the current *active* (non-paused) capture segment began,
+  // or null while paused/idle. Total active time = activeAccumMs + (now - activeSince).
+  activeSince: number | null;
+  activeAccumMs: number;
+  // Called from the status listener on every recording phase transition to keep
+  // the audio-warning bookkeeping in sync (reset on start, pause the clock on
+  // pause, resume it on resume, clear on stop).
+  syncAudioWatch: (phase: RecordingStatus["phase"], noteId: string | null) => void;
 };
 
 let errorIdSeq = 0;
@@ -127,7 +146,68 @@ export const useRecordingStore = create<RecordingState>((set, get) => ({
   dismissFlash: (id) => set((s) => ({ flashes: s.flashes.filter((x) => x.id !== id) })),
   diag: null,
   setDiag: (d) => set({ diag: d }),
+  micLevel: 0,
+  sysLevel: 0,
+  setLevels: (mic, sys) => set({ micLevel: mic, sysLevel: sys }),
+  micHeard: false,
+  activeSince: null,
+  activeAccumMs: 0,
+  syncAudioWatch: (phase, noteId) =>
+    set((s) => {
+      const now = Date.now();
+      switch (phase) {
+        case "starting":
+        case "recording": {
+          // A brand-new recording (different note, or coming from a
+          // non-capturing phase) resets the whole safety-net state. A
+          // recording→recording repeat (heartbeat-driven re-renders don't call
+          // this, but a resume does via "recording") must NOT reset — only
+          // (re)start the active clock.
+          const isNewRecording =
+            s.status.noteId !== noteId || (s.status.phase !== "recording" && s.status.phase !== "paused");
+          if (isNewRecording) {
+            return { micHeard: false, activeAccumMs: 0, activeSince: now, micLevel: 0, sysLevel: 0 };
+          }
+          // Resume: bank nothing extra, just restart the active clock if it was
+          // stopped (paused). If already ticking, leave it.
+          return s.activeSince === null ? { activeSince: now } : {};
+        }
+        case "paused": {
+          // Freeze the active clock: bank the elapsed segment, stop counting.
+          if (s.activeSince === null) return {};
+          return { activeAccumMs: s.activeAccumMs + (now - s.activeSince), activeSince: null };
+        }
+        default: {
+          // stopping / diarizing / idle — recording is over. Clear the meter and
+          // the watch so nothing lingers into the next session.
+          return { micHeard: false, activeSince: null, activeAccumMs: 0, micLevel: 0, sysLevel: 0 };
+        }
+      }
+    }),
 }));
+
+// Global model-download slice (WP-E). The wizard's Transcription step tracks
+// download progress only while mounted; the sidebar nag chip and the "You're
+// all set" recap need it AFTER the user skips out mid-download. This tiny
+// store is fed by a single `local_whisper_progress` listener registered in
+// bindBackendListeners() so the chip can show "Downloading — NN%" and clear
+// itself (re-evaluating pipelineReady) the instant the download completes.
+type WhisperDownload = { modelId: string; received: number; total: number | null };
+type DownloadState = {
+  // The in-flight whisper model download, or null when nothing is downloading.
+  active: WhisperDownload | null;
+  setProgress: (d: WhisperDownload) => void;
+  clear: () => void;
+};
+export const useDownloadStore = create<DownloadState>((set) => ({
+  active: null,
+  setProgress: (d) => set({ active: d }),
+  clear: () => set({ active: null }),
+}));
+
+// Peak above which we consider the mic to be genuinely hearing something (not
+// noise-floor / silence). Matches the existing active-dot threshold in the bar.
+const MIC_AUDIBLE_PEAK = 0.001;
 
 let listenersBound = false;
 // The note id of the in-flight recording, captured so we can upload its audio
@@ -145,6 +225,10 @@ export function bindBackendListeners() {
   onTranscriptReplaced(({ noteId, text }) => useNotesStore.getState().replaceTranscript(noteId, text));
   onSummary(({ noteId, summary }) => useNotesStore.getState().setSummary(noteId, summary));
   onRecordingStatus((s) => {
+    // Update the audio-warning bookkeeping BEFORE setStatus — syncAudioWatch
+    // compares against the *previous* status to tell a new recording apart from
+    // a resume.
+    useRecordingStore.getState().syncAudioWatch(s.phase, s.noteId);
     useRecordingStore.getState().setStatus(s);
     if (s.phase === "idle") {
       useRecordingStore.getState().setDiag(null);
@@ -165,7 +249,17 @@ export function bindBackendListeners() {
     useRecordingStore.getState().setSummarizing(noteId, active);
   });
   onRecordingError(({ noteId, message }) => useRecordingStore.getState().pushError({ noteId, message }));
-  onRecordingDiagnostic((d) => useRecordingStore.getState().setDiag(d));
+  onRecordingDiagnostic((d) => {
+    const st = useRecordingStore.getState();
+    st.setDiag(d);
+    // Feed the level meter (the bar decays these toward 0 between heartbeats).
+    st.setLevels(d.micPeak, d.sysPeak);
+    // Latch "mic heard" the instant real audio arrives — clears any pending or
+    // shown no-audio warning for the rest of this recording.
+    if (!st.micHeard && d.micPeak > MIC_AUDIBLE_PEAK) {
+      useRecordingStore.setState({ micHeard: true });
+    }
+  });
   // Cloud sync applied remote changes → refetch notes + folders.
   onNotesChanged(() => useNotesStore.getState().refresh());
   // Live sync state → sidebar indicator. Also refresh the per-note pending set,
@@ -181,6 +275,17 @@ export function bindBackendListeners() {
       message: `"${title}" changed on the server — your unsynced edits were saved as a "(conflict copy)" note.`,
     }),
   );
+  // Global whisper-download tracking (WP-E). Feeds the sidebar nag chip + the
+  // "You're all set" recap so a model download that finishes AFTER the user
+  // leaves the wizard still clears the nag. On the final event (received >=
+  // total) we clear the slice, which re-evaluates pipelineReady everywhere.
+  onLocalWhisperProgress(({ modelId, received, total }) => {
+    if (total !== null && received >= total) {
+      useDownloadStore.getState().clear();
+    } else {
+      useDownloadStore.getState().setProgress({ modelId, received, total });
+    }
+  });
   // "Added to a workspace" notification. Watch the cloud status for workspaces
   // that newly appear and that you didn't create (role !== owner) — i.e. an
   // admin added you — and flash it, since otherwise it's silent.

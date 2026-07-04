@@ -71,7 +71,12 @@ export type SettingsKey =
   | "theme"
   | "palette"
   | "developer_mode"
-  | "silence_rms_threshold";
+  | "silence_rms_threshold"
+  // Onboarding wizard (v0.31): completion flag + resume cursor. Both are
+  // plain settings rows so the grandfathering migration and the frontend
+  // takeover guard read the same source of truth.
+  | "onboarding_completed"
+  | "onboarding_step";
 
 export type TranscribeProvider = "openai" | "local" | "deepgram" | "groq";
 
@@ -199,6 +204,9 @@ export const ipc = {
   getSetting: (key: SettingsKey) => invoke<string | null>("settings_get", { key }),
   setSetting: (key: SettingsKey, value: string) => invoke<void>("settings_set", { key, value }),
   appDataDir: () => invoke<string>("app_data_dir"),
+  // CPU architecture of the running process ("aarch64", "x86_64", …).
+  // Onboarding uses it to steer Intel Macs toward cloud transcription.
+  systemArch: () => invoke<string>("system_arch"),
   noteDiagnosticsDir: (noteId: string) =>
     invoke<string>("note_diagnostics_dir", { noteId }),
   noteAudioDir: (noteId: string) =>

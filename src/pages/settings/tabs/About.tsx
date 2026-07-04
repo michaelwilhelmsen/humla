@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { getVersion } from "@tauri-apps/api/app";
 import { open as openExternal } from "@tauri-apps/plugin-shell";
 import { ipc } from "../../../lib/ipc";
@@ -15,6 +16,7 @@ const TAPS_TO_ENABLE_DEV_MODE = 7;
 const TAP_RESET_MS = 3000;
 
 export function AboutTab() {
+  const navigate = useNavigate();
   const [version, setVersion] = useState<string>("");
   const [dataDir, setDataDir] = useState<string>("");
   const [devMode, setDevMode] = useState<boolean>(false);
@@ -158,6 +160,15 @@ export function AboutTab() {
             Notes, settings, downloaded models, and the audio temp dir all
             live here. Back up <code>notes.sqlite</code> from this folder
             to copy your library to another Mac.
+          </p>
+        </Row>
+      </Section>
+
+      <Section title="Setup">
+        <Row label="Setup assistant">
+          <Btn onClick={() => navigate("/onboarding")}>Run setup again</Btn>
+          <p className="text-xs text-[var(--color-text-muted)] mt-2">
+            Reruns the setup assistant with your current configuration.
           </p>
         </Row>
       </Section>

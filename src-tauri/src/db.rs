@@ -813,6 +813,56 @@ pub fn migrate_per_language_v4(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// v0.31 grandfathering: mark existing installs so the first-run onboarding
+/// wizard never appears for anyone already using Humla. Writes
+/// `onboarding_completed = "true"` when the DB looks lived-in.
+///
+/// Grandfather predicate (either is sufficient):
+///   - any notes exist (`COUNT(*) FROM notes > 0`, trashed included — a
+///     trashed note still proves prior use), OR
+///   - any local Whisper model file (`*.bin`) is present in `models_dir`.
+///
+/// Deliberately does **not** read the Keychain / API keys: a Keychain read at
+/// startup can trigger a macOS auth prompt (notably in unsigned dev builds),
+/// and we must never prompt the user just to decide whether to show a wizard.
+/// A cloud-only / API-key-only user with zero notes and no local model is the
+/// rare edge that (correctly) gets shown the wizard once — harmless, and every
+/// step writes through to live state so nothing they configured is lost.
+///
+/// Idempotent: short-circuits if `onboarding_completed` is already set (either
+/// by a prior run of this migration, or by the wizard itself completing). A
+/// genuinely fresh install writes nothing and falls through — the frontend
+/// takeover guard sees the unset key and shows the wizard.
+pub fn migrate_grandfather_onboarding(conn: &Connection, models_dir: &Path) -> Result<()> {
+    if get_setting(conn, "onboarding_completed")?.is_some() {
+        return Ok(());
+    }
+
+    let note_count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM notes", [], |r| r.get(0))?;
+    let has_notes = note_count > 0;
+
+    // A downloaded on-device model is stored as a `.bin` file in models_dir.
+    // Any such file (regardless of which model) proves the user configured
+    // local transcription. Missing dir / read error → treat as "no model".
+    let has_local_model = std::fs::read_dir(models_dir)
+        .map(|entries| {
+            entries.flatten().any(|e| {
+                e.path()
+                    .extension()
+                    .and_then(|x| x.to_str())
+                    .map(|x| x.eq_ignore_ascii_case("bin"))
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false);
+
+    if has_notes || has_local_model {
+        set_setting(conn, "onboarding_completed", "true")?;
+    }
+    Ok(())
+}
+
 fn map_note(row: &rusqlite::Row) -> rusqlite::Result<Note> {
     Ok(Note {
         id: row.get(0)?,
@@ -1120,5 +1170,90 @@ mod tests {
         // fallback. We assert the error type only to document
         // behaviour, not to require the caller to surface it.
         assert!(migrate_per_language_v4(&conn).is_err());
+    }
+
+    #[test]
+    fn grandfather_onboarding_marks_install_with_notes() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("gf.sqlite")).unwrap();
+        create_note(&conn, "en", "meeting", "").unwrap();
+        // Empty models dir → grandfather solely on the note.
+        let models = dir.path().join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        migrate_grandfather_onboarding(&conn, &models).unwrap();
+        assert_eq!(
+            get_setting(&conn, "onboarding_completed").unwrap().as_deref(),
+            Some("true"),
+        );
+    }
+
+    #[test]
+    fn grandfather_onboarding_marks_install_with_trashed_note() {
+        // A trashed note still proves prior use — COUNT(*) includes it.
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("gf.sqlite")).unwrap();
+        let id = create_note(&conn, "en", "meeting", "").unwrap().id;
+        delete_note(&conn, &id).unwrap();
+        let models = dir.path().join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        migrate_grandfather_onboarding(&conn, &models).unwrap();
+        assert_eq!(
+            get_setting(&conn, "onboarding_completed").unwrap().as_deref(),
+            Some("true"),
+        );
+    }
+
+    #[test]
+    fn grandfather_onboarding_marks_install_with_local_model() {
+        // No notes, but a downloaded model .bin present → grandfather.
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("gf.sqlite")).unwrap();
+        let models = dir.path().join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::write(models.join("ggml-large-v3-turbo-q5_0.bin"), b"x").unwrap();
+        migrate_grandfather_onboarding(&conn, &models).unwrap();
+        assert_eq!(
+            get_setting(&conn, "onboarding_completed").unwrap().as_deref(),
+            Some("true"),
+        );
+    }
+
+    #[test]
+    fn grandfather_onboarding_leaves_fresh_install_unset() {
+        // Zero notes, no model file, models dir absent entirely →
+        // the key stays unset and the frontend shows the wizard.
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("gf.sqlite")).unwrap();
+        let models = dir.path().join("models"); // never created
+        migrate_grandfather_onboarding(&conn, &models).unwrap();
+        assert!(get_setting(&conn, "onboarding_completed").unwrap().is_none());
+    }
+
+    #[test]
+    fn grandfather_onboarding_ignores_non_bin_files() {
+        // A stray non-.bin file in models/ must not count as a model.
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("gf.sqlite")).unwrap();
+        let models = dir.path().join("models");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::write(models.join(".DS_Store"), b"x").unwrap();
+        migrate_grandfather_onboarding(&conn, &models).unwrap();
+        assert!(get_setting(&conn, "onboarding_completed").unwrap().is_none());
+    }
+
+    #[test]
+    fn grandfather_onboarding_is_idempotent_and_respects_prior_completion() {
+        // Once set (by the wizard completing, say to "true", or a Skip),
+        // a fresh-install-looking DB must not be re-marked or overwritten.
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("gf.sqlite")).unwrap();
+        set_setting(&conn, "onboarding_completed", "true").unwrap();
+        let models = dir.path().join("models"); // empty / absent
+        migrate_grandfather_onboarding(&conn, &models).unwrap();
+        assert_eq!(
+            get_setting(&conn, "onboarding_completed").unwrap().as_deref(),
+            Some("true"),
+            "prior value preserved; migration short-circuits",
+        );
     }
 }

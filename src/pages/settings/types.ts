@@ -10,7 +10,13 @@ import { SUMMARY_PRESETS, presetPromptForLang } from "../../lib/presets";
 import type { Theme } from "../../lib/theme";
 import type { Palette } from "../../lib/palette";
 
-export type EditableKey = Exclude<SettingsKey, "theme" | "palette">;
+// The Settings form manages every key except the ones with their own
+// dedicated controls (theme/palette) and the onboarding wizard's internal
+// bookkeeping keys (owned by the wizard shell, never surfaced in Settings).
+export type EditableKey = Exclude<
+  SettingsKey,
+  "theme" | "palette" | "onboarding_completed" | "onboarding_step"
+>;
 
 export type Provider = "openai" | "local" | "deepgram" | "groq";
 

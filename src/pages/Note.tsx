@@ -28,6 +28,7 @@ import {
 import { ipc, onSummaryThinkingDelta, onSummaryContentDelta, type Note as TNote, type NoteRevision, type SummaryPrompt, type TimelineEntry } from "../lib/ipc";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { useNotesStore, useRecordingStore } from "../lib/store";
+import { computeSetupStatus } from "../lib/setupStatus";
 import { useOwnerName, useCloudStore } from "../lib/cloud";
 import { extractSpeakerLabels, renameSpeakerInTranscript } from "../lib/speakers";
 import { RecordingBar } from "../components/RecordingBar";
@@ -1038,6 +1039,25 @@ function NoteToolbar({
   const [menuPos, setMenuPos] = useState<{ x: number; y: number } | null>(null);
 
   async function record() {
+    // Pre-flight: don't start a doomed recording when the pipeline isn't
+    // functional (same shared predicate as the nag chip + recap). Covers a
+    // missing mic AND a missing/unconfigured STT path. Surface an inline
+    // flash pointing at setup rather than hard-failing mid-recording; the
+    // sidebar nag chip is the click-through to /onboarding (the flash UI is
+    // text-only).
+    try {
+      const setup = await computeSetupStatus();
+      if (!setup.pipelineReady) {
+        const msg = !setup.micGranted
+          ? "Finish setup to record — microphone access isn't granted yet."
+          : "Finish setup to record — transcription isn't configured yet.";
+        useRecordingStore.getState().pushFlash(msg);
+        return;
+      }
+    } catch {
+      // If the predicate can't be computed, fall through and attempt the
+      // recording — the backend still surfaces real failures as errors.
+    }
     try {
       await ipc.recordingStart(noteId);
     } catch (e) {
