@@ -12,6 +12,8 @@
 </p>
 
 <p align="center">
+  <a href="https://humla.team"><strong>humla.team</strong></a>
+  ·
   <a href="https://github.com/michaelwilhelmsen/humla/releases/latest"><strong>Download for macOS</strong></a>
   ·
   <a href="#what-it-does">What it does</a>
@@ -24,6 +26,7 @@
 </p>
 
 <p align="center">
+  <a href="https://humla.team"><img alt="Website" src="https://img.shields.io/badge/website-humla.team-black?style=flat-square"></a>
   <a href="https://github.com/michaelwilhelmsen/humla/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/michaelwilhelmsen/humla?style=flat-square&color=black"></a>
   <a href="#license"><img alt="MIT" src="https://img.shields.io/badge/license-MIT-black?style=flat-square"></a>
   <img alt="macOS" src="https://img.shields.io/badge/macOS-13%2B-black?style=flat-square">
@@ -83,7 +86,7 @@ The summary can run on:
 - **Folders + search** — flat folder list with full-text search across titles, bodies, transcripts, and folder names.
 - **Click-to-edit transcript** — coloured speaker pills inline; click anywhere to fix a transcription error.
 - **Auto-update** — signed and notarised; existing installs detect new releases on launch.
-- **System-aware light/dark theme** — Nothing-design aesthetic, Space Grotesk + Space Mono.
+- **System-aware light/dark theme** — clean, typographic UI in Hanken Grotesk with a warm gold accent.
 
 ## Privacy
 
@@ -102,31 +105,21 @@ If you use only Local Whisper + Community-1 (or Sortformer) + a local LLM for su
 
 ## Team sync & self-hosting
 
-Humla is local-first and works fully offline. If you want to **sync across your devices** or **share workspaces with teammates**, point the app at a sync server (Settings → Account → Connect). Two ways to get one:
+Humla is local-first and works fully offline — your local/Personal notes never need a server. If you want to **sync across your devices** or **share workspaces with teammates**, point the app at a sync server (Settings → Account → Connect). The server only stores and relays your notes — transcription and summaries still run through your own providers or on-device, and it never sees your API keys.
+
+The sync engine speaks to a **[PocketBase](https://pocketbase.io)** backend (a single Go binary: SQLite + auth + file storage + REST API). Two ways to get one:
 
 ### Option 1 — Humla Cloud (managed)
 
-The hosted option: sign up in-app, nothing to set up. Team workspaces are a paid subscription (flat monthly per workspace, via Stripe) with a **14-day free trial**; your local/Personal notes are always free. The convenient path — you run no infrastructure.
+The hosted option: sign up in-app, nothing to set up. Team workspaces are a paid subscription (**$7/month per workspace**, via Stripe) with a **14-day free trial**; your local/Personal notes are always free. The convenient path — you run no infrastructure.
 
 ### Option 2 — Self-host (free)
 
-The sync server is just **[PocketBase](https://pocketbase.io)** (a single Go binary) plus Humla's hooks and migrations. Self-hosted servers have **no paywall** — every team feature is free; you're running your own box.
+Run your own PocketBase server — on a VPS or on your own machine — and point Humla at it in **Settings → Account → Connect**. Self-hosted servers have **no paywall**: every team feature is free. Billing only activates when the server has `STRIPE_SECRET_KEY` set, so a self-hosted server never asks anyone to pay.
 
-1. Download the PocketBase binary (v0.39+).
-2. Run it with Humla's server code — the `server/` directory holds the hooks, migrations, and an optional read-only web client:
+Self-hosting also needs Humla's PocketBase schema (the workspace/notes/folders/summary_prompts collections plus the workspace-isolation rules) and route hooks. That server-side setup is maintained separately from this open-source app and isn't bundled in this repo — if you'd like to run your own server, [open an issue](https://github.com/michaelwilhelmsen/humla/issues) and I'll share the schema and deploy recipe.
 
-   ```sh
-   pocketbase serve \
-     --hooksDir=server/pb_hooks \
-     --migrationsDir=server/pb_migrations \
-     --publicDir=server/pb_public
-   ```
-3. Create your account from the PocketBase admin UI at `http://127.0.0.1:8090/_/` (or enable public sign-up).
-4. In Humla: **Settings → Account → Connect**, enter your server URL, and sign in. Notes, folders, summaries, transcripts, audio, and shared workspaces all sync.
-
-For a real deployment, put it behind HTTPS (a reverse proxy) and point PocketBase at S3/R2 storage (Settings → Files) so audio blobs don't fill the local disk.
-
-> **Billing is off by default.** The subscription gate only activates when the server has `STRIPE_SECRET_KEY` set — a self-hosted server never asks anyone to pay.
+For a real deployment, put PocketBase behind HTTPS (a reverse proxy) and point it at S3/R2 storage (Settings → Files) so audio blobs don't fill the local disk.
 
 ## Quick start
 
