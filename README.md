@@ -39,12 +39,12 @@
 
 **Humla** is a meeting-notes app for macOS, inspired by Granola. You take freeform notes during your meeting; Humla records the audio, transcribes it, separates speakers, and produces a structured summary that combines your notes with what was actually said.
 
-Built around one principle: **your audio and your data stay on your machine** unless you explicitly send them to a provider you control. Everything works locally — recording, transcription, speaker identification, even summarisation if you point it at a local LLM.
+Built around one principle: **your audio and your data stay on your machine** unless you explicitly send them somewhere you choose — a transcription/LLM provider, or an optional sync server. Everything works locally — recording, transcription, speaker identification, even summarisation if you point it at a local LLM.
 
 The name is Norwegian for *bumblebee* — small, hum, personal.
 
 > [!NOTE]
-> Humla is a personal project, not a SaaS. There's no signup, no telemetry, no shared backend. The trade-off: you bring your own API keys (or run fully local), and you maintain it yourself.
+> Humla is an indie project, not a big SaaS. The app is **local-first and free** — no account, no telemetry, bring your own API keys (or run fully local). If you want to sync across devices or share workspaces with a team, **Humla Cloud** is an optional paid add-on — and you can self-host the sync server instead. Either way, transcription and summaries still run through your own providers or on-device. See [Team sync & self-hosting](#team-sync--self-hosting).
 
 ## What it does
 
@@ -92,7 +92,7 @@ The summary can run on:
 
 The defaults are designed so nothing leaves your machine unless you tell it to.
 
-- **No backend, no telemetry.** Humla doesn't phone home. The only outbound traffic is to the API endpoints you've explicitly configured.
+- **No telemetry, no backend by default.** Humla doesn't phone home. The only outbound traffic is to the API endpoints you've explicitly configured — plus, *if* you opt into sync, the server you connect to (Humla Cloud or your own).
 - **Your notes and transcripts** live in a single SQLite database at `~/Library/Application Support/no.humla.app/`.
 - **Recorded audio:**
   - During the recording, audio is held in a per-recording temp directory.
