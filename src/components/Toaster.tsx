@@ -22,7 +22,10 @@ export function Toaster() {
               {e.kind === "summary" ? "Summary failed" : "Recording issue"}
             </div>
             <div className="text-[var(--color-text)]">{e.message}</div>
-            {e.message.toLowerCase().includes("permission") && (
+            {/* Copy-coupled: error messages that mention "permission" or
+                "Settings" (see Note.tsx's record pre-flight and the backend's
+                recording_error strings) get a shortcut into Settings. */}
+            {/permission|settings/i.test(e.message) && (
               <button
                 onClick={() => { navigate("/settings"); dismissError(e.id); }}
                 className="mt-2 text-xs underline text-[var(--color-text-muted)] hover:text-[var(--color-text)]"

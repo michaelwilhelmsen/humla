@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import {
   ipc,
   onDiarizeDownloadProgress,
+  onLocalWhisperDownloadError,
   onLocalWhisperProgress,
   type ProviderConfig,
   type TranscribeConfig,
@@ -82,7 +83,37 @@ export function useSettings() {
   useEffect(() => {
     let cancelled = false;
     let unlisten: (() => void) | undefined;
+    // Terminal events trigger an async model-status refetch; the seq guard
+    // drops any refetch that isn't the newest (two terminal events can fire
+    // back-to-back around the backend's atomic rename, and their fetches can
+    // resolve out of order — a stale one must not re-add a cleared bar).
+    let fetchSeq = 0;
     onLocalWhisperProgress((p) => {
+      // Terminal event (received caught up with a known total): completion
+      // must be derived HERE, from the event stream — the invoke promise in
+      // downloadModel() dies with the mount that started it, and a download
+      // that outlives a Settings visit would otherwise sit on a full
+      // progress bar reading "Not downloaded" until app restart.
+      if (p.total !== null && p.received >= p.total) {
+        const seq = ++fetchSeq;
+        void ipc
+          .localWhisperModels()
+          .then((models) => {
+            if (cancelled || seq !== fetchSeq) return;
+            setLocal((s) => {
+              // The loop can emit received == total just before the atomic
+              // rename; only clear the bar once the file is really in place.
+              // The backend's post-rename event settles the race.
+              const inPlace = models.find((m) => m.id === p.modelId)?.downloaded ?? false;
+              const next = { ...s.downloading };
+              if (inPlace) delete next[p.modelId];
+              else next[p.modelId] = { received: p.received, total: p.total };
+              return { ...s, models, downloading: next };
+            });
+          })
+          .catch(() => {});
+        return;
+      }
       setLocal((s) => ({
         ...s,
         downloading: {
@@ -90,6 +121,27 @@ export function useSettings() {
           [p.modelId]: { received: p.received, total: p.total },
         },
       }));
+    }).then((u) => {
+      if (cancelled) u();
+      else unlisten = u;
+    });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
+
+  // Failure counterpart: without this, a download that errors after its
+  // initiating mount is gone leaves a forever-progress bar.
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    onLocalWhisperDownloadError((e) => {
+      setLocal((s) => {
+        const next = { ...s.downloading };
+        delete next[e.modelId];
+        return { ...s, downloading: next, error: e.message };
+      });
     }).then((u) => {
       if (cancelled) u();
       else unlisten = u;

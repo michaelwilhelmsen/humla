@@ -25,7 +25,18 @@ export function LanguageStep({ ctx }: { ctx: StepContext }) {
     ipc
       .getSetting("language")
       .then((v) => {
-        if (!cancelled) setValue(v ?? DEFAULT_LANGUAGE);
+        if (cancelled) return;
+        setValue(v ?? DEFAULT_LANGUAGE);
+        // Never-written setting: persist the default we're displaying.
+        // Accepting the pre-selected language via Continue skips change(),
+        // and downstream consumers (the Transcription step, chunk-time
+        // language resolution) read the setting directly — an unset row
+        // left them with null forever on fresh installs.
+        if (v === null) {
+          ipc.setSetting("language", DEFAULT_LANGUAGE).catch((e) => {
+            console.warn("[onboarding] failed to save default language:", e);
+          });
+        }
       })
       .catch(() => {
         if (!cancelled) setValue(DEFAULT_LANGUAGE);

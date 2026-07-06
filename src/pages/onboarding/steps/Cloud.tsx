@@ -14,8 +14,10 @@
 //   2. "Set up a team workspace" — the full funnel: configure the hosted server
 //      → inline signup → name + create workspace → Stripe Checkout → poll
 //      cloud_status until the subscription goes live → success.
-//   3. "I already have an account" — configure → login → pick a workspace (or
-//      fall into the create-workspace sub-flow if they have none).
+//   3. "Join an existing team" — configure → sign in (or create an account via
+//      the inline auth toggle) → pick a workspace, or — for a brand-new user
+//      whose admin hasn't added them yet — a calm "ask your admin" note with
+//      workspace creation demoted to the fallback.
 //   + Self-hosted — a small text link (not a card) that reveals a server-URL
 //      input; from there the same sign-up / sign-in forms apply.
 //
@@ -155,11 +157,11 @@ export function CloudStep({ ctx }: { ctx: StepContext }) {
           {option === "team" && <TeamFunnel ctx={ctx} mode="signup" />}
         </OptionCard>
 
-        {/* Option 3 — Already have an account. */}
+        {/* Option 3 — Join a team that already uses Humla (account or not). */}
         <OptionCard
           icon={<LogIn size={18} strokeWidth={1.8} />}
-          title="I already have an account"
-          blurb="Sign in and join your team's workspace."
+          title="Join an existing team"
+          blurb="Your team already uses Humla Cloud. Sign in — or create an account and get added by your workspace admin."
           selected={option === "existing"}
           onSelect={() => setOption("existing")}
         >
@@ -262,8 +264,10 @@ function TeamFunnel({
   }
 
   // Stage 3 — signed in, no active workspace → create (or pick, if any exist).
+  // On the join path, an empty workspace list means "wait for your admin", so
+  // the stage needs to know which card it's serving.
   if (!ws) {
-    return <WorkspaceStage />;
+    return <WorkspaceStage mode={mode} />;
   }
 
   // Stage 4 — signed in with a workspace whose plan isn't live yet → trial.
@@ -359,11 +363,15 @@ function ConnectStage() {
 
 // ── Stage: auth (signup for the team path, login for the existing path) ───────
 // Reuses the exact command wrappers + error-message patterns from Account.tsx.
+// The card only picks the STARTING form: a new user on the join path has no
+// account yet, and an existing user can land on the team card — either way the
+// other form must be one toggle away, never a dead end.
 
-function AuthStage({ mode }: { mode: "signup" | "signin" }) {
+function AuthStage({ mode: initialMode }: { mode: "signup" | "signin" }) {
   const status = useCloudStore((s) => s.status);
   const refresh = useCloudStore((s) => s.refresh);
 
+  const [mode, setMode] = useState(initialMode);
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -371,6 +379,11 @@ function AuthStage({ mode }: { mode: "signup" | "signin" }) {
   const [error, setError] = useState<string | null>(null);
 
   const isSignup = mode === "signup";
+
+  function toggleMode() {
+    setMode(isSignup ? "signin" : "signup");
+    setError(null);
+  }
   const canSubmit =
     !!email.trim() && !!password && (!isSignup || !!name.trim());
 
@@ -426,20 +439,29 @@ function AuthStage({ mode }: { mode: "signup" | "signin" }) {
         className={inputCls}
       />
       {error && <p className="text-xs text-[var(--color-danger)] break-all">{error}</p>}
-      <button
-        type="button"
-        onClick={submit}
-        disabled={busy || !canSubmit}
-        className="nd-btn nd-btn-primary self-start"
-      >
-        {busy
-          ? isSignup
-            ? "Creating…"
-            : "Signing in…"
-          : isSignup
-            ? "Create account"
-            : "Sign in"}
-      </button>
+      <div className="flex items-center gap-3">
+        <button
+          type="button"
+          onClick={submit}
+          disabled={busy || !canSubmit}
+          className="nd-btn nd-btn-primary"
+        >
+          {busy
+            ? isSignup
+              ? "Creating…"
+              : "Signing in…"
+            : isSignup
+              ? "Create account"
+              : "Sign in"}
+        </button>
+        <button
+          type="button"
+          onClick={toggleMode}
+          className="text-xs text-[var(--color-text-muted)] hover:text-[var(--color-text)] underline transition-colors"
+        >
+          {isSignup ? "Already have an account? Sign in" : "New here? Create an account"}
+        </button>
+      </div>
     </div>
   );
 }
@@ -450,13 +472,19 @@ function AuthStage({ mode }: { mode: "signup" | "signin" }) {
 // current_workspace). If any workspaces already exist, list them and select on
 // click (cloud_select_workspace), matching Organization.tsx.
 
-function WorkspaceStage() {
+function WorkspaceStage({ mode }: { mode: "signup" | "signin" }) {
   const status = useCloudStore((s) => s.status);
   const refresh = useCloudStore((s) => s.refresh);
 
   const [newWs, setNewWs] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // Join path with nothing to pick: the expected next actor is the team's
+  // workspace admin, not this user. Say so calmly and demote creation to a
+  // fallback — the store's workspace watcher surfaces the "Added to…" moment
+  // whenever the admin gets around to it.
+  const joining = mode === "signin" && status.workspaces.length === 0;
 
   async function create() {
     const name = newWs.trim();
@@ -496,6 +524,20 @@ function WorkspaceStage() {
 
   return (
     <div className="flex flex-col gap-3">
+      {joining && (
+        <div className="flex flex-col gap-1.5">
+          <p className="text-xs text-[var(--color-text-muted)] flex items-center gap-2">
+            <Check size={14} strokeWidth={2.5} className="text-[var(--color-success)] shrink-0" />
+            Signed in{status.user ? ` as ${status.user.email}` : ""}.
+          </p>
+          <p className="text-xs leading-relaxed text-[var(--color-text-muted)]">
+            Ask your workspace admin to add{" "}
+            {status.user ? status.user.email : "your email"} — workspaces you're
+            added to appear automatically. You can finish setup now.
+          </p>
+        </div>
+      )}
+
       {status.workspaces.length > 0 && (
         <div className="flex flex-col gap-1">
           <p className="text-xs text-[var(--color-text-muted)]">Your workspaces:</p>
@@ -518,7 +560,7 @@ function WorkspaceStage() {
 
       <div className="flex flex-col gap-2">
         <p className="text-xs text-[var(--color-text-muted)]">
-          {status.workspaces.length > 0
+          {status.workspaces.length > 0 || joining
             ? "Or create a new workspace:"
             : "Name your workspace:"}
         </p>

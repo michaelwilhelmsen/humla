@@ -82,7 +82,7 @@ The name is Norwegian for "bumblebee".
 
 - **React 19** + **TypeScript** + **Vite 6** + **Tauri 2** (`@tauri-apps/api` for `invoke` + event listeners).
 - **React Router 7** — note routing (`/note/:id`), settings, home.
-- **Zustand** — `useNotesStore` (notes/folders) + `useRecordingStore` (status/errors/diagnostics); backend events bound once via `bindBackendListeners`. Listens for `transcript_replaced`, `summary_ready`, `summary_thinking_delta`, `summary_content_delta`, `summary_status`, `recording_status`, `recording_error`, `recording_diagnostic`, `local_whisper_progress`, `diarize_download_progress`.
+- **Zustand** — `useNotesStore` (notes/folders) + `useRecordingStore` (status/errors/diagnostics); backend events bound once via `bindBackendListeners`. Listens for `transcript_replaced`, `summary_ready`, `summary_thinking_delta`, `summary_content_delta`, `summary_status`, `recording_status`, `recording_error`, `recording_diagnostic`, `local_whisper_progress`, `local_whisper_download_error`, `diarize_download_progress`.
 - **Tiptap v2** — body editor (StarterKit + Placeholder + Suggestion + BubbleMenu).
 - **Transcript view** — styled-by-default with `white-space: pre-wrap` so its rendered height matches the textarea exactly (no per-line margin → no page-jump on click-to-edit). Speaker labels rendered as inline `nd-speaker-pill` chips; rest of line is plain text.
 - **`SpeakerLabels` chip strip** — derives unique speaker labels from the transcript on every render; click to inline-rename. Rename rewrites the transcript via line-anchored regex (`/^Speaker N: /gm` → `/^Michael: /gm`).

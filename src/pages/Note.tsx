@@ -27,7 +27,7 @@ import {
 } from "lucide-react";
 import { ipc, onSummaryThinkingDelta, onSummaryContentDelta, type Note as TNote, type NoteRevision, type SummaryPrompt, type TimelineEntry } from "../lib/ipc";
 import { convertFileSrc } from "@tauri-apps/api/core";
-import { useNotesStore, useRecordingStore } from "../lib/store";
+import { useDownloadStore, useNotesStore, useRecordingStore } from "../lib/store";
 import { computeSetupStatus } from "../lib/setupStatus";
 import { useOwnerName, useCloudStore } from "../lib/cloud";
 import { extractSpeakerLabels, renameSpeakerInTranscript } from "../lib/speakers";
@@ -1041,17 +1041,26 @@ function NoteToolbar({
   async function record() {
     // Pre-flight: don't start a doomed recording when the pipeline isn't
     // functional (same shared predicate as the nag chip + recap). Covers a
-    // missing mic AND a missing/unconfigured STT path. Surface an inline
-    // flash pointing at setup rather than hard-failing mid-recording; the
-    // sidebar nag chip is the click-through to /onboarding (the flash UI is
-    // text-only).
+    // missing mic AND a missing/unconfigured STT path. A failed Record click
+    // is an ERROR, not a confirmation: it goes through the persistent error
+    // toast (which carries the Open Settings affordance), never a
+    // 2.5-second flash — that read as "the button did nothing".
     try {
       const setup = await computeSetupStatus();
       if (!setup.pipelineReady) {
-        const msg = !setup.micGranted
-          ? "Finish setup to record — microphone access isn't granted yet."
-          : "Finish setup to record — transcription isn't configured yet.";
-        useRecordingStore.getState().pushFlash(msg);
+        const downloading = useDownloadStore.getState().active;
+        const message = !setup.micGranted
+          ? "Can't record — microphone permission isn't granted yet. Grant it in Settings."
+          : setup.stt.kind === "local"
+            ? downloading?.modelId === setup.stt.model
+              ? `Can't record yet — the transcription model (${setup.stt.model}) is still downloading. Try again when it finishes.`
+              : `Can't record — the selected transcription model (${setup.stt.model}) isn't downloaded. Download it in Settings → Transcription.`
+            : `Can't record — no API key stored for ${setup.stt.provider}. Add one in Settings → Transcription.`;
+        // Sticky: this blocks the user's next action; auto-dismissing it
+        // read as "the button did nothing". NOTE: mentioning "Settings" in
+        // these messages is what makes the Toaster attach its Open Settings
+        // shortcut — keep that word if you rewrite the copy.
+        useRecordingStore.getState().pushError({ noteId, message, sticky: true });
         return;
       }
     } catch {

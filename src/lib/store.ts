@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { ipc, onRecordingDiagnostic, onRecordingError, onRecordingStatus, onSummary, onSummaryStatus, onTranscript, onTranscriptReplaced, onNotesChanged, onSyncStatus, onSyncConflict, onLocalWhisperProgress, type Folder, type Note, type RecordingDiagnostic, type RecordingStatus } from "./ipc";
+import { ipc, onRecordingDiagnostic, onRecordingError, onRecordingStatus, onSummary, onSummaryStatus, onTranscript, onTranscriptReplaced, onNotesChanged, onSyncStatus, onSyncConflict, onLocalWhisperProgress, onLocalWhisperDownloadError, type Folder, type Note, type RecordingDiagnostic, type RecordingStatus } from "./ipc";
 import { useCloudStore } from "./cloud";
 
 type NotesState = {
@@ -75,8 +75,11 @@ type RecordingState = {
   // summary running for that note.
   summarizing: Record<string, boolean>;
   setSummarizing: (noteId: string, active: boolean) => void;
-  errors: { id: number; noteId: string | null; message: string; kind?: "recording" | "summary" }[];
-  pushError: (e: { noteId: string | null; message: string; kind?: "recording" | "summary" }) => void;
+  // `sticky` errors skip the auto-dismiss timer — for failures that block the
+  // user's next action (e.g. Record refused because setup is incomplete),
+  // where vanishing after a few seconds reads as "the button did nothing".
+  errors: { id: number; noteId: string | null; message: string; kind?: "recording" | "summary"; sticky?: boolean }[];
+  pushError: (e: { noteId: string | null; message: string; kind?: "recording" | "summary"; sticky?: boolean }) => void;
   dismissError: (id: number) => void;
   flashes: Flash[];
   pushFlash: (message: string) => void;
@@ -129,7 +132,9 @@ export const useRecordingStore = create<RecordingState>((set, get) => ({
     }
     const id = ++errorIdSeq;
     set((s) => ({ errors: [...s.errors, { id, ...e }] }));
-    window.setTimeout(() => set((s) => ({ errors: s.errors.filter((x) => x.id !== id) })), 8000);
+    if (!e.sticky) {
+      window.setTimeout(() => set((s) => ({ errors: s.errors.filter((x) => x.id !== id) })), 8000);
+    }
   },
   dismissError: (id) => set((s) => ({ errors: s.errors.filter((x) => x.id !== id) })),
   flashes: [],
@@ -285,6 +290,16 @@ export function bindBackendListeners() {
     } else {
       useDownloadStore.getState().setProgress({ modelId, received, total });
     }
+  });
+  // Failure counterpart: clear the slice (the nag chip must not show a live
+  // download that's dead) and tell the user — the invoke promise that could
+  // have reported this may belong to an unmounted page.
+  onLocalWhisperDownloadError(({ message }) => {
+    useDownloadStore.getState().clear();
+    useRecordingStore.getState().pushError({
+      noteId: null,
+      message: `Transcription model download failed: ${message}`,
+    });
   });
   // "Added to a workspace" notification. Watch the cloud status for workspaces
   // that newly appear and that you didn't create (role !== owner) — i.e. an

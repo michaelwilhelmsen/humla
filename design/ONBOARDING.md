@@ -153,7 +153,12 @@ smelling like a paywall):
   the workspace active. Rationale for going all the way through checkout: a workspace without a
   trial is **read-only** — an account-but-no-trial state is a dead end, not a milestone, so
   stopping at signup strands the user.
-- **"I already have an account"** — sign in + select workspace (the joining-a-team case).
+- **"Join an existing team"** (formerly "I already have an account") — sign in + select workspace.
+  The auth form carries a **sign-in ⇄ create-account toggle** (the card only picks the *starting*
+  form): the joining-a-team case is usually a *new* user whose admin hasn't added them yet, and a
+  sign-in-only form was a dead end for them. After auth with zero workspaces this path shows a calm
+  "ask your workspace admin to add \<email\>" note and demotes workspace creation to a fallback —
+  creating + paying is the other card's job.
 - Small **"self-hosted server"** text link (`cloud_configure`) — present but not a card.
 
 Skippable at every sub-step; abandoned funnels degrade gracefully to the existing Organization tab
@@ -194,7 +199,10 @@ not on the empty home screen.
   mid-download reads as a false accusation).
 - **Click**: reopens the wizard at the **first incomplete step**, pre-filled from live state.
 - **Record button is not hard-disabled** while the chip is live: hitting record with no working STT
-  surfaces the same "Finish setup" path inline. A disabled button hides *why*; a click can explain.
+  surfaces a **sticky error toast** naming the exact gap (mic permission / model not downloaded /
+  no API key) with an Open Settings shortcut. A disabled button hides *why*; a click can explain.
+  (Originally shipped as a 2.5 s auto-dismissing flash — that read as "the button did nothing",
+  which is precisely the failure this rule exists to avoid.)
 
 ## Audio meter + no-audio warning (the safety net)
 

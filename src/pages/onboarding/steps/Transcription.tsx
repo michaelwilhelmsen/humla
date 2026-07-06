@@ -35,6 +35,7 @@ import {
 } from "lucide-react";
 import {
   ipc,
+  onLocalWhisperDownloadError,
   onLocalWhisperProgress,
   type LocalWhisperModelStatus,
   type ProviderConfig,
@@ -158,10 +159,14 @@ export function TranscriptionStep({ ctx }: { ctx: StepContext }) {
     };
   }, []);
 
-  // Subscribe to whisper download progress (StrictMode-safe cleanup).
+  // Subscribe to whisper download progress + failure (StrictMode-safe
+  // cleanup). Both completion AND failure are derived from events: the
+  // startDownload() promise dies with the mount that created it, so a user
+  // who navigated away and back would otherwise never see either outcome.
   useEffect(() => {
     let cancelled = false;
     let unlisten: (() => void) | undefined;
+    let unlistenErr: (() => void) | undefined;
     onLocalWhisperProgress((p) => {
       if (p.modelId !== modelId) return;
       setProgress({ received: p.received, total: p.total });
@@ -173,9 +178,18 @@ export function TranscriptionStep({ ctx }: { ctx: StepContext }) {
       if (cancelled) u();
       else unlisten = u;
     });
+    onLocalWhisperDownloadError((e) => {
+      if (e.modelId !== modelId) return;
+      setDownloadError(e.message);
+      downloadInFlight = false;
+    }).then((u) => {
+      if (cancelled) u();
+      else unlistenErr = u;
+    });
     return () => {
       cancelled = true;
       unlisten?.();
+      unlistenErr?.();
     };
   }, [modelId]);
 
@@ -310,7 +324,13 @@ export function TranscriptionStep({ ctx }: { ctx: StepContext }) {
   const canContinue =
     selection === "local" || (selection === "cloud" && testResult?.ok === true);
 
-  const loading = language === null || arch === null || models === null;
+  // arch and models always resolve (their fetches fall back on error), so
+  // this only covers the initial IPC round-trip. `language` is deliberately
+  // NOT part of the gate: it stays null when the setting is unset or the
+  // read fails, and modelIdForLanguage(null) already falls back to the
+  // multilingual default — gating on it disabled the On-device card forever
+  // on fresh installs.
+  const loading = arch === null || models === null;
 
   return (
     <StepShell
@@ -324,8 +344,9 @@ export function TranscriptionStep({ ctx }: { ctx: StepContext }) {
           type="button"
           onClick={selectLocal}
           disabled={loading}
+          aria-busy={loading}
           className={
-            "text-left rounded-[var(--radius)] border px-4 py-4 transition-colors " +
+            "text-left rounded-[var(--radius)] border px-4 py-4 transition-colors disabled:opacity-60 disabled:cursor-wait " +
             (selection === "local"
               ? "border-[var(--color-accent)] bg-[var(--color-accent-soft)]"
               : "border-[var(--color-line)] bg-[var(--color-surface)] hover:border-[var(--color-line-visible)]")

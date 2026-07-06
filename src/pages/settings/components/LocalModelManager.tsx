@@ -152,6 +152,16 @@ function ModelRow({
                 }`
               : `Not downloaded · ~${formatBytes(model.sizeBytesHint)}`}
           </p>
+          {/* The default's model_id can point at a model that isn't on disk
+              (fresh installs; onboarding skips). Recording with the local
+              provider won't start in that state — say so here, where the
+              user is already looking, instead of letting Record fail. */}
+          {isActive && !model.downloaded && !progress && (
+            <p className="text-xs text-[var(--color-warning-text)]">
+              Selected as the default but not downloaded — recording won't
+              start until you download it.
+            </p>
+          )}
         </div>
         <div className="flex gap-2">
           {!model.downloaded && !progress && (

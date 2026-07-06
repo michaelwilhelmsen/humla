@@ -132,6 +132,11 @@ export type LocalWhisperProgress = {
   total: number | null;
 };
 
+export type LocalWhisperDownloadError = {
+  modelId: string;
+  message: string;
+};
+
 export type DiarizeModelStatus = {
   downloaded: boolean;
   sizeBytes: number | null;
@@ -346,6 +351,16 @@ export function onRecordingDiagnostic(cb: (e: RecordingDiagnostic) => void): Pro
 }
 export function onLocalWhisperProgress(cb: (e: LocalWhisperProgress) => void): Promise<UnlistenFn> {
   return listen<LocalWhisperProgress>("local_whisper_progress", (e) => cb(e.payload));
+}
+// Fired when a model download fails on the backend. Progress events alone
+// can't express failure, and the invoke promise that started the download may
+// belong to a component that has since unmounted — this event is how any
+// still-mounted UI learns the download is dead instead of showing a
+// forever-progress bar.
+export function onLocalWhisperDownloadError(
+  cb: (e: LocalWhisperDownloadError) => void,
+): Promise<UnlistenFn> {
+  return listen<LocalWhisperDownloadError>("local_whisper_download_error", (e) => cb(e.payload));
 }
 export function onDiarizeDownloadProgress(cb: (e: DiarizeDownloadProgress) => void): Promise<UnlistenFn> {
   return listen<DiarizeDownloadProgress>("diarize_download_progress", (e) => cb(e.payload));

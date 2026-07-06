@@ -146,11 +146,33 @@ struct DownloadProgress {
     total: Option<u64>,
 }
 
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DownloadError {
+    model_id: String,
+    message: String,
+}
+
 #[tauri::command]
 pub async fn local_whisper_download(app: AppHandle, model_id: String) -> Result<(), String> {
-    let info = local_whisper::find_model(&model_id)
+    let r = local_whisper_download_inner(&app, &model_id).await;
+    // Failure must reach the UI as an event, not only as this command's Err:
+    // the invoke promise that started the download may belong to a page that
+    // has since unmounted, and progress events alone would leave any mounted
+    // listener showing a forever-progress bar.
+    if let Err(ref message) = r {
+        let _ = app.emit("local_whisper_download_error", DownloadError {
+            model_id: model_id.clone(),
+            message: message.clone(),
+        });
+    }
+    r
+}
+
+async fn local_whisper_download_inner(app: &AppHandle, model_id: &str) -> Result<(), String> {
+    let info = local_whisper::find_model(model_id)
         .ok_or_else(|| format!("unknown model id: {model_id}"))?;
-    let dir = local_model_dir(&app)?;
+    let dir = local_model_dir(app)?;
     tokio::fs::create_dir_all(&dir).await.map_err(|e| format!("mkdir: {e}"))?;
     let final_path = dir.join(info.filename);
     // Download to a temp file in the same dir, then rename atomically so a
@@ -201,10 +223,15 @@ pub async fn local_whisper_download(app: AppHandle, model_id: String) -> Result<
     tokio::fs::rename(&tmp_path, &final_path)
         .await
         .map_err(|e| format!("rename: {e}"))?;
+    // Post-rename event: the file is fully in place, so `received` IS the
+    // total. Stamping it in (even when the server sent no Content-Length and
+    // `total` was None all along) is what lets listeners detect completion
+    // as `received >= total` — the invoke promise that started the download
+    // may belong to a page that has since unmounted.
     let _ = app.emit("local_whisper_progress", DownloadProgress {
         model_id: info.id.to_string(),
         received,
-        total,
+        total: total.or(Some(received)),
     });
     Ok(())
 }
