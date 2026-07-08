@@ -161,7 +161,7 @@ export function AccountTab() {
           label="Disconnect server"
           description="Forget this server and sign out. Cloud sync is opt-in — your notes always live locally first."
           control={
-            <Btn onClick={disconnect} disabled={busy}>
+            <Btn onClick={disconnect} disabled={busy} aria-label="Disconnect server">
               <span className="inline-flex items-center gap-1.5">
                 <CloudOff size={14} strokeWidth={1.5} /> Disconnect
               </span>

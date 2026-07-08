@@ -390,10 +390,9 @@ export function OrganizationTab() {
                 {m.name && <div className="text-xs text-[var(--color-text-muted)] truncate">{m.email}</div>}
               </div>
               {canManage && m.role !== "owner" ? (
-                // Fixed-width, non-growing slot: the shared Select is `w-full`,
-                // which would otherwise claim the whole row and collapse the
-                // name/email block (it's `flex-1 min-w-0`, so it shrinks to 0).
-                <div className="shrink-0 w-48">
+                // Non-growing slot so the name/email block (flex-1 min-w-0)
+                // keeps its space; the popover Select trigger sizes to content.
+                <div className="shrink-0">
                   <Select
                     value={m.role}
                     onChange={(v) => changeRole(m.id, v as CloudRole)}

@@ -73,6 +73,67 @@ describe("Account section", () => {
       within(dialog).getByRole("heading", { name: /create account/i }),
     ).toBeInTheDocument();
     expect(within(dialog).getByPlaceholderText(/your name/i)).toBeInTheDocument();
+    // Escape hatch for a mistyped server URL.
+    expect(
+      within(dialog).getByRole("button", { name: /change server/i }),
+    ).toBeInTheDocument();
+  });
+
+  it("unverified account shows the warning with a working resend", async () => {
+    const resends: unknown[] = [];
+    const status = signedIn("owner");
+    status.user.verified = false;
+    renderApp("/settings?tab=account", {
+      cloud_status: () => status,
+      cloud_workspace_members: () => MEMBERS,
+      cloud_resend_verification: () => {
+        resends.push(true);
+        return null;
+      },
+    });
+    const dialog = await screen.findByRole("dialog", { name: /settings/i });
+
+    expect(
+      await within(dialog).findByText(/isn't verified yet/i),
+    ).toBeInTheDocument();
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: /resend verification/i }),
+    );
+
+    expect(resends).toHaveLength(1);
+    expect(
+      await within(dialog).findByText(/verification email sent/i),
+    ).toBeInTheDocument();
+  });
+
+  it("inviting a member sends the invite and confirms it", async () => {
+    const invites: unknown[] = [];
+    renderApp("/settings?tab=account", {
+      cloud_status: () => signedIn("owner"),
+      cloud_workspace_members: () => MEMBERS,
+      cloud_invite_member: (args) => {
+        invites.push(args);
+        return "invited";
+      },
+    });
+    const dialog = await screen.findByRole("dialog", { name: /settings/i });
+
+    await userEvent.type(
+      await within(dialog).findByPlaceholderText(/teammate@example.com/i),
+      "kari@example.no",
+    );
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: /invite/i }),
+    );
+
+    expect(invites).toHaveLength(1);
+    expect(invites[0]).toMatchObject({
+      workspaceId: "w1",
+      email: "kari@example.no",
+    });
+    expect(
+      await within(dialog).findByText(/invited kari@example.no/i),
+    ).toBeInTheDocument();
   });
 
   it("signed-in owner sees identity, workspace, billing, members, and delete", async () => {
