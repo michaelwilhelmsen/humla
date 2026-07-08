@@ -20,7 +20,17 @@ export function Select({
   useEffect(() => {
     if (!open) return;
     const onDown = (e: MouseEvent) => {
-      if (!rootRef.current?.contains(e.target as Node)) setOpen(false);
+      if (!rootRef.current?.contains(e.target as Node)) {
+        setOpen(false);
+        // Swallow the click this mousedown produces: dismissing the popover
+        // must not also activate whatever is underneath (the dialog backdrop
+        // would close all of settings). Matches native macOS menu behavior.
+        document.addEventListener(
+          "click",
+          (ce) => ce.stopPropagation(),
+          { capture: true, once: true },
+        );
+      }
     };
     // Capture phase + stopPropagation: Escape dismisses the listbox only —
     // it must never bubble to the settings dialog's window listener and

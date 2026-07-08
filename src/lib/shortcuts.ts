@@ -1,11 +1,12 @@
 import { useEffect } from "react";
-import { useNavigate } from "react-router-dom";
+import { useLocation, useNavigate } from "react-router-dom";
 import { ipc } from "./ipc";
 import { useNotesStore, useRecordingStore } from "./store";
 import { useCloudStore } from "./cloud";
 
 export function useGlobalShortcuts() {
   const navigate = useNavigate();
+  const location = useLocation();
 
   useEffect(() => {
     async function onKey(e: KeyboardEvent) {
@@ -19,7 +20,9 @@ export function useGlobalShortcuts() {
         navigate(`/note/${note.id}`);
       } else if (e.key === ",") {
         e.preventDefault();
-        navigate("/settings");
+        // No-op while the settings dialog is already open — a second push
+        // would stack /settings history entries and break "Esc closes".
+        if (!location.pathname.startsWith("/settings")) navigate("/settings");
       } else if (e.key === "r") {
         e.preventDefault();
         const { status } = useRecordingStore.getState();
@@ -48,5 +51,5 @@ export function useGlobalShortcuts() {
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [navigate]);
+  }, [navigate, location.pathname]);
 }

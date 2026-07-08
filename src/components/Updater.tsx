@@ -72,7 +72,7 @@ export function Updater() {
   if (phase.kind === "idle") return null;
 
   return (
-    <div className="no-drag fixed bottom-6 right-6 z-50 max-w-sm">
+    <div className="no-drag fixed bottom-6 right-6 z-[60] max-w-sm">
       <div className="px-4 py-3 rounded-lg bg-[var(--color-surface)] border border-[var(--color-line)] shadow-md text-sm">
         {phase.kind === "checking" && (
           <div className="text-[var(--color-text-muted)]">Checking for updates…</div>

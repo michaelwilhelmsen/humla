@@ -159,6 +159,73 @@ describe("settings dialog", () => {
     ).toBeInTheDocument();
   });
 
+  it("Escape in a nested modal closes only that modal, not the dialog", async () => {
+    renderApp("/settings?tab=summaries");
+    const dialog = await screen.findByRole("dialog", { name: /settings/i });
+
+    // The summary-prompt editor is a Modal nested inside the dialog.
+    await userEvent.click(
+      await within(dialog).findByRole("button", { name: /new prompt/i }),
+    );
+    const editor = await screen.findByRole("dialog", { name: /new prompt/i });
+    expect(editor).toBeInTheDocument();
+
+    await userEvent.keyboard("{Escape}");
+
+    // Editor dismissed; the settings dialog (and any typed work behind it)
+    // survives.
+    expect(
+      screen.queryByRole("dialog", { name: /new prompt/i }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("dialog", { name: /settings/i }),
+    ).toBeInTheDocument();
+  });
+
+  it("backdrop click with an open select dismisses only the select", async () => {
+    renderApp("/settings?tab=general");
+    const dialog = await screen.findByRole("dialog", { name: /settings/i });
+
+    const trigger = await within(dialog).findByRole("button", {
+      name: /norwegian/i,
+    });
+    await userEvent.click(trigger);
+    expect(within(dialog).getByRole("listbox")).toBeInTheDocument();
+
+    await userEvent.click(screen.getByTestId("settings-backdrop"));
+
+    // First backdrop click only dismisses the popover.
+    expect(within(dialog).queryByRole("listbox")).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("dialog", { name: /settings/i }),
+    ).toBeInTheDocument();
+
+    await userEvent.click(screen.getByTestId("settings-backdrop"));
+    expect(
+      screen.queryByRole("dialog", { name: /settings/i }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("⌘, with the dialog already open doesn't stack history entries", async () => {
+    renderApp("/");
+    await screen.findByRole("button", { name: /new note/i });
+    await openSettingsFromSidebar();
+
+    // ⌘, again while open — must not push a second /settings entry.
+    await userEvent.keyboard("{Meta>},{/Meta}");
+    expect(
+      screen.getByRole("dialog", { name: /settings/i }),
+    ).toBeInTheDocument();
+
+    await userEvent.keyboard("{Escape}");
+
+    // One Escape closes it and we're back where we started.
+    expect(
+      screen.queryByRole("dialog", { name: /settings/i }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByTestId("location")).toHaveTextContent(/^\/$/);
+  });
+
   it("has a search field in the sidebar (filtering is a fast-follow)", async () => {
     renderApp("/settings");
     const dialog = await screen.findByRole("dialog", { name: /settings/i });

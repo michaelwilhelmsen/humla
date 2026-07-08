@@ -12,7 +12,9 @@ export function RecordingSection({
   return (
     <>
       <Section title="Permissions">
-        <Permissions />
+        <div className="py-3.5">
+          <Permissions />
+        </div>
       </Section>
 
       <Section title="Audio retention">
