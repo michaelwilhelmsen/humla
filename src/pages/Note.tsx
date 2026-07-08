@@ -541,7 +541,7 @@ export function Note() {
             <span>
               {isViewer
                 ? "View-only — you have viewer access to this workspace, so this note can’t be edited."
-                : "Read-only — this workspace needs an active subscription. The owner can start it in Settings → Organization → Billing."}
+                : "Read-only — this workspace needs an active subscription. The owner can start it in Settings → Account → Billing."}
             </span>
           </div>
         )}

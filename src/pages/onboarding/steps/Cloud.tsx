@@ -23,7 +23,7 @@
 //
 // Everything is skippable at every sub-step: Continue always advances. Cloud
 // NEVER nags — a half-finished funnel (signed up but abandoned checkout, say)
-// degrades gracefully to Settings → Organization, which handles leftover
+// degrades gracefully to Settings → Account, which handles leftover
 // billing state. That's why bailing mid-funnel is always allowed here.
 //
 // Write-through philosophy: there is no local cloud state to persist. Server /
@@ -171,7 +171,7 @@ export function CloudStep({ ctx }: { ctx: StepContext }) {
 
       {/* Continue — always enabled. On the free path this advances with zero
           network calls; on a team path it advances regardless of how far the
-          funnel got (Settings → Organization handles leftover state). Cloud
+          funnel got (Settings → Account handles leftover state). Cloud
           never blocks the wizard. */}
       <div className="mt-8 w-full max-w-md flex flex-col items-center gap-3">
         <button
@@ -184,7 +184,7 @@ export function CloudStep({ ctx }: { ctx: StepContext }) {
         </button>
         {option === "solo" && (
           <p className="text-xs text-[var(--color-text-muted)] text-center max-w-xs">
-            You can set up a team workspace anytime in Settings → Organization.
+            You can set up a team workspace anytime in Settings → Account.
           </p>
         )}
       </div>
@@ -737,7 +737,7 @@ function SuccessStage({ ws }: { ws: CloudWorkspace }) {
       </div>
       <p className="text-xs text-[var(--color-success)]">{label} — you're all set.</p>
       <p className="text-xs leading-relaxed text-[var(--color-text-muted)]">
-        Manage members and billing anytime in Settings → Organization.
+        Manage members and billing anytime in Settings → Account.
       </p>
     </div>
   );
