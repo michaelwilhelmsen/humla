@@ -1,54 +1,58 @@
-// Two-pane settings layout with a vertical sidebar of tabs and a
-// scrolling content area. Tabs are configured per-instance — the page
-// just maps tab id → content component and lets the layout handle the
-// chrome.
+// Two-pane settings chrome inside the settings dialog: a vertical sidebar
+// of section rows and a scrolling content area.
 //
-// Pattern follows macOS Ventura+ System Settings: vertical sidebar of
-// labels with the active row highlighted, content fills the rest. Easier
-// to scan than top tabs once the count grows past a couple, and matches
-// what Mac users expect for app-level preferences.
+// `?tab=<id>` in the URL is the source of truth for the active section —
+// legacy tab ids from old deep links resolve through resolveSectionId so
+// none of them 404 (e.g. `?tab=keys` lands on Transcription).
 
-import { useState, type ReactNode } from "react";
+import type { ReactNode } from "react";
 import { useSearchParams } from "react-router-dom";
+import { Search as SearchIcon } from "lucide-react";
+import { resolveSectionId, type SectionId } from "./sections";
 
-export type SettingsTab = {
-  id: string;
+export type SettingsSection = {
+  id: SectionId;
   label: string;
   content: ReactNode;
 };
 
-export function SettingsLayout({
-  tabs,
-  defaultTabId,
-}: {
-  tabs: SettingsTab[];
-  defaultTabId?: string;
-}) {
-  // `?tab=<id>` deep-links a specific tab (e.g. the sidebar's "Sign in" link).
+export function SettingsLayout({ sections }: { sections: SettingsSection[] }) {
   const [params, setParams] = useSearchParams();
-  const [activeId, setActiveId] = useState<string>(
-    params.get("tab") ?? defaultTabId ?? tabs[0]?.id ?? "",
-  );
-  const active = tabs.find((t) => t.id === activeId) ?? tabs[0];
+  const activeId = resolveSectionId(params.get("tab"));
+  const active = sections.find((s) => s.id === activeId) ?? sections[0];
 
   return (
     <div className="h-full flex">
-      <aside className="w-56 shrink-0 border-r border-[var(--color-line)] py-12 pl-6 pr-3">
-        <h1 className="text-2xl font-light tracking-[-0.02em] mb-8 px-3">
+      <aside className="w-56 shrink-0 border-r border-[var(--color-line)] py-8 pl-6 pr-3">
+        <h1 className="text-2xl font-light tracking-[-0.02em] mb-4 px-3">
           Settings
         </h1>
+        {/* Layout-only for now: the cross-section filter is a fast-follow. */}
+        <div className="px-3 mb-4">
+          <div className="flex items-center gap-2 px-2.5 py-1.5 rounded-md border border-[var(--color-line-visible)] bg-[var(--color-surface)]">
+            <SearchIcon
+              size={13}
+              strokeWidth={1.8}
+              className="shrink-0 text-[var(--color-text-muted)]"
+              aria-hidden
+            />
+            <input
+              type="search"
+              aria-label="Search settings"
+              placeholder="Search"
+              className="w-full bg-transparent text-sm outline-none placeholder:text-[var(--color-text-muted)]"
+            />
+          </div>
+        </div>
         <nav className="flex flex-col gap-0.5" role="tablist">
-          {tabs.map((tab) => {
-            const isActive = tab.id === active?.id;
+          {sections.map((section) => {
+            const isActive = section.id === active?.id;
             return (
               <button
-                key={tab.id}
+                key={section.id}
                 role="tab"
                 aria-selected={isActive}
-                onClick={() => {
-                  setActiveId(tab.id);
-                  setParams({ tab: tab.id }, { replace: true });
-                }}
+                onClick={() => setParams({ tab: section.id }, { replace: true })}
                 className={
                   "text-left px-3 py-1.5 rounded-md text-sm transition-colors " +
                   (isActive
@@ -56,14 +60,14 @@ export function SettingsLayout({
                     : "text-[var(--color-text-muted)] hover:text-[var(--color-text)] hover:bg-[var(--color-pill-hover)]")
                 }
               >
-                {tab.label}
+                {section.label}
               </button>
             );
           })}
         </nav>
       </aside>
       <div className="flex-1 h-full overflow-y-auto">
-        <div className="max-w-2xl mx-auto px-12 py-12" role="tabpanel">
+        <div className="max-w-2xl mx-auto px-12 py-10" role="tabpanel">
           {active?.content}
         </div>
       </div>

@@ -1,5 +1,8 @@
+import type { ReactNode } from "react";
 import { SettingsLayout } from "./settings/SettingsLayout";
+import { SECTIONS, type SectionId } from "./settings/sections";
 import { GeneralTab } from "./settings/tabs/General";
+import { RecordingSection } from "./settings/tabs/Recording";
 import { TranscriptionTab } from "./settings/tabs/Transcription";
 import { SummaryTab } from "./settings/tabs/Summary";
 import { ApiKeysTab } from "./settings/tabs/ApiKeys";
@@ -8,84 +11,71 @@ import { AccountTab } from "./settings/tabs/Account";
 import { OrganizationTab } from "./settings/tabs/Organization";
 import { useSettings } from "./settings/useSettings";
 
+// Section registry: maps the 5-section IA (see sections.ts) to content.
+// Transcription and Summaries render their pre-refactor tab bodies (plus
+// the old API-keys fields under Transcription) until PRD 2/2 rebuilds
+// them; the keys live inline under providers from then on.
 export function Settings() {
   const settings = useSettings();
+
+  const content: Record<SectionId, ReactNode> = {
+    recording: <RecordingSection s={settings.s} update={settings.update} />,
+    transcription: (
+      <>
+        <TranscriptionTab
+          s={settings.s}
+          update={settings.update}
+          transcribeConfig={settings.transcribeConfig}
+          setDefaultConfig={settings.setDefaultConfig}
+          setLanguageOverride={settings.setLanguageOverride}
+          removeLanguageOverride={settings.removeLanguageOverride}
+          local={settings.local}
+          downloadModel={settings.downloadModel}
+          deleteModel={settings.deleteModel}
+          diarize={settings.diarize}
+          downloadDiarize={settings.downloadDiarize}
+          deleteDiarize={settings.deleteDiarize}
+          sortformer={settings.sortformer}
+          downloadSortformer={settings.downloadSortformer}
+          deleteSortformer={settings.deleteSortformer}
+        />
+        <ApiKeysTab
+          openaiKey={settings.openaiKey}
+          setOpenaiKey={settings.setOpenaiKey}
+          deepgramKey={settings.deepgramKey}
+          setDeepgramKey={settings.setDeepgramKey}
+          groqKey={settings.groqKey}
+          setGroqKey={settings.setGroqKey}
+          saveProviderKey={settings.saveProviderKey}
+          testProviderKey={settings.testProviderKey}
+        />
+      </>
+    ),
+    summaries: (
+      <SummaryTab
+        s={settings.s}
+        update={settings.update}
+        llmModels={settings.llmModels}
+        refreshLlmModels={settings.refreshLlmModels}
+      />
+    ),
+    account: (
+      <>
+        <AccountTab />
+        <OrganizationTab />
+      </>
+    ),
+    general: (
+      <>
+        <GeneralTab s={settings.s} update={settings.update} />
+        <AboutTab />
+      </>
+    ),
+  };
+
   return (
     <SettingsLayout
-      defaultTabId="general"
-      tabs={[
-        {
-          id: "general",
-          label: "General",
-          content: <GeneralTab s={settings.s} update={settings.update} />,
-        },
-        {
-          id: "account",
-          label: "Account",
-          content: <AccountTab />,
-        },
-        {
-          id: "organization",
-          label: "Organization",
-          content: <OrganizationTab />,
-        },
-        {
-          id: "transcription",
-          label: "Transcription",
-          content: (
-            <TranscriptionTab
-              s={settings.s}
-              update={settings.update}
-              transcribeConfig={settings.transcribeConfig}
-              setDefaultConfig={settings.setDefaultConfig}
-              setLanguageOverride={settings.setLanguageOverride}
-              removeLanguageOverride={settings.removeLanguageOverride}
-              local={settings.local}
-              downloadModel={settings.downloadModel}
-              deleteModel={settings.deleteModel}
-              diarize={settings.diarize}
-              downloadDiarize={settings.downloadDiarize}
-              deleteDiarize={settings.deleteDiarize}
-              sortformer={settings.sortformer}
-              downloadSortformer={settings.downloadSortformer}
-              deleteSortformer={settings.deleteSortformer}
-            />
-          ),
-        },
-        {
-          id: "summary",
-          label: "AI Summary",
-          content: (
-            <SummaryTab
-              s={settings.s}
-              update={settings.update}
-              llmModels={settings.llmModels}
-              refreshLlmModels={settings.refreshLlmModels}
-            />
-          ),
-        },
-        {
-          id: "keys",
-          label: "API keys",
-          content: (
-            <ApiKeysTab
-              openaiKey={settings.openaiKey}
-              setOpenaiKey={settings.setOpenaiKey}
-              deepgramKey={settings.deepgramKey}
-              setDeepgramKey={settings.setDeepgramKey}
-              groqKey={settings.groqKey}
-              setGroqKey={settings.setGroqKey}
-              saveProviderKey={settings.saveProviderKey}
-              testProviderKey={settings.testProviderKey}
-            />
-          ),
-        },
-        {
-          id: "about",
-          label: "About",
-          content: <AboutTab />,
-        },
-      ]}
+      sections={SECTIONS.map((s) => ({ ...s, content: content[s.id] }))}
     />
   );
 }
