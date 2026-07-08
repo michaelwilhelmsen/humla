@@ -1,34 +1,7 @@
 import { describe, it, expect } from "vitest";
-import { render, screen, within } from "@testing-library/react";
+import { screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { MemoryRouter, useLocation } from "react-router-dom";
-import App from "../../App";
-import { mockTauri } from "../../test/tauri";
-
-// Surfaces the real router URL so tests can assert on it — the dialog is
-// route-backed, so open/close must be visible in the location.
-function LocationProbe() {
-  const loc = useLocation();
-  return <div data-testid="location">{loc.pathname + loc.search}</div>;
-}
-
-function renderApp(
-  initialPath = "/",
-  handlers: Parameters<typeof mockTauri>[0] = {},
-) {
-  mockTauri(handlers);
-  return render(
-    <MemoryRouter initialEntries={[initialPath]}>
-      <App />
-      <LocationProbe />
-    </MemoryRouter>,
-  );
-}
-
-async function openSettingsFromSidebar() {
-  await userEvent.click(screen.getByRole("link", { name: /settings/i }));
-  return await screen.findByRole("dialog", { name: /settings/i });
-}
+import { renderApp, openSettingsFromSidebar } from "../../test/app";
 
 describe("settings dialog", () => {
   it("opens over the current view instead of replacing it", async () => {
@@ -297,13 +270,11 @@ describe("settings dialog", () => {
     expect(
       within(dialog).getByRole("tab", { name: "Account" }),
     ).toHaveAttribute("aria-selected", "true");
-    // Account content (cloud sign-in) and the absorbed Organization content
-    // are both reachable in the one section.
+    // Signed out: the merged section is just the connect surface — workspace
+    // management appears in the same section once signed in (covered in
+    // AccountSection.test.tsx).
     expect(
       await within(dialog).findByRole("heading", { name: /connect to sync/i }),
-    ).toBeInTheDocument();
-    expect(
-      within(dialog).getByRole("heading", { name: /organization/i }),
     ).toBeInTheDocument();
   });
 
