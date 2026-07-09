@@ -67,6 +67,18 @@ describe("OllamaConnect", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("auto-picks the first model when nothing is chosen yet", async () => {
+    // Regression guard: with model unset, the dropdown used to LOOK fine
+    // (HTML default fallback) while summaries failed with "model not
+    // configured". An empty selection must self-heal on first contact.
+    const { onModelChange } = renderConnect({
+      local_llm_list_models: () => ["llama3.2:3b", "qwen3:8b"],
+    });
+
+    await screen.findByText(/connected/i);
+    expect(onModelChange).toHaveBeenCalledWith("llama3.2:3b");
+  });
+
   it("warns when the stored model is gone from the server", async () => {
     renderConnect(
       { local_llm_list_models: () => ["llama3.2:3b"] },

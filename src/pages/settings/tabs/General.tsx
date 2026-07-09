@@ -1,13 +1,12 @@
 import { useThemeStore } from "../../../lib/theme";
 import { usePaletteStore } from "../../../lib/palette";
-import { SUMMARY_PRESETS, presetLabel } from "../../../lib/presets";
 import { Row, Section } from "../components/Section";
 import { Segmented } from "../components/Segmented";
-import { Select } from "../components/Select";
 import { PALETTES, THEMES } from "../types";
-import type { SettingsHook } from "../useSettings";
 
-export function GeneralTab({ s, update }: Pick<SettingsHook, "s" | "update">) {
+// General owns appearance + the absorbed About content. Defaults moved to
+// their sections (#15): language → Transcription, preset → Summaries.
+export function GeneralTab() {
   const theme = useThemeStore((t) => t.theme);
   const setThemePref = useThemeStore((t) => t.setTheme);
   const palette = usePaletteStore((p) => p.palette);
@@ -15,23 +14,6 @@ export function GeneralTab({ s, update }: Pick<SettingsHook, "s" | "update">) {
 
   return (
     <>
-      <Section title="Defaults">
-        <Row
-          label="Summary preset"
-          description='Which preset new notes start with. Each note can switch to a different preset (or "Custom") from its own header.'
-          control={
-            <Select
-              value={s.default_summary_preset}
-              onChange={(v) => update("default_summary_preset", v)}
-              options={SUMMARY_PRESETS.map((p) => ({
-                value: p.value,
-                label: presetLabel(p),
-              }))}
-            />
-          }
-        />
-      </Section>
-
       <Section title="Appearance">
         <Row
           label="Palette"

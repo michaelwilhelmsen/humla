@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { ipc } from "../../lib/ipc";
 import { Select } from "../../pages/settings/components/Select";
 
@@ -24,11 +24,25 @@ export function OllamaConnect({
   const [reachable, setReachable] = useState<boolean | null>(null);
   const [installed, setInstalled] = useState<string[] | null>(null);
 
+  // Ref so the poll's closure always sees the current selection without
+  // re-subscribing the interval per keystroke.
+  const modelRef = useRef(model);
+  modelRef.current = model;
+  const onModelChangeRef = useRef(onModelChange);
+  onModelChangeRef.current = onModelChange;
+
   const probe = useCallback(async () => {
     try {
       const list = await ipc.localLlmListModels(baseUrl);
       setReachable(true);
       setInstalled(list);
+      // Empty selection self-heals on first contact: with no model set the
+      // dropdown used to LOOK fine (HTML default fallback) while summaries
+      // failed with "model not configured". A stored-but-missing model is
+      // NOT auto-switched — the warning below tells the user instead.
+      if (!modelRef.current && list.length > 0) {
+        onModelChangeRef.current(list[0]);
+      }
     } catch {
       setReachable(false);
       setInstalled(null);

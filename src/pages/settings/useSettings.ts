@@ -10,11 +10,9 @@ import {
 import {
   DEFAULTS,
   EMPTY_DIARIZE_STATE,
-  EMPTY_LLM_MODELS_STATE,
   EMPTY_LOCAL_STATE,
   type DiarizeState,
   type EditableKey,
-  type LlmModelsState,
   type LocalState,
 } from "./types";
 
@@ -31,7 +29,6 @@ export function useSettings() {
   // shows both rows so users can have one downloaded but the other active
   // while they decide.
   const [sortformer, setSortformer] = useState<DiarizeState>(EMPTY_DIARIZE_STATE);
-  const [llmModels, setLlmModels] = useState<LlmModelsState>(EMPTY_LLM_MODELS_STATE);
   const [s, setS] = useState<Record<EditableKey, string>>(DEFAULTS);
   const [transcribeConfig, setTranscribeConfig] = useState<TranscribeConfig>({
     default: { provider: "openai", model: "whisper-1" },
@@ -189,44 +186,9 @@ export function useSettings() {
     }, 4000);
   }
 
-  // Hit the user-configured local server's /v1/models endpoint and populate
-  // the model dropdown. Triggered by the Refresh button + automatically when
-  // the user first picks Local provider.
-  async function refreshLlmModels(baseUrl: string) {
-    setLlmModels({ list: null, loading: true, error: null });
-    try {
-      const list = await ipc.localLlmListModels(baseUrl);
-      list.sort();
-      setLlmModels({ list, loading: false, error: null });
-      // Auto-pick the first model when (a) the user hasn't picked anything
-      // yet, or (b) the previously-saved choice is no longer on the server
-      // (they ran `ollama rm` between sessions). Without this, the <select>
-      // shows the first option due to HTML's default-fallback rendering but
-      // s.local_llm_model stays empty — summary calls fail with "model not
-      // configured" even though the dropdown looks fine.
-      if (
-        list.length > 0 &&
-        (!s.local_llm_model || !list.includes(s.local_llm_model))
-      ) {
-        await update("local_llm_model", list[0]);
-      }
-    } catch (e) {
-      // reqwest's connection-refused error surfaces as "error sending request
-      // for url (...)" — opaque to non-technical users. Classify it into a
-      // structured kind so the Summary tab can render specific guidance
-      // (start Ollama / pull a model) instead of the raw error string.
-      const raw = String(e);
-      const isUnreachable = /error sending request|connection refused|failed to connect/i
-        .test(raw);
-      setLlmModels({
-        list: null,
-        loading: false,
-        error: isUnreachable
-          ? { kind: "unreachable", baseUrl }
-          : { kind: "other", message: raw },
-      });
-    }
-  }
+  // Local-LLM model listing moved into OllamaConnect
+  // (src/components/provider/), which owns probing/polling and the
+  // empty-selection self-heal — nothing here tracks llm models anymore.
 
   async function downloadModel(modelId: string) {
     setLocal((p) => ({
@@ -487,8 +449,6 @@ export function useSettings() {
     sortformer,
     downloadSortformer,
     deleteSortformer,
-    llmModels,
-    refreshLlmModels,
   };
 }
 

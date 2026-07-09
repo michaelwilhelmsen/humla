@@ -428,6 +428,63 @@ describe("settings dialog", () => {
     ).toBeInTheDocument();
   });
 
+  it("summaries: labeled provider rows with the OpenAI key inline, preset relocated", async () => {
+    renderApp("/settings?tab=summaries");
+    const dialog = await screen.findByRole("dialog", { name: /settings/i });
+
+    expect(await within(dialog).findByText("Provider")).toBeInTheDocument();
+    expect(
+      within(dialog).getByText(/local keeps the transcript on your mac/i),
+    ).toBeInTheDocument();
+    // Key inline under the cloud provider — no separate keys surface.
+    expect(
+      await within(dialog).findByLabelText(/openai api key/i),
+    ).toBeInTheDocument();
+    // Default preset moved here from General.
+    expect(
+      within(dialog).getByRole("button", { name: /meeting/i }),
+    ).toBeInTheDocument();
+
+    await userEvent.click(within(dialog).getByRole("tab", { name: "General" }));
+    expect(
+      within(dialog).queryByRole("button", { name: /meeting/i }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("summaries local provider connects through OllamaConnect", async () => {
+    const writes: Record<string, string> = {};
+    renderApp("/settings?tab=summaries", {
+      settings_get: (args) => {
+        const key = (args as { key?: string }).key;
+        if (key === "onboarding_completed") return "true";
+        if (key === "summary_provider") return "local";
+        return null;
+      },
+      settings_set: (args) => {
+        const { key, value } = args as { key: string; value: string };
+        writes[key] = value;
+        return null;
+      },
+      local_llm_list_models: () => ["qwen3:8b", "llama3.2:3b"],
+    });
+    const dialog = await screen.findByRole("dialog", { name: /settings/i });
+
+    // Reachable server → connected state, no manual Refresh dance.
+    expect(await within(dialog).findByText(/connected/i)).toBeInTheDocument();
+    // Thinking mode is a Toggle, not a checkbox.
+    expect(
+      within(dialog).getByRole("switch", { name: /thinking/i }),
+    ).toBeInTheDocument();
+
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: /choose a model|qwen3/i }),
+    );
+    await userEvent.click(
+      within(dialog).getByRole("option", { name: "qwen3:8b" }),
+    );
+    expect(writes.local_llm_model).toBe("qwen3:8b");
+  });
+
   it("deep-links ?tab=account to the merged Account section", async () => {
     renderApp("/settings?tab=account");
     const dialog = await screen.findByRole("dialog", { name: /settings/i });

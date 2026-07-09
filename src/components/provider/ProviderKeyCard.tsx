@@ -4,6 +4,30 @@ import { Btn } from "../../pages/settings/components/Btn";
 
 export type KeyProvider = "openai" | "deepgram" | "groq";
 
+// Default row copy per provider — consumers can override, but usually
+// shouldn't have to.
+const DEFAULT_COPY: Record<
+  KeyProvider,
+  { label: string; description: string; placeholder: string }
+> = {
+  openai: {
+    label: "OpenAI",
+    description:
+      "Cloud transcription (whisper-1, gpt-4o-transcribe) and cloud summaries.",
+    placeholder: "sk-…",
+  },
+  deepgram: {
+    label: "Deepgram",
+    description: "Nova-3 and Nova-2 cloud transcription.",
+    placeholder: "Deepgram API key",
+  },
+  groq: {
+    label: "Groq",
+    description: "Fast cloud Whisper (whisper-large-v3-turbo).",
+    placeholder: "gsk_…",
+  },
+};
+
 // Self-contained per-provider API-key row: loads the stored-or-not state,
 // saves, and tests — no state threading through the settings hook. The
 // backend only ever reports a sentinel, never the key itself, so the input
@@ -13,13 +37,13 @@ export type KeyProvider = "openai" | "deepgram" | "groq";
 // of settings-page state dependencies.
 export function ProviderKeyCard({
   provider,
-  label,
-  description,
-  placeholder = "API key",
+  label = DEFAULT_COPY[provider].label,
+  description = DEFAULT_COPY[provider].description,
+  placeholder = DEFAULT_COPY[provider].placeholder,
 }: {
   provider: KeyProvider;
-  label: string;
-  description: string;
+  label?: string;
+  description?: string;
   placeholder?: string;
 }) {
   const [hasKey, setHasKey] = useState(false);

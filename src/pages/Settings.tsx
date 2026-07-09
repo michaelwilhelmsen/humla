@@ -40,14 +40,7 @@ export function Settings() {
         />
       </>
     ),
-    summaries: (
-      <SummaryTab
-        s={settings.s}
-        update={settings.update}
-        llmModels={settings.llmModels}
-        refreshLlmModels={settings.refreshLlmModels}
-      />
-    ),
+    summaries: <SummaryTab s={settings.s} update={settings.update} />,
     account: (
       <>
         <AccountTab />
@@ -56,7 +49,7 @@ export function Settings() {
     ),
     general: (
       <>
-        <GeneralTab s={settings.s} update={settings.update} />
+        <GeneralTab />
         <AboutTab />
       </>
     ),

@@ -11,26 +11,9 @@ import { LANGUAGES, languageOptionLabel } from "../../../lib/languages";
 import { inputClass } from "../types";
 import type { SettingsHook } from "../useSettings";
 
-// Copy for the inline per-provider key cards. The selected cloud provider's
-// card renders right under the picker; the others sit in Advanced so keys
-// for override-only providers stay reachable.
-const KEY_META: Record<KeyProvider, { label: string; description: string; placeholder: string }> = {
-  openai: {
-    label: "OpenAI",
-    description: "Cloud transcription (whisper-1, gpt-4o-transcribe) and cloud summaries.",
-    placeholder: "sk-…",
-  },
-  deepgram: {
-    label: "Deepgram",
-    description: "Nova-3 and Nova-2 cloud transcription.",
-    placeholder: "Deepgram API key",
-  },
-  groq: {
-    label: "Groq",
-    description: "Fast cloud Whisper (whisper-large-v3-turbo).",
-    placeholder: "gsk_…",
-  },
-};
+// The selected cloud provider's key card renders right under the picker;
+// the others sit in Advanced so keys for override-only providers stay
+// reachable. Copy comes from the card's per-provider defaults.
 const KEY_PROVIDERS: KeyProvider[] = ["openai", "deepgram", "groq"];
 
 // Engine choice row: label + description left, pick-radio right, the
@@ -160,10 +143,7 @@ export function TranscriptionTab({
           </p>
         )}
         {def.provider !== "local" && (
-          <ProviderKeyCard
-            provider={def.provider as KeyProvider}
-            {...KEY_META[def.provider as KeyProvider]}
-          />
+          <ProviderKeyCard provider={def.provider as KeyProvider} />
         )}
         <Row
           label="Language"
@@ -227,7 +207,7 @@ export function TranscriptionTab({
               Keys for providers used only by per-language overrides.
             </p>
             {KEY_PROVIDERS.filter((p) => p !== def.provider).map((p) => (
-              <ProviderKeyCard key={p} provider={p} {...KEY_META[p]} />
+              <ProviderKeyCard key={p} provider={p} />
             ))}
           </div>
         </Disclosure>
