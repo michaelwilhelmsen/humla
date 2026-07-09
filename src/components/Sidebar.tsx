@@ -2,6 +2,7 @@ import { Link, useNavigate, useLocation } from "react-router-dom";
 import { useMemo, useState } from "react";
 import {
   ChevronLeft,
+  FileAudio,
   Files,
   Folder as FolderIcon,
   FolderPlus,
@@ -11,6 +12,7 @@ import {
   Settings as SettingsIcon,
   Trash2,
 } from "lucide-react";
+import { open } from "@tauri-apps/plugin-dialog";
 import { useNotesStore } from "../lib/store";
 import { ipc, type Folder, type Note } from "../lib/ipc";
 import { cn } from "../lib/cn";
@@ -47,10 +49,36 @@ export function Sidebar({ onCollapse }: { onCollapse: () => void }) {
   const notes = useNotesStore((s) => s.notes);
   const folders = useNotesStore((s) => s.folders);
   const removeLocal = useNotesStore((s) => s.removeLocal);
+  const upsertLocal = useNotesStore((s) => s.upsertLocal);
   const upsertFolder = useNotesStore((s) => s.upsertFolder);
   const [q, setQ] = useState("");
   const [creatingFolder, setCreatingFolder] = useState(false);
   const [newFolderName, setNewFolderName] = useState("");
+
+  // Import an existing audio file: pick it, create a new note seeded from the
+  // filename, and run it through the transcription pipeline (backend streams
+  // the transcript in). Navigate to the note so the user watches it fill in.
+  async function importAudio() {
+    let selected: string | string[] | null;
+    try {
+      selected = await open({
+        multiple: false,
+        filters: [
+          {
+            name: "Audio",
+            // Whatever AVFoundation decodes — the sidecar handles the rest.
+            extensions: ["m4a", "mp3", "wav", "aac", "caf", "aiff", "aif", "m4b", "mp4"],
+          },
+        ],
+      });
+    } catch {
+      return; // dialog unavailable / cancelled
+    }
+    if (typeof selected !== "string") return; // cancelled or multi (shouldn't happen)
+    const note = await ipc.importAudio(selected);
+    upsertLocal(note);
+    navigate(`/note/${note.id}`);
+  }
 
   async function deleteNote(e: React.MouseEvent, id: string) {
     e.preventDefault();
@@ -166,6 +194,15 @@ export function Sidebar({ onCollapse }: { onCollapse: () => void }) {
             active={location.pathname === "/all-notes"}
             count={notes.length}
           />
+          <button
+            type="button"
+            onClick={importAudio}
+            title="Import an existing audio file as a new note"
+            className="no-drag flex items-center gap-2.5 px-2.5 py-2 rounded-[var(--radius)] text-[13.5px] transition-colors text-[var(--color-text-muted)] hover:bg-[var(--color-pill-hover)] hover:text-[var(--color-text)]"
+          >
+            <FileAudio size={16} strokeWidth={1.6} className="shrink-0 opacity-85" />
+            <span className="flex-1 truncate text-left">Import audio…</span>
+          </button>
         </div>
 
         {searching ? (

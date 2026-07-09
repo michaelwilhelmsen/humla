@@ -340,6 +340,9 @@ export const ipc = {
 
   recordingStart: (noteId: string) => invoke<void>("recording_start", { noteId }),
   recordingStop: () => invoke<void>("recording_stop"),
+  // Import an existing audio file into a NEW note and run it through the full
+  // transcription pipeline. Returns the created note.
+  importAudio: (path: string) => invoke<Note>("import_audio", { path }),
   recordingPause: () => invoke<void>("recording_pause"),
   recordingResume: () => invoke<void>("recording_resume"),
   recordingState: () => invoke<"idle" | "recording">("recording_state"),
@@ -365,7 +368,7 @@ export type PermissionsStatus = {
 export type TranscriptEvent = { noteId: string; text: string };
 export type SummaryEvent = { noteId: string; summary: string };
 export type StreamDeltaEvent = { noteId: string; delta: string };
-export type RecordingPhase = "idle" | "starting" | "recording" | "paused" | "stopping" | "diarizing";
+export type RecordingPhase = "idle" | "starting" | "recording" | "paused" | "stopping" | "diarizing" | "importing";
 export type SummaryProvider = "openai" | "local";
 export type RecordingStatus = { noteId: string | null; phase: RecordingPhase };
 export type RecordingError = { noteId: string | null; message: string };

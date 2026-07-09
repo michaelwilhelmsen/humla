@@ -223,16 +223,20 @@ export function Note() {
   const isStarting = isThisNoteActive && recPhase.phase === "starting";
   const isStopping = isThisNoteActive && recPhase.phase === "stopping";
   const isDiarizing = isThisNoteActive && recPhase.phase === "diarizing";
-  const recActive = isStarting || isRecording || isPaused || isStopping || isDiarizing;
+  // A file import replaying through the pipeline. Treated like a live capture
+  // for UI purposes (transcript streams in, Record/Summarize hidden) but has no
+  // pause/stop controls — the sidecar replays once and finishes on its own.
+  const isImporting = isThisNoteActive && recPhase.phase === "importing";
+  const recActive = isStarting || isRecording || isPaused || isStopping || isDiarizing || isImporting;
 
-  // When a recording starts on this note, surface the live transcript: open
-  // the context panel and switch to its Transcript tab.
+  // When a recording or import starts on this note, surface the live
+  // transcript: open the context panel and switch to its Transcript tab.
   useEffect(() => {
-    if (isStarting || isRecording) {
+    if (isStarting || isRecording || isImporting) {
       setPanelOpen(true);
       setActiveTab("transcript");
     }
-  }, [isStarting, isRecording]);
+  }, [isStarting, isRecording, isImporting]);
 
   // Drag-to-resize for the context panel. A handle on the panel's left edge
   // adjusts its width (clamped 320–720); persisted to localStorage. The
@@ -373,7 +377,7 @@ export function Note() {
   // Diarization replaces the transcript wholesale, so we want the editor to
   // reflect that update immediately.
   const allowTranscriptSync =
-    isRecording || isPaused || isStarting || isStopping || isDiarizing;
+    isRecording || isPaused || isStarting || isStopping || isDiarizing || isImporting;
   useEffect(() => {
     if (!note || !draft || note.id !== draft.id) return;
     setDraft((d) => {
@@ -513,7 +517,7 @@ export function Note() {
   // collapsed transcript card to its bottom so newly transcribed
   // chunks stay visible. After stop / on a saved note the user is
   // reading from the top, so flip back to top alignment.
-  const transcriptLive = isRecording || isPaused || isStopping || isDiarizing;
+  const transcriptLive = isRecording || isPaused || isStopping || isDiarizing || isImporting;
 
   const folder = draft.folder_id ? folders.find((f) => f.id === draft.folder_id) : null;
   const backTo = folder ? `/folder/${folder.id}` : "/";
