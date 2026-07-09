@@ -267,6 +267,70 @@ describe("settings dialog", () => {
     ).toBeInTheDocument();
   });
 
+  it("default provider renders as self-describing rows", async () => {
+    renderApp("/settings?tab=transcription");
+    const dialog = await screen.findByRole("dialog", { name: /settings/i });
+
+    // Every control is a labeled row with an explanation — no bare selects
+    // (maintainer design-review amendment on #15).
+    expect(await within(dialog).findByText("Provider")).toBeInTheDocument();
+    expect(
+      within(dialog).getByText(/where audio is transcribed/i),
+    ).toBeInTheDocument();
+    expect(within(dialog).getByText("Model")).toBeInTheDocument();
+    // The selected provider shows in the picker trigger.
+    expect(
+      within(dialog).getByRole("button", { name: /openai/i }),
+    ).toBeInTheDocument();
+  });
+
+  it("local provider exposes labeled Quality and Metal rows", async () => {
+    const writes: unknown[] = [];
+    renderApp("/settings?tab=transcription", {
+      get_transcribe_config: () => ({
+        default: {
+          provider: "local",
+          model_id: "large-v3-turbo-q5",
+          preset: "quality",
+          use_gpu: true,
+        },
+        per_language: {},
+      }),
+      local_whisper_models: () => [
+        {
+          id: "large-v3-turbo-q5",
+          label: "Large v3 Turbo (quantized)",
+          description: "",
+          filename: "x.bin",
+          sizeBytesHint: 1,
+          kind: "multilingual",
+          specificLanguage: null,
+          downloaded: true,
+          sizeBytes: 1,
+          path: null,
+        },
+      ],
+      set_transcribe_config: (args) => {
+        writes.push(args);
+        return null;
+      },
+    });
+    const dialog = await screen.findByRole("dialog", { name: /settings/i });
+
+    expect(await within(dialog).findByText("Quality")).toBeInTheDocument();
+    const metal = await within(dialog).findByRole("switch", {
+      name: /metal/i,
+    });
+    expect(metal).toBeChecked();
+
+    await userEvent.click(metal);
+
+    const write = writes.at(-1) as {
+      config?: { default?: { use_gpu?: boolean } };
+    };
+    expect(write?.config?.default?.use_gpu).toBe(false);
+  });
+
   it("deep-links ?tab=account to the merged Account section", async () => {
     renderApp("/settings?tab=account");
     const dialog = await screen.findByRole("dialog", { name: /settings/i });

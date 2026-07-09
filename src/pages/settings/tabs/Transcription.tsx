@@ -47,41 +47,16 @@ export function TranscriptionTab({
   return (
     <>
       <Section title="Default provider">
-        <Row label="Active">
-          <ProviderConfigForm
-            value={def}
-            onChange={setDefaultConfig}
-            localModels={local.models}
-          />
-          {def.provider === "local" && !local.models.some((m) => m.downloaded) && (
-            <p className="text-xs text-red-600 dark:text-red-400 mt-2">
-              No local model is downloaded. Download one below before recording.
-            </p>
-          )}
-          {def.provider === "openai" && def.model === "gpt-4o-transcribe-diarize" && (
-            <p className="text-xs text-[var(--color-text-muted)] mt-2">
-              Note: <code>gpt-4o-transcribe-diarize</code> treats the
-              language setting as a hint and does not accept a biasing
-              prompt. For strict language locking, use{" "}
-              <code>whisper-1</code> or <code>gpt-4o-transcribe</code>.
-            </p>
-          )}
-          {def.provider === "deepgram" && (
-            <p className="text-xs text-[var(--color-text-muted)] mt-2">
-              <code>nova-3</code> is the current best for English; falls
-              back gracefully to other languages. Add your Deepgram API
-              key under Settings → API keys.
-            </p>
-          )}
-          {def.provider === "groq" && (
-            <p className="text-xs text-[var(--color-text-muted)] mt-2">
-              Groq hosts <code>whisper-large-v3-turbo</code> at OpenAI-
-              compatible endpoints — same Whisper quality, ~10× cheaper
-              and faster than OpenAI's hosted Whisper. Add your Groq API
-              key under Settings → API keys.
-            </p>
-          )}
-        </Row>
+        <ProviderConfigForm
+          value={def}
+          onChange={setDefaultConfig}
+          localModels={local.models}
+        />
+        {def.provider === "local" && !local.models.some((m) => m.downloaded) && (
+          <p className="text-xs text-[var(--color-danger)] py-3">
+            No local model is downloaded. Download one below before recording.
+          </p>
+        )}
       </Section>
 
       <Section title="Per-language overrides">
