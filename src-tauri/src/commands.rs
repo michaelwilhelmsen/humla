@@ -124,6 +124,46 @@ pub async fn rediarize_note(app: AppHandle, note_id: String) -> Result<(), Strin
     // latest take (earlier takes keep their existing labels — full
     // cross-session unification is issue #17).
     let recordings = sessions::recordings_dir(&app_dir, &note_id);
+
+    // Multi-session notes: "Re-diarize" means the cross-session unify pass
+    // (#17) — fresh clustering over every take's concatenated audio so one
+    // voice carries one label across takes. Falls back to the latest-take
+    // re-diarize below when fewer than two sessions have retained source
+    // audio + chunk timings (legacy notes, takes recorded before
+    // auto-retention). Single-session notes never enter this branch and
+    // keep today's behaviour exactly.
+    if sessions::resolve_sessions(&recordings).len() >= 2 {
+        {
+            let state: State<AppState> = app.state();
+            let engine = active_diarize_engine(&state);
+            match diarize::status(&app, engine).await {
+                Ok(s) if s.downloaded => {}
+                _ => {
+                    return Err(
+                        "Diarize model isn't downloaded. Download it in Settings → Transcription → Speaker diarization, then try again."
+                            .to_string(),
+                    );
+                }
+            }
+        }
+        emit_status(&app, Some(&note_id), Phase::Diarizing);
+        match unify_note_speakers(&app, &note_id).await {
+            Ok(true) => {
+                emit_status(&app, None, Phase::Idle);
+                return Ok(());
+            }
+            Ok(false) => {
+                // Not enough retained per-session audio to unify — fall
+                // through to the latest-take re-diarize.
+                emit_status(&app, None, Phase::Idle);
+            }
+            Err(e) => {
+                emit_status(&app, None, Phase::Idle);
+                return Err(format!("Speaker unification failed: {e}"));
+            }
+        }
+    }
+
     let audio_dir = sessions::latest_session_dir(&recordings);
     let session_id = sessions::resolve_sessions(&recordings)
         .last()
@@ -1848,6 +1888,19 @@ async fn run_post_stop_chain(
     // session-aware path resolution. Duration comes from the timeline
     // diarize_and_apply just wrote (max end_ms); 0 when nothing landed.
     finalize_session(&app, &note_id, &session_id, &session_started_at, streams).await;
+    // Cross-session speaker unification (#17): once the note has two or more
+    // takes with retained source audio + chunk timings, re-cluster the
+    // concatenated audio so one voice carries one label across takes —
+    // replacing the offset-only numbers diarize_and_apply just wrote. Must
+    // run after finalize_session (the manifest has to include this take) and
+    // before the temp-dir cleanup is irrelevant (it reads the retained
+    // session copies, not the temp WAVs). No-op for single-session notes;
+    // failures keep the per-take labels.
+    match unify_note_speakers(&app, &note_id).await {
+        Ok(true) => eprintln!("unify: cross-session speaker unification applied"),
+        Ok(false) => {}
+        Err(e) => eprintln!("unify: failed, keeping per-take labels: {e}"),
+    }
     // The pipeline wrote the transcript directly (per-chunk during capture,
     // then the labelled rewrite), bypassing the notes_* commands — so push it
     // to the cloud now. Covers every diarize_and_apply exit path.
@@ -3476,6 +3529,260 @@ fn unify_relabel(
         timelines.push((sess.session_id.clone(), out));
     }
     UnifyOutcome { timelines, notices }
+}
+
+/// One session that qualified for the concatenated pass, with its chunk log
+/// already loaded.
+struct UnifyCandidate {
+    entry: sessions::SessionEntry,
+    dir: PathBuf,
+    chunks: Vec<ChunkRecord>,
+    mode: SessionMode,
+}
+
+/// Concatenate 16 kHz mono WAVs into `out`, returning each input's start
+/// offset (ms) inside the result, computed from real sample counts. `None`
+/// when `paths` is empty (no file written).
+async fn concat_wavs(
+    paths: &[PathBuf],
+    out: &std::path::Path,
+) -> anyhow::Result<Option<Vec<u64>>> {
+    if paths.is_empty() {
+        return Ok(None);
+    }
+    let mut combined: Vec<f32> = Vec::new();
+    let mut counts = Vec::with_capacity(paths.len());
+    for p in paths {
+        let samples = wav::read_f32_mono_16k(p).await?;
+        counts.push(samples.len());
+        combined.extend_from_slice(&samples);
+    }
+    wav::write_pcm16_mono_16k(out, &combined).await?;
+    Ok(Some(concat_offsets_ms(&counts)))
+}
+
+/// Run the cross-session speaker unification pass (#17) on a note.
+///
+/// Returns `Ok(true)` when the pass ran and rewrote labels, `Ok(false)` when
+/// the note doesn't qualify (fewer than two sessions, fewer than two with
+/// retained source audio + chunk timings, or the diarize model isn't
+/// downloaded) — callers then keep the per-take offset labelling exactly as
+/// before. `Err` means the pass started but failed; existing labels are left
+/// untouched (the pass only writes after diarize succeeded on every needed
+/// stream).
+///
+/// Cost note: this re-diarizes the note's ENTIRE concatenated audio (per
+/// stream) each time it runs — on every stop of a multi-session note the
+/// diarizer processes all takes, not just the new one. That's inherent to
+/// the approach (clustering must see all takes at once to unify voices) and
+/// bounded by note length; the concat WAVs live in a temp dir and are
+/// removed when the pass ends.
+pub(crate) async fn unify_note_speakers(
+    app: &AppHandle,
+    note_id: &str,
+) -> anyhow::Result<bool> {
+    let app_dir = app.path().app_data_dir()?;
+    let recordings = sessions::recordings_dir(&app_dir, note_id);
+    let resolved = sessions::resolve_sessions(&recordings);
+    if resolved.len() < 2 {
+        return Ok(false);
+    }
+
+    let (expected_speakers, engine, thresholds) = {
+        let state: State<AppState> = app.state();
+        let eng = active_diarize_engine(&state);
+        let thr = read_diarize_thresholds(&state);
+        let conn = state.db.lock();
+        let hint = db::get_note(&conn, note_id)
+            .ok()
+            .and_then(|n| n.expected_speakers)
+            .filter(|n| *n > 0);
+        (hint, eng, thr)
+    };
+    match diarize::status(app, engine).await {
+        Ok(s) if s.downloaded => {}
+        _ => {
+            eprintln!("unify: diarize model not downloaded, keeping per-take labels");
+            return Ok(false);
+        }
+    }
+
+    // Partition into sessions that can join the concatenated pass and
+    // "frozen" ones that keep their existing labels — a take without
+    // chunks.json or its diarized-stream WAV (e.g. a first take recorded
+    // before auto-retention kicked in, or a keep-audio-off legacy note)
+    // can't be re-clustered, so its labels stay and the unified numbering
+    // is offset past them.
+    let mut unifiable: Vec<UnifyCandidate> = Vec::new();
+    let mut frozen_dirs: Vec<PathBuf> = Vec::new();
+    for (entry, dir) in resolved {
+        let chunks_path = dir.join("chunks.json");
+        let chunks = if chunks_path.exists() {
+            parse_chunks_json(&chunks_path).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let has_mic = dir.join("mic.wav").exists();
+        let has_sys = dir.join("sys.wav").exists();
+        match session_mode(&chunks) {
+            Some(mode) if session_unifiable(mode, has_mic, has_sys) => {
+                unifiable.push(UnifyCandidate { entry, dir, chunks, mode });
+            }
+            _ => frozen_dirs.push(dir),
+        }
+    }
+    if unifiable.len() < 2 {
+        eprintln!(
+            "unify: only {} session(s) have retained audio + chunk timings (need 2+), keeping per-take labels",
+            unifiable.len()
+        );
+        return Ok(false);
+    }
+
+    // Concat WAVs are scratch files — never inside the session dirs.
+    let tmp = std::env::temp_dir().join(format!("humla-unify-{note_id}"));
+    tokio::fs::create_dir_all(&tmp).await?;
+    let result = unify_apply(
+        app,
+        note_id,
+        &tmp,
+        &unifiable,
+        &frozen_dirs,
+        expected_speakers,
+        engine,
+        thresholds,
+    )
+    .await;
+    let _ = tokio::fs::remove_dir_all(&tmp).await;
+    result
+}
+
+/// The IO half of the unify pass, split out so the caller can always clean
+/// up the temp dir. Concatenates + diarizes per stream, runs the pure
+/// relabel, writes every unified session's timeline, and rebuilds the DB
+/// transcript from all sessions (frozen ones included, untouched).
+#[allow(clippy::too_many_arguments)]
+async fn unify_apply(
+    app: &AppHandle,
+    note_id: &str,
+    tmp: &std::path::Path,
+    unifiable: &[UnifyCandidate],
+    frozen_dirs: &[PathBuf],
+    expected_speakers: Option<i64>,
+    engine: diarize::Engine,
+    thresholds: diarize::Thresholds,
+) -> anyhow::Result<bool> {
+    // Per-stream concatenation in manifest order. Mic concat = mic-only
+    // sessions (hybrid mic is "You" by channel attribution, never
+    // diarized); sys concat = sys-only + hybrid sessions. Matches the
+    // per-source passes diarize_and_apply runs on a single take.
+    let mic_paths: Vec<PathBuf> = unifiable
+        .iter()
+        .filter(|c| c.mode == SessionMode::MicOnly)
+        .map(|c| c.dir.join("mic.wav"))
+        .collect();
+    let sys_paths: Vec<PathBuf> = unifiable
+        .iter()
+        .filter(|c| c.mode != SessionMode::MicOnly)
+        .map(|c| c.dir.join("sys.wav"))
+        .collect();
+    let mic_concat = tmp.join("mic-concat.wav");
+    let sys_concat = tmp.join("sys-concat.wav");
+    let mic_offsets = concat_wavs(&mic_paths, &mic_concat).await?;
+    let sys_offsets = concat_wavs(&sys_paths, &sys_concat).await?;
+
+    // Same speaker-count hint semantics as the per-take pass: the note's
+    // expected_speakers applies to the mic stream directly (in-person);
+    // when any take is hybrid, one of those speakers is the user ("You"),
+    // so the sys stream is asked to find the remaining N-1. Sortformer's
+    // 4-speaker cap applies to the combined audio exactly as it does to a
+    // single take — no special-casing.
+    let mic_segments = match &mic_offsets {
+        Some(_) => {
+            diarize_and_maybe_clean(app, &mic_concat, expected_speakers, engine, thresholds)
+                .await?
+        }
+        None => Vec::new(),
+    };
+    let any_hybrid = unifiable.iter().any(|c| c.mode == SessionMode::Hybrid);
+    let sys_hint = if any_hybrid {
+        expected_speakers.map(|n| (n - 1).max(1))
+    } else {
+        expected_speakers
+    };
+    let sys_segments = match &sys_offsets {
+        Some(_) => {
+            diarize_and_maybe_clean(app, &sys_concat, sys_hint, engine, thresholds).await?
+        }
+        None => Vec::new(),
+    };
+    if mic_offsets.is_some() && mic_segments.is_empty() {
+        anyhow::bail!("diarize returned no segments for the combined mic stream");
+    }
+    if sys_offsets.is_some() && sys_segments.is_empty() {
+        anyhow::bail!("diarize returned no segments for the combined system stream");
+    }
+
+    // Unified generated numbers start past any frozen session's existing
+    // ones so the two label spaces never collide in the merged transcript.
+    let label_offset = frozen_dirs
+        .iter()
+        .map(|d| max_speaker_in_timeline(&d.join("timeline.jsonl")))
+        .max()
+        .unwrap_or(0);
+
+    let mut mic_iter = mic_offsets.unwrap_or_default().into_iter();
+    let mut sys_iter = sys_offsets.unwrap_or_default().into_iter();
+    let sessions_in: Vec<UnifySession> = unifiable
+        .iter()
+        .map(|c| {
+            let mic_offset_ms = if c.mode == SessionMode::MicOnly {
+                mic_iter.next().unwrap_or(0)
+            } else {
+                0
+            };
+            let sys_offset_ms = if c.mode != SessionMode::MicOnly {
+                sys_iter.next().unwrap_or(0)
+            } else {
+                0
+            };
+            UnifySession {
+                session_id: c.entry.id.clone(),
+                mode: c.mode,
+                chunks: c.chunks.clone(),
+                mic_offset_ms,
+                sys_offset_ms,
+                old_spans: spans_from_values(&read_timeline_values(
+                    &c.dir.join("timeline.jsonl"),
+                )),
+            }
+        })
+        .collect();
+
+    let outcome = unify_relabel(&sessions_in, &mic_segments, &sys_segments, label_offset);
+
+    for ((session_id, jsonl), cand) in outcome.timelines.iter().zip(unifiable) {
+        debug_assert_eq!(session_id, &cand.entry.id);
+        tokio::fs::write(cand.dir.join("timeline.jsonl"), jsonl).await?;
+    }
+
+    // Rebuild the DB transcript from every session's timeline (frozen ones
+    // keep their old labels) and notify the UI + sync.
+    let transcript = rebuild_note_transcript(app, note_id).map_err(|e| anyhow::anyhow!(e))?;
+    commit_rebuilt_transcript(app, note_id, transcript).map_err(|e| anyhow::anyhow!(e))?;
+
+    // Surface custom-name merges on the existing transient-toast channel
+    // (recording_error doubles as the informational surface — the sidecar's
+    // non-fatal Diagnostic notices already ride it).
+    for notice in &outcome.notices {
+        emit_error(app, Some(note_id), notice);
+    }
+    eprintln!(
+        "unify: relabelled {} session(s) from unified clustering ({} frozen)",
+        unifiable.len(),
+        frozen_dirs.len()
+    );
+    Ok(true)
 }
 
 /// Jaccard similarity: |A ∩ B| / |A ∪ B|. 1.0 when the sets are
