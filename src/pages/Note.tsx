@@ -31,6 +31,7 @@ import { useDownloadStore, useNotesStore, useRecordingStore } from "../lib/store
 import { computeSetupStatus } from "../lib/setupStatus";
 import { useOwnerName, useCloudStore } from "../lib/cloud";
 import { extractSpeakerLabels, renameSpeakerInTranscript } from "../lib/speakers";
+import { SpeakerLabels, speakerColorMap } from "../components/SpeakerLabels";
 import { RecordingBar } from "../components/RecordingBar";
 import type { LayoutOutletContext } from "../components/Layout";
 import { SkeletonLines } from "../components/Skeleton";
@@ -1509,137 +1510,10 @@ function CopyButton({ getText, label }: { getText: () => string; label: string }
 // have; red (--color-speaker-4) last because the design language reserves it
 // for "interrupt only" — a five-speaker meeting will still get red, but
 // for the common 2–3 speaker case it stays out of the way.
-const SPEAKER_COLORS = [
-  "var(--color-interactive)",
-  "var(--color-success)",
-  "var(--color-warning)",
-  "var(--color-speaker-4)",
-];
-
-function speakerColorMap(labels: string[]): Map<string, string> {
-  const map = new Map<string, string>();
-  labels.forEach((label, i) => {
-    map.set(label, SPEAKER_COLORS[i % SPEAKER_COLORS.length]);
-  });
-  return map;
-}
-
-// extractSpeakerLabels / renameSpeakerInTranscript moved to ../lib/speakers
-// (imported above) so they can be unit-tested in isolation — see speakers.test.ts.
-
-function SpeakerLabels({
-  transcript,
-  onRename,
-  readOnly,
-}: {
-  transcript: string;
-  onRename: (oldLabel: string, newLabel: string) => void;
-  readOnly?: boolean;
-}) {
-  const labels = useMemo(() => extractSpeakerLabels(transcript), [transcript]);
-  const colors = useMemo(() => speakerColorMap(labels), [labels]);
-  // Only render the strip when there are 2+ unique speakers — solo
-  // monologues don't need management UI.
-  if (labels.length < 2) return null;
-  return (
-    <div className="flex flex-wrap gap-2 mb-4">
-      {labels.map((label) => (
-        <SpeakerChip
-          key={label}
-          label={label}
-          color={colors.get(label) ?? SPEAKER_COLORS[0]}
-          onRename={(next) => onRename(label, next)}
-          readOnly={readOnly}
-        />
-      ))}
-    </div>
-  );
-}
-
-function SpeakerChip({
-  label,
-  color,
-  onRename,
-  readOnly,
-}: {
-  label: string;
-  color: string;
-  onRename: (next: string) => void;
-  readOnly?: boolean;
-}) {
-  const [editing, setEditing] = useState(false);
-  const [draft, setDraft] = useState(label);
-  const inputRef = useRef<HTMLInputElement | null>(null);
-
-  // Snap the draft back to the canonical label whenever the underlying
-  // label changes (e.g. diarize replaced the transcript and our label
-  // was re-derived).
-  useEffect(() => {
-    setDraft(label);
-  }, [label]);
-
-  useEffect(() => {
-    if (editing) inputRef.current?.select();
-  }, [editing]);
-
-  function commit() {
-    setEditing(false);
-    const trimmed = draft.trim();
-    if (!trimmed || trimmed === label) {
-      setDraft(label);
-      return;
-    }
-    onRename(trimmed);
-  }
-
-  // Read-only (viewer): a static, non-interactive pill — no click-to-rename.
-  if (readOnly) {
-    return (
-      <span className="nd-speaker-pill" style={{ background: color }}>
-        {label}
-      </span>
-    );
-  }
-
-  if (editing) {
-    // size= sets the visible character width; with monospace font this
-    // makes the input width track the typed text. Floor at 3 so the
-    // pill never collapses to nothing while the user is mid-edit.
-    return (
-      <input
-        ref={inputRef}
-        value={draft}
-        onChange={(e) => setDraft(e.target.value)}
-        onBlur={commit}
-        size={Math.max(draft.length, 3)}
-        onKeyDown={(e) => {
-          if (e.key === "Enter") {
-            e.preventDefault();
-            commit();
-          } else if (e.key === "Escape") {
-            e.preventDefault();
-            setDraft(label);
-            setEditing(false);
-          }
-        }}
-        className="nd-speaker-pill cursor-text outline-none"
-        style={{ background: color }}
-      />
-    );
-  }
-
-  return (
-    <button
-      type="button"
-      onClick={() => setEditing(true)}
-      title="Click to rename — applies to every turn from this speaker"
-      className="nd-speaker-pill cursor-pointer hover:opacity-90"
-      style={{ background: color }}
-    >
-      {label}
-    </button>
-  );
-}
+// SPEAKER_COLORS / speakerColorMap / SpeakerLabels / SpeakerChip moved to
+// ../components/SpeakerLabels (imported above) so the chip strip — now with
+// the merge affordance (#23) — can be unit-tested in isolation.
+// extractSpeakerLabels / renameSpeakerInTranscript live in ../lib/speakers.
 
 const TranscriptEditor = memo(function TranscriptEditor({
   value,
