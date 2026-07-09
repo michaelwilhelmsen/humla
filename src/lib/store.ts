@@ -252,7 +252,12 @@ export function bindBackendListeners() {
         const id = recordingNoteId;
         recordingNoteId = null;
         const note = useNotesStore.getState().notes.find((n) => n.id === id);
-        if (note?.workspace_id) void ipc.uploadNoteAudio(id);
+        if (note?.workspace_id) {
+          // notes.audio keeps the latest take playable for old clients;
+          // uploadNoteSessions pushes every take's per-session assets (#16).
+          void ipc.uploadNoteAudio(id);
+          void ipc.uploadNoteSessions(id);
+        }
       }
     } else if (s.noteId) {
       recordingNoteId = s.noteId; // an active recording — remember which note

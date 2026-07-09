@@ -272,6 +272,12 @@ export const ipc = {
   // shared note's audio down for local playback.
   uploadNoteAudio: (noteId: string) => invoke<void>("cloud_upload_note_audio", { noteId }),
   downloadNoteAudio: (noteId: string) => invoke<boolean>("cloud_download_note_audio", { noteId }),
+  // Per-session asset sync (#16): upload every take's assets after a recording
+  // / re-diarize, or pull a shared note's sessions (rebuilds sessions.json +
+  // fetches each take's playback + timeline). Returns true when sessions landed.
+  uploadNoteSessions: (noteId: string) => invoke<void>("cloud_upload_note_sessions", { noteId }),
+  downloadNoteSessions: (noteId: string) =>
+    invoke<boolean>("cloud_download_note_sessions", { noteId }),
   // Who (if anyone) is currently recording a shared note. null = nobody, a
   // Personal note, or the cloud isn't configured. Drives the recording-lock
   // banner + disabled Record button so teammates don't record the same note.
