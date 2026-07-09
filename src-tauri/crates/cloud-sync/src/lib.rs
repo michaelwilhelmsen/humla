@@ -1944,4 +1944,66 @@ mod it {
         w.pull_collection("summary_prompts", "prompts_cursor", &auth.token, |v| w.apply_remote_prompt_json(v)).await.expect("pull2");
         assert_eq!(scalar(&db, "SELECT content FROM summary_prompts WHERE id = ?1", &uuid), None);
     }
+
+    /// note_sessions metadata push + tombstone against a live PocketBase (#16).
+    /// Skipped unless HUMLA_TEST_* are set. Requires the humla-cloud
+    /// `note_sessions` collection (migration 1718900900) on the test server.
+    /// Reconstruction/download live in the app (cloud.rs + sessions.rs) and are
+    /// covered by their own unit tests, so this exercises the crate's slice: a
+    /// take's manifest entry → note_sessions record → tombstone.
+    #[tokio::test]
+    async fn session_roundtrip() {
+        let Some(mut config) = env_config() else {
+            eprintln!("session_roundtrip: skipped (set HUMLA_TEST_*)");
+            return;
+        };
+        // Stand up a temp recordings dir with a one-take manifest for the push
+        // to read (mirrors what the post-stop chain writes on disk).
+        let root = std::env::temp_dir().join(format!("humla-sess-it-{}", now_ms()));
+        let note_uuid = format!("note-{}", now_ms());
+        let sess_uuid = format!("sess-{}", now_ms());
+        let note_dir = root.join(&note_uuid);
+        std::fs::create_dir_all(&note_dir).unwrap();
+        std::fs::write(
+            note_dir.join("sessions.json"),
+            format!(
+                r#"{{"version":1,"sessions":[{{"id":"{sess_uuid}","index":1,"startedAt":"2026-07-09T10:00:00+00:00","durationMs":4200,"streams":["mic","sys"]}}]}}"#
+            ),
+        )
+        .unwrap();
+        config.recordings_dir = root.clone();
+
+        let db = test_db();
+        let w = worker(db.clone(), config);
+        let ws = w.config.workspace_id.clone();
+        {
+            let conn = db.lock();
+            conn.execute(
+                "INSERT INTO notes (id, title, workspace_id, created_at, updated_at)
+                 VALUES (?1, 'session IT', ?2, 10, 10)",
+                rusqlite::params![note_uuid, ws],
+            )
+            .unwrap();
+        }
+        let auth = w.ensure_auth().await.expect("auth");
+        // The parent note must exist first — push it, then the session.
+        w.push_note(&note_uuid, &ws).await.expect("push_note");
+        w.push_session(&note_uuid, &sess_uuid, &ws).await.expect("push_session");
+        let found = w
+            .find_remote_id("note_sessions", &sess_uuid, &ws, &auth.token)
+            .await
+            .expect("find");
+        assert!(found.is_some(), "pushed session should exist remotely");
+        assert!(!found.unwrap().1, "record should not be tombstoned yet");
+
+        // Tombstone via the shared delete path, verify the flag flips.
+        w.push_delete("note_sessions", &sess_uuid, &ws).await.expect("delete");
+        let after = w
+            .find_remote_id("note_sessions", &sess_uuid, &ws, &auth.token)
+            .await
+            .expect("find2");
+        assert!(after.map(|(_, deleted, _)| deleted).unwrap_or(false), "session tombstoned");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
