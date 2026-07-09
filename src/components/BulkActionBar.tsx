@@ -41,7 +41,10 @@ export function BulkActionBar({
   return (
     <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-40 no-drag">
       <div className="flex items-center gap-1 pl-4 pr-1.5 py-1.5 rounded-full bg-[var(--color-surface-raised)] border border-[var(--color-line-visible)] shadow-xl">
-        <span className="text-[13px] text-[var(--color-text-muted)] tabular-nums whitespace-nowrap pr-1">
+        <span
+          aria-live="polite"
+          className="text-[13px] text-[var(--color-text-muted)] tabular-nums whitespace-nowrap pr-1"
+        >
           {count} selected
         </span>
 
@@ -58,7 +61,7 @@ export function BulkActionBar({
           <button
             onClick={() => setPickerOpen((o) => !o)}
             disabled={busy}
-            aria-haspopup="menu"
+            aria-haspopup="true"
             aria-expanded={pickerOpen}
             className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-[13px] text-[var(--color-text)] hover:bg-[var(--color-pill-hover)] transition-colors disabled:opacity-50"
           >
@@ -66,12 +69,13 @@ export function BulkActionBar({
             Move to folder
           </button>
           {pickerOpen && (
+            // Plain list of focusable buttons rather than a role="menu": they're
+            // already Tab-reachable and honest about being buttons. A false
+            // ARIA-menu contract would promise arrow-key roving we don't wire.
             <div
-              role="menu"
               className="absolute bottom-full mb-2 left-1/2 -translate-x-1/2 min-w-[12rem] max-h-64 overflow-y-auto py-1 rounded-lg bg-[var(--color-canvas)] border border-[var(--color-line-visible)] shadow-xl"
             >
               <button
-                role="menuitem"
                 onClick={() => {
                   setPickerOpen(false);
                   onMove(null);
@@ -83,7 +87,6 @@ export function BulkActionBar({
               {folders.map((f) => (
                 <button
                   key={f.id}
-                  role="menuitem"
                   onClick={() => {
                     setPickerOpen(false);
                     onMove(f.id);

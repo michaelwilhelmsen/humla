@@ -65,6 +65,50 @@ describe("AllNotes selection", () => {
     expect(loc()).toBe("/");
   });
 
+  it("exposes selection via aria-selected, not colour alone", async () => {
+    mockTauri();
+    seed([makeNote("n1", "Alpha"), makeNote("n2", "Beta")]);
+    renderAll();
+
+    const row = screen.getByRole("link", { name: /Alpha/ });
+    // Programmatically determinable both before and after selecting.
+    expect(row).toHaveAttribute("aria-selected", "false");
+    fireEvent.click(row, { metaKey: true });
+    expect(row).toHaveAttribute("aria-selected", "true");
+  });
+
+  it("Space toggles selection on a focused row without navigating", async () => {
+    mockTauri();
+    seed([makeNote("n1", "Alpha"), makeNote("n2", "Beta")]);
+    renderAll();
+
+    const row = screen.getByRole("link", { name: /Alpha/ });
+    fireEvent.keyDown(row, { key: " " });
+    expect(row).toHaveAttribute("aria-selected", "true");
+    expect(loc()).toBe("/"); // Space selects, never navigates
+
+    fireEvent.keyDown(row, { key: " " }); // toggle back off
+    expect(row).toHaveAttribute("aria-selected", "false");
+    expect(loc()).toBe("/");
+  });
+
+  it("Shift+Space extends a keyboard selection into a range", async () => {
+    mockTauri();
+    seed([makeNote("n1", "Alpha"), makeNote("n2", "Beta"), makeNote("n3", "Gamma")]);
+    renderAll();
+
+    fireEvent.keyDown(screen.getByRole("link", { name: /Alpha/ }), { key: " " });
+    fireEvent.keyDown(screen.getByRole("link", { name: /Gamma/ }), {
+      key: " ",
+      shiftKey: true,
+    });
+
+    expect(screen.getByRole("link", { name: /Alpha/ })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("link", { name: /Beta/ })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("link", { name: /Gamma/ })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByText("3 selected")).toBeInTheDocument();
+  });
+
   it("ctrl-click does NOT toggle selection (macOS context-menu click)", async () => {
     mockTauri();
     seed([makeNote("n1", "Alpha"), makeNote("n2", "Beta")]);
@@ -204,7 +248,7 @@ describe("AllNotes bulk move", () => {
     fireEvent.click(screen.getByRole("link", { name: /Beta/ }), { metaKey: true });
 
     fireEvent.click(screen.getByRole("button", { name: /Move to folder/ }));
-    fireEvent.click(screen.getByRole("menuitem", { name: "Work" }));
+    fireEvent.click(screen.getByRole("button", { name: "Work" }));
 
     await waitFor(() => expect(moveSpy).toHaveBeenCalledTimes(2));
     expect(moveSpy).toHaveBeenCalledWith({ id: "n1", folderId: "f1" });
@@ -229,7 +273,10 @@ describe("AllNotes bulk move", () => {
     fireEvent.click(screen.getByRole("link", { name: /Beta/ }), { metaKey: true });
 
     fireEvent.click(screen.getByRole("button", { name: /Move to folder/ }));
-    fireEvent.click(screen.getByRole("menuitem", { name: "No folder" }));
+    // "No folder" also names a filter chip up top; the popover entry is the
+    // last one in DOM order.
+    const noFolderButtons = screen.getAllByRole("button", { name: "No folder" });
+    fireEvent.click(noFolderButtons[noFolderButtons.length - 1]);
 
     await waitFor(() => expect(moveSpy).toHaveBeenCalledTimes(2));
     expect(moveSpy).toHaveBeenCalledWith({ id: "n1", folderId: null });
