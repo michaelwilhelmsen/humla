@@ -4,7 +4,8 @@
 use super::{err, DEFAULT_LANGUAGE};
 use crate::db::{self, Note, NotePatch};
 use crate::AppState;
-use tauri::State;
+use std::path::Path;
+use tauri::{AppHandle, Manager, State};
 
 #[tauri::command]
 pub fn notes_list(state: State<AppState>) -> Result<Vec<Note>, String> {
@@ -89,10 +90,37 @@ pub fn notes_restore(state: State<AppState>, id: String) -> Result<Note, String>
 
 /// Permanently delete a note from the Trash (hard delete, not recoverable). The
 /// server copy is already tombstoned from the soft-delete, so this is local-only.
+///
+/// Cascade (issue #19): purge is the point of no return, so the note's retained
+/// audio / playback assets under `recordings/<note_id>/` go with it. Soft delete
+/// deliberately does NOT touch these — a Trash-restore must keep playback intact.
 #[tauri::command]
-pub fn notes_purge(state: State<AppState>, id: String) -> Result<(), String> {
-    let conn = state.db.lock();
-    db::purge_note(&conn, &id).map_err(err)
+pub fn notes_purge(app: AppHandle, state: State<AppState>, id: String) -> Result<(), String> {
+    {
+        let conn = state.db.lock();
+        db::purge_note(&conn, &id).map_err(err)?;
+    } // drop the db guard before touching the filesystem
+    // Best-effort asset cleanup: the DB row is already gone, which is the
+    // primary effect. A missing directory is expected (notes without retained
+    // audio) and is not an error; any other IO failure is swallowed so a
+    // filesystem hiccup can't leave the note un-purgeable.
+    if let Ok(base) = app.path().app_data_dir() {
+        let _ = purge_note_assets(&base, &id);
+    }
+    Ok(())
+}
+
+/// Remove a note's `recordings/<note_id>/` directory (retained audio + the
+/// always-written playback assets). Returns `Ok` when the directory never
+/// existed — purging a note that had no assets is not an error. Any other IO
+/// error propagates so callers/tests can observe a genuine failure.
+pub(crate) fn purge_note_assets(app_data_dir: &Path, note_id: &str) -> std::io::Result<()> {
+    let dir = app_data_dir.join("recordings").join(note_id);
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 /// Saved content revisions for a note, newest first (local version history).
@@ -154,4 +182,36 @@ pub fn notes_set_workspace(
     };
     state.sync.note_moved(&id, &from, &workspace_id);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::purge_note_assets;
+    use std::fs;
+
+    #[test]
+    fn purge_removes_the_notes_recordings_dir() {
+        let base = tempfile::tempdir().unwrap();
+        let note_id = "note-123";
+        let dir = base.path().join("recordings").join(note_id);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("playback.wav"), b"fake").unwrap();
+        fs::write(dir.join("mic-full.wav"), b"fake").unwrap();
+        assert!(dir.exists());
+
+        purge_note_assets(base.path(), note_id).unwrap();
+
+        assert!(!dir.exists(), "recordings/<note_id> should be gone after purge");
+        // A sibling note's assets must be untouched.
+        assert!(base.path().join("recordings").exists());
+    }
+
+    #[test]
+    fn purge_is_ok_when_no_assets_exist() {
+        let base = tempfile::tempdir().unwrap();
+        // No recordings/ dir at all — a note that never retained audio.
+        purge_note_assets(base.path(), "never-recorded").unwrap();
+        // Idempotent: purging again is still fine.
+        purge_note_assets(base.path(), "never-recorded").unwrap();
+    }
 }
