@@ -26,6 +26,7 @@
 //! access is a scoped lock/snapshot/unlock before any network call. That keeps
 //! the worker future `Send`.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -52,6 +53,11 @@ pub struct Config {
     pub workspace_id: String,
     /// How often to pull remote changes.
     pub poll_interval: Duration,
+    /// `<app_data>/recordings`. Session-metadata pushes read each note's
+    /// `sessions.json` manifest from `<recordings_dir>/<note_id>/`. (Binary
+    /// session assets are uploaded/downloaded separately by the app's cloud
+    /// commands — the crate only syncs the metadata records.)
+    pub recordings_dir: PathBuf,
 }
 
 /// Cheap handle the observer glue calls. Sends ops to the worker; never blocks.
@@ -87,6 +93,24 @@ impl CloudSync {
             to: to.to_string(),
         });
     }
+    /// A recording session's metadata was created or changed (#16). Pushes the
+    /// `note_sessions` record; the parent note must be synced first (it is —
+    /// the note upsert is enqueued ahead of this and drains in seq order).
+    pub fn enqueue_session_upsert(&self, note_id: &str, session_id: &str) {
+        let _ = self.tx.send(Op::Session {
+            note_id: note_id.to_string(),
+            session_id: session_id.to_string(),
+            delete: false,
+        });
+    }
+    /// A recording session was deleted → tombstone its `note_sessions` record.
+    pub fn enqueue_session_delete(&self, note_id: &str, session_id: &str) {
+        let _ = self.tx.send(Op::Session {
+            note_id: note_id.to_string(),
+            session_id: session_id.to_string(),
+            delete: true,
+        });
+    }
 }
 
 enum Op {
@@ -94,6 +118,7 @@ enum Op {
     Folder { id: String, delete: bool },
     Prompt { id: String, delete: bool },
     NoteMove { id: String, from: String, to: String },
+    Session { note_id: String, session_id: String, delete: bool },
 }
 
 /// Build the sync engine. Returns the handle plus the worker future; the
@@ -244,6 +269,27 @@ impl Worker {
                 }
                 Ok(())
             }
+            Op::Session { note_id, session_id, delete } => {
+                // A session row keys on the parent note's workspace. On delete
+                // the note may already be gone locally, so fall back to the
+                // active workspace (reads/tombstones are workspace-scoped),
+                // mirroring `enqueue_simple`. The entity_id packs both ids so
+                // the push can read the manifest AND resolve the parent note.
+                let workspace = if delete {
+                    self.config.workspace_id.clone()
+                } else {
+                    let conn = self.db.lock();
+                    conn.query_row(
+                        "SELECT workspace_id FROM notes WHERE id = ?1",
+                        rusqlite::params![note_id],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .optional()?
+                    .unwrap_or_default()
+                };
+                let entity_id = session_entity_id(&note_id, &session_id);
+                self.enqueue_row("session", &entity_id, if delete { "delete" } else { "upsert" }, &workspace)
+            }
         }
     }
 
@@ -322,6 +368,16 @@ impl Worker {
                 ("folder", "delete") => self.push_delete("folders", &entity_id, &workspace).await,
                 ("prompt", "upsert") => self.push_prompt(&entity_id, &workspace).await,
                 ("prompt", "delete") => self.push_delete("summary_prompts", &entity_id, &workspace).await,
+                ("session", "upsert") => {
+                    let (note_id, session_id) = split_session_entity_id(&entity_id);
+                    self.push_session(&note_id, &session_id, &workspace).await
+                }
+                ("session", "delete") => {
+                    let (_, session_id) = split_session_entity_id(&entity_id);
+                    // Session UUIDs are globally unique, so (client_id, workspace)
+                    // locates the record without needing the parent note.
+                    self.push_delete("note_sessions", &session_id, &workspace).await
+                }
                 _ => {
                     eprintln!("cloud-sync: unknown outbox row {entity}/{op}; dropping");
                     Ok(())
@@ -479,6 +535,58 @@ impl Worker {
             "deleted": false,
         });
         self.upsert_record("summary_prompts", uuid, workspace, &auth.token, body).await
+    }
+
+    /// Push a recording session's METADATA record (#16). The binary assets
+    /// (playback / timeline / mic / sys / chunks) are uploaded separately by
+    /// the app's cloud commands via multipart PATCH — this only creates/updates
+    /// the `note_sessions` row the assets attach to.
+    ///
+    /// Metadata is effectively immutable after a take finalises (index /
+    /// started_at / duration / streams never change), so the LWW key is derived
+    /// from the session's own start time: re-pushing is idempotent, and two
+    /// devices can't create the same session UUID, so there's no real conflict.
+    async fn push_session(&self, note_id: &str, session_id: &str, workspace: &str) -> Result<()> {
+        let Some(meta) = self.read_session_meta(note_id, session_id) else {
+            return Ok(()); // manifest entry gone (deleted before push) — nothing to do
+        };
+        let auth = self.ensure_auth().await?;
+        // The parent note must exist on the server first — the note upsert is
+        // enqueued ahead of this and drains in seq order. If it isn't there yet
+        // (out-of-order pull, or the note push is still failing), treat as
+        // transient so this retries once the note lands, rather than dropping it.
+        let Some((note_pb_id, _, _)) =
+            self.find_remote_id("notes", note_id, workspace, &auth.token).await?
+        else {
+            return Err(anyhow!(
+                "cloud-sync: parent note {note_id} not on server yet; deferring session push"
+            ));
+        };
+        let started_ms = started_at_to_ms(&meta.started_at);
+        let client_updated_at = started_ms.max(1);
+        let body = json!({
+            "client_id": session_id,
+            "note": note_pb_id,
+            "workspace": workspace,
+            "session_index": meta.index,
+            "started_at": started_ms,
+            "duration_ms": meta.duration_ms,
+            "streams": meta.streams,
+            "client_updated_at": client_updated_at,
+            "deleted": false,
+        });
+        // (client_id, workspace) uniquely finds the record because session UUIDs
+        // are globally unique; on create the POST carries the `note` relation.
+        self.upsert_record("note_sessions", session_id, workspace, &auth.token, body).await
+    }
+
+    /// Read one session's manifest entry from `<recordings_dir>/<note>/sessions.json`.
+    /// `None` when the manifest or entry is absent/unparseable.
+    fn read_session_meta(&self, note_id: &str, session_id: &str) -> Option<ManifestEntry> {
+        let path = self.config.recordings_dir.join(note_id).join("sessions.json");
+        let body = std::fs::read_to_string(&path).ok()?;
+        let manifest: ManifestFile = serde_json::from_str(&body).ok()?;
+        manifest.sessions.into_iter().find(|e| e.id == session_id)
     }
 
     /// Soft-delete (tombstone) a record by `client_id` so other devices pull
@@ -1150,6 +1258,58 @@ fn is_unauthorized(e: &anyhow::Error) -> bool {
     e.downcast_ref::<PbError>().is_some_and(|pb| pb.status == 401)
 }
 
+/// Pack a session outbox row's `entity_id` as `<note_id>/<session_id>`. Both
+/// are client-minted UUIDs, so the `/` separator is unambiguous and neither
+/// half carries filter metacharacters.
+fn session_entity_id(note_id: &str, session_id: &str) -> String {
+    format!("{note_id}/{session_id}")
+}
+
+/// Inverse of [`session_entity_id`]. A malformed value (no `/`) yields an empty
+/// note id and the whole string as the session id — the push then simply finds
+/// no manifest entry and no-ops.
+fn split_session_entity_id(entity_id: &str) -> (String, String) {
+    match entity_id.split_once('/') {
+        Some((n, s)) => (n.to_string(), s.to_string()),
+        None => (String::new(), entity_id.to_string()),
+    }
+}
+
+/// RFC3339 (manifest `started_at`) → epoch-ms for the note_sessions contract.
+/// Empty / unparseable → 0.
+fn started_at_to_ms(rfc3339: &str) -> i64 {
+    if rfc3339.trim().is_empty() {
+        return 0;
+    }
+    chrono::DateTime::parse_from_rfc3339(rfc3339)
+        .map(|dt| dt.timestamp_millis())
+        .unwrap_or(0)
+}
+
+/// Minimal mirror of the app's `sessions.json` manifest — just the fields a
+/// metadata push needs. The crate is framework-agnostic (can't depend on the
+/// app's `sessions` module), so this deliberately duplicates the shape, exactly
+/// as the worker already duplicates knowledge of the SQLite schema.
+#[derive(Deserialize)]
+struct ManifestFile {
+    #[serde(default)]
+    sessions: Vec<ManifestEntry>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ManifestEntry {
+    id: String,
+    #[serde(default)]
+    index: u32,
+    #[serde(default)]
+    started_at: String,
+    #[serde(default)]
+    duration_ms: u64,
+    #[serde(default)]
+    streams: Vec<String>,
+}
+
 fn now_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -1331,6 +1491,7 @@ mod it {
             password: std::env::var("HUMLA_TEST_PASSWORD").ok()?,
             workspace_id: std::env::var("HUMLA_TEST_WORKSPACE").ok()?,
             poll_interval: Duration::from_secs(60),
+            recordings_dir: std::env::temp_dir(),
         })
     }
 
@@ -1390,6 +1551,7 @@ mod it {
             password: String::new(),
             workspace_id: workspace.to_string(),
             poll_interval: Duration::from_secs(60),
+            recordings_dir: std::path::PathBuf::new(),
         }
     }
 
@@ -1423,6 +1585,88 @@ mod it {
         assert_eq!(count, 1, "three enqueues collapse to one pending row");
         assert_eq!(op, "delete", "latest op wins");
         assert_eq!(ws, "wsX", "upsert captured the note's own workspace");
+    }
+
+    /// Session outbox entity_id packing round-trips, and a malformed value
+    /// degrades safely (empty note id → push finds no manifest entry, no-ops).
+    #[test]
+    fn session_entity_id_roundtrips() {
+        let packed = session_entity_id("note-uuid", "sess-uuid");
+        assert_eq!(packed, "note-uuid/sess-uuid");
+        assert_eq!(
+            split_session_entity_id(&packed),
+            ("note-uuid".to_string(), "sess-uuid".to_string())
+        );
+        assert_eq!(
+            split_session_entity_id("no-slash"),
+            (String::new(), "no-slash".to_string())
+        );
+    }
+
+    /// started_at RFC3339 → epoch-ms (the note_sessions contract's number),
+    /// with empty / unparseable collapsing to 0.
+    #[test]
+    fn started_at_parses_to_ms() {
+        assert!(started_at_to_ms("2026-07-09T10:00:00+00:00") > 0);
+        assert_eq!(started_at_to_ms(""), 0);
+        assert_eq!(started_at_to_ms("garbage"), 0);
+    }
+
+    /// A session upsert enqueues one row keyed on the packed (note/session)
+    /// entity_id, capturing the parent note's workspace; a repeat coalesces.
+    #[test]
+    fn session_enqueue_captures_workspace_and_coalesces() {
+        let db = test_db();
+        let w = worker(db.clone(), offline_config("wsS"));
+        {
+            let conn = db.lock();
+            conn.execute(
+                "INSERT INTO notes (id, workspace_id, created_at, updated_at) VALUES ('n1', 'wsS', 1, 1)",
+                [],
+            )
+            .unwrap();
+        }
+        w.enqueue(Op::Session { note_id: "n1".into(), session_id: "s1".into(), delete: false })
+            .unwrap();
+        w.enqueue(Op::Session { note_id: "n1".into(), session_id: "s1".into(), delete: false })
+            .unwrap();
+
+        let conn = db.lock();
+        let (count, eid, ws): (i64, String, String) = conn
+            .query_row(
+                "SELECT COUNT(*), MAX(entity_id), MAX(workspace) FROM sync_outbox WHERE entity='session'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "repeat session enqueues collapse to one row");
+        assert_eq!(eid, "n1/s1");
+        assert_eq!(ws, "wsS", "captured the parent note's workspace");
+    }
+
+    /// Reads the just-recorded take's metadata out of a real sessions.json.
+    #[test]
+    fn read_session_meta_from_manifest() {
+        let root = std::env::temp_dir().join(format!("humla-sess-test-{}", now_ms()));
+        let note_dir = root.join("note-1");
+        std::fs::create_dir_all(&note_dir).unwrap();
+        std::fs::write(
+            note_dir.join("sessions.json"),
+            r#"{"version":1,"sessions":[
+                {"id":"sA","index":1,"startedAt":"2026-07-09T10:00:00+00:00","durationMs":4200,"streams":["mic","sys"]}
+            ]}"#,
+        )
+        .unwrap();
+        let mut cfg = offline_config("wsS");
+        cfg.recordings_dir = root.clone();
+        let w = worker(test_db(), cfg);
+        let meta = w.read_session_meta("note-1", "sA").expect("entry present");
+        assert_eq!(meta.index, 1);
+        assert_eq!(meta.duration_ms, 4200);
+        assert_eq!(meta.streams, vec!["mic", "sys"]);
+        assert!(w.read_session_meta("note-1", "missing").is_none());
+        assert!(w.read_session_meta("no-note", "sA").is_none());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Ingest id safety: real UUIDs + plain test ids pass; filter-metacharacter
