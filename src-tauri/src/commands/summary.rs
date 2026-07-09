@@ -113,18 +113,41 @@ pub async fn summarize_note(app: AppHandle, note_id: String) -> Result<(), Strin
     result.map_err(|e| e.to_string())
 }
 
+/// Resolve the summary prompt for a note. Three cases, in priority order:
+///   1. `custom:<id>` — a user-defined prompt row. Look it up; if the row
+///      was deleted out from under us, fall back to the built-in default
+///      prompt so the summary still runs.
+///   2. `"custom"` — the legacy single-prompt sentinel from before the
+///      summary_prompts table. The legacy `summary_prompt` setting is no
+///      longer read here (migrate_summary_prompts seeds a prompt row for
+///      upgraders, rewriting these notes to `custom:<id>`); any note that
+///      still carries the bare sentinel falls back to the built-in default
+///      prompt.
+///   3. Built-in preset value ("meeting", "lecture", etc.) — language-aware
+///      via presets::prompt.
+fn resolve_prompt(conn: &rusqlite::Connection, note: &Note, language: &str) -> String {
+    if let Some(id) = note.summary_preset.strip_prefix("custom:") {
+        match db::get_summary_prompt(conn, id) {
+            Ok(p) => p.content,
+            Err(_) => DEFAULT_SUMMARY_PROMPT.to_string(),
+        }
+    } else if note.summary_preset == "custom" {
+        DEFAULT_SUMMARY_PROMPT.to_string()
+    } else {
+        presets::prompt(&note.summary_preset, language)
+    }
+}
+
 async fn run_summary(app: AppHandle, note_id: String) -> anyhow::Result<()> {
     let state: State<AppState> = app.state();
     // Read the API key out of band — keychain lookup shouldn't sit
     // inside the DB lock that resolve_provider takes.
     let openai_api_key = read_provider_api_key(&state, "openai")
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let (provider, custom_prompt, language, note) = {
+    let (provider, language, note) = {
         let conn = state.db.lock();
         let n = db::get_note(&conn, &note_id)?;
         let p_resolved = resolve_provider(&conn, &n, openai_api_key)?;
-        let p = db::get_setting(&conn, "summary_prompt")?
-            .unwrap_or_else(|| DEFAULT_SUMMARY_PROMPT.to_string());
         let global_lang = db::get_setting(&conn, "language")?
             .unwrap_or_else(|| DEFAULT_LANGUAGE.to_string());
         // Same fallback rule as transcription: note language wins, empty
@@ -134,31 +157,14 @@ async fn run_summary(app: AppHandle, note_id: String) -> anyhow::Result<()> {
         } else {
             n.language.clone()
         };
-        (p_resolved, p, lang, n)
+        (p_resolved, lang, n)
     };
     if note.transcript.trim().is_empty() && note.body.trim().is_empty() {
         return Ok(());
     }
-    // Resolve the prompt for this note. Three cases, in priority order:
-    //   1. `custom:<id>` — a user-defined prompt row. Look it up; if the
-    //      row was deleted out from under us, fall back to the legacy
-    //      single-prompt setting so the summary still runs.
-    //   2. `"custom"` — the legacy single-prompt sentinel from before
-    //      the summary_prompts table. Reads the `summary_prompt` setting.
-    //      Old notes that didn't get migrated land here.
-    //   3. Built-in preset value ("meeting", "lecture", etc.) —
-    //      language-aware via presets::prompt.
-    let prompt = if let Some(id) = note.summary_preset.strip_prefix("custom:") {
-        let state: State<AppState> = app.state();
+    let prompt = {
         let conn = state.db.lock();
-        match db::get_summary_prompt(&conn, id) {
-            Ok(p) => p.content,
-            Err(_) => custom_prompt,
-        }
-    } else if note.summary_preset == "custom" {
-        custom_prompt
-    } else {
-        presets::prompt(&note.summary_preset, &language)
+        resolve_prompt(&conn, &note, &language)
     };
     let body_text = crate::html_text::html_to_text(&note.body);
     // Always send both labels even when one side is empty. Sending only
@@ -253,5 +259,53 @@ fn language_directive(lang: &str) -> String {
             "IMPORTANT: Write the entire response in {}.",
             languages::english_name(other)
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_conn() -> (tempfile::TempDir, rusqlite::Connection) {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = db::open(&dir.path().join("summary-test.sqlite")).unwrap();
+        (dir, conn)
+    }
+
+    #[test]
+    fn custom_id_resolves_to_the_stored_prompt_row() {
+        let (_dir, conn) = temp_conn();
+        let row = db::create_summary_prompt(&conn, "Mine", "MY CUSTOM PROMPT", "").unwrap();
+        let note = db::create_note(&conn, "no", &format!("custom:{}", row.id), "").unwrap();
+        assert_eq!(resolve_prompt(&conn, &note, "no"), "MY CUSTOM PROMPT");
+    }
+
+    #[test]
+    fn deleted_custom_row_falls_back_to_the_builtin_default() {
+        // A note pointing at a custom prompt row that has since been
+        // deleted must still summarise — using the built-in default, not
+        // the retired `summary_prompt` setting.
+        let (_dir, conn) = temp_conn();
+        let note = db::create_note(&conn, "no", "custom:does-not-exist", "").unwrap();
+        assert_eq!(resolve_prompt(&conn, &note, "no"), DEFAULT_SUMMARY_PROMPT);
+    }
+
+    #[test]
+    fn legacy_custom_sentinel_falls_back_to_the_builtin_default() {
+        // Pre-table `"custom"` sentinel that never got migrated. No longer
+        // reads the legacy `summary_prompt` setting.
+        let (_dir, conn) = temp_conn();
+        let note = db::create_note(&conn, "no", "custom", "").unwrap();
+        assert_eq!(resolve_prompt(&conn, &note, "no"), DEFAULT_SUMMARY_PROMPT);
+    }
+
+    #[test]
+    fn builtin_preset_uses_the_language_aware_preset_prompt() {
+        let (_dir, conn) = temp_conn();
+        let note = db::create_note(&conn, "no", "meeting", "").unwrap();
+        assert_eq!(
+            resolve_prompt(&conn, &note, "no"),
+            presets::prompt("meeting", "no")
+        );
     }
 }
