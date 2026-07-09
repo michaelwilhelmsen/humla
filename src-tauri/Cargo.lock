@@ -397,6 +397,7 @@ name = "cloud-sync"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "parking_lot",
  "reqwest 0.12.28",
  "rusqlite",
