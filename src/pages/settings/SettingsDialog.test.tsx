@@ -113,7 +113,7 @@ describe("settings dialog", () => {
   });
 
   it("Escape in an open select closes the select, not the dialog", async () => {
-    renderApp("/settings?tab=general");
+    renderApp("/settings?tab=transcription");
     const dialog = await screen.findByRole("dialog", { name: /settings/i });
 
     // Open the Language select's listbox.
@@ -156,7 +156,7 @@ describe("settings dialog", () => {
   });
 
   it("backdrop click with an open select dismisses only the select", async () => {
-    renderApp("/settings?tab=general");
+    renderApp("/settings?tab=transcription");
     const dialog = await screen.findByRole("dialog", { name: /settings/i });
 
     const trigger = await within(dialog).findByRole("button", {
@@ -249,19 +249,240 @@ describe("settings dialog", () => {
   });
 
   it("resolves legacy deep links to their new sections", async () => {
-    // `keys` tab is dissolved: it anchors to Transcription, where the key
-    // fields now live (until PRD 2/2 inlines them per provider).
+    // `keys` tab is dissolved: it anchors to Transcription. The active
+    // provider's key is inline; the other providers' keys live under the
+    // section's Advanced disclosure alongside overrides.
     renderApp("/settings?tab=keys");
     const dialog = await screen.findByRole("dialog", { name: /settings/i });
     expect(
       within(dialog).getByRole("tab", { name: "Transcription" }),
     ).toHaveAttribute("aria-selected", "true");
     expect(
-      await within(dialog).findByRole("heading", { name: "OpenAI" }),
+      await within(dialog).findByLabelText(/openai api key/i),
+    ).toBeInTheDocument();
+
+    await userEvent.click(
+      (await within(dialog).findAllByRole("button", { name: /advanced/i }))[0],
+    );
+    expect(
+      await within(dialog).findByLabelText(/deepgram api key/i),
     ).toBeInTheDocument();
     expect(
-      within(dialog).getByRole("heading", { name: "Deepgram" }),
+      within(dialog).getByLabelText(/groq api key/i),
     ).toBeInTheDocument();
+  });
+
+  it("the default language lives in Transcription and persists", async () => {
+    const writes: Record<string, string> = {};
+    renderApp("/settings?tab=transcription", {
+      settings_set: (args) => {
+        const { key, value } = args as { key: string; value: string };
+        writes[key] = value;
+        return null;
+      },
+    });
+    const dialog = await screen.findByRole("dialog", { name: /settings/i });
+
+    // Relocated from General (#15): the language sits with the engine that
+    // consumes it.
+    const trigger = await within(dialog).findByRole("button", {
+      name: /norwegian/i,
+    });
+    await userEvent.click(trigger);
+    await userEvent.click(
+      within(dialog).getByRole("option", { name: /^english/i }),
+    );
+    expect(writes.language).toBe("en");
+
+    // And General no longer offers it.
+    await userEvent.click(within(dialog).getByRole("tab", { name: "General" }));
+    expect(
+      within(dialog).queryByRole("button", { name: /norwegian|english/i }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("per-language overrides and local models sit behind Advanced", async () => {
+    renderApp("/settings?tab=transcription");
+    const dialog = await screen.findByRole("dialog", { name: /settings/i });
+    await within(dialog).findByText("Provider");
+
+    // Collapsed: expert routing is out of sight.
+    expect(
+      within(dialog).queryByText("Per-language overrides"),
+    ).not.toBeInTheDocument();
+    expect(
+      within(dialog).queryByText(/pick a multilingual model/i),
+    ).not.toBeInTheDocument();
+
+    await userEvent.click(
+      within(dialog).getAllByRole("button", { name: /advanced/i })[0],
+    );
+
+    expect(
+      await within(dialog).findByText("Per-language overrides"),
+    ).toBeInTheDocument();
+    expect(
+      within(dialog).getByText(/pick a multilingual model/i),
+    ).toBeInTheDocument();
+  });
+
+  it("default provider renders as self-describing rows", async () => {
+    renderApp("/settings?tab=transcription");
+    const dialog = await screen.findByRole("dialog", { name: /settings/i });
+
+    // Every control is a labeled row with an explanation — no bare selects
+    // (maintainer design-review amendment on #15).
+    expect(await within(dialog).findByText("Provider")).toBeInTheDocument();
+    expect(
+      within(dialog).getByText(/where audio is transcribed/i),
+    ).toBeInTheDocument();
+    expect(within(dialog).getByText("Model")).toBeInTheDocument();
+    // The selected provider shows in the picker trigger.
+    expect(
+      within(dialog).getByRole("button", { name: /openai/i }),
+    ).toBeInTheDocument();
+  });
+
+  it("local provider exposes labeled Quality and Metal rows", async () => {
+    const writes: unknown[] = [];
+    renderApp("/settings?tab=transcription", {
+      get_transcribe_config: () => ({
+        default: {
+          provider: "local",
+          model_id: "large-v3-turbo-q5",
+          preset: "quality",
+          use_gpu: true,
+        },
+        per_language: {},
+      }),
+      local_whisper_models: () => [
+        {
+          id: "large-v3-turbo-q5",
+          label: "Large v3 Turbo (quantized)",
+          description: "",
+          filename: "x.bin",
+          sizeBytesHint: 1,
+          kind: "multilingual",
+          specificLanguage: null,
+          downloaded: true,
+          sizeBytes: 1,
+          path: null,
+        },
+      ],
+      set_transcribe_config: (args) => {
+        writes.push(args);
+        return null;
+      },
+    });
+    const dialog = await screen.findByRole("dialog", { name: /settings/i });
+
+    expect(await within(dialog).findByText("Quality")).toBeInTheDocument();
+    const metal = await within(dialog).findByRole("switch", {
+      name: /metal/i,
+    });
+    expect(metal).toBeChecked();
+
+    await userEvent.click(metal);
+
+    const write = writes.at(-1) as {
+      config?: { default?: { use_gpu?: boolean } };
+    };
+    expect(write?.config?.default?.use_gpu).toBe(false);
+  });
+
+  it("detection thresholds live behind an Advanced disclosure as labeled rows", async () => {
+    const writes: Record<string, string> = {};
+    renderApp("/settings?tab=transcription", {
+      settings_set: (args) => {
+        const { key, value } = args as { key: string; value: string };
+        writes[key] = value;
+        return null;
+      },
+    });
+    const dialog = await screen.findByRole("dialog", { name: /settings/i });
+
+    // Collapsed by default — expert knobs don't shout (and no developer-mode
+    // gate: tuning re-diarize thresholds is user-relevant).
+    await within(dialog).findByText(/speaker labels/i);
+    expect(
+      within(dialog).queryByText(/community-1 clustering threshold/i),
+    ).not.toBeInTheDocument();
+
+    // Two per-section disclosures exist (Transcription, Speaker labels);
+    // the thresholds live under the Speaker labels one — last in order.
+    const advanced = within(dialog).getAllByRole("button", {
+      name: /advanced/i,
+    });
+    await userEvent.click(advanced[advanced.length - 1]);
+
+    const field = within(dialog).getByLabelText(
+      /community-1 clustering threshold/i,
+    );
+    await userEvent.clear(field);
+    await userEvent.type(field, "0.6");
+
+    expect(writes.community1_threshold).toBe("0.6");
+    // Sentence-case labels — the uppercase .nd-label style is retired.
+    expect(
+      within(dialog).getByText(/silence rms threshold/i),
+    ).toBeInTheDocument();
+  });
+
+  it("summaries: labeled provider rows with the OpenAI key inline, preset relocated", async () => {
+    renderApp("/settings?tab=summaries");
+    const dialog = await screen.findByRole("dialog", { name: /settings/i });
+
+    expect(await within(dialog).findByText("Provider")).toBeInTheDocument();
+    expect(
+      within(dialog).getByText(/local keeps the transcript on your mac/i),
+    ).toBeInTheDocument();
+    // Key inline under the cloud provider — no separate keys surface.
+    expect(
+      await within(dialog).findByLabelText(/openai api key/i),
+    ).toBeInTheDocument();
+    // Default preset moved here from General.
+    expect(
+      within(dialog).getByRole("button", { name: /meeting/i }),
+    ).toBeInTheDocument();
+
+    await userEvent.click(within(dialog).getByRole("tab", { name: "General" }));
+    expect(
+      within(dialog).queryByRole("button", { name: /meeting/i }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("summaries local provider connects through OllamaConnect", async () => {
+    const writes: Record<string, string> = {};
+    renderApp("/settings?tab=summaries", {
+      settings_get: (args) => {
+        const key = (args as { key?: string }).key;
+        if (key === "onboarding_completed") return "true";
+        if (key === "summary_provider") return "local";
+        return null;
+      },
+      settings_set: (args) => {
+        const { key, value } = args as { key: string; value: string };
+        writes[key] = value;
+        return null;
+      },
+      local_llm_list_models: () => ["qwen3:8b", "llama3.2:3b"],
+    });
+    const dialog = await screen.findByRole("dialog", { name: /settings/i });
+
+    // Reachable server → connected state, no manual Refresh dance.
+    expect(await within(dialog).findByText(/connected/i)).toBeInTheDocument();
+    // Thinking mode is a Toggle, not a checkbox.
+    expect(
+      within(dialog).getByRole("switch", { name: /thinking/i }),
+    ).toBeInTheDocument();
+
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: /choose a model|qwen3/i }),
+    );
+    await userEvent.click(
+      within(dialog).getByRole("option", { name: "qwen3:8b" }),
+    );
+    expect(writes.local_llm_model).toBe("qwen3:8b");
   });
 
   it("deep-links ?tab=account to the merged Account section", async () => {

@@ -5,7 +5,6 @@ import { GeneralTab } from "./settings/tabs/General";
 import { RecordingSection } from "./settings/tabs/Recording";
 import { TranscriptionTab } from "./settings/tabs/Transcription";
 import { SummaryTab } from "./settings/tabs/Summary";
-import { ApiKeysTab } from "./settings/tabs/ApiKeys";
 import { AboutTab } from "./settings/tabs/About";
 import { AccountTab } from "./settings/tabs/Account";
 import { OrganizationTab } from "./settings/tabs/Organization";
@@ -39,26 +38,9 @@ export function Settings() {
           downloadSortformer={settings.downloadSortformer}
           deleteSortformer={settings.deleteSortformer}
         />
-        <ApiKeysTab
-          openaiKey={settings.openaiKey}
-          setOpenaiKey={settings.setOpenaiKey}
-          deepgramKey={settings.deepgramKey}
-          setDeepgramKey={settings.setDeepgramKey}
-          groqKey={settings.groqKey}
-          setGroqKey={settings.setGroqKey}
-          saveProviderKey={settings.saveProviderKey}
-          testProviderKey={settings.testProviderKey}
-        />
       </>
     ),
-    summaries: (
-      <SummaryTab
-        s={settings.s}
-        update={settings.update}
-        llmModels={settings.llmModels}
-        refreshLlmModels={settings.refreshLlmModels}
-      />
-    ),
+    summaries: <SummaryTab s={settings.s} update={settings.update} />,
     account: (
       <>
         <AccountTab />
@@ -67,7 +49,7 @@ export function Settings() {
     ),
     general: (
       <>
-        <GeneralTab s={settings.s} update={settings.update} />
+        <GeneralTab />
         <AboutTab />
       </>
     ),

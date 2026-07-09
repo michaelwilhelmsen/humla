@@ -12,7 +12,9 @@ export function Disclosure({
 }) {
   const [open, setOpen] = useState(false);
   return (
-    <div className="border-t border-[var(--color-line)] pt-3 mt-1">
+    // No border of its own: inside a Section card the divide-y hairline
+    // already separates it from the row above.
+    <div className="py-3.5">
       <button
         type="button"
         aria-expanded={open}

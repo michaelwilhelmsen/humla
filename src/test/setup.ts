@@ -1,7 +1,12 @@
 import "@testing-library/jest-dom/vitest";
 import { afterEach } from "vitest";
-import { cleanup } from "@testing-library/react";
+import { cleanup, configure } from "@testing-library/react";
 import { mockIPC } from "@tauri-apps/api/mocks";
+
+// findBy*'s default 1s can flake under parallel test workers when a
+// component chains async loads (cloud status → members). Generous ceiling;
+// passing tests don't get slower, only genuinely-absent elements do.
+configure({ asyncUtilTimeout: 4000 });
 
 // The event plugin unregisters listeners through this internal, which
 // mockIPC doesn't provide.
