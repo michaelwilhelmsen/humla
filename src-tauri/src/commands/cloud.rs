@@ -603,6 +603,31 @@ pub async fn cloud_resend_verification(state: State<'_, AppState>) -> Result<(),
     Err(format!("couldn't resend verification ({status}): {body}"))
 }
 
+/// Ask the server to email a password-reset link. Signed-out flow, so it needs
+/// only the configured base URL, not a session. PocketBase answers 204 even
+/// for unknown addresses (no account enumeration), so success here only means
+/// "request accepted", not "account exists".
+#[tauri::command]
+pub async fn cloud_request_password_reset(
+    state: State<'_, AppState>,
+    email: String,
+) -> Result<(), String> {
+    let base = read_base_url(&state)
+        .ok_or("Cloud isn't configured — set the server URL first.")?;
+    let resp = http()
+        .post(format!("{base}/api/collections/users/request-password-reset"))
+        .json(&serde_json::json!({ "email": email.trim() }))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if resp.status().is_success() {
+        return Ok(()); // 204 No Content
+    }
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    Err(format!("couldn't request a password reset ({status}): {body}"))
+}
+
 #[tauri::command]
 pub fn cloud_logout(state: State<'_, AppState>) -> Result<(), String> {
     clear_creds();

@@ -24,6 +24,7 @@ export function AccountTab() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [verifyMsg, setVerifyMsg] = useState<string | null>(null);
+  const [resetMsg, setResetMsg] = useState<string | null>(null);
 
   async function connect() {
     setBusy(true);
@@ -91,6 +92,26 @@ export function AccountTab() {
       setVerifyMsg("Verification email sent — check your inbox.");
     } catch (e) {
       setVerifyMsg(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function forgotPassword() {
+    const addr = email.trim();
+    if (!addr) {
+      setResetMsg("Enter your email above first, then try again.");
+      return;
+    }
+    setBusy(true);
+    setResetMsg(null);
+    try {
+      await cloudApi.requestPasswordReset(addr);
+      // The server answers 204 even for unknown addresses (no account
+      // enumeration), so this only promises the request went out.
+      setResetMsg(`Password reset email sent to ${addr} — check your inbox.`);
+    } catch (e) {
+      setResetMsg(String(e));
     } finally {
       setBusy(false);
     }
@@ -210,12 +231,21 @@ export function AccountTab() {
             </Btn>
             <Btn onClick={disconnect} disabled={busy}>Change server</Btn>
           </div>
-          <div>
+          <div className="flex items-center gap-4">
             <button type="button" onClick={toggleMode}
               className="text-xs text-[var(--color-interactive)] hover:underline">
               {isSignup ? "Already have an account? Sign in" : "Need an account? Create one"}
             </button>
+            {!isSignup && (
+              <button type="button" onClick={forgotPassword} disabled={busy}
+                className="text-xs text-[var(--color-interactive)] hover:underline disabled:opacity-50">
+                Forgot password?
+              </button>
+            )}
           </div>
+          {resetMsg && (
+            <div className="text-xs text-[var(--color-text-muted)]">{resetMsg}</div>
+          )}
         </div>
       </Section>
     );

@@ -234,6 +234,7 @@ where
             commands::cloud_login,
             commands::cloud_signup,
             commands::cloud_resend_verification,
+            commands::cloud_request_password_reset,
             commands::cloud_logout,
             commands::cloud_create_workspace,
             commands::cloud_select_workspace,

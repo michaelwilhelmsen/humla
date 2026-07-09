@@ -112,6 +112,43 @@ describe("Account section", () => {
     ).toBeInTheDocument();
   });
 
+  it("forgot password sends a reset email for the typed address", async () => {
+    const resets: unknown[] = [];
+    renderApp("/settings?tab=account", {
+      cloud_status: () => signedOutConfigured(),
+      cloud_request_password_reset: (args) => {
+        resets.push(args);
+        return null;
+      },
+    });
+    const dialog = await screen.findByRole("dialog", { name: /settings/i });
+    await within(dialog).findByRole("heading", { name: /sign in/i });
+
+    const forgot = within(dialog).getByRole("button", {
+      name: /forgot password/i,
+    });
+
+    // Without an email there's nothing to reset — the user gets a nudge,
+    // not a silent no-op.
+    await userEvent.click(forgot);
+    expect(
+      within(dialog).getByText(/enter your email/i),
+    ).toBeInTheDocument();
+    expect(resets).toHaveLength(0);
+
+    await userEvent.type(
+      within(dialog).getByPlaceholderText(/you@example.com/i),
+      "m@example.no",
+    );
+    await userEvent.click(forgot);
+
+    expect(resets).toHaveLength(1);
+    expect(resets[0]).toMatchObject({ email: "m@example.no" });
+    expect(
+      await within(dialog).findByText(/reset email sent to m@example.no/i),
+    ).toBeInTheDocument();
+  });
+
   it("unverified account shows the warning with a working resend", async () => {
     const resends: unknown[] = [];
     const status = signedIn("owner");
