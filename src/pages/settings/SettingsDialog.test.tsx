@@ -199,12 +199,13 @@ describe("settings dialog", () => {
     expect(screen.getByTestId("location")).toHaveTextContent(/^\/$/);
   });
 
-  it("has a search field in the sidebar (filtering is a fast-follow)", async () => {
+  it("has no search field until filtering actually works", async () => {
+    // Maintainer call (2026-07-09): a dead search box promises something
+    // the dialog can't do — removed until the filter ships.
     renderApp("/settings");
     const dialog = await screen.findByRole("dialog", { name: /settings/i });
-    expect(
-      within(dialog).getByRole("searchbox", { name: /search settings/i }),
-    ).toBeInTheDocument();
+    await within(dialog).findByRole("tab", { name: "Recording" });
+    expect(within(dialog).queryByRole("searchbox")).not.toBeInTheDocument();
   });
 
   it("shows the five sections in the sidebar nav", async () => {

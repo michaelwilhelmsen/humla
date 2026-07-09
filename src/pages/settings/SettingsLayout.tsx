@@ -7,7 +7,6 @@
 
 import type { ReactNode } from "react";
 import { useSearchParams } from "react-router-dom";
-import { Search as SearchIcon } from "lucide-react";
 import { resolveSectionId, type SectionId } from "./sections";
 
 export type SettingsSection = {
@@ -24,26 +23,11 @@ export function SettingsLayout({ sections }: { sections: SettingsSection[] }) {
   return (
     <div className="h-full flex">
       <aside className="w-56 shrink-0 border-r border-[var(--color-line)] py-8 pl-6 pr-3">
-        <h1 className="text-2xl font-light tracking-[-0.02em] mb-4 px-3">
+        {/* No search field until the cross-section filter actually works —
+            a dead search box promises more than the dialog delivers. */}
+        <h1 className="text-2xl font-light tracking-[-0.02em] mb-6 px-3">
           Settings
         </h1>
-        {/* Layout-only for now: the cross-section filter is a fast-follow. */}
-        <div className="px-3 mb-4">
-          <div className="flex items-center gap-2 px-2.5 py-1.5 rounded-md border border-[var(--color-line-visible)] bg-[var(--color-surface)]">
-            <SearchIcon
-              size={13}
-              strokeWidth={1.8}
-              className="shrink-0 text-[var(--color-text-muted)]"
-              aria-hidden
-            />
-            <input
-              type="search"
-              aria-label="Search settings"
-              placeholder="Search"
-              className="w-full bg-transparent text-sm outline-none placeholder:text-[var(--color-text-muted)]"
-            />
-          </div>
-        </div>
         <nav className="flex flex-col gap-0.5" role="tablist">
           {sections.map((section) => {
             const isActive = section.id === active?.id;
