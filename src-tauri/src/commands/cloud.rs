@@ -1223,6 +1223,30 @@ fn safe_path_seg(s: &str) -> bool {
         && s.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'-'))
 }
 
+/// Drop any pulled session record whose server-controlled `client_id` isn't a
+/// safe path segment. `client_id` is used verbatim as a filesystem path
+/// segment (`session_dir` → `remove_dir_all` for tombstones, `create_dir_all` +
+/// file writes for live takes) *and* baked into `sessions.json` via
+/// `reconcile_manifest`. A malicious workspace member could set it to
+/// `../../../../Desktop` so a victim opening the shared note deletes an
+/// arbitrary directory. Filtering here — before either the FS ops or the
+/// manifest reconstruction see the records — closes both paths at once.
+fn retain_safe_sessions(records: Vec<RemoteSession>) -> Vec<RemoteSession> {
+    records
+        .into_iter()
+        .filter(|r| {
+            let ok = safe_path_seg(&r.client_id);
+            if !ok {
+                eprintln!(
+                    "cloud: dropping note_session with unsafe client_id {:?}",
+                    r.client_id
+                );
+            }
+            ok
+        })
+        .collect()
+}
+
 /// Which asset fields exist on disk for a session dir.
 fn local_present_assets(session_dir: &std::path::Path) -> Vec<crate::sessions::AssetField> {
     crate::sessions::AssetField::ALL
@@ -1361,6 +1385,10 @@ pub(crate) async fn download_note_sessions(app: &tauri::AppHandle, note_id: &str
         return Ok(false);
     };
     let records = find_session_records(&base, &session.token, &note_pb).await?;
+    // Trust boundary: `client_id` is server-controlled but becomes a local path
+    // segment + a persisted manifest id below. Drop hostile ids before anything
+    // touches the filesystem or `reconcile_manifest`.
+    let records = retain_safe_sessions(records);
     if records.is_empty() {
         return Ok(false); // no per-session data — caller falls back to notes.audio
     }
@@ -1740,4 +1768,75 @@ pub fn cloud_pending_note_ids(state: State<'_, AppState>) -> Result<Vec<String>,
         }
     }
     Ok(ids.into_iter().collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Minimal `RemoteSession` builder — only `client_id` matters for the
+    /// path-traversal guard; the rest are placeholders.
+    fn rec(client_id: &str) -> RemoteSession {
+        RemoteSession {
+            pb_id: "pbid000000000000".to_string(),
+            client_id: client_id.to_string(),
+            index: 1,
+            started_at_ms: 0,
+            duration_ms: 0,
+            streams: Vec::new(),
+            deleted: false,
+            files: std::collections::HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn retain_drops_traversal_client_id() {
+        // The confirmed exploit payload: a `../…` client_id aimed at wiping an
+        // arbitrary dir via the tombstone branch's `remove_dir_all`.
+        let out = retain_safe_sessions(vec![rec("../../../../Desktop")]);
+        assert!(out.is_empty(), "traversal client_id must be dropped entirely");
+    }
+
+    #[test]
+    fn retain_drops_absolute_and_separator_ids() {
+        let hostile = vec![
+            rec("/etc"),
+            rec("a/b"),
+            rec("..\\..\\windows"),
+            rec(".."),
+            rec(""),
+            rec("has space"),
+        ];
+        let n = hostile.len();
+        let out = retain_safe_sessions(hostile);
+        assert!(out.is_empty(), "all {n} hostile ids must be dropped");
+    }
+
+    #[test]
+    fn retain_keeps_valid_uuid_and_legacy() {
+        let good = vec![
+            rec("550e8400-e29b-41d4-a716-446655440000"),
+            rec(crate::sessions::LEGACY_SESSION_ID), // "__legacy__"
+            rec("session-1_take.2"), // dots/dashes/underscores are fine as a segment
+        ];
+        let out = retain_safe_sessions(good);
+        assert_eq!(out.len(), 3, "valid UUID + __legacy__ + plain segment must pass");
+        assert_eq!(out[1].client_id, "__legacy__");
+    }
+
+    #[test]
+    fn retain_filters_mixed_batch_only_safe_survive() {
+        let batch = vec![
+            rec("550e8400-e29b-41d4-a716-446655440000"),
+            rec("../../../../Desktop"),
+            rec("__legacy__"),
+        ];
+        let out = retain_safe_sessions(batch);
+        let ids: Vec<&str> = out.iter().map(|r| r.client_id.as_str()).collect();
+        assert_eq!(ids, ["550e8400-e29b-41d4-a716-446655440000", "__legacy__"]);
+        assert!(
+            !ids.iter().any(|id| id.contains("..")),
+            "no traversal id may survive into the reconcile input"
+        );
+    }
 }

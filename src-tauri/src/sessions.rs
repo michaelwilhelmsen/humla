@@ -111,6 +111,19 @@ pub fn session_dir(recordings_dir: &Path, session_id: &str) -> PathBuf {
     recordings_dir.join(session_id)
 }
 
+/// True when `id` is safe to use as a filesystem path segment for a session
+/// dir: non-empty and only `[A-Za-z0-9_-]`. Our client only ever mints session
+/// ids as UUIDs (or the `__legacy__` sentinel, which is all underscores), so
+/// anything else — path separators, `..`, dots, whitespace — is a hostile id
+/// smuggled in from a remote `note_sessions.client_id` or a tampered
+/// `sessions.json`. Rejecting it at every point where manifest/remote data
+/// becomes a path stops directory traversal (e.g. `../../../Desktop` reaching
+/// `remove_dir_all`). Mirrors `cloud_sync::is_safe_id`, whose remote pull path
+/// guards the same way. Note `__legacy__` passes (underscores only).
+pub fn is_safe_session_id(id: &str) -> bool {
+    !id.is_empty() && id.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+}
+
 /// Read + parse the manifest. `None` when it's absent or unparseable — the
 /// caller then falls back to the legacy flat layout.
 pub fn read_manifest(recordings_dir: &Path) -> Option<SessionsManifest> {
@@ -172,6 +185,10 @@ pub fn resolve_sessions(recordings_dir: &Path) -> Vec<(SessionEntry, PathBuf)> {
             let mut pairs: Vec<(SessionEntry, PathBuf)> = manifest
                 .sessions
                 .into_iter()
+                // Trust boundary: a manifest entry's id is joined onto the
+                // recordings dir below. Drop any that isn't a safe segment so a
+                // tampered `sessions.json` can't traverse out of the tree.
+                .filter(|e| is_safe_session_id(&e.id))
                 .map(|e| {
                     let dir = session_dir(recordings_dir, &e.id);
                     (e, dir)
@@ -414,10 +431,18 @@ pub fn reconcile_manifest(
         .map(|m| m.sessions)
         .unwrap_or_default()
         .into_iter()
+        // Sanitize a possibly-tampered on-disk manifest so unsafe ids can never
+        // survive a reconcile and be written back / joined onto a path.
+        .filter(|e| is_safe_session_id(&e.id))
         .map(|e| (e.id.clone(), e))
         .collect();
 
     for r in remote {
+        // A remote `client_id` is server-controlled and becomes both a local
+        // path segment and a persisted manifest id. Never let a hostile one in.
+        if !is_safe_session_id(&r.client_id) {
+            continue;
+        }
         if r.deleted {
             by_id.remove(&r.client_id);
             continue;
@@ -758,5 +783,101 @@ mod tests {
         assert_eq!(after.sessions.len(), 1);
         assert_eq!(after.sessions[0].duration_ms, 5000);
         assert_eq!(after.sessions[0].streams, vec!["mic"]);
+    }
+
+    // ---- session-id path-traversal guard ---------------------------------
+
+    #[test]
+    fn is_safe_session_id_accepts_uuid_and_legacy() {
+        assert!(is_safe_session_id("550e8400-e29b-41d4-a716-446655440000"));
+        assert!(is_safe_session_id(LEGACY_SESSION_ID)); // "__legacy__"
+        assert!(is_safe_session_id("note-123"));
+    }
+
+    #[test]
+    fn is_safe_session_id_rejects_traversal_and_separators() {
+        assert!(!is_safe_session_id(""));
+        assert!(!is_safe_session_id(".."));
+        assert!(!is_safe_session_id("../../../../Desktop"));
+        assert!(!is_safe_session_id("a/b"));
+        assert!(!is_safe_session_id("a\\b"));
+        assert!(!is_safe_session_id("has space"));
+        assert!(!is_safe_session_id("with.dot")); // dots aren't minted, reject to stay strict
+    }
+
+    #[test]
+    fn reconcile_drops_hostile_remote_client_id() {
+        // A malicious workspace member pushes a session whose client_id would
+        // traverse out of the recordings tree. It must never enter the manifest.
+        let after = reconcile_manifest(
+            None,
+            &[meta("../../../../Desktop", 1, false), meta("safe-uuid", 2, false)],
+        );
+        let ids: Vec<&str> = after.sessions.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, ["safe-uuid"]);
+        assert!(!ids.iter().any(|id| id.contains("..")));
+    }
+
+    #[test]
+    fn reconcile_sanitizes_tampered_existing_manifest() {
+        // An on-disk manifest tampered with before this fix carries a hostile
+        // id; reconcile must strip it rather than carry it forward.
+        let mut existing = SessionsManifest::empty();
+        existing.sessions.push(SessionEntry {
+            id: "../../evil".into(),
+            index: 1,
+            started_at: String::new(),
+            duration_ms: 0,
+            streams: vec![],
+        });
+        let after = reconcile_manifest(Some(existing), &[meta("safe", 2, false)]);
+        let ids: Vec<&str> = after.sessions.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, ["safe"]);
+    }
+
+    #[test]
+    fn resolve_sessions_skips_hostile_manifest_entries() {
+        let tmp = TempDir::new().unwrap();
+        let rec = recordings_dir(tmp.path(), "note1");
+        let mut manifest = SessionsManifest::empty();
+        manifest.sessions.push(SessionEntry {
+            id: "../../../../Desktop".into(),
+            index: 1,
+            started_at: String::new(),
+            duration_ms: 0,
+            streams: vec![],
+        });
+        manifest.sessions.push(SessionEntry {
+            id: "550e8400-e29b-41d4-a716-446655440000".into(),
+            index: 2,
+            started_at: String::new(),
+            duration_ms: 0,
+            streams: vec![],
+        });
+        write_manifest(&rec, &manifest).unwrap();
+
+        let resolved = resolve_sessions(&rec);
+        assert_eq!(resolved.len(), 1, "hostile manifest entry must be skipped");
+        assert_eq!(resolved[0].0.id, "550e8400-e29b-41d4-a716-446655440000");
+        // And the returned path stays inside the recordings tree.
+        assert!(resolved[0].1.starts_with(&rec));
+    }
+
+    #[test]
+    fn resolve_session_dir_rejects_hostile_id_via_manifest() {
+        let tmp = TempDir::new().unwrap();
+        let rec = recordings_dir(tmp.path(), "note1");
+        let mut manifest = SessionsManifest::empty();
+        manifest.sessions.push(SessionEntry {
+            id: "../../../../Desktop".into(),
+            index: 1,
+            started_at: String::new(),
+            duration_ms: 0,
+            streams: vec![],
+        });
+        write_manifest(&rec, &manifest).unwrap();
+        // note_session_playback_path feeds a frontend id through here; a poisoned
+        // manifest must not resolve to a traversal path.
+        assert!(resolve_session_dir(&rec, "../../../../Desktop").is_none());
     }
 }
