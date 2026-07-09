@@ -67,7 +67,9 @@ export function SettingsLayout({ sections }: { sections: SettingsSection[] }) {
         </nav>
       </aside>
       <div className="flex-1 h-full overflow-y-auto">
-        <div className="max-w-2xl mx-auto px-12 py-10" role="tabpanel">
+        {/* Claude-Desktop-ish density: ~32px gutters, not the page-scale 48px
+            the old full-screen settings used. */}
+        <div className="max-w-2xl mx-auto px-8 py-7" role="tabpanel">
           {active?.content}
         </div>
       </div>

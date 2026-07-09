@@ -11,9 +11,12 @@ export function Section({
   children: React.ReactNode;
 }) {
   return (
-    <section className="mb-10">
-      <h2 className="text-sm font-medium mb-3">{title}</h2>
-      <div className="flex flex-col divide-y divide-[var(--color-line)] rounded-[var(--radius-card)] border border-[var(--color-line-visible)] bg-[var(--color-surface)] px-4">
+    <section className="mb-8">
+      <h2 className="text-sm font-medium mb-2.5">{title}</h2>
+      {/* py-2 keeps legacy block children (which carry no vertical padding
+          of their own) off the card edges until PRD 2/2 rebuilds them onto
+          Rows; kit Rows add their own py on top of it. */}
+      <div className="flex flex-col divide-y divide-[var(--color-line)] rounded-[var(--radius-card)] border border-[var(--color-line-visible)] bg-[var(--color-surface)] px-4 py-2">
         {children}
       </div>
     </section>
