@@ -230,8 +230,8 @@ export function OrganizationTab() {
       setAddEmail("");
       setNotice(
         status === "invited"
-          ? `Invited ${email} — they'll join automatically when they sign up.`
-          : `Added ${email} to the workspace.`,
+          ? `Invitation emailed to ${email} — they'll join automatically when they sign up and verify their email.`
+          : `Added ${email} to the workspace — they've been notified by email.`,
       );
       await loadMembers(ws.id);
     } catch (e) {
@@ -445,8 +445,9 @@ export function OrganizationTab() {
             </div>
             {notice && <p className="text-xs text-[var(--color-success)] mt-2">{notice}</p>}
             <p className="text-xs text-[var(--color-text-muted)] mt-2">
-              If they already have an account they're added right away; otherwise they're invited and
-              join automatically when they sign up on this server.
+              They get an email either way: existing accounts are added right away; new
+              people get an invitation and join automatically when they sign up on this
+              server with the invited address.
             </p>
           </Row>
         )}

@@ -164,8 +164,11 @@ describe("Account section", () => {
       workspaceId: "w1",
       email: "kari@example.no",
     });
+    // The notice must say an email went out — the server really sends one
+    // (Usesend+SES), and the old copy left inviters thinking they had to
+    // notify the teammate themselves.
     expect(
-      await within(dialog).findByText(/invited kari@example.no/i),
+      await within(dialog).findByText(/invitation emailed to kari@example.no/i),
     ).toBeInTheDocument();
   });
 
