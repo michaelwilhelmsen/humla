@@ -96,20 +96,6 @@ export const SUMMARY_MODELS = [
 export const inputClass =
   "w-full px-3 py-2 rounded-md text-sm bg-[var(--color-input-bg)] border border-[var(--color-line)] focus:border-[var(--color-text-muted)]";
 
-export type KeyState = {
-  draft: string;
-  hasKey: boolean;
-  testing: boolean;
-  result: null | { ok: true } | { ok: false; message: string };
-};
-
-export const EMPTY_KEY_STATE: KeyState = {
-  draft: "",
-  hasKey: false,
-  testing: false,
-  result: null,
-};
-
 /// Flash message shape. `info` is a plain text toast; `suggest_language_override`
 /// renders a one-click "Add as <language> override?" affordance after a
 /// language-specific model is downloaded.

@@ -6,17 +6,14 @@ import {
   onLocalWhisperProgress,
   type ProviderConfig,
   type TranscribeConfig,
-  type TranscribeProvider,
 } from "../../lib/ipc";
 import {
   DEFAULTS,
   EMPTY_DIARIZE_STATE,
-  EMPTY_KEY_STATE,
   EMPTY_LLM_MODELS_STATE,
   EMPTY_LOCAL_STATE,
   type DiarizeState,
   type EditableKey,
-  type KeyState,
   type LlmModelsState,
   type LocalState,
 } from "./types";
@@ -26,9 +23,6 @@ import {
 // can grab only the slices they care about, and so the page renders
 // stay focused on layout.
 export function useSettings() {
-  const [openaiKey, setOpenaiKey] = useState<KeyState>(EMPTY_KEY_STATE);
-  const [deepgramKey, setDeepgramKey] = useState<KeyState>(EMPTY_KEY_STATE);
-  const [groqKey, setGroqKey] = useState<KeyState>(EMPTY_KEY_STATE);
   const [local, setLocal] = useState<LocalState>(EMPTY_LOCAL_STATE);
   const [diarize, setDiarize] = useState<DiarizeState>(EMPTY_DIARIZE_STATE);
   // Parallel state for the Sortformer engine. Tracked independently of
@@ -47,19 +41,13 @@ export function useSettings() {
   useEffect(() => {
     let cancelled = false;
     (async () => {
-      const [k1, kdg, kgrq, models, ds, ss, cfg] = await Promise.all([
-        ipc.getProviderKey("openai").catch(() => null),
-        ipc.getProviderKey("deepgram").catch(() => null),
-        ipc.getProviderKey("groq").catch(() => null),
+      const [models, ds, ss, cfg] = await Promise.all([
         ipc.localWhisperModels(),
         ipc.diarizeStatus("community1").catch(() => null),
         ipc.diarizeStatus("sortformer").catch(() => null),
         ipc.getTranscribeConfig().catch(() => null),
       ]);
       if (cancelled) return;
-      setOpenaiKey((p) => ({ ...p, hasKey: !!k1 }));
-      setDeepgramKey((p) => ({ ...p, hasKey: !!kdg }));
-      setGroqKey((p) => ({ ...p, hasKey: !!kgrq }));
       setLocal((p) => ({ ...p, models }));
       setDiarize((p) => ({ ...p, status: ds }));
       setSortformer((p) => ({ ...p, status: ss }));
@@ -478,44 +466,9 @@ export function useSettings() {
     await updateTranscribeConfig({ ...transcribeConfig, per_language: next });
   }
 
-  async function saveProviderKey(provider: TranscribeProvider) {
-    const slot =
-      provider === "openai" ? openaiKey
-      : provider === "deepgram" ? deepgramKey
-      : provider === "groq" ? groqKey
-      : null;
-    const setter =
-      provider === "openai" ? setOpenaiKey
-      : provider === "deepgram" ? setDeepgramKey
-      : provider === "groq" ? setGroqKey
-      : null;
-    if (!slot || !setter || !slot.draft.trim()) return;
-    await ipc.setProviderKey(provider, slot.draft.trim());
-    setter({ draft: "", hasKey: true, testing: false, result: null });
-  }
-
-  async function testProviderKey(provider: TranscribeProvider) {
-    const setter =
-      provider === "openai" ? setOpenaiKey
-      : provider === "deepgram" ? setDeepgramKey
-      : provider === "groq" ? setGroqKey
-      : null;
-    if (!setter) return;
-    setter((p) => ({ ...p, testing: true }));
-    try {
-      const r = await ipc.testProviderKey(provider);
-      const result = r.ok
-        ? ({ ok: true } as const)
-        : ({ ok: false, message: `${r.status}: ${r.error ?? "unknown error"}` } as const);
-      setter((p) => ({ ...p, testing: false, result }));
-    } catch (e) {
-      setter((p) => ({
-        ...p,
-        testing: false,
-        result: { ok: false, message: String(e) },
-      }));
-    }
-  }
+  // Provider API keys moved out of this hook entirely: ProviderKeyCard
+  // (src/components/provider/) is self-contained against the keychain
+  // commands, so nothing here loads or mutates key state anymore.
 
   return {
     s,
@@ -525,14 +478,6 @@ export function useSettings() {
     setDefaultConfig,
     setLanguageOverride,
     removeLanguageOverride,
-    openaiKey,
-    setOpenaiKey,
-    deepgramKey,
-    setDeepgramKey,
-    groqKey,
-    setGroqKey,
-    saveProviderKey,
-    testProviderKey,
     local,
     downloadModel,
     deleteModel,

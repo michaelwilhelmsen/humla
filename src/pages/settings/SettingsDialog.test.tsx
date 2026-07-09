@@ -249,18 +249,21 @@ describe("settings dialog", () => {
   });
 
   it("resolves legacy deep links to their new sections", async () => {
-    // `keys` tab is dissolved: it anchors to Transcription, where the key
-    // fields now live (until PRD 2/2 inlines them per provider).
+    // `keys` tab is dissolved: it anchors to Transcription, where the
+    // provider key cards live.
     renderApp("/settings?tab=keys");
     const dialog = await screen.findByRole("dialog", { name: /settings/i });
     expect(
       within(dialog).getByRole("tab", { name: "Transcription" }),
     ).toHaveAttribute("aria-selected", "true");
     expect(
-      await within(dialog).findByRole("heading", { name: "OpenAI" }),
+      await within(dialog).findByLabelText(/openai api key/i),
     ).toBeInTheDocument();
     expect(
-      within(dialog).getByRole("heading", { name: "Deepgram" }),
+      within(dialog).getByLabelText(/deepgram api key/i),
+    ).toBeInTheDocument();
+    expect(
+      within(dialog).getByLabelText(/groq api key/i),
     ).toBeInTheDocument();
   });
 

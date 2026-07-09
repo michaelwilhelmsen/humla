@@ -39,16 +39,7 @@ export function Settings() {
           downloadSortformer={settings.downloadSortformer}
           deleteSortformer={settings.deleteSortformer}
         />
-        <ApiKeysTab
-          openaiKey={settings.openaiKey}
-          setOpenaiKey={settings.setOpenaiKey}
-          deepgramKey={settings.deepgramKey}
-          setDeepgramKey={settings.setDeepgramKey}
-          groqKey={settings.groqKey}
-          setGroqKey={settings.setGroqKey}
-          saveProviderKey={settings.saveProviderKey}
-          testProviderKey={settings.testProviderKey}
-        />
+        <ApiKeysTab />
       </>
     ),
     summaries: (

@@ -212,8 +212,11 @@ describe("Account section", () => {
   it("signed-in owner sees identity, workspace, billing, members, and delete", async () => {
     const dialog = await openAccount(signedIn("owner"));
 
-    expect(await within(dialog).findByText("Michael")).toBeInTheDocument();
-    // Identity card + own row in the members roster both show the email.
+    // Identity card + own row in the members roster both show the name and
+    // email (roster load races the identity render, so never single-match).
+    expect(
+      (await within(dialog).findAllByText("Michael")).length,
+    ).toBeGreaterThanOrEqual(1);
     expect(
       (await within(dialog).findAllByText("m@example.no")).length,
     ).toBeGreaterThanOrEqual(1);
