@@ -9,9 +9,11 @@ import { cn } from "../lib/cn";
 // the left; created-time and an optional folder chip on the right. The folder
 // chip is omitted inside a folder view (where it would be redundant).
 //
-// Selection (issue #19): a modifier-click (Cmd/Ctrl to toggle, Shift for a
-// range) is intercepted for multi-select and must NOT navigate; a plain click
-// still follows the link.
+// Selection (issue #19): a modifier-click (Cmd to toggle, Shift for a range)
+// is intercepted for multi-select and must NOT navigate; a plain click still
+// follows the link. Ctrl is deliberately excluded: on macOS ctrl-click is the
+// OS secondary/context-menu click, so treating it as a selection modifier
+// triple-fired (nav suppression + toggle + native context menu).
 export function NoteListRow({
   note,
   folder,
@@ -26,7 +28,7 @@ export function NoteListRow({
   const preview = notePreview(note);
 
   function handleClick(e: MouseEvent) {
-    if (onSelect && (e.metaKey || e.ctrlKey || e.shiftKey)) {
+    if (onSelect && (e.metaKey || e.shiftKey)) {
       e.preventDefault(); // suppress navigation for modifier-clicks
       onSelect(e);
     }

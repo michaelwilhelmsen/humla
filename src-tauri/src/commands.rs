@@ -1178,7 +1178,10 @@ struct PostStopSnapshot {
 async fn session_write_dir(app: &AppHandle, note_id: &str, session_id: &str) -> Option<PathBuf> {
     let app_dir = app.path().app_data_dir().ok()?;
     let recordings = sessions::recordings_dir(&app_dir, note_id);
-    let target = sessions::session_dir(&recordings, session_id);
+    // Resolve through the shared write resolver so a legacy note's assets land
+    // flat (where the read path reads them), not in an orphan `__legacy__`
+    // subdir. See `sessions::session_write_dir`.
+    let target = sessions::session_write_dir(&recordings, session_id);
     if let Err(e) = tokio::fs::create_dir_all(&target).await {
         eprintln!("sessions: mkdir {}: {e}", target.display());
         return None;
@@ -1208,6 +1211,10 @@ async fn prepare_sessions_for_new_take(app: &AppHandle, note_id: &str) -> usize 
         return 0;
     };
     let note_id = note_id.to_string();
+    // Serialize the manifest read-modify-write against the cloud pull worker
+    // (both rewrite sessions.json). Guard is Send + held across spawn_blocking.
+    let lock = app.state::<AppState>().manifest_lock.clone();
+    let _manifest_guard = lock.lock().await;
     tokio::task::spawn_blocking(move || {
         let recordings = sessions::recordings_dir(&app_dir, &note_id);
         // Only a flat, manifest-less note migrates; brand-new notes and
@@ -1238,9 +1245,13 @@ async fn finalize_session(
         return;
     };
     let recordings = sessions::recordings_dir(&app_dir, note_id);
-    let duration_ms = timeline_duration_ms(&sessions::session_dir(&recordings, session_id));
+    let duration_ms = timeline_duration_ms(&sessions::session_write_dir(&recordings, session_id));
     let session_id = session_id.to_string();
     let started_at = started_at.to_string();
+    // Serialize the append (read-modify-write of sessions.json) against a
+    // concurrent cloud pull reconcile so neither loses the other's session.
+    let lock = app.state::<AppState>().manifest_lock.clone();
+    let _manifest_guard = lock.lock().await;
     let res = tokio::task::spawn_blocking(move || {
         sessions::append_session(&recordings, &session_id, &started_at, duration_ms, streams)
     })
@@ -3603,10 +3614,37 @@ async fn concat_wavs(
 /// the approach (clustering must see all takes at once to unify voices) and
 /// bounded by note length; the concat WAVs live in a temp dir and are
 /// removed when the pass ends.
+/// A scratch dir for one unify invocation's concat WAVs. Unique per call (a
+/// UUID suffix) so two overlapping unify passes for the *same* note — auto-unify
+/// in the post-stop chain racing a user `rediarize_note`, or two rapid
+/// Re-diarize clicks — never write to and `remove_dir_all` each other's concat
+/// files (a mid-read truncation that silently produced wrong unified labels).
+fn unify_scratch_dir(note_id: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("humla-unify-{note_id}-{}", uuid::Uuid::new_v4()))
+}
+
+/// Get (or lazily create) the per-note unify lock. Same note → same `Arc`, so
+/// concurrent unify passes for it serialize; different notes get independent
+/// locks and stay concurrent. The `parking_lot` guard is dropped before the
+/// caller `.await`s on the returned tokio lock.
+fn unify_note_lock(
+    locks: &parking_lot::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    note_id: &str,
+) -> Arc<tokio::sync::Mutex<()>> {
+    locks.lock().entry(note_id.to_string()).or_default().clone()
+}
+
 pub(crate) async fn unify_note_speakers(
     app: &AppHandle,
     note_id: &str,
 ) -> anyhow::Result<bool> {
+    // Per-note re-entrancy guard: a second unify for this note waits for the
+    // first to finish (then re-runs on its up-to-date timelines) rather than
+    // racing it. Held for the whole pass; safe because unify is a leaf that
+    // never re-enters itself, so this can't deadlock the post-stop chain.
+    let note_lock = unify_note_lock(&app.state::<AppState>().unify_locks, note_id);
+    let _unify_guard = note_lock.lock().await;
+
     let app_dir = app.path().app_data_dir()?;
     let recordings = sessions::recordings_dir(&app_dir, note_id);
     let resolved = sessions::resolve_sessions(&recordings);
@@ -3665,8 +3703,9 @@ pub(crate) async fn unify_note_speakers(
         return Ok(false);
     }
 
-    // Concat WAVs are scratch files — never inside the session dirs.
-    let tmp = std::env::temp_dir().join(format!("humla-unify-{note_id}"));
+    // Concat WAVs are scratch files — never inside the session dirs. Unique per
+    // invocation so overlapping passes can't clobber each other's concats.
+    let tmp = unify_scratch_dir(note_id);
     tokio::fs::create_dir_all(&tmp).await?;
     let result = unify_apply(
         app,
@@ -5089,6 +5128,50 @@ fn is_repetition_collapse(text: &str) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod unify_concurrency_tests {
+    use super::*;
+
+    #[test]
+    fn scratch_dir_is_unique_per_invocation() {
+        // Two unify passes for the SAME note must get distinct scratch dirs, or
+        // one's remove_dir_all truncates the other's concat WAVs mid-read →
+        // wrong unified labels written to every session.
+        let a = unify_scratch_dir("note1");
+        let b = unify_scratch_dir("note1");
+        assert_ne!(a, b);
+        assert!(a.file_name().unwrap().to_string_lossy().contains("note1"));
+        assert!(a.starts_with(std::env::temp_dir()));
+    }
+
+    #[test]
+    fn note_lock_shared_per_note_distinct_across_notes() {
+        let locks = parking_lot::Mutex::new(std::collections::HashMap::new());
+        let a1 = unify_note_lock(&locks, "n1");
+        let a2 = unify_note_lock(&locks, "n1");
+        let b = unify_note_lock(&locks, "n2");
+        // Same note → same lock (so passes serialize); different note → its own.
+        assert!(Arc::ptr_eq(&a1, &a2));
+        assert!(!Arc::ptr_eq(&a1, &b));
+    }
+
+    #[test]
+    fn note_lock_serializes_same_note() {
+        // A held lock forces a second unify for the same note to wait; a
+        // different note is never blocked.
+        let locks = parking_lot::Mutex::new(std::collections::HashMap::new());
+        let held = unify_note_lock(&locks, "n1").try_lock_owned().unwrap();
+        let same = unify_note_lock(&locks, "n1");
+        assert!(same.try_lock().is_err(), "second unify for the note must wait");
+        assert!(
+            unify_note_lock(&locks, "n2").try_lock().is_ok(),
+            "a different note stays concurrent"
+        );
+        drop(held);
+        assert!(same.try_lock().is_ok(), "lock frees once the first pass ends");
+    }
 }
 
 #[cfg(test)]

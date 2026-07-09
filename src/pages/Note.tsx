@@ -1803,7 +1803,8 @@ const TranscriptView = memo(function TranscriptView({
 // next recording or re-diarize regenerates the bundle. Acceptable
 // trade-off for v1; the alternative (chunk-level edit UI) is a much
 // bigger refactor.
-const TranscriptPlayer = memo(function TranscriptPlayer({
+// Exported for unit tests (session-switch seek behaviour, BUG A/B).
+export const TranscriptPlayer = memo(function TranscriptPlayer({
   noteId,
   timeline,
   setTimeline,
@@ -1847,31 +1848,60 @@ const TranscriptPlayer = memo(function TranscriptPlayer({
     }
   }, [sessions, activeSessionId]);
 
+  // A seek (and optional resume) to apply once the freshly-swapped <audio>
+  // source has loaded — how "switch session then seek-and-keep-playing"
+  // survives the src change.
+  const pendingSeekRef = useRef<{ ms: number; play: boolean } | null>(null);
+
+  // Consume any queued seek against the already-loaded <audio>. Used both when
+  // the src is about to reload (via loadeddata) and when it WON'T reload (same
+  // resolved url) — in the latter case no loadeddata fires, so the seek must be
+  // applied inline or it strands and later misfires on the next genuine swap
+  // (BUG A/B). Guarded on readyState so we don't seek an element that has no
+  // media yet; a not-yet-ready element still has loadeddata coming.
+  function applyPendingSeek() {
+    const pending = pendingSeekRef.current;
+    const audio = audioRef.current;
+    if (!pending || !audio) return;
+    if (audio.readyState < 1 /* HAVE_METADATA */) return;
+    pendingSeekRef.current = null;
+    audio.currentTime = pending.ms / 1000;
+    if (pending.play) audio.play().catch(() => {});
+  }
+
   // Resolve the active session's playback.wav → tauri asset URL. Falls back
   // to the single-file URL for notes without per-session files.
   const [activeUrl, setActiveUrl] = useState<string | null>(fallbackPlaybackUrl);
+  // Mirror of activeUrl so the resolver can tell whether the <audio> src is
+  // actually about to change. When two sessions resolve to the SAME url (multiple
+  // takes sharing legacy notes.audio, a downloaded workspace note, or a legacy /
+  // unmatched-session timeline), setting the same src fires no loadeddata.
+  const activeUrlRef = useRef<string | null>(fallbackPlaybackUrl);
   useEffect(() => {
     let cancelled = false;
     (async () => {
+      let nextUrl: string | null;
       if (!activeSessionId) {
-        if (!cancelled) setActiveUrl(fallbackPlaybackUrl);
-        return;
+        nextUrl = fallbackPlaybackUrl;
+      } else {
+        const p = await ipc
+          .noteSessionPlaybackPath(noteId, activeSessionId)
+          .catch(() => null);
+        if (cancelled) return;
+        nextUrl = p ? convertFileSrc(p) : fallbackPlaybackUrl;
       }
-      const p = await ipc
-        .noteSessionPlaybackPath(noteId, activeSessionId)
-        .catch(() => null);
       if (cancelled) return;
-      setActiveUrl(p ? convertFileSrc(p) : fallbackPlaybackUrl);
+      const sameUrl = nextUrl === activeUrlRef.current;
+      activeUrlRef.current = nextUrl;
+      setActiveUrl(nextUrl);
+      // If the src won't change, loadeddata won't fire — apply any queued seek
+      // now against the already-loaded element instead of stranding it.
+      if (sameUrl) applyPendingSeek();
     })();
     return () => {
       cancelled = true;
     };
   }, [activeSessionId, noteId, fallbackPlaybackUrl]);
-
-  // A seek (and optional resume) to apply once the freshly-swapped <audio>
-  // source has loaded — how "switch session then seek-and-keep-playing"
-  // survives the src change.
-  const pendingSeekRef = useRef<{ ms: number; play: boolean } | null>(null);
   const [isPlaying, setIsPlaying] = useState(false);
   // Topmost session divider currently in view — the idle active-pill anchor.
   const [topVisibleSessionId, setTopVisibleSessionId] = useState<string | null>(null);
@@ -2077,11 +2107,7 @@ const TranscriptPlayer = memo(function TranscriptPlayer({
     // click / cross-session word click seeks-and-keeps-playing across the
     // src change.
     const onLoaded = () => {
-      const pending = pendingSeekRef.current;
-      if (!pending) return;
-      pendingSeekRef.current = null;
-      audio.currentTime = pending.ms / 1000;
-      if (pending.play) audio.play().catch(() => {});
+      applyPendingSeek();
       computeAndSync();
     };
     audio.addEventListener("play", start);

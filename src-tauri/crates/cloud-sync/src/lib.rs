@@ -558,9 +558,17 @@ impl Worker {
         let Some((note_pb_id, _, _)) =
             self.find_remote_id("notes", note_id, workspace, &auth.token).await?
         else {
-            return Err(anyhow!(
-                "cloud-sync: parent note {note_id} not on server yet; deferring session push"
-            ));
+            // The parent note isn't on the server. Distinguish two cases so the
+            // session can't orphan-loop forever:
+            //  - the note's own upsert is still queued in the outbox → it simply
+            //    hasn't drained yet (drains ahead of us in seq order, or is being
+            //    retried). TRANSIENT: retry once it lands.
+            //  - no queued note upsert remains → the note push was permanently
+            //    dropped (an allow-listed 4xx) or the note is gone, so this
+            //    session can NEVER resolve its `note` relation. PERMANENT: drop
+            //    it, else it re-auths + GETs /notes every tick and pins the
+            //    note's "syncing…" indicator on for good.
+            return Err(self.orphan_session_error(note_id, session_id, workspace));
         };
         let started_ms = started_at_to_ms(&meta.started_at);
         let client_updated_at = started_ms.max(1);
@@ -587,6 +595,38 @@ impl Worker {
         let body = std::fs::read_to_string(&path).ok()?;
         let manifest: ManifestFile = serde_json::from_str(&body).ok()?;
         manifest.sessions.into_iter().find(|e| e.id == session_id)
+    }
+
+    /// True while the parent note still has a queued upsert in the outbox for
+    /// this workspace — i.e. it just hasn't drained yet, versus having been
+    /// dropped/quarantined. On a DB error, err on the side of `true` (transient)
+    /// so a read hiccup never turns into a dropped session.
+    fn note_push_pending(&self, note_id: &str, workspace: &str) -> bool {
+        let conn = self.db.lock();
+        conn.query_row(
+            "SELECT 1 FROM sync_outbox WHERE entity='note' AND entity_id=?1 AND op='upsert' AND workspace=?2 LIMIT 1",
+            rusqlite::params![note_id, workspace],
+            |_| Ok(()),
+        )
+        .optional()
+        .map(|row| row.is_some())
+        .unwrap_or(true)
+    }
+
+    /// Decide the retry policy for a session push whose parent note was NOT found
+    /// on the server. Transient (defer, keep retrying) while the note's own
+    /// upsert is still queued; permanent (drop) once that row is gone so the
+    /// orphaned session can't loop forever. See the call site in `push_session`.
+    fn orphan_session_error(&self, note_id: &str, session_id: &str, workspace: &str) -> anyhow::Error {
+        if self.note_push_pending(note_id, workspace) {
+            anyhow!("cloud-sync: parent note {note_id} not on server yet; deferring session push")
+        } else {
+            PermanentPushError(format!(
+                "cloud-sync: parent note {note_id} has no queued push and isn't on the server; \
+                 session {session_id} can never resolve its note relation — dropping"
+            ))
+            .into()
+        }
     }
 
     /// Soft-delete (tombstone) a record by `client_id` so other devices pull
@@ -1235,6 +1275,24 @@ impl std::fmt::Display for PbError {
 
 impl std::error::Error for PbError {}
 
+/// A locally-determined permanent push failure that isn't an HTTP status. Unlike
+/// a transient network error, retrying can never succeed as enqueued, so the
+/// drain loop drops it. The one producer today: a session push whose parent note
+/// has been permanently dropped from the outbox (and isn't on the server), so
+/// the session can never resolve its `note` relation and would otherwise
+/// orphan-loop every tick (auth + GET /notes forever) — and, via
+/// `cloud_pending_note_ids`, pin a note's "syncing…" indicator on for good.
+#[derive(Debug)]
+struct PermanentPushError(String);
+
+impl std::fmt::Display for PermanentPushError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for PermanentPushError {}
+
 /// True for a 4xx that means "this exact request is malformed/forbidden and will
 /// always be rejected", so dropping the outbox row is safe. This is a strict
 /// allow-list: anything not listed (401 auth-expired, 408/409/413/423/425/429,
@@ -1250,6 +1308,9 @@ fn is_permanent_status(status: u16) -> bool {
 /// as transient.
 fn is_permanent_push_error(e: &anyhow::Error) -> bool {
     e.downcast_ref::<PbError>().is_some_and(|pb| is_permanent_status(pb.status))
+        // A locally-classified permanent failure (e.g. an orphaned session whose
+        // parent note is gone) is also un-retryable — drop rather than loop.
+        || e.downcast_ref::<PermanentPushError>().is_some()
 }
 
 /// True if the error is a PocketBase 401 (auth/token expired) — the realtime loop
@@ -1722,10 +1783,79 @@ mod it {
         })));
         // A non-HTTP error (transport / timeout / serde) is transient.
         assert!(!is_permanent_push_error(&anyhow!("connection reset by peer")));
+        // A locally-classified permanent failure (orphaned session) is permanent
+        // regardless of status — it carries no HTTP code.
+        assert!(is_permanent_push_error(
+            &PermanentPushError("orphaned session".into()).into()
+        ));
         // 401 is recognised for realtime re-auth — by status, not substring.
         assert!(is_unauthorized(&anyhow::Error::new(PbError { status: 401, body: String::new() })));
         assert!(!is_unauthorized(&anyhow::Error::new(PbError { status: 403, body: String::new() })));
         assert!(!is_unauthorized(&anyhow!("incidental 401 in some message")));
+    }
+
+    /// BUG D: an orphaned session push (parent note not on the server) is
+    /// TRANSIENT while the note's own upsert is still queued (it just hasn't
+    /// drained), but PERMANENT once that row is gone — the note was dropped, so
+    /// the session can never resolve its `note` relation and must not loop.
+    /// Also verifies the per-note "syncing…" set (mirrors `cloud_pending_note_ids`)
+    /// clears once the orphaned session outbox row is dropped.
+    #[test]
+    fn orphan_session_push_transient_until_note_dropped_then_permanent() {
+        let db = test_db();
+        let w = worker(db.clone(), offline_config("wsS"));
+        {
+            let conn = db.lock();
+            conn.execute(
+                "INSERT INTO notes (id, workspace_id, created_at, updated_at) VALUES ('n1', 'wsS', 1, 1)",
+                [],
+            )
+            .unwrap();
+        }
+        // Parent note upsert + the session upsert are both queued.
+        w.enqueue(Op::Note { id: "n1".into(), delete: false }).unwrap();
+        w.enqueue(Op::Session { note_id: "n1".into(), session_id: "s1".into(), delete: false })
+            .unwrap();
+
+        // (a) Note still queued → session push is transient (kept for retry).
+        let e = w.orphan_session_error("n1", "s1", "wsS");
+        assert!(
+            !is_permanent_push_error(&e),
+            "session push must be transient while the parent note is still queued"
+        );
+
+        // Simulate the note push being permanently dropped (an allow-listed 4xx):
+        // its outbox row is deleted.
+        db.lock()
+            .execute(
+                "DELETE FROM sync_outbox WHERE entity='note' AND entity_id='n1' AND workspace='wsS'",
+                [],
+            )
+            .unwrap();
+
+        // (b) No queued note upsert remains → the session can never resolve its
+        // parent, so the push is permanent (drop, don't loop).
+        let e = w.orphan_session_error("n1", "s1", "wsS");
+        assert!(
+            is_permanent_push_error(&e),
+            "session push must be permanent once the parent note is gone"
+        );
+
+        // The drain loop drops permanent failures. Mirror that (delete the
+        // session row) and confirm the per-note pending set — the query
+        // `cloud_pending_note_ids` runs — no longer folds this note in.
+        db.lock()
+            .execute("DELETE FROM sync_outbox WHERE entity='session' AND entity_id='n1/s1'", [])
+            .unwrap();
+        let pending: i64 = db
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM sync_outbox WHERE entity IN ('note','session')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending, 0, "pending set clears once the orphaned session is dropped");
     }
 
     /// Moving a note across workspaces queues a tombstone in the old workspace
