@@ -198,16 +198,24 @@ export const useRecordingStore = create<RecordingState>((set, get) => ({
 // bindBackendListeners() so the chip can show "Downloading — NN%" and clear
 // itself (re-evaluating pipelineReady) the instant the download completes.
 type WhisperDownload = { modelId: string; received: number; total: number | null };
+type WhisperDownloadError = { modelId: string; message: string };
 type DownloadState = {
   // The in-flight whisper model download, or null when nothing is downloading.
   active: WhisperDownload | null;
+  // Terminal failure of the last download. Persisted here (not in component
+  // state) so a surface the user navigated away from can still show the
+  // outcome; cleared when a new download makes progress.
+  error: WhisperDownloadError | null;
   setProgress: (d: WhisperDownload) => void;
   clear: () => void;
+  fail: (e: WhisperDownloadError) => void;
 };
 export const useDownloadStore = create<DownloadState>((set) => ({
   active: null,
-  setProgress: (d) => set({ active: d }),
-  clear: () => set({ active: null }),
+  error: null,
+  setProgress: (d) => set({ active: d, error: null }),
+  clear: () => set({ active: null, error: null }),
+  fail: (e) => set({ active: null, error: e }),
 }));
 
 // Peak above which we consider the mic to be genuinely hearing something (not
@@ -291,11 +299,12 @@ export function bindBackendListeners() {
       useDownloadStore.getState().setProgress({ modelId, received, total });
     }
   });
-  // Failure counterpart: clear the slice (the nag chip must not show a live
-  // download that's dead) and tell the user — the invoke promise that could
-  // have reported this may belong to an unmounted page.
-  onLocalWhisperDownloadError(({ message }) => {
-    useDownloadStore.getState().clear();
+  // Failure counterpart: fail the slice (the nag chip must not show a live
+  // download that's dead; the wizard's inline error reads the message from
+  // here) and tell the user — the invoke promise that could have reported
+  // this may belong to an unmounted page.
+  onLocalWhisperDownloadError(({ modelId, message }) => {
+    useDownloadStore.getState().fail({ modelId, message });
     useRecordingStore.getState().pushError({
       noteId: null,
       message: `Transcription model download failed: ${message}`,

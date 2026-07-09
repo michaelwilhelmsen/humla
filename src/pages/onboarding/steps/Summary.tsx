@@ -22,10 +22,12 @@
 //   OpenAI → summary_provider=openai, summary_model=gpt-5.4-mini
 //   Local  → summary_provider=local, local_llm_base_url=<probed>,
 //            local_llm_model=<selected>, local_llm_think=false
-import { useCallback, useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 import { open as openExternal } from "@tauri-apps/plugin-shell";
 import { Sparkles, Cloud, Server, Check, Copy, ExternalLink } from "lucide-react";
-import { ipc, type TranscribeProvider } from "../../../lib/ipc";
+import { ipc } from "../../../lib/ipc";
+import { useOllamaProbe } from "../../../components/provider/useOllamaProbe";
+import { useProviderKey } from "../../../components/provider/useProviderKey";
 import type { StepContext } from "../types";
 import { StepShell } from "../StepShell";
 
@@ -46,19 +48,13 @@ export function SummaryStep({ ctx }: { ctx: StepContext }) {
   const [hasOpenAiKey, setHasOpenAiKey] = useState<boolean | null>(null);
   const [selection, setSelection] = useState<Option>(null);
 
-  // OpenAI inline-key state (only when no key exists yet).
-  const [keyDraft, setKeyDraft] = useState("");
-  const [keySaved, setKeySaved] = useState(false);
-  const [testing, setTesting] = useState(false);
-  const [testResult, setTestResult] = useState<
-    null | { ok: true } | { ok: false; message: string }
-  >(null);
+  // OpenAI inline-key mechanics (only rendered when no key exists yet) come
+  // from the shared hook (#22); the step wraps test() with its commit point.
+  const key = useProviderKey("openai");
   const [openaiConfigured, setOpenaiConfigured] = useState(false);
 
-  // Local (Ollama) sub-flow state.
-  const [probing, setProbing] = useState(false);
-  const [reachable, setReachable] = useState<boolean | null>(null);
-  const [installed, setInstalled] = useState<string[] | null>(null);
+  // Local (Ollama) sub-flow state. Reachability + model list come from the
+  // shared probe hook (#22); presentation stays this wizard's staged cards.
   const [selectedModel, setSelectedModel] = useState<string>("");
   const [localConfigured, setLocalConfigured] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -83,41 +79,27 @@ export function SummaryStep({ ctx }: { ctx: StepContext }) {
   }, []);
 
   // ---- Local (Ollama) probing + polling -----------------------------------
-  // A single probe: hit the model-listing endpoint. Reachable → we also get
-  // the installed model list for free. Unreachable classifies as "install
-  // Ollama".
-  const probeOllama = useCallback(async () => {
-    setProbing(true);
-    try {
-      const list = await ipc.localLlmListModels(DEFAULT_LOCAL_BASE_URL);
-      setReachable(true);
-      setInstalled(list);
-      // Preselect the recommended model if present; else leave empty so the
-      // pull command shows.
-      setSelectedModel((prev) => {
-        if (prev && list.includes(prev)) return prev;
-        if (list.includes(RECOMMENDED_OLLAMA_MODEL)) return RECOMMENDED_OLLAMA_MODEL;
-        return list[0] ?? "";
-      });
-    } catch {
-      setReachable(false);
-      setInstalled(null);
-    } finally {
-      setProbing(false);
-    }
-  }, []);
+  // The shared hook probes the model-listing endpoint every ~2s while the
+  // Local option is selected — the "Waiting for Ollama…" loop: it flips
+  // `reachable`/`installed` when the server appears, and re-lists so a
+  // freshly-pulled model shows up without a retry button
+  // (design/ONBOARDING.md § 5). Deselecting parks it.
+  const { reachable, installed } = useOllamaProbe(DEFAULT_LOCAL_BASE_URL, {
+    pollMs: OLLAMA_POLL_MS,
+    enabled: selection === "local",
+  });
 
-  // While the Local option is selected, probe every ~2s. This is the
-  // "Waiting for Ollama…" loop: it flips `reachable`/`installed` when the
-  // server appears, and re-lists so a freshly-pulled model shows up without
-  // a retry button (design/ONBOARDING.md § 5). A 2s /models GET is cheap;
-  // the interval is torn down on unmount / option change.
+  // Preselect the recommended model if present; else first installed; else
+  // leave empty so the pull command shows. Re-runs per poll so a pull that
+  // completes mid-wizard is picked up.
   useEffect(() => {
-    if (selection !== "local") return;
-    void probeOllama(); // immediate probe on selection
-    const timer = window.setInterval(() => void probeOllama(), OLLAMA_POLL_MS);
-    return () => window.clearInterval(timer);
-  }, [selection, probeOllama]);
+    if (!installed) return;
+    setSelectedModel((prev) => {
+      if (prev && installed.includes(prev)) return prev;
+      if (installed.includes(RECOMMENDED_OLLAMA_MODEL)) return RECOMMENDED_OLLAMA_MODEL;
+      return installed[0] ?? "";
+    });
+  }, [installed]);
 
   // ---- OpenAI path --------------------------------------------------------
   async function useSameOpenAiKey() {
@@ -130,39 +112,15 @@ export function SummaryStep({ ctx }: { ctx: StepContext }) {
     }
   }
 
-  async function saveOpenAiKey() {
-    const trimmed = keyDraft.trim();
-    if (!trimmed) return;
-    try {
-      await ipc.setProviderKey("openai" as TranscribeProvider, trimmed);
-      setKeySaved(true);
-      setKeyDraft("");
-      setTestResult(null);
-    } catch (e) {
-      setTestResult({ ok: false, message: String(e) });
-    }
-  }
-
+  // A passed Test is the commit point: write OpenAI as the summary provider.
   async function testOpenAiKey() {
-    setTesting(true);
-    setTestResult(null);
+    if (!(await key.test())) return;
     try {
-      const r = await ipc.testProviderKey("openai" as TranscribeProvider);
-      if (r.ok) {
-        setTestResult({ ok: true });
-        await ipc.setSetting("summary_provider", "openai");
-        await ipc.setSetting("summary_model", DEFAULT_OPENAI_SUMMARY_MODEL);
-        setOpenaiConfigured(true);
-      } else {
-        setTestResult({
-          ok: false,
-          message: `${r.status}: ${r.error ?? "unknown error"}`,
-        });
-      }
+      await ipc.setSetting("summary_provider", "openai");
+      await ipc.setSetting("summary_model", DEFAULT_OPENAI_SUMMARY_MODEL);
+      setOpenaiConfigured(true);
     } catch (e) {
-      setTestResult({ ok: false, message: String(e) });
-    } finally {
-      setTesting(false);
+      console.warn("[onboarding] failed to write openai summary settings:", e);
     }
   }
 
@@ -201,9 +159,9 @@ export function SummaryStep({ ctx }: { ctx: StepContext }) {
     setSelection("openai");
   }
   function selectLocal() {
+    // The probe hook resets to "no verdict" while disabled, so flipping the
+    // selection starts from a clean probing state automatically.
     setSelection("local");
-    setReachable(null);
-    setInstalled(null);
   }
 
   // Continue enables when either path is fully configured.
@@ -294,19 +252,15 @@ export function SummaryStep({ ctx }: { ctx: StepContext }) {
                   <div className="flex gap-2">
                     <input
                       type="password"
-                      value={keyDraft}
-                      onChange={(e) => {
-                        setKeyDraft(e.target.value);
-                        if (keySaved) setKeySaved(false);
-                        if (testResult) setTestResult(null);
-                      }}
-                      placeholder={keySaved ? "•••••••• stored" : "sk-…"}
+                      value={key.draft}
+                      onChange={(e) => key.setDraft(e.target.value)}
+                      placeholder={key.hasKey ? "•••••••• stored" : "sk-…"}
                       className="flex-1 min-w-0 px-3 py-2 rounded-md text-sm bg-[var(--color-input-bg)] border border-[var(--color-line)] focus:border-[var(--color-text-muted)]"
                     />
                     <button
                       type="button"
-                      onClick={saveOpenAiKey}
-                      disabled={!keyDraft.trim()}
+                      onClick={key.save}
+                      disabled={!key.draft.trim()}
                       className="nd-btn"
                     >
                       Save
@@ -314,21 +268,21 @@ export function SummaryStep({ ctx }: { ctx: StepContext }) {
                     <button
                       type="button"
                       onClick={testOpenAiKey}
-                      disabled={!keySaved || testing}
+                      disabled={!key.hasKey || key.testing}
                       className="nd-btn nd-btn-primary"
                     >
-                      {testing ? "Testing…" : "Test"}
+                      {key.testing ? "Testing…" : "Test"}
                     </button>
                   </div>
-                  {testResult?.ok === true && (
+                  {key.result?.ok === true && (
                     <p className="text-xs text-[var(--color-success)] flex items-center gap-1.5">
                       <Check size={13} strokeWidth={2.5} />
                       Connected
                     </p>
                   )}
-                  {testResult?.ok === false && (
+                  {key.result?.ok === false && (
                     <p className="text-xs text-[var(--color-danger)] break-all">
-                      {testResult.message}
+                      {key.result.message}
                     </p>
                   )}
                 </div>
@@ -375,7 +329,7 @@ export function SummaryStep({ ctx }: { ctx: StepContext }) {
 
           {selection === "local" && (
             <div className="mt-4 flex flex-col gap-3">
-              {reachable === null && probing && (
+              {reachable === null && (
                 <p className="text-xs text-[var(--color-text-muted)]">
                   Checking for Ollama…
                 </p>
