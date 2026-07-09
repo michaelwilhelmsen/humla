@@ -113,7 +113,7 @@ describe("settings dialog", () => {
   });
 
   it("Escape in an open select closes the select, not the dialog", async () => {
-    renderApp("/settings?tab=general");
+    renderApp("/settings?tab=transcription");
     const dialog = await screen.findByRole("dialog", { name: /settings/i });
 
     // Open the Language select's listbox.
@@ -156,7 +156,7 @@ describe("settings dialog", () => {
   });
 
   it("backdrop click with an open select dismisses only the select", async () => {
-    renderApp("/settings?tab=general");
+    renderApp("/settings?tab=transcription");
     const dialog = await screen.findByRole("dialog", { name: /settings/i });
 
     const trigger = await within(dialog).findByRole("button", {
@@ -249,8 +249,9 @@ describe("settings dialog", () => {
   });
 
   it("resolves legacy deep links to their new sections", async () => {
-    // `keys` tab is dissolved: it anchors to Transcription, where the
-    // provider key cards live.
+    // `keys` tab is dissolved: it anchors to Transcription. The active
+    // provider's key is inline; the other providers' keys live under the
+    // section's Advanced disclosure alongside overrides.
     renderApp("/settings?tab=keys");
     const dialog = await screen.findByRole("dialog", { name: /settings/i });
     expect(
@@ -259,11 +260,69 @@ describe("settings dialog", () => {
     expect(
       await within(dialog).findByLabelText(/openai api key/i),
     ).toBeInTheDocument();
+
+    await userEvent.click(
+      (await within(dialog).findAllByRole("button", { name: /advanced/i }))[0],
+    );
     expect(
-      within(dialog).getByLabelText(/deepgram api key/i),
+      await within(dialog).findByLabelText(/deepgram api key/i),
     ).toBeInTheDocument();
     expect(
       within(dialog).getByLabelText(/groq api key/i),
+    ).toBeInTheDocument();
+  });
+
+  it("the default language lives in Transcription and persists", async () => {
+    const writes: Record<string, string> = {};
+    renderApp("/settings?tab=transcription", {
+      settings_set: (args) => {
+        const { key, value } = args as { key: string; value: string };
+        writes[key] = value;
+        return null;
+      },
+    });
+    const dialog = await screen.findByRole("dialog", { name: /settings/i });
+
+    // Relocated from General (#15): the language sits with the engine that
+    // consumes it.
+    const trigger = await within(dialog).findByRole("button", {
+      name: /norwegian/i,
+    });
+    await userEvent.click(trigger);
+    await userEvent.click(
+      within(dialog).getByRole("option", { name: /^english/i }),
+    );
+    expect(writes.language).toBe("en");
+
+    // And General no longer offers it.
+    await userEvent.click(within(dialog).getByRole("tab", { name: "General" }));
+    expect(
+      within(dialog).queryByRole("button", { name: /norwegian|english/i }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("per-language overrides and local models sit behind Advanced", async () => {
+    renderApp("/settings?tab=transcription");
+    const dialog = await screen.findByRole("dialog", { name: /settings/i });
+    await within(dialog).findByText("Provider");
+
+    // Collapsed: expert routing is out of sight.
+    expect(
+      within(dialog).queryByText("Per-language overrides"),
+    ).not.toBeInTheDocument();
+    expect(
+      within(dialog).queryByText(/pick a multilingual model/i),
+    ).not.toBeInTheDocument();
+
+    await userEvent.click(
+      within(dialog).getAllByRole("button", { name: /advanced/i })[0],
+    );
+
+    expect(
+      await within(dialog).findByText("Per-language overrides"),
+    ).toBeInTheDocument();
+    expect(
+      within(dialog).getByText(/pick a multilingual model/i),
     ).toBeInTheDocument();
   });
 
@@ -349,10 +408,12 @@ describe("settings dialog", () => {
       within(dialog).queryByText(/community-1 clustering threshold/i),
     ).not.toBeInTheDocument();
 
-    const advanced = within(dialog).getByRole("button", {
+    // Two per-section disclosures exist (Transcription, Speaker labels);
+    // the thresholds live under the Speaker labels one — last in order.
+    const advanced = within(dialog).getAllByRole("button", {
       name: /advanced/i,
     });
-    await userEvent.click(advanced);
+    await userEvent.click(advanced[advanced.length - 1]);
 
     const field = within(dialog).getByLabelText(
       /community-1 clustering threshold/i,

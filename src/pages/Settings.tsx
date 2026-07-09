@@ -5,7 +5,6 @@ import { GeneralTab } from "./settings/tabs/General";
 import { RecordingSection } from "./settings/tabs/Recording";
 import { TranscriptionTab } from "./settings/tabs/Transcription";
 import { SummaryTab } from "./settings/tabs/Summary";
-import { ApiKeysTab } from "./settings/tabs/ApiKeys";
 import { AboutTab } from "./settings/tabs/About";
 import { AccountTab } from "./settings/tabs/Account";
 import { OrganizationTab } from "./settings/tabs/Organization";
@@ -39,7 +38,6 @@ export function Settings() {
           downloadSortformer={settings.downloadSortformer}
           deleteSortformer={settings.deleteSortformer}
         />
-        <ApiKeysTab />
       </>
     ),
     summaries: (

@@ -1,6 +1,5 @@
 import { useThemeStore } from "../../../lib/theme";
 import { usePaletteStore } from "../../../lib/palette";
-import { LANGUAGES, languageOptionLabel } from "../../../lib/languages";
 import { SUMMARY_PRESETS, presetLabel } from "../../../lib/presets";
 import { Row, Section } from "../components/Section";
 import { Segmented } from "../components/Segmented";
@@ -17,20 +16,6 @@ export function GeneralTab({ s, update }: Pick<SettingsHook, "s" | "update">) {
   return (
     <>
       <Section title="Defaults">
-        <Row
-          label="Language"
-          description="Default for new notes. Each note has its own language chip in the header that overrides this."
-          control={
-            <Select
-              value={s.language}
-              onChange={(v) => update("language", v)}
-              options={LANGUAGES.map((l) => ({
-                value: l.value,
-                label: languageOptionLabel(l),
-              }))}
-            />
-          }
-        />
         <Row
           label="Summary preset"
           description='Which preset new notes start with. Each note can switch to a different preset (or "Custom") from its own header.'

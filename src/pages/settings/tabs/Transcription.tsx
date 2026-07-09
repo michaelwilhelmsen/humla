@@ -5,8 +5,33 @@ import { LocalModelManager } from "../components/LocalModelManager";
 import { PerLanguageOverrides } from "../components/PerLanguageOverrides";
 import { ProviderConfigForm } from "../components/ProviderConfigForm";
 import { Row, Section } from "../components/Section";
+import { Select } from "../components/Select";
+import { ProviderKeyCard, type KeyProvider } from "../../../components/provider/ProviderKeyCard";
+import { LANGUAGES, languageOptionLabel } from "../../../lib/languages";
 import { inputClass } from "../types";
 import type { SettingsHook } from "../useSettings";
+
+// Copy for the inline per-provider key cards. The selected cloud provider's
+// card renders right under the picker; the others sit in Advanced so keys
+// for override-only providers stay reachable.
+const KEY_META: Record<KeyProvider, { label: string; description: string; placeholder: string }> = {
+  openai: {
+    label: "OpenAI",
+    description: "Cloud transcription (whisper-1, gpt-4o-transcribe) and cloud summaries.",
+    placeholder: "sk-…",
+  },
+  deepgram: {
+    label: "Deepgram",
+    description: "Nova-3 and Nova-2 cloud transcription.",
+    placeholder: "Deepgram API key",
+  },
+  groq: {
+    label: "Groq",
+    description: "Fast cloud Whisper (whisper-large-v3-turbo).",
+    placeholder: "gsk_…",
+  },
+};
+const KEY_PROVIDERS: KeyProvider[] = ["openai", "deepgram", "groq"];
 
 // Engine choice row: label + description left, pick-radio right, the
 // download/status manager underneath. The radio is presence-gated — an
@@ -122,7 +147,7 @@ export function TranscriptionTab({
 
   return (
     <>
-      <Section title="Default provider">
+      <Section title="Transcription">
         <ProviderConfigForm
           value={def}
           onChange={setDefaultConfig}
@@ -130,47 +155,82 @@ export function TranscriptionTab({
         />
         {def.provider === "local" && !local.models.some((m) => m.downloaded) && (
           <p className="text-xs text-[var(--color-danger)] py-3">
-            No local model is downloaded. Download one below before recording.
+            No local model is downloaded. Download one under Advanced below
+            before recording.
           </p>
         )}
-      </Section>
-
-      <Section title="Per-language overrides">
-        <Row label="Overrides">
-          <PerLanguageOverrides
-            config={transcribeConfig}
-            setLanguageOverride={setLanguageOverride}
-            removeLanguageOverride={removeLanguageOverride}
-            local={local}
+        {def.provider !== "local" && (
+          <ProviderKeyCard
+            provider={def.provider as KeyProvider}
+            {...KEY_META[def.provider as KeyProvider]}
           />
-        </Row>
-      </Section>
-
-      <Section title="Local models">
-        <LocalModelManager
-          state={local}
-          activeId={def.provider === "local" ? def.model_id : ""}
-          language={s.language}
-          onDownload={downloadModel}
-          onDelete={deleteModel}
-          setLanguageOverride={setLanguageOverride}
-          onSelect={(id) => {
-            // Selecting a local model from the manager pins it as the
-            // default's model_id. If currently on a non-local default,
-            // switch them to Local with this model — matches the v0.23
-            // implicit behaviour of the radio button.
-            if (def.provider === "local") {
-              setDefaultConfig({ ...def, model_id: id });
-            } else {
-              setDefaultConfig({
-                provider: "local",
-                model_id: id,
-                preset: "quality",
-                use_gpu: true,
-              });
-            }
-          }}
+        )}
+        <Row
+          label="Language"
+          description="Default for new notes. Each note has its own language chip in the header that overrides this."
+          control={
+            <Select
+              value={s.language}
+              onChange={(v) => update("language", v)}
+              options={LANGUAGES.map((l) => ({
+                value: l.value,
+                label: languageOptionLabel(l),
+              }))}
+            />
+          }
         />
+        <Disclosure label="Advanced">
+          <div>
+            <div className="text-sm">Per-language overrides</div>
+            <p className="text-xs text-[var(--color-text-muted)] mt-0.5 mb-3">
+              Route specific recording languages to a different provider than
+              the default above — e.g. NB Whisper for Norwegian, Deepgram
+              Nova-3 for English.
+            </p>
+            <PerLanguageOverrides
+              config={transcribeConfig}
+              setLanguageOverride={setLanguageOverride}
+              removeLanguageOverride={removeLanguageOverride}
+              local={local}
+            />
+          </div>
+          <div>
+            <div className="text-sm">Local models</div>
+            <LocalModelManager
+              state={local}
+              activeId={def.provider === "local" ? def.model_id : ""}
+              language={s.language}
+              onDownload={downloadModel}
+              onDelete={deleteModel}
+              setLanguageOverride={setLanguageOverride}
+              onSelect={(id) => {
+                // Selecting a local model from the manager pins it as the
+                // default's model_id. If currently on a non-local default,
+                // switch them to Local with this model — matches the v0.23
+                // implicit behaviour of the radio button.
+                if (def.provider === "local") {
+                  setDefaultConfig({ ...def, model_id: id });
+                } else {
+                  setDefaultConfig({
+                    provider: "local",
+                    model_id: id,
+                    preset: "quality",
+                    use_gpu: true,
+                  });
+                }
+              }}
+            />
+          </div>
+          <div>
+            <div className="text-sm">Other API keys</div>
+            <p className="text-xs text-[var(--color-text-muted)] mt-0.5">
+              Keys for providers used only by per-language overrides.
+            </p>
+            {KEY_PROVIDERS.filter((p) => p !== def.provider).map((p) => (
+              <ProviderKeyCard key={p} provider={p} {...KEY_META[p]} />
+            ))}
+          </div>
+        </Disclosure>
       </Section>
 
       <Section title="Speaker labels">
