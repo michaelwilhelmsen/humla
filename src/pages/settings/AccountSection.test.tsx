@@ -58,6 +58,39 @@ describe("Account section", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("pitches Humla Cloud with a pricing card whose CTA starts the connect flow", async () => {
+    const configures: unknown[] = [];
+    renderApp("/settings?tab=account", {
+      cloud_configure: (args) => {
+        configures.push(args);
+        return null;
+      },
+    });
+    const dialog = await screen.findByRole("dialog", { name: /settings/i });
+
+    // The pitch: what it does, what it costs, and the trial.
+    expect(
+      await within(dialog).findByText(/share notes across your team/i),
+    ).toBeInTheDocument();
+    expect(within(dialog).getByText("$7")).toBeInTheDocument();
+    expect(
+      within(dialog).getByText(/month for the entire team/i),
+    ).toBeInTheDocument();
+    expect(
+      within(dialog).getByText(/14-day free trial/i),
+    ).toBeInTheDocument();
+
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: /upgrade/i }),
+    );
+
+    // CTA points the app at the hosted server (sign-in/up renders next).
+    expect(configures).toHaveLength(1);
+    expect(String((configures[0] as { baseUrl?: string })?.baseUrl)).toMatch(
+      /humla/i,
+    );
+  });
+
   it("configured + signed out shows the sign-in form with a signup mode", async () => {
     const dialog = await openAccount(signedOutConfigured());
 

@@ -44,7 +44,8 @@ export function AccountTab() {
     setBusy(true);
     setError(null);
     try {
-      setServerUrl(HUMLA_CLOUD_URL);
+      // Don't mirror the URL into the self-hosted input — that field is for
+      // custom servers only; the hosted URL showing up there reads as a bug.
       await cloudApi.configure(HUMLA_CLOUD_URL);
       await refresh();
     } catch (e) {
@@ -225,17 +226,39 @@ export function AccountTab() {
     <Section title="Connect to sync">
       <div className="py-3.5 flex flex-col gap-3">
         <p className="text-sm text-[var(--color-text-muted)]">
-          Humla works fully offline. To sync across devices and collaborate with a team, connect to
-          <strong> Humla Cloud</strong> (hosted — easiest) or point Humla at your own server.
+          Humla works fully offline. Your notes always live on your Mac first.
         </p>
         {error && <div className="text-xs text-[var(--color-danger)]">{error}</div>}
-        <div className="flex items-center gap-2">
-          <Btn onClick={useHumlaCloud} disabled={busy}>
-            <span className="inline-flex items-center gap-1.5">
-              <Cloud size={14} strokeWidth={1.5} /> {busy ? "Connecting…" : "Use Humla Cloud"}
+        {/* Humla Cloud pitch: the one place the hosted offer gets to sell
+            itself — accent-washed so it stands out from the surrounding
+            settings chrome without shouting. */}
+        <div className="rounded-lg border border-[var(--color-accent)] bg-[var(--color-accent-soft)] p-4 flex flex-col gap-1.5">
+          <div className="flex items-center gap-1.5 text-sm font-medium">
+            <Cloud size={15} strokeWidth={1.7} /> Humla Cloud
+          </div>
+          <p className="text-sm text-[var(--color-text-muted)]">
+            Share notes across your team — synced to every device, backed up,
+            and ready for teammates.
+          </p>
+          <div className="flex items-baseline gap-1.5 pt-1">
+            <span className="text-2xl font-semibold tracking-tight">$7</span>
+            <span className="text-xs text-[var(--color-text-muted)]">
+              /month for the entire team
             </span>
-          </Btn>
-          <span className="text-xs text-[var(--color-text-muted)]">14-day free trial · cancel anytime</span>
+          </div>
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 pt-1.5">
+            <button
+              type="button"
+              onClick={useHumlaCloud}
+              disabled={busy}
+              className="nd-btn nd-btn-primary"
+            >
+              {busy ? "Connecting…" : "Upgrade to Humla Cloud"}
+            </button>
+            <span className="text-xs text-[var(--color-text-muted)] whitespace-nowrap">
+              14-day free trial · cancel anytime
+            </span>
+          </div>
         </div>
       </div>
       <Row label="Self-hosted server">
