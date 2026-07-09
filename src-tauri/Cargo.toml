@@ -45,6 +45,9 @@ parking_lot = "0.12"
 dirs = "5"
 libc = "0.2"
 tauri-plugin-process = "2"
+# Native save panel for the note-export flow (issue #18). Frontend picks the
+# target path via the JS `save()` dialog; `export_note` writes to it.
+tauri-plugin-dialog = "2"
 # OpenAI API key lives in macOS Keychain (apple-native backend, no D-Bus
 # / linux-keyutils transitive deps). Migration from the legacy SQLite
 # row is one-shot inside read_openai_api_key.

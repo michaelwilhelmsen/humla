@@ -1,4 +1,5 @@
 mod db;
+mod html_text;
 mod openai;
 mod local_whisper;
 mod diarize;
@@ -63,6 +64,7 @@ where
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_dialog::init())
         .setup(move |app| {
             // Point GGML at our prebuilt default.metallib BEFORE any
             // whisper.cpp init runs. whisper-rs 0.13 ships a vendored
@@ -265,6 +267,7 @@ where
             commands::note_timeline_set_chunk_label,
             commands::note_timeline_delete_chunk,
             commands::open_in_finder,
+            commands::export_note,
             commands::rediarize_note,
             commands::summary_prompts_list,
             commands::summary_prompts_create,

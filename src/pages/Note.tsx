@@ -37,6 +37,7 @@ import type { LayoutOutletContext } from "../components/Layout";
 import { SkeletonLines } from "../components/Skeleton";
 import { NoteEditor } from "../components/Editor";
 import { ContextMenu, ContextMenuItem } from "../components/ContextMenu";
+import { ExportModal } from "./ExportModal";
 import { SUMMARY_PRESETS, presetLabel } from "../lib/presets";
 import { LANGUAGES, languageOptionLabel } from "../lib/languages";
 import { useDeveloperMode } from "../lib/useDeveloperMode";
@@ -1037,7 +1038,9 @@ function NoteToolbar({
 }) {
   const navigate = useNavigate();
   const removeLocal = useNotesStore((s) => s.removeLocal);
+  const note = useNotesStore((s) => s.notes.find((n) => n.id === noteId));
   const [menuPos, setMenuPos] = useState<{ x: number; y: number } | null>(null);
+  const [exportOpen, setExportOpen] = useState(false);
 
   async function record() {
     // Pre-flight: don't start a doomed recording when the pipeline isn't
@@ -1130,10 +1133,23 @@ function NoteToolbar({
       )}
       {menuPos && (
         <ContextMenu x={menuPos.x} y={menuPos.y} onClose={() => setMenuPos(null)}>
+          {note && (
+            <ContextMenuItem
+              onClick={() => {
+                setMenuPos(null);
+                setExportOpen(true);
+              }}
+            >
+              Export…
+            </ContextMenuItem>
+          )}
           <ContextMenuItem onClick={onDelete} danger>
             Delete note
           </ContextMenuItem>
         </ContextMenu>
+      )}
+      {note && (
+        <ExportModal note={note} open={exportOpen} onClose={() => setExportOpen(false)} />
       )}
     </div>
   );
