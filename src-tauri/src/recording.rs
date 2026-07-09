@@ -143,12 +143,25 @@ pub struct ChunkRecord {
     pub words: Vec<ChunkWord>,
 }
 
+/// Live in-memory state for the *currently capturing* recording — child
+/// process handles, in-flight transcribe tasks, rolling context, and the
+/// id/timestamp allocated for the persisted session this capture will
+/// finalize into. Named `LiveCapture` (not `RecordingSession`) to avoid
+/// colliding with the persisted per-note *session* concept in
+/// [`crate::sessions`], which is what `sessions.json`, the carousel, and the
+/// on-disk `recordings/<note_id>/<session_id>/` layout all refer to.
 #[derive(Default)]
-pub struct RecordingSession {
+pub struct LiveCapture {
     pub note_id: Option<String>,
     pub child: Option<Child>,
     pub temp_dir: Option<PathBuf>,
     pub stop_tx: Option<mpsc::Sender<()>>,
+    // Persisted-session bookkeeping. Allocated at `recording_start` and
+    // snapshotted into the post-stop chain, which writes this capture's
+    // assets into `recordings/<note_id>/<session_id>/` and appends a manifest
+    // entry stamped `session_started_at`.
+    pub session_id: Option<String>,
+    pub session_started_at: Option<String>,
     // Handles for in-flight transcribe tasks. Drained on stop so the
     // transcript is fully written before we flip to Idle.
     pub inflight: Inflight,

@@ -993,14 +993,18 @@ async fn find_note_remote(
     }))
 }
 
+/// Local path for the note's single synced `playback.wav`.
+///
+/// Per-session storage (#16) keeps each take in its own subdir, but the cloud
+/// contract is still one audio file per note (the per-session sync is a
+/// separate follow-up). So the upload source is the *latest* session's
+/// playback.wav, and the download target is the same resolved path — which
+/// for a note never recorded locally (no manifest) falls back to the flat
+/// `recordings/<note_id>/playback.wav`, exactly as before this feature.
 fn playback_path(app: &tauri::AppHandle, note_id: &str) -> Result<std::path::PathBuf, String> {
-    Ok(app
-        .path()
-        .app_data_dir()
-        .map_err(|e| e.to_string())?
-        .join("recordings")
-        .join(note_id)
-        .join("playback.wav"))
+    let app_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let recordings = crate::sessions::recordings_dir(&app_dir, note_id);
+    Ok(crate::sessions::latest_session_dir(&recordings).join("playback.wav"))
 }
 
 /// Upload a finished recording's mixed `playback.wav` to its workspace note

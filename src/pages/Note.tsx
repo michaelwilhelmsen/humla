@@ -25,13 +25,15 @@ import {
   Users,
   X,
 } from "lucide-react";
-import { ipc, onSummaryThinkingDelta, onSummaryContentDelta, type Note as TNote, type NoteRevision, type SummaryPrompt, type TimelineEntry } from "../lib/ipc";
+import { ipc, onSummaryThinkingDelta, onSummaryContentDelta, type Note as TNote, type NoteRevision, type NoteSession, type SummaryPrompt, type TimelineEntry } from "../lib/ipc";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { useDownloadStore, useNotesStore, useRecordingStore } from "../lib/store";
 import { computeSetupStatus } from "../lib/setupStatus";
 import { useOwnerName, useCloudStore } from "../lib/cloud";
 import { extractSpeakerLabels, renameSpeakerInTranscript } from "../lib/speakers";
 import { SpeakerLabels, speakerColorMap } from "../components/SpeakerLabels";
+import { RecordingSessions } from "../components/RecordingSessions";
+import { groupTimeline, resolveActivePill, formatSessionCaption } from "../lib/sessions";
 import { RecordingBar } from "../components/RecordingBar";
 import type { LayoutOutletContext } from "../components/Layout";
 import { SkeletonLines } from "../components/Skeleton";
@@ -135,6 +137,10 @@ export function Note() {
   // TranscriptEditor in that case.
   const [playbackUrl, setPlaybackUrl] = useState<string | null>(null);
   const [timeline, setTimeline] = useState<TimelineEntry[]>([]);
+  // Recording sessions (#16): every take on this note, in order. Drives the
+  // playback carousel + the session-switched player. Empty for notes with no
+  // recordings.
+  const [sessions, setSessions] = useState<NoteSession[]>([]);
 
   // Pending field changes accumulated across the debounce window. The
   // single saveTimer used to capture only one field's value per cycle —
@@ -389,18 +395,25 @@ export function Note() {
     if (!draft) return;
     let cancelled = false;
     (async () => {
-      let [path, tl] = await Promise.all([
+      let [path, tl, sess] = await Promise.all([
         ipc.notePlaybackPath(draft.id).catch(() => null),
         ipc.noteTimeline(draft.id).catch((): TimelineEntry[] => []),
+        ipc.noteSessions(draft.id).catch((): NoteSession[] => []),
       ]);
       // No local audio but the note is shared → pull it from the workspace.
+      // Cloud audio is still one file per note; it lands as the latest/legacy
+      // session, so re-list sessions after the download.
       if (!path && draft.workspace_id) {
         const got = await ipc.downloadNoteAudio(draft.id).catch(() => false);
-        if (got && !cancelled) path = await ipc.notePlaybackPath(draft.id).catch(() => null);
+        if (got && !cancelled) {
+          path = await ipc.notePlaybackPath(draft.id).catch(() => null);
+          sess = await ipc.noteSessions(draft.id).catch(() => sess);
+        }
       }
       if (cancelled) return;
       setPlaybackUrl(path ? convertFileSrc(path) : null);
       setTimeline(tl);
+      setSessions(sess);
     })();
     return () => {
       cancelled = true;
@@ -910,12 +923,14 @@ export function Note() {
                       {!readOnly && <RediarizeAction noteId={draft.id} />}
                       {devMode && <DiagnosticsLinks noteId={draft.id} />}
                     </div>
-                    {playbackUrl && timeline.length > 0 ? (
+                    {(playbackUrl || sessions.some((s) => s.hasPlayback)) &&
+                    timeline.length > 0 ? (
                       <TranscriptPlayer
                         noteId={draft.id}
                         timeline={timeline}
                         setTimeline={setTimeline}
-                        playbackUrl={playbackUrl}
+                        sessions={sessions}
+                        fallbackPlaybackUrl={playbackUrl}
                         transcript={draft.transcript}
                         onChange={onTranscriptChange}
                         disabled={readOnly || recActive}
@@ -1778,7 +1793,8 @@ const TranscriptPlayer = memo(function TranscriptPlayer({
   noteId,
   timeline,
   setTimeline,
-  playbackUrl,
+  sessions,
+  fallbackPlaybackUrl,
   transcript,
   onChange,
   disabled,
@@ -1788,7 +1804,12 @@ const TranscriptPlayer = memo(function TranscriptPlayer({
   noteId: string;
   timeline: TimelineEntry[];
   setTimeline: React.Dispatch<React.SetStateAction<TimelineEntry[]>>;
-  playbackUrl: string;
+  // Recording sessions (#16) in order. One <audio> element plays the
+  // *active* session's playback.wav; the reader shows every session's text.
+  sessions: NoteSession[];
+  // Latest/legacy single-file playback URL, used when a session has no
+  // resolvable per-session file yet (e.g. a downloaded workspace note).
+  fallbackPlaybackUrl: string | null;
   transcript: string;
   onChange: (v: string) => void;
   disabled: boolean;
@@ -1796,6 +1817,50 @@ const TranscriptPlayer = memo(function TranscriptPlayer({
   bottomAligned: boolean;
 }) {
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  // Which session's audio is loaded in the player. Defaults to the first
+  // session that has a playback file. Clicking a pill (or a word in another
+  // session) switches it.
+  const [activeSessionId, setActiveSessionId] = useState<string | null>(
+    () => (sessions.find((s) => s.hasPlayback) ?? sessions[0])?.id ?? null,
+  );
+  const activeSessionIdRef = useRef(activeSessionId);
+  activeSessionIdRef.current = activeSessionId;
+  // Keep the active session valid as sessions load / change.
+  useEffect(() => {
+    if (sessions.length === 0) return;
+    if (!sessions.some((s) => s.id === activeSessionId)) {
+      setActiveSessionId((sessions.find((s) => s.hasPlayback) ?? sessions[0]).id);
+    }
+  }, [sessions, activeSessionId]);
+
+  // Resolve the active session's playback.wav → tauri asset URL. Falls back
+  // to the single-file URL for notes without per-session files.
+  const [activeUrl, setActiveUrl] = useState<string | null>(fallbackPlaybackUrl);
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      if (!activeSessionId) {
+        if (!cancelled) setActiveUrl(fallbackPlaybackUrl);
+        return;
+      }
+      const p = await ipc
+        .noteSessionPlaybackPath(noteId, activeSessionId)
+        .catch(() => null);
+      if (cancelled) return;
+      setActiveUrl(p ? convertFileSrc(p) : fallbackPlaybackUrl);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [activeSessionId, noteId, fallbackPlaybackUrl]);
+
+  // A seek (and optional resume) to apply once the freshly-swapped <audio>
+  // source has loaded — how "switch session then seek-and-keep-playing"
+  // survives the src change.
+  const pendingSeekRef = useRef<{ ms: number; play: boolean } | null>(null);
+  const [isPlaying, setIsPlaying] = useState(false);
+  // Topmost session divider currently in view — the idle active-pill anchor.
+  const [topVisibleSessionId, setTopVisibleSessionId] = useState<string | null>(null);
   // The two derived states from playback position: which chunks
   // currently bracket currentTime (mic + sys can overlap, so this is a
   // set, not a single index) and which word inside each active chunk
@@ -1840,43 +1905,23 @@ const TranscriptPlayer = memo(function TranscriptPlayer({
   // (label cycle, delete) still operate on the underlying chunks.
   // `wordCountByChunk` lets the active-word highlight map an
   // (active chunk index, active word index in that chunk) pair to a
-  // single position in the flattened `words` array.
-  const groups = useMemo(() => {
-    type Group = {
-      label: string;
-      indices: number[];
-      startMs: number;
-      endMs: number;
-      text: string;
-      words: Array<{ text: string; start_ms: number; end_ms: number }>;
-      wordCountByChunk: number[];
-    };
-    const out: Group[] = [];
-    for (let i = 0; i < timeline.length; i++) {
-      const e = timeline[i];
-      const ws = e.words ?? [];
-      const label = e.label || "";
-      const last = out[out.length - 1];
-      if (last && last.label === label) {
-        last.indices.push(i);
-        last.endMs = Math.max(last.endMs, e.end_ms);
-        last.text = last.text ? `${last.text} ${e.text}` : e.text;
-        last.words.push(...ws);
-        last.wordCountByChunk.push(ws.length);
-      } else {
-        out.push({
-          label,
-          indices: [i],
-          startMs: e.start_ms,
-          endMs: e.end_ms,
-          text: e.text,
-          words: [...ws],
-          wordCountByChunk: [ws.length],
-        });
-      }
-    }
-    return out;
-  }, [timeline]);
+  // single position in the flattened `words` array. Groups break at
+  // session boundaries too, so each carries its session identity and a
+  // divider anchor (#16).
+  const groups = useMemo(() => groupTimeline(timeline), [timeline]);
+  const sessionById = useMemo(() => {
+    const m = new Map<string, NoteSession>();
+    sessions.forEach((s) => m.set(s.id, s));
+    return m;
+  }, [sessions]);
+  // The visually-active pill: playhead's session while playing, else the
+  // topmost divider in view (idle scroll orientation).
+  const activePillId = resolveActivePill({
+    playing: isPlaying,
+    playheadSessionId: activeSessionId,
+    topVisibleSessionId,
+    sessions,
+  });
 
   const chunkToGroup = useMemo(() => {
     const m = new Map<number, number>();
@@ -1946,8 +1991,15 @@ const TranscriptPlayer = memo(function TranscriptPlayer({
       // — a later chunk on the other source might already have ended.
       // O(n) per tick; n is one entry per ~5–15 s chunk, so even a
       // 2-hour recording is < 1500 entries. Cheap.
+      const active = activeSessionIdRef.current;
       for (let i = 0; i < tl.length; i++) {
         const e = tl[i];
+        // Karaoke/seek only track the session whose playback.wav is loaded.
+        // Other sessions' text still renders (reader fix) — it just never
+        // lights up, and its local times (which restart at 0) never match
+        // this playhead. Skip before the sorted-break so an earlier
+        // session's entries don't stop the scan prematurely.
+        if (active !== null && e.sessionId !== active) continue;
         if (e.start_ms > ms) break;
         if (e.end_ms < ms) continue;
         idxs.push(i);
@@ -1996,12 +2048,26 @@ const TranscriptPlayer = memo(function TranscriptPlayer({
       raf = requestAnimationFrame(tick);
     };
     const start = () => {
+      setIsPlaying(true);
       if (raf) return;
       raf = requestAnimationFrame(tick);
     };
     const stop = () => {
+      setIsPlaying(false);
       cancelAnimationFrame(raf);
       raf = 0;
+      computeAndSync();
+    };
+    // When the source swaps to a newly-selected session, apply any pending
+    // seek (and resume) once the new audio is ready. This is how a pill
+    // click / cross-session word click seeks-and-keeps-playing across the
+    // src change.
+    const onLoaded = () => {
+      const pending = pendingSeekRef.current;
+      if (!pending) return;
+      pendingSeekRef.current = null;
+      audio.currentTime = pending.ms / 1000;
+      if (pending.play) audio.play().catch(() => {});
       computeAndSync();
     };
     audio.addEventListener("play", start);
@@ -2009,6 +2075,7 @@ const TranscriptPlayer = memo(function TranscriptPlayer({
     audio.addEventListener("pause", stop);
     audio.addEventListener("ended", stop);
     audio.addEventListener("seeked", computeAndSync);
+    audio.addEventListener("loadeddata", onLoaded);
     computeAndSync();
     if (!audio.paused) start();
     return () => {
@@ -2019,6 +2086,7 @@ const TranscriptPlayer = memo(function TranscriptPlayer({
       audio.removeEventListener("pause", stop);
       audio.removeEventListener("ended", stop);
       audio.removeEventListener("seeked", computeAndSync);
+      audio.removeEventListener("loadeddata", onLoaded);
     };
   }, []);
 
@@ -2039,11 +2107,51 @@ const TranscriptPlayer = memo(function TranscriptPlayer({
     el.setSelectionRange(len, len);
   }, [editing]);
 
-  function seek(ms: number) {
-    const a = audioRef.current;
-    if (!a) return;
-    a.currentTime = ms / 1000;
-    a.play().catch(() => {});
+  // Seek to a millisecond offset within a given session. When it's the
+  // already-loaded session, seek + play inline; otherwise swap the source to
+  // that session and apply the seek once it loads. Clicking a word/line
+  // always starts playback (matches the pre-session behaviour).
+  function seekInSession(sessionId: string, ms: number) {
+    if (sessionId === activeSessionIdRef.current) {
+      const a = audioRef.current;
+      if (!a) return;
+      a.currentTime = ms / 1000;
+      a.play().catch(() => {});
+      return;
+    }
+    pendingSeekRef.current = { ms, play: true };
+    setActiveSessionId(sessionId);
+  }
+
+  // Click a session pill: scroll that session's first turn to the top and
+  // seek the player to its start, keeping the current play state
+  // (seek-and-keep-playing). Read-only carousel — no delete in v1.
+  function selectSession(sessionId: string) {
+    const groupIdx = groups.findIndex((g) => g.sessionId === sessionId);
+    if (groupIdx >= 0) virtualizer.scrollToIndex(groupIdx, { align: "start" });
+    setTopVisibleSessionId(sessionId);
+    if (sessionId === activeSessionIdRef.current) {
+      const a = audioRef.current;
+      if (a) a.currentTime = 0;
+      return;
+    }
+    const wasPlaying = audioRef.current ? !audioRef.current.paused : false;
+    pendingSeekRef.current = { ms: 0, play: wasPlaying };
+    setActiveSessionId(sessionId);
+  }
+
+  // Idle active-pill tracking: on scroll, find the topmost rendered turn and
+  // adopt its session so the lit pill follows the reader (#16).
+  function handleScroll() {
+    const el = scrollRef.current;
+    if (!el) return;
+    const st = el.scrollTop;
+    const items = virtualizer.getVirtualItems();
+    const vis = items.find((it) => it.start + it.size > st) ?? items[0];
+    if (vis) {
+      const sid = groups[vis.index]?.sessionId;
+      if (sid) setTopVisibleSessionId(sid);
+    }
   }
 
   // Drop a single chunk row. Used to remove off-topic content the
@@ -2054,15 +2162,18 @@ const TranscriptPlayer = memo(function TranscriptPlayer({
   async function deleteGroup(g: { indices: number[] }) {
     if (disabled) return;
     const set = new Set(g.indices);
-    // Delete from highest chunk index to lowest so each IPC sees a
-    // valid still-present index in the backend timeline (which the
-    // first delete starts shifting). The optimistic frontend update
-    // operates on the original index set in one shot.
-    const sortedDesc = [...g.indices].sort((a, b) => b - a);
+    // Map each merged-timeline index to its (session, local chunk index) so
+    // the edit routes to the right session file. A group is single-session,
+    // so delete highest local index first — each backend delete shifts the
+    // remaining indices in that file.
+    const targets = g.indices
+      .map((ci) => ({ sessionId: timeline[ci]?.sessionId, chunkIdx: timeline[ci]?.chunkIdx }))
+      .filter((t): t is { sessionId: string; chunkIdx: number } => t.sessionId != null)
+      .sort((a, b) => b.chunkIdx - a.chunkIdx);
     setTimeline((tl) => tl.filter((_, i) => !set.has(i)));
-    for (const ci of sortedDesc) {
+    for (const t of targets) {
       try {
-        await ipc.noteTimelineDeleteChunk(noteId, ci);
+        await ipc.noteTimelineDeleteChunk(noteId, t.sessionId, t.chunkIdx);
       } catch (err) {
         console.error("noteTimelineDeleteChunk failed", err);
       }
@@ -2085,12 +2196,15 @@ const TranscriptPlayer = memo(function TranscriptPlayer({
     const next = labels[(at + 1) % labels.length] ?? labels[0];
     if (next === g.label) return;
     const set = new Set(g.indices);
+    const targets = g.indices
+      .map((ci) => ({ sessionId: timeline[ci]?.sessionId, chunkIdx: timeline[ci]?.chunkIdx }))
+      .filter((t): t is { sessionId: string; chunkIdx: number } => t.sessionId != null);
     setTimeline((tl) =>
       tl.map((e, i) => (set.has(i) ? { ...e, label: next } : e)),
     );
-    for (const ci of g.indices) {
+    for (const t of targets) {
       try {
-        await ipc.noteTimelineSetChunkLabel(noteId, ci, next);
+        await ipc.noteTimelineSetChunkLabel(noteId, t.sessionId, t.chunkIdx, next);
       } catch (err) {
         console.error("noteTimelineSetChunkLabel failed", err);
       }
@@ -2101,10 +2215,17 @@ const TranscriptPlayer = memo(function TranscriptPlayer({
 
   return (
     <div className={fill ? "flex flex-col min-h-0 flex-1" : undefined}>
+      <div className={cn(fill && "shrink-0")}>
+        <RecordingSessions
+          sessions={sessions}
+          activeId={activePillId}
+          onSelect={selectSession}
+        />
+      </div>
       <div className={cn("flex items-center gap-2 mb-3", fill && "shrink-0")}>
         <audio
           ref={audioRef}
-          src={playbackUrl}
+          src={activeUrl ?? undefined}
           controls
           // preload="auto" so the whole WAV streams in up-front and
           // every subsequent seek is in-memory. With "metadata" each
@@ -2144,6 +2265,7 @@ const TranscriptPlayer = memo(function TranscriptPlayer({
       ) : (
         <div
           ref={scrollRef}
+          onScroll={handleScroll}
           className={cn(
             "text-sm leading-relaxed text-[var(--color-text-muted)] overflow-y-auto",
             fill && "flex-1 min-h-0",
@@ -2207,6 +2329,12 @@ const TranscriptPlayer = memo(function TranscriptPlayer({
                   transform: `translateY(${vrow.start}px)`,
                 }}
               >
+              {sessions.length > 1 && g.firstInSession && (
+                <SessionDivider
+                  session={sessionById.get(g.sessionId)}
+                  index={g.sessionIndex}
+                />
+              )}
               <div
                 data-idx={gi}
                 className={
@@ -2249,7 +2377,7 @@ const TranscriptPlayer = memo(function TranscriptPlayer({
                           key={wi}
                           onClick={(e) => {
                             e.stopPropagation();
-                            seek(w.start_ms);
+                            seekInSession(g.sessionId, w.start_ms);
                           }}
                           className={
                             "nd-word " + (wordActive ? "nd-word-active" : "")
@@ -2271,7 +2399,7 @@ const TranscriptPlayer = memo(function TranscriptPlayer({
                 ) : (
                   <button
                     type="button"
-                    onClick={() => seek(g.startMs)}
+                    onClick={() => seekInSession(g.sessionId, g.startMs)}
                     title="Click to play from here"
                     className="text-left flex-1 nd-bare cursor-text"
                   >
@@ -2311,6 +2439,32 @@ const TranscriptPlayer = memo(function TranscriptPlayer({
     </div>
   );
 });
+
+// Session divider rendered in the styled reader at each take's first turn
+// (#16). Manifest-derived and orientation-only — since it's anchored to the
+// timeline (the same source the styled view renders from), it always sits at
+// a real session boundary and never drifts, even when the user hand-edits the
+// transcript textarea (that edits the DB text, not the timeline).
+function SessionDivider({
+  session,
+  index,
+}: {
+  session: NoteSession | undefined;
+  index: number;
+}) {
+  const caption = session ? formatSessionCaption(session) : "";
+  return (
+    <div className="flex items-center gap-2 px-2 pt-3 pb-1 select-none">
+      <span className="nd-label shrink-0">Recording {index}</span>
+      {caption && caption !== `Recording ${index}` && (
+        <span className="text-[10px] text-[color:var(--color-text-muted)] tracking-[0.02em]">
+          {caption}
+        </span>
+      )}
+      <span className="h-px flex-1 bg-[color:var(--color-line-visible)]" aria-hidden />
+    </div>
+  );
+}
 
 function escapeHtml(s: string): string {
   return s

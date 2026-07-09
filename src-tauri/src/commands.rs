@@ -1,6 +1,7 @@
 use crate::db;
 use crate::diarize;
 use crate::local_whisper;
+use crate::sessions;
 use crate::wav;
 use crate::recording::{ChunkRecord, ChunkSource, DiagnosticPayload, ErrorPayload, Inflight, Phase, RecordingStatus, SidecarEvent, TranscriptPayload};
 use crate::AppState;
@@ -107,7 +108,16 @@ fn err<E: std::fmt::Display>(e: E) -> String { e.to_string() }
 #[tauri::command]
 pub async fn rediarize_note(app: AppHandle, note_id: String) -> Result<(), String> {
     let app_dir = app.path().app_data_dir().map_err(err)?;
-    let audio_dir = app_dir.join("recordings").join(&note_id);
+    // Re-diarize operates on the most recent session's retained audio. Legacy
+    // flat notes resolve to the flat dir; multi-session notes re-diarize the
+    // latest take (earlier takes keep their existing labels — full
+    // cross-session unification is issue #17).
+    let recordings = sessions::recordings_dir(&app_dir, &note_id);
+    let audio_dir = sessions::latest_session_dir(&recordings);
+    let session_id = sessions::resolve_sessions(&recordings)
+        .last()
+        .map(|(e, _)| e.id.clone())
+        .unwrap_or_else(|| sessions::LEGACY_SESSION_ID.to_string());
     let mic_path = audio_dir.join("mic.wav");
     let sys_path = audio_dir.join("sys.wav");
     let mic_wav = if mic_path.exists() { Some(mic_path) } else { None };
@@ -151,6 +161,7 @@ pub async fn rediarize_note(app: AppHandle, note_id: String) -> Result<(), Strin
     rediarize_apply_to_chunks(
         app,
         note_id,
+        session_id,
         mic_wav,
         sys_wav,
         chunks,
@@ -237,7 +248,8 @@ fn read_chunks_from_diagnostic(diag_dir: &std::path::Path) -> anyhow::Result<Vec
 /// chunks.json existed.
 fn read_chunks_for_note(app: &AppHandle, note_id: &str) -> anyhow::Result<Vec<ChunkRecord>> {
     let app_dir = app.path().app_data_dir()?;
-    let chunks_path = app_dir.join("recordings").join(note_id).join("chunks.json");
+    let recordings = sessions::recordings_dir(&app_dir, note_id);
+    let chunks_path = sessions::latest_session_dir(&recordings).join("chunks.json");
     if chunks_path.exists() {
         let chunks = parse_chunks_json(&chunks_path)?;
         if !chunks.is_empty() {
@@ -255,6 +267,7 @@ fn read_chunks_for_note(app: &AppHandle, note_id: &str) -> anyhow::Result<Vec<Ch
 async fn rediarize_apply_to_chunks(
     app: AppHandle,
     note_id: String,
+    session_id: String,
     mic_wav: Option<PathBuf>,
     sys_wav: Option<PathBuf>,
     chunks: Vec<ChunkRecord>,
@@ -396,37 +409,69 @@ async fn rediarize_apply_to_chunks(
         return Err(anyhow::anyhow!("re-diarize produced empty transcript"));
     }
 
-    {
-        let state: State<AppState> = app.state();
-        let conn = state.db.lock();
-        db::set_transcript(&conn, &note_id, &new_transcript)?;
-    }
-    note_changed_for_sync(&app, &note_id); // re-diarize rewrote the transcript
-    let _ = app.emit(
-        "transcript_replaced",
-        TranscriptPayload {
-            note_id: note_id.clone(),
-            text: new_transcript,
-        },
-    );
+    // Offset this session's speaker numbers past any in the prior sessions,
+    // so re-diarizing the latest take of a multi-session note doesn't collide
+    // its "Speaker 1" with an earlier take's. For a single-session / legacy
+    // note this is 0 and the behaviour is unchanged.
+    let label_offset = prior_sessions_speaker_offset(&app, &note_id, &session_id);
 
-    // Refresh the playback timeline so highlighting reflects the new
-    // labels. The mixed playback.wav is rebuilt too — cheap, idempotent,
-    // and saves us from having a separate "did the audio change?"
-    // signal. Re-diarize doesn't change audio content, but downstream
-    // assumptions about the bundle being self-consistent survive.
-    let timeline = serialize_timeline(&chunks, split_chunk.as_ref());
+    // Refresh the playback timeline so highlighting reflects the new labels.
+    // The mixed playback.wav is rebuilt too — cheap, idempotent. Write it
+    // FIRST, then rebuild the full DB transcript from every session's timeline
+    // (so earlier takes are preserved), matching the per-chunk edit path.
+    let timeline = serialize_timeline(&chunks, split_chunk.as_ref(), label_offset);
     write_playback_assets(
         &app,
         &note_id,
+        &session_id,
         timeline,
         mic_wav.as_deref(),
         sys_wav.as_deref(),
     )
     .await;
 
+    let full_transcript = rebuild_note_transcript(&app, &note_id).map_err(|e| anyhow::anyhow!(e))?;
+    {
+        let state: State<AppState> = app.state();
+        let conn = state.db.lock();
+        db::set_transcript(&conn, &note_id, &full_transcript)?;
+    }
+    note_changed_for_sync(&app, &note_id); // re-diarize rewrote the transcript
+    let _ = app.emit(
+        "transcript_replaced",
+        TranscriptPayload {
+            note_id: note_id.clone(),
+            text: full_transcript,
+        },
+    );
+
     emit_status(&app, None, Phase::Idle);
     Ok(())
+}
+
+/// Speaker-number offset for a session being (re)built in isolation: the
+/// highest `Speaker N` across every *earlier* session's timeline. Mirrors
+/// what `combine_with_snapshot` would have produced from the prior takes.
+fn prior_sessions_speaker_offset(app: &AppHandle, note_id: &str, session_id: &str) -> u32 {
+    let Ok(app_dir) = app.path().app_data_dir() else {
+        return 0;
+    };
+    let recordings = sessions::recordings_dir(&app_dir, note_id);
+    let mut acc = String::new();
+    for (entry, dir) in sessions::resolve_sessions(&recordings) {
+        if entry.id == session_id {
+            break;
+        }
+        let values = read_timeline_values(&dir.join("timeline.jsonl"));
+        let part = group_values_to_transcript(&values);
+        if !part.trim().is_empty() {
+            if !acc.is_empty() {
+                acc.push('\n');
+            }
+            acc.push_str(&part);
+        }
+    }
+    max_speaker_number(&acc)
 }
 
 /// One word's text + millisecond bounds in stream-absolute time.
@@ -449,36 +494,45 @@ pub struct TimelineWord {
 /// to whichever started most recently — older timelines (pre-end_ms)
 /// fall back to start-only behavior on read.
 #[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TimelineEntry {
     pub start_ms: u64,
     pub end_ms: u64,
     pub label: String,
     pub text: String,
     pub words: Vec<TimelineWord>,
+    // Which session (persisted recording) this entry belongs to, and its
+    // 0-based line index *within that session's* timeline.jsonl. `note_timeline`
+    // concatenates every session's timeline into one merged document (so the
+    // reader never hides text), and the per-chunk edit IPCs
+    // (set-label / delete) route back to the right session file via these.
+    // `start_ms` / `end_ms` / word times stay session-*local* — the player
+    // loads one session's playback.wav at a time and matches only that
+    // session's entries against the playhead.
+    pub session_id: String,
+    pub session_index: u32,
+    pub chunk_idx: usize,
 }
 
-/// Read the timeline.jsonl that `write_playback_assets` saved. Returns
-/// an empty vec for older notes / failed reads — the frontend treats
-/// "no timeline" as "no highlighting available" and renders the plain
-/// transcript instead.
-#[tauri::command]
-pub fn note_timeline(app: AppHandle, note_id: String) -> Result<Vec<TimelineEntry>, String> {
-    let path = app
-        .path()
-        .app_data_dir()
-        .map_err(err)?
-        .join("recordings")
-        .join(&note_id)
-        .join("timeline.jsonl");
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let content = std::fs::read_to_string(&path).map_err(|e| format!("read timeline: {e}"))?;
+/// Parse one session's `timeline.jsonl` into entries carrying that session's
+/// identity. Skips malformed lines; backfills a usable `end_ms` for legacy
+/// entries (pre-`end_ms`) by stretching to the next entry's start (or +5 s
+/// for the last). Times stay session-*local* — one file is one session's own
+/// playback timeline.
+fn parse_session_timeline(
+    path: &std::path::Path,
+    session_id: &str,
+    session_index: u32,
+) -> Vec<TimelineEntry> {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
     let mut out = Vec::new();
-    for line in content.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
+    for (idx, line) in content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .enumerate()
+    {
         let v: serde_json::Value = match serde_json::from_str(line) {
             Ok(v) => v,
             Err(e) => {
@@ -500,31 +554,17 @@ pub fn note_timeline(app: AppHandle, note_id: String) -> Result<Vec<TimelineEntr
                     .collect()
             })
             .unwrap_or_default();
-        let start_ms = v.get("start_ms").and_then(|s| s.as_u64()).unwrap_or(0);
-        // Older timelines (pre-end_ms) didn't write the field. Default to 0
-        // here; the synthesis pass below extends each missing end_ms to the
-        // next chunk's start_ms so chunk-level highlight still works.
-        let end_ms = v.get("end_ms").and_then(|s| s.as_u64()).unwrap_or(0);
         out.push(TimelineEntry {
-            start_ms,
-            end_ms,
-            label: v
-                .get("label")
-                .and_then(|s| s.as_str())
-                .unwrap_or("")
-                .to_string(),
-            text: v
-                .get("text")
-                .and_then(|s| s.as_str())
-                .unwrap_or("")
-                .to_string(),
+            start_ms: v.get("start_ms").and_then(|s| s.as_u64()).unwrap_or(0),
+            end_ms: v.get("end_ms").and_then(|s| s.as_u64()).unwrap_or(0),
+            label: v.get("label").and_then(|s| s.as_str()).unwrap_or("").to_string(),
+            text: v.get("text").and_then(|s| s.as_str()).unwrap_or("").to_string(),
             words,
+            session_id: session_id.to_string(),
+            session_index,
+            chunk_idx: idx,
         });
     }
-    // Backfill end_ms for legacy entries: stretch each zero-end entry to the
-    // next entry's start_ms (or +5s if it's the last). The frontend then
-    // gets a usable interval per chunk regardless of when the note was
-    // recorded, without a migration pass.
     for i in 0..out.len() {
         if out[i].end_ms <= out[i].start_ms {
             let fallback = out
@@ -536,53 +576,206 @@ pub fn note_timeline(app: AppHandle, note_id: String) -> Result<Vec<TimelineEntr
             out[i].end_ms = fallback;
         }
     }
+    out
+}
+
+/// Merged timeline for a note: every session's `timeline.jsonl` concatenated
+/// in manifest order, each entry tagged with its session id/index and its
+/// local chunk index. Legacy flat notes resolve to a single session. Empty
+/// for older notes / failed reads — the frontend treats "no timeline" as "no
+/// highlighting available" and renders the plain transcript instead.
+///
+/// This is the field-report reader fix (#16): the styled reader renders the
+/// FULL merged transcript across every take; the player only karaoke-matches
+/// the *active* session's entries against its loaded playback.wav, and never
+/// hides text from sessions it isn't currently playing.
+#[tauri::command]
+pub fn note_timeline(app: AppHandle, note_id: String) -> Result<Vec<TimelineEntry>, String> {
+    let app_dir = app.path().app_data_dir().map_err(err)?;
+    let recordings = sessions::recordings_dir(&app_dir, &note_id);
+    let mut out = Vec::new();
+    for (entry, dir) in sessions::resolve_sessions(&recordings) {
+        out.extend(parse_session_timeline(
+            &dir.join("timeline.jsonl"),
+            &entry.id,
+            entry.index,
+        ));
+    }
     Ok(out)
 }
 
-/// Override the speaker label for a single chunk in the timeline,
-/// then rebuild `note.transcript` from the updated timeline so the
-/// saved text reflects the change. Used when the user clicks a chunk
-/// pill to cycle through speakers — handles cases where diarize
-/// merged or split turns incorrectly.
+/// Session metadata for a note, in recording order. Drives the playback
+/// carousel (numbered pills + per-session date/duration/streams) and the
+/// styled reader's session dividers. Empty for notes with no recordings.
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NoteSession {
+    pub id: String,
+    pub index: u32,
+    pub started_at: String,
+    pub duration_ms: u64,
+    pub streams: Vec<String>,
+    /// Whether this session has a playable `playback.wav` on disk.
+    pub has_playback: bool,
+}
+
+/// List a note's recording sessions (see [`NoteSession`]).
+#[tauri::command]
+pub fn note_sessions(app: AppHandle, note_id: String) -> Result<Vec<NoteSession>, String> {
+    let app_dir = app.path().app_data_dir().map_err(err)?;
+    let recordings = sessions::recordings_dir(&app_dir, &note_id);
+    let out = sessions::resolve_sessions(&recordings)
+        .into_iter()
+        .map(|(e, dir)| NoteSession {
+            id: e.id,
+            index: e.index,
+            started_at: e.started_at,
+            duration_ms: e.duration_ms,
+            streams: e.streams,
+            has_playback: dir.join("playback.wav").exists(),
+        })
+        .collect();
+    Ok(out)
+}
+
+/// Path to a specific session's `playback.wav`, or `None` when absent. The
+/// frontend feeds this through `convertFileSrc` into the `<audio>` element
+/// when the user switches the carousel to that session.
+#[tauri::command]
+pub fn note_session_playback_path(
+    app: AppHandle,
+    note_id: String,
+    session_id: String,
+) -> Result<Option<String>, String> {
+    let app_dir = app.path().app_data_dir().map_err(err)?;
+    let recordings = sessions::recordings_dir(&app_dir, &note_id);
+    let Some(dir) = sessions::resolve_session_dir(&recordings, &session_id) else {
+        return Ok(None);
+    };
+    let path = dir.join("playback.wav");
+    if !path.exists() {
+        return Ok(None);
+    }
+    Ok(path.to_str().map(|s| s.to_string()))
+}
+
+/// Parse a `timeline.jsonl` into raw JSON values, skipping blank/malformed
+/// lines. Shared by the per-chunk edit commands.
+fn read_timeline_values(path: &std::path::Path) -> Vec<serde_json::Value> {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .collect()
+}
+
+/// Write timeline values back as JSONL (one object per line).
+fn write_timeline_values(path: &std::path::Path, values: &[serde_json::Value]) -> Result<(), String> {
+    let mut out = String::new();
+    for v in values {
+        out.push_str(&v.to_string());
+        out.push('\n');
+    }
+    std::fs::write(path, out).map_err(|e| format!("write timeline: {e}"))
+}
+
+/// Group one session's timeline values into transcript lines: consecutive
+/// same-label entries join with a space; a label change starts a new line
+/// prefixed `Label: `. Mirrors `build_labelled_transcript`. Returns the
+/// session's contribution with no trailing newline.
+fn group_values_to_transcript(values: &[serde_json::Value]) -> String {
+    let mut out = String::new();
+    let mut last_label: Option<String> = None;
+    for v in values {
+        let label = v.get("label").and_then(|s| s.as_str()).unwrap_or("").to_string();
+        let text = v.get("text").and_then(|s| s.as_str()).unwrap_or("").trim();
+        if text.is_empty() {
+            continue;
+        }
+        if last_label.as_deref() != Some(label.as_str()) {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            if !label.is_empty() {
+                out.push_str(&format!("{label}: "));
+            }
+            last_label = Some(label);
+        } else {
+            out.push(' ');
+        }
+        out.push_str(text);
+    }
+    out
+}
+
+/// Rebuild the note's full DB transcript from every session's timeline, in
+/// manifest order, joined by newlines. Because each session's timeline stores
+/// its speaker labels *already offset* (see `serialize_timeline`), the plain
+/// concatenation reproduces the same labelled transcript
+/// `combine_with_snapshot` wrote — so a per-chunk edit in one session never
+/// clobbers the others.
+fn rebuild_note_transcript(app: &AppHandle, note_id: &str) -> Result<String, String> {
+    let app_dir = app.path().app_data_dir().map_err(err)?;
+    let recordings = sessions::recordings_dir(&app_dir, note_id);
+    let mut parts = Vec::new();
+    for (_, dir) in sessions::resolve_sessions(&recordings) {
+        let values = read_timeline_values(&dir.join("timeline.jsonl"));
+        let part = group_values_to_transcript(&values);
+        if !part.trim().is_empty() {
+            parts.push(part);
+        }
+    }
+    Ok(parts.join("\n"))
+}
+
+/// Persist a rebuilt transcript to the DB, ping sync, and notify the UI.
+fn commit_rebuilt_transcript(app: &AppHandle, note_id: &str, transcript: String) -> Result<(), String> {
+    {
+        let state: State<AppState> = app.state();
+        let conn = state.db.lock();
+        db::set_transcript(&conn, note_id, &transcript).map_err(err)?;
+    }
+    note_changed_for_sync(app, note_id); // timeline edit rewrote the transcript
+    let _ = app.emit(
+        "transcript_replaced",
+        TranscriptPayload {
+            note_id: note_id.to_string(),
+            text: transcript,
+        },
+    );
+    Ok(())
+}
+
+/// Override the speaker label for a single chunk in a session's timeline,
+/// then rebuild `note.transcript` across *all* sessions so the saved text
+/// reflects the change. Used when the user clicks a chunk pill to cycle
+/// through speakers — handles cases where diarize merged or split turns
+/// incorrectly.
 ///
-/// `chunk_idx` is the 0-based line index in timeline.jsonl. We
-/// identify by index (not start_ms) because two chunks could in
-/// principle land at the same start_ms, and the file is the source of
-/// truth for ordering anyway.
+/// `session_id` selects which take's timeline file to edit (legacy flat
+/// notes pass [`sessions::LEGACY_SESSION_ID`]); `chunk_idx` is the 0-based
+/// line index within *that* file.
 #[tauri::command]
 pub fn note_timeline_set_chunk_label(
     app: AppHandle,
     note_id: String,
+    session_id: String,
     chunk_idx: usize,
     new_label: String,
 ) -> Result<(), String> {
-    let path = app
-        .path()
-        .app_data_dir()
-        .map_err(err)?
-        .join("recordings")
-        .join(&note_id)
-        .join("timeline.jsonl");
+    let app_dir = app.path().app_data_dir().map_err(err)?;
+    let recordings = sessions::recordings_dir(&app_dir, &note_id);
+    let Some(dir) = sessions::resolve_session_dir(&recordings, &session_id) else {
+        return Err("no timeline for this session".to_string());
+    };
+    let path = dir.join("timeline.jsonl");
     if !path.exists() {
         return Err("no timeline for this note".to_string());
     }
-    let content = std::fs::read_to_string(&path).map_err(|e| format!("read timeline: {e}"))?;
-
-    // Parse all entries first so we can rewrite the file atomically
-    // and rebuild the transcript from the same structure. Skip
-    // malformed lines on read so a corrupt entry doesn't poison the
-    // whole rename — they get dropped, not preserved (the alternative
-    // is rendering them in the file but not the transcript, which is
-    // worse).
-    let mut entries: Vec<serde_json::Value> = Vec::new();
-    for line in content.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-            entries.push(v);
-        }
-    }
+    let mut entries = read_timeline_values(&path);
     if chunk_idx >= entries.len() {
         return Err(format!(
             "chunk_idx {chunk_idx} out of bounds (timeline has {} entries)",
@@ -590,91 +783,32 @@ pub fn note_timeline_set_chunk_label(
         ));
     }
     entries[chunk_idx]["label"] = serde_json::Value::String(new_label);
+    write_timeline_values(&path, &entries)?;
 
-    // Write timeline back.
-    let mut out = String::with_capacity(content.len());
-    for v in &entries {
-        out.push_str(&v.to_string());
-        out.push('\n');
-    }
-    std::fs::write(&path, out).map_err(|e| format!("write timeline: {e}"))?;
-
-    // Rebuild the DB transcript from the updated timeline. Group
-    // consecutive same-label entries into one line, exactly the way
-    // build_labelled_transcript would. This keeps note.transcript in
-    // sync so summaries + the textarea edit view see the relabel.
-    let mut transcript = String::new();
-    let mut last_label: Option<String> = None;
-    for v in &entries {
-        let label = v
-            .get("label")
-            .and_then(|s| s.as_str())
-            .unwrap_or("")
-            .to_string();
-        let text = v.get("text").and_then(|s| s.as_str()).unwrap_or("").trim();
-        if text.is_empty() {
-            continue;
-        }
-        if last_label.as_deref() != Some(label.as_str()) {
-            if !transcript.is_empty() {
-                transcript.push('\n');
-            }
-            if !label.is_empty() {
-                transcript.push_str(&format!("{label}: "));
-            }
-            last_label = Some(label);
-        } else {
-            transcript.push(' ');
-        }
-        transcript.push_str(text);
-    }
-
-    {
-        let state: State<AppState> = app.state();
-        let conn = state.db.lock();
-        db::set_transcript(&conn, &note_id, &transcript).map_err(err)?;
-    }
-    note_changed_for_sync(&app, &note_id); // timeline edit rewrote the transcript
-    let _ = app.emit(
-        "transcript_replaced",
-        TranscriptPayload {
-            note_id: note_id.clone(),
-            text: transcript,
-        },
-    );
-    Ok(())
+    let transcript = rebuild_note_transcript(&app, &note_id)?;
+    commit_rebuilt_transcript(&app, &note_id, transcript)
 }
 
-/// Drop a single chunk from the timeline by index, then rebuild
-/// `note.transcript` from what's left. Used when the user clicks the
-/// per-row × in the player view to remove an off-topic chunk
-/// (e.g. unrelated speech that bled in from system audio).
+/// Drop a single chunk from a session's timeline by index, then rebuild
+/// `note.transcript` across all sessions from what's left. Used when the user
+/// clicks the per-row × in the player view to remove an off-topic chunk.
 #[tauri::command]
 pub fn note_timeline_delete_chunk(
     app: AppHandle,
     note_id: String,
+    session_id: String,
     chunk_idx: usize,
 ) -> Result<(), String> {
-    let path = app
-        .path()
-        .app_data_dir()
-        .map_err(err)?
-        .join("recordings")
-        .join(&note_id)
-        .join("timeline.jsonl");
+    let app_dir = app.path().app_data_dir().map_err(err)?;
+    let recordings = sessions::recordings_dir(&app_dir, &note_id);
+    let Some(dir) = sessions::resolve_session_dir(&recordings, &session_id) else {
+        return Err("no timeline for this session".to_string());
+    };
+    let path = dir.join("timeline.jsonl");
     if !path.exists() {
         return Err("no timeline for this note".to_string());
     }
-    let content = std::fs::read_to_string(&path).map_err(|e| format!("read timeline: {e}"))?;
-    let mut entries: Vec<serde_json::Value> = Vec::new();
-    for line in content.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-            entries.push(v);
-        }
-    }
+    let mut entries = read_timeline_values(&path);
     if chunk_idx >= entries.len() {
         return Err(format!(
             "chunk_idx {chunk_idx} out of bounds (timeline has {} entries)",
@@ -682,68 +816,19 @@ pub fn note_timeline_delete_chunk(
         ));
     }
     entries.remove(chunk_idx);
+    // Leave a zero-byte file when emptied so subsequent reads still find it.
+    write_timeline_values(&path, &entries)?;
 
-    // Write back. If we just emptied the file, leave a zero-byte file
-    // so subsequent reads still find it (and produce zero entries).
-    let mut out = String::with_capacity(content.len());
-    for v in &entries {
-        out.push_str(&v.to_string());
-        out.push('\n');
-    }
-    std::fs::write(&path, out).map_err(|e| format!("write timeline: {e}"))?;
-
-    // Rebuild the DB transcript from the surviving entries — same
-    // grouping as note_timeline_set_chunk_label so summaries pick
-    // up the deletion immediately.
-    let mut transcript = String::new();
-    let mut last_label: Option<String> = None;
-    for v in &entries {
-        let label = v
-            .get("label")
-            .and_then(|s| s.as_str())
-            .unwrap_or("")
-            .to_string();
-        let text = v.get("text").and_then(|s| s.as_str()).unwrap_or("").trim();
-        if text.is_empty() {
-            continue;
-        }
-        if last_label.as_deref() != Some(label.as_str()) {
-            if !transcript.is_empty() {
-                transcript.push('\n');
-            }
-            if !label.is_empty() {
-                transcript.push_str(&format!("{label}: "));
-            }
-            last_label = Some(label);
-        } else {
-            transcript.push(' ');
-        }
-        transcript.push_str(text);
-    }
-
-    {
-        let state: State<AppState> = app.state();
-        let conn = state.db.lock();
-        db::set_transcript(&conn, &note_id, &transcript).map_err(err)?;
-    }
-    note_changed_for_sync(&app, &note_id); // timeline edit rewrote the transcript
-    let _ = app.emit(
-        "transcript_replaced",
-        TranscriptPayload {
-            note_id: note_id.clone(),
-            text: transcript,
-        },
-    );
-    Ok(())
+    let transcript = rebuild_note_transcript(&app, &note_id)?;
+    commit_rebuilt_transcript(&app, &note_id, transcript)
 }
 
-/// Rewrite every timeline entry whose label exactly matches `old_label`
-/// to use `new_label` instead. Mirrors the regex line-anchored rename
-/// the frontend already does on `note.transcript`, so the player view's
-/// chunk highlights stay in sync with the saved transcript when the
-/// user renames a speaker via the chip strip. Best-effort: returns
-/// silently when no timeline.jsonl exists (older notes), and skips
-/// malformed lines instead of failing the whole rewrite.
+/// Rewrite every timeline entry whose label exactly matches `old_label` to
+/// use `new_label` instead, across **all** of the note's sessions. Mirrors
+/// the regex line-anchored rename the frontend does on `note.transcript`, so
+/// the player's chunk highlights stay in sync when the user renames (or
+/// merges, #23) a speaker via the chip strip. Best-effort: skips sessions
+/// with no timeline and malformed lines instead of failing the whole rewrite.
 #[tauri::command]
 pub fn note_timeline_rename(
     app: AppHandle,
@@ -754,37 +839,40 @@ pub fn note_timeline_rename(
     if old_label == new_label {
         return Ok(());
     }
-    let path = app
-        .path()
-        .app_data_dir()
-        .map_err(err)?
-        .join("recordings")
-        .join(&note_id)
-        .join("timeline.jsonl");
-    if !path.exists() {
-        return Ok(());
-    }
-    let content = std::fs::read_to_string(&path).map_err(|e| format!("read timeline: {e}"))?;
-    let mut out = String::with_capacity(content.len());
-    for line in content.lines() {
-        if line.trim().is_empty() {
+    let app_dir = app.path().app_data_dir().map_err(err)?;
+    let recordings = sessions::recordings_dir(&app_dir, &note_id);
+    for (_, dir) in sessions::resolve_sessions(&recordings) {
+        let path = dir.join("timeline.jsonl");
+        if !path.exists() {
             continue;
         }
-        let mut v: serde_json::Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(_) => {
-                out.push_str(line);
-                out.push('\n');
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let mut out = String::with_capacity(content.len());
+        for line in content.lines() {
+            if line.trim().is_empty() {
                 continue;
             }
-        };
-        if v.get("label").and_then(|s| s.as_str()) == Some(old_label.as_str()) {
-            v["label"] = serde_json::Value::String(new_label.clone());
+            let mut v: serde_json::Value = match serde_json::from_str(line) {
+                Ok(v) => v,
+                Err(_) => {
+                    out.push_str(line);
+                    out.push('\n');
+                    continue;
+                }
+            };
+            if v.get("label").and_then(|s| s.as_str()) == Some(old_label.as_str()) {
+                v["label"] = serde_json::Value::String(new_label.clone());
+            }
+            out.push_str(&v.to_string());
+            out.push('\n');
         }
-        out.push_str(&v.to_string());
-        out.push('\n');
+        if let Err(e) = std::fs::write(&path, out) {
+            eprintln!("timeline rename: write {}: {e}", path.display());
+        }
     }
-    std::fs::write(&path, out).map_err(|e| format!("write timeline: {e}"))?;
     Ok(())
 }
 
@@ -1017,6 +1105,11 @@ struct PostStopSnapshot {
     sys_wav: Option<PathBuf>,
     chunks: Vec<ChunkRecord>,
     transcript_at_start: String,
+    // Persisted-session identity for this capture (allocated at
+    // recording_start). The post-stop chain writes this capture's assets
+    // into `recordings/<note_id>/<session_id>/` and appends a manifest entry.
+    session_id: String,
+    session_started_at: String,
 }
 
 /// Copy the temp-dir full WAVs to a permanent location keyed by
@@ -1024,7 +1117,106 @@ struct PostStopSnapshot {
 /// the post-stop chain *before* diarize_and_apply consumes and deletes
 /// the temp files via cleanup_full_wav. Best-effort: individual copy
 /// failures log and proceed.
-async fn maybe_keep_audio(app: &AppHandle, note_id: &str, snapshot: &PostStopSnapshot) {
+/// Resolve (and create) the write target for this capture's session assets:
+/// `recordings/<note_id>/<session_id>/`. `None` when the app data dir is
+/// unavailable.
+async fn session_write_dir(app: &AppHandle, note_id: &str, session_id: &str) -> Option<PathBuf> {
+    let app_dir = app.path().app_data_dir().ok()?;
+    let recordings = sessions::recordings_dir(&app_dir, note_id);
+    let target = sessions::session_dir(&recordings, session_id);
+    if let Err(e) = tokio::fs::create_dir_all(&target).await {
+        eprintln!("sessions: mkdir {}: {e}", target.display());
+        return None;
+    }
+    Some(target)
+}
+
+/// Which streams produced chunks in this capture (`["mic"]`, `["sys"]`, or
+/// `["mic","sys"]`). Stored on the manifest entry for the carousel tooltip.
+fn session_streams(chunks: &[ChunkRecord]) -> Vec<String> {
+    let mut out = Vec::new();
+    if chunks.iter().any(|c| c.source == ChunkSource::Mic) {
+        out.push("mic".to_string());
+    }
+    if chunks.iter().any(|c| c.source == ChunkSource::Sys) {
+        out.push("sys".to_string());
+    }
+    out
+}
+
+/// Ensure the note's storage is session-shaped before a new take is written,
+/// and report how many sessions already existed. Migrates a pre-feature flat
+/// note into a session subdir on its second recording so the first take
+/// survives (best-effort). Runs the blocking FS work off the async runtime.
+async fn prepare_sessions_for_new_take(app: &AppHandle, note_id: &str) -> usize {
+    let Ok(app_dir) = app.path().app_data_dir() else {
+        return 0;
+    };
+    let note_id = note_id.to_string();
+    tokio::task::spawn_blocking(move || {
+        let recordings = sessions::recordings_dir(&app_dir, &note_id);
+        // Only a flat, manifest-less note migrates; brand-new notes and
+        // already-migrated notes are no-ops.
+        let legacy_id = uuid::Uuid::new_v4().to_string();
+        if let Err(e) = sessions::migrate_flat_if_needed(&recordings, &legacy_id) {
+            eprintln!("sessions: migrate flat {}: {e}", recordings.display());
+        }
+        sessions::existing_session_count(&recordings)
+    })
+    .await
+    .unwrap_or(0)
+}
+
+/// Append this finished take to the note's `sessions.json` manifest. Duration
+/// is read back from the timeline `diarize_and_apply` just wrote (max end_ms)
+/// so it reflects the actual content; 0 when the timeline is missing/empty.
+/// Best-effort — a missing manifest entry only hides the take from the
+/// carousel, it never loses the audio.
+async fn finalize_session(
+    app: &AppHandle,
+    note_id: &str,
+    session_id: &str,
+    started_at: &str,
+    streams: Vec<String>,
+) {
+    let Ok(app_dir) = app.path().app_data_dir() else {
+        return;
+    };
+    let recordings = sessions::recordings_dir(&app_dir, note_id);
+    let duration_ms = timeline_duration_ms(&sessions::session_dir(&recordings, session_id));
+    let session_id = session_id.to_string();
+    let started_at = started_at.to_string();
+    let res = tokio::task::spawn_blocking(move || {
+        sessions::append_session(&recordings, &session_id, &started_at, duration_ms, streams)
+    })
+    .await;
+    if let Err(e) = res.map_err(|e| e.to_string()).and_then(|r| r.map_err(|e| e.to_string())) {
+        eprintln!("sessions: finalize {note_id}: {e}");
+    }
+}
+
+/// Highest `end_ms` across a session dir's `timeline.jsonl`, i.e. the take's
+/// wall-clock length. 0 when the file is absent or empty.
+fn timeline_duration_ms(session_dir: &std::path::Path) -> u64 {
+    let path = session_dir.join("timeline.jsonl");
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return 0;
+    };
+    content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter_map(|v| v.get("end_ms").and_then(|e| e.as_u64()))
+        .max()
+        .unwrap_or(0)
+}
+
+async fn maybe_keep_audio(
+    app: &AppHandle,
+    note_id: &str,
+    snapshot: &PostStopSnapshot,
+    force_retain: bool,
+) {
     let state: State<AppState> = app.state();
     let keep = {
         let conn = state.db.lock();
@@ -1033,20 +1225,18 @@ async fn maybe_keep_audio(app: &AppHandle, note_id: &str, snapshot: &PostStopSna
             .flatten()
             .unwrap_or_else(|| DEFAULT_KEEP_AUDIO.to_string())
     };
-    if keep != "true" {
+    // Source WAVs are always retained once a note has a second session (so a
+    // later concatenated re-diarize / unification has every take's audio to
+    // work with — issue #16 decision), regardless of the keep_audio setting.
+    if keep != "true" && !force_retain {
         return;
     }
     let mic_wav = snapshot.mic_wav.clone();
     let sys_wav = snapshot.sys_wav.clone();
-    let Ok(app_dir) = app.path().app_data_dir() else {
-        eprintln!("keep_audio: app_data_dir unavailable");
+    let Some(target) = session_write_dir(app, note_id, &snapshot.session_id).await else {
+        eprintln!("keep_audio: session dir unavailable");
         return;
     };
-    let target = app_dir.join("recordings").join(note_id);
-    if let Err(e) = tokio::fs::create_dir_all(&target).await {
-        eprintln!("keep_audio: mkdir {}: {e}", target.display());
-        return;
-    }
     if let Some(src) = mic_wav {
         if let Err(e) = tokio::fs::copy(&src, target.join("mic.wav")).await {
             eprintln!("keep_audio: copy mic: {e}");
@@ -1402,6 +1592,11 @@ pub async fn recording_start(
         s.child = Some(child);
         s.temp_dir = Some(temp_dir);
         s.inflight = inflight.clone();
+        // Allocate this capture's persisted session identity now, so the
+        // post-stop chain writes into recordings/<note_id>/<session_id>/ and
+        // stamps the manifest with a real start time.
+        s.session_id = Some(uuid::Uuid::new_v4().to_string());
+        s.session_started_at = Some(chrono::Utc::now().to_rfc3339());
         // Wipe any context from a previous recording — proper nouns and
         // sentence fragments from a different conversation would only confuse
         // this session's decoder. Same for the speaker bookkeeping. Per-source
@@ -1672,13 +1867,30 @@ pub async fn recording_stop(
     // so it can't race a new `recording_start` (which clears
     // `state.recording.chunk_log`).
     let post_stop = {
-        let s = state.recording.lock();
+        let mut s = state.recording.lock();
         let mic_wav = s.mic_full_wav_path.lock().clone();
         let sys_wav = s.sys_full_wav_path.lock().clone();
         let chunks = s.chunk_log.lock().clone();
         let transcript_at_start = s.transcript_at_start.lock().clone();
+        // Fall back to a fresh UUID if (somehow) unset — a missing id would
+        // only cost this take its own subdir, never a clobber.
+        let session_id = s
+            .session_id
+            .take()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let session_started_at = s
+            .session_started_at
+            .take()
+            .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
         drop(s);
-        PostStopSnapshot { mic_wav, sys_wav, chunks, transcript_at_start }
+        PostStopSnapshot {
+            mic_wav,
+            sys_wav,
+            chunks,
+            transcript_at_start,
+            session_id,
+            session_started_at,
+        }
     };
 
     // Spawn the post-stop processing chain in the background:
@@ -1701,12 +1913,25 @@ pub async fn recording_stop(
         // chunk_log snapshot is complete).
         emit_status(&app_for_post, Some(&note_for_post), Phase::Diarizing);
 
-        // Copy full WAVs to a permanent location FIRST when keep_audio is
-        // on. diarize_and_apply calls cleanup_full_wav on the temp paths
-        // after it's done with them, so retention has to happen before
-        // the diarize step consumes the files.
-        maybe_keep_audio(&app_for_post, &note_for_post, &post_stop).await;
+        // Make the note's storage session-shaped before writing this take.
+        // For a pre-feature flat note, migrate its single take into a session
+        // subdir on this (its second) recording so both takes survive. Count
+        // the sessions that already exist so we can force source-WAV
+        // retention once the note gains a second session (issue #16).
+        let prior_session_count =
+            prepare_sessions_for_new_take(&app_for_post, &note_for_post).await;
+        let force_retain = prior_session_count >= 1;
 
+        // Copy full WAVs into this session's subdir FIRST when keep_audio is
+        // on (or auto-retained because this is a 2nd+ session).
+        // diarize_and_apply calls cleanup_full_wav on the temp paths after
+        // it's done with them, so retention has to happen before the diarize
+        // step consumes the files.
+        maybe_keep_audio(&app_for_post, &note_for_post, &post_stop, force_retain).await;
+
+        let session_id = post_stop.session_id.clone();
+        let session_started_at = post_stop.session_started_at.clone();
+        let streams = session_streams(&post_stop.chunks);
         if let Err(e) = diarize_and_apply(app_for_post.clone(), note_for_post.clone(), post_stop).await {
             eprintln!("diarize_and_apply: {e}");
             emit_error(
@@ -1715,6 +1940,17 @@ pub async fn recording_stop(
                 &format!("Diarization failed (transcript still saved): {e}"),
             );
         }
+        // Append this take to the manifest so it shows up in the carousel and
+        // in session-aware path resolution. Duration comes from the timeline
+        // diarize_and_apply just wrote (max end_ms); 0 when nothing landed.
+        finalize_session(
+            &app_for_post,
+            &note_for_post,
+            &session_id,
+            &session_started_at,
+            streams,
+        )
+        .await;
         // The recording pipeline wrote the transcript directly (per-chunk during
         // capture, then the labelled rewrite on stop), bypassing the notes_*
         // commands — so push it to the cloud now. Covers every diarize_and_apply
@@ -1771,6 +2007,7 @@ async fn diarize_and_apply(
     let sys_wav = post_stop.sys_wav.clone();
     let chunks = post_stop.chunks.clone();
     let snapshot = post_stop.transcript_at_start.clone();
+    let session_id = post_stop.session_id.clone();
     let (expected_speakers, engine, thresholds) = {
         let state: State<AppState> = app.state();
         let eng = active_diarize_engine(&state);
@@ -1985,6 +2222,10 @@ async fn diarize_and_apply(
 
     let new_session = build_labelled_transcript(&chunks, split_chunk.as_ref());
     let combined = combine_with_snapshot(&snapshot, &new_session);
+    // Same offset combine_with_snapshot applied to the DB transcript — bake it
+    // into this session's timeline labels so the styled reader (rendered from
+    // the concatenated per-session timelines) matches the saved transcript.
+    let label_offset = session_speaker_offset(&snapshot);
     if combined.trim().is_empty() {
         return Ok(());
     }
@@ -2007,10 +2248,11 @@ async fn diarize_and_apply(
     // log to stderr but don't abort the post-stop chain. Compute the
     // timeline synchronously so the splitter doesn't have to be Send +
     // Sync to cross the awaits inside write_playback_assets.
-    let timeline = serialize_timeline(&chunks, split_chunk.as_ref());
+    let timeline = serialize_timeline(&chunks, split_chunk.as_ref(), label_offset);
     write_playback_assets(
         &app,
         &note_id,
+        &session_id,
         timeline,
         mic_wav.as_deref(),
         sys_wav.as_deref(),
@@ -2083,6 +2325,33 @@ fn combine_with_snapshot(snapshot: &str, new_session: &str) -> String {
         new_trimmed.to_string()
     };
     format!("{snap_trimmed}\n{offset_new}")
+}
+
+/// Per-session speaker-number offset: the highest `Speaker N` already present
+/// in the prior-transcript snapshot. This is the same value
+/// `combine_with_snapshot` uses to renumber a resumed take's speakers, and it
+/// gets baked into the session's own `timeline.jsonl` labels so the styled
+/// reader (which renders from the concatenated timelines) shows exactly the
+/// same labels as the saved transcript + chip strip.
+fn session_speaker_offset(snapshot: &str) -> u32 {
+    max_speaker_number(snapshot.trim_end())
+}
+
+/// Offset a *bare* speaker label (no trailing colon): `"Speaker 2"` + 3 →
+/// `"Speaker 5"`. Non-numbered labels (`"You"`, `"Michael"`) and the empty
+/// label pass through untouched, matching `offset_speaker_numbers`.
+fn offset_speaker_label(label: &str, offset: u32) -> String {
+    if offset == 0 {
+        return label.to_string();
+    }
+    if let Some(rest) = label.strip_prefix("Speaker ") {
+        if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()) {
+            if let Ok(n) = rest.parse::<u32>() {
+                return format!("Speaker {}", n + offset);
+            }
+        }
+    }
+    label.to_string()
 }
 
 /// Highest N appearing in any line that starts with `Speaker N:`. Returns
@@ -2330,6 +2599,7 @@ fn normalize_tokens(s: &str) -> Vec<String> {
 async fn write_playback_assets(
     app: &AppHandle,
     note_id: &str,
+    session_id: &str,
     timeline: String,
     mic_wav: Option<&std::path::Path>,
     sys_wav: Option<&std::path::Path>,
@@ -2337,15 +2607,10 @@ async fn write_playback_assets(
     if mic_wav.is_none() && sys_wav.is_none() && timeline.is_empty() {
         return;
     }
-    let Ok(app_dir) = app.path().app_data_dir() else {
-        eprintln!("playback: app_data_dir unavailable");
+    let Some(target) = session_write_dir(app, note_id, session_id).await else {
+        eprintln!("playback: session dir unavailable");
         return;
     };
-    let target = app_dir.join("recordings").join(note_id);
-    if let Err(e) = tokio::fs::create_dir_all(&target).await {
-        eprintln!("playback: mkdir {}: {e}", target.display());
-        return;
-    }
 
     if let Err(e) = build_playback_wav(mic_wav, sys_wav, &target.join("playback.wav")).await {
         eprintln!("playback: build_playback_wav: {e}");
@@ -2404,6 +2669,7 @@ async fn build_playback_wav(
 fn serialize_timeline(
     chunks: &[ChunkRecord],
     split_chunk: &dyn Fn(&ChunkRecord) -> Vec<LabelledPiece>,
+    label_offset: u32,
 ) -> String {
     let kept = dedup_mic_against_sys(chunks);
     let mut sorted: Vec<&ChunkRecord> = kept.iter().collect();
@@ -2531,7 +2797,7 @@ fn serialize_timeline(
         let json = serde_json::json!({
             "start_ms": entry.start_ms,
             "end_ms": end_ms,
-            "label": entry.label,
+            "label": offset_speaker_label(&entry.label, label_offset),
             "text": entry.text,
             "words": entry.words,
         });
@@ -4756,6 +5022,91 @@ mod diarize_tests {
         assert_eq!(
             combine_with_snapshot(snap, new),
             "Michael: prior\nWilma: prior\nSpeaker 1: new"
+        );
+    }
+
+    // ---- Per-session (#16) label offset + timeline plumbing -------------
+
+    #[test]
+    fn offset_speaker_label_bumps_numbered_only() {
+        assert_eq!(offset_speaker_label("Speaker 1", 3), "Speaker 4");
+        assert_eq!(offset_speaker_label("Speaker 12", 2), "Speaker 14");
+        // Zero offset, non-numbered, and renamed labels pass through.
+        assert_eq!(offset_speaker_label("Speaker 1", 0), "Speaker 1");
+        assert_eq!(offset_speaker_label("You", 5), "You");
+        assert_eq!(offset_speaker_label("Michael", 5), "Michael");
+        assert_eq!(offset_speaker_label("", 5), "");
+    }
+
+    #[test]
+    fn session_speaker_offset_matches_combine_offset() {
+        // The offset baked into a session's timeline must equal the one
+        // combine_with_snapshot applies to the DB transcript, so the reader
+        // (rendered from concatenated timelines) and the chip strip agree.
+        let snap = "Speaker 1: a\nSpeaker 2: b";
+        assert_eq!(session_speaker_offset(snap), 2);
+        assert_eq!(session_speaker_offset(""), 0);
+        assert_eq!(session_speaker_offset("You: hi\nMichael: yo"), 0);
+    }
+
+    #[test]
+    fn session_streams_reflects_present_sources() {
+        assert_eq!(session_streams(&[mic(0, "a")]), vec!["mic"]);
+        assert_eq!(session_streams(&[sys(0, "a")]), vec!["sys"]);
+        assert_eq!(
+            session_streams(&[mic(0, "a"), sys(100, "b")]),
+            vec!["mic", "sys"]
+        );
+        assert!(session_streams(&[]).is_empty());
+    }
+
+    #[test]
+    fn serialize_timeline_applies_label_offset() {
+        // A resumed take's timeline `Speaker N` labels get bumped past the
+        // prior take's, matching the DB transcript combine_with_snapshot
+        // produces. Two same-speaker sys chunks (terminated so the
+        // continuation absorber leaves them be).
+        let chunks = vec![sys(0, "alpha beta gamma."), sys(5_000, "delta epsilon zeta.")];
+        let labeller = |c: &ChunkRecord| single_piece(c, Some("Speaker 1".to_string()));
+        let out = serialize_timeline(&chunks, &labeller, 2);
+        let labels: Vec<String> = out
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| {
+                serde_json::from_str::<serde_json::Value>(l)
+                    .unwrap()
+                    .get("label")
+                    .and_then(|v| v.as_str())
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert!(!labels.is_empty());
+        assert!(labels.iter().all(|l| l == "Speaker 3"), "labels = {labels:?}");
+    }
+
+    #[test]
+    fn serialize_timeline_leaves_you_and_zero_offset_untouched() {
+        // "You" is never offset; offset 0 is a no-op.
+        let chunks = vec![mic(0, "just me talking.")];
+        let labeller = |c: &ChunkRecord| single_piece(c, Some("You".to_string()));
+        let out = serialize_timeline(&chunks, &labeller, 4);
+        assert!(out.contains("\"label\":\"You\""));
+    }
+
+    #[test]
+    fn group_values_to_transcript_merges_same_label_runs() {
+        let vals: Vec<serde_json::Value> = [
+            ("Speaker 1", "hello"),
+            ("Speaker 1", "there"),
+            ("Speaker 2", "hi back"),
+        ]
+        .iter()
+        .map(|(l, t)| serde_json::json!({ "label": l, "text": t }))
+        .collect();
+        assert_eq!(
+            group_values_to_transcript(&vals),
+            "Speaker 1: hello there\nSpeaker 2: hi back"
         );
     }
 

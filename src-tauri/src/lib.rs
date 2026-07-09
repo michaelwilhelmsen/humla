@@ -7,6 +7,7 @@ mod languages;
 mod presets;
 mod wav;
 mod recording;
+mod sessions;
 mod commands;
 mod stt;
 pub mod sync;
@@ -18,7 +19,7 @@ use tauri::{Emitter, Manager};
 
 pub struct AppState {
     pub db: Arc<Mutex<rusqlite::Connection>>,
-    pub recording: Arc<Mutex<recording::RecordingSession>>,
+    pub recording: Arc<Mutex<recording::LiveCapture>>,
     pub whisper: local_whisper::SharedContext,
     // Held for the duration of one chunk's transcription so back-to-back
     // chunks don't both read a stale trail snapshot. Sequential transcribes
@@ -129,7 +130,7 @@ where
             });
             app.manage(AppState {
                 db,
-                recording: Arc::new(Mutex::new(recording::RecordingSession::default())),
+                recording: Arc::new(Mutex::new(recording::LiveCapture::default())),
                 whisper: local_whisper::new_shared(),
                 transcribe_gate: Arc::new(tokio::sync::Mutex::new(())),
                 api_key_cache: stt::new_cache(),
@@ -262,6 +263,8 @@ where
             commands::note_audio_files,
             commands::note_diagnostics_files,
             commands::note_playback_path,
+            commands::note_sessions,
+            commands::note_session_playback_path,
             commands::note_timeline,
             commands::note_timeline_rename,
             commands::note_timeline_set_chunk_label,

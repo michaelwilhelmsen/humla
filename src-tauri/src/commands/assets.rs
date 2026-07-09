@@ -61,27 +61,24 @@ pub fn note_audio_dir(app: AppHandle, note_id: String) -> Result<String, String>
 /// keep_audio was off at recording time, or after a manual cleanup.
 #[tauri::command]
 pub fn note_audio_files(app: AppHandle, note_id: String) -> Result<Vec<String>, String> {
-    let dir = app
-        .path()
-        .app_data_dir()
-        .map_err(err)?
-        .join("recordings")
-        .join(&note_id);
-    if !dir.exists() {
-        return Ok(Vec::new());
-    }
-    let mut out = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(&dir) {
-        for entry in entries.flatten() {
-            if let Some(name) = entry.file_name().to_str() {
-                if name.ends_with(".wav") {
-                    out.push(name.to_string());
+    // Retained WAVs now live inside per-session subdirs (or flat for legacy
+    // notes). Scan every resolved session dir so the "Audio" Finder affordance
+    // still lights up when any take kept its source audio.
+    let app_dir = app.path().app_data_dir().map_err(err)?;
+    let recordings = crate::sessions::recordings_dir(&app_dir, &note_id);
+    let mut out = std::collections::BTreeSet::<String>::new();
+    for (_, dir) in crate::sessions::resolve_sessions(&recordings) {
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                if let Some(name) = entry.file_name().to_str() {
+                    if name.ends_with(".wav") {
+                        out.insert(name.to_string());
+                    }
                 }
             }
         }
     }
-    out.sort();
-    Ok(out)
+    Ok(out.into_iter().collect())
 }
 
 /// Open a local path (file or directory) in Finder via macOS's `open`
@@ -124,13 +121,12 @@ pub fn open_in_finder(app: AppHandle, path: String) -> Result<(), String> {
 /// builds that include the playback feature; missing for older notes.
 #[tauri::command]
 pub fn note_playback_path(app: AppHandle, note_id: String) -> Result<Option<String>, String> {
-    let path = app
-        .path()
-        .app_data_dir()
-        .map_err(err)?
-        .join("recordings")
-        .join(&note_id)
-        .join("playback.wav");
+    // Back-compat single-file resolver: the latest session's playback.wav
+    // (falling back to the flat legacy path for pre-#16 notes). The
+    // session-aware player prefers `note_session_playback_path`.
+    let app_dir = app.path().app_data_dir().map_err(err)?;
+    let recordings = crate::sessions::recordings_dir(&app_dir, &note_id);
+    let path = crate::sessions::latest_session_dir(&recordings).join("playback.wav");
     if !path.exists() {
         return Ok(None);
     }
