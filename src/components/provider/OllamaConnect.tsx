@@ -1,12 +1,11 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import { ipc } from "../../lib/ipc";
+import { useEffect, useRef } from "react";
 import { Select } from "../../pages/settings/components/Select";
+import { useOllamaProbe } from "./useOllamaProbe";
 
-// Local-LLM (Ollama / LM Studio / llama-server) connection surface: probes
-// the server's model listing and keeps polling while mounted, so installing
-// Ollama or pulling a model shows up here without a retry button. Base URL
-// and model stay controlled props — settings and onboarding each own their
-// persistence; this component owns reachability + the model list.
+// Local-LLM (Ollama / LM Studio / llama-server) connection surface for the
+// settings dialog: reachability + model list via the shared useOllamaProbe
+// hook, rendered as kit rows. Base URL and model stay controlled props —
+// consumers own their persistence.
 export function OllamaConnect({
   baseUrl,
   onBaseUrlChange,
@@ -20,40 +19,22 @@ export function OllamaConnect({
   onModelChange: (model: string) => void;
   pollMs?: number;
 }) {
-  // null = first probe still in flight (shows neither state).
-  const [reachable, setReachable] = useState<boolean | null>(null);
-  const [installed, setInstalled] = useState<string[] | null>(null);
+  const { reachable, installed } = useOllamaProbe(baseUrl, { pollMs });
 
-  // Ref so the poll's closure always sees the current selection without
-  // re-subscribing the interval per keystroke.
+  // Empty selection self-heals on contact: with no model set the dropdown
+  // used to LOOK fine (HTML default fallback) while summaries failed with
+  // "model not configured". A stored-but-missing model is NOT auto-switched
+  // — the warning below tells the user instead. Refs so each poll's fresh
+  // `installed` array doesn't need the callbacks in deps.
   const modelRef = useRef(model);
   modelRef.current = model;
   const onModelChangeRef = useRef(onModelChange);
   onModelChangeRef.current = onModelChange;
-
-  const probe = useCallback(async () => {
-    try {
-      const list = await ipc.localLlmListModels(baseUrl);
-      setReachable(true);
-      setInstalled(list);
-      // Empty selection self-heals on first contact: with no model set the
-      // dropdown used to LOOK fine (HTML default fallback) while summaries
-      // failed with "model not configured". A stored-but-missing model is
-      // NOT auto-switched — the warning below tells the user instead.
-      if (!modelRef.current && list.length > 0) {
-        onModelChangeRef.current(list[0]);
-      }
-    } catch {
-      setReachable(false);
-      setInstalled(null);
-    }
-  }, [baseUrl]);
-
   useEffect(() => {
-    void probe();
-    const timer = window.setInterval(() => void probe(), pollMs);
-    return () => window.clearInterval(timer);
-  }, [probe, pollMs]);
+    if (installed && installed.length > 0 && !modelRef.current) {
+      onModelChangeRef.current(installed[0]);
+    }
+  }, [installed]);
 
   const modelMissing =
     reachable === true &&

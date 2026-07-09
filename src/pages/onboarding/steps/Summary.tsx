@@ -22,10 +22,11 @@
 //   OpenAI → summary_provider=openai, summary_model=gpt-5.4-mini
 //   Local  → summary_provider=local, local_llm_base_url=<probed>,
 //            local_llm_model=<selected>, local_llm_think=false
-import { useCallback, useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 import { open as openExternal } from "@tauri-apps/plugin-shell";
 import { Sparkles, Cloud, Server, Check, Copy, ExternalLink } from "lucide-react";
 import { ipc, type TranscribeProvider } from "../../../lib/ipc";
+import { useOllamaProbe } from "../../../components/provider/useOllamaProbe";
 import type { StepContext } from "../types";
 import { StepShell } from "../StepShell";
 
@@ -55,10 +56,8 @@ export function SummaryStep({ ctx }: { ctx: StepContext }) {
   >(null);
   const [openaiConfigured, setOpenaiConfigured] = useState(false);
 
-  // Local (Ollama) sub-flow state.
-  const [probing, setProbing] = useState(false);
-  const [reachable, setReachable] = useState<boolean | null>(null);
-  const [installed, setInstalled] = useState<string[] | null>(null);
+  // Local (Ollama) sub-flow state. Reachability + model list come from the
+  // shared probe hook (#22); presentation stays this wizard's staged cards.
   const [selectedModel, setSelectedModel] = useState<string>("");
   const [localConfigured, setLocalConfigured] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -83,41 +82,27 @@ export function SummaryStep({ ctx }: { ctx: StepContext }) {
   }, []);
 
   // ---- Local (Ollama) probing + polling -----------------------------------
-  // A single probe: hit the model-listing endpoint. Reachable → we also get
-  // the installed model list for free. Unreachable classifies as "install
-  // Ollama".
-  const probeOllama = useCallback(async () => {
-    setProbing(true);
-    try {
-      const list = await ipc.localLlmListModels(DEFAULT_LOCAL_BASE_URL);
-      setReachable(true);
-      setInstalled(list);
-      // Preselect the recommended model if present; else leave empty so the
-      // pull command shows.
-      setSelectedModel((prev) => {
-        if (prev && list.includes(prev)) return prev;
-        if (list.includes(RECOMMENDED_OLLAMA_MODEL)) return RECOMMENDED_OLLAMA_MODEL;
-        return list[0] ?? "";
-      });
-    } catch {
-      setReachable(false);
-      setInstalled(null);
-    } finally {
-      setProbing(false);
-    }
-  }, []);
+  // The shared hook probes the model-listing endpoint every ~2s while the
+  // Local option is selected — the "Waiting for Ollama…" loop: it flips
+  // `reachable`/`installed` when the server appears, and re-lists so a
+  // freshly-pulled model shows up without a retry button
+  // (design/ONBOARDING.md § 5). Deselecting parks it.
+  const { reachable, installed } = useOllamaProbe(DEFAULT_LOCAL_BASE_URL, {
+    pollMs: OLLAMA_POLL_MS,
+    enabled: selection === "local",
+  });
 
-  // While the Local option is selected, probe every ~2s. This is the
-  // "Waiting for Ollama…" loop: it flips `reachable`/`installed` when the
-  // server appears, and re-lists so a freshly-pulled model shows up without
-  // a retry button (design/ONBOARDING.md § 5). A 2s /models GET is cheap;
-  // the interval is torn down on unmount / option change.
+  // Preselect the recommended model if present; else first installed; else
+  // leave empty so the pull command shows. Re-runs per poll so a pull that
+  // completes mid-wizard is picked up.
   useEffect(() => {
-    if (selection !== "local") return;
-    void probeOllama(); // immediate probe on selection
-    const timer = window.setInterval(() => void probeOllama(), OLLAMA_POLL_MS);
-    return () => window.clearInterval(timer);
-  }, [selection, probeOllama]);
+    if (!installed) return;
+    setSelectedModel((prev) => {
+      if (prev && installed.includes(prev)) return prev;
+      if (installed.includes(RECOMMENDED_OLLAMA_MODEL)) return RECOMMENDED_OLLAMA_MODEL;
+      return installed[0] ?? "";
+    });
+  }, [installed]);
 
   // ---- OpenAI path --------------------------------------------------------
   async function useSameOpenAiKey() {
@@ -201,9 +186,9 @@ export function SummaryStep({ ctx }: { ctx: StepContext }) {
     setSelection("openai");
   }
   function selectLocal() {
+    // The probe hook resets to "no verdict" while disabled, so flipping the
+    // selection starts from a clean probing state automatically.
     setSelection("local");
-    setReachable(null);
-    setInstalled(null);
   }
 
   // Continue enables when either path is fully configured.
@@ -375,7 +360,7 @@ export function SummaryStep({ ctx }: { ctx: StepContext }) {
 
           {selection === "local" && (
             <div className="mt-4 flex flex-col gap-3">
-              {reachable === null && probing && (
+              {reachable === null && (
                 <p className="text-xs text-[var(--color-text-muted)]">
                   Checking for Ollama…
                 </p>
