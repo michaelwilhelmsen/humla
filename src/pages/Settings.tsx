@@ -43,7 +43,7 @@ export function Settings() {
     summaries: <SummaryTab s={settings.s} update={settings.update} />,
     account: (
       <>
-        <AccountTab />
+        <AccountTab s={settings.s} update={settings.update} />
         <OrganizationTab />
       </>
     ),
