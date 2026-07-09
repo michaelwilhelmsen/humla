@@ -8,10 +8,14 @@ export function Select({
   value,
   onChange,
   options,
+  id,
 }: {
   value: string;
   onChange: (v: string) => void;
   options: { value: string; label: string }[];
+  // Optional id placed on the trigger <button> (a labelable element) so an
+  // external <label htmlFor> can name this control.
+  id?: string;
 }) {
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
@@ -53,6 +57,7 @@ export function Select({
     <div ref={rootRef} className="relative inline-block">
       <button
         type="button"
+        id={id}
         aria-haspopup="listbox"
         aria-expanded={open}
         onClick={() => setOpen((o) => !o)}

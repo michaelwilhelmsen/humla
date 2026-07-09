@@ -12,14 +12,32 @@ export function Toaster() {
 
   return (
     <div className="no-drag fixed bottom-24 right-6 z-[60] flex flex-col gap-2 max-w-sm">
-      {errors.map((e) => (
+      {errors.map((e) => {
+        // The backend routes some informational notices through the
+        // recording_error channel (it has no severity field yet). The
+        // cross-session speaker-unification notice is one of them — it's a
+        // "heads up, here's what I merged; rename to adjust", not a failure.
+        // Detect it by message shape and render it neutrally rather than as a
+        // red error. (A backend severity field would be the cleaner fix.)
+        const isNotice = /^Speaker unification detected/.test(e.message);
+        return (
         <div
           key={`err-${e.id}`}
           className="flex items-start gap-3 px-4 py-3 rounded-lg bg-[var(--color-surface)] border border-[var(--color-line)] shadow-md text-sm"
         >
           <div className="flex-1">
-            <div className="font-medium text-red-600 dark:text-red-400 mb-1">
-              {e.kind === "summary" ? "Summary failed" : "Recording issue"}
+            <div
+              className={
+                isNotice
+                  ? "font-medium text-[var(--color-text)] mb-1"
+                  : "font-medium text-red-600 dark:text-red-400 mb-1"
+              }
+            >
+              {isNotice
+                ? "Speakers merged"
+                : e.kind === "summary"
+                  ? "Summary failed"
+                  : "Recording issue"}
             </div>
             <div className="text-[var(--color-text)]">{e.message}</div>
             {/* Copy-coupled: error messages that mention "permission" or
@@ -40,7 +58,8 @@ export function Toaster() {
             aria-label="Dismiss"
           >×</button>
         </div>
-      ))}
+        );
+      })}
       {flashes.map((f) => (
         <div
           key={`flash-${f.id}`}
