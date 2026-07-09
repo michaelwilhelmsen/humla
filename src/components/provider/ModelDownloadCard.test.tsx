@@ -90,6 +90,68 @@ describe("ModelDownloadCard", () => {
     expect(onChanged).toHaveBeenCalledTimes(1);
   });
 
+  it("renders as a selectable row: radio picks the model, gated on presence", async () => {
+    const onSelect = vi.fn();
+    mockTauri();
+    useDownloadStore.getState().clear();
+    const downloaded = model({ downloaded: true, sizeBytes: 1 });
+    render(
+      <ModelDownloadCard
+        model={downloaded}
+        tag="Multilingual"
+        selected={false}
+        onSelect={onSelect}
+      />,
+    );
+
+    expect(screen.getByText("Multilingual")).toBeInTheDocument();
+    const radio = screen.getByRole("radio", {
+      name: /use large v3 turbo/i,
+    });
+    expect(radio).toBeEnabled();
+    await userEvent.click(radio);
+    expect(onSelect).toHaveBeenCalledTimes(1);
+  });
+
+  it("selection radio is disabled for a model that isn't on disk, with a warning when selected anyway", () => {
+    mockTauri();
+    useDownloadStore.getState().clear();
+    render(
+      <ModelDownloadCard
+        model={model()}
+        tag="Multilingual"
+        selected={true}
+        onSelect={() => {}}
+        warning="Selected as the default but not downloaded — recording won't start until you download it."
+      />,
+    );
+
+    expect(screen.getByRole("radio")).toBeDisabled();
+    expect(
+      screen.getByText(/recording won't start until you download it/i),
+    ).toBeInTheDocument();
+  });
+
+  it("uses the caller's download action when provided", async () => {
+    const onDownload = vi.fn();
+    const invoked: string[] = [];
+    mockTauri({
+      local_whisper_download: () => {
+        invoked.push("direct");
+        return null;
+      },
+    });
+    useDownloadStore.getState().clear();
+    render(<ModelDownloadCard model={model()} onDownload={onDownload} />);
+
+    await userEvent.click(screen.getByRole("button", { name: /download/i }));
+
+    // Settings threads its orchestrating handler (auto-default promotion,
+    // suggest-override flash); the card must not bypass it to raw IPC.
+    expect(onDownload).toHaveBeenCalledWith("large-v3-turbo-q5");
+    expect(invoked).toHaveLength(0);
+  });
+
   it("any in-flight download disables other models' Download buttons", () => {
     renderCard(model({ id: "medium-q5", label: "Medium (quantized)" }));
 

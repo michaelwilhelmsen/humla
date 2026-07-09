@@ -10,12 +10,31 @@ import { Btn } from "../../pages/settings/components/Btn";
 // download invoke's promise, which dies with whatever mount started it. A
 // download started here keeps reporting after the settings dialog closes
 // and reopens, and one started in onboarding shows up here too.
+//
+// Optional surfaces let consumers compose without forking the row:
+// - selected/onSelect + tag: the settings model list's default-model radio
+// - onDownload/onDelete: orchestrating handlers (settings' handler promotes
+//   the first multilingual download to default and fires the
+//   suggest-override flash) — omitted, the card talks to IPC directly
+// - warning: consumer-supplied caution line (e.g. selected-but-not-on-disk)
 export function ModelDownloadCard({
   model,
   onChanged,
+  tag,
+  selected,
+  onSelect,
+  warning,
+  onDownload,
+  onDelete,
 }: {
   model: LocalWhisperModelStatus;
-  onChanged: () => void;
+  onChanged?: () => void;
+  tag?: string;
+  selected?: boolean;
+  onSelect?: () => void;
+  warning?: string;
+  onDownload?: (modelId: string) => void;
+  onDelete?: (modelId: string) => void;
 }) {
   const active = useDownloadStore((s) => s.active);
   const mine = active?.modelId === model.id ? active : null;
@@ -29,33 +48,63 @@ export function ModelDownloadCard({
       wasMine.current = true;
     } else if (wasMine.current) {
       wasMine.current = false;
-      onChanged();
+      onChanged?.();
     }
   }, [mine, onChanged]);
 
   async function download() {
+    if (onDownload) {
+      onDownload(model.id);
+      return;
+    }
     // Fire-and-forget by design; the store carries the progress story. The
     // catch keeps an immediate spawn failure from becoming an unhandled
     // rejection — the backend also emits a download-error event for it.
     try {
       await ipc.localWhisperDownload(model.id);
     } catch {
-      onChanged();
+      onChanged?.();
     }
   }
 
   async function deleteModel() {
+    if (onDelete) {
+      onDelete(model.id);
+      return;
+    }
     await ipc.localWhisperDelete(model.id);
-    onChanged();
+    onChanged?.();
   }
 
   const pct =
     mine && mine.total ? Math.round((mine.received / mine.total) * 100) : null;
 
   return (
-    <div className="py-3.5 flex items-start justify-between gap-4">
-      <div className="min-w-0">
-        <div className="text-sm">{model.label}</div>
+    <div className="py-3.5 flex items-start gap-3">
+      {onSelect && (
+        <input
+          type="radio"
+          checked={!!selected}
+          disabled={!model.downloaded}
+          onChange={onSelect}
+          className="mt-1 shrink-0"
+          aria-label={`Use ${model.label}`}
+        />
+      )}
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center gap-2 text-sm">
+          <span>{model.label}</span>
+          {tag && (
+            <span className="text-xs px-1.5 py-0.5 rounded bg-[var(--color-pill-hover)] text-[var(--color-text-muted)]">
+              {tag}
+            </span>
+          )}
+          {selected && model.downloaded && (
+            <span className="text-xs text-[var(--color-text-muted)]">
+              · active
+            </span>
+          )}
+        </div>
         <p className="text-xs text-[var(--color-text-muted)] mt-0.5">
           {model.description}
         </p>
@@ -66,6 +115,9 @@ export function ModelDownloadCard({
               ? `Downloaded · ${formatBytes(model.sizeBytes ?? model.sizeBytesHint)}`
               : `Not downloaded · ~${formatBytes(model.sizeBytesHint)}`}
         </p>
+        {warning && !mine && (
+          <p className="text-xs text-[var(--color-warning)] mt-1">{warning}</p>
+        )}
         {mine && (
           <div
             role="progressbar"
