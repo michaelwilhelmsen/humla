@@ -226,6 +226,9 @@ let listenersBound = false;
 // The note id of the in-flight recording, captured so we can upload its audio
 // once it finishes (the idle status itself doesn't carry the note id).
 let recordingNoteId: string | null = null;
+// The note id of an in-flight *import* (distinct from a live recording), so that
+// when it finishes we can tell the user if the file yielded no transcript.
+let importingNoteId: string | null = null;
 export function bindBackendListeners() {
   if (listenersBound) return;
   listenersBound = true;
@@ -259,6 +262,22 @@ export function bindBackendListeners() {
           void ipc.uploadNoteSessions(id);
         }
       }
+      // An import just finished. The transcript is written (via
+      // transcript_replaced) before this idle event, so if it's still empty the
+      // file had no detectable speech — say so instead of leaving a blank note
+      // with no feedback.
+      if (importingNoteId) {
+        const id = importingNoteId;
+        importingNoteId = null;
+        const note = useNotesStore.getState().notes.find((n) => n.id === id);
+        if (note && !note.transcript.trim()) {
+          useRecordingStore
+            .getState()
+            .pushFlash("No speech detected in the imported file.");
+        }
+      }
+    } else if (s.phase === "importing") {
+      if (s.noteId) importingNoteId = s.noteId;
     } else if (s.noteId) {
       recordingNoteId = s.noteId; // an active recording — remember which note
     }

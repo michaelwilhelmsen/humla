@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { Merge } from "lucide-react";
 import { extractSpeakerLabels } from "../lib/speakers";
 
@@ -84,6 +84,8 @@ function SpeakerChip({
   const [draft, setDraft] = useState(label);
   const inputRef = useRef<HTMLInputElement | null>(null);
   const wrapRef = useRef<HTMLSpanElement | null>(null);
+  const menuRef = useRef<HTMLDivElement | null>(null);
+  const mergeBtnRef = useRef<HTMLButtonElement | null>(null);
 
   // Snap the draft back to the canonical label whenever the underlying
   // label changes (e.g. diarize replaced the transcript and our label
@@ -96,25 +98,60 @@ function SpeakerChip({
     if (editing) inputRef.current?.select();
   }, [editing]);
 
-  // Dismiss the merge menu on outside click or Escape — the Tauri webview
-  // blocks window.confirm, so the inline menu itself is the confirmation:
-  // picking a target IS the commit, and there's no destructive default.
+  // Dismiss the merge menu on outside click — the Tauri webview blocks
+  // window.confirm, so the inline menu itself is the confirmation: picking a
+  // target IS the commit, and there's no destructive default. (Escape, arrow
+  // roving and focus-return are handled by the menu's own keydown below, per
+  // the ARIA menu keyboard model.)
   useEffect(() => {
     if (!merging) return;
     function onDown(e: MouseEvent) {
       if (wrapRef.current && wrapRef.current.contains(e.target as Node)) return;
       setMerging(false);
     }
-    function onKey(e: KeyboardEvent) {
-      if (e.key === "Escape") setMerging(false);
-    }
     document.addEventListener("mousedown", onDown);
-    document.addEventListener("keydown", onKey);
-    return () => {
-      document.removeEventListener("mousedown", onDown);
-      document.removeEventListener("keydown", onKey);
-    };
+    return () => document.removeEventListener("mousedown", onDown);
   }, [merging]);
+
+  // On open, move focus onto the first menu item (menu keyboard model). We keep
+  // role="menu"/menuitem, so we owe the caller focus-in, arrow roving,
+  // Home/End, and Escape-closes-returning-focus — implemented here + below.
+  useEffect(() => {
+    if (!merging) return;
+    const items = menuRef.current?.querySelectorAll<HTMLElement>('[role="menuitem"]');
+    items?.[0]?.focus();
+  }, [merging]);
+
+  function onMenuKeyDown(e: ReactKeyboardEvent<HTMLDivElement>) {
+    const items = Array.from(
+      menuRef.current?.querySelectorAll<HTMLElement>('[role="menuitem"]') ?? [],
+    );
+    if (items.length === 0) return;
+    const idx = items.indexOf(document.activeElement as HTMLElement);
+    switch (e.key) {
+      case "Escape":
+        e.preventDefault();
+        setMerging(false);
+        mergeBtnRef.current?.focus(); // return focus to the trigger
+        break;
+      case "ArrowDown":
+        e.preventDefault();
+        items[(idx + 1 + items.length) % items.length].focus();
+        break;
+      case "ArrowUp":
+        e.preventDefault();
+        items[(idx - 1 + items.length) % items.length].focus();
+        break;
+      case "Home":
+        e.preventDefault();
+        items[0].focus();
+        break;
+      case "End":
+        e.preventDefault();
+        items[items.length - 1].focus();
+        break;
+    }
+  }
 
   function commit() {
     setEditing(false);
@@ -176,6 +213,7 @@ function SpeakerChip({
       </button>
       {otherLabels.length > 0 && (
         <button
+          ref={mergeBtnRef}
           type="button"
           aria-label={`Merge ${label} into another speaker`}
           aria-haspopup="menu"
@@ -189,8 +227,10 @@ function SpeakerChip({
       )}
       {merging && otherLabels.length > 0 && (
         <div
+          ref={menuRef}
           role="menu"
           aria-label={`Merge ${label} into`}
+          onKeyDown={onMenuKeyDown}
           className="absolute left-0 top-full z-20 mt-1 min-w-[10rem] rounded-lg border border-[color:var(--color-line-visible)] bg-[color:var(--color-surface)] p-1 shadow-lg"
         >
           <div className="nd-label px-2 py-1">Merge into</div>

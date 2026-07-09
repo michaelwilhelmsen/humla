@@ -94,13 +94,13 @@ export function ImportDialog({
         </p>
 
         <div className="flex items-center justify-between gap-4">
-          <label className="text-sm">Language</label>
-          <Select value={language} onChange={setLanguage} options={LANGUAGE_OPTIONS} />
+          <label htmlFor="import-language" className="text-sm">Language</label>
+          <Select id="import-language" value={language} onChange={setLanguage} options={LANGUAGE_OPTIONS} />
         </div>
 
         <div className="flex items-center justify-between gap-4">
-          <label className="text-sm">Speakers</label>
-          <Select value={speakers} onChange={setSpeakers} options={SPEAKER_OPTIONS} />
+          <label htmlFor="import-speakers" className="text-sm">Speakers</label>
+          <Select id="import-speakers" value={speakers} onChange={setSpeakers} options={SPEAKER_OPTIONS} />
         </div>
 
         {error && (

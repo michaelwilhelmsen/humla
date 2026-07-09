@@ -1,11 +1,11 @@
-import { useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { Plus } from "lucide-react";
 import { ipc, type Folder } from "../lib/ipc";
 import { useNotesStore, useRecordingStore } from "../lib/store";
 import { cn } from "../lib/cn";
 import { groupByDate, isRecorded, isSummarized } from "../lib/noteList";
-import { NoteListRow } from "../components/NoteListRow";
+import { NoteListRow, type SelectIntent } from "../components/NoteListRow";
 import { BulkActionBar } from "../components/BulkActionBar";
 import { Modal } from "./settings/components/Modal";
 
@@ -72,7 +72,7 @@ export function AllNotes() {
     anchorRef.current = null;
   }
 
-  function onSelectRow(id: string, e: MouseEvent) {
+  function onSelectRow(id: string, e: SelectIntent) {
     setSelected((prev) => {
       const next = new Set(prev);
       if (e.shiftKey && anchorRef.current) {
