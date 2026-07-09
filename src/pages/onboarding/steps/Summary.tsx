@@ -25,8 +25,9 @@
 import { useEffect, useState } from "react";
 import { open as openExternal } from "@tauri-apps/plugin-shell";
 import { Sparkles, Cloud, Server, Check, Copy, ExternalLink } from "lucide-react";
-import { ipc, type TranscribeProvider } from "../../../lib/ipc";
+import { ipc } from "../../../lib/ipc";
 import { useOllamaProbe } from "../../../components/provider/useOllamaProbe";
+import { useProviderKey } from "../../../components/provider/useProviderKey";
 import type { StepContext } from "../types";
 import { StepShell } from "../StepShell";
 
@@ -47,13 +48,9 @@ export function SummaryStep({ ctx }: { ctx: StepContext }) {
   const [hasOpenAiKey, setHasOpenAiKey] = useState<boolean | null>(null);
   const [selection, setSelection] = useState<Option>(null);
 
-  // OpenAI inline-key state (only when no key exists yet).
-  const [keyDraft, setKeyDraft] = useState("");
-  const [keySaved, setKeySaved] = useState(false);
-  const [testing, setTesting] = useState(false);
-  const [testResult, setTestResult] = useState<
-    null | { ok: true } | { ok: false; message: string }
-  >(null);
+  // OpenAI inline-key mechanics (only rendered when no key exists yet) come
+  // from the shared hook (#22); the step wraps test() with its commit point.
+  const key = useProviderKey("openai");
   const [openaiConfigured, setOpenaiConfigured] = useState(false);
 
   // Local (Ollama) sub-flow state. Reachability + model list come from the
@@ -115,39 +112,15 @@ export function SummaryStep({ ctx }: { ctx: StepContext }) {
     }
   }
 
-  async function saveOpenAiKey() {
-    const trimmed = keyDraft.trim();
-    if (!trimmed) return;
-    try {
-      await ipc.setProviderKey("openai" as TranscribeProvider, trimmed);
-      setKeySaved(true);
-      setKeyDraft("");
-      setTestResult(null);
-    } catch (e) {
-      setTestResult({ ok: false, message: String(e) });
-    }
-  }
-
+  // A passed Test is the commit point: write OpenAI as the summary provider.
   async function testOpenAiKey() {
-    setTesting(true);
-    setTestResult(null);
+    if (!(await key.test())) return;
     try {
-      const r = await ipc.testProviderKey("openai" as TranscribeProvider);
-      if (r.ok) {
-        setTestResult({ ok: true });
-        await ipc.setSetting("summary_provider", "openai");
-        await ipc.setSetting("summary_model", DEFAULT_OPENAI_SUMMARY_MODEL);
-        setOpenaiConfigured(true);
-      } else {
-        setTestResult({
-          ok: false,
-          message: `${r.status}: ${r.error ?? "unknown error"}`,
-        });
-      }
+      await ipc.setSetting("summary_provider", "openai");
+      await ipc.setSetting("summary_model", DEFAULT_OPENAI_SUMMARY_MODEL);
+      setOpenaiConfigured(true);
     } catch (e) {
-      setTestResult({ ok: false, message: String(e) });
-    } finally {
-      setTesting(false);
+      console.warn("[onboarding] failed to write openai summary settings:", e);
     }
   }
 
@@ -279,19 +252,15 @@ export function SummaryStep({ ctx }: { ctx: StepContext }) {
                   <div className="flex gap-2">
                     <input
                       type="password"
-                      value={keyDraft}
-                      onChange={(e) => {
-                        setKeyDraft(e.target.value);
-                        if (keySaved) setKeySaved(false);
-                        if (testResult) setTestResult(null);
-                      }}
-                      placeholder={keySaved ? "•••••••• stored" : "sk-…"}
+                      value={key.draft}
+                      onChange={(e) => key.setDraft(e.target.value)}
+                      placeholder={key.hasKey ? "•••••••• stored" : "sk-…"}
                       className="flex-1 min-w-0 px-3 py-2 rounded-md text-sm bg-[var(--color-input-bg)] border border-[var(--color-line)] focus:border-[var(--color-text-muted)]"
                     />
                     <button
                       type="button"
-                      onClick={saveOpenAiKey}
-                      disabled={!keyDraft.trim()}
+                      onClick={key.save}
+                      disabled={!key.draft.trim()}
                       className="nd-btn"
                     >
                       Save
@@ -299,21 +268,21 @@ export function SummaryStep({ ctx }: { ctx: StepContext }) {
                     <button
                       type="button"
                       onClick={testOpenAiKey}
-                      disabled={!keySaved || testing}
+                      disabled={!key.hasKey || key.testing}
                       className="nd-btn nd-btn-primary"
                     >
-                      {testing ? "Testing…" : "Test"}
+                      {key.testing ? "Testing…" : "Test"}
                     </button>
                   </div>
-                  {testResult?.ok === true && (
+                  {key.result?.ok === true && (
                     <p className="text-xs text-[var(--color-success)] flex items-center gap-1.5">
                       <Check size={13} strokeWidth={2.5} />
                       Connected
                     </p>
                   )}
-                  {testResult?.ok === false && (
+                  {key.result?.ok === false && (
                     <p className="text-xs text-[var(--color-danger)] break-all">
-                      {testResult.message}
+                      {key.result.message}
                     </p>
                   )}
                 </div>

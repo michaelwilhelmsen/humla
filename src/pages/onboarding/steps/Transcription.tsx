@@ -39,8 +39,8 @@ import {
   onLocalWhisperProgress,
   type LocalWhisperModelStatus,
   type ProviderConfig,
-  type TranscribeProvider,
 } from "../../../lib/ipc";
+import { useProviderKey } from "../../../components/provider/useProviderKey";
 import type { StepContext } from "../types";
 import { StepShell } from "../StepShell";
 
@@ -107,14 +107,11 @@ export function TranscriptionStep({ ctx }: { ctx: StepContext }) {
   const [downloadDone, setDownloadDone] = useState(false);
   const [downloadError, setDownloadError] = useState<string | null>(null);
 
-  // Cloud card state.
+  // Cloud card state. Key mechanics come from the shared hook (#22) — it
+  // resets the surface itself when the provider changes; the step wraps
+  // test() with its commit point (write the provider as the default).
   const [cloudProvider, setCloudProvider] = useState<CloudProvider>("openai");
-  const [keyDraft, setKeyDraft] = useState("");
-  const [keySaved, setKeySaved] = useState(false);
-  const [testing, setTesting] = useState(false);
-  const [testResult, setTestResult] = useState<
-    null | { ok: true } | { ok: false; message: string }
-  >(null);
+  const key = useProviderKey(cloudProvider);
 
   const modelId = modelIdForLanguage(language);
   const chosenModel = models?.find((m) => m.id === modelId) ?? null;
@@ -247,53 +244,25 @@ export function TranscriptionStep({ ctx }: { ctx: StepContext }) {
     setSelection("cloud");
   }
 
-  async function saveKey() {
-    const trimmed = keyDraft.trim();
-    if (!trimmed) return;
-    try {
-      await ipc.setProviderKey(cloudProvider as TranscribeProvider, trimmed);
-      setKeySaved(true);
-      setKeyDraft("");
-      setTestResult(null);
-    } catch (e) {
-      setTestResult({ ok: false, message: String(e) });
-    }
-  }
-
   async function testKey() {
-    setTesting(true);
-    setTestResult(null);
+    if (!(await key.test())) return;
+    // A passed Test is the commit point: write the cloud provider as
+    // the default, preserving per-language overrides.
     try {
-      const r = await ipc.testProviderKey(cloudProvider as TranscribeProvider);
-      if (r.ok) {
-        setTestResult({ ok: true });
-        // A passed Test is the commit point: write the cloud provider as
-        // the default, preserving per-language overrides.
-        const cfg = await ipc.getTranscribeConfig().catch(() => null);
-        await ipc.setTranscribeConfig({
-          default: cloudConfig(cloudProvider),
-          per_language: cfg?.per_language ?? {},
-        });
-      } else {
-        setTestResult({
-          ok: false,
-          message: `${r.status}: ${r.error ?? "unknown error"}`,
-        });
-      }
+      const cfg = await ipc.getTranscribeConfig().catch(() => null);
+      await ipc.setTranscribeConfig({
+        default: cloudConfig(cloudProvider),
+        per_language: cfg?.per_language ?? {},
+      });
     } catch (e) {
-      setTestResult({ ok: false, message: String(e) });
-    } finally {
-      setTesting(false);
+      console.warn("[onboarding] failed to write cloud transcribe_config:", e);
     }
   }
 
-  // When the cloud provider dropdown changes, reset the per-provider key
-  // state (each provider has its own Keychain slot + Test).
+  // Each provider has its own Keychain slot + Test; the hook resets its
+  // surface when this changes.
   function changeCloudProvider(p: CloudProvider) {
     setCloudProvider(p);
-    setKeyDraft("");
-    setKeySaved(false);
-    setTestResult(null);
   }
 
   // Fire the diarize download once when leaving the step forward. Non-fatal.
@@ -322,7 +291,7 @@ export function TranscriptionStep({ ctx }: { ctx: StepContext }) {
   // Continue enables when: local selected (download may still run) OR a
   // cloud key passed Test.
   const canContinue =
-    selection === "local" || (selection === "cloud" && testResult?.ok === true);
+    selection === "local" || (selection === "cloud" && key.result?.ok === true);
 
   // arch and models always resolve (their fetches fall back on error), so
   // this only covers the initial IPC round-trip. `language` is deliberately
@@ -454,7 +423,7 @@ export function TranscriptionStep({ ctx }: { ctx: StepContext }) {
                     Cloud API
                   </span>
                   {isIntel && <RecommendedBadge />}
-                  {selection === "cloud" && testResult?.ok === true && (
+                  {selection === "cloud" && key.result?.ok === true && (
                     <Check
                       size={15}
                       strokeWidth={2.5}
@@ -490,19 +459,15 @@ export function TranscriptionStep({ ctx }: { ctx: StepContext }) {
               <div className="flex gap-2">
                 <input
                   type="password"
-                  value={keyDraft}
-                  onChange={(e) => {
-                    setKeyDraft(e.target.value);
-                    if (keySaved) setKeySaved(false);
-                    if (testResult) setTestResult(null);
-                  }}
-                  placeholder={keySaved ? "•••••••• stored" : keyPlaceholder(cloudProvider)}
+                  value={key.draft}
+                  onChange={(e) => key.setDraft(e.target.value)}
+                  placeholder={key.hasKey ? "•••••••• stored" : keyPlaceholder(cloudProvider)}
                   className="flex-1 min-w-0 px-3 py-2 rounded-md text-sm bg-[var(--color-input-bg)] border border-[var(--color-line)] focus:border-[var(--color-text-muted)]"
                 />
                 <button
                   type="button"
-                  onClick={saveKey}
-                  disabled={!keyDraft.trim()}
+                  onClick={key.save}
+                  disabled={!key.draft.trim()}
                   className="nd-btn"
                 >
                   Save
@@ -510,22 +475,22 @@ export function TranscriptionStep({ ctx }: { ctx: StepContext }) {
                 <button
                   type="button"
                   onClick={testKey}
-                  disabled={!keySaved || testing}
+                  disabled={!key.hasKey || key.testing}
                   className="nd-btn nd-btn-primary"
                 >
-                  {testing ? "Testing…" : "Test"}
+                  {key.testing ? "Testing…" : "Test"}
                 </button>
               </div>
 
-              {testResult?.ok === true && (
+              {key.result?.ok === true && (
                 <p className="text-xs text-[var(--color-success)] flex items-center gap-1.5">
                   <Check size={13} strokeWidth={2.5} />
                   Connected — {CLOUD_PROVIDERS.find((p) => p.value === cloudProvider)?.label}
                 </p>
               )}
-              {testResult?.ok === false && (
+              {key.result?.ok === false && (
                 <p className="text-xs text-[var(--color-danger)] break-all">
-                  {testResult.message}
+                  {key.result.message}
                 </p>
               )}
             </div>

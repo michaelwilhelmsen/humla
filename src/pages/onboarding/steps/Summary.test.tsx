@@ -26,6 +26,34 @@ function renderStep(handlers: Parameters<typeof mockTauri>[0] = {}) {
   return render(<SummaryStep ctx={ctx()} />);
 }
 
+describe("onboarding SummaryStep — OpenAI path", () => {
+  it("save + passing test commits OpenAI as the summary provider", async () => {
+    const writes: Record<string, string> = {};
+    renderStep({
+      provider_key_get: () => null, // no key yet → inline key UI
+      settings_set: (args) => {
+        const { key, value } = args as { key: string; value: string };
+        writes[key] = value;
+        return null;
+      },
+      provider_key_test: () => ({ ok: true, status: 200, error: null }),
+    });
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: /^openai/i }),
+    );
+    await userEvent.type(
+      await screen.findByPlaceholderText("sk-…"),
+      "sk-test",
+    );
+    await userEvent.click(screen.getByRole("button", { name: /save/i }));
+    await userEvent.click(screen.getByRole("button", { name: /^test/i }));
+
+    expect(await screen.findByText(/^connected$/i)).toBeInTheDocument();
+    expect(writes.summary_provider).toBe("openai");
+  });
+});
+
 describe("onboarding SummaryStep — local path", () => {
   it("waits for an unreachable Ollama with install guidance", async () => {
     renderStep({
