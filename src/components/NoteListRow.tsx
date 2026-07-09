@@ -1,18 +1,54 @@
+import { type MouseEvent } from "react";
 import { Link } from "react-router-dom";
 import { Folder as FolderIcon } from "lucide-react";
 import { type Folder, type Note } from "../lib/ipc";
 import { formatMeetingTime, notePreview } from "../lib/noteList";
+import { cn } from "../lib/cn";
 
 // One row in a note-list view (All notes, Folder). Title + one-line snippet on
 // the left; created-time and an optional folder chip on the right. The folder
 // chip is omitted inside a folder view (where it would be redundant).
-export function NoteListRow({ note, folder }: { note: Note; folder?: Folder }) {
+//
+// Selection (issue #19): a modifier-click (Cmd/Ctrl to toggle, Shift for a
+// range) is intercepted for multi-select and must NOT navigate; a plain click
+// still follows the link.
+export function NoteListRow({
+  note,
+  folder,
+  selected = false,
+  onSelect,
+}: {
+  note: Note;
+  folder?: Folder;
+  selected?: boolean;
+  onSelect?: (e: MouseEvent) => void;
+}) {
   const preview = notePreview(note);
+
+  function handleClick(e: MouseEvent) {
+    if (onSelect && (e.metaKey || e.ctrlKey || e.shiftKey)) {
+      e.preventDefault(); // suppress navigation for modifier-clicks
+      onSelect(e);
+    }
+  }
+
   return (
     <li>
-      <Link to={`/note/${note.id}`} className="group block">
+      <Link
+        to={`/note/${note.id}`}
+        onClick={handleClick}
+        data-selected={selected ? "true" : undefined}
+        className="group block"
+      >
         <div className="max-w-[880px] mx-auto w-full px-8">
-          <div className="flex items-start gap-3 p-3 rounded-[11px] hover:bg-[var(--color-pill-hover)] transition-colors">
+          <div
+            className={cn(
+              "flex items-start gap-3 p-3 rounded-[11px] transition-colors",
+              selected
+                ? "bg-[var(--color-accent-soft)]"
+                : "hover:bg-[var(--color-pill-hover)]",
+            )}
+          >
             <div className="flex-1 min-w-0">
               <div className="text-[14.5px] font-medium text-[var(--color-text)] truncate">
                 {note.title.trim() || "Untitled"}
