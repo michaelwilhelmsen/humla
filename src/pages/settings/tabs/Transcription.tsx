@@ -1,11 +1,88 @@
+import type { ReactNode } from "react";
 import { DiarizeModelManager } from "../components/DiarizeModelManager";
+import { Disclosure } from "../components/Disclosure";
 import { LocalModelManager } from "../components/LocalModelManager";
 import { PerLanguageOverrides } from "../components/PerLanguageOverrides";
 import { ProviderConfigForm } from "../components/ProviderConfigForm";
 import { Row, Section } from "../components/Section";
-import { useDeveloperMode } from "../../../lib/useDeveloperMode";
 import { inputClass } from "../types";
 import type { SettingsHook } from "../useSettings";
+
+// Engine choice row: label + description left, pick-radio right, the
+// download/status manager underneath. The radio is presence-gated — an
+// engine can't be active until its models are on disk.
+function EngineOption({
+  label,
+  description,
+  checked,
+  disabled,
+  onPick,
+  children,
+}: {
+  label: string;
+  description: string;
+  checked: boolean;
+  disabled: boolean;
+  onPick: () => void;
+  children: ReactNode;
+}) {
+  return (
+    <div className="py-3.5">
+      <div className="flex items-start justify-between gap-6">
+        <div className="min-w-0">
+          <div className="text-sm">{label}</div>
+          <p className="text-xs text-[var(--color-text-muted)] mt-0.5">
+            {description}
+          </p>
+        </div>
+        <input
+          type="radio"
+          name="diarize_model"
+          checked={checked}
+          disabled={disabled}
+          onChange={onPick}
+          aria-label={`Use ${label} for new recordings`}
+          className="mt-1 shrink-0"
+        />
+      </div>
+      <div className="mt-3">{children}</div>
+    </div>
+  );
+}
+
+// Small right-aligned mono numeric field with the row model's label +
+// description — the threshold knobs' shared shape.
+function ThresholdRow({
+  label,
+  description,
+  value,
+  placeholder,
+  onChange,
+}: {
+  label: string;
+  description: string;
+  value: string;
+  placeholder: string;
+  onChange: (v: string) => void;
+}) {
+  return (
+    <Row
+      label={label}
+      description={description}
+      control={
+        <input
+          type="text"
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          placeholder={placeholder}
+          aria-label={label}
+          className="w-24 text-sm text-right px-2.5 py-1.5 rounded-md border border-[var(--color-line-visible)] bg-[var(--color-surface)] focus:border-[var(--color-text-muted)] transition-colors"
+          style={{ fontFamily: "var(--font-mono)" }}
+        />
+      }
+    />
+  );
+}
 
 export function TranscriptionTab({
   s,
@@ -41,7 +118,6 @@ export function TranscriptionTab({
   | "downloadSortformer"
   | "deleteSortformer"
 >) {
-  const devMode = useDeveloperMode();
   const def = transcribeConfig.default;
 
   return (
@@ -97,147 +173,74 @@ export function TranscriptionTab({
         />
       </Section>
 
-      <Section title="Speaker diarization">
-        <p className="text-xs text-[var(--color-text-muted)]">
+      <Section title="Speaker labels">
+        <p className="text-xs text-[var(--color-text-muted)] py-3">
           When downloaded and active, every recording is automatically
           tagged with <code>Speaker 1:</code> / <code>Speaker 2:</code>
           labels after stop. Both engines run locally via CoreML / Apple
           Neural Engine; pick whichever works better for your recordings.
         </p>
-        <Row label="Community-1 (clustering)">
-          <label className="flex items-center gap-2 cursor-pointer text-sm mb-2">
-            <input
-              type="radio"
-              name="diarize_model"
-              checked={s.diarize_model === "community1"}
-              disabled={!diarize.status?.downloaded}
-              onChange={() => update("diarize_model", "community1")}
-            />
-            Use Community-1 for new recordings
-          </label>
+        <EngineOption
+          label="Community-1 (clustering)"
+          description="Pyannote community-1 segmentation + WeSpeaker embeddings + VBx clustering. Strong baseline; auto-detects speaker count; occasionally collapses on rapid back-and-forth in the same channel."
+          checked={s.diarize_model === "community1"}
+          disabled={!diarize.status?.downloaded}
+          onPick={() => update("diarize_model", "community1")}
+        >
           <DiarizeModelManager
             state={diarize}
             onDownload={downloadDiarize}
             onDelete={deleteDiarize}
           />
-          <p className="text-xs text-[var(--color-text-muted)] mt-2">
-            Pyannote community-1 segmentation + WeSpeaker embeddings + VBx
-            clustering. Strong baseline; auto-detects speaker count;
-            occasionally collapses on rapid back-and-forth in the same
-            channel.
-          </p>
-        </Row>
-        <Row label="Sortformer (end-to-end)">
-          <label className="flex items-center gap-2 cursor-pointer text-sm mb-2">
-            <input
-              type="radio"
-              name="diarize_model"
-              checked={s.diarize_model === "sortformer"}
-              disabled={!sortformer.status?.downloaded}
-              onChange={() => update("diarize_model", "sortformer")}
-            />
-            Use Sortformer for new recordings
-          </label>
+        </EngineOption>
+        <EngineOption
+          label="Sortformer (end-to-end)"
+          description="NVIDIA Sortformer running in batch over the saved WAV. Fixed 4-speaker cap. Handles the rapid speaker changes clustering struggles with — the answer if Community-1 keeps confusing your speakers."
+          checked={s.diarize_model === "sortformer"}
+          disabled={!sortformer.status?.downloaded}
+          onPick={() => update("diarize_model", "sortformer")}
+        >
           <DiarizeModelManager
             state={sortformer}
             onDownload={downloadSortformer}
             onDelete={deleteSortformer}
           />
-          <p className="text-xs text-[var(--color-text-muted)] mt-2">
-            NVIDIA Sortformer running in batch over the saved WAV. Fixed
-            4-speaker cap, no count hint. Designed to handle rapid speaker
-            changes that the clustering approach struggles with — the
-            architectural answer if Community-1 keeps confusing your
-            speakers.
-          </p>
-        </Row>
-        {devMode && <Row label="Advanced thresholds">
-          <details className="text-sm">
-            <summary className="cursor-pointer text-[var(--color-text-muted)]">
-              Tune detection thresholds
-            </summary>
-            <div className="flex flex-col gap-3 mt-3">
-              <div>
-                <label className="text-xs uppercase tracking-wide text-[var(--color-text-muted)] block mb-1">
-                  Community-1 clustering threshold
-                </label>
-                <input
-                  type="text"
-                  value={s.community1_threshold}
-                  onChange={(e) => update("community1_threshold", e.target.value)}
-                  placeholder="0.5"
-                  className={inputClass + " w-32"}
-                  style={{ fontFamily: "var(--font-mono)" }}
-                />
-                <p className="text-xs text-[var(--color-text-muted)] mt-1">
-                  Higher = more aggressive separation (more speakers).
-                  Lower = more merging. Default 0.5. Community-1 only.
-                </p>
-              </div>
-              <div>
-                <label className="text-xs uppercase tracking-wide text-[var(--color-text-muted)] block mb-1">
-                  Sortformer silence threshold
-                </label>
-                <input
-                  type="text"
-                  value={s.sortformer_silence_threshold}
-                  onChange={(e) => update("sortformer_silence_threshold", e.target.value)}
-                  placeholder="0.5"
-                  className={inputClass + " w-32"}
-                  style={{ fontFamily: "var(--font-mono)" }}
-                />
-                <p className="text-xs text-[var(--color-text-muted)] mt-1">
-                  Sum of speaker probabilities below which a frame is
-                  treated as silence. Default 0.5.
-                </p>
-              </div>
-              <div>
-                <label className="text-xs uppercase tracking-wide text-[var(--color-text-muted)] block mb-1">
-                  Sortformer prediction threshold
-                </label>
-                <input
-                  type="text"
-                  value={s.sortformer_pred_threshold}
-                  onChange={(e) => update("sortformer_pred_threshold", e.target.value)}
-                  placeholder="0.25"
-                  className={inputClass + " w-32"}
-                  style={{ fontFamily: "var(--font-mono)" }}
-                />
-                <p className="text-xs text-[var(--color-text-muted)] mt-1">
-                  Speech-probability threshold for crediting a speaker.
-                  Default 0.25.
-                </p>
-              </div>
-              <div>
-                <label className="text-xs uppercase tracking-wide text-[var(--color-text-muted)] block mb-1">
-                  Silence RMS threshold
-                </label>
-                <input
-                  type="text"
-                  value={s.silence_rms_threshold}
-                  onChange={(e) => update("silence_rms_threshold", e.target.value)}
-                  placeholder="0.008"
-                  className={inputClass + " w-32"}
-                  style={{ fontFamily: "var(--font-mono)" }}
-                />
-                <p className="text-xs text-[var(--color-text-muted)] mt-1">
-                  Chunks with RMS below this are skipped before
-                  Whisper sees them — prevents hallucinations on
-                  near-silence and HVAC / mic-hiss audio. Higher =
-                  drops more borderline chunks (less hallucination,
-                  but quiet speech can be cut). Default 0.008. Pure
-                  silence ≈ 0.0001, room tone ≈ 0.001, soft speech ≈
-                  0.01+.
-                </p>
-              </div>
-            </div>
-          </details>
-          <p className="text-xs text-[var(--color-text-muted)] mt-2">
+        </EngineOption>
+        <Disclosure label="Advanced">
+          <ThresholdRow
+            label="Community-1 clustering threshold"
+            description="Higher = more aggressive separation (more speakers); lower = more merging. Default 0.5. Community-1 only."
+            value={s.community1_threshold}
+            placeholder="0.5"
+            onChange={(v) => update("community1_threshold", v)}
+          />
+          <ThresholdRow
+            label="Sortformer silence threshold"
+            description="Sum of speaker probabilities below which a frame is treated as silence. Default 0.5."
+            value={s.sortformer_silence_threshold}
+            placeholder="0.5"
+            onChange={(v) => update("sortformer_silence_threshold", v)}
+          />
+          <ThresholdRow
+            label="Sortformer prediction threshold"
+            description="Speech-probability threshold for crediting a speaker. Default 0.25."
+            value={s.sortformer_pred_threshold}
+            placeholder="0.25"
+            onChange={(v) => update("sortformer_pred_threshold", v)}
+          />
+          <ThresholdRow
+            label="Silence RMS threshold"
+            description="Chunks quieter than this are skipped before Whisper sees them — prevents hallucinations on near-silence and mic hiss; too high and quiet speech gets cut. Default 0.008 (pure silence ≈ 0.0001, room tone ≈ 0.001, soft speech ≈ 0.01+)."
+            value={s.silence_rms_threshold}
+            placeholder="0.008"
+            onChange={(v) => update("silence_rms_threshold", v)}
+          />
+          <p className="text-xs text-[var(--color-text-muted)]">
             Tweaks apply on the next recording or re-diarize. Diagnostic
             JSON is dumped per run — open the Note's diagnostics folder
             from its header to inspect where shifts landed.
           </p>
-        </Row>}
+        </Disclosure>
       </Section>
 
       <Section title="Vocabulary">

@@ -331,6 +331,42 @@ describe("settings dialog", () => {
     expect(write?.config?.default?.use_gpu).toBe(false);
   });
 
+  it("detection thresholds live behind an Advanced disclosure as labeled rows", async () => {
+    const writes: Record<string, string> = {};
+    renderApp("/settings?tab=transcription", {
+      settings_set: (args) => {
+        const { key, value } = args as { key: string; value: string };
+        writes[key] = value;
+        return null;
+      },
+    });
+    const dialog = await screen.findByRole("dialog", { name: /settings/i });
+
+    // Collapsed by default — expert knobs don't shout (and no developer-mode
+    // gate: tuning re-diarize thresholds is user-relevant).
+    await within(dialog).findByText(/speaker labels/i);
+    expect(
+      within(dialog).queryByText(/community-1 clustering threshold/i),
+    ).not.toBeInTheDocument();
+
+    const advanced = within(dialog).getByRole("button", {
+      name: /advanced/i,
+    });
+    await userEvent.click(advanced);
+
+    const field = within(dialog).getByLabelText(
+      /community-1 clustering threshold/i,
+    );
+    await userEvent.clear(field);
+    await userEvent.type(field, "0.6");
+
+    expect(writes.community1_threshold).toBe("0.6");
+    // Sentence-case labels — the uppercase .nd-label style is retired.
+    expect(
+      within(dialog).getByText(/silence rms threshold/i),
+    ).toBeInTheDocument();
+  });
+
   it("deep-links ?tab=account to the merged Account section", async () => {
     renderApp("/settings?tab=account");
     const dialog = await screen.findByRole("dialog", { name: /settings/i });
