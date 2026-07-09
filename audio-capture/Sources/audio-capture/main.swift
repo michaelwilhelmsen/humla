@@ -879,7 +879,17 @@ func runImport(_ path: String) {
         do {
             try file.read(into: inBuf)
         } catch {
-            if readAnyFrames { break } // tail-read quirk on compressed files → EOF
+            // Distinguish the benign AVAudioFile tail quirk from genuine
+            // mid-file decode corruption by read position. `read(into:)` is
+            // known to throw at/near the end of some compressed files instead
+            // of cleanly returning frameLength == 0 — that throw lands within
+            // ~one block of file.length. A throw well *before* the end means
+            // the file failed to decode mid-stream, so treating it as clean
+            // EOF would silently import a truncated file (exit 0, "stopped",
+            // no error) while the user believes the whole file came in.
+            // Surface those as a real error; keep the tail quirk silent.
+            let atTail = file.framePosition >= file.length - Int64(blockFrames)
+            if readAnyFrames && atTail { break } // tail-read quirk → EOF
             emitError("import read: \(error.localizedDescription)")
             break
         }
