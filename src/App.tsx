@@ -1,4 +1,11 @@
-import { Routes, Route, Navigate, useNavigate } from "react-router-dom";
+import {
+  Routes,
+  Route,
+  Navigate,
+  useNavigate,
+  useLocation,
+  type Location,
+} from "react-router-dom";
 import { useEffect, useState } from "react";
 import { Layout } from "./components/Layout";
 import { Home } from "./pages/Home";
@@ -6,7 +13,7 @@ import { AllNotes } from "./pages/AllNotes";
 import { Note } from "./pages/Note";
 import { Folder } from "./pages/Folder";
 import { Trash } from "./pages/Trash";
-import { Settings } from "./pages/Settings";
+import { SettingsDialog } from "./pages/settings/SettingsDialog";
 import { Onboarding } from "./pages/onboarding";
 import { ipc } from "./lib/ipc";
 import { useGlobalShortcuts } from "./lib/shortcuts";
@@ -69,22 +76,59 @@ export default function App() {
     return <OnboardingTakeover onDone={() => setOnboardingDone(true)} />;
   }
 
+  return <AppRoutes />;
+}
+
+// Home stand-in when `/settings` is opened with no prior in-app view
+// (fresh launch on the settings URL): there's nothing to restore behind
+// the dialog, so it dims Home.
+const HOME_FALLBACK = {
+  pathname: "/",
+  search: "",
+  hash: "",
+  state: null,
+  key: "settings-home-fallback",
+} as Location;
+
+function AppRoutes() {
+  const location = useLocation();
+  const navigate = useNavigate();
+  // `/settings` renders as a dialog OVER the app, not as a page swap: the
+  // routed view underneath keeps showing the last non-settings location.
+  const isSettings = location.pathname.startsWith("/settings");
+  const [background, setBackground] = useState<Location | null>(null);
+  useEffect(() => {
+    if (!isSettings) setBackground(location);
+  }, [location, isSettings]);
+
+  const displayLocation = isSettings ? (background ?? HOME_FALLBACK) : location;
+
+  // Closing pops the history entry the entry point pushed, landing back on
+  // the view behind the dialog. Opened cold (no background) there's nothing
+  // to pop to — replace with Home.
+  const closeSettings = () => {
+    if (background) navigate(-1);
+    else navigate("/", { replace: true });
+  };
+
   return (
-    <Routes>
-      {/* Manual re-run entry (nag chip / "Run setup again", built by a later
-          package). Same component; navigates home on completion. Lives outside
-          <Layout> so it's also a full-window takeover. */}
-      <Route path="/onboarding" element={<OnboardingRoute />} />
-      <Route element={<Layout />}>
-        <Route path="/" element={<Home />} />
-        <Route path="/all-notes" element={<AllNotes />} />
-        <Route path="/note/:id" element={<Note />} />
-        <Route path="/folder/:id" element={<Folder />} />
-        <Route path="/trash" element={<Trash />} />
-        <Route path="/settings" element={<Settings />} />
-        <Route path="*" element={<Navigate to="/" replace />} />
-      </Route>
-    </Routes>
+    <>
+      <Routes location={displayLocation}>
+        {/* Manual re-run entry (nag chip / "Run setup again", built by a later
+            package). Same component; navigates home on completion. Lives outside
+            <Layout> so it's also a full-window takeover. */}
+        <Route path="/onboarding" element={<OnboardingRoute />} />
+        <Route element={<Layout />}>
+          <Route path="/" element={<Home />} />
+          <Route path="/all-notes" element={<AllNotes />} />
+          <Route path="/note/:id" element={<Note />} />
+          <Route path="/folder/:id" element={<Folder />} />
+          <Route path="/trash" element={<Trash />} />
+          <Route path="*" element={<Navigate to="/" replace />} />
+        </Route>
+      </Routes>
+      {isSettings && <SettingsDialog onClose={closeSettings} />}
+    </>
   );
 }
 

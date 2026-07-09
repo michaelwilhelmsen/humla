@@ -14,6 +14,7 @@ import { useNotesStore } from "../../../lib/store";
 import { Row, Section } from "../components/Section";
 import { Btn } from "../components/Btn";
 import { Select } from "../components/Select";
+import { ValuePill } from "../components/ValuePill";
 
 const inputCls =
   "flex-1 min-w-0 text-sm px-3 py-2 rounded-md border border-[var(--color-line-visible)] bg-[var(--color-surface)] focus:border-[var(--color-text-muted)] transition-colors";
@@ -69,15 +70,11 @@ function BillingPanel({ ws, onChanged }: { ws: CloudWorkspace; onChanged: () => 
   }
 
   return (
-    <div className="flex flex-col gap-3">
-      <Row label="Plan">
-        <span
-          className="shrink-0 px-2 py-0.5 text-[11px] rounded border"
-          style={{ color: meta.color, borderColor: "var(--color-line)", fontFamily: "var(--font-mono)" }}
-        >
-          {meta.label}
-        </span>
-      </Row>
+    <div className="flex flex-col gap-3 py-3.5">
+      <div className="flex items-center justify-between gap-6">
+        <div className="text-sm">Plan</div>
+        <ValuePill color={meta.color}>{meta.label}</ValuePill>
+      </div>
       {!active && (
         <p className="text-xs text-[var(--color-text-muted)] leading-relaxed">
           This workspace is read-only until it has an active subscription.{" "}
@@ -158,16 +155,10 @@ export function OrganizationTab() {
     else setMembers([]);
   }, [ws?.id, loadMembers]);
 
-  // Signed out --------------------------------------------------------------
+  // Signed out: nothing to manage. The sign-in UI renders directly above in
+  // the same Account section (post-merge), so no pointer stub is needed.
   if (!status.logged_in) {
-    return (
-      <Section title="Organization">
-        <p className="text-sm text-[var(--color-text-muted)]">
-          Sign in from the <span className="text-[var(--color-text)]">Account</span> tab to create a
-          workspace and invite your team.
-        </p>
-      </Section>
-    );
+    return null;
   }
 
   // No active workspace -----------------------------------------------------
@@ -186,8 +177,8 @@ export function OrganizationTab() {
       }
     }
     return (
-      <Section title="Organization">
-        <p className="text-sm text-[var(--color-text-muted)]">
+      <Section title="Workspace">
+        <p className="text-sm text-[var(--color-text-muted)] py-3.5">
           You're in Personal (local-only) mode. Create a workspace to start collaborating, or pick
           one from the switcher at the top of the sidebar.
         </p>
@@ -239,8 +230,8 @@ export function OrganizationTab() {
       setAddEmail("");
       setNotice(
         status === "invited"
-          ? `Invited ${email} — they'll join automatically when they sign up.`
-          : `Added ${email} to the workspace.`,
+          ? `Invitation emailed to ${email} — they'll join automatically when they sign up and verify their email.`
+          : `Added ${email} to the workspace — they've been notified by email.`,
       );
       await loadMembers(ws.id);
     } catch (e) {
@@ -362,18 +353,17 @@ export function OrganizationTab() {
             <div className="text-sm">{ws.name}</div>
           )}
         </Row>
-        <Row label="Your role">
-          <div className="flex items-center gap-2">
-            <RolePill role={ws.role} />
-            <span className="text-xs text-[var(--color-text-muted)]">
-              {ws.role === "owner"
-                ? "Full control, including billing and deletion."
-                : ws.role === "admin"
-                ? "Can manage members and settings."
-                : "Can create and edit notes."}
-            </span>
-          </div>
-        </Row>
+        <Row
+          label="Your role"
+          description={
+            ws.role === "owner"
+              ? "Full control, including billing and deletion."
+              : ws.role === "admin"
+              ? "Can manage members and settings."
+              : "Can create and edit notes."
+          }
+          control={<RolePill role={ws.role} />}
+        />
       </Section>
 
       {status.billing_enabled && ws && (
@@ -383,10 +373,10 @@ export function OrganizationTab() {
       )}
 
       <Section title={`Members${members.length ? ` · ${members.length}` : ""}`}>
-        {loading && <div className="text-sm text-[var(--color-text-muted)]">Loading…</div>}
-        {error && <div className="text-xs text-[var(--color-danger)]">{error}</div>}
+        {loading && <div className="text-sm text-[var(--color-text-muted)] py-3.5">Loading…</div>}
+        {error && <div className="text-xs text-[var(--color-danger)] py-3.5">{error}</div>}
 
-        <div className="flex flex-col gap-1">
+        <div className="flex flex-col gap-1 py-3.5">
           {members.map((m) => (
             <div
               key={m.id}
@@ -400,10 +390,9 @@ export function OrganizationTab() {
                 {m.name && <div className="text-xs text-[var(--color-text-muted)] truncate">{m.email}</div>}
               </div>
               {canManage && m.role !== "owner" ? (
-                // Fixed-width, non-growing slot: the shared Select is `w-full`,
-                // which would otherwise claim the whole row and collapse the
-                // name/email block (it's `flex-1 min-w-0`, so it shrinks to 0).
-                <div className="shrink-0 w-48">
+                // Non-growing slot so the name/email block (flex-1 min-w-0)
+                // keeps its space; the popover Select trigger sizes to content.
+                <div className="shrink-0">
                   <Select
                     value={m.role}
                     onChange={(v) => changeRole(m.id, v as CloudRole)}
@@ -456,8 +445,9 @@ export function OrganizationTab() {
             </div>
             {notice && <p className="text-xs text-[var(--color-success)] mt-2">{notice}</p>}
             <p className="text-xs text-[var(--color-text-muted)] mt-2">
-              If they already have an account they're added right away; otherwise they're invited and
-              join automatically when they sign up on this server.
+              They get an email either way: existing accounts are added right away; new
+              people get an invitation and join automatically when they sign up on this
+              server with the invited address.
             </p>
           </Row>
         )}

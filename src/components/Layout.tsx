@@ -14,11 +14,9 @@ import { bindBackendListeners } from "../lib/store";
 // macOS traffic lights when the sidebar is collapsed (no nav card to host them).
 export type LayoutOutletContext = { sidebarCollapsed: boolean };
 
-// Below this width (px) the main app sidebar + Settings inner sidebar +
-// content all fight for room and the right-hand column starts wrapping
-// inside its rows. Auto-collapsing at this threshold keeps the UI from
-// going claustrophobic. Keep in sync with the equivalent threshold in
-// any future responsive Settings logic.
+// Below this width (px) the sidebar + content fight for room and the
+// right-hand column starts wrapping inside its rows. Auto-collapsing at
+// this threshold keeps the UI from going claustrophobic.
 const NARROW_VIEWPORT_PX = 900;
 
 export function Layout() {
@@ -41,18 +39,14 @@ export function Layout() {
     return () => window.removeEventListener("resize", onResize);
   }, []);
 
-  // Auto-collapse when we're on Settings (the page already has its own
-  // navigation chrome — the main sidebar adds clutter without value) or
-  // when the window is too narrow to fit both sidebars + content.
-  const onSettings = location.pathname.startsWith("/settings");
-  const tooNarrow = viewportWidth < NARROW_VIEWPORT_PX;
-  const shouldAutoCollapse = onSettings || tooNarrow;
+  // Auto-collapse when the window is too narrow to fit sidebar + content.
+  // (Settings no longer collapses anything — it renders as a dialog over
+  // the shell, so Layout never even sees a /settings location.)
+  const shouldAutoCollapse = viewportWidth < NARROW_VIEWPORT_PX;
 
-  // Drop any manual override when the auto trigger flips. If the user
-  // navigates away from Settings to a Note in a wide window, we restart
-  // from auto = expanded; they can collapse again with the toggle if they
-  // want. Same the other way around — entering Settings collapses,
-  // overriding any prior manual choice.
+  // Drop any manual override when the auto trigger flips. If the viewport
+  // situation changes, we restart from the auto rule; the user can
+  // re-collapse with the toggle if they want.
   useEffect(() => {
     setManualCollapsed(null);
   }, [shouldAutoCollapse]);

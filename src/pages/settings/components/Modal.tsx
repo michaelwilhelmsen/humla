@@ -17,11 +17,18 @@ export function Modal({
 }) {
   useEffect(() => {
     if (!open) return;
+    // Capture phase + stopPropagation: when this modal is nested inside the
+    // settings dialog (e.g. the prompt editor), Escape must dismiss only the
+    // innermost layer — never reach the dialog's window listener and close
+    // everything (discarding in-progress edits). Same layering as Select.
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (e.key === "Escape") {
+        e.stopPropagation();
+        onClose();
+      }
     };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+    document.addEventListener("keydown", onKey, true);
+    return () => document.removeEventListener("keydown", onKey, true);
   }, [open, onClose]);
 
   if (!open) return null;

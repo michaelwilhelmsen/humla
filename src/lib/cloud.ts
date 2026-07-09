@@ -45,6 +45,9 @@ export const cloudApi = {
     invoke<CloudStatus>("cloud_signup", { email, password, name }),
   /** Resend the email-verification message to the signed-in user. */
   resendVerification: () => invoke<void>("cloud_resend_verification"),
+  /** Email a password-reset link (signed-out; 204 even for unknown emails). */
+  requestPasswordReset: (email: string) =>
+    invoke<void>("cloud_request_password_reset", { email }),
   logout: () => invoke<void>("cloud_logout"),
   createWorkspace: (name: string) => invoke<CloudWorkspace>("cloud_create_workspace", { name }),
   selectWorkspace: (id: string) => invoke<void>("cloud_select_workspace", { id }),

@@ -265,30 +265,6 @@ export function TranscriptionTab({
         </Row>}
       </Section>
 
-      <Section title="Audio retention">
-        <Row label="Keep recorded audio">
-          <label className="flex items-center gap-2 cursor-pointer text-sm">
-            <input
-              type="checkbox"
-              checked={s.keep_audio === "true"}
-              onChange={(e) =>
-                update("keep_audio", e.target.checked ? "true" : "false")
-              }
-            />
-            Save the recording's WAV files for re-use after stop
-          </label>
-          <p className="text-xs text-[var(--color-text-muted)] mt-2">
-            Off by default — recordings live in the temp dir during
-            post-processing and are deleted at the end. Turn on to keep
-            both mic and system tracks under{" "}
-            <code>{`<app data>/recordings/<note_id>/`}</code> so you can
-            re-run diarize at different thresholds, listen back, or
-            inspect later. Storage cost: roughly 1 MB per minute of audio
-            per channel.
-          </p>
-        </Row>
-      </Section>
-
       <Section title="Vocabulary">
         <Row label="Custom terms">
           <textarea

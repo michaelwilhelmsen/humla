@@ -3,13 +3,15 @@ import { Cloud, CloudOff, LogOut } from "lucide-react";
 import { cloudApi, useCloudStore, HUMLA_CLOUD_URL } from "../../../lib/cloud";
 import { Row, Section } from "../components/Section";
 import { Btn } from "../components/Btn";
+import { ValuePill } from "../components/ValuePill";
 
 const inputCls =
   "w-full text-sm px-3 py-2 rounded-md border border-[var(--color-line-visible)] bg-[var(--color-surface)] focus:border-[var(--color-text-muted)] transition-colors";
 
-// Account tab: connect to a Humla Cloud server, sign in/out. The server URL +
-// credentials drive everything else (workspaces, members). Local-only use
-// needs none of this — it's entirely opt-in.
+// Account section: connect to a Humla Cloud server, sign in/out. The server
+// URL + credentials drive everything else (workspace management renders
+// below, from Organization.tsx, once signed in). Local-only use needs none
+// of this — it's entirely opt-in.
 export function AccountTab() {
   const status = useCloudStore((s) => s.status);
   const refresh = useCloudStore((s) => s.refresh);
@@ -22,6 +24,7 @@ export function AccountTab() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [verifyMsg, setVerifyMsg] = useState<string | null>(null);
+  const [resetMsg, setResetMsg] = useState<string | null>(null);
 
   async function connect() {
     setBusy(true);
@@ -42,7 +45,8 @@ export function AccountTab() {
     setBusy(true);
     setError(null);
     try {
-      setServerUrl(HUMLA_CLOUD_URL);
+      // Don't mirror the URL into the self-hosted input — that field is for
+      // custom servers only; the hosted URL showing up there reads as a bug.
       await cloudApi.configure(HUMLA_CLOUD_URL);
       await refresh();
     } catch (e) {
@@ -93,6 +97,26 @@ export function AccountTab() {
     }
   }
 
+  async function forgotPassword() {
+    const addr = email.trim();
+    if (!addr) {
+      setResetMsg("Enter your email above first, then try again.");
+      return;
+    }
+    setBusy(true);
+    setResetMsg(null);
+    try {
+      await cloudApi.requestPasswordReset(addr);
+      // The server answers 204 even for unknown addresses (no account
+      // enumeration), so this only promises the request went out.
+      setResetMsg(`Password reset email sent to ${addr} — check your inbox.`);
+    } catch (e) {
+      setResetMsg(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function signOut() {
     setBusy(true);
     try {
@@ -116,20 +140,29 @@ export function AccountTab() {
   }
 
   // Signed in ----------------------------------------------------------------
+  // (The active workspace is shown and managed in the Workspace section
+  // rendered below this one — not duplicated here.)
   if (status.logged_in && status.user) {
     return (
-      <>
-        <Section title="Account">
-          <div className="flex items-center gap-3">
-            <div className="shrink-0 grid place-items-center w-11 h-11 rounded-full bg-[var(--color-pill-hover)] text-[var(--color-text-muted)]">
-              <Cloud size={20} strokeWidth={1.5} />
+      <Section title="Account">
+        <div className="flex items-center justify-between gap-3 py-3.5">
+          <div className="flex items-center gap-3 min-w-0">
+            <div className="shrink-0 grid place-items-center w-10 h-10 rounded-full bg-[var(--color-pill-hover)] text-[var(--color-text-muted)]">
+              <Cloud size={18} strokeWidth={1.5} />
             </div>
             <div className="min-w-0">
               <div className="text-sm truncate">{status.user.name || status.user.email}</div>
               <div className="text-xs text-[var(--color-text-muted)] truncate">{status.user.email}</div>
             </div>
           </div>
-          {!status.user.verified && (
+          <Btn onClick={signOut} disabled={busy}>
+            <span className="inline-flex items-center gap-1.5">
+              <LogOut size={14} strokeWidth={1.5} /> Sign out
+            </span>
+          </Btn>
+        </div>
+        {!status.user.verified && (
+          <div className="py-3.5">
             <div className="rounded-md border border-[var(--color-warning)] bg-[var(--color-pill-hover)] px-3 py-2 text-xs flex flex-col gap-2">
               <div>
                 <span style={{ color: "var(--color-warning)" }}>⚠</span>{" "}
@@ -143,33 +176,21 @@ export function AccountTab() {
                 {verifyMsg && <span className="text-[var(--color-text-muted)]">{verifyMsg}</span>}
               </div>
             </div>
-          )}
-          <Row label="Server">
-            <div className="text-sm text-[var(--color-text-muted)] break-all">{status.base_url}</div>
-          </Row>
-          <Row label="Active workspace">
-            <div className="text-sm text-[var(--color-text-muted)]">
-              {status.current_workspace ? status.current_workspace.name : "Personal (local only)"}
-            </div>
-          </Row>
-          <div className="flex gap-2">
-            <Btn onClick={signOut} disabled={busy}>
-              <span className="inline-flex items-center gap-1.5">
-                <LogOut size={14} strokeWidth={1.5} /> Sign out
-              </span>
-            </Btn>
-            <Btn onClick={disconnect} disabled={busy}>
-              <span className="inline-flex items-center gap-1.5">
-                <CloudOff size={14} strokeWidth={1.5} /> Disconnect server
-              </span>
-            </Btn>
           </div>
-        </Section>
-        <p className="text-xs text-[var(--color-text-muted)] -mt-6">
-          Cloud sync is opt-in. Your notes always live locally first; signing in lets you sync them
-          to a workspace and collaborate with a team.
-        </p>
-      </>
+        )}
+        <Row label="Server" control={<ValuePill>{status.base_url}</ValuePill>} />
+        <Row
+          label="Disconnect server"
+          description="Forget this server and sign out. Cloud sync is opt-in — your notes always live locally first."
+          control={
+            <Btn onClick={disconnect} disabled={busy} aria-label="Disconnect server">
+              <span className="inline-flex items-center gap-1.5">
+                <CloudOff size={14} strokeWidth={1.5} /> Disconnect
+              </span>
+            </Btn>
+          }
+        />
+      </Section>
     );
   }
 
@@ -184,9 +205,7 @@ export function AccountTab() {
     };
     return (
       <Section title={isSignup ? "Create account" : "Sign in"}>
-        <Row label="Server">
-          <div className="text-sm text-[var(--color-text-muted)] break-all">{status.base_url}</div>
-        </Row>
+        <Row label="Server" control={<ValuePill>{status.base_url}</ValuePill>} />
         {isSignup && (
           <Row label="Name">
             <input className={inputCls} type="text" autoComplete="name" value={name}
@@ -204,18 +223,29 @@ export function AccountTab() {
             onKeyDown={(e) => e.key === "Enter" && canSubmit && submit()}
             placeholder={isSignup ? "At least 8 characters" : "••••••••"} />
         </Row>
-        {error && <div className="text-xs text-[var(--color-danger)]">{error}</div>}
-        <div className="flex gap-2">
-          <Btn onClick={submit} disabled={busy || !canSubmit}>
-            {busy ? (isSignup ? "Creating…" : "Signing in…") : isSignup ? "Create account" : "Sign in"}
-          </Btn>
-          <Btn onClick={disconnect} disabled={busy}>Change server</Btn>
-        </div>
-        <div>
-          <button type="button" onClick={toggleMode}
-            className="text-xs text-[var(--color-interactive)] hover:underline">
-            {isSignup ? "Already have an account? Sign in" : "Need an account? Create one"}
-          </button>
+        <div className="py-3.5 flex flex-col gap-3">
+          {error && <div className="text-xs text-[var(--color-danger)]">{error}</div>}
+          <div className="flex gap-2">
+            <Btn onClick={submit} disabled={busy || !canSubmit}>
+              {busy ? (isSignup ? "Creating…" : "Signing in…") : isSignup ? "Create account" : "Sign in"}
+            </Btn>
+            <Btn onClick={disconnect} disabled={busy}>Change server</Btn>
+          </div>
+          <div className="flex items-center gap-4">
+            <button type="button" onClick={toggleMode}
+              className="text-xs text-[var(--color-interactive)] hover:underline">
+              {isSignup ? "Already have an account? Sign in" : "Need an account? Create one"}
+            </button>
+            {!isSignup && (
+              <button type="button" onClick={forgotPassword} disabled={busy}
+                className="text-xs text-[var(--color-interactive)] hover:underline disabled:opacity-50">
+                Forgot password?
+              </button>
+            )}
+          </div>
+          {resetMsg && (
+            <div className="text-xs text-[var(--color-text-muted)]">{resetMsg}</div>
+          )}
         </div>
       </Section>
     );
@@ -224,34 +254,54 @@ export function AccountTab() {
   // Not configured -----------------------------------------------------------
   return (
     <Section title="Connect to sync">
-      <p className="text-sm text-[var(--color-text-muted)]">
-        Humla works fully offline. To sync across devices and collaborate with a team, connect to
-        <strong> Humla Cloud</strong> (hosted — easiest) or point Humla at your own server.
-      </p>
-      {error && <div className="text-xs text-[var(--color-danger)]">{error}</div>}
-      <div className="flex items-center gap-2">
-        <Btn onClick={useHumlaCloud} disabled={busy}>
-          <span className="inline-flex items-center gap-1.5">
-            <Cloud size={14} strokeWidth={1.5} /> {busy ? "Connecting…" : "Use Humla Cloud"}
-          </span>
-        </Btn>
-        <span className="text-xs text-[var(--color-text-muted)]">14-day free trial · cancel anytime</span>
+      <div className="py-3.5 flex flex-col gap-3">
+        <p className="text-sm text-[var(--color-text-muted)]">
+          Humla works fully offline. Your notes always live on your Mac first.
+        </p>
+        {error && <div className="text-xs text-[var(--color-danger)]">{error}</div>}
+        {/* Humla Cloud pitch: the one place the hosted offer gets to sell
+            itself — accent-washed so it stands out from the surrounding
+            settings chrome without shouting. */}
+        <div className="rounded-lg border border-[var(--color-accent)] bg-[var(--color-accent-soft)] p-4 flex flex-col gap-1.5">
+          <div className="flex items-center gap-1.5 text-sm font-medium">
+            <Cloud size={15} strokeWidth={1.7} /> Humla Cloud
+          </div>
+          <p className="text-sm text-[var(--color-text-muted)]">
+            Share notes across your team — synced to every device, backed up,
+            and ready for teammates.
+          </p>
+          <div className="flex items-baseline gap-1.5 pt-1">
+            <span className="text-2xl font-semibold tracking-tight">$7</span>
+            <span className="text-xs text-[var(--color-text-muted)]">
+              /month for the entire team
+            </span>
+          </div>
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 pt-1.5">
+            <button
+              type="button"
+              onClick={useHumlaCloud}
+              disabled={busy}
+              className="nd-btn nd-btn-primary"
+            >
+              {busy ? "Connecting…" : "Upgrade to Humla Cloud"}
+            </button>
+            <span className="text-xs text-[var(--color-text-muted)] whitespace-nowrap">
+              14-day free trial · cancel anytime
+            </span>
+          </div>
+        </div>
       </div>
-
-      <p className="text-xs text-[var(--color-text-muted)] pt-2">
-        Or connect your own self-hosted server:
-      </p>
-      <Row label="Server URL">
-        <input className={inputCls} type="url" value={serverUrl}
-          onChange={(e) => setServerUrl(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && connect()}
-          placeholder="https://sync.example.com" />
+      <Row label="Self-hosted server">
+        <div className="flex gap-2">
+          <input className={inputCls} type="url" value={serverUrl}
+            onChange={(e) => setServerUrl(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && connect()}
+            placeholder="https://sync.example.com" />
+          <Btn onClick={connect} disabled={busy || !serverUrl.trim()}>
+            {busy ? "Connecting…" : "Connect"}
+          </Btn>
+        </div>
       </Row>
-      <div>
-        <Btn onClick={connect} disabled={busy || !serverUrl.trim()}>
-          {busy ? "Connecting…" : "Connect"}
-        </Btn>
-      </div>
     </Section>
   );
 }

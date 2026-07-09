@@ -11,7 +11,7 @@ export function Toaster() {
   if (errors.length === 0 && flashes.length === 0) return null;
 
   return (
-    <div className="no-drag fixed bottom-24 right-6 z-50 flex flex-col gap-2 max-w-sm">
+    <div className="no-drag fixed bottom-24 right-6 z-[60] flex flex-col gap-2 max-w-sm">
       {errors.map((e) => (
         <div
           key={`err-${e.id}`}
