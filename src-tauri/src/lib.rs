@@ -290,6 +290,7 @@ where
             commands::diarize_delete,
             commands::recording_start,
             commands::recording_stop,
+            commands::import_audio,
             commands::recording_pause,
             commands::recording_resume,
             commands::recording_state,

@@ -149,6 +149,7 @@ export function RecordingBar({ noteId }: { noteId: string }) {
       )}
 
       {phase === "starting" && <BusyPill label="Starting…" />}
+      {phase === "importing" && <BusyPill label="Transcribing audio…" />}
       {phase === "stopping" && <BusyPill label="Stopping…" />}
       {phase === "diarizing" && <BusyPill label="Identifying speakers…" />}
       {isSummarizing && <BusyPill label="Summarizing…" />}
