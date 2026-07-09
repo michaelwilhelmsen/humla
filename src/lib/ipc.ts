@@ -195,6 +195,26 @@ export type TimelineEntry = {
   label: string;
   text: string;
   words: TimelineWord[];
+  // Which recording session (#16) this entry belongs to, and its 0-based
+  // index within that session's own timeline. `noteTimeline` concatenates
+  // every session's timeline into one merged document so the reader never
+  // hides text; `start_ms` / `end_ms` / word times stay session-*local*, so
+  // the player only karaoke-matches the active session's entries against the
+  // one playback.wav it has loaded.
+  sessionId: string;
+  sessionIndex: number;
+  chunkIdx: number;
+};
+
+// One recording session (a single recording_start→stop cycle) for a note.
+// Drives the playback carousel + the styled reader's session dividers.
+export type NoteSession = {
+  id: string;
+  index: number;
+  startedAt: string;
+  durationMs: number;
+  streams: string[];
+  hasPlayback: boolean;
 };
 
 export const ipc = {
@@ -242,6 +262,12 @@ export const ipc = {
     invoke<string[]>("note_diagnostics_files", { noteId }),
   notePlaybackPath: (noteId: string) =>
     invoke<string | null>("note_playback_path", { noteId }),
+  // Recording sessions (#16): list a note's takes, and resolve a specific
+  // take's playback.wav for the session-switched player.
+  noteSessions: (noteId: string) =>
+    invoke<NoteSession[]>("note_sessions", { noteId }),
+  noteSessionPlaybackPath: (noteId: string, sessionId: string) =>
+    invoke<string | null>("note_session_playback_path", { noteId, sessionId }),
   // Cloud audio sync: upload a finished recording to its workspace, or pull a
   // shared note's audio down for local playback.
   uploadNoteAudio: (noteId: string) => invoke<void>("cloud_upload_note_audio", { noteId }),
@@ -255,10 +281,20 @@ export const ipc = {
     invoke<TimelineEntry[]>("note_timeline", { noteId }),
   noteTimelineRename: (noteId: string, oldLabel: string, newLabel: string) =>
     invoke<void>("note_timeline_rename", { noteId, oldLabel, newLabel }),
-  noteTimelineSetChunkLabel: (noteId: string, chunkIdx: number, newLabel: string) =>
-    invoke<void>("note_timeline_set_chunk_label", { noteId, chunkIdx, newLabel }),
-  noteTimelineDeleteChunk: (noteId: string, chunkIdx: number) =>
-    invoke<void>("note_timeline_delete_chunk", { noteId, chunkIdx }),
+  noteTimelineSetChunkLabel: (
+    noteId: string,
+    sessionId: string,
+    chunkIdx: number,
+    newLabel: string,
+  ) =>
+    invoke<void>("note_timeline_set_chunk_label", {
+      noteId,
+      sessionId,
+      chunkIdx,
+      newLabel,
+    }),
+  noteTimelineDeleteChunk: (noteId: string, sessionId: string, chunkIdx: number) =>
+    invoke<void>("note_timeline_delete_chunk", { noteId, sessionId, chunkIdx }),
   openInFinder: (path: string) => invoke<void>("open_in_finder", { path }),
   // Write a note's selected content to the chosen path as one combined file.
   exportNote: (noteId: string, spec: ExportSpec) =>

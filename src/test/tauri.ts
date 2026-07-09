@@ -28,6 +28,8 @@ export function mockTauri(handlers: Record<string, Handler> = {}) {
       case "local_whisper_models":
       case "note_audio_files":
       case "note_diagnostics_files":
+      case "note_sessions":
+      case "note_timeline":
         return [];
       case "recording_state":
         return "idle";
