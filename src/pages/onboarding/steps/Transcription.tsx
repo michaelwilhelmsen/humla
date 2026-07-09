@@ -22,9 +22,11 @@
 //
 // Download survival across navigation: the download runs on the Rust side
 // (local_whisper_download) independently of this component. Unmount doesn't
-// cancel it. A MODULE-LEVEL in-flight flag (`downloadInFlight`) guards
-// against double-starting when the user navigates back to this step while a
-// download is still running.
+// cancel it. Progress, completion, and failure are read from the global
+// useDownloadStore slice — fed by the app's single local_whisper_progress /
+// download-error listener in bindBackendListeners — so navigating back
+// mid-download re-attaches to the running download instead of double-starting
+// it. Same pattern as ModelDownloadCard.
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   HardDriveDownload,
@@ -35,11 +37,10 @@ import {
 } from "lucide-react";
 import {
   ipc,
-  onLocalWhisperDownloadError,
-  onLocalWhisperProgress,
   type LocalWhisperModelStatus,
   type ProviderConfig,
 } from "../../../lib/ipc";
+import { useDownloadStore } from "../../../lib/store";
 import { useProviderKey } from "../../../components/provider/useProviderKey";
 import type { StepContext } from "../types";
 import { StepShell } from "../StepShell";
@@ -86,10 +87,6 @@ function keyPlaceholder(p: CloudProvider): string {
   return p === "openai" ? "sk-…" : p === "deepgram" ? "Deepgram API key" : "gsk_…";
 }
 
-// Module-level guard: survives unmount so navigating back mid-download
-// doesn't re-trigger the download. Cleared when the download settles.
-let downloadInFlight = false;
-
 type Selection = "local" | "cloud" | null;
 
 export function TranscriptionStep({ ctx }: { ctx: StepContext }) {
@@ -99,13 +96,14 @@ export function TranscriptionStep({ ctx }: { ctx: StepContext }) {
 
   const [selection, setSelection] = useState<Selection>(null);
 
-  // Local-download UI state.
+  // Local-download UI state. Live progress and terminal failure come from the
+  // global download slice (survives this step's unmount); `downloadStarted`
+  // bridges the gap between clicking the card and the first progress event,
+  // and `downloadDone` records on-disk presence.
   const [downloadStarted, setDownloadStarted] = useState(false);
-  const [progress, setProgress] = useState<{ received: number; total: number | null } | null>(
-    null,
-  );
   const [downloadDone, setDownloadDone] = useState(false);
-  const [downloadError, setDownloadError] = useState<string | null>(null);
+  const activeDownload = useDownloadStore((s) => s.active);
+  const downloadFailure = useDownloadStore((s) => s.error);
 
   // Cloud card state. Key mechanics come from the shared hook (#22) — it
   // resets the surface itself when the provider changes; the step wraps
@@ -117,6 +115,10 @@ export function TranscriptionStep({ ctx }: { ctx: StepContext }) {
   const chosenModel = models?.find((m) => m.id === modelId) ?? null;
   const isNorwegian = modelId === NB_MODEL_ID;
   const isIntel = arch !== null && arch !== "aarch64";
+
+  // This step's slice of the global download state.
+  const mine = activeDownload?.modelId === modelId ? activeDownload : null;
+  const myError = downloadFailure?.modelId === modelId ? downloadFailure.message : null;
 
   // Load language, arch, and the model registry (for honest sizes + the
   // already-downloaded check). Then reconcile local state: if the chosen
@@ -138,17 +140,16 @@ export function TranscriptionStep({ ctx }: { ctx: StepContext }) {
       const wantId = modelIdForLanguage(lang);
       const already = ms.find((m) => m.id === wantId)?.downloaded ?? false;
 
-      // Pre-select from live config so a resuming user sees their prior choice.
+      // Pre-select from live config so a resuming user sees their prior
+      // choice. An in-flight download needs no special-casing here: the
+      // store-transition effect below reflects it the moment it renders.
       if (cfg?.default.provider === "local") {
         setSelection("local");
         if (already) setDownloadDone(true);
-        else if (downloadInFlight) setDownloadStarted(true);
       } else if (cfg && cfg.default.provider !== "openai") {
         // A non-openai, non-local default means a cloud provider was chosen.
         setSelection("cloud");
         setCloudProvider(cfg.default.provider as CloudProvider);
-      } else if (already && downloadInFlight) {
-        setDownloadStarted(true);
       }
     });
     return () => {
@@ -156,39 +157,30 @@ export function TranscriptionStep({ ctx }: { ctx: StepContext }) {
     };
   }, []);
 
-  // Subscribe to whisper download progress + failure (StrictMode-safe
-  // cleanup). Both completion AND failure are derived from events: the
-  // startDownload() promise dies with the mount that created it, so a user
-  // who navigated away and back would otherwise never see either outcome.
+  // Store-transition tracking. A live download for this step's model means
+  // the panel must show (covers navigating back mid-download — the job the
+  // old module-level in-flight flag did); the terminal transition (slice
+  // cleared on completion or failure) triggers a presence refetch to learn
+  // the outcome, exactly like ModelDownloadCard. Completion via this path is
+  // what lets a user who navigated away and back still see "Model ready" —
+  // the startDownload() promise dies with the mount that created it.
+  const wasMine = useRef(false);
   useEffect(() => {
-    let cancelled = false;
-    let unlisten: (() => void) | undefined;
-    let unlistenErr: (() => void) | undefined;
-    onLocalWhisperProgress((p) => {
-      if (p.modelId !== modelId) return;
-      setProgress({ received: p.received, total: p.total });
-      if (p.total !== null && p.received >= p.total) {
-        setDownloadDone(true);
-        downloadInFlight = false;
-      }
-    }).then((u) => {
-      if (cancelled) u();
-      else unlisten = u;
-    });
-    onLocalWhisperDownloadError((e) => {
-      if (e.modelId !== modelId) return;
-      setDownloadError(e.message);
-      downloadInFlight = false;
-    }).then((u) => {
-      if (cancelled) u();
-      else unlistenErr = u;
-    });
-    return () => {
-      cancelled = true;
-      unlisten?.();
-      unlistenErr?.();
-    };
-  }, [modelId]);
+    if (mine) {
+      wasMine.current = true;
+      setDownloadStarted(true);
+    } else if (wasMine.current) {
+      wasMine.current = false;
+      ipc
+        .localWhisperModels()
+        .then((ms) => {
+          if (!ms) return;
+          setModels(ms);
+          if (ms.find((m) => m.id === modelId)?.downloaded) setDownloadDone(true);
+        })
+        .catch(() => {});
+    }
+  }, [mine, modelId]);
 
   // Start (or resume awareness of) the on-device model download.
   const startDownload = useCallback(
@@ -200,25 +192,29 @@ export function TranscriptionStep({ ctx }: { ctx: StepContext }) {
         setDownloadDone(true);
         return;
       }
-      if (downloadInFlight) {
-        // Another mount already kicked it off; just reflect the in-flight state.
+      const downloads = useDownloadStore.getState();
+      if (downloads.active !== null) {
+        // A download is already running (this step's or another surface's —
+        // one at a time app-wide); just reflect the in-flight state.
         setDownloadStarted(true);
         return;
       }
-      downloadInFlight = true;
+      // Retrying after a failure: drop the stale error before re-invoking.
+      downloads.clear();
       setDownloadStarted(true);
-      setDownloadError(null);
-      setProgress({ received: 0, total: null });
       try {
         await ipc.localWhisperDownload(id);
-        // The command resolves when the file is fully written + renamed.
+        // The command resolves when the file is fully written + renamed —
+        // authoritative while this mount lives (the store transition above
+        // covers the navigated-away case).
         setDownloadDone(true);
         const refreshed = await ipc.localWhisperModels().catch(() => null);
         if (refreshed) setModels(refreshed);
       } catch (e) {
-        setDownloadError(String(e));
-      } finally {
-        downloadInFlight = false;
+        // Immediate spawn failure. The backend emits a download-error event
+        // for this too; failing the slice directly just makes the outcome
+        // independent of listener timing (same terminal state either way).
+        useDownloadStore.getState().fail({ modelId: id, message: String(e) });
       }
     },
     [],
@@ -356,11 +352,11 @@ export function TranscriptionStep({ ctx }: { ctx: StepContext }) {
               )}
 
               {/* Inline download progress. */}
-              {selection === "local" && (downloadStarted || downloadDone) && (
+              {selection === "local" && (downloadStarted || downloadDone || myError !== null) && (
                 <div className="mt-3">
-                  {downloadError ? (
+                  {myError && !downloadDone ? (
                     <p className="text-xs text-[var(--color-danger)] break-all">
-                      Download failed: {downloadError}
+                      Download failed: {myError}
                     </p>
                   ) : downloadDone ? (
                     <p className="text-xs text-[var(--color-success)] flex items-center gap-1.5">
@@ -371,10 +367,10 @@ export function TranscriptionStep({ ctx }: { ctx: StepContext }) {
                     <>
                       <div className="text-xs text-[var(--color-text-muted)] mb-1">
                         Downloading
-                        {progress?.total
-                          ? ` ${formatSize(progress.received)} / ${formatSize(progress.total)}`
-                          : progress
-                          ? ` ${formatSize(progress.received)}`
+                        {mine?.total
+                          ? ` ${formatSize(mine.received)} / ${formatSize(mine.total)}`
+                          : mine
+                          ? ` ${formatSize(mine.received)}`
                           : ""}
                         … you can continue while it finishes.
                       </div>
@@ -383,8 +379,8 @@ export function TranscriptionStep({ ctx }: { ctx: StepContext }) {
                           className="h-full bg-[var(--color-accent)] transition-[width] duration-150"
                           style={{
                             width:
-                              progress?.total
-                                ? `${Math.min(100, (progress.received / progress.total) * 100)}%`
+                              mine?.total
+                                ? `${Math.min(100, (mine.received / mine.total) * 100)}%`
                                 : "25%",
                           }}
                         />

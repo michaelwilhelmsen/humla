@@ -306,6 +306,37 @@ describe("onboarding TranscriptionStep — on-device download flow", () => {
     dl.resolve(null);
     act(() => useDownloadStore.getState().clear());
   });
+
+  it("still shows a failure that landed while the user was on another step", async () => {
+    // Post-consolidation behavior: the failure lives in the global download
+    // slice (bindBackendListeners fails it on the download-error event), so
+    // it survives this step's unmount — the invoke promise that could have
+    // reported it died with the mount that started the download.
+    const handlers: Parameters<typeof mockTauri>[0] = {
+      get_transcribe_config: () => ({
+        default: { provider: "local", model_id: TURBO, preset: "quality", use_gpu: true },
+        per_language: {},
+      }),
+      local_whisper_download: () => new Promise(() => {}),
+    };
+    const first = renderStep(handlers);
+    await userEvent.click(await onDeviceCard());
+    storeProgress(TURBO, 100_000_000, 574_000_000);
+    first.unmount();
+
+    // The download dies while the user is elsewhere in the wizard.
+    act(() => {
+      useDownloadStore.getState().fail({ modelId: TURBO, message: "connection reset" });
+    });
+
+    mockTauri({ local_whisper_models: () => whisperModels(), ...handlers });
+    render(<TranscriptionStep ctx={ctx()} />);
+
+    expect(await screen.findByText(/download failed/i)).toBeInTheDocument();
+    expect(screen.getByText(/connection reset/i)).toBeInTheDocument();
+
+    act(() => useDownloadStore.getState().clear());
+  });
 });
 
 describe("onboarding TranscriptionStep — cloud path", () => {
