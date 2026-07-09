@@ -11,6 +11,7 @@ use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
+use tokio::sync::Semaphore;
 
 // Command handlers are split into submodules under `commands/`. Each holds a
 // cohesive group of #[tauri::command] fns and is re-exported with `pub use`
@@ -89,6 +90,16 @@ const DEFAULT_SILENCE_RMS_THRESHOLD: f32 = 0.005;
 // before cleanup so the user can re-run diarize at different thresholds,
 // or just listen back. Privacy posture stays opt-in.
 const DEFAULT_KEEP_AUDIO: &str = "false";
+
+// Bounded backlog for the import reader loop. An `--import` replay emits chunks
+// at full disk speed — far faster than realtime — so without a bound the reader
+// would spawn a transcribe task per chunk and a multi-hour file would pile up
+// hundreds of parked tasks doing eager pre-gate work (silence RMS read, config
+// lookups) while they queue behind `transcribe_gate`. The reader acquires a
+// permit before spawning each chunk's task and the task releases it on
+// completion, capping the parked backlog. Transcription quality is unchanged —
+// the tasks still serialise on `transcribe_gate` exactly as live recording does.
+const IMPORT_BACKLOG_PERMITS: usize = 16;
 
 const DEFAULT_SUMMARY_MODEL: &str = "gpt-5.4-mini";
 // Ollama's default port + OpenAI-compat path. Any user running LM Studio,
@@ -1412,80 +1423,9 @@ pub async fn recording_start(
         let _ = c.kill().await;
     }
 
-    // Pre-check the configured provider's prerequisites — without them
-    // transcription always fails silently. Resolve the per-language
-    // override (if any) up front: both the prereq check and the prewarm
-    // path use the resolved provider — otherwise a user with a Norwegian
-    // override (Local) and an English default (Deepgram) would prewarm
-    // the wrong model when starting an English meeting.
-    let transcribe_cfg = read_transcribe_config(&state)
-        .map_err(|e| e.to_string())?;
-    let language = {
-        let conn = state.db.lock();
-        let global = db::get_setting(&conn, "language")
-            .map_err(err)?
-            .unwrap_or_else(|| DEFAULT_LANGUAGE.to_string());
-        let note_lang = db::get_note(&conn, &note_id)
-            .map(|n| n.language)
-            .unwrap_or_default();
-        if note_lang.trim().is_empty() { global } else { note_lang }
-    };
-    let provider_cfg = transcribe_cfg.resolve(&language).clone();
-    // Each cloud provider has its own Keychain slot. Look up the right
-    // one based on the active provider so the prerequisite check doesn't
-    // pass when (e.g.) the user picked Deepgram but only saved an OpenAI
-    // key.
-    let pre_err: Option<String> = match &provider_cfg {
-        crate::stt::ProviderConfig::Local(local_cfg) => {
-            let p = local_model_path(&app, &language, &local_cfg.model_id)
-                .map_err(|e| e.to_string())?;
-            if p.exists() {
-                None
-            } else {
-                Some(
-                    "Local Whisper model not downloaded. Download it in Settings → Transcription."
-                        .to_string(),
-                )
-            }
-        }
-        other => {
-            let provider_id = other.provider_id();
-            if read_provider_api_key(&state, provider_id)?.is_none() {
-                let label = match provider_id {
-                    "openai" => "OpenAI",
-                    "deepgram" => "Deepgram",
-                    "groq" => "Groq",
-                    _ => "the selected provider",
-                };
-                Some(format!(
-                    "{label} API key not set. Add one in Settings → API keys."
-                ))
-            } else {
-                None
-            }
-        }
-    };
-    if let Some(ref msg) = pre_err {
-        emit_error(&app, Some(&note_id), msg);
-        return Err(msg.clone());
-    }
-
-    // Race a Whisper model load against the sidecar startup so the first
-    // chunk doesn't pay the cold-start tax (~1–2 s on Apple Silicon). Fire
-    // and forget — by the time VAD rotates the first chunk, the model is
-    // already in Metal memory and inference is fast.
-    if let crate::stt::ProviderConfig::Local(local_cfg) = &provider_cfg {
-        let model_id = local_cfg.model_id.clone();
-        let use_gpu = local_cfg.use_gpu;
-        if let Ok(model_path) = local_model_path(&app, &language, &model_id) {
-            let shared = state.whisper.clone();
-            tokio::spawn(async move {
-                if let Err(e) = local_whisper::prewarm(shared, model_path, use_gpu).await {
-                    eprintln!("whisper prewarm: {e}");
-                }
-            });
-        }
-    }
+    // Pre-check the configured provider's prerequisites (API key / local model
+    // present) and fire the local-Whisper prewarm. Shared with `import_audio`.
+    ensure_provider_ready(&app, &state, &note_id).await?;
 
     // Pre-check microphone permission — without it we can't capture anything useful.
     if let Ok(p) = permissions_status(app.clone()).await {
@@ -1634,67 +1574,13 @@ pub async fn recording_start(
             let trimmed = line.trim();
             if trimmed.is_empty() { continue; }
             match serde_json::from_str::<SidecarEvent>(trimmed) {
-                Ok(SidecarEvent::Chunk { source, path, start_ms }) => {
-                    let pb = PathBuf::from(path);
-                    let app2 = app_clone.clone();
-                    let note_id2 = note_id_clone.clone();
-                    let h = tokio::spawn(async move {
-                        if let Err(e) = transcribe_chunk(app2.clone(), note_id2.clone(), source, pb, start_ms).await {
-                            let msg = format!("Transcription failed: {e}");
-                            eprintln!("{msg}");
-                            let _ = app2.emit("recording_error", ErrorPayload {
-                                note_id: Some(note_id2),
-                                message: msg,
-                            });
-                        }
-                    });
-                    inflight_for_reader.lock().push(h);
-                }
-                Ok(SidecarEvent::FullRecording { source, path, duration_ms: _ }) => {
-                    // Stash the path on the session; the diarization pass on
-                    // stop reads them. We don't act here — the recording is
-                    // still wrapping up. Each source has its own slot so the
-                    // post-stop pass can branch (mic-only → diarize mic;
-                    // both present → "You" + diarize sys).
-                    let state: tauri::State<AppState> = app_clone.state();
-                    let session = state.recording.lock();
-                    let slot = match source {
-                        ChunkSource::Mic => &session.mic_full_wav_path,
-                        ChunkSource::Sys => &session.sys_full_wav_path,
-                    };
-                    *slot.lock() = Some(PathBuf::from(path));
-                }
-                Ok(SidecarEvent::Error { message }) => {
-                    eprintln!("sidecar error: {message}");
-                    let _ = app_clone.emit("recording_error", ErrorPayload {
-                        note_id: Some(note_id_clone.clone()),
-                        message,
-                    });
-                }
-                Ok(SidecarEvent::Stopped) => break,
-                Ok(SidecarEvent::Paused) => emit_status(&app_clone, Some(&note_id_clone), Phase::Paused),
-                Ok(SidecarEvent::Resumed) => emit_status(&app_clone, Some(&note_id_clone), Phase::Recording),
-                Ok(SidecarEvent::Heartbeat { mic_frames, sys_frames, chunks, mic_peak, sys_peak }) => {
-                    let _ = app_clone.emit("recording_diagnostic", DiagnosticPayload {
-                        note_id: note_id_clone.clone(),
-                        mic_frames,
-                        sys_frames,
-                        chunks,
-                        mic_peak,
-                        sys_peak,
-                    });
-                }
-                Ok(SidecarEvent::Diagnostic { message }) => {
-                    // Non-fatal sidecar notice (e.g. mic capture recovered after
-                    // an audio device change). Reuse the recording_error channel
-                    // — on the frontend it's a transient, auto-dismissing toast —
-                    // so the user gets a heads-up without it reading as a hard
-                    // failure.
-                    eprintln!("sidecar diagnostic: {message}");
-                    let _ = app_clone.emit("recording_error", ErrorPayload {
-                        note_id: Some(note_id_clone.clone()),
-                        message,
-                    });
+                // Live capture passes `None` for the backlog — chunks arrive at
+                // realtime so there's nothing to bound (see `import_audio` for
+                // the semaphore-bounded variant).
+                Ok(ev) => {
+                    if dispatch_sidecar_event(&app_clone, &note_id_clone, ev, &inflight_for_reader, None).await {
+                        break;
+                    }
                 }
                 Err(e) => eprintln!("bad sidecar line: {e} -- {line}"),
             }
@@ -1836,6 +1722,38 @@ pub async fn recording_stop(
     // The user sees Phase::Stopping during the drain, which can be a few
     // seconds in the typical case.
     emit_status(&app, Some(&note_id), Phase::Stopping);
+    drain_inflight(&inflight).await;
+
+    // Snapshot every piece of session-derived state the post-stop chain
+    // needs, NOW — *after* the drain so chunk_log includes every chunk
+    // whose transcribe finished, and before spawning the background task
+    // so it can't race a new `recording_start` (which clears
+    // `state.recording.chunk_log`).
+    let post_stop = {
+        let mut s = state.recording.lock();
+        take_post_stop_snapshot(&mut s)
+    };
+
+    // Spawn the post-stop processing chain in the background:
+    //   Stopping → Diarizing → Idle
+    // (`temp_dir` is dropped at the end of the chain, after diarize is done
+    // with the full WAVs — see `run_post_stop_chain`.)
+    let app_for_post = app.clone();
+    let note_for_post = note_id.clone();
+    tokio::spawn(async move {
+        run_post_stop_chain(app_for_post, note_for_post, temp_dir, post_stop).await;
+    });
+
+    Ok(())
+}
+
+/// Await every in-flight transcribe handle, aborting stragglers past the 300 s
+/// ceiling. Shared by `recording_stop` and the import completion path.
+///
+/// The generous ceiling lets Whisper inference that's been slowed down (Metal
+/// accumulating, queued behind `transcribe_gate`) still finish — aborting =
+/// silently dropping that chunk's audio, which is the bug this exists to avoid.
+async fn drain_inflight(inflight: &Inflight) {
     let drain = async {
         loop {
             let next = inflight.lock().pop();
@@ -1845,12 +1763,12 @@ pub async fn recording_stop(
             }
         }
     };
-    let drain_timed_out =
+    let timed_out =
         tokio::time::timeout(std::time::Duration::from_secs(300), drain).await.is_err();
-    if drain_timed_out {
+    if timed_out {
         let remaining: Vec<_> = inflight.lock().drain(..).collect();
         eprintln!(
-            "recording_stop: drain timed out, aborting {} lingering transcribe(s)",
+            "drain_inflight: timed out, aborting {} lingering transcribe(s)",
             remaining.len()
         );
         for h in &remaining {
@@ -1860,114 +1778,507 @@ pub async fn recording_stop(
             let _ = tokio::time::timeout(std::time::Duration::from_secs(2), h).await;
         }
     }
+}
 
-    // Snapshot every piece of session-derived state the post-stop chain
-    // needs, NOW — *after* the drain so chunk_log includes every chunk
-    // whose transcribe finished, and before spawning the background task
-    // so it can't race a new `recording_start` (which clears
-    // `state.recording.chunk_log`).
-    let post_stop = {
-        let mut s = state.recording.lock();
-        let mic_wav = s.mic_full_wav_path.lock().clone();
-        let sys_wav = s.sys_full_wav_path.lock().clone();
-        let chunks = s.chunk_log.lock().clone();
-        let transcript_at_start = s.transcript_at_start.lock().clone();
-        // Fall back to a fresh UUID if (somehow) unset — a missing id would
-        // only cost this take its own subdir, never a clobber.
-        let session_id = s
-            .session_id
-            .take()
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        let session_started_at = s
-            .session_started_at
-            .take()
-            .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
-        drop(s);
-        PostStopSnapshot {
-            mic_wav,
-            sys_wav,
-            chunks,
-            transcript_at_start,
-            session_id,
-            session_started_at,
+/// Freeze the live capture's session-derived state into a [`PostStopSnapshot`].
+/// Must be called *after* the inflight drain so `chunk_log` includes every
+/// finished chunk. `session_id` / `session_started_at` fall back to fresh
+/// values if (somehow) unset — a missing id only costs this take its own
+/// subdir, never a clobber. Shared by `recording_stop` and `finish_import`.
+fn take_post_stop_snapshot(s: &mut crate::recording::LiveCapture) -> PostStopSnapshot {
+    let mic_wav = s.mic_full_wav_path.lock().clone();
+    let sys_wav = s.sys_full_wav_path.lock().clone();
+    let chunks = s.chunk_log.lock().clone();
+    let transcript_at_start = s.transcript_at_start.lock().clone();
+    let session_id = s
+        .session_id
+        .take()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let session_started_at = s
+        .session_started_at
+        .take()
+        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+    PostStopSnapshot {
+        mic_wav,
+        sys_wav,
+        chunks,
+        transcript_at_start,
+        session_id,
+        session_started_at,
+    }
+}
+
+/// The shared post-stop chain: Diarizing → (session bookkeeping, keep-audio,
+/// diarize + label, manifest append, sync ping, temp-dir cleanup) → Idle. Runs
+/// off a snapshot so it can't race a new capture claiming the slot. Driven by
+/// both `recording_stop` (live) and `finish_import` (file import — the mic-only
+/// diarize branch).
+async fn run_post_stop_chain(
+    app: AppHandle,
+    note_id: String,
+    temp_dir: Option<PathBuf>,
+    post_stop: PostStopSnapshot,
+) {
+    emit_status(&app, Some(&note_id), Phase::Diarizing);
+
+    // Make the note's storage session-shaped before writing this take. For a
+    // pre-feature flat note, migrate its single take into a session subdir so
+    // both takes survive. Count existing sessions so we can force source-WAV
+    // retention once the note gains a second session (issue #16).
+    let prior_session_count = prepare_sessions_for_new_take(&app, &note_id).await;
+    let force_retain = prior_session_count >= 1;
+
+    // Copy full WAVs into this session's subdir FIRST when keep_audio is on (or
+    // auto-retained because this is a 2nd+ session). diarize_and_apply cleans up
+    // the temp paths after it's done, so retention has to happen before it runs.
+    maybe_keep_audio(&app, &note_id, &post_stop, force_retain).await;
+
+    let session_id = post_stop.session_id.clone();
+    let session_started_at = post_stop.session_started_at.clone();
+    let streams = session_streams(&post_stop.chunks);
+    if let Err(e) = diarize_and_apply(app.clone(), note_id.clone(), post_stop).await {
+        eprintln!("diarize_and_apply: {e}");
+        emit_error(
+            &app,
+            Some(&note_id),
+            &format!("Diarization failed (transcript still saved): {e}"),
+        );
+    }
+    // Append this take to the manifest so it shows up in the carousel and in
+    // session-aware path resolution. Duration comes from the timeline
+    // diarize_and_apply just wrote (max end_ms); 0 when nothing landed.
+    finalize_session(&app, &note_id, &session_id, &session_started_at, streams).await;
+    // The pipeline wrote the transcript directly (per-chunk during capture,
+    // then the labelled rewrite), bypassing the notes_* commands — so push it
+    // to the cloud now. Covers every diarize_and_apply exit path.
+    note_changed_for_sync(&app, &note_id);
+    // Now that every step that needs the WAVs has finished, drop the temp dir.
+    // Best-effort: a leftover dir is harmless.
+    if let Some(dir) = temp_dir {
+        let _ = tokio::fs::remove_dir_all(dir).await;
+    }
+    emit_status(&app, None, Phase::Idle);
+}
+
+/// Resolve the active transcription provider for `note_id`'s language and
+/// verify its prerequisites are in place — a stored API key for a cloud
+/// provider, or a downloaded model file for local Whisper. On a miss it emits
+/// a `recording_error` toast for the note and returns `Err(msg)`. On success it
+/// also fires the local-Whisper prewarm (fire-and-forget) so the first chunk
+/// doesn't pay the cold-start tax. Shared by `recording_start` and
+/// `import_audio`.
+async fn ensure_provider_ready(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+    note_id: &str,
+) -> Result<(), String> {
+    // Resolve the per-language override (if any) up front: both the prereq
+    // check and the prewarm use the resolved provider — otherwise a user with a
+    // Norwegian override (Local) and an English default (Deepgram) would prewarm
+    // the wrong model.
+    let transcribe_cfg = read_transcribe_config(state).map_err(|e| e.to_string())?;
+    let language = {
+        let conn = state.db.lock();
+        let global = db::get_setting(&conn, "language")
+            .map_err(err)?
+            .unwrap_or_else(|| DEFAULT_LANGUAGE.to_string());
+        let note_lang = db::get_note(&conn, note_id)
+            .map(|n| n.language)
+            .unwrap_or_default();
+        if note_lang.trim().is_empty() { global } else { note_lang }
+    };
+    let provider_cfg = transcribe_cfg.resolve(&language).clone();
+    // Each cloud provider has its own Keychain slot. Look up the right one so
+    // the check doesn't pass when (e.g.) the user picked Deepgram but only saved
+    // an OpenAI key.
+    let pre_err: Option<String> = match &provider_cfg {
+        crate::stt::ProviderConfig::Local(local_cfg) => {
+            let p = local_model_path(app, &language, &local_cfg.model_id)
+                .map_err(|e| e.to_string())?;
+            if p.exists() {
+                None
+            } else {
+                Some(
+                    "Local Whisper model not downloaded. Download it in Settings → Transcription."
+                        .to_string(),
+                )
+            }
+        }
+        other => {
+            let provider_id = other.provider_id();
+            if read_provider_api_key(state, provider_id)?.is_none() {
+                let label = match provider_id {
+                    "openai" => "OpenAI",
+                    "deepgram" => "Deepgram",
+                    "groq" => "Groq",
+                    _ => "the selected provider",
+                };
+                Some(format!("{label} API key not set. Add one in Settings → API keys."))
+            } else {
+                None
+            }
         }
     };
+    if let Some(msg) = pre_err {
+        emit_error(app, Some(note_id), &msg);
+        return Err(msg);
+    }
 
-    // Spawn the post-stop processing chain in the background:
-    //   Stopping → Diarizing → Idle
-    // Apply chunk-level speaker labels to the live transcript and write
-    // playback assets, then drop the temp dir.
-    let app_for_post = app.clone();
-    let note_for_post = note_id.clone();
-    // Move temp_dir into the post-stop task and clean it up *after* the
-    // diarize step finishes. A parallel 30s-delay cleanup would race
-    // diarize on long recordings — the cleanup fires mid-flight, and the
-    // diarize sidecar then tries to open a file that's been deleted out
-    // from under it (surfaces as a CoreAudio "wht?" / 2003334207 error
-    // from FluidAudio's AVAudioFile reader). Sequencing cleanup behind
-    // the chain ensures the full WAVs survive for as long as diarize
-    // needs them.
-    tokio::spawn(async move {
-        // Flip from Stopping → Diarizing once we move past the drain
-        // (which already ran synchronously in `recording_stop` so the
-        // chunk_log snapshot is complete).
-        emit_status(&app_for_post, Some(&note_for_post), Phase::Diarizing);
-
-        // Make the note's storage session-shaped before writing this take.
-        // For a pre-feature flat note, migrate its single take into a session
-        // subdir on this (its second) recording so both takes survive. Count
-        // the sessions that already exist so we can force source-WAV
-        // retention once the note gains a second session (issue #16).
-        let prior_session_count =
-            prepare_sessions_for_new_take(&app_for_post, &note_for_post).await;
-        let force_retain = prior_session_count >= 1;
-
-        // Copy full WAVs into this session's subdir FIRST when keep_audio is
-        // on (or auto-retained because this is a 2nd+ session).
-        // diarize_and_apply calls cleanup_full_wav on the temp paths after
-        // it's done with them, so retention has to happen before the diarize
-        // step consumes the files.
-        maybe_keep_audio(&app_for_post, &note_for_post, &post_stop, force_retain).await;
-
-        let session_id = post_stop.session_id.clone();
-        let session_started_at = post_stop.session_started_at.clone();
-        let streams = session_streams(&post_stop.chunks);
-        if let Err(e) = diarize_and_apply(app_for_post.clone(), note_for_post.clone(), post_stop).await {
-            eprintln!("diarize_and_apply: {e}");
-            emit_error(
-                &app_for_post,
-                Some(&note_for_post),
-                &format!("Diarization failed (transcript still saved): {e}"),
-            );
+    // Race a Whisper model load against the sidecar startup so the first chunk
+    // doesn't pay the cold-start tax (~1–2 s on Apple Silicon). Fire and forget.
+    if let crate::stt::ProviderConfig::Local(local_cfg) = &provider_cfg {
+        let model_id = local_cfg.model_id.clone();
+        let use_gpu = local_cfg.use_gpu;
+        if let Ok(model_path) = local_model_path(app, &language, &model_id) {
+            let shared = state.whisper.clone();
+            tokio::spawn(async move {
+                if let Err(e) = local_whisper::prewarm(shared, model_path, use_gpu).await {
+                    eprintln!("whisper prewarm: {e}");
+                }
+            });
         }
-        // Append this take to the manifest so it shows up in the carousel and
-        // in session-aware path resolution. Duration comes from the timeline
-        // diarize_and_apply just wrote (max end_ms); 0 when nothing landed.
-        finalize_session(
-            &app_for_post,
-            &note_for_post,
-            &session_id,
-            &session_started_at,
-            streams,
+    }
+    Ok(())
+}
+
+/// Handle one decoded sidecar event during a live capture or an import.
+///
+/// Chunks are transcribed on spawned tasks tracked in `inflight`. When
+/// `backlog` is `Some`, a permit is acquired *before* spawning (and released
+/// when the task finishes), so a full-speed import replay can't pile up
+/// hundreds of parked pre-gate tasks. Live recording passes `None` — realtime
+/// arrival needs no bound. Returns `true` when the sidecar signalled `Stopped`
+/// and the reader loop should break.
+async fn dispatch_sidecar_event(
+    app: &AppHandle,
+    note_id: &str,
+    event: SidecarEvent,
+    inflight: &Inflight,
+    backlog: Option<&Arc<Semaphore>>,
+) -> bool {
+    match event {
+        SidecarEvent::Chunk { source, path, start_ms } => {
+            let pb = PathBuf::from(path);
+            let app2 = app.clone();
+            let note_id2 = note_id.to_string();
+            // Block the reader here until a permit frees when importing — this
+            // is the backpressure. `acquire_owned` yields a permit we move into
+            // the spawned task so it's released the instant the chunk finishes.
+            let permit = match backlog {
+                Some(sem) => sem.clone().acquire_owned().await.ok(),
+                None => None,
+            };
+            let h = tokio::spawn(async move {
+                let _permit = permit; // held until this transcribe returns
+                if let Err(e) =
+                    transcribe_chunk(app2.clone(), note_id2.clone(), source, pb, start_ms).await
+                {
+                    let msg = format!("Transcription failed: {e}");
+                    eprintln!("{msg}");
+                    let _ = app2.emit("recording_error", ErrorPayload {
+                        note_id: Some(note_id2),
+                        message: msg,
+                    });
+                }
+            });
+            inflight.lock().push(h);
+            false
+        }
+        SidecarEvent::FullRecording { source, path, duration_ms: _ } => {
+            // Stash the path on the session; the diarization pass on stop reads
+            // it. Each source has its own slot so the post-stop pass can branch
+            // (mic-only → diarize mic; both present → "You" + diarize sys).
+            let state: State<AppState> = app.state();
+            let session = state.recording.lock();
+            let slot = match source {
+                ChunkSource::Mic => &session.mic_full_wav_path,
+                ChunkSource::Sys => &session.sys_full_wav_path,
+            };
+            *slot.lock() = Some(PathBuf::from(path));
+            false
+        }
+        SidecarEvent::Error { message } => {
+            eprintln!("sidecar error: {message}");
+            let _ = app.emit("recording_error", ErrorPayload {
+                note_id: Some(note_id.to_string()),
+                message,
+            });
+            false
+        }
+        SidecarEvent::Stopped => true,
+        SidecarEvent::Paused => {
+            emit_status(app, Some(note_id), Phase::Paused);
+            false
+        }
+        SidecarEvent::Resumed => {
+            emit_status(app, Some(note_id), Phase::Recording);
+            false
+        }
+        SidecarEvent::Heartbeat { mic_frames, sys_frames, chunks, mic_peak, sys_peak } => {
+            let _ = app.emit("recording_diagnostic", DiagnosticPayload {
+                note_id: note_id.to_string(),
+                mic_frames,
+                sys_frames,
+                chunks,
+                mic_peak,
+                sys_peak,
+            });
+            false
+        }
+        SidecarEvent::Diagnostic { message } => {
+            // Non-fatal sidecar notice (e.g. mic capture recovered after a
+            // device change). Reuse the recording_error channel — it's a
+            // transient auto-dismissing toast on the frontend.
+            eprintln!("sidecar diagnostic: {message}");
+            let _ = app.emit("recording_error", ErrorPayload {
+                note_id: Some(note_id.to_string()),
+                message,
+            });
+            false
+        }
+    }
+}
+
+/// Seed a note title from an imported audio file's name: the file stem with no
+/// extension, trimmed. Falls back to "Imported audio" for a path with no usable
+/// stem. Kept deliberately literal — the user's filename is meaningful, so we
+/// don't reflow or re-case it.
+pub(crate) fn title_from_filename(path: &std::path::Path) -> String {
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(|s| s.trim())
+        .unwrap_or("");
+    if stem.is_empty() {
+        "Imported audio".to_string()
+    } else {
+        stem.to_string()
+    }
+}
+
+/// Import an existing audio file into a NEW note and run it through the full
+/// transcription pipeline (VAD chunking → transcribe fan-out → mic-only diarize
+/// → playback assets → summary-ready), streaming the transcript live.
+///
+/// Mirrors `recording_start` but: skips the mic/screen permission checks and the
+/// cloud recording lock (a fresh personal note has no contention), seeds the
+/// title from the filename, and spawns the sidecar in `--import` mode (decode →
+/// resample → replay through the same VAD ChunkWriter as the mic stream). Still
+/// runs the provider prereq check. Occupies the single live-capture slot, so
+/// Record and Import are mutually exclusive.
+#[tauri::command]
+pub async fn import_audio(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<db::Note, String> {
+    let source_path = PathBuf::from(&path);
+    if !source_path.exists() {
+        return Err(format!("File not found: {path}"));
+    }
+
+    // Same single-slot self-heal + refusal as recording_start: import and live
+    // recording share the one capture slot.
+    let stale_child: Option<tokio::process::Child> = {
+        let mut s = state.recording.lock();
+        if s.note_id.is_some() {
+            let child_dead = match s.child.as_mut() {
+                Some(c) => matches!(c.try_wait(), Ok(Some(_)) | Err(_)),
+                None => true,
+            };
+            let reader_dead = s.reader.as_ref().map_or(true, |r| r.is_finished());
+            if !child_dead && !reader_dead {
+                return Err("already recording or importing".into());
+            }
+            let stale = s.child.take();
+            s.note_id = None;
+            s.temp_dir = None;
+            s.reader = None;
+            s.inflight = Arc::new(parking_lot::Mutex::new(Vec::new()));
+            stale
+        } else {
+            None
+        }
+    };
+    if let Some(mut c) = stale_child {
+        if let Some(pid) = c.id() {
+            #[cfg(unix)]
+            unsafe { libc::kill(pid as i32, libc::SIGTERM); }
+        }
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), c.wait()).await;
+        let _ = c.kill().await;
+    }
+
+    // Create the destination note now so provider-prereq errors can attach to
+    // it and the title can be seeded from the filename. v1: a Personal
+    // (unsynced) note — no cloud recording lock needed.
+    let note = {
+        let conn = state.db.lock();
+        let default_language = db::get_setting(&conn, "language")
+            .map_err(err)?
+            .unwrap_or_else(|| DEFAULT_LANGUAGE.to_string());
+        let default_preset = db::get_setting(&conn, "default_summary_preset")
+            .map_err(err)?
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "meeting".to_string());
+        let mut note = db::create_note(&conn, &default_language, &default_preset, "").map_err(err)?;
+        let title = title_from_filename(&source_path);
+        db::update_note(
+            &conn,
+            &note.id,
+            &db::NotePatch { title: Some(title.clone()), ..Default::default() },
         )
-        .await;
-        // The recording pipeline wrote the transcript directly (per-chunk during
-        // capture, then the labelled rewrite on stop), bypassing the notes_*
-        // commands — so push it to the cloud now. Covers every diarize_and_apply
-        // exit path (labelled, single-speaker fallback, model-missing skip, or
-        // error-with-transcript-saved); a truly empty recording just re-pushes
-        // unchanged content, which is harmless.
-        note_changed_for_sync(&app_for_post, &note_for_post);
-        // Now that every step that needs the WAVs has finished, drop the
-        // temp dir. Best-effort: a leftover dir is harmless and gets
-        // collected by macOS's normal /tmp cleanup eventually.
-        if let Some(dir) = temp_dir {
-            let _ = tokio::fs::remove_dir_all(dir).await;
+        .map_err(err)?;
+        note.title = title;
+        note
+    };
+    state.sync.note_upserted(&note.id);
+    let note_id = note.id.clone();
+
+    // Provider prereq (key / local model). Skipped vs. recording_start:
+    // mic/screen permission + cloud recording lock.
+    ensure_provider_ready(&app, &state, &note_id).await?;
+
+    emit_status(&app, Some(&note_id), Phase::Importing);
+
+    let temp_dir = std::env::temp_dir().join(format!("notes-app-import-{}", note_id));
+    std::fs::create_dir_all(&temp_dir).map_err(err)?;
+
+    let sidecar_path = sidecar_path(&app)?;
+    let mut cmd = Command::new(&sidecar_path);
+    cmd.arg("--import").arg(&source_path);
+    cmd.arg("--out").arg(&temp_dir);
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    cmd.kill_on_drop(true);
+    // Detach into a new session for parity with the live path (harmless here —
+    // import needs no TCC-bound permissions).
+    #[cfg(unix)]
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                // Non-fatal: continue without detaching.
+            }
+            Ok(())
+        });
+    }
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("spawn audio-capture (import): {e}"))?;
+    let stdout = child.stdout.take().ok_or("no stdout")?;
+    let stderr = child.stderr.take().ok_or("no stderr")?;
+
+    // Drain stderr (same humla-error filter as recording_start).
+    {
+        let app_err = app.clone();
+        let note_id_err = note_id.clone();
+        tokio::spawn(async move {
+            let mut reader = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                let trimmed = line.trim();
+                if trimmed.is_empty() { continue; }
+                eprintln!("audio-capture(import) stderr: {trimmed}");
+                if let Some(msg) = trimmed.strip_prefix("humla-error: ") {
+                    let _ = app_err.emit("recording_error", ErrorPayload {
+                        note_id: Some(note_id_err.clone()),
+                        message: format!("audio-capture: {msg}"),
+                    });
+                }
+            }
+        });
+    }
+
+    let inflight: Inflight = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    {
+        let mut s = state.recording.lock();
+        s.note_id = Some(note_id.clone());
+        s.child = Some(child);
+        s.temp_dir = Some(temp_dir);
+        s.inflight = inflight.clone();
+        s.session_id = Some(uuid::Uuid::new_v4().to_string());
+        s.session_started_at = Some(chrono::Utc::now().to_rfc3339());
+        s.mic_trail.lock().clear();
+        s.sys_trail.lock().clear();
+        s.chunk_log.lock().clear();
+        *s.mic_full_wav_path.lock() = None;
+        *s.sys_full_wav_path.lock() = None;
+        // Fresh note → no prior transcript to prepend on diarize.
+        *s.transcript_at_start.lock() = String::new();
+        // Import holds no cloud recording lock.
+        s.lock_id = None;
+    }
+
+    let app_clone = app.clone();
+    let note_id_clone = note_id.clone();
+    let inflight_for_reader = inflight.clone();
+    let reader_handle = tokio::spawn(async move {
+        // Bounded backlog so a full-speed replay can't pile up parked tasks.
+        let backlog = Arc::new(Semaphore::new(IMPORT_BACKLOG_PERMITS));
+        let mut reader = BufReader::new(stdout).lines();
+        while let Ok(Some(line)) = reader.next_line().await {
+            let trimmed = line.trim();
+            if trimmed.is_empty() { continue; }
+            match serde_json::from_str::<SidecarEvent>(trimmed) {
+                Ok(ev) => {
+                    if dispatch_sidecar_event(
+                        &app_clone,
+                        &note_id_clone,
+                        ev,
+                        &inflight_for_reader,
+                        Some(&backlog),
+                    )
+                    .await
+                    {
+                        break;
+                    }
+                }
+                Err(e) => eprintln!("bad sidecar line: {e} -- {line}"),
+            }
         }
-        emit_status(&app_for_post, None, Phase::Idle);
+        // Replay finished (Stopped, or the sidecar closed its pipe). Drive the
+        // same post-stop chain the live path runs on recording_stop.
+        finish_import(&app_clone, &note_id_clone).await;
     });
 
-    Ok(())
+    state.recording.lock().reader = Some(reader_handle);
+
+    Ok(note)
+}
+
+/// Completion path for an import: the sidecar replayed the whole file and closed
+/// its pipe. Drain the outstanding transcribes, free the capture slot, then run
+/// the shared post-stop chain (mic-only diarize → playback assets →
+/// summary-ready). No SIGTERM/child-wait — the import sidecar exits on its own.
+async fn finish_import(app: &AppHandle, note_id: &str) {
+    let state: State<AppState> = app.state();
+    // Bail if a newer capture already claimed the slot (shouldn't happen —
+    // import holds it until here).
+    let inflight = {
+        let s = state.recording.lock();
+        if s.note_id.as_deref() != Some(note_id) {
+            return;
+        }
+        s.inflight.clone()
+    };
+    // No more chunks are coming (reader loop exited), so drain what's queued.
+    drain_inflight(&inflight).await;
+
+    let (temp_dir, post_stop) = {
+        let mut s = state.recording.lock();
+        let temp_dir = s.temp_dir.take();
+        let post_stop = take_post_stop_snapshot(&mut s);
+        // Free the slot so a new capture can start while this one's diarize runs
+        // in the background (mirrors recording_stop).
+        s.note_id = None;
+        s.child = None;
+        s.reader = None;
+        s.inflight = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        (temp_dir, post_stop)
+    };
+
+    run_post_stop_chain(app.clone(), note_id.to_string(), temp_dir, post_stop).await;
 }
 
 /// Run offline speaker diarization on the just-finished recording and
@@ -5360,5 +5671,66 @@ mod hallucination_tests {
             "And that was the meeting. Subtitles by Amara.org community.",
             "en"
         ));
+    }
+}
+
+#[cfg(test)]
+mod import_tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn title_from_filename_strips_extension() {
+        assert_eq!(title_from_filename(Path::new("/tmp/meeting.m4a")), "meeting");
+        assert_eq!(title_from_filename(Path::new("Voice Memo 3.mp3")), "Voice Memo 3");
+    }
+
+    #[test]
+    fn title_from_filename_keeps_stem_verbatim() {
+        // Underscores / dashes / casing are the user's — preserved as-is so the
+        // note title matches the file they picked.
+        assert_eq!(
+            title_from_filename(Path::new("standup_2026-07-09.wav")),
+            "standup_2026-07-09"
+        );
+    }
+
+    #[test]
+    fn title_from_filename_handles_no_extension() {
+        assert_eq!(title_from_filename(Path::new("/x/recording")), "recording");
+    }
+
+    #[test]
+    fn title_from_filename_falls_back_when_empty() {
+        assert_eq!(title_from_filename(Path::new("")), "Imported audio");
+        assert_eq!(title_from_filename(Path::new("/")), "Imported audio");
+    }
+
+    #[test]
+    fn title_from_filename_trims_whitespace() {
+        assert_eq!(title_from_filename(Path::new("  spaced  .mp3")), "spaced");
+    }
+
+    #[tokio::test]
+    async fn import_backlog_semaphore_bounds_concurrency() {
+        // The import reader acquires a permit before spawning each chunk's
+        // transcribe task; with IMPORT_BACKLOG_PERMITS outstanding the next
+        // acquire must block. This pins the invariant the bounded-backlog
+        // backpressure relies on (a full-speed replay can't pile up unboundedly).
+        let sem = Arc::new(Semaphore::new(IMPORT_BACKLOG_PERMITS));
+        let mut held = Vec::new();
+        for _ in 0..IMPORT_BACKLOG_PERMITS {
+            held.push(sem.clone().acquire_owned().await.unwrap());
+        }
+        assert!(
+            sem.clone().try_acquire_owned().is_err(),
+            "backlog should be saturated at IMPORT_BACKLOG_PERMITS"
+        );
+        // Releasing one permit (a chunk finished) frees a slot again.
+        held.pop();
+        assert!(
+            sem.try_acquire_owned().is_ok(),
+            "a freed permit should be acquirable"
+        );
     }
 }

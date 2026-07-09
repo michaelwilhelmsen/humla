@@ -219,6 +219,13 @@ pub enum Phase {
     Paused,
     Stopping,
     Diarizing,
+    // A file import is replaying through the transcribe pipeline. Occupies the
+    // same single capture slot as a live recording (Record and Import are
+    // mutually exclusive), but the sidecar runs a one-shot `--import` replay
+    // instead of live mic/system capture. Streams the transcript in exactly
+    // like recording; on completion it flows into the same Diarizing → Idle
+    // post-stop chain.
+    Importing,
 }
 
 #[derive(Clone, Serialize)]
