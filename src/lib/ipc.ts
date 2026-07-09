@@ -78,9 +78,12 @@ export type SettingsKey =
   | "sortformer_silence_threshold"
   | "sortformer_pred_threshold"
   | "keep_audio"
+  // Cloud/teams: upload a finished recording's audio to its workspace note
+  // so teammates can play it back. Default on; only the string "false"
+  // disables it on the upload path. Surfaced in the Account section.
+  | "sync_audio"
   | "custom_vocabulary"
   | "summary_model"
-  | "summary_prompt"
   | "summary_provider"
   | "local_llm_base_url"
   | "local_llm_model"

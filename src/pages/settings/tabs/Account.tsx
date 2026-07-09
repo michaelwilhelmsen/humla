@@ -4,6 +4,8 @@ import { cloudApi, useCloudStore, HUMLA_CLOUD_URL } from "../../../lib/cloud";
 import { Row, Section } from "../components/Section";
 import { Btn } from "../components/Btn";
 import { ValuePill } from "../components/ValuePill";
+import { Toggle } from "../components/Toggle";
+import type { SettingsHook } from "../useSettings";
 
 const inputCls =
   "w-full text-sm px-3 py-2 rounded-md border border-[var(--color-line-visible)] bg-[var(--color-surface)] focus:border-[var(--color-text-muted)] transition-colors";
@@ -12,7 +14,7 @@ const inputCls =
 // URL + credentials drive everything else (workspace management renders
 // below, from Organization.tsx, once signed in). Local-only use needs none
 // of this — it's entirely opt-in.
-export function AccountTab() {
+export function AccountTab({ s, update }: Pick<SettingsHook, "s" | "update">) {
   const status = useCloudStore((s) => s.status);
   const refresh = useCloudStore((s) => s.refresh);
 
@@ -179,6 +181,17 @@ export function AccountTab() {
           </div>
         )}
         <Row label="Server" control={<ValuePill>{status.base_url}</ValuePill>} />
+        <Row
+          label="Upload recording audio"
+          description="Send each recording's audio to its workspace note so teammates can play it back. Transcripts and summaries always sync; turning this off keeps the audio itself on your Mac. Personal notes never leave the device either way."
+          control={
+            <Toggle
+              label="Upload recording audio"
+              checked={s.sync_audio !== "false"}
+              onChange={(on) => update("sync_audio", on ? "true" : "false")}
+            />
+          }
+        />
         <Row
           label="Disconnect server"
           description="Forget this server and sign out. Cloud sync is opt-in — your notes always live locally first."

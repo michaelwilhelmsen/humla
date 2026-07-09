@@ -247,6 +247,28 @@ describe("Account section", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("signed-in user can toggle workspace audio upload (default on)", async () => {
+    const sets: unknown[] = [];
+    renderApp("/settings?tab=account", {
+      cloud_status: () => signedIn("owner"),
+      cloud_workspace_members: () => MEMBERS,
+      settings_set: (args) => {
+        sets.push(args);
+        return null;
+      },
+    });
+    const dialog = await screen.findByRole("dialog", { name: /settings/i });
+
+    const toggle = await within(dialog).findByRole("switch", {
+      name: /upload recording audio/i,
+    });
+    // Default is on — the upload path only treats the literal "false" as off.
+    expect(toggle).toHaveAttribute("aria-checked", "true");
+
+    await userEvent.click(toggle);
+    expect(sets).toContainEqual({ key: "sync_audio", value: "false" });
+  });
+
   it("owner can change a member's role through the popover select", async () => {
     const roleChanges: unknown[] = [];
     renderApp("/settings?tab=account", {
