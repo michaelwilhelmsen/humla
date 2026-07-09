@@ -1137,6 +1137,306 @@ pub async fn cloud_download_note_audio(app: tauri::AppHandle, note_id: String) -
     download_note_audio(&app, &note_id).await
 }
 
+// ---- per-session asset sync (#16) ------------------------------------------
+//
+// Session METADATA (the `note_sessions` records) syncs through the cloud-sync
+// crate's outbox/pull machinery, pinged from the backend post-stop chain
+// (`SyncObserver::session_upserted`). The BINARY ASSETS (playback / timeline /
+// mic / sys / chunks) are handled here, mirroring the single-file
+// `upload_note_audio` / `download_note_audio` pattern: upload is fire-and-forget
+// after a recording (waits for the record to exist, then multipart-PATCHes),
+// download is triggered on note-open (reconstructs sessions.json + fetches the
+// assets a teammate needs to read/play the note).
+//
+// The legacy single-file `notes.audio` path above is UNCHANGED and still used,
+// so old clients and pre-#16 notes keep playing exactly as before.
+
+/// One remote `note_sessions` record, as needed for asset up/download.
+struct RemoteSession {
+    pb_id: String,
+    client_id: String,
+    index: u32,
+    started_at_ms: i64,
+    duration_ms: u64,
+    streams: Vec<String>,
+    deleted: bool,
+    /// Stored (suffixed) filename per file field; empty when the field is unset.
+    files: std::collections::HashMap<&'static str, String>,
+}
+
+fn parse_remote_session(it: &serde_json::Value) -> RemoteSession {
+    let s = |k: &str| it.get(k).and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    let mut files = std::collections::HashMap::new();
+    for f in ["playback", "mic", "sys", "timeline", "chunks"] {
+        files.insert(f, it.get(f).and_then(|v| v.as_str()).unwrap_or_default().to_string());
+    }
+    RemoteSession {
+        pb_id: s("id"),
+        client_id: s("client_id"),
+        index: it.get("session_index").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+        started_at_ms: it.get("started_at").and_then(|v| v.as_i64()).unwrap_or(0),
+        duration_ms: it.get("duration_ms").and_then(|v| v.as_u64()).unwrap_or(0),
+        streams: it
+            .get("streams")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .unwrap_or_default(),
+        deleted: it.get("deleted").and_then(|v| v.as_bool()).unwrap_or(false),
+        files,
+    }
+}
+
+/// List every `note_sessions` record (incl. tombstones) for a note by its PB id.
+async fn find_session_records(
+    base: &str,
+    token: &str,
+    note_pb_id: &str,
+) -> Result<Vec<RemoteSession>, String> {
+    let filter = format!("note='{note_pb_id}'");
+    let val = authed_get(
+        base,
+        token,
+        "/api/collections/note_sessions/records",
+        &[
+            ("filter", filter.as_str()),
+            ("perPage", "200"),
+            ("sort", "session_index"),
+            (
+                "fields",
+                "id,client_id,session_index,started_at,duration_ms,streams,deleted,playback,mic,sys,timeline,chunks",
+            ),
+        ],
+    )
+    .await?;
+    Ok(val
+        .get("items")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().map(parse_remote_session).collect())
+        .unwrap_or_default())
+}
+
+/// A server-controlled path segment (PB id or stored filename) is opaque; reject
+/// anything that could traverse or rewrite the request URL.
+fn safe_path_seg(s: &str) -> bool {
+    !s.is_empty()
+        && !s.contains("..")
+        && s.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'-'))
+}
+
+/// Which asset fields exist on disk for a session dir.
+fn local_present_assets(session_dir: &std::path::Path) -> Vec<crate::sessions::AssetField> {
+    crate::sessions::AssetField::ALL
+        .into_iter()
+        .filter(|f| session_dir.join(f.file_name()).exists())
+        .collect()
+}
+
+/// Which asset fields the remote record already holds a file for.
+fn remote_present_assets(rec: &RemoteSession) -> Vec<crate::sessions::AssetField> {
+    crate::sessions::AssetField::ALL
+        .into_iter()
+        .filter(|f| rec.files.get(f.field()).is_some_and(|n| !n.is_empty()))
+        .collect()
+}
+
+/// Upload a note's per-session assets to the cloud (#16). For each locally
+/// recorded session (skipping the synthesized legacy flat entry), attach the
+/// assets the server doesn't have yet — plus the timeline every time, since
+/// re-diarize / unification rewrites it. No-op for Personal notes or when
+/// `sync_audio` is "false". Fire-and-forget: waits (bounded) for the note +
+/// session records to sync, then PATCHes.
+pub(crate) async fn upload_note_sessions(app: &tauri::AppHandle, note_id: &str) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let workspace = {
+        let conn = state.db.lock();
+        if db::get_setting(&conn, "sync_audio").ok().flatten().as_deref() == Some("false") {
+            return Ok(());
+        }
+        db::get_note(&conn, note_id).map_err(err)?.workspace_id
+    };
+    if workspace.is_empty() {
+        return Ok(()); // Personal — never leaves the device
+    }
+    let app_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let recordings = crate::sessions::recordings_dir(&app_dir, note_id);
+    // Only real (manifest-backed) sessions sync per-session; a legacy flat note
+    // keeps using notes.audio until it gains a second take (which migrates it).
+    let sessions: Vec<(crate::sessions::SessionEntry, std::path::PathBuf)> =
+        crate::sessions::resolve_sessions(&recordings)
+            .into_iter()
+            .filter(|(e, _)| e.id != crate::sessions::LEGACY_SESSION_ID)
+            .collect();
+    if sessions.is_empty() {
+        return Ok(());
+    }
+
+    let (base, session) = ensure_session(&state).await?;
+    // The note record syncs asynchronously post-stop; wait for it to exist.
+    let mut note_pb = None;
+    for _ in 0..20 {
+        if let Some((id, _)) = find_note_remote(&base, &session.token, note_id, &workspace).await? {
+            note_pb = Some(id);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    }
+    let Some(note_pb) = note_pb else {
+        return Ok(()); // note never synced — skip rather than error
+    };
+
+    // The session records are pushed by the sync worker after our
+    // session_upserted ping; wait until they cover every local session.
+    let wanted: std::collections::HashSet<String> =
+        sessions.iter().map(|(e, _)| e.id.clone()).collect();
+    let mut records: Vec<RemoteSession> = Vec::new();
+    for _ in 0..20 {
+        records = find_session_records(&base, &session.token, &note_pb).await?;
+        let have: std::collections::HashSet<&str> =
+            records.iter().map(|r| r.client_id.as_str()).collect();
+        if wanted.iter().all(|w| have.contains(w.as_str())) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    }
+    let by_client: std::collections::HashMap<&str, &RemoteSession> =
+        records.iter().map(|r| (r.client_id.as_str(), r)).collect();
+
+    for (entry, dir) in &sessions {
+        let Some(rec) = by_client.get(entry.id.as_str()) else {
+            continue; // its metadata hasn't synced yet — try again next time
+        };
+        let plan = crate::sessions::session_upload_plan(
+            &local_present_assets(dir),
+            &remote_present_assets(rec),
+        );
+        if plan.is_empty() {
+            continue;
+        }
+        let mut form = reqwest::multipart::Form::new();
+        let mut any = false;
+        for field in plan {
+            let path = dir.join(field.file_name());
+            let Ok(bytes) = std::fs::read(&path) else { continue };
+            let part = reqwest::multipart::Part::bytes(bytes)
+                .file_name(field.file_name())
+                .mime_str(field.mime())
+                .map_err(|e| e.to_string())?;
+            form = form.part(field.field(), part);
+            any = true;
+        }
+        if !any {
+            continue;
+        }
+        let resp = http()
+            .patch(format!("{base}/api/collections/note_sessions/records/{}", rec.pb_id))
+            .bearer_auth(&session.token)
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        pb_json(resp).await?;
+    }
+    Ok(())
+}
+
+/// Download a shared note's per-session assets and rebuild `sessions.json` (#16).
+/// Reconstructs the local manifest from the remote `note_sessions` records
+/// (honouring tombstones), then fetches each live session's `playback.wav` +
+/// `timeline.jsonl` — the assets the reader/player/carousel need — via the
+/// protected file-token flow. Heavy raw `mic`/`sys`/`chunks` are left on the
+/// server (fetched only if a future re-diarize needs them). Returns true when
+/// at least one session was reconstructed. No-op for Personal notes.
+pub(crate) async fn download_note_sessions(app: &tauri::AppHandle, note_id: &str) -> Result<bool, String> {
+    let state = app.state::<AppState>();
+    let workspace = {
+        let conn = state.db.lock();
+        db::get_note(&conn, note_id).map_err(err)?.workspace_id
+    };
+    if workspace.is_empty() {
+        return Ok(false);
+    }
+    let (base, session) = ensure_session(&state).await?;
+    let Some((note_pb, _)) = find_note_remote(&base, &session.token, note_id, &workspace).await?
+    else {
+        return Ok(false);
+    };
+    let records = find_session_records(&base, &session.token, &note_pb).await?;
+    if records.is_empty() {
+        return Ok(false); // no per-session data — caller falls back to notes.audio
+    }
+
+    let app_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let recordings = crate::sessions::recordings_dir(&app_dir, note_id);
+
+    // Reconstruct the manifest from the remote metadata (tombstones drop entries,
+    // local-only takes are preserved). Skip the synthesized legacy pseudo-entry
+    // so a flat local note doesn't leak `__legacy__` into the written manifest.
+    let existing = crate::sessions::read_manifest(&recordings);
+    let remote_meta: Vec<crate::sessions::RemoteSessionMeta> = records
+        .iter()
+        .map(|r| crate::sessions::RemoteSessionMeta {
+            client_id: r.client_id.clone(),
+            index: r.index,
+            started_at_ms: r.started_at_ms,
+            duration_ms: r.duration_ms,
+            streams: r.streams.clone(),
+            deleted: r.deleted,
+        })
+        .collect();
+    let manifest = crate::sessions::reconcile_manifest(existing, &remote_meta);
+    crate::sessions::write_manifest(&recordings, &manifest).map_err(|e| e.to_string())?;
+
+    // Mint one protected-file token and fetch each live session's core assets.
+    let tok = authed_post(&base, &session.token, "/api/files/token", serde_json::json!({})).await?;
+    let file_token = tok.get("token").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+
+    for rec in &records {
+        let dir = crate::sessions::session_dir(&recordings, &rec.client_id);
+        if rec.deleted {
+            let _ = std::fs::remove_dir_all(&dir); // honour the tombstone locally
+            continue;
+        }
+        if !safe_path_seg(&rec.pb_id) {
+            continue;
+        }
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        for field in [crate::sessions::AssetField::Playback, crate::sessions::AssetField::Timeline] {
+            let filename = rec.files.get(field.field()).cloned().unwrap_or_default();
+            if filename.is_empty() || !safe_path_seg(&filename) {
+                continue;
+            }
+            let dest = dir.join(field.file_name());
+            if dest.exists() {
+                continue; // already local
+            }
+            let url = format!("{base}/api/files/note_sessions/{}/{}", rec.pb_id, filename);
+            let resp = http()
+                .get(url)
+                .query(&[("token", file_token.as_str())])
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
+            if !resp.status().is_success() {
+                eprintln!("session asset download failed ({}) for {}", resp.status(), field.field());
+                continue;
+            }
+            let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
+            std::fs::write(&dest, &bytes).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(true)
+}
+
+#[tauri::command]
+pub async fn cloud_upload_note_sessions(app: tauri::AppHandle, note_id: String) -> Result<(), String> {
+    upload_note_sessions(&app, &note_id).await
+}
+
+#[tauri::command]
+pub async fn cloud_download_note_sessions(app: tauri::AppHandle, note_id: String) -> Result<bool, String> {
+    download_note_sessions(&app, &note_id).await
+}
+
 // ---- recording lock (shared-note mutual exclusion) -------------------------
 //
 // Two teammates recording the same workspace note at once would clobber each
@@ -1416,12 +1716,28 @@ pub async fn cloud_note_recording_status(
 #[tauri::command]
 pub fn cloud_pending_note_ids(state: State<'_, AppState>) -> Result<Vec<String>, String> {
     let conn = state.db.lock();
-    let ids = conn
-        .prepare("SELECT DISTINCT entity_id FROM sync_outbox WHERE entity = 'note'")
-        .and_then(|mut stmt| {
-            stmt.query_map([], |r| r.get::<_, String>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()
-        })
-        .unwrap_or_default();
-    Ok(ids)
+    // A note is "pending" if it has a queued note push OR a queued per-session
+    // push. Session rows pack their entity_id as `<note_id>/<session_id>`, so
+    // the note id is the part before the first '/'. Collapsing both keeps the
+    // per-note "syncing…" indicator accurate for session-asset uploads too.
+    let mut ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Ok(mut stmt) =
+        conn.prepare("SELECT DISTINCT entity, entity_id FROM sync_outbox WHERE entity IN ('note','session')")
+    {
+        if let Ok(rows) = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        }) {
+            for (entity, entity_id) in rows.flatten() {
+                let note_id = if entity == "session" {
+                    entity_id.split('/').next().unwrap_or("").to_string()
+                } else {
+                    entity_id
+                };
+                if !note_id.is_empty() {
+                    ids.insert(note_id);
+                }
+            }
+        }
+    }
+    Ok(ids.into_iter().collect())
 }

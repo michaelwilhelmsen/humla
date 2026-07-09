@@ -386,16 +386,6 @@ pub struct RemoteSessionMeta {
     pub deleted: bool,
 }
 
-/// RFC3339 (manifest `started_at`) → epoch-ms. Empty / unparseable → 0.
-pub fn started_at_to_ms(rfc3339: &str) -> i64 {
-    if rfc3339.trim().is_empty() {
-        return 0;
-    }
-    chrono::DateTime::parse_from_rfc3339(rfc3339)
-        .map(|dt| dt.timestamp_millis())
-        .unwrap_or(0)
-}
-
 /// epoch-ms → RFC3339 (manifest `started_at`). 0 / negative → empty string
 /// (matching how a legacy session with no known start is represented).
 pub fn ms_to_started_at(ms: i64) -> String {
@@ -683,15 +673,18 @@ mod tests {
     }
 
     #[test]
-    fn started_at_roundtrips_through_ms() {
-        let ms = started_at_to_ms("2026-07-09T10:00:00+00:00");
-        assert!(ms > 0);
-        // ms → rfc3339 → ms is stable to the millisecond.
-        assert_eq!(started_at_to_ms(&ms_to_started_at(ms)), ms);
-        // Empty / unknown maps to 0 and back to empty.
-        assert_eq!(started_at_to_ms(""), 0);
+    fn ms_to_started_at_formats_and_guards_zero() {
+        // A known epoch-ms formats to a parseable RFC3339 carrying the same instant.
+        let ms = 1_719_921_600_000; // 2024-07-02T12:00:00Z
+        let s = ms_to_started_at(ms);
+        assert!(!s.is_empty());
+        assert_eq!(
+            chrono::DateTime::parse_from_rfc3339(&s).unwrap().timestamp_millis(),
+            ms
+        );
+        // 0 / negative (unknown start) collapses to empty, matching a legacy take.
         assert_eq!(ms_to_started_at(0), "");
-        assert_eq!(started_at_to_ms("not-a-date"), 0);
+        assert_eq!(ms_to_started_at(-5), "");
     }
 
     #[test]

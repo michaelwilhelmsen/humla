@@ -47,6 +47,16 @@ pub trait SyncObserver: Send + Sync {
     /// A custom summary prompt was deleted. `id` is the now-removed prompt id.
     fn summary_prompt_deleted(&self, _id: &str) {}
 
+    /// A recording session's metadata (`sessions.json` entry) was created or
+    /// changed — a take finished recording/importing, or was re-diarized (#16).
+    /// The pipeline writes sessions to disk outside the `notes_*` commands, so
+    /// this must be pinged explicitly or the `note_sessions` record never syncs.
+    /// Binary assets are uploaded separately by the cloud commands.
+    fn session_upserted(&self, _note_id: &str, _session_id: &str) {}
+
+    /// A recording session was deleted → tombstone its remote record.
+    fn session_deleted(&self, _note_id: &str, _session_id: &str) {}
+
     /// Cloud configuration changed — the server URL, the stored credentials, or
     /// the selected workspace. A sync implementation should re-evaluate whether
     /// it can run (all of base URL + credentials + workspace present) and
