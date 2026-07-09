@@ -85,6 +85,46 @@ describe("SpeakerLabels merge flow", () => {
     expect(merged).toContain("Speaker 2:");
   });
 
+  it("moves focus onto the first menu item when the menu opens", async () => {
+    const user = userEvent.setup();
+    render(<SpeakerLabels transcript={THREE_SPEAKERS} onRename={vi.fn()} />);
+
+    await user.click(
+      screen.getByRole("button", { name: /merge speaker 1 into another/i }),
+    );
+    const items = screen.getAllByRole("menuitem");
+    expect(items[0]).toHaveFocus();
+  });
+
+  it("roves focus with ArrowDown/ArrowUp (wrapping)", async () => {
+    const user = userEvent.setup();
+    render(<SpeakerLabels transcript={THREE_SPEAKERS} onRename={vi.fn()} />);
+
+    await user.click(
+      screen.getByRole("button", { name: /merge speaker 1 into another/i }),
+    );
+    const items = screen.getAllByRole("menuitem"); // Speaker 2, Speaker 3
+    expect(items[0]).toHaveFocus();
+    await user.keyboard("{ArrowDown}");
+    expect(items[1]).toHaveFocus();
+    await user.keyboard("{ArrowDown}"); // wraps back to first
+    expect(items[0]).toHaveFocus();
+    await user.keyboard("{ArrowUp}"); // wraps to last
+    expect(items[1]).toHaveFocus();
+  });
+
+  it("Escape closes the menu and returns focus to the merge trigger", async () => {
+    const user = userEvent.setup();
+    render(<SpeakerLabels transcript={THREE_SPEAKERS} onRename={vi.fn()} />);
+
+    const trigger = screen.getByRole("button", { name: /merge speaker 1 into another/i });
+    await user.click(trigger);
+    expect(screen.getByRole("menu")).toBeTruthy();
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("menu")).toBeNull();
+    expect(trigger).toHaveFocus();
+  });
+
   it("closes the merge menu on Escape without merging", async () => {
     const user = userEvent.setup();
     const onRename = vi.fn();
