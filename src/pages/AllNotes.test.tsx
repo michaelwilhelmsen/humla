@@ -65,6 +65,19 @@ describe("AllNotes selection", () => {
     expect(loc()).toBe("/");
   });
 
+  it("ctrl-click does NOT toggle selection (macOS context-menu click)", async () => {
+    mockTauri();
+    seed([makeNote("n1", "Alpha"), makeNote("n2", "Beta")]);
+    renderAll();
+
+    const row = screen.getByRole("link", { name: /Alpha/ });
+    fireEvent.click(row, { ctrlKey: true });
+    // Ctrl is not a selection modifier: the row is not selected and no
+    // selection bar appears.
+    expect(row).not.toHaveAttribute("data-selected");
+    expect(screen.queryByText(/selected$/)).not.toBeInTheDocument();
+  });
+
   it("plain click still navigates to the note", async () => {
     mockTauri();
     seed([makeNote("n1", "Alpha")]);
