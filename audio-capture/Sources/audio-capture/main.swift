@@ -868,15 +868,23 @@ func runImport(_ path: String) {
     // Read/convert in ~1 s blocks. Block size is at the source rate; the
     // converter downmixes to mono and resamples to 16 kHz in one pass.
     let blockFrames = AVAudioFrameCount(max(inFormat.sampleRate, 16_000))
+    // Track whether we've read any audio yet. AVAudioFile.read(into:) is known
+    // to throw `_GenericObjCError error 0` at/near the end of some compressed
+    // files (m4a/mp4/aac) instead of cleanly returning frameLength == 0. Once
+    // we've already read at least one block, treat that throw as end-of-stream
+    // rather than surfacing a scary error toast for an import that succeeded.
+    var readAnyFrames = false
     while true {
         guard let inBuf = AVAudioPCMBuffer(pcmFormat: inFormat, frameCapacity: blockFrames) else { break }
         do {
             try file.read(into: inBuf)
         } catch {
+            if readAnyFrames { break } // tail-read quirk on compressed files → EOF
             emitError("import read: \(error.localizedDescription)")
             break
         }
         if inBuf.frameLength == 0 { break } // EOF
+        readAnyFrames = true
 
         let ratio = targetSampleRate / inFormat.sampleRate
         let cap = AVAudioFrameCount(Double(inBuf.frameLength) * ratio + 1024)

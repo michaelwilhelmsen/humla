@@ -347,8 +347,11 @@ export const ipc = {
   recordingStart: (noteId: string) => invoke<void>("recording_start", { noteId }),
   recordingStop: () => invoke<void>("recording_stop"),
   // Import an existing audio file into a NEW note and run it through the full
-  // transcription pipeline. Returns the created note.
-  importAudio: (path: string) => invoke<Note>("import_audio", { path }),
+  // transcription pipeline. Language + expected speaker count come from the
+  // import config dialog so the note is seeded correctly before the (one-shot)
+  // transcription runs. Returns the created note.
+  importAudio: (path: string, language: string, expectedSpeakers: number | null) =>
+    invoke<Note>("import_audio", { path, language, expectedSpeakers }),
   recordingPause: () => invoke<void>("recording_pause"),
   recordingResume: () => invoke<void>("recording_resume"),
   recordingState: () => invoke<"idle" | "recording">("recording_state"),

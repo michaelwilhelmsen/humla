@@ -2133,6 +2133,10 @@ pub async fn import_audio(
     app: AppHandle,
     state: State<'_, AppState>,
     path: String,
+    // From the import config dialog. `language` is a code like "en"/"no";
+    // `expected_speakers` is a diarization hint (None = auto).
+    language: String,
+    expected_speakers: Option<i64>,
 ) -> Result<db::Note, String> {
     let source_path = PathBuf::from(&path);
     if !source_path.exists() {
@@ -2176,22 +2180,35 @@ pub async fn import_audio(
     // (unsynced) note — no cloud recording lock needed.
     let note = {
         let conn = state.db.lock();
-        let default_language = db::get_setting(&conn, "language")
-            .map_err(err)?
-            .unwrap_or_else(|| DEFAULT_LANGUAGE.to_string());
+        // Language comes from the import dialog. Fall back to the global default
+        // only if the caller sent an empty string (defensive / older frontend).
+        let language = if language.trim().is_empty() {
+            db::get_setting(&conn, "language")
+                .map_err(err)?
+                .unwrap_or_else(|| DEFAULT_LANGUAGE.to_string())
+        } else {
+            language.clone()
+        };
         let default_preset = db::get_setting(&conn, "default_summary_preset")
             .map_err(err)?
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| "meeting".to_string());
-        let mut note = db::create_note(&conn, &default_language, &default_preset, "").map_err(err)?;
+        let mut note = db::create_note(&conn, &language, &default_preset, "").map_err(err)?;
         let title = title_from_filename(&source_path);
         db::update_note(
             &conn,
             &note.id,
-            &db::NotePatch { title: Some(title.clone()), ..Default::default() },
+            &db::NotePatch {
+                title: Some(title.clone()),
+                // `Some(expected_speakers)` writes the hint; `Some(None)` (the
+                // "Auto" choice) leaves diarization to auto-detect.
+                expected_speakers: Some(expected_speakers),
+                ..Default::default()
+            },
         )
         .map_err(err)?;
         note.title = title;
+        note.expected_speakers = expected_speakers;
         note
     };
     state.sync.note_upserted(&note.id);

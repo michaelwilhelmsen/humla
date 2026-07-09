@@ -44,11 +44,13 @@ beforeEach(() => {
 });
 
 describe("Sidebar import audio", () => {
-  it("picks a file, imports it into a new note, and navigates there", async () => {
+  it("picks a file, opens the config dialog, then imports and navigates", async () => {
     const importSpy = vi.fn();
     mockTauri({
       // The native open panel returns the chosen path.
       "plugin:dialog|open": () => "/Users/me/meeting.m4a",
+      // Dialog preseeds its language chip from the global default.
+      settings_get: () => "en",
       import_audio: (args) => {
         importSpy(args);
         return makeNote("imp1", "meeting");
@@ -58,8 +60,24 @@ describe("Sidebar import audio", () => {
 
     fireEvent.click(screen.getByRole("button", { name: /Import audio/ }));
 
+    // A config dialog opens first — import must NOT start immediately (this is
+    // the whole point: language/speakers are chosen before the one-shot
+    // transcription runs). Wait for the language chip to preseed from the
+    // global default ("en" → "English") before confirming.
+    const importBtn = await screen.findByRole("button", { name: /^Import$/ });
+    expect(importSpy).not.toHaveBeenCalled();
+    await screen.findByText("English");
+
+    fireEvent.click(importBtn);
+
     await waitFor(() => expect(importSpy).toHaveBeenCalledTimes(1));
-    expect(importSpy).toHaveBeenCalledWith({ path: "/Users/me/meeting.m4a" });
+    expect(importSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        path: "/Users/me/meeting.m4a",
+        language: "en",
+        expectedSpeakers: null,
+      }),
+    );
     // The created note lands in the store and we navigate to it.
     await waitFor(() => expect(loc()).toBe("/note/imp1"));
     expect(useNotesStore.getState().notes.map((n) => n.id)).toContain("imp1");

@@ -19,6 +19,7 @@ import { cn } from "../lib/cn";
 import { ContextMenu, ContextMenuItem } from "./ContextMenu";
 import { WorkspaceSwitcher } from "./WorkspaceSwitcher";
 import { SetupNag } from "./SetupNag";
+import { ImportDialog } from "./ImportDialog";
 import { useCloudStore } from "../lib/cloud";
 
 // Humla mark sourced from humla-small.svg — single-path silhouette of
@@ -54,10 +55,14 @@ export function Sidebar({ onCollapse }: { onCollapse: () => void }) {
   const [q, setQ] = useState("");
   const [creatingFolder, setCreatingFolder] = useState(false);
   const [newFolderName, setNewFolderName] = useState("");
+  // Path of the file awaiting an import-config dialog. Non-null while the
+  // dialog is open, between picking the file and confirming language/speakers.
+  const [importPath, setImportPath] = useState<string | null>(null);
 
-  // Import an existing audio file: pick it, create a new note seeded from the
-  // filename, and run it through the transcription pipeline (backend streams
-  // the transcript in). Navigate to the note so the user watches it fill in.
+  // Import an existing audio file. Step 1: pick the file. We then open a config
+  // dialog (language + speakers) rather than importing immediately — the
+  // transcription runs once and can't be re-run per language, so the language
+  // must be chosen before it starts, not corrected on the note afterward.
   async function importAudio() {
     let selected: string | string[] | null;
     try {
@@ -75,8 +80,18 @@ export function Sidebar({ onCollapse }: { onCollapse: () => void }) {
       return; // dialog unavailable / cancelled
     }
     if (typeof selected !== "string") return; // cancelled or multi (shouldn't happen)
-    const note = await ipc.importAudio(selected);
+    setImportPath(selected);
+  }
+
+  // Step 2: config confirmed. Create the note with the chosen language +
+  // speaker hint and kick off the pipeline; navigate so the transcript fills
+  // in live. Throws propagate to the dialog, which surfaces the error inline.
+  async function confirmImport(language: string, expectedSpeakers: number | null) {
+    const path = importPath;
+    if (!path) return;
+    const note = await ipc.importAudio(path, language, expectedSpeakers);
     upsertLocal(note);
+    setImportPath(null);
     navigate(`/note/${note.id}`);
   }
 
@@ -288,6 +303,14 @@ export function Sidebar({ onCollapse }: { onCollapse: () => void }) {
         title="⌘,"
       />
       <AccountRow />
+
+      {importPath && (
+        <ImportDialog
+          path={importPath}
+          onCancel={() => setImportPath(null)}
+          onConfirm={confirmImport}
+        />
+      )}
     </div>
   );
 }
