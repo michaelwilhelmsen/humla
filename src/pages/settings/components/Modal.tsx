@@ -1,9 +1,19 @@
 import { useEffect, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 
 // Lightweight centred modal. Click backdrop or press Esc to dismiss;
 // inner content is the caller's responsibility. Used by the summary
 // prompt editor — kept small and neutral so future modals can reuse
 // it without inheriting opinionated styling.
+//
+// Rendered through a portal to <body> (same idiom as ContextMenu) so the
+// overlay + panel escape whatever stacking context the caller sits in.
+// Callers like the Note toolbar live deep inside a positioned/z-indexed
+// subtree, and a sibling — the Summary/Transcript context panel (`aside`,
+// `relative z-30`) — would otherwise paint above this modal: `fixed z-50`
+// only outranks siblings *within the same stacking context*, and the
+// toolbar's own `relative z-30` traps it below that panel. Portaling to
+// <body> lifts it above the whole app so the overlay dims everything.
 export function Modal({
   open,
   onClose,
@@ -33,7 +43,7 @@ export function Modal({
 
   if (!open) return null;
 
-  return (
+  return createPortal(
     <div
       role="dialog"
       aria-modal="true"
@@ -53,6 +63,7 @@ export function Modal({
         )}
         <div className="px-6 py-5">{children}</div>
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }
