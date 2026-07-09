@@ -2562,6 +2562,7 @@ function DiagnosticsLinks({ noteId }: { noteId: string }) {
 // the button entirely.
 function RediarizeAction({ noteId }: { noteId: string }) {
   const [hasAudio, setHasAudio] = useState(false);
+  const [multiSession, setMultiSession] = useState(false);
   const [rediarizing, setRediarizing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const phase = useRecordingStore((s) => s.status.phase);
@@ -2571,6 +2572,14 @@ function RediarizeAction({ noteId }: { noteId: string }) {
     ipc.noteAudioFiles(noteId)
       .then((f) => {
         if (!cancelled) setHasAudio(f.length > 0);
+      })
+      .catch(() => {});
+    // On a multi-session note the backend runs the cross-session unify
+    // pass (#17) instead of the latest-take re-diarize, so the copy
+    // should say what will actually happen.
+    ipc.noteSessions(noteId)
+      .then((s) => {
+        if (!cancelled) setMultiSession(s.length > 1);
       })
       .catch(() => {});
     return () => {
@@ -2599,9 +2608,19 @@ function RediarizeAction({ noteId }: { noteId: string }) {
         onClick={rediarize}
         disabled={rediarizing}
         className="self-start text-xs underline text-[var(--color-text-muted)] hover:text-[var(--color-text)] disabled:opacity-50"
-        title="Re-run speaker detection using the saved audio and the speaker count above"
+        title={
+          multiSession
+            ? "Re-run speaker detection across all recordings on this note, so the same voice gets one label everywhere"
+            : "Re-run speaker detection using the saved audio and the speaker count above"
+        }
       >
-        {rediarizing ? "Re-diarizing…" : "Re-diarize speakers"}
+        {rediarizing
+          ? multiSession
+            ? "Unifying speakers…"
+            : "Re-diarizing…"
+          : multiSession
+            ? "Unify speakers across recordings"
+            : "Re-diarize speakers"}
       </button>
       {error && (
         <p className="text-xs text-red-600 dark:text-red-400 break-all">
