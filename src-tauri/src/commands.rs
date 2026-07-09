@@ -488,6 +488,10 @@ async fn rediarize_apply_to_chunks(
         db::set_transcript(&conn, &note_id, &full_transcript)?;
     }
     note_changed_for_sync(&app, &note_id); // re-diarize rewrote the transcript
+    // Re-diarize rewrote this session's timeline.jsonl — re-push the metadata
+    // (idempotent) so the record exists; the frontend re-uploads the timeline
+    // asset after the command returns.
+    session_changed_for_sync(&app, &note_id, &session_id);
     let _ = app.emit(
         "transcript_replaced",
         TranscriptPayload {
@@ -1905,6 +1909,11 @@ async fn run_post_stop_chain(
     // then the labelled rewrite), bypassing the notes_* commands — so push it
     // to the cloud now. Covers every diarize_and_apply exit path.
     note_changed_for_sync(&app, &note_id);
+    // Ping the session AFTER the note (lower seq → the note record drains
+    // first, so the session's parent-note lookup resolves). Enqueues the
+    // note_sessions metadata push; the assets upload separately (the frontend
+    // fires cloud_upload_note_sessions once this chain lands on Idle).
+    session_changed_for_sync(&app, &note_id, &session_id);
     // Now that every step that needs the WAVs has finished, drop the temp dir.
     // Best-effort: a leftover dir is harmless.
     if let Some(dir) = temp_dir {
@@ -4826,6 +4835,19 @@ fn emit_error(app: &AppHandle, note_id: Option<&str>, message: &str) {
 /// No-op under the open-source `NoopSync`.
 fn note_changed_for_sync(app: &AppHandle, note_id: &str) {
     app.state::<AppState>().sync.note_upserted(note_id);
+}
+
+/// Tell the sync observer a recording *session* was created or changed (#16) —
+/// a take finished recording/importing, or was re-diarized. Enqueues the
+/// `note_sessions` metadata push (the binary assets are uploaded separately,
+/// frontend-triggered). Without this explicit ping the session would never
+/// sync, since the pipeline writes it to disk outside the `notes_*` commands.
+/// No-op under the open-source `NoopSync`.
+fn session_changed_for_sync(app: &AppHandle, note_id: &str, session_id: &str) {
+    if session_id == sessions::LEGACY_SESSION_ID {
+        return; // synthesized legacy take — synced via the notes.audio path
+    }
+    app.state::<AppState>().sync.session_upserted(note_id, session_id);
 }
 
 fn sidecar_path(_app: &AppHandle) -> Result<PathBuf, String> {

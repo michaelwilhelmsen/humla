@@ -405,13 +405,18 @@ export function Note() {
         ipc.noteSessions(draft.id).catch((): NoteSession[] => []),
       ]);
       // No local audio but the note is shared → pull it from the workspace.
-      // Cloud audio is still one file per note; it lands as the latest/legacy
-      // session, so re-list sessions after the download.
+      // Prefer per-session sync (#16): rebuild sessions.json + fetch each take's
+      // playback/timeline. Fall back to the legacy single-file notes.audio for
+      // notes that predate sessions (or were uploaded by an old client).
       if (!path && draft.workspace_id) {
-        const got = await ipc.downloadNoteAudio(draft.id).catch(() => false);
+        let got = await ipc.downloadNoteSessions(draft.id).catch(() => false);
+        if (!got) {
+          got = await ipc.downloadNoteAudio(draft.id).catch(() => false);
+        }
         if (got && !cancelled) {
           path = await ipc.notePlaybackPath(draft.id).catch(() => null);
           sess = await ipc.noteSessions(draft.id).catch(() => sess);
+          tl = await ipc.noteTimeline(draft.id).catch(() => tl);
         }
       }
       if (cancelled) return;
@@ -921,6 +926,11 @@ export function Note() {
                           );
                           ipc
                             .noteTimelineRename(draft.id, oldLabel, newLabel)
+                            .then(() => {
+                              // Re-upload the rewritten timelines for shared
+                              // notes (#16); a no-op for Personal notes.
+                              void ipc.uploadNoteSessions(draft.id);
+                            })
                             .catch((err) => console.error("noteTimelineRename failed", err));
                         }}
                       />
@@ -2182,6 +2192,9 @@ const TranscriptPlayer = memo(function TranscriptPlayer({
         console.error("noteTimelineDeleteChunk failed", err);
       }
     }
+    // Push the rewritten session timelines to the workspace (#16); Personal
+    // notes short-circuit in the backend.
+    void ipc.uploadNoteSessions(noteId);
     useRecordingStore
       .getState()
       .pushFlash(g.indices.length === 1 ? "Line deleted" : "Turn deleted");
@@ -2213,6 +2226,8 @@ const TranscriptPlayer = memo(function TranscriptPlayer({
         console.error("noteTimelineSetChunkLabel failed", err);
       }
     }
+    // Sync the relabelled session timelines (#16); no-op for Personal notes.
+    void ipc.uploadNoteSessions(noteId);
   }
 
   const showEditor = editing && !disabled;
@@ -2594,6 +2609,9 @@ function RediarizeAction({ noteId }: { noteId: string }) {
     setError(null);
     try {
       await ipc.rediarizeNote(noteId);
+      // Re-diarize rewrote the session timelines — push them to the
+      // workspace (#16); a no-op for Personal notes.
+      void ipc.uploadNoteSessions(noteId);
     } catch (e) {
       setError(String(e));
     } finally {

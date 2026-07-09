@@ -17,3 +17,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 parking_lot = "0.12"
 anyhow = "1"
+# Only for parsing a session manifest's RFC3339 `started_at` into the epoch-ms
+# the note_sessions contract expects. std-only, no clock backend needed.
+chrono = { version = "0.4", default-features = false, features = ["std"] }

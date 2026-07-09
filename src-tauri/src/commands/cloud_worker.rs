@@ -23,7 +23,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::Mutex;
-use tauri::{AppHandle, Emitter};
+// `Manager as _` brings the trait's methods (e.g. `AppHandle::path`) into scope
+// without binding the name `Manager`, which is also this module's own struct.
+use tauri::{AppHandle, Emitter, Manager as _};
 
 use crate::sync::{SyncContext, SyncObserver};
 
@@ -157,12 +159,22 @@ impl Manager {
             return None;
         }
         let (email, password) = super::cloud::read_creds()?;
+        // Where session-metadata pushes read each note's sessions.json manifest.
+        // A missing app-data dir is unexpected but non-fatal for the rest of
+        // sync, so fall back to an empty path (session pushes then just no-op).
+        let recordings_dir = self
+            .app
+            .path()
+            .app_data_dir()
+            .map(|d| d.join("recordings"))
+            .unwrap_or_default();
         Some(cloud_sync::Config {
             base_url,
             email,
             password,
             workspace_id,
             poll_interval: POLL_INTERVAL,
+            recordings_dir,
         })
     }
 }
@@ -201,6 +213,16 @@ impl SyncObserver for CloudObserver {
     fn summary_prompt_deleted(&self, id: &str) {
         if let Some(h) = self.mgr.handle() {
             h.enqueue_prompt_delete(id);
+        }
+    }
+    fn session_upserted(&self, note_id: &str, session_id: &str) {
+        if let Some(h) = self.mgr.handle() {
+            h.enqueue_session_upsert(note_id, session_id);
+        }
+    }
+    fn session_deleted(&self, note_id: &str, session_id: &str) {
+        if let Some(h) = self.mgr.handle() {
+            h.enqueue_session_delete(note_id, session_id);
         }
     }
     fn config_changed(&self) {

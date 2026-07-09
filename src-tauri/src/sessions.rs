@@ -283,6 +283,165 @@ pub fn existing_session_count(recordings_dir: &Path) -> usize {
     resolve_sessions(recordings_dir).len()
 }
 
+// ---------------------------------------------------------------------------
+// Cloud sync (#16) — pure helpers shared by the asset upload/download path in
+// `commands::cloud`. Kept here (over `crate::sessions` FS state) so they can be
+// unit-tested without a Tauri `AppHandle` or a live PocketBase.
+// ---------------------------------------------------------------------------
+
+/// One per-session asset file, matching the five typed file fields on the
+/// server's `note_sessions` collection. The `field` name is both the
+/// PocketBase record key and the multipart form-part name; `file` is the local
+/// filename inside a session dir.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AssetField {
+    Playback,
+    Mic,
+    Sys,
+    Timeline,
+    Chunks,
+}
+
+impl AssetField {
+    /// All five fields, in a stable order.
+    pub const ALL: [AssetField; 5] = [
+        AssetField::Playback,
+        AssetField::Mic,
+        AssetField::Sys,
+        AssetField::Timeline,
+        AssetField::Chunks,
+    ];
+
+    /// The `note_sessions` field / multipart part name.
+    pub fn field(self) -> &'static str {
+        match self {
+            AssetField::Playback => "playback",
+            AssetField::Mic => "mic",
+            AssetField::Sys => "sys",
+            AssetField::Timeline => "timeline",
+            AssetField::Chunks => "chunks",
+        }
+    }
+
+    /// The local filename inside a session dir.
+    pub fn file_name(self) -> &'static str {
+        match self {
+            AssetField::Playback => "playback.wav",
+            AssetField::Mic => "mic.wav",
+            AssetField::Sys => "sys.wav",
+            AssetField::Timeline => "timeline.jsonl",
+            AssetField::Chunks => "chunks.json",
+        }
+    }
+
+    /// The MIME type to stamp on the multipart upload. The JSON-ish assets go
+    /// up as octet-stream (the server's timeline/chunks fields have no mime
+    /// restriction — jsonl/json content-sniff inconsistently).
+    pub fn mime(self) -> &'static str {
+        match self {
+            AssetField::Playback | AssetField::Mic | AssetField::Sys => "audio/wav",
+            AssetField::Timeline | AssetField::Chunks => "application/octet-stream",
+        }
+    }
+}
+
+/// Decide which asset fields to (re-)upload for one session, given which are
+/// present on disk locally and which already have a file on the server.
+///
+/// Rules (the "upload sequencing" decision, unit-tested):
+///  - `timeline` is uploaded whenever it exists locally — it's rewritten by
+///    re-diarize / cross-session unification and is tiny, so teammates always
+///    get the latest speaker labels.
+///  - every other asset is uploaded only once (when present locally but not yet
+///    on the server), so a long recording's multi-hundred-MB `mic`/`sys`/
+///    `playback` WAVs aren't re-sent on every subsequent timeline edit.
+pub fn session_upload_plan(
+    local_present: &[AssetField],
+    remote_present: &[AssetField],
+) -> Vec<AssetField> {
+    AssetField::ALL
+        .into_iter()
+        .filter(|f| {
+            let local = local_present.contains(f);
+            if !local {
+                return false;
+            }
+            matches!(f, AssetField::Timeline) || !remote_present.contains(f)
+        })
+        .collect()
+}
+
+/// Metadata for one remote `note_sessions` record, used to reconstruct the
+/// local `sessions.json` manifest on a receiving (teammate) device.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteSessionMeta {
+    /// Session UUID (the record's `client_id`).
+    pub client_id: String,
+    pub index: u32,
+    /// `started_at` epoch-ms (server `started_at`), 0 when unknown.
+    pub started_at_ms: i64,
+    pub duration_ms: u64,
+    pub streams: Vec<String>,
+    /// Tombstone — a deleted record removes the session from the manifest.
+    pub deleted: bool,
+}
+
+/// epoch-ms → RFC3339 (manifest `started_at`). 0 / negative → empty string
+/// (matching how a legacy session with no known start is represented).
+pub fn ms_to_started_at(ms: i64) -> String {
+    if ms <= 0 {
+        return String::new();
+    }
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms)
+        .map(|dt| dt.to_rfc3339())
+        .unwrap_or_default()
+}
+
+/// Reconcile pulled remote session records into a local manifest.
+///
+///  - Non-deleted remote records become (or overwrite) manifest entries.
+///  - A deleted remote record removes its entry (tombstone honoured).
+///  - Local-only entries not present in `remote` are preserved — a device may
+///    hold a freshly-recorded take that hasn't finished pushing yet, and a
+///    pull mustn't drop it. (The synthesized [`LEGACY_SESSION_ID`] is likewise
+///    preserved.)
+///  - Entries are returned sorted by `index`.
+pub fn reconcile_manifest(
+    existing: Option<SessionsManifest>,
+    remote: &[RemoteSessionMeta],
+) -> SessionsManifest {
+    let mut by_id: std::collections::BTreeMap<String, SessionEntry> = existing
+        .map(|m| m.sessions)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|e| (e.id.clone(), e))
+        .collect();
+
+    for r in remote {
+        if r.deleted {
+            by_id.remove(&r.client_id);
+            continue;
+        }
+        by_id.insert(
+            r.client_id.clone(),
+            SessionEntry {
+                id: r.client_id.clone(),
+                index: r.index,
+                started_at: ms_to_started_at(r.started_at_ms),
+                duration_ms: r.duration_ms,
+                streams: r.streams.clone(),
+            },
+        );
+    }
+
+    let mut sessions: Vec<SessionEntry> = by_id.into_values().collect();
+    sessions.sort_by_key(|e| e.index);
+    SessionsManifest {
+        version: MANIFEST_VERSION,
+        sessions,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -498,5 +657,106 @@ mod tests {
         let sessions = resolve_sessions(&rec);
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].0.id, LEGACY_SESSION_ID);
+    }
+
+    // ---- cloud sync (#16) pure helpers -----------------------------------
+
+    fn meta(id: &str, index: u32, deleted: bool) -> RemoteSessionMeta {
+        RemoteSessionMeta {
+            client_id: id.into(),
+            index,
+            started_at_ms: 1_719_000_000_000,
+            duration_ms: 5000,
+            streams: vec!["mic".into()],
+            deleted,
+        }
+    }
+
+    #[test]
+    fn ms_to_started_at_formats_and_guards_zero() {
+        // A known epoch-ms formats to a parseable RFC3339 carrying the same instant.
+        let ms = 1_719_921_600_000; // 2024-07-02T12:00:00Z
+        let s = ms_to_started_at(ms);
+        assert!(!s.is_empty());
+        assert_eq!(
+            chrono::DateTime::parse_from_rfc3339(&s).unwrap().timestamp_millis(),
+            ms
+        );
+        // 0 / negative (unknown start) collapses to empty, matching a legacy take.
+        assert_eq!(ms_to_started_at(0), "");
+        assert_eq!(ms_to_started_at(-5), "");
+    }
+
+    #[test]
+    fn upload_plan_uploads_missing_once_and_timeline_always() {
+        use AssetField::*;
+        // First upload: everything present locally, nothing on the server yet.
+        let plan = session_upload_plan(&[Playback, Mic, Sys, Timeline, Chunks], &[]);
+        assert_eq!(plan, vec![Playback, Mic, Sys, Timeline, Chunks]);
+
+        // A later edit: all five already on the server → only timeline re-uploads.
+        let plan = session_upload_plan(
+            &[Playback, Mic, Sys, Timeline, Chunks],
+            &[Playback, Mic, Sys, Timeline, Chunks],
+        );
+        assert_eq!(plan, vec![Timeline]);
+
+        // Playback + timeline present locally, playback already remote → timeline only.
+        let plan = session_upload_plan(&[Playback, Timeline], &[Playback]);
+        assert_eq!(plan, vec![Timeline]);
+
+        // Nothing local → nothing uploaded, even if the server expects it.
+        assert!(session_upload_plan(&[], &[Playback]).is_empty());
+    }
+
+    #[test]
+    fn reconcile_builds_manifest_sorted_by_index() {
+        let m = reconcile_manifest(None, &[meta("b", 2, false), meta("a", 1, false)]);
+        assert_eq!(m.sessions.len(), 2);
+        assert_eq!(m.sessions[0].id, "a");
+        assert_eq!(m.sessions[1].id, "b");
+        assert!(!m.sessions[0].started_at.is_empty());
+    }
+
+    #[test]
+    fn reconcile_tombstone_removes_entry() {
+        let existing = reconcile_manifest(None, &[meta("a", 1, false), meta("b", 2, false)]);
+        let after = reconcile_manifest(Some(existing), &[meta("a", 1, true)]);
+        assert_eq!(after.sessions.len(), 1);
+        assert_eq!(after.sessions[0].id, "b");
+    }
+
+    #[test]
+    fn reconcile_preserves_local_only_and_legacy_entries() {
+        // A local manifest holds an un-pushed take + a legacy synthesized entry;
+        // a pull carrying an unrelated remote session must keep both locals.
+        let mut existing = SessionsManifest::empty();
+        existing.sessions.push(SessionEntry {
+            id: "local-unpushed".into(),
+            index: 1,
+            started_at: String::new(),
+            duration_ms: 0,
+            streams: vec![],
+        });
+        let after = reconcile_manifest(Some(existing), &[meta("remote", 2, false)]);
+        let ids: Vec<&str> = after.sessions.iter().map(|e| e.id.as_str()).collect();
+        assert!(ids.contains(&"local-unpushed"));
+        assert!(ids.contains(&"remote"));
+    }
+
+    #[test]
+    fn reconcile_remote_overwrites_matching_local_metadata() {
+        let mut existing = SessionsManifest::empty();
+        existing.sessions.push(SessionEntry {
+            id: "a".into(),
+            index: 1,
+            started_at: String::new(),
+            duration_ms: 0,
+            streams: vec![],
+        });
+        let after = reconcile_manifest(Some(existing), &[meta("a", 1, false)]);
+        assert_eq!(after.sessions.len(), 1);
+        assert_eq!(after.sessions[0].duration_ms, 5000);
+        assert_eq!(after.sessions[0].streams, vec!["mic"]);
     }
 }
