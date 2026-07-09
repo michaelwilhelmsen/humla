@@ -87,6 +87,19 @@ if let i = args.firstIndex(of: "--out"), i + 1 < args.count {
 }
 try? FileManager.default.createDirectory(at: outDir, withIntermediateDirectories: true, attributes: nil)
 
+// Import mode: `--import <file>`. Instead of live-capturing mic + system audio,
+// decode an existing file, resample it to the target format, and replay it
+// through the SAME VAD ChunkWriter + FullRecordingWriter used for the mic
+// stream — emitting the identical `chunk` / `full_recording` / `stopped`
+// events. The Rust side then reuses its whole recording pipeline unchanged
+// (transcribe fan-out → mic-only diarize). A one-shot replay: no AVAudioEngine,
+// no ScreenCaptureKit, no heartbeat / pause / watchdog / signal handlers.
+let importPath: String? = {
+    guard let i = args.firstIndex(of: "--import"), i + 1 < args.count else { return nil }
+    return args[i + 1]
+}()
+let isImport = importPath != nil
+
 // MARK: - JSON event emitter (stdout)
 
 let stdoutLock = NSLock()
@@ -409,6 +422,7 @@ func installMicTap(_ input: AVAudioInputNode, format inFormat: AVAudioFormat) {
     }
 }
 
+if !isImport {
 do {
     let input = engine.inputNode
     // NOTE: do NOT call `input.setVoiceProcessingEnabled(true)`. It enables
@@ -427,6 +441,7 @@ do {
 } catch {
     emitError("mic engine: \(error.localizedDescription)")
 }
+} // if !isImport
 
 // MARK: - System audio via ScreenCaptureKit
 
@@ -639,7 +654,9 @@ final class NoopVideoOutput: NSObject, SCStreamOutput {
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {}
 }
 
-Task { await startSystemAudio() }
+if !isImport {
+    Task { await startSystemAudio() }
+}
 
 // MARK: - Heartbeat (every 2s) for live diagnostics
 
@@ -665,7 +682,9 @@ hbTimer.setEventHandler {
         "sys_peak": sp,
     ])
 }
-hbTimer.resume()
+if !isImport {
+    hbTimer.resume()
+}
 
 // MARK: - Pause / Resume via SIGUSR1 / SIGUSR2
 
@@ -700,8 +719,10 @@ signal(SIGUSR1, SIG_IGN)
 signal(SIGUSR2, SIG_IGN)
 pauseSrc.setEventHandler { pauseCapture() }
 resumeSrc.setEventHandler { resumeCapture() }
-pauseSrc.resume()
-resumeSrc.resume()
+if !isImport {
+    pauseSrc.resume()
+    resumeSrc.resume()
+}
 
 // MARK: - Audio device / configuration change recovery
 //
@@ -738,12 +759,14 @@ func reconfigureMicAfterDeviceChange() {
     emit(["event": "diagnostic", "message": "Audio input device changed; microphone capture resumed on the new device."])
 }
 
-NotificationCenter.default.addObserver(
-    forName: .AVAudioEngineConfigurationChange,
-    object: engine,
-    queue: .main
-) { _ in
-    reconfigureMicAfterDeviceChange()
+if !isImport {
+    NotificationCenter.default.addObserver(
+        forName: .AVAudioEngineConfigurationChange,
+        object: engine,
+        queue: .main
+    ) { _ in
+        reconfigureMicAfterDeviceChange()
+    }
 }
 
 // MARK: - Parent-death watchdog
@@ -767,7 +790,9 @@ parentWatchdog.setEventHandler {
         exit(0)
     }
 }
-parentWatchdog.resume()
+if !isImport {
+    parentWatchdog.resume()
+}
 
 // MARK: - Signal handling: SIGTERM / SIGINT → finalize
 
@@ -807,7 +832,85 @@ let shutdown: () -> Void = {
 
 sigSource.setEventHandler(handler: shutdown)
 sigSource2.setEventHandler(handler: shutdown)
-sigSource.resume()
-sigSource2.resume()
+if !isImport {
+    sigSource.resume()
+    sigSource2.resume()
+}
 
-RunLoop.main.run()
+// MARK: - Import replay
+//
+// Decode the source file to PCM, resample each block to the target 16 kHz
+// mono format via AVAudioConverter, and feed the SAME mic writers as live
+// capture. Runs at full speed (no realtime pacing) — the OS/disk buffers the
+// per-chunk WAVs and the Rust reader applies a bounded-backlog semaphore so a
+// fast replay can't swamp the transcribe queue. On completion it closes the
+// writers (emitting the final chunk + `full_recording`), emits `stopped`, and
+// exits. Only the mic writers are touched, so the Rust side sees a mic-only
+// session and runs the mic-only diarize branch — exactly what we want.
+func runImport(_ path: String) {
+    let url = URL(fileURLWithPath: path)
+    let file: AVAudioFile
+    do {
+        file = try AVAudioFile(forReading: url)
+    } catch {
+        emitError("import open \(url.lastPathComponent): \(error.localizedDescription)")
+        emit(["event": "stopped"])
+        exit(1)
+    }
+
+    let inFormat = file.processingFormat
+    guard let converter = AVAudioConverter(from: inFormat, to: targetFormat) else {
+        emitError("import: could not build converter from \(inFormat)")
+        emit(["event": "stopped"])
+        exit(1)
+    }
+
+    // Read/convert in ~1 s blocks. Block size is at the source rate; the
+    // converter downmixes to mono and resamples to 16 kHz in one pass.
+    let blockFrames = AVAudioFrameCount(max(inFormat.sampleRate, 16_000))
+    while true {
+        guard let inBuf = AVAudioPCMBuffer(pcmFormat: inFormat, frameCapacity: blockFrames) else { break }
+        do {
+            try file.read(into: inBuf)
+        } catch {
+            emitError("import read: \(error.localizedDescription)")
+            break
+        }
+        if inBuf.frameLength == 0 { break } // EOF
+
+        let ratio = targetSampleRate / inFormat.sampleRate
+        let cap = AVAudioFrameCount(Double(inBuf.frameLength) * ratio + 1024)
+        guard let out = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: cap) else { break }
+        var convErr: NSError?
+        var supplied = false
+        let status = converter.convert(to: out, error: &convErr) { _, s in
+            if supplied { s.pointee = .noDataNow; return nil }
+            supplied = true
+            s.pointee = .haveData
+            return inBuf
+        }
+        if status == .error {
+            emitError("import convert: \(convErr?.localizedDescription ?? "unknown")")
+            break
+        }
+        if out.frameLength > 0, let chans = out.floatChannelData {
+            let n = Int(out.frameLength)
+            let arr = Array(UnsafeBufferPointer(start: chans[0], count: n))
+            if let buf = makeBuffer(arr) {
+                micWriter.write(buf)
+                micFullWriter.write(buf)
+            }
+        }
+    }
+
+    micWriter.close()
+    micFullWriter.close()
+    emit(["event": "stopped"])
+    exit(0)
+}
+
+if let importPath = importPath {
+    runImport(importPath)
+} else {
+    RunLoop.main.run()
+}
