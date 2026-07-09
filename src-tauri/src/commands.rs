@@ -20,6 +20,7 @@ use tokio::process::Command;
 mod api_keys;
 mod assets;
 mod cloud;
+mod export;
 // Live cloud-sync worker glue. Behind the `cloud` feature; `pub` so `run()` can
 // reach `cloud_worker::install`. Not a #[tauri::command] group, so no glob
 // re-export below.
@@ -37,6 +38,7 @@ mod transcription_config;
 pub use api_keys::*;
 pub use assets::*;
 pub use cloud::*;
+pub use export::*;
 pub use folders::*;
 pub use local_llm::*;
 pub use models::*;

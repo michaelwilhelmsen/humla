@@ -53,6 +53,23 @@ export type Folder = {
   updated_at: number;
 };
 
+// Note export (issue #18). One combined file; content selection + format +
+// speaker-label toggle. Adding a future format is just a new union member
+// here + a formatter branch in the backend — no surface rework.
+export type ExportFormat = "markdown" | "txt";
+
+export type ExportSpec = {
+  // Destination chosen in the native save panel.
+  path: string;
+  format: ExportFormat;
+  includeSummary: boolean;
+  includeTranscript: boolean;
+  includeNotes: boolean;
+  // When false, the leading `Label: ` prefix is stripped from each
+  // transcript line in the export.
+  includeSpeakerLabels: boolean;
+};
+
 export type SettingsKey =
   | "language"
   | "default_summary_preset"
@@ -240,6 +257,9 @@ export const ipc = {
   noteTimelineDeleteChunk: (noteId: string, chunkIdx: number) =>
     invoke<void>("note_timeline_delete_chunk", { noteId, chunkIdx }),
   openInFinder: (path: string) => invoke<void>("open_in_finder", { path }),
+  // Write a note's selected content to the chosen path as one combined file.
+  exportNote: (noteId: string, spec: ExportSpec) =>
+    invoke<void>("export_note", { noteId, spec }),
   rediarizeNote: (noteId: string) => invoke<void>("rediarize_note", { noteId }),
 
   summaryPromptsList: () => invoke<SummaryPrompt[]>("summary_prompts_list"),

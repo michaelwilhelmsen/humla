@@ -160,7 +160,7 @@ async fn run_summary(app: AppHandle, note_id: String) -> anyhow::Result<()> {
     } else {
         presets::prompt(&note.summary_preset, &language)
     };
-    let body_text = html_to_text(&note.body);
+    let body_text = crate::html_text::html_to_text(&note.body);
     // Always send both labels even when one side is empty. Sending only
     // [Transkripsjon] while the system prompt references [Notater] sends
     // thinking models down a rabbit hole second-guessing whether the notes
@@ -234,57 +234,6 @@ fn emit_summary_status(app: &AppHandle, note_id: &str, active: bool) {
         note_id: note_id.to_string(),
         active,
     });
-}
-
-// Strip Tiptap-emitted HTML to plain text, preserving paragraph and list
-// structure so the summarizer sees the user's note shape. Not a full HTML
-// parser — only handles the small set of tags Tiptap produces.
-fn html_to_text(html: &str) -> String {
-    let s = html
-        .replace("<br>", "\n")
-        .replace("<br/>", "\n")
-        .replace("<br />", "\n")
-        .replace("</p>", "\n")
-        .replace("</li>", "\n")
-        .replace("</h1>", "\n")
-        .replace("</h2>", "\n")
-        .replace("</h3>", "\n")
-        .replace("</h4>", "\n")
-        .replace("</blockquote>", "\n")
-        .replace("<li>", "- ");
-    let mut out = String::with_capacity(s.len());
-    let mut in_tag = false;
-    for c in s.chars() {
-        match c {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
-            _ if !in_tag => out.push(c),
-            _ => {}
-        }
-    }
-    let out = out
-        .replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&nbsp;", " ");
-    // Collapse runs of 3+ newlines down to 2 so paragraph breaks survive
-    // but the model doesn't see endless whitespace.
-    let mut collapsed = String::with_capacity(out.len());
-    let mut nl = 0;
-    for c in out.chars() {
-        if c == '\n' {
-            nl += 1;
-            if nl <= 2 {
-                collapsed.push(c);
-            }
-        } else {
-            nl = 0;
-            collapsed.push(c);
-        }
-    }
-    collapsed.trim().to_string()
 }
 
 // Hard directive appended to the summary system prompt. Enforces output
