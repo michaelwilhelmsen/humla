@@ -1399,7 +1399,6 @@ pub(crate) async fn download_note_sessions(app: &tauri::AppHandle, note_id: &str
     // Reconstruct the manifest from the remote metadata (tombstones drop entries,
     // local-only takes are preserved). Skip the synthesized legacy pseudo-entry
     // so a flat local note doesn't leak `__legacy__` into the written manifest.
-    let existing = crate::sessions::read_manifest(&recordings);
     let remote_meta: Vec<crate::sessions::RemoteSessionMeta> = records
         .iter()
         .map(|r| crate::sessions::RemoteSessionMeta {
@@ -1411,8 +1410,16 @@ pub(crate) async fn download_note_sessions(app: &tauri::AppHandle, note_id: &str
             deleted: r.deleted,
         })
         .collect();
-    let manifest = crate::sessions::reconcile_manifest(existing, &remote_meta);
-    crate::sessions::write_manifest(&recordings, &manifest).map_err(|e| e.to_string())?;
+    {
+        // Serialize the read-modify-write against the post-stop chain
+        // (migrate/append) so a finalize landing mid-pull isn't lost. The guard
+        // scopes to just the reconcile → write, not the asset downloads below.
+        let manifest_lock = state.manifest_lock.clone();
+        let _manifest_guard = manifest_lock.lock().await;
+        let existing = crate::sessions::read_manifest(&recordings);
+        let manifest = crate::sessions::reconcile_manifest(existing, &remote_meta);
+        crate::sessions::write_manifest(&recordings, &manifest).map_err(|e| e.to_string())?;
+    }
 
     // Mint one protected-file token and fetch each live session's core assets.
     let tok = authed_post(&base, &session.token, "/api/files/token", serde_json::json!({})).await?;

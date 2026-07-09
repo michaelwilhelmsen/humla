@@ -111,6 +111,25 @@ pub fn session_dir(recordings_dir: &Path, session_id: &str) -> PathBuf {
     recordings_dir.join(session_id)
 }
 
+/// The dir new assets for `session_id` should be **written** into — kept in
+/// lockstep with the read path ([`resolve_session_dir`]).
+///
+/// This is the whole fix for the legacy-note re-diarize no-op: a legacy note's
+/// assets are *read* flat from `recordings/<note_id>/`, but a naïve
+/// `session_dir(recordings, LEGACY_SESSION_ID)` writes to a
+/// `recordings/<note_id>/__legacy__/` **subdir** the reader never looks at — so
+/// re-diarize would silently write new labels to an orphan dir while the UI
+/// kept showing the stale flat transcript. Special-casing the sentinel here
+/// makes every writer (playback assets, keep-audio copies, timeline rewrites)
+/// land exactly where [`resolve_session_dir`] / [`latest_session_dir`] read.
+pub fn session_write_dir(recordings_dir: &Path, session_id: &str) -> PathBuf {
+    if session_id == LEGACY_SESSION_ID {
+        recordings_dir.to_path_buf()
+    } else {
+        session_dir(recordings_dir, session_id)
+    }
+}
+
 /// True when `id` is safe to use as a filesystem path segment for a session
 /// dir: non-empty and only `[A-Za-z0-9_-]`. Our client only ever mints session
 /// ids as UUIDs (or the `__legacy__` sentinel, which is all underscores), so
@@ -139,11 +158,22 @@ pub fn read_manifest(recordings_dir: &Path) -> Option<SessionsManifest> {
 }
 
 /// Write the manifest (pretty-printed), creating the recordings dir if needed.
+///
+/// **Atomic replace.** The body is written to a sibling temp file on the *same*
+/// filesystem, then `rename`d over the target. A concurrent reader therefore
+/// only ever observes the old complete file or the new complete file — never a
+/// half-written `sessions.json` (which [`read_manifest`] would treat as
+/// unparseable and fall back to the legacy/empty layout, blanking the
+/// carousel). The temp name is fixed because the process-wide manifest lock in
+/// `AppState` serializes read-modify-write across the post-stop and cloud-pull
+/// paths, so two writers can never race on the temp file itself.
 pub fn write_manifest(recordings_dir: &Path, manifest: &SessionsManifest) -> std::io::Result<()> {
     std::fs::create_dir_all(recordings_dir)?;
     let body = serde_json::to_string_pretty(manifest)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    std::fs::write(manifest_path(recordings_dir), body)
+    let tmp_path = recordings_dir.join(format!("{MANIFEST_FILE}.tmp"));
+    std::fs::write(&tmp_path, body)?;
+    std::fs::rename(&tmp_path, manifest_path(recordings_dir))
 }
 
 /// Whether any flat (pre-feature) asset file sits directly in the recordings
@@ -513,6 +543,103 @@ mod tests {
         touch(&rec.join("sys.wav"));
         let sessions = resolve_sessions(&rec);
         assert_eq!(sessions[0].0.streams, vec!["mic", "sys"]);
+    }
+
+    // ---- write/read dir agreement (BUG 1: legacy re-diarize orphan dir) ----
+
+    #[test]
+    fn legacy_write_dir_matches_read_dir() {
+        let tmp = TempDir::new().unwrap();
+        let rec = recordings_dir(tmp.path(), "note1");
+        touch(&rec.join("playback.wav")); // flat legacy note
+        let read_dir = resolve_session_dir(&rec, LEGACY_SESSION_ID).unwrap();
+        let write_dir = session_write_dir(&rec, LEGACY_SESSION_ID);
+        // The writer must target exactly the dir the reader reads from — the
+        // flat recordings dir, NOT a `__legacy__` subdir.
+        assert_eq!(write_dir, read_dir);
+        assert_eq!(write_dir, rec);
+        assert_ne!(write_dir, session_dir(&rec, LEGACY_SESSION_ID));
+    }
+
+    #[test]
+    fn uuid_write_dir_matches_read_dir() {
+        let tmp = TempDir::new().unwrap();
+        let rec = recordings_dir(tmp.path(), "note1");
+        append_session(&rec, "uuid-a", "", 0, vec!["mic".into()]).unwrap();
+        let read_dir = resolve_session_dir(&rec, "uuid-a").unwrap();
+        let write_dir = session_write_dir(&rec, "uuid-a");
+        assert_eq!(write_dir, read_dir);
+        assert_eq!(write_dir, session_dir(&rec, "uuid-a"));
+    }
+
+    #[test]
+    fn legacy_rediarize_write_is_visible_to_read() {
+        // Round-trip the exact failure: re-diarize writes NEW labels through
+        // the write path; the read path (rebuild_note_transcript / note_timeline
+        // both go through resolve_session_dir) must then see them, and no orphan
+        // `__legacy__` subdir may be created.
+        let tmp = TempDir::new().unwrap();
+        let rec = recordings_dir(tmp.path(), "note1");
+        touch(&rec.join("playback.wav"));
+        fs::write(rec.join("timeline.jsonl"), b"{\"label\":\"Speaker 1\",\"text\":\"stale\"}\n")
+            .unwrap();
+
+        let wdir = session_write_dir(&rec, LEGACY_SESSION_ID);
+        fs::write(wdir.join("timeline.jsonl"), b"{\"label\":\"Alice\",\"text\":\"fresh\"}\n").unwrap();
+
+        let rdir = resolve_session_dir(&rec, LEGACY_SESSION_ID).unwrap();
+        let body = fs::read_to_string(rdir.join("timeline.jsonl")).unwrap();
+        assert!(body.contains("Alice"), "read path must see the re-diarized labels");
+        assert!(!body.contains("stale"));
+        assert!(
+            !rec.join(LEGACY_SESSION_ID).exists(),
+            "no orphan __legacy__ subdir may be created"
+        );
+    }
+
+    // ---- atomic manifest write (BUG 2a) ----------------------------------
+
+    #[test]
+    fn write_manifest_is_atomic_temp_plus_rename() {
+        let tmp = TempDir::new().unwrap();
+        let rec = recordings_dir(tmp.path(), "note1");
+        let mut m = SessionsManifest::empty();
+        m.sessions.push(SessionEntry {
+            id: "uuid-a".into(),
+            index: 1,
+            started_at: String::new(),
+            duration_ms: 0,
+            streams: vec![],
+        });
+        write_manifest(&rec, &m).unwrap();
+
+        // The final file is complete + parseable.
+        let back = read_manifest(&rec).unwrap();
+        assert_eq!(back.sessions.len(), 1);
+        assert_eq!(back.sessions[0].id, "uuid-a");
+
+        // The temp file used for the rename must not survive (rename consumes
+        // it), so a reader never trips over a partial `.tmp` and the dir holds
+        // only the real manifest.
+        assert!(!rec.join(format!("{MANIFEST_FILE}.tmp")).exists());
+        let names: Vec<String> = fs::read_dir(&rec)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec![MANIFEST_FILE.to_string()]);
+    }
+
+    #[test]
+    fn write_manifest_overwrite_never_leaves_partial() {
+        // Rewriting an existing manifest replaces it atomically: a reader always
+        // parses a whole file, and no stale temp lingers.
+        let tmp = TempDir::new().unwrap();
+        let rec = recordings_dir(tmp.path(), "note1");
+        append_session(&rec, "uuid-a", "", 0, vec![]).unwrap();
+        append_session(&rec, "uuid-b", "", 0, vec![]).unwrap();
+        let back = read_manifest(&rec).unwrap();
+        assert_eq!(back.sessions.len(), 2);
+        assert!(!rec.join(format!("{MANIFEST_FILE}.tmp")).exists());
     }
 
     #[test]

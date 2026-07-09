@@ -37,6 +37,27 @@ pub struct AppState {
     /// open-source build; a commercial build installs an observer that
     /// enqueues the change for upload.
     pub sync: Arc<dyn sync::SyncObserver>,
+    /// Serializes every read-modify-write of any note's `sessions.json`.
+    /// The post-stop chain (`migrate_flat_if_needed` + `append_session`) and
+    /// the cloud pull worker (`reconcile_manifest` + `write_manifest`) both
+    /// rewrite the manifest with no other coordination; without this a
+    /// concurrent pull + finalize would lose a session (last-write-wins over a
+    /// stale in-memory copy). A `tokio::sync::Mutex` (not `parking_lot`) so the
+    /// guard is `Send` and may be held across the `spawn_blocking` / network
+    /// `.await`s inside those critical sections. One global lock (not per-note):
+    /// manifest writes are rare and sub-millisecond, so the contention cost is
+    /// nil and a single lock is impossible to mis-key.
+    pub manifest_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Per-note re-entrancy guard for cross-session speaker unification
+    /// (`unify_note_speakers`). Auto-unify in the post-stop chain can race a
+    /// user-triggered `rediarize_note` (or two rapid Re-diarize clicks) for the
+    /// *same* note; without serialization both passes clobber each other's
+    /// scratch WAVs and session timelines. Each note gets its own
+    /// `tokio::sync::Mutex` so a second unify for that note waits for the first,
+    /// while different notes stay fully concurrent. Held only inside
+    /// `unify_note_speakers` (a leaf — never across another unify), so it can't
+    /// deadlock the post-stop chain.
+    pub unify_locks: Arc<Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -135,6 +156,8 @@ where
                 transcribe_gate: Arc::new(tokio::sync::Mutex::new(())),
                 api_key_cache: stt::new_cache(),
                 sync,
+                manifest_lock: Arc::new(tokio::sync::Mutex::new(())),
+                unify_locks: Arc::new(Mutex::new(std::collections::HashMap::new())),
             });
 
             let menu = build_menu(app.handle())?;
