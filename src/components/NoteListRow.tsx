@@ -1,6 +1,6 @@
 import { type MouseEvent, type KeyboardEvent, useRef } from "react";
 import { Link } from "react-router-dom";
-import { Folder as FolderIcon } from "lucide-react";
+import { Folder as FolderIcon, Check } from "lucide-react";
 import { type Folder, type Note } from "../lib/ipc";
 import { formatMeetingTime, notePreview } from "../lib/noteList";
 import { cn } from "../lib/cn";
@@ -106,19 +106,40 @@ export function NoteListRow({
               className={cn(
                 "shrink-0 overflow-hidden transition-[width,opacity] duration-150 ease-out",
                 checkboxShown
-                  ? "w-7 opacity-100"
-                  : "w-0 opacity-0 group-hover:w-7 group-hover:opacity-100 focus-within:w-7 focus-within:opacity-100",
+                  ? "w-9 opacity-100"
+                  : "w-0 opacity-0 group-hover:w-9 group-hover:opacity-100 focus-within:w-9 focus-within:opacity-100",
               )}
             >
-              <input
-                type="checkbox"
-                checked={selected}
-                aria-label={`Select ${title}`}
-                data-shown={checkboxShown ? "true" : "false"}
-                onClick={handleCheckboxClick}
-                onChange={handleCheckboxChange}
-                className="shrink-0 mt-0.5 w-4 h-4 rounded-[5px] cursor-pointer accent-[var(--color-accent-text)]"
-              />
+              {/* Custom circular checkbox: the native input is a transparent
+                  overlay filling a ~26px hit target (bigger tap area than the
+                  18px visual); the ring + check are painted on top and are
+                  pointer-transparent so clicks reach the input. */}
+              <div className="relative flex items-center justify-center w-[26px] h-[26px] mt-px">
+                <input
+                  type="checkbox"
+                  checked={selected}
+                  aria-label={`Select ${title}`}
+                  data-shown={checkboxShown ? "true" : "false"}
+                  onClick={handleCheckboxClick}
+                  onChange={handleCheckboxChange}
+                  className="peer absolute inset-0 m-0 w-full h-full appearance-none opacity-0 cursor-pointer"
+                />
+                <span
+                  aria-hidden
+                  className={cn(
+                    "w-[18px] h-[18px] rounded-full border transition-colors pointer-events-none",
+                    "border-[var(--color-line-visible)] peer-hover:border-[var(--color-text-muted)]",
+                    "peer-checked:border-[var(--color-accent-text)] peer-checked:bg-[var(--color-accent-text)]",
+                    "peer-focus-visible:ring-2 peer-focus-visible:ring-[var(--color-accent-text)] peer-focus-visible:ring-offset-1 peer-focus-visible:ring-offset-[var(--color-canvas)]",
+                  )}
+                />
+                <Check
+                  aria-hidden
+                  size={12}
+                  strokeWidth={3}
+                  className="absolute opacity-0 peer-checked:opacity-100 text-[var(--color-canvas)] pointer-events-none"
+                />
+              </div>
             </div>
           )}
           <Link
