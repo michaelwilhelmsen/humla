@@ -3,6 +3,7 @@ import { LogOut, Trash2, UserPlus } from "lucide-react";
 import { open as openExternal } from "@tauri-apps/plugin-shell";
 import {
   cloudApi,
+  formatSeatPrice,
   roleColorVar,
   roleLabel,
   useCloudStore,
@@ -49,12 +50,28 @@ function planMeta(status: CloudWorkspace["plan_status"]): { label: string; color
 // starts a 14-day trial / manages the subscription via Stripe (opened in the
 // browser); everyone else sees the status. The server is the source of truth, so
 // this is a thin control surface — status comes from the workspace's plan_status.
-function BillingPanel({ ws, onChanged }: { ws: CloudWorkspace; onChanged: () => void }) {
+function BillingPanel({
+  ws,
+  seatPriceCents,
+  seatCurrency,
+  onChanged,
+}: {
+  ws: CloudWorkspace;
+  seatPriceCents?: number | null;
+  seatCurrency?: string | null;
+  onChanged: () => void;
+}) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const isOwner = ws.role === "owner";
   const active = ws.plan_status === "active" || ws.plan_status === "trialing";
   const meta = planMeta(ws.plan_status);
+  // Seat/price rows show only for a workspace with a real subscription (the
+  // seat count is meaningless otherwise). "past_due" is included so an owner
+  // fixing payment still sees what they're being billed for.
+  const seats = typeof ws.seats === "number" && ws.seats > 0 ? ws.seats : null;
+  const seatsBilled =
+    ws.plan_status === "active" || ws.plan_status === "trialing" || ws.plan_status === "past_due";
 
   async function go(kind: "checkout" | "portal") {
     setBusy(true);
@@ -75,6 +92,30 @@ function BillingPanel({ ws, onChanged }: { ws: CloudWorkspace; onChanged: () => 
         <div className="text-sm">Plan</div>
         <ValuePill color={meta.color}>{meta.label}</ValuePill>
       </div>
+      {seats != null && seatsBilled && (
+        <>
+          <div className="flex items-center justify-between gap-6">
+            <div className="text-sm">Seats</div>
+            <ValuePill>{seats}</ValuePill>
+          </div>
+          {typeof seatPriceCents === "number" && (
+            <>
+              <div className="flex items-center justify-between gap-6">
+                <div className="text-sm">Per seat</div>
+                <ValuePill>{`${formatSeatPrice(seatPriceCents, seatCurrency)}/mo`}</ValuePill>
+              </div>
+              <div className="flex items-center justify-between gap-6">
+                <div className="text-sm">Total</div>
+                <ValuePill>{`${formatSeatPrice(seatPriceCents * seats, seatCurrency)}/mo`}</ValuePill>
+              </div>
+            </>
+          )}
+          <p className="text-xs text-[var(--color-text-muted)] leading-relaxed">
+            Seats track workspace members — adding or removing a member updates the next
+            invoice automatically, prorated.
+          </p>
+        </>
+      )}
       {!active && (
         <p className="text-xs text-[var(--color-text-muted)] leading-relaxed">
           This workspace is read-only until it has an active subscription.{" "}
@@ -368,7 +409,12 @@ export function OrganizationTab() {
 
       {status.billing_enabled && ws && (
         <Section title="Billing">
-          <BillingPanel ws={ws} onChanged={refreshCloud} />
+          <BillingPanel
+            ws={ws}
+            seatPriceCents={status.seat_price_cents}
+            seatCurrency={status.seat_currency}
+            onChanged={refreshCloud}
+          />
         </Section>
       )}
 

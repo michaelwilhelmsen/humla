@@ -61,6 +61,10 @@ pub struct CloudWorkspace {
     /// "past_due" / "canceled" / "none". Only meaningful when billing is enabled
     /// on the server; self-host leaves it "none" and the UI ignores it.
     pub plan_status: String,
+    /// Number of billed seats (= workspace members) on the subscription. `None`
+    /// when the server predates per-seat billing or the row carries no usable
+    /// count; the UI hides the seat/price rows in that case.
+    pub seats: Option<u32>,
 }
 
 #[derive(Serialize)]
@@ -76,6 +80,13 @@ pub struct CloudStatus {
     /// True when the server enforces billing (humla-cloud). Self-host → false, and
     /// the client hides the billing UI and never treats a workspace as locked.
     pub billing_enabled: bool,
+    /// Per-seat price in the smallest currency unit (Stripe `unit_amount`, e.g.
+    /// 500 = $5.00). `None` when the server doesn't advertise it (older builds),
+    /// in which case the UI shows the seat count without pricing.
+    pub seat_price_cents: Option<u32>,
+    /// Lowercase ISO currency for `seat_price_cents` (e.g. "usd"). `None` when
+    /// unknown; the formatter falls back to USD.
+    pub seat_currency: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -331,6 +342,18 @@ fn derive_role(ws: &serde_json::Value, user_id: &str) -> String {
     "member".into()
 }
 
+/// Parse a subscription row's `seats` count. The server encodes it as a JSON
+/// number (integer or float, depending on how PocketBase/Stripe round-trips it),
+/// so accept either. Missing, zero, negative, or non-numeric all mean "no usable
+/// seat count" → `None`, which the UI treats as pre-per-seat-billing.
+fn parse_seats(sub: &serde_json::Value) -> Option<u32> {
+    let n = sub.get("seats")?.as_f64()?;
+    if !n.is_finite() || n < 1.0 {
+        return None;
+    }
+    Some(n.round() as u32)
+}
+
 async fn list_workspaces_inner(base: &str, session: &Session) -> Result<Vec<CloudWorkspace>, String> {
     // No client-side filter: the workspaces collection listRule is already
     // `members.id ?= @request.auth.id`, so the server returns exactly the
@@ -347,11 +370,12 @@ async fn list_workspaces_inner(base: &str, session: &Session) -> Result<Vec<Clou
     .await?;
     let items = val.get("items").and_then(|v| v.as_array()).cloned().unwrap_or_default();
 
-    // Per-workspace subscription status. The subscriptions listRule scopes to the
-    // user's memberships, so an unfiltered fetch returns exactly their rows.
-    // Best-effort: any error just leaves statuses "none" (billing_enabled gates
-    // the UI), and self-host servers simply have no rows.
-    let mut status_by_ws: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    // Per-workspace subscription (status + billed seat count). The subscriptions
+    // listRule scopes to the user's memberships, so an unfiltered fetch returns
+    // exactly their rows. Best-effort: any error just leaves statuses "none"
+    // (billing_enabled gates the UI), and self-host servers simply have no rows.
+    let mut sub_by_ws: std::collections::HashMap<String, (String, Option<u32>)> =
+        std::collections::HashMap::new();
     if let Ok(subs) =
         authed_get(base, &session.token, "/api/collections/subscriptions/records", &[("perPage", "200")]).await
     {
@@ -360,7 +384,7 @@ async fn list_workspaces_inner(base: &str, session: &Session) -> Result<Vec<Clou
                 let ws = it.get("workspace").and_then(|v| v.as_str()).unwrap_or_default().to_string();
                 let st = it.get("status").and_then(|v| v.as_str()).unwrap_or_default().to_string();
                 if !ws.is_empty() {
-                    status_by_ws.insert(ws, st);
+                    sub_by_ws.insert(ws, (st, parse_seats(it)));
                 }
             }
         }
@@ -370,30 +394,55 @@ async fn list_workspaces_inner(base: &str, session: &Session) -> Result<Vec<Clou
         .iter()
         .map(|it| {
             let id = it.get("id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-            let plan_status = status_by_ws.get(&id).cloned().unwrap_or_else(|| "none".to_string());
+            let (plan_status, seats) = sub_by_ws
+                .get(&id)
+                .cloned()
+                .unwrap_or_else(|| ("none".to_string(), None));
             CloudWorkspace {
                 id,
                 name: it.get("name").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
                 role: derive_role(it, &session.user_id),
                 plan_status,
+                seats,
             }
         })
         .collect())
 }
 
-/// Whether the configured server enforces billing (humla-cloud) vs runs free
-/// (self-host). Reads the public `/api/humla/billing/config` flag; any failure
-/// (older server, network) is treated as "not enabled" so the UI degrades to the
-/// free/self-host experience.
-async fn fetch_billing_enabled(base: &str) -> bool {
+/// Public billing config from `/api/humla/billing/config`. `enabled` says whether
+/// the server enforces billing (humla-cloud) vs runs free (self-host); the seat
+/// price fields are advertised only by servers that support per-seat billing.
+#[derive(Default)]
+struct BillingConfig {
+    enabled: bool,
+    seat_price_cents: Option<u32>,
+    seat_currency: Option<String>,
+}
+
+/// Read the public billing config. Any failure (older server, network) degrades
+/// to the free/self-host experience (`enabled: false`, no pricing). The seat
+/// price fields are optional — today's prod returns only `{ "enabled": true }`.
+async fn fetch_billing_config(base: &str) -> BillingConfig {
     let Ok(resp) = http().get(format!("{base}/api/humla/billing/config")).send().await else {
-        return false;
+        return BillingConfig::default();
     };
-    resp.json::<serde_json::Value>()
-        .await
-        .ok()
-        .and_then(|v| v.get("enabled").and_then(|b| b.as_bool()))
-        .unwrap_or(false)
+    let Ok(val) = resp.json::<serde_json::Value>().await else {
+        return BillingConfig::default();
+    };
+    let enabled = val.get("enabled").and_then(|b| b.as_bool()).unwrap_or(false);
+    // Stripe `unit_amount` in cents. Accept integer or float encodings; drop
+    // non-numeric / negative values so the UI falls back to "price unknown".
+    let seat_price_cents = val
+        .get("seat_price_cents")
+        .and_then(|v| v.as_f64())
+        .filter(|n| n.is_finite() && *n >= 0.0)
+        .map(|n| n.round() as u32);
+    let seat_currency = val
+        .get("seat_currency")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .filter(|s| !s.trim().is_empty());
+    BillingConfig { enabled, seat_price_cents, seat_currency }
 }
 
 // ---- commands --------------------------------------------------------------
@@ -413,6 +462,8 @@ pub async fn cloud_status(state: State<'_, AppState>) -> Result<CloudStatus, Str
             current_workspace: None,
             workspaces: vec![],
             billing_enabled: false,
+            seat_price_cents: None,
+            seat_currency: None,
         });
     };
 
@@ -442,7 +493,7 @@ pub async fn cloud_status(state: State<'_, AppState>) -> Result<CloudStatus, Str
         .as_ref()
         .and_then(|id| workspaces.iter().find(|w| &w.id == id).cloned());
 
-    let billing_enabled = fetch_billing_enabled(&base_url).await;
+    let billing = fetch_billing_config(&base_url).await;
     Ok(CloudStatus {
         configured: true,
         logged_in: true,
@@ -455,7 +506,9 @@ pub async fn cloud_status(state: State<'_, AppState>) -> Result<CloudStatus, Str
         }),
         current_workspace,
         workspaces,
-        billing_enabled,
+        billing_enabled: billing.enabled,
+        seat_price_cents: billing.seat_price_cents,
+        seat_currency: billing.seat_currency,
     })
 }
 
@@ -659,7 +712,8 @@ pub async fn cloud_create_workspace(
         db::set_setting(&conn, SETTING_WORKSPACE, &id).map_err(err)?;
     }
     state.sync.config_changed(); // new workspace selected → (re)start the worker
-    Ok(CloudWorkspace { id, name, role: "owner".into(), plan_status: "none".into() })
+    // A freshly created workspace has no subscription yet → no seat count.
+    Ok(CloudWorkspace { id, name, role: "owner".into(), plan_status: "none".into(), seats: None })
 }
 
 #[tauri::command]

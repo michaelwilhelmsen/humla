@@ -20,7 +20,14 @@ export type CloudRole = "owner" | "admin" | "member" | "viewer";
 export type PlanStatus = "active" | "trialing" | "past_due" | "canceled" | "none";
 
 export type CloudUser = { id: string; email: string; name: string; verified: boolean };
-export type CloudWorkspace = { id: string; name: string; role: CloudRole; plan_status: PlanStatus };
+export type CloudWorkspace = {
+  id: string;
+  name: string;
+  role: CloudRole;
+  plan_status: PlanStatus;
+  /** Billed seats (= workspace members). Absent on servers predating per-seat billing. */
+  seats?: number | null;
+};
 export type CloudMember = { id: string; email: string; name: string; role: CloudRole };
 
 export type CloudStatus = {
@@ -34,6 +41,10 @@ export type CloudStatus = {
   workspaces: CloudWorkspace[];
   /** True when the server enforces billing (humla-cloud); false on self-host. */
   billing_enabled: boolean;
+  /** Per-seat price in cents (Stripe unit_amount, e.g. 500 = $5.00). Absent on older servers. */
+  seat_price_cents?: number | null;
+  /** Lowercase ISO currency for seat_price_cents (e.g. "usd"). Absent when unknown. */
+  seat_currency?: string | null;
 };
 
 export const cloudApi = {
@@ -87,6 +98,8 @@ export const DISCONNECTED: CloudStatus = {
   current_workspace: null,
   workspaces: [],
   billing_enabled: false,
+  seat_price_cents: null,
+  seat_currency: null,
 };
 
 type CloudState = {
@@ -165,6 +178,21 @@ export function useOwnerName(ownerId: string | undefined | null): string | null 
 
 export function roleLabel(role: CloudRole): string {
   return role.charAt(0).toUpperCase() + role.slice(1);
+}
+
+/**
+ * Format a per-seat price (in cents, Stripe `unit_amount`) as a currency string.
+ * Drops the fraction when the amount is a whole unit: 500 → "$5", 550 → "$5.50".
+ * Falls back to USD when the currency is unknown.
+ */
+export function formatSeatPrice(cents: number, currency?: string | null): string {
+  const whole = cents % 100 === 0;
+  return new Intl.NumberFormat("en-US", {
+    style: "currency",
+    currency: (currency || "usd").toUpperCase(),
+    minimumFractionDigits: whole ? 0 : 2,
+    maximumFractionDigits: whole ? 0 : 2,
+  }).format(cents / 100);
 }
 
 /** Token-driven colour for a role pill, reusing the speaker-pill palette. */
