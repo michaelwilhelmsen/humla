@@ -1,12 +1,12 @@
-import { type MouseEvent, type KeyboardEvent } from "react";
+import { type MouseEvent, type KeyboardEvent, useRef } from "react";
 import { Link } from "react-router-dom";
-import { Check, Folder as FolderIcon } from "lucide-react";
+import { Folder as FolderIcon } from "lucide-react";
 import { type Folder, type Note } from "../lib/ipc";
 import { formatMeetingTime, notePreview } from "../lib/noteList";
 import { cn } from "../lib/cn";
 
 // Selection intent reported to the parent. Only the shift flag matters (range
-// vs toggle); works for both a modifier-click and the keyboard toggle.
+// vs toggle); works for a modifier-click, the checkbox, and the keyboard toggle.
 export type SelectIntent = { shiftKey: boolean };
 
 // One row in a note-list view (All notes, Folder). Title + one-line snippet on
@@ -19,22 +19,42 @@ export type SelectIntent = { shiftKey: boolean };
 // OS secondary/context-menu click, so treating it as a selection modifier
 // triple-fired (nav suppression + toggle + native context menu).
 //
-// A11y: selection is exposed via `aria-selected` (not colour alone) and is
-// reachable from the keyboard — Space on a focused row toggles it (Shift+Space
-// extends a range), while Enter stays as the link's native navigate. A check
-// mark gives a non-colour visual cue for WCAG 1.4.1.
+// Discoverability: a checkbox on the left is the visible affordance. It's
+// hidden at rest and fades in on row hover (Tailwind group-hover); it stays
+// shown for a selected row and, once ANY row is selected (`selectionActive`),
+// for every row — so continuing to pick is obvious. The checkbox is a sibling
+// of the <Link> (not nested inside the anchor) so toggling it never navigates.
+// Shift+checkbox extends a range, exactly like shift-click. The Cmd/Shift-click
+// and Space shortcuts stay as the power-user paths.
+//
+// A11y: the checkbox is a real focusable control with an accessible name
+// (`Select <title>`) and reflects checked state. Selection is also exposed via
+// `aria-selected` on the row (not colour alone), and is reachable from the
+// keyboard — Space on a focused row toggles it (Shift+Space extends a range),
+// while Enter stays as the link's native navigate.
 export function NoteListRow({
   note,
   folder,
   selected = false,
+  selectionActive = false,
   onSelect,
 }: {
   note: Note;
   folder?: Folder;
   selected?: boolean;
+  // True when any note in the list is selected. Forces every row's checkbox
+  // visible (not just on hover) so continuing to pick is obvious.
+  selectionActive?: boolean;
   onSelect?: (e: SelectIntent) => void;
 }) {
   const preview = notePreview(note);
+  const title = note.title.trim() || "Untitled";
+  // Force the checkbox visible when the row is selected or selection mode is on;
+  // otherwise it's hover-only (fades in via group-hover / on focus).
+  const checkboxShown = selected || selectionActive;
+  // The checkbox's toggle fires via onChange (which carries no modifier flags),
+  // so we stash the click's shift state here for the onChange to read.
+  const shiftRef = useRef(false);
 
   function handleClick(e: MouseEvent) {
     if (onSelect && (e.metaKey || e.shiftKey)) {
@@ -53,36 +73,57 @@ export function NoteListRow({
     }
   }
 
+  function handleCheckboxClick(e: MouseEvent) {
+    // Capture the modifier for the onChange that follows; a shift-click on the
+    // checkbox should extend the range just like a shift-click on the row.
+    shiftRef.current = e.shiftKey;
+  }
+
+  function handleCheckboxChange() {
+    onSelect?.({ shiftKey: shiftRef.current });
+    shiftRef.current = false;
+  }
+
   return (
     <li>
-      <Link
-        to={`/note/${note.id}`}
-        onClick={handleClick}
-        onKeyDown={handleKeyDown}
-        aria-selected={selected}
-        data-selected={selected ? "true" : undefined}
-        className="group block"
-      >
-        <div className="max-w-[880px] mx-auto w-full px-8">
-          <div
-            className={cn(
-              "flex items-start gap-3 p-3 rounded-[11px] transition-colors",
-              selected
-                ? "bg-[var(--color-accent-soft)]"
-                : "hover:bg-[var(--color-pill-hover)]",
-            )}
+      {/* `group` here (not on the Link) so hovering anywhere in the row — the
+          checkbox included — fades the checkbox in. */}
+      <div className="group max-w-[880px] mx-auto w-full px-8">
+        <div
+          className={cn(
+            "flex items-start gap-3 p-3 rounded-[11px] transition-colors",
+            selected
+              ? "bg-[var(--color-accent-soft)]"
+              : "hover:bg-[var(--color-pill-hover)]",
+          )}
+        >
+          {onSelect && (
+            <input
+              type="checkbox"
+              checked={selected}
+              aria-label={`Select ${title}`}
+              data-shown={checkboxShown ? "true" : "false"}
+              onClick={handleCheckboxClick}
+              onChange={handleCheckboxChange}
+              className={cn(
+                "shrink-0 mt-0.5 w-4 h-4 rounded-[5px] cursor-pointer",
+                "accent-[var(--color-accent-text)] transition-opacity",
+                "focus-visible:opacity-100",
+                checkboxShown ? "opacity-100" : "opacity-0 group-hover:opacity-100",
+              )}
+            />
+          )}
+          <Link
+            to={`/note/${note.id}`}
+            onClick={handleClick}
+            onKeyDown={handleKeyDown}
+            aria-selected={selected}
+            data-selected={selected ? "true" : undefined}
+            className="flex-1 min-w-0 flex items-start gap-3"
           >
-            {selected && (
-              <span
-                aria-hidden
-                className="shrink-0 mt-0.5 grid place-items-center w-4 h-4 rounded-full bg-[var(--color-accent-text)] text-[var(--color-canvas)]"
-              >
-                <Check size={11} strokeWidth={2.5} />
-              </span>
-            )}
             <div className="flex-1 min-w-0">
               <div className="text-[14.5px] font-medium text-[var(--color-text)] truncate">
-                {note.title.trim() || "Untitled"}
+                {title}
               </div>
               {preview && (
                 <div className="mt-0.5 text-[13px] text-[var(--color-text-muted)] truncate">
@@ -101,9 +142,9 @@ export function NoteListRow({
                 </span>
               )}
             </div>
-          </div>
+          </Link>
         </div>
-      </Link>
+      </div>
     </li>
   );
 }

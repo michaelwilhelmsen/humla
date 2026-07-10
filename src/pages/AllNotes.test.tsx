@@ -173,6 +173,89 @@ describe("AllNotes selection", () => {
   });
 });
 
+describe("AllNotes hover checkbox (discoverability)", () => {
+  it("renders a per-row checkbox that toggles selection without navigating", async () => {
+    mockTauri();
+    seed([makeNote("n1", "Alpha"), makeNote("n2", "Beta")]);
+    renderAll();
+
+    const cb = screen.getByRole("checkbox", { name: /Select Alpha/ });
+    expect(cb).toBeInTheDocument();
+    expect(cb).not.toBeChecked();
+
+    fireEvent.click(cb);
+    expect(loc()).toBe("/"); // checkbox never navigates
+    expect(cb).toBeChecked();
+    expect(screen.getByRole("link", { name: /Alpha/ })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+
+    fireEvent.click(cb); // toggle back off
+    expect(cb).not.toBeChecked();
+    expect(loc()).toBe("/");
+  });
+
+  it("clicking a second row's checkbox adds it — selection mode persists", async () => {
+    mockTauri();
+    seed([makeNote("n1", "Alpha"), makeNote("n2", "Beta")]);
+    renderAll();
+
+    fireEvent.click(screen.getByRole("checkbox", { name: /Select Alpha/ }));
+    fireEvent.click(screen.getByRole("checkbox", { name: /Select Beta/ }));
+
+    expect(screen.getByRole("checkbox", { name: /Select Alpha/ })).toBeChecked();
+    expect(screen.getByRole("checkbox", { name: /Select Beta/ })).toBeChecked();
+    expect(screen.getByText("2 selected")).toBeInTheDocument();
+  });
+
+  it("shift+checkbox extends selection into a contiguous range", async () => {
+    mockTauri();
+    seed([makeNote("n1", "Alpha"), makeNote("n2", "Beta"), makeNote("n3", "Gamma")]);
+    renderAll();
+
+    fireEvent.click(screen.getByRole("checkbox", { name: /Select Alpha/ }));
+    fireEvent.click(screen.getByRole("checkbox", { name: /Select Gamma/ }), {
+      shiftKey: true,
+    });
+
+    expect(screen.getByRole("checkbox", { name: /Select Alpha/ })).toBeChecked();
+    expect(screen.getByRole("checkbox", { name: /Select Beta/ })).toBeChecked();
+    expect(screen.getByRole("checkbox", { name: /Select Gamma/ })).toBeChecked();
+    expect(screen.getByText("3 selected")).toBeInTheDocument();
+  });
+
+  it("shows every row's checkbox while a selection is active, hides them once cleared", async () => {
+    mockTauri();
+    seed([makeNote("n1", "Alpha"), makeNote("n2", "Beta")]);
+    renderAll();
+
+    const beta = screen.getByRole("checkbox", { name: /Select Beta/ });
+    // At rest, an unselected row's checkbox is hover-only (not force-shown).
+    expect(beta).toHaveAttribute("data-shown", "false");
+
+    // Selecting Alpha enters selection mode → all rows force their checkbox.
+    fireEvent.click(screen.getByRole("checkbox", { name: /Select Alpha/ }));
+    expect(beta).toHaveAttribute("data-shown", "true");
+
+    // Clearing selection returns unselected rows to hover-only.
+    fireEvent.keyDown(document.body, { key: "Escape" });
+    expect(screen.getByRole("checkbox", { name: /Select Beta/ })).toHaveAttribute(
+      "data-shown",
+      "false",
+    );
+  });
+
+  it("shows the action bar at a single checkbox selection", async () => {
+    mockTauri();
+    seed([makeNote("n1", "Alpha"), makeNote("n2", "Beta")]);
+    renderAll();
+
+    fireEvent.click(screen.getByRole("checkbox", { name: /Select Alpha/ }));
+    expect(screen.getByText("1 selected")).toBeInTheDocument();
+  });
+});
+
 describe("AllNotes bulk delete", () => {
   it("deletes every selected note behind one confirm, one invoke per id", async () => {
     const deleteSpy = vi.fn();

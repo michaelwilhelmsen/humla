@@ -239,6 +239,7 @@ export function AllNotes() {
                       note={n}
                       folder={n.folder_id ? folderById.get(n.folder_id) : undefined}
                       selected={selected.has(n.id)}
+                      selectionActive={selected.size > 0}
                       onSelect={(e) => onSelectRow(n.id, e)}
                     />
                   ))}
@@ -249,7 +250,9 @@ export function AllNotes() {
         )}
       </div>
 
-      {selected.size >= 2 && (
+      {/* Bar appears at the first selection: with an explicit checkbox affordance,
+          a single pick with no visible action would read as a dead end. */}
+      {selected.size >= 1 && (
         <BulkActionBar
           count={selected.size}
           folders={folders}
