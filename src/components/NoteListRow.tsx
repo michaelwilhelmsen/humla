@@ -91,27 +91,35 @@ export function NoteListRow({
       <div className="group max-w-[880px] mx-auto w-full px-8">
         <div
           className={cn(
-            "flex items-start gap-3 p-3 rounded-[11px] transition-colors",
+            "flex items-start p-3 rounded-[11px] transition-colors",
             selected
               ? "bg-[var(--color-accent-soft)]"
               : "hover:bg-[var(--color-pill-hover)]",
           )}
         >
           {onSelect && (
-            <input
-              type="checkbox"
-              checked={selected}
-              aria-label={`Select ${title}`}
-              data-shown={checkboxShown ? "true" : "false"}
-              onClick={handleCheckboxClick}
-              onChange={handleCheckboxChange}
+            // Zero-width slot at rest so the title sits flush-left; it grows
+            // (and the checkbox fades in) on row hover / focus, and stays open
+            // once the row is selected or selection mode is on. `w-7` matches
+            // the checkbox (w-4) plus the trailing gap the row used to reserve.
+            <div
               className={cn(
-                "shrink-0 mt-0.5 w-4 h-4 rounded-[5px] cursor-pointer",
-                "accent-[var(--color-accent-text)] transition-opacity",
-                "focus-visible:opacity-100",
-                checkboxShown ? "opacity-100" : "opacity-0 group-hover:opacity-100",
+                "shrink-0 overflow-hidden transition-[width,opacity] duration-150 ease-out",
+                checkboxShown
+                  ? "w-7 opacity-100"
+                  : "w-0 opacity-0 group-hover:w-7 group-hover:opacity-100 focus-within:w-7 focus-within:opacity-100",
               )}
-            />
+            >
+              <input
+                type="checkbox"
+                checked={selected}
+                aria-label={`Select ${title}`}
+                data-shown={checkboxShown ? "true" : "false"}
+                onClick={handleCheckboxClick}
+                onChange={handleCheckboxChange}
+                className="shrink-0 mt-0.5 w-4 h-4 rounded-[5px] cursor-pointer accent-[var(--color-accent-text)]"
+              />
+            </div>
           )}
           <Link
             to={`/note/${note.id}`}
