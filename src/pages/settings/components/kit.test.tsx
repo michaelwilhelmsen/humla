@@ -137,4 +137,24 @@ describe("Select", () => {
       screen.getByRole("button", { name: /norwegian/i }),
     ).toBeInTheDocument();
   });
+
+  it("portals the listbox to <body>, escaping an overflow-clipping ancestor", async () => {
+    // Mirrors ImportDialog's placement: the shared Modal's panel is
+    // `overflow-y-auto`, which clips absolutely-positioned in-flow children.
+    // The listbox must render outside that subtree (a body-level portal),
+    // not as a descendant of the clipping container.
+    const { container } = render(
+      <div data-testid="clipper" style={{ overflow: "hidden" }}>
+        <Harness />
+      </div>,
+    );
+    const clipper = container.querySelector('[data-testid="clipper"]')!;
+    const trigger = screen.getByRole("button", { name: /norwegian/i });
+
+    await userEvent.click(trigger);
+    const listbox = screen.getByRole("listbox");
+
+    expect(clipper.contains(listbox)).toBe(false);
+    expect(document.body.contains(listbox)).toBe(true);
+  });
 });

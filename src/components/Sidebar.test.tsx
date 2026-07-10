@@ -44,6 +44,15 @@ beforeEach(() => {
 });
 
 describe("Sidebar import audio", () => {
+  it("labels the nav entry 'Import audio' with no trailing ellipsis", () => {
+    mockTauri();
+    renderSidebar();
+    expect(
+      screen.getByRole("button", { name: "Import audio" }),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("Import audio…")).not.toBeInTheDocument();
+  });
+
   it("picks a file, opens the config dialog, then imports and navigates", async () => {
     const importSpy = vi.fn();
     mockTauri({
