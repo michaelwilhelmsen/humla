@@ -200,7 +200,7 @@ export function Sidebar({ onCollapse }: { onCollapse: () => void }) {
       {/* Scrollable nav body: primary links → Folders section (or search
           results when searching). */}
       <div className="flex-1 overflow-y-auto -mx-1 px-1 mt-3.5">
-        <div className="flex flex-col gap-px">
+        <div className="flex flex-col gap-1">
           <NavItem to="/" icon={HomeIcon} label="Home" active={location.pathname === "/"} />
           <NavItem
             to="/all-notes"
