@@ -216,7 +216,7 @@ export function Sidebar({ onCollapse }: { onCollapse: () => void }) {
             className="no-drag flex items-center gap-2.5 px-2.5 py-2 rounded-[var(--radius)] text-[13.5px] transition-colors text-[var(--color-text-muted)] hover:bg-[var(--color-pill-hover)] hover:text-[var(--color-text)]"
           >
             <FileAudio size={16} strokeWidth={1.6} className="shrink-0 opacity-85" />
-            <span className="flex-1 truncate text-left">Import audio…</span>
+            <span className="flex-1 truncate text-left">Import audio</span>
           </button>
         </div>
 
