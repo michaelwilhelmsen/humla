@@ -128,7 +128,7 @@ export function NoteListRow({
                   aria-hidden
                   className={cn(
                     "w-[18px] h-[18px] rounded-full border transition-colors pointer-events-none",
-                    "border-[var(--color-line-visible)] peer-hover:border-[var(--color-text-muted)]",
+                    "border-[var(--color-line-visible)] bg-[var(--color-surface)] peer-hover:border-[var(--color-text-muted)]",
                     "peer-checked:border-[var(--color-accent-text)] peer-checked:bg-[var(--color-accent-text)]",
                     "peer-focus-visible:ring-2 peer-focus-visible:ring-[var(--color-accent-text)] peer-focus-visible:ring-offset-1 peer-focus-visible:ring-offset-[var(--color-canvas)]",
                   )}
