@@ -284,9 +284,9 @@ export function AccountTab({ s, update }: Pick<SettingsHook, "s" | "update">) {
             and ready for teammates.
           </p>
           <div className="flex items-baseline gap-1.5 pt-1">
-            <span className="text-2xl font-semibold tracking-tight">$7</span>
+            <span className="text-2xl font-semibold tracking-tight">$5</span>
             <span className="text-xs text-[var(--color-text-muted)]">
-              /month for the entire team
+              per seat, per month
             </span>
           </div>
           <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 pt-1.5">

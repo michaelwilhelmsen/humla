@@ -72,9 +72,9 @@ describe("Account section", () => {
     expect(
       await within(dialog).findByText(/share notes across your team/i),
     ).toBeInTheDocument();
-    expect(within(dialog).getByText("$7")).toBeInTheDocument();
+    expect(within(dialog).getByText("$5")).toBeInTheDocument();
     expect(
-      within(dialog).getByText(/month for the entire team/i),
+      within(dialog).getByText(/per seat, per month/i),
     ).toBeInTheDocument();
     expect(
       within(dialog).getByText(/14-day free trial/i),

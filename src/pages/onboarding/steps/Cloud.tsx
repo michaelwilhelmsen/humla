@@ -125,7 +125,7 @@ export function CloudStep({ ctx }: { ctx: StepContext }) {
       <StepShell
         icon={<Cloud size={26} strokeWidth={1.6} />}
         title="Humla Cloud"
-        subtitle="Humla is free on your Mac — Cloud is for teams: $7/mo after a 14-day trial."
+        subtitle="Humla is free on your Mac — Cloud is for teams: $5 per seat/mo after a 14-day trial."
       />
     );
   }
@@ -134,7 +134,7 @@ export function CloudStep({ ctx }: { ctx: StepContext }) {
     <StepShell
       icon={<Cloud size={26} strokeWidth={1.6} />}
       title="Humla Cloud"
-      subtitle="Humla is free on your Mac — Cloud is for teams: $7/mo after a 14-day trial."
+      subtitle="Humla is free on your Mac — Cloud is for teams: $5 per seat/mo after a 14-day trial."
     >
       <div className="w-full max-w-md flex flex-col gap-3 text-left">
         {/* Option 1 — Just me (free, preselected). */}
@@ -150,7 +150,7 @@ export function CloudStep({ ctx }: { ctx: StepContext }) {
         <OptionCard
           icon={<Users size={18} strokeWidth={1.8} />}
           title="Set up a team workspace"
-          blurb="Sync and collaborate with your team. 14-day trial · $7/mo · cancel anytime."
+          blurb="Sync and collaborate with your team. 14-day trial · $5 per seat/mo · cancel anytime."
           selected={option === "team"}
           onSelect={() => setOption("team")}
         >
@@ -665,7 +665,7 @@ function TrialStage({ ws, ctx }: { ws: CloudWorkspace; ctx: StepContext }) {
 
       <p className="text-xs leading-relaxed text-[var(--color-text-muted)]">
         Start a 14-day free trial to unlock syncing and editing for everyone in
-        it. $7/mo · cancel anytime.
+        it. $5 per seat/mo · cancel anytime.
       </p>
 
       {checkout === "idle" && (
