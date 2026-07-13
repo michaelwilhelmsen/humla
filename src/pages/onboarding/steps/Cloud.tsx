@@ -602,6 +602,11 @@ function TrialStage({ ws, ctx }: { ws: CloudWorkspace; ctx: StepContext }) {
   // subscription (humla-cloud billing.pb.js) — a canceled/past_due workspace
   // re-subscribes without a new trial, so don't promise one.
   const firstSub = ws.plan_status === "none";
+  // A past-due subscription still exists on Stripe — opening a fresh Checkout
+  // would create a SECOND subscription (double billing). Send the owner to the
+  // Customer Portal to fix the failed payment instead; once it settles the plan
+  // flips to active and the poll below lands on SuccessStage.
+  const pastDue = ws.plan_status === "past_due";
   const refresh = useCloudStore((s) => s.refresh);
   const [checkout, setCheckout] = useState<CheckoutState>("idle");
   const [busy, setBusy] = useState(false);
@@ -648,7 +653,11 @@ function TrialStage({ ws, ctx }: { ws: CloudWorkspace; ctx: StepContext }) {
     setBusy(true);
     setError(null);
     try {
-      const url = await cloudApi.billingCheckout(ws.id);
+      // past_due → fix the existing subscription in the Customer Portal;
+      // otherwise start a new Checkout (trial or fresh subscription).
+      const url = pastDue
+        ? await cloudApi.billingPortal(ws.id)
+        : await cloudApi.billingCheckout(ws.id);
       await openExternal(url);
       setCheckout("waiting");
     } catch (e) {
@@ -668,10 +677,16 @@ function TrialStage({ ws, ctx }: { ws: CloudWorkspace; ctx: StepContext }) {
       </div>
 
       <p className="text-xs leading-relaxed text-[var(--color-text-muted)]">
-        {firstSub
-          ? "Start a 14-day free trial to unlock syncing and editing for everyone in it."
-          : "Subscribe to unlock syncing and editing for everyone in it."}{" "}
-        $5 per seat/mo · cancel anytime.
+        {pastDue ? (
+          "A payment for this workspace didn't go through. Update your payment method to keep syncing and editing active for everyone in it."
+        ) : (
+          <>
+            {firstSub
+              ? "Start a 14-day free trial to unlock syncing and editing for everyone in it."
+              : "Subscribe to unlock syncing and editing for everyone in it."}{" "}
+            $5 per seat/mo · cancel anytime.
+          </>
+        )}
       </p>
 
       {checkout === "idle" && (
@@ -682,7 +697,7 @@ function TrialStage({ ws, ctx }: { ws: CloudWorkspace; ctx: StepContext }) {
           className="nd-btn nd-btn-primary self-start"
         >
           <ExternalLink size={14} strokeWidth={2} />
-          {busy ? "Opening…" : firstSub ? "Start free trial" : "Subscribe"}
+          {busy ? "Opening…" : pastDue ? "Fix payment" : firstSub ? "Start free trial" : "Subscribe"}
         </button>
       )}
 
@@ -690,7 +705,9 @@ function TrialStage({ ws, ctx }: { ws: CloudWorkspace; ctx: StepContext }) {
         <div className="flex flex-col gap-2">
           <p className="text-xs text-[var(--color-text-muted)] flex items-center gap-2">
             <span className="inline-block w-2 h-2 rounded-full bg-[var(--color-warning)] animate-pulse" />
-            Waiting for checkout… complete it in your browser.
+            {pastDue
+              ? "Waiting for payment… complete it in your browser."
+              : "Waiting for checkout… complete it in your browser."}
           </p>
           <button
             type="button"
@@ -698,7 +715,7 @@ function TrialStage({ ws, ctx }: { ws: CloudWorkspace; ctx: StepContext }) {
             disabled={busy}
             className="self-start text-xs text-[var(--color-text-muted)] hover:text-[var(--color-text)] underline transition-colors"
           >
-            Reopen checkout
+            {pastDue ? "Reopen billing" : "Reopen checkout"}
           </button>
         </div>
       )}

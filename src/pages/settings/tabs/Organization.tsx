@@ -38,7 +38,7 @@ function planMeta(status: CloudWorkspace["plan_status"]): { label: string; color
     case "active":
       return { label: "Active", color: "var(--color-success)" };
     case "past_due":
-      return { label: "Past due", color: "var(--color-warning)" };
+      return { label: "Payment past due", color: "var(--color-warning)" };
     case "canceled":
       return { label: "Canceled", color: "var(--color-danger)" };
     default:
@@ -65,6 +65,10 @@ function BillingPanel({
   const [err, setErr] = useState<string | null>(null);
   const isOwner = ws.role === "owner";
   const active = ws.plan_status === "active" || ws.plan_status === "trialing";
+  // A past-due subscription still exists on Stripe — we must NOT offer checkout
+  // (that creates a second subscription → double billing). The owner fixes the
+  // failed payment through the same Customer Portal as "Manage billing".
+  const pastDue = ws.plan_status === "past_due";
   // The server grants the 14-day trial only to workspaces that never had a
   // subscription (humla-cloud billing.pb.js) — mirror that so the CTA never
   // promises a trial that checkout won't include.
@@ -120,21 +124,34 @@ function BillingPanel({
           </p>
         </>
       )}
-      {!active && (
+      {pastDue ? (
         <p className="text-xs text-[var(--color-text-muted)] leading-relaxed">
-          This workspace is read-only until it has an active subscription.{" "}
+          A payment for this workspace didn't go through.{" "}
           {isOwner
-            ? firstSub
-              ? "Start a 14-day free trial to unlock syncing and editing for everyone in it."
-              : "Subscribe to unlock syncing and editing for everyone in it."
-            : "Ask the workspace owner to subscribe."}
+            ? "Update your payment method to keep syncing and editing active for everyone in it."
+            : "Ask the workspace owner to update the payment method."}
         </p>
+      ) : (
+        !active && (
+          <p className="text-xs text-[var(--color-text-muted)] leading-relaxed">
+            This workspace is read-only until it has an active subscription.{" "}
+            {isOwner
+              ? firstSub
+                ? "Start a 14-day free trial to unlock syncing and editing for everyone in it."
+                : "Subscribe to unlock syncing and editing for everyone in it."
+              : "Ask the workspace owner to subscribe."}
+          </p>
+        )
       )}
       {isOwner && (
         <div className="flex items-center gap-2">
           {active ? (
             <Btn onClick={() => go("portal")} disabled={busy}>
               {busy ? "Opening…" : "Manage billing"}
+            </Btn>
+          ) : pastDue ? (
+            <Btn onClick={() => go("portal")} disabled={busy}>
+              {busy ? "Opening…" : "Fix payment"}
             </Btn>
           ) : (
             <Btn onClick={() => go("checkout")} disabled={busy}>

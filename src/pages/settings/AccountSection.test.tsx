@@ -247,6 +247,50 @@ describe("Account section", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("owner on a past_due plan is offered Fix payment (portal), never checkout", async () => {
+    const portals: unknown[] = [];
+    const checkouts: unknown[] = [];
+    const status = signedIn("owner");
+    // Same ws object backs current_workspace and workspaces[0].
+    status.current_workspace.plan_status = "past_due";
+    renderApp("/settings?tab=account", {
+      cloud_status: () => status,
+      cloud_workspace_members: () => MEMBERS,
+      cloud_billing_portal: (args) => {
+        portals.push(args);
+        return "https://billing.stripe.test/portal";
+      },
+      cloud_billing_checkout: (args) => {
+        checkouts.push(args);
+        return "https://checkout.stripe.test/session";
+      },
+    });
+    const dialog = await screen.findByRole("dialog", { name: /settings/i });
+
+    // The badge reads as a payment problem, not as "not subscribed".
+    expect(
+      await within(dialog).findByText(/payment past due/i),
+    ).toBeInTheDocument();
+
+    // The double-billing trap: a past_due workspace must NOT be offered a
+    // fresh checkout (that would create a second subscription).
+    expect(
+      within(dialog).queryByRole("button", { name: /subscribe/i }),
+    ).not.toBeInTheDocument();
+    expect(
+      within(dialog).queryByRole("button", { name: /free trial/i }),
+    ).not.toBeInTheDocument();
+
+    // Fix payment goes to the Customer Portal — the same call the "Manage
+    // billing" button uses — and never touches checkout.
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: /fix payment/i }),
+    );
+    expect(checkouts).toHaveLength(0);
+    expect(portals).toHaveLength(1);
+    expect(portals[0]).toMatchObject({ workspaceId: "w1" });
+  });
+
   it("signed-in user can toggle workspace audio upload (default on)", async () => {
     const sets: unknown[] = [];
     renderApp("/settings?tab=account", {
