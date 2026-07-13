@@ -598,6 +598,10 @@ function WorkspaceStage({ mode }: { mode: "signup" | "signin" }) {
 // throughout.
 
 function TrialStage({ ws, ctx }: { ws: CloudWorkspace; ctx: StepContext }) {
+  // The server grants the 14-day trial only to workspaces that never had a
+  // subscription (humla-cloud billing.pb.js) — a canceled/past_due workspace
+  // re-subscribes without a new trial, so don't promise one.
+  const firstSub = ws.plan_status === "none";
   const refresh = useCloudStore((s) => s.refresh);
   const [checkout, setCheckout] = useState<CheckoutState>("idle");
   const [busy, setBusy] = useState(false);
@@ -664,8 +668,10 @@ function TrialStage({ ws, ctx }: { ws: CloudWorkspace; ctx: StepContext }) {
       </div>
 
       <p className="text-xs leading-relaxed text-[var(--color-text-muted)]">
-        Start a 14-day free trial to unlock syncing and editing for everyone in
-        it. $5 per seat/mo · cancel anytime.
+        {firstSub
+          ? "Start a 14-day free trial to unlock syncing and editing for everyone in it."
+          : "Subscribe to unlock syncing and editing for everyone in it."}{" "}
+        $5 per seat/mo · cancel anytime.
       </p>
 
       {checkout === "idle" && (
@@ -676,7 +682,7 @@ function TrialStage({ ws, ctx }: { ws: CloudWorkspace; ctx: StepContext }) {
           className="nd-btn nd-btn-primary self-start"
         >
           <ExternalLink size={14} strokeWidth={2} />
-          {busy ? "Opening…" : "Start free trial"}
+          {busy ? "Opening…" : firstSub ? "Start free trial" : "Subscribe"}
         </button>
       )}
 

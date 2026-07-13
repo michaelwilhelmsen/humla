@@ -65,6 +65,10 @@ function BillingPanel({
   const [err, setErr] = useState<string | null>(null);
   const isOwner = ws.role === "owner";
   const active = ws.plan_status === "active" || ws.plan_status === "trialing";
+  // The server grants the 14-day trial only to workspaces that never had a
+  // subscription (humla-cloud billing.pb.js) — mirror that so the CTA never
+  // promises a trial that checkout won't include.
+  const firstSub = ws.plan_status === "none";
   const meta = planMeta(ws.plan_status);
   // Seat/price rows show only for a workspace with a real subscription (the
   // seat count is meaningless otherwise). "past_due" is included so an owner
@@ -120,7 +124,9 @@ function BillingPanel({
         <p className="text-xs text-[var(--color-text-muted)] leading-relaxed">
           This workspace is read-only until it has an active subscription.{" "}
           {isOwner
-            ? "Start a 14-day free trial to unlock syncing and editing for everyone in it."
+            ? firstSub
+              ? "Start a 14-day free trial to unlock syncing and editing for everyone in it."
+              : "Subscribe to unlock syncing and editing for everyone in it."
             : "Ask the workspace owner to subscribe."}
         </p>
       )}
@@ -132,7 +138,7 @@ function BillingPanel({
             </Btn>
           ) : (
             <Btn onClick={() => go("checkout")} disabled={busy}>
-              {busy ? "Opening…" : "Start 14-day free trial"}
+              {busy ? "Opening…" : firstSub ? "Start 14-day free trial" : "Subscribe"}
             </Btn>
           )}
           <Btn onClick={onChanged} disabled={busy}>
