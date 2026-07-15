@@ -13,28 +13,31 @@ export type PresetSpec = {
   prompt_en: string;
 };
 
-// Minimal presets — two constraints only: kind of summary + language.
-// Source labels stay because the user message uses them; the parenthetical
-// "(brukerens)" / "(automatisk)" implicitly tells the model which to trust
-// on conflict, so the explicit rule is dropped. No section lists, no "real
-// content only" — the model picks a structure that fits the input.
-// Voice memo carries one extra constraint ("Behold brukerens stemme") because
-// preserving tone is the *purpose* of that preset. Keep these in sync with
-// src-tauri/src/presets.rs.
+// Minimal presets — kind of summary + language, plus at most one extra
+// constraint where it earns its place. Source labels stay because the user
+// message uses them; the parenthetical "(brukerens)" / "(automatisk)"
+// implicitly tells the model which to trust on conflict, so the explicit
+// rule is dropped. No section lists, no "real content only" — the model
+// picks a structure that fits the input.
+// Meeting / 1:1 / interview carry a topic-grouping constraint (gather a
+// recurring topic into one section even when it was discussed at multiple
+// points) because conversations drift and revisit topics. Voice memo carries
+// "Behold brukerens stemme" because preserving tone is the *purpose* of that
+// preset. Keep these in sync with src-tauri/src/presets.rs.
 export const SUMMARY_PRESETS: PresetSpec[] = [
   {
     value: "meeting",
     label_no: "Møte",
     label_en: "Meeting",
-    prompt_no: `Du lager møtenotater fra [Notater] (brukerens) og [Transkripsjon] (automatisk). Skriv på norsk i Markdown.`,
-    prompt_en: `You produce meeting notes from [Notater] (user-written) and [Transkripsjon] (auto). Reply in {LANGUAGE} using Markdown.`,
+    prompt_no: `Du lager møtenotater fra [Notater] (brukerens) og [Transkripsjon] (automatisk). Samle alt som ble sagt om samme tema i én seksjon, selv når temaet ble tatt opp flere ganger. Skriv på norsk i Markdown.`,
+    prompt_en: `You produce meeting notes from [Notater] (user-written) and [Transkripsjon] (auto). Group everything said about the same topic into one section, even when it came up at several points. Reply in {LANGUAGE} using Markdown.`,
   },
   {
     value: "one_on_one",
     label_no: "1:1-samtale",
     label_en: "1:1 conversation",
-    prompt_no: `Du lager notater fra en 1:1-samtale fra [Notater] (brukerens) og [Transkripsjon] (automatisk). Skriv på norsk i Markdown.`,
-    prompt_en: `You produce 1:1 notes from [Notater] (user-written) and [Transkripsjon] (auto). Reply in {LANGUAGE} using Markdown.`,
+    prompt_no: `Du lager notater fra en 1:1-samtale fra [Notater] (brukerens) og [Transkripsjon] (automatisk). Samle alt som ble sagt om samme tema i én seksjon, selv når temaet ble tatt opp flere ganger. Skriv på norsk i Markdown.`,
+    prompt_en: `You produce 1:1 notes from [Notater] (user-written) and [Transkripsjon] (auto). Group everything said about the same topic into one section, even when it came up at several points. Reply in {LANGUAGE} using Markdown.`,
   },
   {
     value: "lecture",
@@ -47,8 +50,8 @@ export const SUMMARY_PRESETS: PresetSpec[] = [
     value: "interview",
     label_no: "Intervju",
     label_en: "Interview",
-    prompt_no: `Du lager intervjunotater fra [Notater] (brukerens) og [Transkripsjon] (automatisk). Skriv på norsk i Markdown.`,
-    prompt_en: `You produce interview notes from [Notater] (user-written) and [Transkripsjon] (auto). Reply in {LANGUAGE} using Markdown.`,
+    prompt_no: `Du lager intervjunotater fra [Notater] (brukerens) og [Transkripsjon] (automatisk). Samle alt som ble sagt om samme tema i én seksjon, selv når temaet ble tatt opp flere ganger. Skriv på norsk i Markdown.`,
+    prompt_en: `You produce interview notes from [Notater] (user-written) and [Transkripsjon] (auto). Group everything said about the same topic into one section, even when it came up at several points. Reply in {LANGUAGE} using Markdown.`,
   },
   {
     value: "brainstorm",
