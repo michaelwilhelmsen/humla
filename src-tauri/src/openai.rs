@@ -1250,6 +1250,75 @@ pub async fn list_models(base_url: &str) -> Result<Vec<String>> {
     Ok(body.data.into_iter().map(|m| m.id).collect())
 }
 
+// ── Embeddings (issue #48) ──────────────────────────────────────────────────
+// Cloud OpenAI and Ollama both serve the OpenAI-compatible `/v1/embeddings`
+// shape (`{model, input:[…]}` → `{data:[{embedding, index}]}`), so one function
+// covers both — base_url selects the target. Unlike chat, embeddings have no
+// thinking mode, so the "use Ollama's native /api/chat" caveat doesn't apply.
+
+#[derive(Serialize)]
+struct EmbedRequest<'a> {
+    model: &'a str,
+    input: &'a [String],
+}
+#[derive(Deserialize)]
+struct EmbedResponse {
+    data: Vec<EmbedDatum>,
+}
+#[derive(Deserialize)]
+struct EmbedDatum {
+    embedding: Vec<f32>,
+    #[serde(default)]
+    index: usize,
+}
+
+/// Embed a batch of texts via the OpenAI-compatible embeddings endpoint at
+/// `base_url`. `api_key` is sent as a bearer when present (cloud OpenAI); local
+/// servers ignore it. Returns one vector per input, in input order.
+pub(crate) async fn openai_embed(
+    base_url: &str,
+    api_key: Option<&str>,
+    model: &str,
+    inputs: &[String],
+) -> Result<Vec<Vec<f32>>> {
+    if inputs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let url = format!("{base_url}/embeddings");
+    let mut req = local_client().post(&url).json(&EmbedRequest { model, input: inputs });
+    if let Some(key) = api_key {
+        req = req.bearer_auth(key);
+    }
+    let r = req.send().await.map_err(|e| {
+        if e.is_timeout() {
+            anyhow!("Timed out waiting for embeddings from {url}.")
+        } else if e.is_connect() {
+            anyhow!("Couldn't reach {url} for embeddings.")
+        } else {
+            anyhow!("network error requesting embeddings from {url}: {}", error_chain(&e))
+        }
+    })?;
+    let status = r.status();
+    if !status.is_success() {
+        let body = r.text().await.unwrap_or_default();
+        return Err(anyhow!("HTTP {status} from {url}: {body}"));
+    }
+    let mut body: EmbedResponse = r
+        .json()
+        .await
+        .map_err(|e| anyhow!("could not parse embeddings response from {url}: {e}"))?;
+    if body.data.len() != inputs.len() {
+        return Err(anyhow!(
+            "embeddings response had {} vectors for {} inputs",
+            body.data.len(),
+            inputs.len()
+        ));
+    }
+    // Order by `index` so vectors line up with inputs regardless of wire order.
+    body.data.sort_by_key(|d| d.index);
+    Ok(body.data.into_iter().map(|d| d.embedding).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

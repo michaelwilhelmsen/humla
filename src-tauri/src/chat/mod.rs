@@ -277,6 +277,7 @@ pub async fn run_chat(
     grounding: &str,
     scope: &ToolScope,
     workspace: &str,
+    embedder: Option<&dyn crate::embed::EmbeddingAdapter>,
     user_text: &str,
     mut sink: impl FnMut(ChatEvent) + Send,
 ) -> Result<()> {
@@ -316,7 +317,8 @@ pub async fn run_chat(
     // 3. Agentic loop.
     let specs = tool_specs();
     let result = agentic_loop(
-        db, adapter, ctx, scope, workspace, &specs, base, &assistant_id, &answer_block, &mut sink,
+        db, adapter, ctx, scope, workspace, &specs, base, &assistant_id, &answer_block, embedder,
+        &mut sink,
     )
     .await;
 
@@ -350,6 +352,7 @@ async fn agentic_loop(
     base: Vec<ChatTurn>,
     assistant_id: &str,
     answer_block: &str,
+    embedder: Option<&dyn crate::embed::EmbeddingAdapter>,
     sink: &mut (impl FnMut(ChatEvent) + Send),
 ) -> Result<Vec<Part>> {
     let mut working = base;
@@ -396,9 +399,33 @@ async fn agentic_loop(
         for call in &out.tool_calls {
             let args: serde_json::Value =
                 serde_json::from_str(&call.arguments).unwrap_or_else(|_| serde_json::json!({}));
+
+            // For a search, embed the query BEFORE taking the DB lock (embedding
+            // is async; the lock is not held across .await). A failed/absent
+            // embedder yields no vector → hybrid search degrades to keyword-only
+            // (issue #48 graceful degradation).
+            let (query_vec, embed_model): (Option<Vec<f32>>, &str) = match embedder {
+                Some(emb) if call.name == tools::TOOL_SEARCH => {
+                    let q = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
+                    let vec = if q.trim().is_empty() {
+                        None
+                    } else {
+                        match emb.embed(std::slice::from_ref(&q.to_string())).await {
+                            Ok(mut v) => v.pop(),
+                            Err(e) => {
+                                eprintln!("[chat] query embed failed, keyword-only: {e}");
+                                None
+                            }
+                        }
+                    };
+                    (vec, emb.model_id())
+                }
+                _ => (None, ""),
+            };
+
             let outcome = {
                 let conn = db.lock();
-                execute_tool(&conn, workspace, scope, &call.name, &args)
+                execute_tool(&conn, workspace, scope, &call.name, &args, query_vec.as_deref(), embed_model)
             };
             sink(ChatEvent::ToolActivity {
                 message_id: assistant_id.to_string(),
@@ -563,7 +590,7 @@ mod tests {
         let adapter = FakeChatAdapter::new(["Hello world"]);
         let mut events: Vec<ChatEvent> = Vec::new();
         run_chat(
-            &dbh, &adapter, FAKE_CTX, &conv_id, "GROUNDING", &ToolScope::All, "", "What happened?",
+            &dbh, &adapter, FAKE_CTX, &conv_id, "GROUNDING", &ToolScope::All, "", None, "What happened?",
             |ev| events.push(ev),
         )
         .await
@@ -596,7 +623,7 @@ mod tests {
             let (dbh, _path) = temp_db(&dir);
             conv_id = conv(&dbh, "note-1");
             let adapter = FakeChatAdapter::new(["answer"]);
-            run_chat(&dbh, &adapter, FAKE_CTX, &conv_id, "G", &ToolScope::All, "", "hi", |_| {})
+            run_chat(&dbh, &adapter, FAKE_CTX, &conv_id, "G", &ToolScope::All, "", None, "hi", |_| {})
                 .await
                 .unwrap();
         }
@@ -646,7 +673,7 @@ mod tests {
         let (dbh, _path) = temp_db(&dir);
         let conv_id = conv(&dbh, "n");
         let res = run_chat(
-            &dbh, &FailingAdapter, FAKE_CTX, &conv_id, "G", &ToolScope::All, "", "hi", |_| {},
+            &dbh, &FailingAdapter, FAKE_CTX, &conv_id, "G", &ToolScope::All, "", None, "hi", |_| {},
         )
         .await;
         assert!(res.is_err());
@@ -673,7 +700,7 @@ mod tests {
         ]);
         let mut events: Vec<ChatEvent> = Vec::new();
         run_chat(
-            &dbh, &adapter, FAKE_CTX, &conv_id, "", &ToolScope::All, "", "what about budget?",
+            &dbh, &adapter, FAKE_CTX, &conv_id, "", &ToolScope::All, "", None, "what about budget?",
             |ev| events.push(ev),
         )
         .await
@@ -707,7 +734,7 @@ mod tests {
             FakeChatAdapter::text_step("I couldn't open that note, but here's what I know."),
         ]);
         let mut events: Vec<ChatEvent> = Vec::new();
-        run_chat(&dbh, &adapter, FAKE_CTX, &conv_id, "", &ToolScope::All, "", "open note x", |ev| {
+        run_chat(&dbh, &adapter, FAKE_CTX, &conv_id, "", &ToolScope::All, "", None, "open note x", |ev| {
             events.push(ev)
         })
         .await
@@ -734,7 +761,7 @@ mod tests {
             .map(|_| FakeChatAdapter::tool_step("c", "search_notes", r#"{"query":"content"}"#))
             .collect();
         let adapter = FakeChatAdapter::scripted(steps);
-        run_chat(&dbh, &adapter, FAKE_CTX, &conv_id, "", &ToolScope::All, "", "keep going", |_| {})
+        run_chat(&dbh, &adapter, FAKE_CTX, &conv_id, "", &ToolScope::All, "", None, "keep going", |_| {})
             .await
             .unwrap();
 
@@ -765,7 +792,7 @@ mod tests {
         };
         let adapter =
             FakeChatAdapter::scripted(vec![preamble, FakeChatAdapter::text_step("The answer.")]);
-        run_chat(&dbh, &adapter, FAKE_CTX, &conv_id, "", &ToolScope::All, "", "q", |_| {})
+        run_chat(&dbh, &adapter, FAKE_CTX, &conv_id, "", &ToolScope::All, "", None, "q", |_| {})
             .await
             .unwrap();
 
@@ -779,6 +806,45 @@ mod tests {
             })
             .collect();
         assert_eq!(text, "The answer.", "preamble on the tool step is not stored in the answer");
+    }
+
+    #[tokio::test]
+    async fn search_degrades_to_keyword_when_the_embedder_errors() {
+        // Issue #48 graceful degradation: an embedder that fails must not break
+        // chat — search falls back to keyword-only and still finds + cites.
+        struct FailingEmbedder;
+        #[async_trait::async_trait]
+        impl crate::embed::EmbeddingAdapter for FailingEmbedder {
+            fn model_id(&self) -> &str {
+                "boom"
+            }
+            async fn embed(&self, _texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+                Err(anyhow::anyhow!("embedding backend down"))
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let (dbh, _path) = temp_db(&dir);
+        let note_id = seed_note(&dbh, "Budget review", "We cut the marketing budget in Q3.");
+        let conv_id = conv(&dbh, "all");
+
+        let adapter = FakeChatAdapter::scripted(vec![
+            FakeChatAdapter::tool_step("c1", "search_notes", r#"{"query":"budget"}"#),
+            FakeChatAdapter::text_step("Your Q3 budget was cut."),
+        ]);
+        let mut events: Vec<ChatEvent> = Vec::new();
+        run_chat(
+            &dbh, &adapter, FAKE_CTX, &conv_id, "", &ToolScope::All, "", Some(&FailingEmbedder),
+            "budget?", |ev| events.push(ev),
+        )
+        .await
+        .unwrap();
+
+        // The failed embed didn't error the tool; the keyword hit still cited.
+        let cited = events.iter().any(|e| matches!(e, ChatEvent::Citations { citations, .. }
+            if citations.iter().any(|c| c.note_id == note_id)));
+        assert!(cited, "keyword fallback found and cited the note despite embed failure");
+        assert!(events.iter().any(|e| matches!(e, ChatEvent::Done { .. })));
     }
 
     #[tokio::test]
@@ -797,7 +863,7 @@ mod tests {
         ]);
         let mut events: Vec<ChatEvent> = Vec::new();
         run_chat(
-            &dbh, &adapter, FAKE_CTX, &conv_id, "", &ToolScope::Note(anchor.clone()), "",
+            &dbh, &adapter, FAKE_CTX, &conv_id, "", &ToolScope::Note(anchor.clone()), "", None,
             "find it", |ev| events.push(ev),
         )
         .await

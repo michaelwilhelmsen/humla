@@ -176,16 +176,21 @@ fn truncate(s: &str, max: usize) -> String {
 
 /// Run one tool call against the DB. Never returns `Err` — every failure path
 /// (unknown tool, bad args, DB error) becomes a `ToolOutcome { is_error }` the
-/// model reads and recovers from.
+/// model reads and recovers from. `query_vec`/`embed_model` carry the search
+/// query's embedding when semantic retrieval is available (issue #48) — the
+/// caller embeds the query before taking the DB lock, since embedding is async;
+/// `None` degrades `search_notes` to keyword-only.
 pub fn execute_tool(
     conn: &Connection,
     workspace: &str,
     scope: &ToolScope,
     name: &str,
     args: &Value,
+    query_vec: Option<&[f32]>,
+    embed_model: &str,
 ) -> ToolOutcome {
     match name {
-        TOOL_SEARCH => run_search(conn, workspace, scope, args),
+        TOOL_SEARCH => run_search(conn, workspace, scope, args, query_vec, embed_model),
         TOOL_GET => run_get(conn, workspace, scope, args),
         TOOL_LIST => run_list(conn, workspace, scope, args),
         other => ToolOutcome::error(format!(
@@ -194,12 +199,27 @@ pub fn execute_tool(
     }
 }
 
-fn run_search(conn: &Connection, workspace: &str, scope: &ToolScope, args: &Value) -> ToolOutcome {
+fn run_search(
+    conn: &Connection,
+    workspace: &str,
+    scope: &ToolScope,
+    args: &Value,
+    query_vec: Option<&[f32]>,
+    embed_model: &str,
+) -> ToolOutcome {
     let Some(query) = str_arg(args, "query") else {
         return ToolOutcome::error("search_notes needs a non-empty \"query\" string.");
     };
     let filter = resolve_filter(scope, args);
-    let hits = match db::search_chunks(conn, query, filter, workspace, clamp_limit(args)) {
+    let hits = match db::hybrid_search_chunks(
+        conn,
+        query,
+        query_vec,
+        embed_model,
+        filter,
+        workspace,
+        clamp_limit(args),
+    ) {
         Ok(h) => h,
         Err(e) => return ToolOutcome::error(format!("search failed: {e}")),
     };
@@ -334,6 +354,11 @@ mod tests {
         db::open(&dir.path().join("t.sqlite")).unwrap()
     }
 
+    /// Keyword-only tool call (no query embedding) — the common test path.
+    fn exec(conn: &Connection, workspace: &str, scope: &ToolScope, name: &str, args: &Value) -> ToolOutcome {
+        execute_tool(conn, workspace, scope, name, args, None, "")
+    }
+
     #[test]
     fn tool_specs_cover_the_three_tools() {
         let names: Vec<&str> = tool_specs().iter().map(|s| s.name).collect();
@@ -350,7 +375,7 @@ mod tests {
         let id = seed(&conn, "Budget review", "We cut the marketing budget in Q3.");
         seed(&conn, "Hiring", "Interviewed two backend engineers.");
 
-        let out = execute_tool(&conn, "", &ToolScope::All, TOOL_SEARCH, &json!({ "query": "budget" }));
+        let out = exec(&conn, "", &ToolScope::All, TOOL_SEARCH, &json!({ "query": "budget" }));
         assert!(!out.is_error);
         assert!(out.model_text.contains("Budget review"));
         assert_eq!(out.citations.len(), 1);
@@ -360,7 +385,7 @@ mod tests {
     #[test]
     fn search_empty_query_is_an_error_outcome_not_a_panic() {
         let conn = open();
-        let out = execute_tool(&conn, "", &ToolScope::All, TOOL_SEARCH, &json!({ "query": "  " }));
+        let out = exec(&conn, "", &ToolScope::All, TOOL_SEARCH, &json!({ "query": "  " }));
         assert!(out.is_error);
         assert!(out.citations.is_empty());
     }
@@ -370,7 +395,7 @@ mod tests {
         let conn = open();
         seed(&conn, "Budget", "Money talk.");
         let out =
-            execute_tool(&conn, "", &ToolScope::All, TOOL_SEARCH, &json!({ "query": "zzznonexistent" }));
+            exec(&conn, "", &ToolScope::All, TOOL_SEARCH, &json!({ "query": "zzznonexistent" }));
         assert!(!out.is_error, "an empty result is a valid answer, not a failure");
         assert!(out.model_text.to_lowercase().contains("no notes matched"));
         assert!(out.model_text.contains("Do not guess"));
@@ -380,7 +405,7 @@ mod tests {
     fn get_note_returns_full_content_and_a_citation() {
         let conn = open();
         let id = seed(&conn, "Kickoff", "Project kickoff transcript body.");
-        let out = execute_tool(&conn, "", &ToolScope::All, TOOL_GET, &json!({ "note_id": id }));
+        let out = exec(&conn, "", &ToolScope::All, TOOL_GET, &json!({ "note_id": id }));
         assert!(!out.is_error);
         assert!(out.model_text.contains("Project kickoff transcript body."));
         assert!(out.model_text.contains("[Transcript]"));
@@ -393,8 +418,8 @@ mod tests {
     #[test]
     fn get_note_missing_id_and_unknown_note_are_recoverable_errors() {
         let conn = open();
-        assert!(execute_tool(&conn, "", &ToolScope::All, TOOL_GET, &json!({})).is_error);
-        let out = execute_tool(&conn, "", &ToolScope::All, TOOL_GET, &json!({ "note_id": "nope" }));
+        assert!(exec(&conn, "", &ToolScope::All, TOOL_GET, &json!({})).is_error);
+        let out = exec(&conn, "", &ToolScope::All, TOOL_GET, &json!({ "note_id": "nope" }));
         assert!(out.is_error);
         assert!(out.model_text.contains("No note found"));
     }
@@ -406,9 +431,9 @@ mod tests {
         let other = seed(&conn, "Other", "other content");
         let scope = ToolScope::Note(anchor.clone());
         // The anchor is reachable...
-        assert!(!execute_tool(&conn, "", &scope, TOOL_GET, &json!({ "note_id": anchor })).is_error);
+        assert!(!exec(&conn, "", &scope, TOOL_GET, &json!({ "note_id": anchor })).is_error);
         // ...a different note is not.
-        let out = execute_tool(&conn, "", &scope, TOOL_GET, &json!({ "note_id": other }));
+        let out = exec(&conn, "", &scope, TOOL_GET, &json!({ "note_id": other }));
         assert!(out.is_error);
         assert!(out.model_text.contains("out of scope"));
     }
@@ -416,7 +441,7 @@ mod tests {
     #[test]
     fn unknown_tool_is_a_recoverable_error() {
         let conn = open();
-        let out = execute_tool(&conn, "", &ToolScope::All, "frobnicate", &json!({}));
+        let out = exec(&conn, "", &ToolScope::All, "frobnicate", &json!({}));
         assert!(out.is_error);
         assert!(out.model_text.contains("Unknown tool"));
     }
@@ -426,7 +451,7 @@ mod tests {
         let conn = open();
         seed(&conn, "First", "a");
         seed(&conn, "Second", "b");
-        let out = execute_tool(&conn, "", &ToolScope::All, TOOL_LIST, &json!({}));
+        let out = exec(&conn, "", &ToolScope::All, TOOL_LIST, &json!({}));
         assert!(!out.is_error);
         assert!(out.model_text.contains("First"));
         assert!(out.model_text.contains("Second"));

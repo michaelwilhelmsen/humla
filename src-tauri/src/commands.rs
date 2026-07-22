@@ -2642,6 +2642,8 @@ async fn diarize_and_apply(
         // the final transcript — refresh retrieval chunks so chat can search it.
         chat::reindex_note_content(&conn, &note_id);
     }
+    // Embed the refreshed chunks off the request path (issue #48).
+    tauri::async_runtime::spawn(chat::embed_note_bg(app.clone(), note_id.clone()));
     let _ = app.emit(
         "transcript_replaced",
         TranscriptPayload {

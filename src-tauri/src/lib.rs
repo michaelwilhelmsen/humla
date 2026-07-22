@@ -11,6 +11,7 @@ mod sessions;
 mod commands;
 mod stt;
 mod chat;
+mod embed;
 pub mod sync;
 
 use std::sync::Arc;
@@ -245,8 +246,17 @@ where
                     let state: tauri::State<AppState> = app.state();
                     state.db.clone()
                 };
-                tauri::async_runtime::spawn_blocking(move || {
-                    commands::backfill_note_chunks(&db);
+                let app_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    // 1. Re-chunk (CPU-bound) off the async pool.
+                    let db2 = db.clone();
+                    let _ = tauri::async_runtime::spawn_blocking(move || {
+                        commands::backfill_note_chunks(&db2);
+                    })
+                    .await;
+                    // 2. Embed the (re)chunked notes so cross-note semantic
+                    //    search works day-one (issue #48). Best-effort + cached.
+                    commands::embed_backfill(app_handle).await;
                 });
             }
 

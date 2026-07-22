@@ -7,7 +7,12 @@ import { CommandSnippet } from "../../../components/CommandSnippet";
 import { useOllamaProbe } from "../../../components/provider/useOllamaProbe";
 import { useProviderKey } from "../../../components/provider/useProviderKey";
 import { CHAT_PROVIDERS, SUMMARY_MODELS } from "../types";
-import { RECOMMENDED_OLLAMA_MODEL } from "../../../lib/localModels";
+import {
+  EMBEDDING_OLLAMA_MODEL,
+  RECOMMENDED_OLLAMA_MODEL,
+  isEmbeddingModel,
+  isModelInstalled,
+} from "../../../lib/localModels";
 import type { SettingsHook } from "../useSettings";
 
 // AI Chat provider setting (issue #44). A dedicated provider choice, separate
@@ -29,6 +34,8 @@ export function ChatTab({ s, update }: Pick<SettingsHook, "s" | "update">) {
   if (isOllama) {
     if (reachable === false) hint = "Start or install Ollama — it's detected automatically.";
     else if (!s.chat_model) hint = "Choose a chat model above.";
+    else if (isEmbeddingModel(s.chat_model))
+      hint = `“${s.chat_model}” is an embedding model — choose a chat model above.`;
     else if (installed && !installed.includes(s.chat_model))
       hint = `“${s.chat_model}” isn't installed on the server — run ollama pull ${s.chat_model}.`;
     else ready = true;
@@ -103,6 +110,27 @@ export function ChatTab({ s, update }: Pick<SettingsHook, "s" | "update">) {
               command={`ollama pull ${s.chat_model || RECOMMENDED_OLLAMA_MODEL}`}
               ariaLabel="Copy Ollama pull command"
             />
+          </div>
+          {/* Embedding model for semantic retrieval (issue #48). Optional —
+              chat works keyword-only without it — so this never blocks the
+              readiness gate above; it's a soft recommendation. */}
+          <div className="py-3 space-y-2 border-t border-[var(--color-line)]">
+            {isModelInstalled(installed, EMBEDDING_OLLAMA_MODEL) ? (
+              <p className="text-xs text-[var(--color-success)]">
+                Semantic search ready ✓ — {EMBEDDING_OLLAMA_MODEL} is installed.
+              </p>
+            ) : (
+              <>
+                <p className="text-xs text-[var(--color-text-muted)]">
+                  For semantic search — finding answers by meaning, not just keywords — also pull
+                  the embedding model (~600 MB). Optional; chat works without it.
+                </p>
+                <CommandSnippet
+                  command={`ollama pull ${EMBEDDING_OLLAMA_MODEL}`}
+                  ariaLabel="Copy embedding-model pull command"
+                />
+              </>
+            )}
           </div>
         </>
       )}

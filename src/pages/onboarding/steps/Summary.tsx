@@ -28,11 +28,15 @@ import { Sparkles, Cloud, Server, Check, Copy, ExternalLink } from "lucide-react
 import { ipc } from "../../../lib/ipc";
 import { useOllamaProbe } from "../../../components/provider/useOllamaProbe";
 import { useProviderKey } from "../../../components/provider/useProviderKey";
+import { CommandSnippet } from "../../../components/CommandSnippet";
 import type { StepContext } from "../types";
 import { StepShell } from "../StepShell";
 import {
+  EMBEDDING_OLLAMA_MODEL,
   RECOMMENDED_OLLAMA_MODEL,
   RECOMMENDED_OLLAMA_MODEL_16GB,
+  completionModels,
+  isModelInstalled,
 } from "../../../lib/localModels";
 
 // Mirrors Settings → Summary defaults (settings/types.ts DEFAULTS).
@@ -97,11 +101,13 @@ export function SummaryStep({ ctx }: { ctx: StepContext }) {
   // completes mid-wizard is picked up.
   useEffect(() => {
     if (!installed) return;
+    // Only completion models are valid picks — never embeddinggemma etc. (#48).
+    const usable = completionModels(installed);
     setSelectedModel((prev) => {
-      if (prev && installed.includes(prev)) return prev;
-      if (installed.includes(RECOMMENDED_OLLAMA_MODEL)) return RECOMMENDED_OLLAMA_MODEL;
-      if (installed.includes(RECOMMENDED_OLLAMA_MODEL_16GB)) return RECOMMENDED_OLLAMA_MODEL_16GB;
-      return installed[0] ?? "";
+      if (prev && usable.includes(prev)) return prev;
+      if (usable.includes(RECOMMENDED_OLLAMA_MODEL)) return RECOMMENDED_OLLAMA_MODEL;
+      if (usable.includes(RECOMMENDED_OLLAMA_MODEL_16GB)) return RECOMMENDED_OLLAMA_MODEL_16GB;
+      return usable[0] ?? "";
     });
   }, [installed]);
 
@@ -427,6 +433,30 @@ export function SummaryStep({ ctx }: { ctx: StepContext }) {
                   )}
                 </div>
               )}
+
+              {/* Optional embedding model for semantic chat (issue #48). Never
+                  blocks setup — chat works keyword-only without it. */}
+              {reachable === true && (
+                <div className="mt-3 pt-3 border-t border-[var(--color-line)] space-y-1.5">
+                  {isModelInstalled(installed, EMBEDDING_OLLAMA_MODEL) ? (
+                    <p className="text-xs text-[var(--color-success)] flex items-center gap-1.5">
+                      <Check size={13} strokeWidth={2.5} />
+                      Semantic chat search ready ({EMBEDDING_OLLAMA_MODEL})
+                    </p>
+                  ) : (
+                    <>
+                      <p className="text-xs text-[var(--color-text-muted)]">
+                        Optional: for AI chat that finds answers by meaning, pull the small
+                        embedding model too.
+                      </p>
+                      <CommandSnippet
+                        command={`ollama pull ${EMBEDDING_OLLAMA_MODEL}`}
+                        ariaLabel="Copy embedding-model pull command"
+                      />
+                    </>
+                  )}
+                </div>
+              )}
             </div>
           )}
         </div>
@@ -510,7 +540,7 @@ function ModelSelect({
         className="w-full px-3 py-2 rounded-md text-sm bg-[var(--color-input-bg)] border border-[var(--color-line)] focus:border-[var(--color-text-muted)]"
       >
         <option value="">— pick a model —</option>
-        {installed.map((m) => (
+        {completionModels(installed).map((m) => (
           <option key={m} value={m}>
             {m}
             {m === RECOMMENDED_OLLAMA_MODEL
