@@ -105,11 +105,24 @@ export function SummaryStep({ ctx }: { ctx: StepContext }) {
     });
   }, [installed]);
 
+  // Seed the AI Chat provider (issue #47) to mirror the summary choice, so
+  // chat works out of the box without a second setup — chat reuses the same
+  // OpenAI key / Ollama server. It can still be changed later in Settings → Chat.
+  async function seedChatProvider(chatProvider: "openai" | "ollama", chatModel: string) {
+    try {
+      await ipc.setSetting("chat_provider", chatProvider);
+      await ipc.setSetting("chat_model", chatModel);
+    } catch (e) {
+      console.warn("[onboarding] failed to seed chat provider:", e);
+    }
+  }
+
   // ---- OpenAI path --------------------------------------------------------
   async function useSameOpenAiKey() {
     try {
       await ipc.setSetting("summary_provider", "openai");
       await ipc.setSetting("summary_model", DEFAULT_OPENAI_SUMMARY_MODEL);
+      await seedChatProvider("openai", DEFAULT_OPENAI_SUMMARY_MODEL);
       setOpenaiConfigured(true);
     } catch (e) {
       console.warn("[onboarding] failed to write openai summary settings:", e);
@@ -122,6 +135,7 @@ export function SummaryStep({ ctx }: { ctx: StepContext }) {
     try {
       await ipc.setSetting("summary_provider", "openai");
       await ipc.setSetting("summary_model", DEFAULT_OPENAI_SUMMARY_MODEL);
+      await seedChatProvider("openai", DEFAULT_OPENAI_SUMMARY_MODEL);
       setOpenaiConfigured(true);
     } catch (e) {
       console.warn("[onboarding] failed to write openai summary settings:", e);
@@ -140,6 +154,7 @@ export function SummaryStep({ ctx }: { ctx: StepContext }) {
       await ipc.setSetting("local_llm_base_url", DEFAULT_LOCAL_BASE_URL);
       await ipc.setSetting("local_llm_model", model);
       await ipc.setSetting("local_llm_think", "false");
+      await seedChatProvider("ollama", model);
       setLocalConfigured(true);
     } catch (e) {
       console.warn("[onboarding] failed to write local summary settings:", e);
@@ -193,8 +208,8 @@ export function SummaryStep({ ctx }: { ctx: StepContext }) {
       title="Set up AI summaries"
       subtitle={
         neutral
-          ? "Humla fuses your notes with the transcript into a summary. Local: private, needs Ollama + ~6 GB RAM · OpenAI: better summaries, needs API key."
-          : "Humla fuses your notes with the transcript into a summary. This is optional — you can skip it and set it up later."
+          ? "Humla fuses your notes with the transcript into a summary — and powers AI Chat over your notes. Local: private, needs Ollama + ~6 GB RAM · OpenAI: better summaries, needs API key."
+          : "Humla fuses your notes with the transcript into a summary, and powers AI Chat over your notes. This is optional — you can skip it and set it up later."
       }
     >
       <div className="w-full max-w-md flex flex-col gap-3 text-left">
