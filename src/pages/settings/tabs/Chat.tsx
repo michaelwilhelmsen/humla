@@ -10,6 +10,7 @@ import { CHAT_PROVIDERS, SUMMARY_MODELS } from "../types";
 import {
   EMBEDDING_OLLAMA_MODEL,
   RECOMMENDED_OLLAMA_MODEL,
+  isEmbeddingModel,
   isModelInstalled,
 } from "../../../lib/localModels";
 import type { SettingsHook } from "../useSettings";
@@ -33,6 +34,8 @@ export function ChatTab({ s, update }: Pick<SettingsHook, "s" | "update">) {
   if (isOllama) {
     if (reachable === false) hint = "Start or install Ollama — it's detected automatically.";
     else if (!s.chat_model) hint = "Choose a chat model above.";
+    else if (isEmbeddingModel(s.chat_model))
+      hint = `“${s.chat_model}” is an embedding model — choose a chat model above.`;
     else if (installed && !installed.includes(s.chat_model))
       hint = `“${s.chat_model}” isn't installed on the server — run ollama pull ${s.chat_model}.`;
     else ready = true;

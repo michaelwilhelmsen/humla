@@ -177,6 +177,17 @@ fn resolve_scope(breadth: &str, note: &db::Note) -> ToolScope {
     }
 }
 
+/// Whether a model id is embedding-only (can't do chat completions). Mirrors
+/// the frontend `isEmbeddingModel` heuristic — matches embeddinggemma and the
+/// common embedding families.
+fn is_embedding_model(model: &str) -> bool {
+    let m = model.to_lowercase();
+    m.contains("embed")
+        || m.starts_with("bge-")
+        || m.starts_with("all-minilm")
+        || m.starts_with("paraphrase-")
+}
+
 // Resolved chat provider for a single call. Only "openai" (cloud, shared key)
 // and "ollama" (local) are valid — see issue #44.
 struct ResolvedChat {
@@ -211,6 +222,15 @@ fn resolve_chat(
             let model = model_setting.ok_or_else(|| {
                 anyhow::anyhow!("No chat model configured — pick one in Settings → Chat.")
             })?;
+            // Defence in depth: an embedding model (e.g. embeddinggemma, pulled
+            // for semantic search) can't do chat — Ollama 400s "does not support
+            // chat". The pickers now exclude it, but guard a stale setting too.
+            if is_embedding_model(&model) {
+                anyhow::bail!(
+                    "“{model}” is an embedding model and can't chat — pick a chat model in \
+                     Settings → Chat."
+                );
+            }
             Ok(ResolvedChat { provider, base_url, api_key: None, model, think })
         }
         _ => {
@@ -434,4 +454,31 @@ pub fn chat_history(state: State<AppState>, note_id: String) -> Result<Vec<ChatM
             created_at: m.created_at,
         })
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embedding_models_are_recognised() {
+        for m in ["embeddinggemma", "embeddinggemma:latest", "nomic-embed-text", "mxbai-embed-large", "bge-m3", "all-minilm", "snowflake-arctic-embed2", "paraphrase-multilingual"] {
+            assert!(is_embedding_model(m), "expected embedding: {m}");
+        }
+        for m in ["gemma4:12b-mlx", "qwen3.5:4b", "llama3.2:3b", "gpt-5.4-mini"] {
+            assert!(!is_embedding_model(m), "expected chat-capable: {m}");
+        }
+    }
+
+    #[test]
+    fn resolve_chat_rejects_an_embedding_model_as_the_chat_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = db::open(&dir.path().join("t.sqlite")).unwrap();
+        db::set_setting(&conn, "chat_provider", "ollama").unwrap();
+        db::set_setting(&conn, "chat_model", "embeddinggemma:latest").unwrap();
+        let res = resolve_chat(&conn, None);
+        assert!(res.is_err());
+        let err = res.err().unwrap().to_string();
+        assert!(err.contains("embedding model"), "clear guidance, not a raw 400: {err}");
+    }
 }

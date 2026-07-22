@@ -95,4 +95,28 @@ describe("ChatTab readiness", () => {
     // Tag-insensitive match: "embeddinggemma:latest" satisfies "embeddinggemma".
     expect(screen.queryByRole("button", { name: /Copy embedding-model pull command/ })).toBeNull();
   });
+
+  // Regression: an embedding model must never be usable as the chat model
+  // (Ollama 400s "does not support chat"). Surfaced by real pnpm tauri dev.
+  it("Ollama: flags an embedding model wrongly set as the chat model", async () => {
+    mockTauri({ local_llm_list_models: () => ["embeddinggemma:latest", "gemma4:12b-mlx"] });
+    render(
+      <ChatTab
+        s={settings({ chat_provider: "ollama", chat_model: "embeddinggemma:latest" })}
+        update={async () => {}}
+      />,
+    );
+    await waitFor(() => expect(screen.getByText("Setup needed")).toBeInTheDocument());
+    expect(screen.getByText(/is an embedding model/)).toBeInTheDocument();
+  });
+
+  it("Ollama: auto-selects a chat model, never the embedding model, when none is set", async () => {
+    const update = vi.fn();
+    // Embedding model listed FIRST (as Ollama does) — the old installed[0]
+    // auto-select would have picked it.
+    mockTauri({ local_llm_list_models: () => ["embeddinggemma:latest", "gemma4:12b-mlx"] });
+    render(<ChatTab s={settings({ chat_provider: "ollama", chat_model: "" })} update={update} />);
+    await waitFor(() => expect(update).toHaveBeenCalledWith("chat_model", "gemma4:12b-mlx"));
+    expect(update).not.toHaveBeenCalledWith("chat_model", "embeddinggemma:latest");
+  });
 });

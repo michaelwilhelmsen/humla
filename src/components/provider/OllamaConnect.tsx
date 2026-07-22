@@ -1,5 +1,6 @@
 import { useEffect, useRef } from "react";
 import { Select } from "../../pages/settings/components/Select";
+import { completionModels } from "../../lib/localModels";
 import { useOllamaProbe } from "./useOllamaProbe";
 
 // Local-LLM (Ollama / LM Studio / llama-server) connection surface for the
@@ -21,6 +22,11 @@ export function OllamaConnect({
 }) {
   const { reachable, installed } = useOllamaProbe(baseUrl, { pollMs });
 
+  // This is a completion-model picker (chat + summary), so embedding-only
+  // models (e.g. embeddinggemma, pulled for semantic search #48) must never be
+  // offered or auto-selected — Ollama 400s "does not support chat" for them.
+  const models = completionModels(installed);
+
   // Empty selection self-heals on contact: with no model set the dropdown
   // used to LOOK fine (HTML default fallback) while summaries failed with
   // "model not configured". A stored-but-missing model is NOT auto-switched
@@ -31,8 +37,9 @@ export function OllamaConnect({
   const onModelChangeRef = useRef(onModelChange);
   onModelChangeRef.current = onModelChange;
   useEffect(() => {
-    if (installed && installed.length > 0 && !modelRef.current) {
-      onModelChangeRef.current(installed[0]);
+    const usable = completionModels(installed);
+    if (usable.length > 0 && !modelRef.current) {
+      onModelChangeRef.current(usable[0]);
     }
   }, [installed]);
 
@@ -40,7 +47,7 @@ export function OllamaConnect({
     reachable === true &&
     installed !== null &&
     model !== "" &&
-    !installed.includes(model);
+    !models.includes(model);
 
   return (
     <div className="py-3.5 flex flex-col gap-3">
@@ -92,7 +99,7 @@ export function OllamaConnect({
                 ...(model === "" || modelMissing
                   ? [{ value: model, label: model === "" ? "Choose a model…" : model }]
                   : []),
-                ...(installed ?? []).map((m) => ({ value: m, label: m })),
+                ...models.map((m) => ({ value: m, label: m })),
               ]}
             />
           </div>

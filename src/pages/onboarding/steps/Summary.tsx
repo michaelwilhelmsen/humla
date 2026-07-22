@@ -35,6 +35,7 @@ import {
   EMBEDDING_OLLAMA_MODEL,
   RECOMMENDED_OLLAMA_MODEL,
   RECOMMENDED_OLLAMA_MODEL_16GB,
+  completionModels,
   isModelInstalled,
 } from "../../../lib/localModels";
 
@@ -100,11 +101,13 @@ export function SummaryStep({ ctx }: { ctx: StepContext }) {
   // completes mid-wizard is picked up.
   useEffect(() => {
     if (!installed) return;
+    // Only completion models are valid picks — never embeddinggemma etc. (#48).
+    const usable = completionModels(installed);
     setSelectedModel((prev) => {
-      if (prev && installed.includes(prev)) return prev;
-      if (installed.includes(RECOMMENDED_OLLAMA_MODEL)) return RECOMMENDED_OLLAMA_MODEL;
-      if (installed.includes(RECOMMENDED_OLLAMA_MODEL_16GB)) return RECOMMENDED_OLLAMA_MODEL_16GB;
-      return installed[0] ?? "";
+      if (prev && usable.includes(prev)) return prev;
+      if (usable.includes(RECOMMENDED_OLLAMA_MODEL)) return RECOMMENDED_OLLAMA_MODEL;
+      if (usable.includes(RECOMMENDED_OLLAMA_MODEL_16GB)) return RECOMMENDED_OLLAMA_MODEL_16GB;
+      return usable[0] ?? "";
     });
   }, [installed]);
 
@@ -537,7 +540,7 @@ function ModelSelect({
         className="w-full px-3 py-2 rounded-md text-sm bg-[var(--color-input-bg)] border border-[var(--color-line)] focus:border-[var(--color-text-muted)]"
       >
         <option value="">— pick a model —</option>
-        {installed.map((m) => (
+        {completionModels(installed).map((m) => (
           <option key={m} value={m}>
             {m}
             {m === RECOMMENDED_OLLAMA_MODEL

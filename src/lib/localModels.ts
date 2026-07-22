@@ -21,3 +21,24 @@ export function isModelInstalled(installed: string[] | null | undefined, model: 
   const base = model.split(":")[0];
   return installed.some((m) => m === model || m.split(":")[0] === base);
 }
+
+/// Whether a model is embedding-only and so must NOT appear in a chat/summary
+/// (completion) model picker — selecting one makes Ollama's /api/chat 400 with
+/// "does not support chat". Matches embeddinggemma plus the common embedding
+/// families a user might have pulled (nomic-embed, mxbai-embed, arctic-embed,
+/// granite-embedding, bge-*, all-minilm, paraphrase-*).
+export function isEmbeddingModel(name: string): boolean {
+  const n = name.toLowerCase();
+  return (
+    /embed/.test(n) ||
+    n.startsWith("bge-") ||
+    n.startsWith("all-minilm") ||
+    n.startsWith("paraphrase-")
+  );
+}
+
+/// The installed models usable for chat/summary completions — embedding-only
+/// models filtered out.
+export function completionModels(installed: string[] | null | undefined): string[] {
+  return (installed ?? []).filter((m) => !isEmbeddingModel(m));
+}
