@@ -388,9 +388,14 @@ export const ipc = {
   // streamed completion — the answer arrives via chat_* events, so the
   // resolved promise only carries the conversation id + a truncation flag.
   // `chatHistory` reloads a Note's persisted conversation after restart.
-  chatSend: (noteId: string, message: string) =>
-    invoke<ChatSendResult>("chat_send", { noteId, message }),
+  // `scope` is the Scope-popover breadth ("note" | "folder" | "all"), a live
+  // filter on retrieval within the same conversation (issue #47).
+  chatSend: (noteId: string, message: string, scope: ChatScope = "note") =>
+    invoke<ChatSendResult>("chat_send", { noteId, message, scope }),
   chatHistory: (noteId: string) => invoke<ChatMessageDto[]>("chat_history", { noteId }),
+  // Rebuild a Note's retrieval index — called on Note-view unmount so edits
+  // that didn't trigger summarize/diarize still land in search.
+  chatReindexNote: (noteId: string) => invoke<void>("chat_reindex_note", { noteId }),
 
   permissionsStatus: () => invoke<PermissionsStatus>("permissions_status"),
   permissionsRequest: (kind: PermissionKind) => invoke<PermissionsStatus>("permissions_request", { kind }),
@@ -409,10 +414,21 @@ export type PermissionsStatus = {
   screen: PermissionStatus;
 };
 
-// ── AI chat (issue #46) ──────────────────────────────────────────────────
-// A message's content is a typed parts array (opencode v2 shape). Only text
-// parts exist in this slice; reasoning/tool variants arrive with retrieval.
-export type ChatPart = { type: "text"; id: string; text: string };
+// ── AI chat (issues #46, #47) ────────────────────────────────────────────
+// A message's content is a typed parts array (opencode v2 shape): text parts
+// plus, since #47, tool parts recording each executed retrieval call.
+export type ChatCitation = { noteId: string; title: string; createdAt: number };
+export type ChatPart =
+  | { type: "text"; id: string; text: string }
+  | {
+      type: "tool";
+      id: string;
+      name: string;
+      args?: string;
+      result?: string;
+      citations?: ChatCitation[];
+      isError?: boolean;
+    };
 export type ChatMessageDto = {
   id: string;
   role: "user" | "assistant";
@@ -421,8 +437,10 @@ export type ChatMessageDto = {
   createdAt: number;
 };
 export type ChatSendResult = { conversationId: string; truncated: boolean };
+// Retrieval breadth chosen in the Scope popover (issue #47).
+export type ChatScope = "note" | "folder" | "all";
 
-// Slice-3 streaming events (subset of the #46 wire contract).
+// Streaming events (the #46 wire contract + #47 tool/citation events).
 export type ChatTextDeltaEvent = {
   conversationId: string;
   messageId: string;
@@ -431,9 +449,26 @@ export type ChatTextDeltaEvent = {
 };
 export type ChatDoneEvent = { conversationId: string; messageId: string };
 export type ChatErrorEvent = { conversationId: string; message: string };
+export type ChatToolActivityEvent = {
+  conversationId: string;
+  messageId: string;
+  name: string;
+  isError: boolean;
+};
+export type ChatCitationsEvent = {
+  conversationId: string;
+  messageId: string;
+  citations: ChatCitation[];
+};
 
 export function onChatTextDelta(cb: (e: ChatTextDeltaEvent) => void): Promise<UnlistenFn> {
   return listen<ChatTextDeltaEvent>("chat_text_delta", (e) => cb(e.payload));
+}
+export function onChatToolActivity(cb: (e: ChatToolActivityEvent) => void): Promise<UnlistenFn> {
+  return listen<ChatToolActivityEvent>("chat_tool_activity", (e) => cb(e.payload));
+}
+export function onChatCitations(cb: (e: ChatCitationsEvent) => void): Promise<UnlistenFn> {
+  return listen<ChatCitationsEvent>("chat_citations", (e) => cb(e.payload));
 }
 // Part of the wire contract and emitted by the backend after the assistant
 // row is finalised. The Note's ChatPanel drives completion off the chat_send

@@ -1,24 +1,30 @@
 import { memo, useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { useNavigate } from "react-router-dom";
 import { open as openExternal } from "@tauri-apps/plugin-shell";
-import { AlertTriangle, MessageCircle, Send, Settings2 } from "lucide-react";
+import { AlertTriangle, FileText, Loader2, MessageCircle, Send, Settings2 } from "lucide-react";
 import {
   ipc,
+  onChatCitations,
   onChatError,
+  onChatToolActivity,
   onChatTextDelta,
+  type ChatCitation,
   type ChatMessageDto,
+  type ChatScope,
 } from "../lib/ipc";
+import { useNotesStore } from "../lib/store";
 import { useChatReadiness } from "./provider/useChatReadiness";
+import { SelectablePopover, type PopoverItem } from "./SelectablePopover";
 import { RECOMMENDED_OLLAMA_MODEL } from "../lib/localModels";
 import { CommandSnippet } from "./CommandSnippet";
 import { cn } from "../lib/cn";
 
-// Chat with a single Note (issue #46). A message list + input where the user
-// asks questions grounded in the current Note; the answer streams token-by-
-// token (reusing the summary-streaming event style) and the conversation
-// persists locally, reloading after restart. Personal scope only — one
-// conversation per Note, created lazily on the backend on first send.
+// Chat over the user's Notes (issues #46 + #47). The assistant runs an agentic
+// retrieval loop on the backend: it searches/reads notes with tools, streams
+// its answer, and cites the notes it drew from. A Scope popover controls how
+// broadly it searches (this note / this folder / all notes) as a live filter.
 
 const Markdown = memo(function Markdown({ source }: { source: string }) {
   return <ReactMarkdown remarkPlugins={[remarkGfm]}>{source}</ReactMarkdown>;
@@ -27,8 +33,39 @@ const Markdown = memo(function Markdown({ source }: { source: string }) {
 function partsText(m: ChatMessageDto): string {
   return m.parts
     .filter((p) => p.type === "text")
-    .map((p) => p.text)
+    .map((p) => (p.type === "text" ? p.text : ""))
     .join("");
+}
+
+// Citations for an assistant message, gathered from its tool parts and
+// de-duplicated by note (a note cited by several tools shows one chip).
+function messageCitations(m: ChatMessageDto): ChatCitation[] {
+  const seen = new Set<string>();
+  const out: ChatCitation[] = [];
+  for (const p of m.parts) {
+    if (p.type !== "tool" || !p.citations) continue;
+    for (const c of p.citations) {
+      if (!seen.has(c.noteId)) {
+        seen.add(c.noteId);
+        out.push(c);
+      }
+    }
+  }
+  return out;
+}
+
+// A running tool call → a human progress line (story 18).
+function toolActivityLabel(name: string): string {
+  switch (name) {
+    case "search_notes":
+      return "Searching your notes…";
+    case "get_note":
+      return "Reading a note…";
+    case "list_notes":
+      return "Browsing your notes…";
+    default:
+      return "Working…";
+  }
 }
 
 export function ChatPanel({ noteId }: { noteId: string }) {
@@ -37,21 +74,34 @@ export function ChatPanel({ noteId }: { noteId: string }) {
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
   const [streaming, setStreaming] = useState("");
+  const [activity, setActivity] = useState<string | null>(null);
+  const [liveCitations, setLiveCitations] = useState<ChatCitation[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [truncated, setTruncated] = useState(false);
+  const [scope, setScope] = useState<ChatScope>("note");
   const scrollRef = useRef<HTMLDivElement | null>(null);
-  // A ref so the (once-bound) event listeners can gate on "is a send in
-  // flight" without re-subscribing every time `sending` flips.
   const sendingRef = useRef(false);
 
+  // The anchor note's folder drives the "this folder" scope option.
+  const folder = useNotesStore((s) => {
+    const note = s.notes.find((n) => n.id === noteId);
+    const fid = note?.folder_id;
+    return fid ? s.folders.find((f) => f.id === fid) ?? null : null;
+  });
+
   // Load persisted history on mount / note change, and clear transient state.
+  // On unmount / note change, rebuild the note's retrieval index so edits made
+  // in this session are searchable next time (content-settled checkpoint).
   useEffect(() => {
     let cancelled = false;
     setInput("");
     setStreaming("");
+    setActivity(null);
+    setLiveCitations([]);
     setError(null);
     setTruncated(false);
     setSending(false);
+    setScope("note");
     sendingRef.current = false;
     ipc
       .chatHistory(noteId)
@@ -63,12 +113,12 @@ export function ChatPanel({ noteId }: { noteId: string }) {
       });
     return () => {
       cancelled = true;
+      void ipc.chatReindexNote(noteId).catch(() => {});
     };
   }, [noteId]);
 
-  // Stream subscription. Bound once; the cancelled-flag + claim pattern keeps
-  // it StrictMode- and async-listen-safe (mirrors the summary streaming in
-  // Note.tsx). Deltas are accepted only while our own send is in flight.
+  // Stream subscription. Bound once; cancelled-flag + claim keeps it StrictMode-
+  // and async-listen-safe. Deltas/activity accepted only while our send is live.
   useEffect(() => {
     let cancelled = false;
     const unsubs: (() => void)[] = [];
@@ -77,7 +127,21 @@ export function ChatPanel({ noteId }: { noteId: string }) {
       else unsubs.push(u);
     };
     onChatTextDelta((e) => {
-      if (sendingRef.current) setStreaming((s) => s + e.delta);
+      if (sendingRef.current) {
+        setStreaming((s) => s + e.delta);
+        setActivity(null); // text is flowing — clear the progress line
+      }
+    }).then(claim);
+    onChatToolActivity((e) => {
+      if (sendingRef.current) setActivity(toolActivityLabel(e.name));
+    }).then(claim);
+    onChatCitations((e) => {
+      if (sendingRef.current) {
+        setLiveCitations((prev) => {
+          const seen = new Set(prev.map((c) => c.noteId));
+          return [...prev, ...e.citations.filter((c) => !seen.has(c.noteId))];
+        });
+      }
     }).then(claim);
     onChatError((e) => {
       if (sendingRef.current) setError(e.message);
@@ -88,11 +152,10 @@ export function ChatPanel({ noteId }: { noteId: string }) {
     };
   }, []);
 
-  // Keep the newest content in view.
   useEffect(() => {
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [messages, streaming, sending]);
+  }, [messages, streaming, sending, activity]);
 
   async function send() {
     const text = input.trim();
@@ -100,11 +163,11 @@ export function ChatPanel({ noteId }: { noteId: string }) {
     setInput("");
     setError(null);
     setStreaming("");
+    setActivity(null);
+    setLiveCitations([]);
     setTruncated(false);
     setSending(true);
     sendingRef.current = true;
-    // Optimistic user bubble so the message shows instantly; replaced by the
-    // authoritative history on completion.
     const optimistic: ChatMessageDto = {
       id: `optimistic-${Date.now()}`,
       role: "user",
@@ -114,13 +177,10 @@ export function ChatPanel({ noteId }: { noteId: string }) {
     };
     setMessages((m) => [...m, optimistic]);
     try {
-      const result = await ipc.chatSend(noteId, text);
+      const result = await ipc.chatSend(noteId, text, scope);
       setMessages(await ipc.chatHistory(noteId));
       setTruncated(result.truncated);
     } catch (e) {
-      // The backend rolls back a failed assistant turn; reload reflects the
-      // truth (the user turn persists on a stream error, nothing on a config
-      // error). Only surface a message here if the chat_error event didn't.
       setError((prev) => prev ?? String(e));
       try {
         setMessages(await ipc.chatHistory(noteId));
@@ -129,6 +189,7 @@ export function ChatPanel({ noteId }: { noteId: string }) {
       }
     } finally {
       setStreaming("");
+      setActivity(null);
       setSending(false);
       sendingRef.current = false;
     }
@@ -141,10 +202,6 @@ export function ChatPanel({ noteId }: { noteId: string }) {
     }
   }
 
-  // Not yet configured → the readiness/setup prompt from #44: say exactly
-  // what's missing, and for Ollama surface the same install link + copy-pull
-  // affordances the Settings tab uses. Key entry stays in Settings (sensitive
-  // + shared across features), so OpenAI shows a pointer there.
   if (!readinessLoading && !ready) {
     const isOllama = provider === "ollama";
     return (
@@ -176,22 +233,34 @@ export function ChatPanel({ noteId }: { noteId: string }) {
     );
   }
 
-  const showTyping = sending && streaming.length === 0;
+  const showTyping = sending && streaming.length === 0 && !activity;
 
   return (
     <div className="flex-1 min-h-0 flex flex-col">
+      <ScopeBar scope={scope} onScope={setScope} folderName={folder?.name ?? null} />
+
       <div ref={scrollRef} className="flex-1 min-h-0 overflow-y-auto px-4 py-4 flex flex-col gap-3">
         {messages.length === 0 && !sending ? (
           <div className="flex-1 flex flex-col items-center justify-center gap-3 px-6 text-center">
             <MessageCircle size={22} strokeWidth={1.5} className="text-[var(--color-text-disabled)]" />
             <p className="text-sm text-[var(--color-text-muted)]">
-              Ask anything about this note — it answers from your notes, transcript, and summary.
+              Ask anything about your notes — it searches, reads, and cites them to answer.
             </p>
           </div>
         ) : (
-          messages.map((m) => <Bubble key={m.id} role={m.role} text={partsText(m)} />)
+          messages.map((m) => (
+            <Bubble key={m.id} role={m.role} text={partsText(m)} citations={messageCitations(m)} />
+          ))
         )}
-        {sending && streaming.length > 0 && <Bubble role="assistant" text={streaming} />}
+        {sending && streaming.length > 0 && (
+          <Bubble role="assistant" text={streaming} citations={liveCitations} />
+        )}
+        {activity && (
+          <div className="self-start flex items-center gap-1.5 text-xs text-[var(--color-text-muted)] px-1">
+            <Loader2 size={12} strokeWidth={2} className="animate-spin" />
+            {activity}
+          </div>
+        )}
         {showTyping && (
           <div className="self-start text-xs text-[var(--color-text-muted)] px-1">Thinking…</div>
         )}
@@ -216,7 +285,7 @@ export function ChatPanel({ noteId }: { noteId: string }) {
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={onKeyDown}
           rows={1}
-          placeholder="Ask about this note…"
+          placeholder="Ask about your notes…"
           disabled={sending}
           className="flex-1 resize-none max-h-40 bg-transparent text-sm leading-relaxed px-2 py-1.5 outline-none placeholder:text-[var(--color-text-disabled)] disabled:opacity-60"
         />
@@ -238,10 +307,56 @@ export function ChatPanel({ noteId }: { noteId: string }) {
   );
 }
 
-function Bubble({ role, text }: { role: "user" | "assistant"; text: string }) {
+// Breadth selector at the top of the chat. "This folder" only appears when the
+// note actually has a folder (there's nothing to widen to otherwise).
+function ScopeBar({
+  scope,
+  onScope,
+  folderName,
+}: {
+  scope: ChatScope;
+  onScope: (s: ChatScope) => void;
+  folderName: string | null;
+}) {
+  const items: PopoverItem[] = [
+    { id: "note", label: "This note" },
+    ...(folderName ? [{ id: "folder", label: `Folder: ${folderName}` }] : []),
+    { id: "all", label: "All notes" },
+  ];
+  // If the folder disappears while "folder" is selected, fall back to "note".
+  const activeId = scope === "folder" && !folderName ? "note" : scope;
+  const label = items.find((i) => i.id === activeId)?.label ?? "This note";
+
+  return (
+    <div className="shrink-0 flex items-center gap-2 px-4 py-2 border-b border-[var(--color-line)]">
+      <span className="text-xs text-[var(--color-text-disabled)]">Search</span>
+      <SelectablePopover
+        ariaLabel="Chat scope"
+        items={items}
+        activeId={activeId}
+        onSelect={(id) => onScope((id as ChatScope) ?? "note")}
+        trigger={
+          <span className="nd-chip inline-flex items-center gap-1 text-xs cursor-pointer">
+            {label}
+          </span>
+        }
+      />
+    </div>
+  );
+}
+
+function Bubble({
+  role,
+  text,
+  citations,
+}: {
+  role: "user" | "assistant";
+  text: string;
+  citations: ChatCitation[];
+}) {
   const isUser = role === "user";
   return (
-    <div className={cn("flex", isUser ? "justify-end" : "justify-start")}>
+    <div className={cn("flex flex-col", isUser ? "items-end" : "items-start")}>
       <div
         className={cn(
           "max-w-[85%] rounded-[var(--radius-card)] px-3 py-2 text-sm leading-relaxed",
@@ -258,6 +373,30 @@ function Bubble({ role, text }: { role: "user" | "assistant"; text: string }) {
           </div>
         )}
       </div>
+      {!isUser && citations.length > 0 && (
+        <div className="mt-1.5 flex flex-wrap gap-1.5 max-w-[85%]">
+          {citations.map((c) => (
+            <CitationChip key={c.noteId} citation={c} />
+          ))}
+        </div>
+      )}
     </div>
+  );
+}
+
+function CitationChip({ citation }: { citation: ChatCitation }) {
+  const navigate = useNavigate();
+  const title = citation.title.trim() || "Untitled note";
+  const date = new Date(citation.createdAt).toLocaleDateString();
+  return (
+    <button
+      type="button"
+      onClick={() => navigate(`/note/${citation.noteId}`)}
+      title={`Open “${title}” (${date})`}
+      className="nd-chip inline-flex items-center gap-1 text-xs cursor-pointer hover:text-[var(--color-text)]"
+    >
+      <FileText size={11} strokeWidth={1.7} className="shrink-0" />
+      <span className="truncate max-w-[16rem]">{title}</span>
+    </button>
   );
 }
