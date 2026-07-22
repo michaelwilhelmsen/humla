@@ -1248,61 +1248,6 @@ fn fts_match_query(query: &str) -> Option<String> {
     }
 }
 
-/// Keyword-search Note chunks in a workspace, optionally narrowed by folder
-/// and/or client (independent, combinable filters — never a nested taxonomy).
-/// Returns the top `limit` chunk hits ranked by bm25. An empty/uparseable query
-/// or no matches returns an empty vec (the tool layer turns that into a
-/// structured "no results" the model recovers from).
-pub fn search_chunks(
-    conn: &Connection,
-    query: &str,
-    filter: NoteFilter<'_>,
-    workspace: &str,
-    limit: usize,
-) -> Result<Vec<ChunkHit>> {
-    let Some(match_expr) = fts_match_query(query) else {
-        return Ok(Vec::new());
-    };
-    use rusqlite::types::Value;
-    let mut sql = String::from(
-        "SELECT n.id, n.title, n.created_at, c.source, c.text, bm25(note_chunks_fts) AS rank \
-         FROM note_chunks_fts f \
-         JOIN note_chunks c ON c.id = f.chunk_id \
-         JOIN notes n ON n.id = c.note_id \
-         WHERE note_chunks_fts MATCH ?1 AND n.workspace_id = ?2 AND n.deleted_at IS NULL",
-    );
-    let mut args: Vec<Value> = vec![Value::Text(match_expr), Value::Text(workspace.to_string())];
-    if let Some(id) = filter.note_id {
-        args.push(Value::Text(id.to_string()));
-        sql.push_str(&format!(" AND n.id = ?{}", args.len()));
-    }
-    if let Some(f) = filter.folder_id {
-        args.push(Value::Text(f.to_string()));
-        sql.push_str(&format!(" AND n.folder_id = ?{}", args.len()));
-    }
-    if let Some(cl) = filter.client_id {
-        args.push(Value::Text(cl.to_string()));
-        sql.push_str(&format!(" AND n.client_id = ?{}", args.len()));
-    }
-    args.push(Value::Integer(limit as i64));
-    sql.push_str(&format!(" ORDER BY rank LIMIT ?{}", args.len()));
-
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt
-        .query_map(rusqlite::params_from_iter(args), |row| {
-            Ok(ChunkHit {
-                note_id: row.get(0)?,
-                note_title: row.get(1)?,
-                note_created_at: row.get(2)?,
-                source: row.get(3)?,
-                text: row.get(4)?,
-                rank: row.get(5)?,
-            })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(rows)
-}
-
 // ── Semantic retrieval: embedding cache + hybrid (RRF) search (issue #48) ────
 
 /// Encode an embedding vector as a little-endian f32 blob for storage.
@@ -1353,7 +1298,28 @@ pub fn store_embedding(conn: &Connection, text_hash: &str, model: &str, vector: 
     Ok(())
 }
 
-/// How many chunk embeddings exist for a model (telemetry / tests).
+/// Ids of live notes that have at least one chunk with no embedding under
+/// `model` — the work-list for the startup embed backfill, so cross-note
+/// semantic search works day-one rather than only for touched notes.
+pub fn note_ids_needing_embedding(conn: &Connection, model: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT c.note_id FROM note_chunks c \
+         JOIN notes n ON n.id = c.note_id \
+         WHERE n.deleted_at IS NULL AND c.text_hash <> '' \
+         AND NOT EXISTS ( \
+            SELECT 1 FROM chunk_embeddings e \
+            WHERE e.text_hash = c.text_hash AND e.model = ?1 \
+         )",
+    )?;
+    let ids = stmt
+        .query_map(params![model], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(ids)
+}
+
+/// How many chunk embeddings exist for a model. Test-only for now (asserts the
+/// incremental cache); promote to `pub` if telemetry ever needs it.
+#[cfg(test)]
 pub fn count_embeddings(conn: &Connection, model: &str) -> Result<i64> {
     Ok(conn.query_row(
         "SELECT COUNT(*) FROM chunk_embeddings WHERE model = ?1",
@@ -1408,7 +1374,7 @@ struct IdentifiedHit {
 }
 
 /// Keyword-ranked chunks (bm25, best first) with their chunk ids — the FTS half
-/// of hybrid search. Mirrors `search_chunks`' filters.
+/// of hybrid search. Applies the same combinable note filters as the rest.
 fn keyword_ranked(
     conn: &Connection,
     query: &str,
@@ -2322,7 +2288,7 @@ mod tests {
         reindex_note(&conn, &a.id, &na.body, &na.transcript, &na.summary).unwrap();
         reindex_note(&conn, &b.id, &nb.body, &nb.transcript, &nb.summary).unwrap();
 
-        let hits = search_chunks(&conn, "budget", NoteFilter::default(), "", 10).unwrap();
+        let hits = hybrid_search_chunks(&conn, "budget", None, "", NoteFilter::default(), "", 10).unwrap();
         assert_eq!(hits.len(), 1, "only the budget note matches");
         assert_eq!(hits[0].note_id, a.id);
         assert_eq!(hits[0].note_title, "Budget planning");
@@ -2330,12 +2296,12 @@ mod tests {
 
         // Punctuation / operator chars in the query don't blow up FTS5.
         let safe =
-            search_chunks(&conn, "budget: \"marketing\" -foo*", NoteFilter::default(), "", 10).unwrap();
+            hybrid_search_chunks(&conn, "budget: \"marketing\" -foo*", None, "", NoteFilter::default(), "", 10).unwrap();
         assert!(!safe.is_empty(), "sanitised query still matches");
 
         // A gibberish query returns nothing rather than erroring.
-        assert!(search_chunks(&conn, "!!!@@@", NoteFilter::default(), "", 10).unwrap().is_empty());
-        assert!(search_chunks(&conn, "zzzzznope", NoteFilter::default(), "", 10).unwrap().is_empty());
+        assert!(hybrid_search_chunks(&conn, "!!!@@@", None, "", NoteFilter::default(), "", 10).unwrap().is_empty());
+        assert!(hybrid_search_chunks(&conn, "zzzzznope", None, "", NoteFilter::default(), "", 10).unwrap().is_empty());
     }
 
     #[test]
@@ -2353,10 +2319,10 @@ mod tests {
 
         // Old content is no longer findable after an edit; new content is.
         reindex_note(&conn, &n.id, "hello world", "", "").unwrap();
-        assert_eq!(search_chunks(&conn, "world", NoteFilter::default(), "", 10).unwrap().len(), 1);
+        assert_eq!(hybrid_search_chunks(&conn, "world", None, "", NoteFilter::default(), "", 10).unwrap().len(), 1);
         reindex_note(&conn, &n.id, "totally different", "", "").unwrap();
-        assert!(search_chunks(&conn, "world", NoteFilter::default(), "", 10).unwrap().is_empty());
-        assert_eq!(search_chunks(&conn, "different", NoteFilter::default(), "", 10).unwrap().len(), 1);
+        assert!(hybrid_search_chunks(&conn, "world", None, "", NoteFilter::default(), "", 10).unwrap().is_empty());
+        assert_eq!(hybrid_search_chunks(&conn, "different", None, "", NoteFilter::default(), "", 10).unwrap().len(), 1);
     }
 
     #[test]
@@ -2396,14 +2362,14 @@ mod tests {
             NoteFilter { folder_id: Some(&folder.id), client_id: Some(&client.id), ..Default::default() };
         let f_note = NoteFilter { note_id: Some(&outside.id), ..Default::default() };
 
-        assert_eq!(search_chunks(&conn, "keyword", NoteFilter::default(), "", 10).unwrap().len(), 2, "unfiltered sees both");
-        let by_folder = search_chunks(&conn, "keyword", f_folder, "", 10).unwrap();
+        assert_eq!(hybrid_search_chunks(&conn, "keyword", None, "", NoteFilter::default(), "", 10).unwrap().len(), 2, "unfiltered sees both");
+        let by_folder = hybrid_search_chunks(&conn, "keyword", None, "", f_folder, "", 10).unwrap();
         assert_eq!(by_folder.len(), 1);
         assert_eq!(by_folder[0].note_id, inside.id);
         // folder AND client combine (both narrow to the same single note).
-        assert_eq!(search_chunks(&conn, "keyword", f_both, "", 10).unwrap().len(), 1);
+        assert_eq!(hybrid_search_chunks(&conn, "keyword", None, "", f_both, "", 10).unwrap().len(), 1);
         // note_id clamp (the "this Note" breadth) pins search to one note.
-        let by_note = search_chunks(&conn, "keyword", f_note, "", 10).unwrap();
+        let by_note = hybrid_search_chunks(&conn, "keyword", None, "", f_note, "", 10).unwrap();
         assert_eq!(by_note.len(), 1);
         assert_eq!(by_note[0].note_id, outside.id);
 

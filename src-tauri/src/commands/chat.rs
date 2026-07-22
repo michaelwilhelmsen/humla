@@ -118,6 +118,35 @@ pub fn backfill_note_chunks(db: &std::sync::Arc<parking_lot::Mutex<rusqlite::Con
     }
 }
 
+/// One-time embedding backfill (issue #48): after chunks exist, embed every
+/// Note that still lacks vectors under the current model, so semantic search
+/// covers the whole corpus on day one — not only notes touched since #48.
+/// Runs off the request path at startup, best-effort (a missing model / API
+/// error just leaves those notes keyword-only). Batched per Note + cached, so
+/// it's idempotent and cheap on reruns.
+pub async fn embed_backfill(app: AppHandle) {
+    let state: State<AppState> = app.state();
+    let key = super::read_provider_api_key(&state, "openai").ok().flatten();
+    let resolved = {
+        let conn = state.db.lock();
+        resolve_chat(&conn, key)
+    };
+    let Ok(resolved) = resolved else { return };
+    let adapter = resolve_embed(&resolved).adapter();
+    let ids = {
+        let conn = state.db.lock();
+        db::note_ids_needing_embedding(&conn, adapter.model_id()).unwrap_or_default()
+    };
+    if ids.is_empty() {
+        return;
+    }
+    eprintln!("[chat] embedding backfill: {} note(s) under {}", ids.len(), adapter.model_id());
+    for id in ids {
+        embed_note(&state.db, &adapter, &id).await;
+    }
+    eprintln!("[chat] embedding backfill complete");
+}
+
 /// Rebuild a Note's retrieval index on demand — the frontend calls this when
 /// the Note view unmounts, so edits made without triggering summarize/diarize
 /// still land in search. Re-chunks synchronously, then embeds off the request
