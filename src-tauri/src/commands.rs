@@ -2638,6 +2638,9 @@ async fn diarize_and_apply(
         let state: State<AppState> = app.state();
         let conn = state.db.lock();
         db::set_transcript(&conn, &note_id, &combined)?;
+        // Content-settled checkpoint (issue #47): the diarized transcript is
+        // the final transcript — refresh retrieval chunks so chat can search it.
+        chat::reindex_note_content(&conn, &note_id);
     }
     let _ = app.emit(
         "transcript_replaced",

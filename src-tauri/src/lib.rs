@@ -235,6 +235,21 @@ where
                 }
             }
 
+            // One-time retrieval backfill (issue #47): index any Notes that
+            // predate the chunk substrate so agentic chat can search them.
+            // Off the main thread — a large library shouldn't delay launch.
+            // `async_runtime::spawn` (not bare tokio::spawn) — see the setup
+            // main-thread caveat in CLAUDE.md.
+            {
+                let db = {
+                    let state: tauri::State<AppState> = app.state();
+                    state.db.clone()
+                };
+                tauri::async_runtime::spawn_blocking(move || {
+                    commands::backfill_note_chunks(&db);
+                });
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -328,6 +343,7 @@ where
             commands::summarize_note,
             commands::chat_send,
             commands::chat_history,
+            commands::chat_reindex_note,
             commands::permissions_status,
             commands::permissions_request,
             commands::permissions_open_settings,

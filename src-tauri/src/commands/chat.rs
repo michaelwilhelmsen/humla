@@ -6,12 +6,69 @@
 //! assembly, budget, streaming orchestration) lives Tauri-free in `crate::chat`.
 
 use super::{DEFAULT_LOCAL_LLM_BASE_URL, DEFAULT_SUMMARY_MODEL};
-use crate::chat::{self, ChatCtx, ChatEvent};
+use crate::chat::{self, ChatCtx, ChatEvent, Citation, ToolScope};
 use crate::db::{self, CHAT_SCOPE_NOTE, CHAT_TENANT_PERSONAL};
 use crate::openai;
 use crate::AppState;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
+
+/// Rebuild one Note's retrieval chunks from its current content. The single
+/// place body-HTML→text + `db::reindex_note` are combined, called from every
+/// content-settled checkpoint (after summarize, after diarization, on
+/// Note-view unmount) and the startup backfill. Best-effort: a failure to
+/// index never blocks the user-facing action.
+pub(crate) fn reindex_note_content(conn: &rusqlite::Connection, note_id: &str) {
+    if let Ok(note) = db::get_note(conn, note_id) {
+        let body_text = crate::html_text::html_to_text(&note.body);
+        if let Err(e) = db::reindex_note(conn, note_id, &body_text, &note.transcript, &note.summary) {
+            eprintln!("[chat] reindex of note {note_id} failed: {e}");
+        }
+    }
+}
+
+/// One-time backfill: index every live Note that has no chunks yet, so notes
+/// created before #47 become searchable. Cheap and idempotent — reruns index
+/// only the still-missing ones. Runs off-thread at startup.
+pub fn backfill_note_chunks(db: &std::sync::Arc<parking_lot::Mutex<rusqlite::Connection>>) {
+    let ids = {
+        let conn = db.lock();
+        db::note_ids_without_chunks(&conn).unwrap_or_default()
+    };
+    if ids.is_empty() {
+        return;
+    }
+    eprintln!("[chat] backfilling retrieval chunks for {} note(s)", ids.len());
+    for id in ids {
+        let conn = db.lock();
+        reindex_note_content(&conn, &id);
+    }
+}
+
+/// Rebuild a Note's retrieval index on demand — the frontend calls this when
+/// the Note view unmounts, so edits made without triggering summarize/diarize
+/// still land in search.
+#[tauri::command]
+pub fn chat_reindex_note(state: State<AppState>, note_id: String) -> Result<(), String> {
+    let conn = state.db.lock();
+    reindex_note_content(&conn, &note_id);
+    Ok(())
+}
+
+/// Resolve the retrieval breadth the user picked in the Scope popover into a
+/// server-enforced `ToolScope`. "folder" resolves to the anchor Note's folder;
+/// a folder-less Note falls back to Note breadth (there's no folder to widen
+/// to). Anything unrecognised is treated as the safe single-Note breadth.
+fn resolve_scope(breadth: &str, note: &db::Note) -> ToolScope {
+    match breadth {
+        "all" => ToolScope::All,
+        "folder" => match note.folder_id.as_deref() {
+            Some(folder_id) if !folder_id.is_empty() => ToolScope::Folder(folder_id.to_string()),
+            _ => ToolScope::Note(note.id.clone()),
+        },
+        _ => ToolScope::Note(note.id.clone()),
+    }
+}
 
 // Resolved chat provider for a single call. Only "openai" (cloud, shared key)
 // and "ollama" (local) are valid — see issue #44.
@@ -95,6 +152,26 @@ struct ChatErrorPayload {
     message: String,
 }
 
+/// Tool activity between steps — drives the "searching your notes…" progress
+/// line (issue #47, story 18).
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatToolActivityPayload {
+    conversation_id: String,
+    message_id: String,
+    name: String,
+    is_error: bool,
+}
+
+/// Sources gathered so far, for citation chips (story 28).
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatCitationsPayload {
+    conversation_id: String,
+    message_id: String,
+    citations: Vec<Citation>,
+}
+
 /// Synchronous result of `chat_send`: enough for the UI to attach a
 /// "context truncated" notice to the turn and to know which conversation it
 /// landed in. The streamed answer arrives via events, not here.
@@ -110,22 +187,32 @@ pub async fn chat_send(
     app: AppHandle,
     note_id: String,
     message: String,
+    scope: Option<String>,
 ) -> Result<ChatSendResult, String> {
     let state: State<AppState> = app.state();
     // Keychain read out of band — not inside the DB lock. Chat reuses the
     // shared OpenAI key (issue #44).
     let openai_api_key = super::read_provider_api_key(&state, "openai")?;
+    let breadth = scope.unwrap_or_else(|| "note".into());
 
-    let (grounding, resolved, conversation_id) = {
+    let (grounding, resolved, conversation_id, tool_scope, workspace) = {
         let conn = state.db.lock();
         let note = db::get_note(&conn, &note_id).map_err(|e| e.to_string())?;
+        let workspace = super::cloud::active_workspace(&conn);
         let resolved = resolve_chat(&conn, openai_api_key).map_err(|e| e.to_string())?;
+        // Conversation is keyed by the anchor Note; breadth is a live filter
+        // within it, not a new conversation (issue #47).
         let conversation =
             db::get_or_create_conversation(&conn, CHAT_TENANT_PERSONAL, CHAT_SCOPE_NOTE, &note_id)
                 .map_err(|e| e.to_string())?;
+        // Keep the anchor Note searchable — reindex it now so "this Note" and
+        // any broader search always find the note the user is looking at, even
+        // if a content-settled checkpoint hasn't fired yet.
         let body_text = crate::html_text::html_to_text(&note.body);
+        let _ = db::reindex_note(&conn, &note.id, &body_text, &note.transcript, &note.summary);
+        let tool_scope = resolve_scope(&breadth, &note);
         let grounding = chat::build_grounding(&body_text, &note.transcript, &note.summary);
-        (grounding, resolved, conversation.id)
+        (grounding, resolved, conversation.id, tool_scope, workspace)
     };
 
     let adapter = chat::build_chat_adapter(&resolved.provider);
@@ -141,6 +228,23 @@ pub async fn chat_send(
                     block_id,
                     delta,
                 },
+            );
+        }
+        ChatEvent::ToolActivity { message_id, name, is_error } => {
+            let _ = app_for_sink.emit(
+                "chat_tool_activity",
+                ChatToolActivityPayload {
+                    conversation_id: conv_for_sink.clone(),
+                    message_id,
+                    name,
+                    is_error,
+                },
+            );
+        }
+        ChatEvent::Citations { message_id, citations } => {
+            let _ = app_for_sink.emit(
+                "chat_citations",
+                ChatCitationsPayload { conversation_id: conv_for_sink.clone(), message_id, citations },
             );
         }
         ChatEvent::Done { message_id } => {
@@ -163,6 +267,8 @@ pub async fn chat_send(
         ctx,
         &conversation_id,
         &grounding.text,
+        &tool_scope,
+        &workspace,
         &message,
         sink,
     )

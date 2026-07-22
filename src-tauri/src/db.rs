@@ -175,6 +175,33 @@ pub fn open(path: &Path) -> Result<Connection> {
         );
         CREATE INDEX IF NOT EXISTS idx_messages_conversation
             ON messages(conversation_id, seq);
+
+        -- Retrieval substrate for agentic chat (issue #47). Each Note is split
+        -- into fixed-size chunks across its body / transcript / summary; the
+        -- chunks are the unit of keyword search (and, in the next slice, of
+        -- semantic embeddings). `note_chunks` holds the structured rows (source
+        -- + order + text) for citations; `note_chunks_fts` is the FTS5 index the
+        -- search tool queries. The two are kept in lockstep by `reindex_note`.
+        CREATE TABLE IF NOT EXISTS note_chunks (
+            id          TEXT PRIMARY KEY,
+            note_id     TEXT NOT NULL,
+            seq         INTEGER NOT NULL,
+            source      TEXT NOT NULL,
+            text        TEXT NOT NULL,
+            created_at  INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_note_chunks_note ON note_chunks(note_id);
+
+        -- Standalone FTS5 index (not external-content, so plain DELETE/INSERT
+        -- keep it in sync without triggers). `chunk_id`/`note_id` ride along
+        -- UNINDEXED so a MATCH returns the joinable ids directly. unicode61 with
+        -- diacritics folded suits mixed Norwegian/English notes.
+        CREATE VIRTUAL TABLE IF NOT EXISTS note_chunks_fts USING fts5(
+            text,
+            chunk_id UNINDEXED,
+            note_id UNINDEXED,
+            tokenize = 'unicode61 remove_diacritics 2'
+        );
         "#,
     )?;
     // Idempotent migrations for older schemas. ALTER TABLE adds columns
@@ -1008,6 +1035,279 @@ pub fn list_chat_messages(conn: &Connection, conversation_id: &str) -> Result<Ve
     Ok(rows)
 }
 
+// ── Retrieval substrate: chunking + FTS5 keyword search (issue #47) ──────────
+
+/// Target chunk size in characters. ~750 tokens at ~4 chars/token, comfortably
+/// inside the 500–1000-token window the issue asks for. Chunks break on
+/// paragraph boundaries; a paragraph longer than this is hard-split.
+pub const CHUNK_TARGET_CHARS: usize = 3000;
+
+/// A keyword-search hit: the matched chunk plus enough of the parent Note to
+/// build a citation chip (title + date). `rank` is the raw bm25 score (lower =
+/// better); callers order by it and otherwise treat it as opaque.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChunkHit {
+    pub note_id: String,
+    pub note_title: String,
+    pub note_created_at: i64,
+    pub source: String,
+    pub text: String,
+    pub rank: f64,
+}
+
+/// Lightweight Note descriptor for the `list_notes` tool — just what a citation
+/// or a "which note?" decision needs, never the full body/transcript.
+#[derive(Debug, Clone, Serialize)]
+pub struct NoteMeta {
+    pub id: String,
+    pub title: String,
+    pub created_at: i64,
+    pub folder_id: Option<String>,
+    pub client_id: Option<String>,
+}
+
+/// Independent, combinable Note filters for retrieval. Every field is optional
+/// and ANDs with the others — never a nested taxonomy. `note_id` backs the
+/// chat "this Note" breadth clamp; `folder_id`/`client_id` back the "this
+/// Folder" clamp and the model's own narrowing tool params.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoteFilter<'a> {
+    pub note_id: Option<&'a str>,
+    pub folder_id: Option<&'a str>,
+    pub client_id: Option<&'a str>,
+}
+
+/// Split arbitrary text into ~`target`-char chunks, breaking on blank-line
+/// paragraph boundaries where possible and hard-splitting any single paragraph
+/// longer than `target`. Blank/whitespace input yields no chunks.
+pub fn split_into_chunks(text: &str, target: usize) -> Vec<String> {
+    let target = target.max(1);
+    let mut chunks: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    // Paragraphs are runs separated by blank lines; fall back to the whole
+    // string if there are none.
+    for para in text.split("\n\n") {
+        let para = para.trim();
+        if para.is_empty() {
+            continue;
+        }
+        if para.chars().count() > target {
+            // Flush what we have, then hard-split the oversized paragraph on
+            // char boundaries.
+            if !cur.is_empty() {
+                chunks.push(std::mem::take(&mut cur));
+            }
+            let chars: Vec<char> = para.chars().collect();
+            for window in chars.chunks(target) {
+                chunks.push(window.iter().collect());
+            }
+            continue;
+        }
+        // Would appending this paragraph overflow the target? If so, flush.
+        if !cur.is_empty() && cur.chars().count() + para.chars().count() + 2 > target {
+            chunks.push(std::mem::take(&mut cur));
+        }
+        if !cur.is_empty() {
+            cur.push_str("\n\n");
+        }
+        cur.push_str(para);
+    }
+    if !cur.is_empty() {
+        chunks.push(cur);
+    }
+    chunks
+}
+
+/// Produce the (source, text) chunk list for a Note. `body_text` must already be
+/// plain text (HTML stripped by the caller). Sources are chunked independently
+/// so a chunk never straddles e.g. transcript and summary.
+pub fn note_chunk_texts(
+    body_text: &str,
+    transcript: &str,
+    summary: &str,
+) -> Vec<(&'static str, String)> {
+    let mut out: Vec<(&'static str, String)> = Vec::new();
+    for (source, text) in [
+        ("body", body_text),
+        ("transcript", transcript),
+        ("summary", summary),
+    ] {
+        for chunk in split_into_chunks(text, CHUNK_TARGET_CHARS) {
+            out.push((source, chunk));
+        }
+    }
+    out
+}
+
+/// Rebuild a Note's chunk rows + FTS index from its current content. Idempotent:
+/// clears the Note's existing chunks first, so calling it on every
+/// content-settled checkpoint keeps the index fresh without duplication.
+/// Returns the number of chunks indexed.
+pub fn reindex_note(
+    conn: &Connection,
+    note_id: &str,
+    body_text: &str,
+    transcript: &str,
+    summary: &str,
+) -> Result<usize> {
+    remove_note_chunks(conn, note_id)?;
+    let now = now_ms();
+    let chunks = note_chunk_texts(body_text, transcript, summary);
+    for (seq, (source, text)) in chunks.iter().enumerate() {
+        let chunk_id = uuid::Uuid::new_v4().to_string();
+        conn.execute(
+            "INSERT INTO note_chunks (id, note_id, seq, source, text, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![chunk_id, note_id, seq as i64, source, text, now],
+        )?;
+        conn.execute(
+            "INSERT INTO note_chunks_fts (text, chunk_id, note_id) VALUES (?1, ?2, ?3)",
+            params![text, chunk_id, note_id],
+        )?;
+    }
+    Ok(chunks.len())
+}
+
+/// Drop a Note's chunk + FTS rows (e.g. before a rebuild, or when a Note is
+/// hard-deleted). Safe to call for a Note that has none.
+pub fn remove_note_chunks(conn: &Connection, note_id: &str) -> Result<()> {
+    conn.execute("DELETE FROM note_chunks WHERE note_id = ?1", params![note_id])?;
+    conn.execute("DELETE FROM note_chunks_fts WHERE note_id = ?1", params![note_id])?;
+    Ok(())
+}
+
+/// Ids of live notes that have no chunks yet — the work-list for the one-time
+/// startup backfill that makes pre-#47 notes searchable. Cheap anti-join.
+pub fn note_ids_without_chunks(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT id FROM notes WHERE deleted_at IS NULL \
+         AND id NOT IN (SELECT DISTINCT note_id FROM note_chunks)",
+    )?;
+    let ids = stmt
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(ids)
+}
+
+/// Sanitise a free-text query into a safe FTS5 MATCH expression. FTS5 MATCH
+/// syntax treats many characters as operators (`"`, `*`, `:`, `-`, `(`, `^`,
+/// `AND`/`OR`/`NOT`), so a raw user/model string can be a syntax error. We keep
+/// only alphanumeric runs as terms, wrap each in double quotes (defeating
+/// operator interpretation), and join with `OR` for recall — bm25 still ranks
+/// notes matching more/rarer terms higher. Returns `None` if no usable term
+/// remains, which the caller surfaces as an empty-query error.
+fn fts_match_query(query: &str) -> Option<String> {
+    let terms: Vec<String> = query
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(|t| format!("\"{}\"", t.to_lowercase()))
+        .collect();
+    if terms.is_empty() {
+        None
+    } else {
+        Some(terms.join(" OR "))
+    }
+}
+
+/// Keyword-search Note chunks in a workspace, optionally narrowed by folder
+/// and/or client (independent, combinable filters — never a nested taxonomy).
+/// Returns the top `limit` chunk hits ranked by bm25. An empty/uparseable query
+/// or no matches returns an empty vec (the tool layer turns that into a
+/// structured "no results" the model recovers from).
+pub fn search_chunks(
+    conn: &Connection,
+    query: &str,
+    filter: NoteFilter<'_>,
+    workspace: &str,
+    limit: usize,
+) -> Result<Vec<ChunkHit>> {
+    let Some(match_expr) = fts_match_query(query) else {
+        return Ok(Vec::new());
+    };
+    use rusqlite::types::Value;
+    let mut sql = String::from(
+        "SELECT n.id, n.title, n.created_at, c.source, c.text, bm25(note_chunks_fts) AS rank \
+         FROM note_chunks_fts f \
+         JOIN note_chunks c ON c.id = f.chunk_id \
+         JOIN notes n ON n.id = c.note_id \
+         WHERE note_chunks_fts MATCH ?1 AND n.workspace_id = ?2 AND n.deleted_at IS NULL",
+    );
+    let mut args: Vec<Value> = vec![Value::Text(match_expr), Value::Text(workspace.to_string())];
+    if let Some(id) = filter.note_id {
+        args.push(Value::Text(id.to_string()));
+        sql.push_str(&format!(" AND n.id = ?{}", args.len()));
+    }
+    if let Some(f) = filter.folder_id {
+        args.push(Value::Text(f.to_string()));
+        sql.push_str(&format!(" AND n.folder_id = ?{}", args.len()));
+    }
+    if let Some(cl) = filter.client_id {
+        args.push(Value::Text(cl.to_string()));
+        sql.push_str(&format!(" AND n.client_id = ?{}", args.len()));
+    }
+    args.push(Value::Integer(limit as i64));
+    sql.push_str(&format!(" ORDER BY rank LIMIT ?{}", args.len()));
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(args), |row| {
+            Ok(ChunkHit {
+                note_id: row.get(0)?,
+                note_title: row.get(1)?,
+                note_created_at: row.get(2)?,
+                source: row.get(3)?,
+                text: row.get(4)?,
+                rank: row.get(5)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// List live Notes in a workspace, optionally narrowed by folder and/or client,
+/// most-recent first. Backs the `list_notes` retrieval tool.
+pub fn list_notes_filtered(
+    conn: &Connection,
+    filter: NoteFilter<'_>,
+    workspace: &str,
+    limit: usize,
+) -> Result<Vec<NoteMeta>> {
+    use rusqlite::types::Value;
+    let mut sql = String::from(
+        "SELECT id, title, created_at, folder_id, client_id FROM notes \
+         WHERE workspace_id = ?1 AND deleted_at IS NULL",
+    );
+    let mut args: Vec<Value> = vec![Value::Text(workspace.to_string())];
+    if let Some(id) = filter.note_id {
+        args.push(Value::Text(id.to_string()));
+        sql.push_str(&format!(" AND id = ?{}", args.len()));
+    }
+    if let Some(f) = filter.folder_id {
+        args.push(Value::Text(f.to_string()));
+        sql.push_str(&format!(" AND folder_id = ?{}", args.len()));
+    }
+    if let Some(cl) = filter.client_id {
+        args.push(Value::Text(cl.to_string()));
+        sql.push_str(&format!(" AND client_id = ?{}", args.len()));
+    }
+    args.push(Value::Integer(limit as i64));
+    sql.push_str(&format!(" ORDER BY updated_at DESC LIMIT ?{}", args.len()));
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(args), |row| {
+            Ok(NoteMeta {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                created_at: row.get(2)?,
+                folder_id: row.get(3)?,
+                client_id: row.get(4)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 /// One-time migration: pull the legacy single `summary_prompt` setting
 /// into a row in `summary_prompts`, then rewrite any note whose preset
 /// is the literal `"custom"` to `"custom:<new-id>"` so it points at
@@ -1644,5 +1944,166 @@ mod tests {
             Some("true"),
             "prior value preserved; migration short-circuits",
         );
+    }
+
+    // ── Retrieval substrate: chunking + FTS5 search (issue #47) ──────────────
+
+    #[test]
+    fn split_into_chunks_breaks_on_paragraphs_and_hard_splits_long_ones() {
+        assert!(split_into_chunks("   \n\n  ", 100).is_empty(), "blank yields nothing");
+
+        // Three short paragraphs, tiny target → one chunk each (each alone fits,
+        // but two together overflow).
+        let text = "alpha para\n\nbeta para\n\ngamma para";
+        let chunks = split_into_chunks(text, 12);
+        assert_eq!(chunks.len(), 3, "each paragraph its own chunk under a tight budget");
+        assert_eq!(chunks[0], "alpha para");
+
+        // A single paragraph longer than the target is hard-split on char count.
+        let long = "x".repeat(250);
+        let chunks = split_into_chunks(&long, 100);
+        assert_eq!(chunks.len(), 3, "250 chars / 100 target = 3 windows");
+        assert_eq!(chunks[0].chars().count(), 100);
+        assert_eq!(chunks[2].chars().count(), 50);
+
+        // Small paragraphs that fit together stay merged.
+        let merged = split_into_chunks("one\n\ntwo", 1000);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0], "one\n\ntwo");
+    }
+
+    #[test]
+    fn note_chunk_texts_tags_each_source() {
+        let chunks = note_chunk_texts("body words", "transcript words", "summary words");
+        let sources: Vec<&str> = chunks.iter().map(|(s, _)| *s).collect();
+        assert_eq!(sources, vec!["body", "transcript", "summary"]);
+        // Blank sources contribute nothing.
+        let sparse = note_chunk_texts("only body", "", "");
+        assert_eq!(sparse.len(), 1);
+        assert_eq!(sparse[0].0, "body");
+    }
+
+    #[test]
+    fn reindex_and_search_finds_and_ranks_notes() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("search.sqlite")).unwrap();
+
+        let a = create_note(&conn, "en", "meeting", "").unwrap();
+        update_note(
+            &conn,
+            &a.id,
+            &NotePatch {
+                title: Some("Budget planning".into()),
+                transcript: Some("We discussed the quarterly budget and the marketing spend.".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let b = create_note(&conn, "en", "meeting", "").unwrap();
+        update_note(
+            &conn,
+            &b.id,
+            &NotePatch {
+                title: Some("Hiring".into()),
+                transcript: Some("Reviewed candidates for the engineering role.".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let na = get_note(&conn, &a.id).unwrap();
+        let nb = get_note(&conn, &b.id).unwrap();
+        reindex_note(&conn, &a.id, &na.body, &na.transcript, &na.summary).unwrap();
+        reindex_note(&conn, &b.id, &nb.body, &nb.transcript, &nb.summary).unwrap();
+
+        let hits = search_chunks(&conn, "budget", NoteFilter::default(), "", 10).unwrap();
+        assert_eq!(hits.len(), 1, "only the budget note matches");
+        assert_eq!(hits[0].note_id, a.id);
+        assert_eq!(hits[0].note_title, "Budget planning");
+        assert_eq!(hits[0].source, "transcript");
+
+        // Punctuation / operator chars in the query don't blow up FTS5.
+        let safe =
+            search_chunks(&conn, "budget: \"marketing\" -foo*", NoteFilter::default(), "", 10).unwrap();
+        assert!(!safe.is_empty(), "sanitised query still matches");
+
+        // A gibberish query returns nothing rather than erroring.
+        assert!(search_chunks(&conn, "!!!@@@", NoteFilter::default(), "", 10).unwrap().is_empty());
+        assert!(search_chunks(&conn, "zzzzznope", NoteFilter::default(), "", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn reindex_is_idempotent_and_reflects_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("reindex.sqlite")).unwrap();
+        let n = create_note(&conn, "en", "meeting", "").unwrap();
+
+        reindex_note(&conn, &n.id, "hello world", "", "").unwrap();
+        reindex_note(&conn, &n.id, "hello world", "", "").unwrap(); // twice
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM note_chunks WHERE note_id = ?1", params![n.id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "reindex clears before rebuild — no duplication");
+
+        // Old content is no longer findable after an edit; new content is.
+        reindex_note(&conn, &n.id, "hello world", "", "").unwrap();
+        assert_eq!(search_chunks(&conn, "world", NoteFilter::default(), "", 10).unwrap().len(), 1);
+        reindex_note(&conn, &n.id, "totally different", "", "").unwrap();
+        assert!(search_chunks(&conn, "world", NoteFilter::default(), "", 10).unwrap().is_empty());
+        assert_eq!(search_chunks(&conn, "different", NoteFilter::default(), "", 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn search_and_list_respect_folder_and_client_filters() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("filters.sqlite")).unwrap();
+        let folder = create_folder(&conn, "Work", "").unwrap();
+        let client = create_client(&conn, "Acme", "").unwrap();
+
+        // Note in the folder AND tagged the client.
+        let inside = create_note(&conn, "en", "meeting", "").unwrap();
+        move_note(&conn, &inside.id, Some(&folder.id)).unwrap();
+        set_note_client(&conn, &inside.id, Some(&client.id)).unwrap();
+        update_note(
+            &conn,
+            &inside.id,
+            &NotePatch { transcript: Some("shared keyword here".into()), ..Default::default() },
+        )
+        .unwrap();
+        // Note with the same keyword but no folder/client.
+        let outside = create_note(&conn, "en", "meeting", "").unwrap();
+        update_note(
+            &conn,
+            &outside.id,
+            &NotePatch { transcript: Some("shared keyword here too".into()), ..Default::default() },
+        )
+        .unwrap();
+
+        for id in [&inside.id, &outside.id] {
+            let nn = get_note(&conn, id).unwrap();
+            reindex_note(&conn, id, &nn.body, &nn.transcript, &nn.summary).unwrap();
+        }
+
+        let f_folder = NoteFilter { folder_id: Some(&folder.id), ..Default::default() };
+        let f_client = NoteFilter { client_id: Some(&client.id), ..Default::default() };
+        let f_both =
+            NoteFilter { folder_id: Some(&folder.id), client_id: Some(&client.id), ..Default::default() };
+        let f_note = NoteFilter { note_id: Some(&outside.id), ..Default::default() };
+
+        assert_eq!(search_chunks(&conn, "keyword", NoteFilter::default(), "", 10).unwrap().len(), 2, "unfiltered sees both");
+        let by_folder = search_chunks(&conn, "keyword", f_folder, "", 10).unwrap();
+        assert_eq!(by_folder.len(), 1);
+        assert_eq!(by_folder[0].note_id, inside.id);
+        // folder AND client combine (both narrow to the same single note).
+        assert_eq!(search_chunks(&conn, "keyword", f_both, "", 10).unwrap().len(), 1);
+        // note_id clamp (the "this Note" breadth) pins search to one note.
+        let by_note = search_chunks(&conn, "keyword", f_note, "", 10).unwrap();
+        assert_eq!(by_note.len(), 1);
+        assert_eq!(by_note[0].note_id, outside.id);
+
+        // list_notes_filtered mirrors the same combinable filters.
+        assert_eq!(list_notes_filtered(&conn, NoteFilter::default(), "", 10).unwrap().len(), 2);
+        assert_eq!(list_notes_filtered(&conn, f_folder, "", 10).unwrap().len(), 1);
+        assert_eq!(list_notes_filtered(&conn, f_client, "", 10).unwrap().len(), 1);
     }
 }

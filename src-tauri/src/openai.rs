@@ -883,6 +883,318 @@ where
     Ok(trimmed)
 }
 
+// ── Tool-calling steps for agentic chat (issue #47) ─────────────────────────
+// These run ONE step of the loop: offer `tools` (JSON-Schema tool defs already
+// lowered to each provider's envelope by the caller) alongside the full
+// re-lowered conversation, and return the assistant's text plus any tool calls
+// it requested. The caller (`chat::run_chat`) executes the calls and loops.
+// `messages`/`tools` are pre-lowered `serde_json::Value`s so this wire layer
+// stays free of the chat module's types.
+
+use serde_json::Value;
+
+/// A tool call parsed off the wire: provider-supplied (or synthesised) `id`,
+/// tool `name`, and raw JSON `arguments` as a string.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RawToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
+}
+
+#[derive(Serialize)]
+struct ToolChatRequest<'a> {
+    model: &'a str,
+    messages: &'a [Value],
+    stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<&'a [Value]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
+}
+
+// Streaming SSE delta shapes for OpenAI tool calls. `tool_calls` arrive as
+// index-keyed fragments: the first fragment for an index carries `id` + name,
+// later ones append `arguments` text. We accumulate by index.
+#[derive(Deserialize, Default)]
+struct ToolStreamDelta {
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<ToolCallFragment>,
+}
+#[derive(Deserialize)]
+struct ToolCallFragment {
+    index: usize,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    function: Option<ToolFnFragment>,
+}
+#[derive(Deserialize, Default)]
+struct ToolFnFragment {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+}
+#[derive(Deserialize)]
+struct ToolStreamFrame {
+    #[serde(default)]
+    choices: Vec<ToolStreamChoice>,
+}
+#[derive(Deserialize)]
+struct ToolStreamChoice {
+    #[serde(default)]
+    delta: ToolStreamDelta,
+}
+
+/// Run one cloud-OpenAI step with tool-calling. Streams answer tokens via
+/// `on_delta`; buffers streamed tool-call fragments and returns them assembled.
+/// `tools` is a slice of OpenAI tool-def objects (empty = force a text answer).
+pub(crate) async fn openai_chat_step<F>(
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    messages: &[Value],
+    tools: &[Value],
+    mut on_delta: F,
+) -> Result<(String, Vec<RawToolCall>)>
+where
+    F: FnMut(&str) + Send,
+{
+    let req = ToolChatRequest {
+        model,
+        messages,
+        stream: true,
+        tools: if tools.is_empty() { None } else { Some(tools) },
+        temperature: if is_reasoning_model(model) { None } else { Some(0.2) },
+    };
+    let url = format!("{base_url}/chat/completions");
+    let r = summary_cloud_client()
+        .post(&url)
+        .bearer_auth(api_key)
+        .json(&req)
+        .send()
+        .await
+        .map_err(|e| {
+            if e.is_timeout() {
+                anyhow!("Timed out waiting for OpenAI. Try again.")
+            } else if e.is_connect() {
+                anyhow!("Couldn't reach OpenAI. Check your internet connection.")
+            } else {
+                anyhow!("Network error talking to OpenAI: {}", error_chain(&e))
+            }
+        })?;
+    let status = r.status();
+    if !status.is_success() {
+        let body = r.text().await.unwrap_or_default();
+        return Err(anyhow!("HTTP {status} from {base_url}: {body}"));
+    }
+
+    use futures_util::StreamExt;
+    let mut byte_stream = r.bytes_stream();
+    let mut buf = String::new();
+    let mut answer = String::new();
+    // Accumulate tool-call fragments by index → (id, name, arguments).
+    let mut calls: Vec<(String, String, String)> = Vec::new();
+    while let Some(chunk_res) = byte_stream.next().await {
+        let bytes = chunk_res.map_err(|e| anyhow!("stream read: {e}"))?;
+        buf.push_str(&String::from_utf8_lossy(&bytes));
+        while let Some(idx) = buf.find('\n') {
+            let line: String = buf.drain(..=idx).collect();
+            let line = line.trim();
+            let Some(data) = line.strip_prefix("data:") else { continue };
+            let data = data.trim();
+            if data == "[DONE]" {
+                break;
+            }
+            let frame: ToolStreamFrame = match serde_json::from_str(data) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let Some(choice) = frame.choices.into_iter().next() else { continue };
+            if let Some(delta) = choice.delta.content {
+                if !delta.is_empty() {
+                    answer.push_str(&delta);
+                    on_delta(&delta);
+                }
+            }
+            for frag in choice.delta.tool_calls {
+                if calls.len() <= frag.index {
+                    calls.resize(frag.index + 1, (String::new(), String::new(), String::new()));
+                }
+                let slot = &mut calls[frag.index];
+                if let Some(id) = frag.id {
+                    slot.0 = id;
+                }
+                if let Some(f) = frag.function {
+                    if let Some(name) = f.name {
+                        slot.1 = name;
+                    }
+                    if let Some(args) = f.arguments {
+                        slot.2.push_str(&args);
+                    }
+                }
+            }
+        }
+    }
+
+    let tool_calls: Vec<RawToolCall> = calls
+        .into_iter()
+        .enumerate()
+        .filter(|(_, (_, name, _))| !name.is_empty())
+        .map(|(i, (id, name, arguments))| RawToolCall {
+            id: if id.is_empty() { format!("call_{i}") } else { id },
+            name,
+            arguments: if arguments.trim().is_empty() { "{}".into() } else { arguments },
+        })
+        .collect();
+
+    if answer.trim().is_empty() && tool_calls.is_empty() {
+        return Err(anyhow!("{model} returned an empty response"));
+    }
+    Ok((answer, tool_calls))
+}
+
+// Ollama native `/api/chat` step with tools. Per spike #45 this uses
+// `stream: false` (buffered) — the reliability probe validated tool-calling in
+// exactly this mode, and small local models frame tool calls inconsistently
+// when streamed. The buffered content is delivered to `on_delta` in one piece
+// so the UI still renders the final answer. Ollama tool calls carry no id, so
+// we synthesise one; `arguments` may be an object or a string and is
+// normalised to a JSON string.
+#[derive(Serialize)]
+struct OllamaToolChatRequest<'a> {
+    model: &'a str,
+    messages: &'a [Value],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<&'a [Value]>,
+    stream: bool,
+    think: bool,
+    keep_alive: i32,
+    options: OllamaToolOptions,
+}
+// Tool-calling wants determinism, not the Qwen anti-loop sampling used for
+// long summaries — a low temperature makes tool selection + args reliable
+// (the spike ran at temperature 0).
+#[derive(Serialize)]
+struct OllamaToolOptions {
+    temperature: f32,
+    num_predict: i32,
+    num_ctx: i32,
+}
+#[derive(Deserialize)]
+struct OllamaToolResponse {
+    message: OllamaToolMessage,
+}
+#[derive(Deserialize, Default)]
+struct OllamaToolMessage {
+    #[serde(default)]
+    content: String,
+    #[serde(default)]
+    tool_calls: Vec<OllamaToolCallWire>,
+}
+#[derive(Deserialize)]
+struct OllamaToolCallWire {
+    function: OllamaToolFn,
+}
+#[derive(Deserialize)]
+struct OllamaToolFn {
+    name: String,
+    #[serde(default)]
+    arguments: Value,
+}
+
+pub(crate) async fn ollama_chat_step<F>(
+    native_base: &str,
+    model: &str,
+    messages: &[Value],
+    tools: &[Value],
+    mut on_delta: F,
+) -> Result<(String, Vec<RawToolCall>)>
+where
+    F: FnMut(&str) + Send,
+{
+    let url = format!("{native_base}/chat");
+    let prompt_chars: usize = messages
+        .iter()
+        .map(|m| m.get("content").and_then(|c| c.as_str()).map(str::len).unwrap_or(0))
+        .sum();
+    let num_predict = 4096i32;
+    let approx_input_tokens = prompt_chars / 4;
+    let need = approx_input_tokens + (num_predict as usize) + 512;
+    let mut ctx: usize = 8192;
+    while ctx < need && ctx < 65536 {
+        ctx *= 2;
+    }
+    let req = OllamaToolChatRequest {
+        model,
+        messages,
+        tools: if tools.is_empty() { None } else { Some(tools) },
+        stream: false,
+        think: false,
+        keep_alive: 0,
+        options: OllamaToolOptions { temperature: 0.0, num_predict, num_ctx: ctx as i32 },
+    };
+    let started = std::time::Instant::now();
+    eprintln!(
+        "[chat] POST {url} (ollama-native, tools={}) model={model} messages={} prompt_chars={prompt_chars} num_ctx={ctx}",
+        tools.len(),
+        messages.len(),
+    );
+    let r = local_client()
+        .post(&url)
+        .json(&req)
+        .send()
+        .await
+        .map_err(|e| {
+            if e.is_timeout() {
+                anyhow!("Timed out waiting for {url}. Restart Ollama and try again.")
+            } else if e.is_connect() {
+                anyhow!("Couldn't reach {url}. Is `ollama serve` running?")
+            } else {
+                anyhow!("network error talking to {url}: {e}")
+            }
+        })?;
+    let status = r.status();
+    if !status.is_success() {
+        let body = r.text().await.unwrap_or_default();
+        return Err(anyhow!("HTTP {status} from {url}: {body}"));
+    }
+    let resp: OllamaToolResponse = r
+        .json()
+        .await
+        .map_err(|e| anyhow!("could not parse Ollama response from {url}: {e}"))?;
+    let tool_calls: Vec<RawToolCall> = resp
+        .message
+        .tool_calls
+        .into_iter()
+        .enumerate()
+        .map(|(i, tc)| {
+            let arguments = match tc.function.arguments {
+                Value::String(s) => s,
+                other => serde_json::to_string(&other).unwrap_or_else(|_| "{}".into()),
+            };
+            RawToolCall { id: format!("call_{i}"), name: tc.function.name, arguments }
+        })
+        .collect();
+    let content = trim_runaway_repetition(&resp.message.content);
+    if !content.is_empty() {
+        on_delta(&content);
+    }
+    eprintln!(
+        "[chat] ollama step done in {:?}: {} chars, {} tool calls",
+        started.elapsed(),
+        content.len(),
+        tool_calls.len(),
+    );
+    if content.trim().is_empty() && tool_calls.is_empty() {
+        return Err(anyhow!("{model} returned an empty response"));
+    }
+    Ok((content, tool_calls))
+}
+
 /// Detect runaway repetition (the same non-empty line repeated 3+ times
 /// consecutively) and truncate at the first repetition. Qwen 3.5 sometimes
 /// produces a clean summary, then degenerates into "Note: Wilma sa nei.

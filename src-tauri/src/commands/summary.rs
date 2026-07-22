@@ -229,6 +229,9 @@ async fn run_summary(app: AppHandle, note_id: String) -> anyhow::Result<()> {
             summary: Some(summary.clone()),
             ..Default::default()
         })?;
+        // Content-settled checkpoint (issue #47): a fresh summary is new
+        // searchable material — refresh the Note's retrieval chunks.
+        super::chat::reindex_note_content(&conn, &note_id);
     }
     state.sync.note_upserted(&note_id); // AI summary written → enqueue a push
     let _ = app.emit("summary_ready", SummaryPayload { note_id, summary });

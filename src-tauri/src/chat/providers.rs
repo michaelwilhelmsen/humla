@@ -1,13 +1,107 @@
 //! Concrete `ChatAdapter` implementations. The cloud + local ones delegate the
 //! actual HTTP streaming to `openai.rs` (shared with the summary path); the
 //! fake one is deterministic for tests.
+//!
+//! Tool-calling (issue #47) frames differently per provider — OpenAI wants
+//! index-keyed streamed `tool_calls` with ids and stringified arguments; Ollama
+//! native returns buffered `tool_calls` with object arguments and no ids. Both
+//! per-provider stream mappers live here, converting to the normalized
+//! `ChatStep` the loop consumes.
 
-use super::adapter::{ChatAdapter, ChatCtx, ChatStreamEvent, ChatTurn};
+use super::adapter::{ChatAdapter, ChatCtx, ChatStep, ChatStreamEvent, ChatTurn, ToolCall, ToolSpec};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
+use serde_json::{json, Value};
 
-fn as_pairs(messages: &[ChatTurn]) -> Vec<(&str, &str)> {
-    messages.iter().map(|m| (m.role.as_str(), m.text.as_str())).collect()
+/// Lower a tool spec to the OpenAI/Ollama `{type:"function", function:{…}}`
+/// envelope — both providers accept the identical shape (verified in spike #45).
+fn lower_tools(tools: &[ToolSpec]) -> Vec<Value> {
+    tools
+        .iter()
+        .map(|t| {
+            json!({
+                "type": "function",
+                "function": {
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": t.parameters,
+                },
+            })
+        })
+        .collect()
+}
+
+/// Lower the conversation to OpenAI chat messages: assistant turns carry
+/// `tool_calls` (arguments as a JSON string), tool turns carry `tool_call_id`.
+fn lower_messages_openai(messages: &[ChatTurn]) -> Vec<Value> {
+    messages
+        .iter()
+        .map(|m| {
+            if m.role == "assistant" && !m.tool_calls.is_empty() {
+                json!({
+                    "role": "assistant",
+                    "content": m.text,
+                    "tool_calls": m.tool_calls.iter().map(|tc| json!({
+                        "id": tc.id,
+                        "type": "function",
+                        "function": { "name": tc.name, "arguments": tc.arguments },
+                    })).collect::<Vec<_>>(),
+                })
+            } else if m.role == "tool" {
+                json!({
+                    "role": "tool",
+                    "tool_call_id": m.tool_call_id.clone().unwrap_or_default(),
+                    "content": m.text,
+                })
+            } else {
+                json!({ "role": m.role, "content": m.text })
+            }
+        })
+        .collect()
+}
+
+/// Lower the conversation to Ollama native messages: assistant tool calls take
+/// `arguments` as an object (parsed from our stored string), and tool results
+/// are a bare `{role:"tool", content}` (Ollama keys tool output positionally,
+/// with no id — see spike #45).
+fn lower_messages_ollama(messages: &[ChatTurn]) -> Vec<Value> {
+    messages
+        .iter()
+        .map(|m| {
+            if m.role == "assistant" && !m.tool_calls.is_empty() {
+                json!({
+                    "role": "assistant",
+                    "content": m.text,
+                    "tool_calls": m.tool_calls.iter().map(|tc| json!({
+                        "function": {
+                            "name": tc.name,
+                            "arguments": serde_json::from_str::<Value>(&tc.arguments)
+                                .unwrap_or_else(|_| json!({})),
+                        },
+                    })).collect::<Vec<_>>(),
+                })
+            } else if m.role == "tool" {
+                json!({ "role": "tool", "content": m.text })
+            } else {
+                json!({ "role": m.role, "content": m.text })
+            }
+        })
+        .collect()
+}
+
+fn emit_step(
+    text: String,
+    raw: Vec<crate::openai::RawToolCall>,
+    on_event: &mut (dyn FnMut(ChatStreamEvent) + Send),
+) -> ChatStep {
+    let tool_calls: Vec<ToolCall> = raw
+        .into_iter()
+        .map(|c| ToolCall { id: c.id, name: c.name, arguments: c.arguments })
+        .collect();
+    for tc in &tool_calls {
+        on_event(ChatStreamEvent::ToolCall(tc.clone()));
+    }
+    ChatStep { text, tool_calls }
 }
 
 /// Cloud OpenAI, streaming via SSE. Uses the shared BYO key.
@@ -19,25 +113,33 @@ impl ChatAdapter for OpenAiChatAdapter {
         "openai"
     }
 
-    async fn stream(
+    async fn step(
         &self,
         ctx: ChatCtx<'_>,
         messages: &[ChatTurn],
+        tools: &[ToolSpec],
         on_event: &mut (dyn FnMut(ChatStreamEvent) + Send),
-    ) -> Result<String> {
+    ) -> Result<ChatStep> {
         let api_key = ctx
             .api_key
             .ok_or_else(|| anyhow!("OpenAI chat needs an API key — add one in Settings → Chat."))?;
-        let pairs = as_pairs(messages);
-        crate::openai::openai_chat_stream(ctx.base_url, api_key, ctx.model, &pairs, |delta| {
-            on_event(ChatStreamEvent::TextDelta(delta.to_string()));
-        })
-        .await
+        let wire_messages = lower_messages_openai(messages);
+        let wire_tools = lower_tools(tools);
+        let (text, raw) = crate::openai::openai_chat_step(
+            ctx.base_url,
+            api_key,
+            ctx.model,
+            &wire_messages,
+            &wire_tools,
+            |delta| on_event(ChatStreamEvent::TextDelta(delta.to_string())),
+        )
+        .await?;
+        Ok(emit_step(text, raw, on_event))
     }
 }
 
-/// Local Ollama, streaming via its native `/api/chat`. Reuses the summary
-/// path's adaptive context-window sizing and Qwen sampling tuning.
+/// Local Ollama, via its native `/api/chat`. Tool steps are buffered (spike
+/// #45); the final buffered answer is emitted as one text delta.
 pub struct OllamaChatAdapter;
 
 #[async_trait]
@@ -46,45 +148,72 @@ impl ChatAdapter for OllamaChatAdapter {
         "ollama"
     }
 
-    async fn stream(
+    async fn step(
         &self,
         ctx: ChatCtx<'_>,
         messages: &[ChatTurn],
+        tools: &[ToolSpec],
         on_event: &mut (dyn FnMut(ChatStreamEvent) + Send),
-    ) -> Result<String> {
+    ) -> Result<ChatStep> {
         let native = crate::openai::ollama_native_url(ctx.base_url).ok_or_else(|| {
             anyhow!(
                 "Chat on Ollama needs an Ollama server (…:11434). \
                  Check the local server URL in Settings."
             )
         })?;
-        let pairs = as_pairs(messages);
-        crate::openai::ollama_chat_stream(&native, ctx.model, ctx.think, &pairs, |chunk| {
-            // Only the answer is surfaced in this slice; reasoning deltas are
-            // dropped (no reasoning UI for chat yet).
-            if let crate::openai::StreamChunk::Content(c) = chunk {
-                on_event(ChatStreamEvent::TextDelta(c.to_string()));
-            }
-        })
-        .await
+        let wire_messages = lower_messages_ollama(messages);
+        let wire_tools = lower_tools(tools);
+        let (text, raw) = crate::openai::ollama_chat_step(
+            &native,
+            ctx.model,
+            &wire_messages,
+            &wire_tools,
+            |delta| on_event(ChatStreamEvent::TextDelta(delta.to_string())),
+        )
+        .await?;
+        Ok(emit_step(text, raw, on_event))
     }
 }
 
-/// Deterministic adapter for tests: emits each canned delta in order and
-/// returns their concatenation. Never touches the network.
+/// Deterministic adapter for tests: replays a script of `ChatStep`s in order,
+/// emitting the matching normalized events for each (tool-call events for tool
+/// steps, a single text delta for text steps). Never touches the network.
 #[cfg(test)]
 pub struct FakeChatAdapter {
-    deltas: Vec<String>,
+    steps: std::sync::Mutex<std::collections::VecDeque<ChatStep>>,
 }
 
 #[cfg(test)]
 impl FakeChatAdapter {
+    /// A single text answer (no tools) — the #46-style one-shot.
     pub fn new<I, S>(deltas: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        Self { deltas: deltas.into_iter().map(Into::into).collect() }
+        let text: String = deltas.into_iter().map(Into::into).collect();
+        Self::scripted(vec![ChatStep { text, tool_calls: Vec::new() }])
+    }
+
+    /// A full scripted loop: each `ChatStep` is one provider round-trip.
+    pub fn scripted(steps: Vec<ChatStep>) -> Self {
+        Self { steps: std::sync::Mutex::new(steps.into()) }
+    }
+
+    /// Convenience: a step that requests one tool call.
+    pub fn tool_step(id: &str, name: &str, arguments: &str) -> ChatStep {
+        ChatStep {
+            text: String::new(),
+            tool_calls: vec![ToolCall {
+                id: id.into(),
+                name: name.into(),
+                arguments: arguments.into(),
+            }],
+        }
+    }
+
+    pub fn text_step(text: &str) -> ChatStep {
+        ChatStep { text: text.into(), tool_calls: Vec::new() }
     }
 }
 
@@ -95,17 +224,35 @@ impl ChatAdapter for FakeChatAdapter {
         "fake"
     }
 
-    async fn stream(
+    async fn step(
         &self,
         _ctx: ChatCtx<'_>,
         _messages: &[ChatTurn],
+        tools: &[ToolSpec],
         on_event: &mut (dyn FnMut(ChatStreamEvent) + Send),
-    ) -> Result<String> {
-        let mut full = String::new();
-        for d in &self.deltas {
-            full.push_str(d);
-            on_event(ChatStreamEvent::TextDelta(d.clone()));
+    ) -> Result<ChatStep> {
+        let step = self
+            .steps
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_else(|| ChatStep { text: "(no more scripted steps)".into(), tool_calls: Vec::new() });
+        // A scripted tool step only "counts" its tool calls when tools are on
+        // offer; on the forced final step (tools dropped) fall back to its text
+        // so the loop always terminates with an answer.
+        if !step.tool_calls.is_empty() && !tools.is_empty() {
+            for tc in &step.tool_calls {
+                on_event(ChatStreamEvent::ToolCall(tc.clone()));
+            }
+            Ok(step)
+        } else {
+            let text = if step.text.is_empty() {
+                "Based on your notes, here is the answer.".to_string()
+            } else {
+                step.text
+            };
+            on_event(ChatStreamEvent::TextDelta(text.clone()));
+            Ok(ChatStep { text, tool_calls: Vec::new() })
         }
-        Ok(full)
     }
 }
