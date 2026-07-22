@@ -233,6 +233,8 @@ async fn run_summary(app: AppHandle, note_id: String) -> anyhow::Result<()> {
         // searchable material — refresh the Note's retrieval chunks.
         super::chat::reindex_note_content(&conn, &note_id);
     }
+    // Embed the refreshed chunks off the request path (issue #48).
+    tauri::async_runtime::spawn(super::chat::embed_note_bg(app.clone(), note_id.clone()));
     state.sync.note_upserted(&note_id); // AI summary written → enqueue a push
     let _ = app.emit("summary_ready", SummaryPayload { note_id, summary });
     Ok(())

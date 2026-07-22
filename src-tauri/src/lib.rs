@@ -11,6 +11,7 @@ mod sessions;
 mod commands;
 mod stt;
 mod chat;
+mod embed;
 pub mod sync;
 
 use std::sync::Arc;

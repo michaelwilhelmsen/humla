@@ -182,15 +182,20 @@ pub fn open(path: &Path) -> Result<Connection> {
         -- semantic embeddings). `note_chunks` holds the structured rows (source
         -- + order + text) for citations; `note_chunks_fts` is the FTS5 index the
         -- search tool queries. The two are kept in lockstep by `reindex_note`.
+        -- `text_hash` (issue #48) content-addresses each chunk so its embedding
+        -- survives a reindex (which churns chunk ids): unchanged text keeps its
+        -- cached vector, only changed text re-embeds.
         CREATE TABLE IF NOT EXISTS note_chunks (
             id          TEXT PRIMARY KEY,
             note_id     TEXT NOT NULL,
             seq         INTEGER NOT NULL,
             source      TEXT NOT NULL,
             text        TEXT NOT NULL,
+            text_hash   TEXT NOT NULL DEFAULT '',
             created_at  INTEGER NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_note_chunks_note ON note_chunks(note_id);
+        CREATE INDEX IF NOT EXISTS idx_note_chunks_hash ON note_chunks(text_hash);
 
         -- Standalone FTS5 index (not external-content, so plain DELETE/INSERT
         -- keep it in sync without triggers). `chunk_id`/`note_id` ride along
@@ -202,8 +207,24 @@ pub fn open(path: &Path) -> Result<Connection> {
             note_id UNINDEXED,
             tokenize = 'unicode61 remove_diacritics 2'
         );
+
+        -- Content-addressed embedding cache (issue #48). Keyed by (text_hash,
+        -- model): one vector per distinct chunk text per embedding model. A
+        -- model switch just misses the cache and re-embeds under the new key
+        -- (fixed-dim-per-index — a query only ever reads one model's vectors).
+        -- Brute-force cosine in-process; no vector index.
+        CREATE TABLE IF NOT EXISTS chunk_embeddings (
+            text_hash   TEXT NOT NULL,
+            model       TEXT NOT NULL,
+            dims        INTEGER NOT NULL,
+            vector      BLOB NOT NULL,
+            created_at  INTEGER NOT NULL,
+            PRIMARY KEY (text_hash, model)
+        );
         "#,
     )?;
+    // #48: add text_hash to note_chunks created by the #47 schema.
+    let _ = conn.execute("ALTER TABLE note_chunks ADD COLUMN text_hash TEXT NOT NULL DEFAULT ''", []);
     // Idempotent migrations for older schemas. ALTER TABLE adds columns
     // that didn't exist in earlier versions; if they already exist, the
     // execute fails and we ignore.
@@ -1155,10 +1176,11 @@ pub fn reindex_note(
     let chunks = note_chunk_texts(body_text, transcript, summary);
     for (seq, (source, text)) in chunks.iter().enumerate() {
         let chunk_id = uuid::Uuid::new_v4().to_string();
+        let hash = text_hash(text);
         conn.execute(
-            "INSERT INTO note_chunks (id, note_id, seq, source, text, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![chunk_id, note_id, seq as i64, source, text, now],
+            "INSERT INTO note_chunks (id, note_id, seq, source, text, text_hash, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![chunk_id, note_id, seq as i64, source, text, hash, now],
         )?;
         conn.execute(
             "INSERT INTO note_chunks_fts (text, chunk_id, note_id) VALUES (?1, ?2, ?3)",
@@ -1166,6 +1188,19 @@ pub fn reindex_note(
         )?;
     }
     Ok(chunks.len())
+}
+
+/// Stable content hash for a chunk's text — the embedding cache key. FNV-1a
+/// (64-bit, hex): deterministic across runs/platforms, no dependency. Collision
+/// probability at personal scale (thousands of chunks) is negligible, and the
+/// only cost of one would be a single chunk borrowing another's vector.
+pub fn text_hash(text: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in text.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
 }
 
 /// Drop a Note's chunk + FTS rows (e.g. before a rebuild, or when a Note is
@@ -1176,12 +1211,16 @@ pub fn remove_note_chunks(conn: &Connection, note_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Ids of live notes that have no chunks yet — the work-list for the one-time
-/// startup backfill that makes pre-#47 notes searchable. Cheap anti-join.
-pub fn note_ids_without_chunks(conn: &Connection) -> Result<Vec<String>> {
+/// Ids of live notes needing a (re)index — the startup-backfill work-list.
+/// Covers notes with no chunks (pre-#47) AND notes whose chunks predate the
+/// #48 `text_hash` column (so re-chunking backfills the embedding key). Cheap
+/// anti-join / existence check.
+pub fn note_ids_needing_reindex(conn: &Connection) -> Result<Vec<String>> {
     let mut stmt = conn.prepare(
-        "SELECT id FROM notes WHERE deleted_at IS NULL \
-         AND id NOT IN (SELECT DISTINCT note_id FROM note_chunks)",
+        "SELECT id FROM notes WHERE deleted_at IS NULL AND ( \
+             id NOT IN (SELECT DISTINCT note_id FROM note_chunks) \
+             OR id IN (SELECT DISTINCT note_id FROM note_chunks WHERE text_hash = '') \
+         )",
     )?;
     let ids = stmt
         .query_map([], |r| r.get::<_, String>(0))?
@@ -1262,6 +1301,273 @@ pub fn search_chunks(
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
+}
+
+// ── Semantic retrieval: embedding cache + hybrid (RRF) search (issue #48) ────
+
+/// Encode an embedding vector as a little-endian f32 blob for storage.
+fn vec_to_blob(v: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(v.len() * 4);
+    for f in v {
+        out.extend_from_slice(&f.to_le_bytes());
+    }
+    out
+}
+
+/// Decode a stored little-endian f32 blob back to a vector. A blob whose length
+/// isn't a multiple of 4 (corrupt) decodes to what fits, ignoring the tail.
+fn blob_to_vec(b: &[u8]) -> Vec<f32> {
+    b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+}
+
+/// Distinct (text_hash, text) for a Note's chunks that have no embedding under
+/// `model` yet — the incremental re-embed work-list for a content-settled
+/// checkpoint. Only changed/new text (cache-missing hashes) comes back.
+pub fn note_texts_needing_embedding(
+    conn: &Connection,
+    note_id: &str,
+    model: &str,
+) -> Result<Vec<(String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT c.text_hash, c.text FROM note_chunks c \
+         WHERE c.note_id = ?1 AND c.text_hash <> '' \
+         AND NOT EXISTS ( \
+            SELECT 1 FROM chunk_embeddings e \
+            WHERE e.text_hash = c.text_hash AND e.model = ?2 \
+         )",
+    )?;
+    let rows = stmt
+        .query_map(params![note_id, model], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Store one chunk's embedding under (text_hash, model). Idempotent (REPLACE),
+/// so a re-embed of the same text overwrites rather than duplicates.
+pub fn store_embedding(conn: &Connection, text_hash: &str, model: &str, vector: &[f32]) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO chunk_embeddings (text_hash, model, dims, vector, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![text_hash, model, vector.len() as i64, vec_to_blob(vector), now_ms()],
+    )?;
+    Ok(())
+}
+
+/// How many chunk embeddings exist for a model (telemetry / tests).
+pub fn count_embeddings(conn: &Connection, model: &str) -> Result<i64> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM chunk_embeddings WHERE model = ?1",
+        params![model],
+        |r| r.get(0),
+    )?)
+}
+
+/// Cosine similarity of two equal-length vectors in [-1, 1]. Returns 0 for a
+/// length mismatch or a zero-magnitude vector (degenerate, not comparable).
+pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    let mut dot = 0.0f32;
+    let mut na = 0.0f32;
+    let mut nb = 0.0f32;
+    for i in 0..a.len() {
+        dot += a[i] * b[i];
+        na += a[i] * a[i];
+        nb += b[i] * b[i];
+    }
+    if na == 0.0 || nb == 0.0 {
+        return 0.0;
+    }
+    dot / (na.sqrt() * nb.sqrt())
+}
+
+/// Reciprocal Rank Fusion. Each input list is item ids in rank order (best
+/// first). An item's fused score is Σ 1/(k + rank+1) over the lists it appears
+/// in; higher = better. Returns ids with scores, best first. `k` damps the
+/// contribution of low ranks (60 is the standard default).
+pub fn rrf_fuse(lists: &[Vec<String>], k: f64) -> Vec<(String, f64)> {
+    use std::collections::HashMap;
+    let mut scores: HashMap<String, f64> = HashMap::new();
+    for list in lists {
+        for (rank, id) in list.iter().enumerate() {
+            *scores.entry(id.clone()).or_insert(0.0) += 1.0 / (k + (rank as f64) + 1.0);
+        }
+    }
+    let mut fused: Vec<(String, f64)> = scores.into_iter().collect();
+    // Sort by score desc; tie-break by id for determinism.
+    fused.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0)));
+    fused
+}
+
+/// A chunk hit that carries its stable chunk id (for fusion) alongside the
+/// citation fields.
+struct IdentifiedHit {
+    chunk_id: String,
+    hit: ChunkHit,
+}
+
+/// Keyword-ranked chunks (bm25, best first) with their chunk ids — the FTS half
+/// of hybrid search. Mirrors `search_chunks`' filters.
+fn keyword_ranked(
+    conn: &Connection,
+    query: &str,
+    filter: NoteFilter<'_>,
+    workspace: &str,
+    limit: usize,
+) -> Result<Vec<IdentifiedHit>> {
+    let Some(match_expr) = fts_match_query(query) else {
+        return Ok(Vec::new());
+    };
+    use rusqlite::types::Value;
+    let mut sql = String::from(
+        "SELECT c.id, n.id, n.title, n.created_at, c.source, c.text, bm25(note_chunks_fts) AS rank \
+         FROM note_chunks_fts f \
+         JOIN note_chunks c ON c.id = f.chunk_id \
+         JOIN notes n ON n.id = c.note_id \
+         WHERE note_chunks_fts MATCH ?1 AND n.workspace_id = ?2 AND n.deleted_at IS NULL",
+    );
+    let mut args: Vec<Value> = vec![Value::Text(match_expr), Value::Text(workspace.to_string())];
+    push_note_filters(&mut sql, &mut args, filter, "n");
+    args.push(Value::Integer(limit as i64));
+    sql.push_str(&format!(" ORDER BY rank LIMIT ?{}", args.len()));
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(args), |row| {
+            Ok(IdentifiedHit {
+                chunk_id: row.get(0)?,
+                hit: ChunkHit {
+                    note_id: row.get(1)?,
+                    note_title: row.get(2)?,
+                    note_created_at: row.get(3)?,
+                    source: row.get(4)?,
+                    text: row.get(5)?,
+                    rank: row.get(6)?,
+                },
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Semantic-ranked chunks (cosine vs `query_vec`, best first) for chunks that
+/// have an embedding under `model`. Brute-force over all in-scope chunks — no
+/// vector index (issue #48).
+fn semantic_ranked(
+    conn: &Connection,
+    query_vec: &[f32],
+    model: &str,
+    filter: NoteFilter<'_>,
+    workspace: &str,
+    limit: usize,
+) -> Result<Vec<IdentifiedHit>> {
+    use rusqlite::types::Value;
+    let mut sql = String::from(
+        "SELECT c.id, n.id, n.title, n.created_at, c.source, c.text, e.vector \
+         FROM note_chunks c \
+         JOIN chunk_embeddings e ON e.text_hash = c.text_hash AND e.model = ?1 \
+         JOIN notes n ON n.id = c.note_id \
+         WHERE n.workspace_id = ?2 AND n.deleted_at IS NULL",
+    );
+    let mut args: Vec<Value> = vec![Value::Text(model.to_string()), Value::Text(workspace.to_string())];
+    push_note_filters(&mut sql, &mut args, filter, "n");
+    let mut stmt = conn.prepare(&sql)?;
+    let mut scored: Vec<(f32, IdentifiedHit)> = stmt
+        .query_map(rusqlite::params_from_iter(args), |row| {
+            let blob: Vec<u8> = row.get(6)?;
+            let sim = cosine(query_vec, &blob_to_vec(&blob));
+            Ok((
+                sim,
+                IdentifiedHit {
+                    chunk_id: row.get(0)?,
+                    hit: ChunkHit {
+                        note_id: row.get(1)?,
+                        note_title: row.get(2)?,
+                        note_created_at: row.get(3)?,
+                        source: row.get(4)?,
+                        text: row.get(5)?,
+                        rank: 0.0,
+                    },
+                },
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    scored.truncate(limit);
+    Ok(scored.into_iter().map(|(sim, mut ih)| {
+        ih.hit.rank = sim as f64; // carry the cosine similarity for reference
+        ih
+    }).collect())
+}
+
+/// Append the combinable note filters to a query being built, using positional
+/// params against alias `t`. Shared by keyword + semantic + list queries.
+fn push_note_filters(
+    sql: &mut String,
+    args: &mut Vec<rusqlite::types::Value>,
+    filter: NoteFilter<'_>,
+    t: &str,
+) {
+    use rusqlite::types::Value;
+    if let Some(id) = filter.note_id {
+        args.push(Value::Text(id.to_string()));
+        sql.push_str(&format!(" AND {t}.id = ?{}", args.len()));
+    }
+    if let Some(f) = filter.folder_id {
+        args.push(Value::Text(f.to_string()));
+        sql.push_str(&format!(" AND {t}.folder_id = ?{}", args.len()));
+    }
+    if let Some(cl) = filter.client_id {
+        args.push(Value::Text(cl.to_string()));
+        sql.push_str(&format!(" AND {t}.client_id = ?{}", args.len()));
+    }
+}
+
+/// The size of each per-signal candidate pool fused by RRF. Bigger than the
+/// final `limit` so a chunk ranked mid-pack by one signal can still win on the
+/// other.
+const HYBRID_POOL: usize = 20;
+/// RRF damping constant (standard default).
+const RRF_K: f64 = 60.0;
+
+/// Hybrid keyword+semantic search. With `query_vec = Some`, fuses BM25 and
+/// cosine rankings via RRF; with `None` (embedding unavailable), degrades to
+/// keyword-only so chat still works (issue #48 graceful degradation). Returns
+/// the top `limit` chunk hits.
+pub fn hybrid_search_chunks(
+    conn: &Connection,
+    query: &str,
+    query_vec: Option<&[f32]>,
+    model: &str,
+    filter: NoteFilter<'_>,
+    workspace: &str,
+    limit: usize,
+) -> Result<Vec<ChunkHit>> {
+    let keyword = keyword_ranked(conn, query, filter, workspace, HYBRID_POOL)?;
+    let Some(qv) = query_vec else {
+        // Keyword-only fallback.
+        return Ok(keyword.into_iter().take(limit).map(|ih| ih.hit).collect());
+    };
+    let semantic = semantic_ranked(conn, qv, model, filter, workspace, HYBRID_POOL)?;
+    if semantic.is_empty() {
+        // No vectors yet (e.g. not embedded) → keyword-only.
+        return Ok(keyword.into_iter().take(limit).map(|ih| ih.hit).collect());
+    }
+
+    // Fuse by chunk id; keep a lookup so the winners map back to their hits.
+    use std::collections::HashMap;
+    let mut hits: HashMap<String, ChunkHit> = HashMap::new();
+    let kw_ids: Vec<String> = keyword.into_iter().map(|ih| { hits.insert(ih.chunk_id.clone(), ih.hit); ih.chunk_id }).collect();
+    let sem_ids: Vec<String> = semantic.into_iter().map(|ih| { hits.entry(ih.chunk_id.clone()).or_insert(ih.hit); ih.chunk_id }).collect();
+    let fused = rrf_fuse(&[kw_ids, sem_ids], RRF_K);
+    Ok(fused
+        .into_iter()
+        .take(limit)
+        .filter_map(|(id, score)| hits.remove(&id).map(|mut h| {
+            h.rank = score; // fused RRF score (higher = better)
+            h
+        }))
+        .collect())
 }
 
 /// List live Notes in a workspace, optionally narrowed by folder and/or client,
@@ -2105,5 +2411,120 @@ mod tests {
         assert_eq!(list_notes_filtered(&conn, NoteFilter::default(), "", 10).unwrap().len(), 2);
         assert_eq!(list_notes_filtered(&conn, f_folder, "", 10).unwrap().len(), 1);
         assert_eq!(list_notes_filtered(&conn, f_client, "", 10).unwrap().len(), 1);
+    }
+
+    // ── Semantic retrieval: embeddings + hybrid RRF (issue #48) ──────────────
+
+    #[test]
+    fn cosine_handles_identical_orthogonal_and_mismatched() {
+        assert!((cosine(&[1.0, 0.0], &[1.0, 0.0]) - 1.0).abs() < 1e-6);
+        assert!(cosine(&[1.0, 0.0], &[0.0, 1.0]).abs() < 1e-6);
+        assert!((cosine(&[1.0, 2.0, 3.0], &[2.0, 4.0, 6.0]) - 1.0).abs() < 1e-6, "scale-invariant");
+        assert_eq!(cosine(&[1.0, 0.0], &[1.0, 0.0, 0.0]), 0.0, "length mismatch → 0");
+        assert_eq!(cosine(&[0.0, 0.0], &[1.0, 1.0]), 0.0, "zero vector → 0");
+    }
+
+    #[test]
+    fn rrf_ranks_items_strong_in_both_lists_highest() {
+        let kw = vec!["X".to_string(), "A".into(), "B".into()];
+        let sem = vec!["X".to_string(), "C".into(), "D".into()];
+        let fused = rrf_fuse(&[kw, sem], 60.0);
+        assert_eq!(fused[0].0, "X", "top-of-both wins");
+        // X's score is strictly greater than any single-list item's.
+        let x = fused[0].1;
+        assert!(fused[1..].iter().all(|(_, s)| *s < x));
+    }
+
+    #[test]
+    fn embedding_cache_is_incremental_across_reindex() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("embed.sqlite")).unwrap();
+        let n = create_note(&conn, "en", "meeting", "").unwrap();
+
+        // transcript + summary chunk independently → two chunks.
+        let write = |transcript: &str, summary: &str| {
+            update_note(
+                &conn,
+                &n.id,
+                &NotePatch {
+                    transcript: Some(transcript.into()),
+                    summary: Some(summary.into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let fresh = get_note(&conn, &n.id).unwrap();
+            reindex_note(&conn, &n.id, &fresh.body, &fresh.transcript, &fresh.summary).unwrap();
+        };
+        write("transcript about budgets", "summary about hiring");
+
+        // Both chunks need embedding; embed them.
+        let need = note_texts_needing_embedding(&conn, &n.id, "m").unwrap();
+        assert_eq!(need.len(), 2);
+        for (hash, _text) in &need {
+            store_embedding(&conn, hash, "m", &[1.0, 0.0, 0.0]).unwrap();
+        }
+        assert!(note_texts_needing_embedding(&conn, &n.id, "m").unwrap().is_empty(), "all cached now");
+        assert_eq!(count_embeddings(&conn, "m").unwrap(), 2);
+
+        // Edit ONLY the summary; the transcript chunk is unchanged. Reindex
+        // churns chunk ids, but the content-addressed cache means only the
+        // changed text re-embeds.
+        write("transcript about budgets", "GAMMA totally new summary text");
+        let need2 = note_texts_needing_embedding(&conn, &n.id, "m").unwrap();
+        assert_eq!(need2.len(), 1, "only the changed chunk re-embeds");
+        assert!(need2[0].1.contains("GAMMA"));
+
+        // A different model misses the cache entirely (fixed-dim-per-index).
+        assert_eq!(note_texts_needing_embedding(&conn, &n.id, "other").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn hybrid_falls_back_to_keyword_without_a_query_vector() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("hybrid_kw.sqlite")).unwrap();
+        let a = create_note(&conn, "en", "meeting", "").unwrap();
+        update_note(&conn, &a.id, &NotePatch { transcript: Some("quarterly financial planning".into()), ..Default::default() }).unwrap();
+        let na = get_note(&conn, &a.id).unwrap();
+        reindex_note(&conn, &a.id, &na.body, &na.transcript, &na.summary).unwrap();
+
+        // No query vector → keyword-only, still finds the term.
+        let hits = hybrid_search_chunks(&conn, "financial", None, "m", NoteFilter::default(), "", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].note_id, a.id);
+    }
+
+    #[test]
+    fn hybrid_surfaces_a_semantic_only_match_via_rrf() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("hybrid_sem.sqlite")).unwrap();
+        // note A matches the keyword "budget"; note B does not, but is a near-
+        // synonym match by meaning (we give it a vector identical to the query).
+        let a = create_note(&conn, "en", "meeting", "").unwrap();
+        update_note(&conn, &a.id, &NotePatch { transcript: Some("the budget was approved".into()), ..Default::default() }).unwrap();
+        let b = create_note(&conn, "en", "meeting", "").unwrap();
+        update_note(&conn, &b.id, &NotePatch { transcript: Some("we discussed spending limits".into()), ..Default::default() }).unwrap();
+        for id in [&a.id, &b.id] {
+            let nn = get_note(&conn, id).unwrap();
+            reindex_note(&conn, id, &nn.body, &nn.transcript, &nn.summary).unwrap();
+        }
+
+        // Query vector = [1,0,0]. Give B's chunk that exact vector (cosine 1.0),
+        // A's an orthogonal one (cosine 0) — so semantic ranks B above A.
+        let embed = |note_id: &str, v: &[f32]| {
+            for (hash, _t) in note_texts_needing_embedding(&conn, note_id, "m").unwrap() {
+                store_embedding(&conn, &hash, "m", v).unwrap();
+            }
+        };
+        embed(&a.id, &[0.0, 1.0, 0.0]);
+        embed(&b.id, &[1.0, 0.0, 0.0]);
+
+        let qv = [1.0f32, 0.0, 0.0];
+        let hits = hybrid_search_chunks(&conn, "budget", Some(&qv), "m", NoteFilter::default(), "", 10).unwrap();
+        let note_ids: Vec<&str> = hits.iter().map(|h| h.note_id.as_str()).collect();
+        // Keyword finds A; semantic surfaces B. Hybrid returns BOTH — the
+        // semantic-only match B would be invisible to keyword search alone.
+        assert!(note_ids.contains(&a.id.as_str()), "keyword match present");
+        assert!(note_ids.contains(&b.id.as_str()), "semantic-only match surfaced by RRF");
     }
 }

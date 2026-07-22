@@ -8,10 +8,83 @@
 use super::{DEFAULT_LOCAL_LLM_BASE_URL, DEFAULT_SUMMARY_MODEL};
 use crate::chat::{self, ChatCtx, ChatEvent, Citation, ToolScope};
 use crate::db::{self, CHAT_SCOPE_NOTE, CHAT_TENANT_PERSONAL};
+use crate::embed::{self, EmbeddingAdapter, OLLAMA_EMBED_MODEL, OPENAI_EMBED_MODEL};
 use crate::openai;
 use crate::AppState;
+use parking_lot::Mutex;
+use rusqlite::Connection;
 use serde::Serialize;
+use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager, State};
+
+/// Derive the embedding config from the resolved chat provider (issue #48) —
+/// no user-facing embedding choice. Cloud chat embeds with OpenAI's
+/// `text-embedding-3-small`; local chat with `embeddinggemma` via the same
+/// Ollama server. Both speak the OpenAI-compatible `/v1/embeddings` shape.
+fn resolve_embed(resolved: &ResolvedChat) -> embed::EmbedConfig {
+    match resolved.provider.as_str() {
+        "ollama" => embed::EmbedConfig {
+            provider: "ollama",
+            model: OLLAMA_EMBED_MODEL,
+            base_url: resolved.base_url.clone(),
+            api_key: None,
+        },
+        _ => embed::EmbedConfig {
+            provider: "openai",
+            model: OPENAI_EMBED_MODEL,
+            base_url: resolved.base_url.clone(),
+            api_key: resolved.api_key.clone(),
+        },
+    }
+}
+
+/// Embed a Note's not-yet-embedded chunks under the adapter's model and cache
+/// them (issue #48). Content-addressed, so only changed/new text embeds. Best-
+/// effort: any failure (model missing, API error) logs and returns — chat still
+/// works keyword-only. The DB lock is never held across the embed `.await`.
+pub(crate) async fn embed_note(
+    db: &Arc<Mutex<Connection>>,
+    adapter: &dyn EmbeddingAdapter,
+    note_id: &str,
+) {
+    let need = {
+        let conn = db.lock();
+        db::note_texts_needing_embedding(&conn, note_id, adapter.model_id()).unwrap_or_default()
+    };
+    if need.is_empty() {
+        return;
+    }
+    let texts: Vec<String> = need.iter().map(|(_, t)| t.clone()).collect();
+    match adapter.embed(&texts).await {
+        Ok(vectors) if vectors.len() == need.len() => {
+            let conn = db.lock();
+            for ((hash, _), vector) in need.iter().zip(vectors.iter()) {
+                let _ = db::store_embedding(&conn, hash, adapter.model_id(), vector);
+            }
+        }
+        Ok(vectors) => eprintln!(
+            "[chat] embed count mismatch for note {note_id}: {} vectors for {} chunks",
+            vectors.len(),
+            need.len()
+        ),
+        Err(e) => eprintln!("[chat] embed_note {note_id} failed (keyword-only): {e}"),
+    }
+}
+
+/// Resolve the embedding provider and embed a Note off the request path
+/// (content-settled checkpoint). Spawned fire-and-forget after a re-chunk so
+/// editing never blocks on embedding. No-op if no provider is configured.
+pub async fn embed_note_bg(app: AppHandle, note_id: String) {
+    let state: State<AppState> = app.state();
+    let key = super::read_provider_api_key(&state, "openai").ok().flatten();
+    let resolved = {
+        let conn = state.db.lock();
+        resolve_chat(&conn, key)
+    };
+    let Ok(resolved) = resolved else { return };
+    let adapter = resolve_embed(&resolved).adapter();
+    embed_note(&state.db, &adapter, &note_id).await;
+}
 
 /// Rebuild one Note's retrieval chunks from its current content. The single
 /// place body-HTML→text + `db::reindex_note` are combined, called from every
@@ -33,7 +106,7 @@ pub(crate) fn reindex_note_content(conn: &rusqlite::Connection, note_id: &str) {
 pub fn backfill_note_chunks(db: &std::sync::Arc<parking_lot::Mutex<rusqlite::Connection>>) {
     let ids = {
         let conn = db.lock();
-        db::note_ids_without_chunks(&conn).unwrap_or_default()
+        db::note_ids_needing_reindex(&conn).unwrap_or_default()
     };
     if ids.is_empty() {
         return;
@@ -47,11 +120,16 @@ pub fn backfill_note_chunks(db: &std::sync::Arc<parking_lot::Mutex<rusqlite::Con
 
 /// Rebuild a Note's retrieval index on demand — the frontend calls this when
 /// the Note view unmounts, so edits made without triggering summarize/diarize
-/// still land in search.
+/// still land in search. Re-chunks synchronously, then embeds off the request
+/// path (issue #48) so unmount stays snappy.
 #[tauri::command]
-pub fn chat_reindex_note(state: State<AppState>, note_id: String) -> Result<(), String> {
-    let conn = state.db.lock();
-    reindex_note_content(&conn, &note_id);
+pub fn chat_reindex_note(app: AppHandle, note_id: String) -> Result<(), String> {
+    {
+        let state: State<AppState> = app.state();
+        let conn = state.db.lock();
+        reindex_note_content(&conn, &note_id);
+    }
+    tauri::async_runtime::spawn(embed_note_bg(app, note_id));
     Ok(())
 }
 
@@ -215,6 +293,13 @@ pub async fn chat_send(
         (grounding, resolved, conversation.id, tool_scope, workspace)
     };
 
+    // Embed the anchor Note now (best-effort, cached) so semantic search works
+    // for the note the user is chatting about on the very first question. Other
+    // notes are embedded at their own checkpoints (issue #48).
+    let embed_cfg = resolve_embed(&resolved);
+    let embedder = embed_cfg.adapter();
+    embed_note(&state.db, &embedder, &note_id).await;
+
     let adapter = chat::build_chat_adapter(&resolved.provider);
     let conv_for_sink = conversation_id.clone();
     let app_for_sink = app.clone();
@@ -269,6 +354,7 @@ pub async fn chat_send(
         &grounding.text,
         &tool_scope,
         &workspace,
+        Some(&embedder as &dyn EmbeddingAdapter),
         &message,
         sink,
     )
