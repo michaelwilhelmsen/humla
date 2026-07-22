@@ -1,0 +1,576 @@
+{
+  "qwen3.5:9b": {
+    "clean": 6,
+    "total": 8,
+    "secs": 160.1,
+    "rows": [
+      {
+        "q": "What did we decide about Acme's pricing model?",
+        "kind": "single",
+        "well_formed": true,
+        "used_tool": true,
+        "first_tool": "search_notes",
+        "right_tool": true,
+        "sane_args": true,
+        "consumed": true,
+        "terminated": true,
+        "steps": 3,
+        "answer": "Based on our meeting notes, here's what we decided about Acme's pricing model:\n\n**Decision:** We agreed to switch from their previous pricing structure to **per-seat pricing at $12 per seat**.\n\nThis decision was documented in two key meetings:\n\n- **Acme kickoff (May 2, 2026)** - Note n1\n  - Acme requested the pricing model be switched to per-seat\n  - Jane raised concerns about the migration timeline initially\n  \n- **Acme follow-up (May 14, 2026)** - Note n2  \n  - The $12/seat per-seat pricing was confirmed and finalized\n  - Jane is now happy with this plan\n\n**Note:** There's a risk that Acme's procurement process may be slow, which could cause the implementation to slip into Q3.",
+        "error": null,
+        "calls": [
+          {
+            "name": "search_notes",
+            "args": {
+              "query": "Acme pricing model decision"
+            }
+          },
+          {
+            "name": "get_note",
+            "args": {
+              "id": "n1"
+            }
+          },
+          {
+            "name": "get_note",
+            "args": {
+              "id": "n2"
+            }
+          }
+        ],
+        "clean": true
+      },
+      {
+        "q": "List all my notes in the Sales folder.",
+        "kind": "single",
+        "well_formed": true,
+        "used_tool": true,
+        "first_tool": "list_notes",
+        "right_tool": true,
+        "sane_args": true,
+        "consumed": true,
+        "terminated": true,
+        "steps": 2,
+        "answer": "Here are all your notes in the **Sales** folder:\n\n| ID | Title | Date | Client | Folder |\n|----|-------|------|--------|--------|\n| n1 | Acme kickoff | 2026-05-02 | Acme | Sales |\n| n2 | Acme follow-up | 2026-05-14 | Acme | Sales |\n| n4 | Globex discovery | 2026-06-01 | Globex | Sales |\n| n5 | Globex security review | 2026-06-20 | Globex | Sales |\n| n7 | Initech renewal | 2026-07-01 | Initech | Sales |\n\nYou have **5 notes** total in the Sales folder. Would you like me to retrieve any specific note or search for something within these?",
+        "error": null,
+        "calls": [
+          {
+            "name": "list_notes",
+            "args": {
+              "folder_id": "Sales"
+            }
+          }
+        ],
+        "clean": true
+      },
+      {
+        "q": "Read note n2 and tell me the risk it mentions.",
+        "kind": "single",
+        "well_formed": true,
+        "used_tool": true,
+        "first_tool": "get_note",
+        "right_tool": true,
+        "sane_args": true,
+        "consumed": true,
+        "terminated": true,
+        "steps": 2,
+        "answer": "Note n2 mentions this risk: **Acme procurement is slow and may slip to Q3.**",
+        "error": null,
+        "calls": [
+          {
+            "name": "get_note",
+            "args": {
+              "id": "n2"
+            }
+          }
+        ],
+        "clean": true
+      },
+      {
+        "q": "Which of my clients are at risk right now, and why?",
+        "kind": "multi",
+        "well_formed": true,
+        "used_tool": true,
+        "first_tool": "search_notes",
+        "right_tool": true,
+        "sane_args": true,
+        "consumed": true,
+        "terminated": true,
+        "steps": 5,
+        "answer": "Based on your meeting notes, here are the clients that appear to be at risk right now:\n\n## 1. **Initech** (Highest Risk - Churn)\n- **Note ID:** n7\n- **Why they're at risk:** They've been unhappy about recent downtime and have explicitly asked for a discount to renew. The note states \"At churn risk\" with an action item to escalate to the account owner.\n\n## 2. **Acme** (Medium Risk - Timeline Slip)\n- **Note ID:** n2\n- **Why they're at risk:** Their procurement process is slow, and there's a specific concern that their deal may slip into Q3 instead of closing sooner. Jane was initially concerned about the migration timeline but seems happier now after pricing confirmation.\n\n## 3. **Globex** (Potential Delay Risk)\n- **Note ID:** n5\n- **Why they're at risk:** Their legal team wants a custom DPA which could delay signing, even though their security review has passed and budget is approved for 40 seats. This is more of a procedural hurdle than churn risk.\n\n**Summary:** Initech appears to be your most urgent concern given the explicit \"churn risk\" designation due to dissatisfaction with service quality (downtime). Acme's timeline slip could impact Q3 revenue, while Globex faces potential delays but seems otherwise on track.",
+        "error": null,
+        "calls": [
+          {
+            "name": "search_notes",
+            "args": {
+              "query": "at risk client concern issue problem warning"
+            }
+          },
+          {
+            "name": "get_note",
+            "args": {
+              "id": "n2"
+            }
+          },
+          {
+            "name": "get_note",
+            "args": {
+              "id": "n5"
+            }
+          },
+          {
+            "name": "search_notes",
+            "args": {
+              "query": "churn cancel leave terminate unhappy frustrated slow procurement legal delay DPA"
+            }
+          },
+          {
+            "name": "get_note",
+            "args": {
+              "id": "n7"
+            }
+          },
+          {
+            "name": "list_notes",
+            "args": {}
+          },
+          {
+            "name": "get_note",
+            "args": {
+              "id": "n4"
+            }
+          }
+        ],
+        "clean": true
+      },
+      {
+        "q": "Connect the dots: what are the open risks and opportunities across my client meetings?",
+        "kind": "multi",
+        "well_formed": true,
+        "used_tool": true,
+        "first_tool": "search_notes",
+        "right_tool": true,
+        "sane_args": true,
+        "consumed": false,
+        "terminated": true,
+        "steps": 6,
+        "answer": "",
+        "error": null,
+        "calls": [
+          {
+            "name": "search_notes",
+            "args": {
+              "query": "open risks opportunities"
+            }
+          },
+          {
+            "name": "search_notes",
+            "args": {
+              "query": "risk"
+            }
+          },
+          {
+            "name": "search_notes",
+            "args": {
+              "query": "opportunity"
+            }
+          },
+          {
+            "name": "get_note",
+            "args": {
+              "id": "n2"
+            }
+          },
+          {
+            "name": "get_note",
+            "args": {
+              "id": "n5"
+            }
+          },
+          {
+            "name": "get_note",
+            "args": {
+              "id": "n7"
+            }
+          },
+          {
+            "name": "get_note",
+            "args": {
+              "id": "n4"
+            }
+          },
+          {
+            "name": "search_notes",
+            "args": {
+              "query": "upsell expand growth add-on"
+            }
+          }
+        ],
+        "clean": false
+      },
+      {
+        "q": "What did we agree about the Zephyr quantum protocol?",
+        "kind": "empty",
+        "well_formed": true,
+        "used_tool": true,
+        "first_tool": "search_notes",
+        "right_tool": true,
+        "sane_args": true,
+        "consumed": false,
+        "terminated": true,
+        "steps": 6,
+        "answer": "",
+        "error": null,
+        "calls": [
+          {
+            "name": "search_notes",
+            "args": {
+              "query": "Zephyr quantum protocol"
+            }
+          },
+          {
+            "name": "search_notes",
+            "args": {
+              "query": "quantum"
+            }
+          },
+          {
+            "name": "search_notes",
+            "args": {
+              "query": "Zephyr"
+            }
+          },
+          {
+            "name": "search_notes",
+            "args": {
+              "query": "protocol"
+            }
+          },
+          {
+            "name": "list_notes",
+            "args": {}
+          }
+        ],
+        "clean": false
+      },
+      {
+        "q": "Summarize where things stand with Globex.",
+        "kind": "multi",
+        "well_formed": true,
+        "used_tool": true,
+        "first_tool": "search_notes",
+        "right_tool": true,
+        "sane_args": true,
+        "consumed": true,
+        "terminated": true,
+        "steps": 3,
+        "answer": "Based on the meeting notes, here's where things stand with Globex:\n\n**Current Status:** Things are progressing well. The security review has been completed and passed, and budget approval is now in place for 40 seats.\n\n**Timeline & Progress:**\n- **June 1 (n4):** Initial discovery showed interest but unclear budget; they requested a security review before committing\n- **June 20 (n5):** Security review cleared; budget approved for 40 seats\n\n**Remaining Risks/Issues:**\n- Their legal team wants a custom DPA (Data Processing Agreement), which could delay the final signing\n\n**Opportunities:**\n- Upsell potential exists for the compliance add-on, as noted in earlier discussions\n\nOverall, Globex is moving toward closing with only one remaining hurdle: negotiating their custom DPA requirements.",
+        "error": null,
+        "calls": [
+          {
+            "name": "search_notes",
+            "args": {
+              "query": "Globex"
+            }
+          },
+          {
+            "name": "get_note",
+            "args": {
+              "id": "n4"
+            }
+          },
+          {
+            "name": "get_note",
+            "args": {
+              "id": "n5"
+            }
+          }
+        ],
+        "clean": true
+      },
+      {
+        "q": "What action items do I have for Acme?",
+        "kind": "single",
+        "well_formed": true,
+        "used_tool": true,
+        "first_tool": "search_notes",
+        "right_tool": true,
+        "sane_args": true,
+        "consumed": true,
+        "terminated": true,
+        "steps": 4,
+        "answer": "Based on your meeting notes, here are the action items for Acme:\n\n**From Note n1 (Acme kickoff - 2026-05-02):**\n- **Action:** Send revised quote by Friday\n\nThis was in response to Acme wanting the pricing model switched to per-seat and Jane raising concerns about the migration timeline.\n\nNote that there's also a follow-up note from n2 (Acme follow-up - 2026-05-14) which indicates the per-seat pricing at $12 per seat was confirmed and Jane is happy with the plan, but it doesn't list additional action items\u2014instead noting a risk about Acme's slow procurement process potentially causing delays to Q3.",
+        "error": null,
+        "calls": [
+          {
+            "name": "search_notes",
+            "args": {
+              "query": "Acme action item"
+            }
+          },
+          {
+            "name": "get_note",
+            "args": {
+              "id": "n1"
+            }
+          },
+          {
+            "name": "get_note",
+            "args": {
+              "id": "n2"
+            }
+          },
+          {
+            "name": "search_notes",
+            "args": {
+              "query": "Acme"
+            }
+          }
+        ],
+        "clean": true
+      }
+    ]
+  },
+  "gemma4:12b-mlx": {
+    "clean": 7,
+    "total": 8,
+    "secs": 102.6,
+    "rows": [
+      {
+        "q": "What did we decide about Acme's pricing model?",
+        "kind": "single",
+        "well_formed": true,
+        "used_tool": true,
+        "first_tool": "search_notes",
+        "right_tool": true,
+        "sane_args": true,
+        "consumed": true,
+        "terminated": true,
+        "steps": 2,
+        "answer": "The team decided to switch Acme's pricing model to **per-seat** pricing at **$12 per seat**.\n\nSources:\n- n1 (Acme kickoff)\n- n2 (Acme follow-up)",
+        "error": null,
+        "calls": [
+          {
+            "name": "search_notes",
+            "args": {
+              "query": "Acme pricing"
+            }
+          }
+        ],
+        "clean": true
+      },
+      {
+        "q": "List all my notes in the Sales folder.",
+        "kind": "single",
+        "well_formed": true,
+        "used_tool": true,
+        "first_tool": "list_notes",
+        "right_tool": true,
+        "sane_args": true,
+        "consumed": true,
+        "terminated": true,
+        "steps": 2,
+        "answer": "Here are your notes in the Sales folder:\n\n*   **Acme kickoff** (May 2, 2026) - [n1]\n*   **Acme follow-up** (May 14, 2026) - [n2]\n*   **Globex discovery** (June 1, 2026) - [n4]\n*   **Globex security review** (June 20, 2026) - [n5]\n*   **Initech renewal** (July 1, 2026) - [n7]",
+        "error": null,
+        "calls": [
+          {
+            "name": "list_notes",
+            "args": {
+              "folder_id": "Sales"
+            }
+          }
+        ],
+        "clean": true
+      },
+      {
+        "q": "Read note n2 and tell me the risk it mentions.",
+        "kind": "single",
+        "well_formed": true,
+        "used_tool": true,
+        "first_tool": "get_note",
+        "right_tool": true,
+        "sane_args": true,
+        "consumed": true,
+        "terminated": true,
+        "steps": 2,
+        "answer": "The risk mentioned in note n2 is that Acme procurement is slow and may slip to Q3.",
+        "error": null,
+        "calls": [
+          {
+            "name": "get_note",
+            "args": {
+              "id": "n2"
+            }
+          }
+        ],
+        "clean": true
+      },
+      {
+        "q": "Which of my clients are at risk right now, and why?",
+        "kind": "multi",
+        "well_formed": true,
+        "used_tool": true,
+        "first_tool": "search_notes",
+        "right_tool": true,
+        "sane_args": true,
+        "consumed": true,
+        "terminated": true,
+        "steps": 2,
+        "answer": "Based on your notes, the following clients are currently identified as being at risk:\n\n*   **Initech**: They are at **churn risk** due to unhappiness regarding recent downtime. They have requested a discount to renew (Note n7).\n*   **Acme**: There is a risk that procurement is moving slowly and may cause the deal to slip into Q3 (Note n2).\n*   **Globex**: Their legal team wants a custom DPA, which could potentially delay the signing of the contract (Note n5).",
+        "error": null,
+        "calls": [
+          {
+            "name": "search_notes",
+            "args": {
+              "query": "risk"
+            }
+          }
+        ],
+        "clean": true
+      },
+      {
+        "q": "Connect the dots: what are the open risks and opportunities across my client meetings?",
+        "kind": "multi",
+        "well_formed": true,
+        "used_tool": true,
+        "first_tool": "list_notes",
+        "right_tool": false,
+        "sane_args": true,
+        "consumed": true,
+        "terminated": true,
+        "steps": 3,
+        "answer": "Based on your recent client meetings, here are the key risks and opportunities identified:\n\n### **Risks**\n*   **Acme (Procurement Delay):** There is a risk that Acme's procurement process is slow, which may cause the deal to slip into Q3 (**n2**).\n*   **Globex (Legal/Contracting):** While the security review passed and budget was approved for 40 seats, their legal team is requesting a custom DPA, which could delay the final signing (**n5**).\n*   **Initech (Churn Risk):** Initech is currently at churn risk due to recent downtime. They have requested a discount to renew the contract (**n7**).\n\n### **Opportunities**\n*   **Globex (Upsell):** There is a clear opportunity to upsell the compliance add-on during the current engagement (**n4**).\n*   **Acme (Pricing Alignment):** You successfully moved them to a per-seat pricing model ($12/seat), which has resolved their initial concerns regarding the migration plan (**n1**, **n2**).",
+        "error": null,
+        "calls": [
+          {
+            "name": "list_notes",
+            "args": {}
+          },
+          {
+            "name": "search_notes",
+            "args": {
+              "query": "risk opportunity concern challenge growth potential"
+            }
+          }
+        ],
+        "clean": true
+      },
+      {
+        "q": "What did we agree about the Zephyr quantum protocol?",
+        "kind": "empty",
+        "well_formed": true,
+        "used_tool": true,
+        "first_tool": "search_notes",
+        "right_tool": true,
+        "sane_args": true,
+        "consumed": false,
+        "terminated": true,
+        "steps": 6,
+        "answer": "",
+        "error": null,
+        "calls": [
+          {
+            "name": "search_notes",
+            "args": {
+              "query": "Zephyr quantum protocol"
+            }
+          },
+          {
+            "name": "search_notes",
+            "args": {
+              "query": "Zephyr"
+            }
+          },
+          {
+            "name": "search_notes",
+            "args": {
+              "query": "quantum protocol"
+            }
+          },
+          {
+            "name": "search_notes",
+            "args": {
+              "query": "protocol"
+            }
+          },
+          {
+            "name": "search_notes",
+            "args": {
+              "query": "agreement"
+            }
+          }
+        ],
+        "clean": false
+      },
+      {
+        "q": "Summarize where things stand with Globex.",
+        "kind": "multi",
+        "well_formed": true,
+        "used_tool": true,
+        "first_tool": "search_notes",
+        "right_tool": true,
+        "sane_args": true,
+        "consumed": true,
+        "terminated": true,
+        "steps": 4,
+        "answer": "Based on your meeting notes, here is the current status with Globex:\n\n*   **Current Status:** The security review has passed, and they have approved a budget for 40 seats (Note n5).\n*   **Next Steps & Risks:** There is a potential delay in signing because their legal team is requesting a custom Data Processing Agreement (DPA) (Note n5).\n*   **Opportunities:** There was an identified opportunity to upsell the compliance add-on (Note n4).",
+        "error": null,
+        "calls": [
+          {
+            "name": "search_notes",
+            "args": {
+              "query": "Globex"
+            }
+          },
+          {
+            "name": "get_note",
+            "args": {
+              "id": "n4"
+            }
+          },
+          {
+            "name": "get_note",
+            "args": {
+              "id": "n5"
+            }
+          }
+        ],
+        "clean": true
+      },
+      {
+        "q": "What action items do I have for Acme?",
+        "kind": "single",
+        "well_formed": true,
+        "used_tool": true,
+        "first_tool": "search_notes",
+        "right_tool": true,
+        "sane_args": true,
+        "consumed": true,
+        "terminated": true,
+        "steps": 4,
+        "answer": "You have one action item for Acme:\n\n*   **Send revised quote by Friday** (from the \"Acme kickoff\" meeting on 2026-05-02).\n\nSource: n1",
+        "error": null,
+        "calls": [
+          {
+            "name": "search_notes",
+            "args": {
+              "query": "Acme"
+            }
+          },
+          {
+            "name": "get_note",
+            "args": {
+              "id": "n1"
+            }
+          },
+          {
+            "name": "get_note",
+            "args": {
+              "id": "n2"
+            }
+          }
+        ],
+        "clean": true
+      }
+    ]
+  }
+}
