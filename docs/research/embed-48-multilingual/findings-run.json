@@ -1,0 +1,49 @@
+{
+  "model": "embeddinggemma",
+  "passed": 6,
+  "total": 6,
+  "cases": [
+    {
+      "lang": "en",
+      "query": "How much did we cut the marketing budget?",
+      "correct_rank_top": true,
+      "correct_sim": 0.581,
+      "best_distractor_sim": 0.2406
+    },
+    {
+      "lang": "nb",
+      "query": "Hvor mye kuttet vi i markedsføringsbudsjettet?",
+      "correct_rank_top": true,
+      "correct_sim": 0.4758,
+      "best_distractor_sim": 0.3809
+    },
+    {
+      "lang": "nb",
+      "query": "Hvem er ansvarlig for lanseringen?",
+      "correct_rank_top": true,
+      "correct_sim": 0.4404,
+      "best_distractor_sim": 0.3243
+    },
+    {
+      "lang": "de",
+      "query": "Wann ist die Frist für das Angebot?",
+      "correct_rank_top": true,
+      "correct_sim": 0.8112,
+      "best_distractor_sim": 0.2892
+    },
+    {
+      "lang": "es",
+      "query": "¿Quién aprobó el presupuesto?",
+      "correct_rank_top": true,
+      "correct_sim": 0.6129,
+      "best_distractor_sim": 0.2637
+    },
+    {
+      "lang": "en->nb",
+      "query": "What did we decide about hiring?",
+      "correct_rank_top": true,
+      "correct_sim": 0.5119,
+      "best_distractor_sim": 0.3618
+    }
+  ]
+}

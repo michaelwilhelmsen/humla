@@ -1,6 +1,6 @@
 # embeddinggemma multilingual sanity check (issue #48)
 
-**Status: harness ready; empirical run pending a local `embeddinggemma` pull.**
+**Status: run 2026-07-22 — 6/6 pass across en/nb/de/es + cross-lingual. Ship as-is.**
 
 This is the *non-blocking multilingual sanity check* the #48 acceptance criteria
 ask for. It is deliberately a sanity check, not a benchmark: `embeddinggemma` is
@@ -32,19 +32,35 @@ python3 docs/research/embed-48-multilingual/probe.py
 It writes `findings-run.json` (per-case cosine of the correct passage vs the
 best distractor) and exits non-zero if any case fails.
 
-## Why this wasn't auto-run in the implementing session
-
-`embeddinggemma` was not present on the dev machine, and the check is explicitly
-**non-blocking** for the slice — semantic retrieval degrades gracefully to
-keyword-only when the model is absent, so shipping #48 does not depend on it.
-Pulling a 600 MB model onto the user's machine without asking wasn't warranted
-for a sanity check. Run the command above to record results (paste the
-`findings-run.json` summary into the "Results" section below).
-
 ## Results
 
-_Pending — run `probe.py` and record the per-language pass/fail + cosine
-margins here._
+Run 2026-07-22, `embeddinggemma:latest` via Ollama `/v1/embeddings` (768 dims).
+**6/6 cases pass** — in every language the intended (semantic, non-lexical)
+passage is the top cosine match over its distractors. Raw output in
+`findings-run.json`.
+
+| Lang     | Correct sim | Best distractor | Margin |
+|----------|-------------|-----------------|--------|
+| en       | 0.581       | 0.241           | 0.340  |
+| nb       | 0.476       | 0.381           | 0.095  |
+| nb       | 0.440       | 0.324           | 0.116  |
+| de       | 0.811       | 0.289           | 0.522  |
+| es       | 0.613       | 0.264           | 0.349  |
+| en→nb    | 0.512       | 0.362           | 0.150  |
+
+**Verdict: acceptable, ship as-is.** Norwegian and English both retrieve
+correctly, and cross-lingual (English query → Norwegian passage) works — so a
+bilingual note set is served by a single embedder. Observations:
+
+- **Norwegian margins are the thinnest** (~0.10 vs English's 0.34, German's
+  0.52). Still a clean win over distractors, but Norwegian passages sit closer
+  together in the space than the Latinate languages do. Not weak enough to act
+  on — RRF's keyword half backstops it, and absolute cosine isn't comparable
+  across languages anyway (only the ranking matters).
+- Per the fixed decision framework: **no model swap**. If Norwegian recall ever
+  disappoints in real use, tune retrieval first (smaller/overlapping chunks so a
+  specific passage isn't diluted; an instruction prefix on the query if the
+  embeddinggemma card recommends one; RRF `k`).
 
 ## Decision framework (fixed regardless of results)
 
