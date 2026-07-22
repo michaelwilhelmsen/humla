@@ -1,0 +1,80 @@
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { ChatTab } from "./Chat";
+import { mockTauri } from "../../../test/tauri";
+import { DEFAULTS, type EditableKey } from "../types";
+
+function settings(overrides: Partial<Record<EditableKey, string>> = {}) {
+  return { ...DEFAULTS, ...overrides } as Record<EditableKey, string>;
+}
+
+beforeEach(() => {
+  mockTauri();
+});
+
+describe("ChatTab provider setting", () => {
+  it("offers exactly OpenAI and Ollama — never Groq/Deepgram", () => {
+    render(<ChatTab s={settings({ chat_provider: "openai" })} update={async () => {}} />);
+    fireEvent.click(screen.getByRole("button", { name: /Cloud \(OpenAI\)/ }));
+    const options = screen.getAllByRole("option").map((o) => o.textContent);
+    expect(options).toEqual(["Cloud (OpenAI)", "Local (Ollama)"]);
+    expect(screen.queryByRole("option", { name: /Groq/i })).toBeNull();
+    expect(screen.queryByRole("option", { name: /Deepgram/i })).toBeNull();
+  });
+
+  it("persists the provider choice via update", () => {
+    const update = vi.fn();
+    render(<ChatTab s={settings({ chat_provider: "openai" })} update={update} />);
+    fireEvent.click(screen.getByRole("button", { name: /Cloud \(OpenAI\)/ }));
+    fireEvent.click(screen.getByRole("option", { name: "Local (Ollama)" }));
+    expect(update).toHaveBeenCalledWith("chat_provider", "ollama");
+  });
+});
+
+describe("ChatTab readiness", () => {
+  it("OpenAI: flags a missing key", async () => {
+    mockTauri({ provider_key_get: () => null }); // no key stored
+    render(<ChatTab s={settings({ chat_provider: "openai", chat_model: "gpt-5.4" })} update={async () => {}} />);
+    expect(screen.getByText("Setup needed")).toBeInTheDocument();
+    expect(screen.getByText(/Add your OpenAI key/)).toBeInTheDocument();
+  });
+
+  it("OpenAI: ready with a stored key and a chosen model", async () => {
+    mockTauri({ provider_key_get: () => "stored" });
+    render(<ChatTab s={settings({ chat_provider: "openai", chat_model: "gpt-5.4" })} update={async () => {}} />);
+    await waitFor(() => expect(screen.getByText("Ready ✓")).toBeInTheDocument());
+  });
+
+  it("Ollama: flags an unreachable server", async () => {
+    mockTauri({
+      local_llm_list_models: () => {
+        throw new Error("connection refused");
+      },
+    });
+    render(<ChatTab s={settings({ chat_provider: "ollama", chat_model: "qwen3.5:4b" })} update={async () => {}} />);
+    await waitFor(() => expect(screen.getByText(/Start or install Ollama/)).toBeInTheDocument());
+  });
+
+  it("Ollama: flags a model that isn't installed on the server", async () => {
+    mockTauri({ local_llm_list_models: () => ["some-other-model"] });
+    render(<ChatTab s={settings({ chat_provider: "ollama", chat_model: "qwen3.5:4b" })} update={async () => {}} />);
+    await waitFor(() =>
+      expect(screen.getByText(/isn't installed on the server/)).toBeInTheDocument(),
+    );
+  });
+
+  it("Ollama: ready when the server has the chosen model", async () => {
+    mockTauri({ local_llm_list_models: () => ["qwen3.5:4b"] });
+    render(<ChatTab s={settings({ chat_provider: "ollama", chat_model: "qwen3.5:4b" })} update={async () => {}} />);
+    await waitFor(() => expect(screen.getByText("Ready ✓")).toBeInTheDocument());
+  });
+
+  it("Ollama: the pull command is copyable", () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.assign(navigator, { clipboard: { writeText } });
+    mockTauri({ local_llm_list_models: () => ["some-other-model"] });
+    render(<ChatTab s={settings({ chat_provider: "ollama", chat_model: "qwen3.5:4b" })} update={async () => {}} />);
+    fireEvent.click(screen.getByRole("button", { name: /Copy Ollama pull command/ }));
+    expect(writeText).toHaveBeenCalledWith("ollama pull qwen3.5:4b");
+  });
+});

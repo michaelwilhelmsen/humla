@@ -35,6 +35,8 @@ export const DEFAULTS: Record<EditableKey, string> = {
   local_llm_base_url: "http://localhost:11434/v1",
   local_llm_model: "",
   local_llm_think: "false",
+  chat_provider: "openai",
+  chat_model: "",
   developer_mode: "false",
   silence_rms_threshold: "0.005",
 };
@@ -52,6 +54,13 @@ export const LOCAL_PROVIDER = {
 export const SUMMARY_PROVIDERS = [
   { value: "openai", label: "Cloud (OpenAI)" },
   { value: "local", label: "Local (any OpenAI-compatible server)" },
+];
+
+// AI Chat providers (issue #44). Only these two — Groq/Deepgram can't embed,
+// which chat retrieval will depend on, so they're never offered.
+export const CHAT_PROVIDERS = [
+  { value: "openai", label: "Cloud (OpenAI)" },
+  { value: "ollama", label: "Local (Ollama)" },
 ];
 
 export const WHISPER_PRESETS = [

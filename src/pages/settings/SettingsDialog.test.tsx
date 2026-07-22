@@ -208,7 +208,7 @@ describe("settings dialog", () => {
     expect(within(dialog).queryByRole("searchbox")).not.toBeInTheDocument();
   });
 
-  it("shows the five sections in the sidebar nav", async () => {
+  it("shows the six sections in the sidebar nav", async () => {
     renderApp("/settings");
     const dialog = await screen.findByRole("dialog", { name: /settings/i });
 
@@ -219,6 +219,7 @@ describe("settings dialog", () => {
       "Recording",
       "Transcription",
       "Summaries",
+      "Chat",
       "Account",
       "General",
     ]);

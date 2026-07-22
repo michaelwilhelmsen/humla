@@ -5,6 +5,7 @@ import { Toggle } from "../components/Toggle";
 import { SummaryPromptsManager } from "../components/SummaryPromptsManager";
 import { OllamaConnect } from "../../../components/provider/OllamaConnect";
 import { ProviderKeyCard } from "../../../components/provider/ProviderKeyCard";
+import { CommandSnippet } from "../../../components/CommandSnippet";
 import { SUMMARY_PRESETS, presetLabel } from "../../../lib/presets";
 import { SUMMARY_MODELS, SUMMARY_PROVIDERS } from "../types";
 import type { SettingsHook } from "../useSettings";
@@ -55,19 +56,22 @@ export function SummaryTab({
               model={s.local_llm_model}
               onModelChange={(v) => update("local_llm_model", v)}
             />
-            <p className="text-xs text-[var(--color-text-muted)] py-3">
-              Works with Ollama, LM Studio (<code>http://localhost:1234/v1</code>),
-              <code> llama-server</code>, and vLLM. Don't have one yet?{" "}
-              <button
-                type="button"
-                onClick={() => openExternal("https://ollama.com/download")}
-                className="underline hover:text-[var(--color-text)]"
-              >
-                Install Ollama
-              </button>
-              , then run <code>ollama pull qwen3.5:4b</code>. On 16 GB Macs,
-              stick to 4B-class models — 9B and up will OOM during summary.
-            </p>
+            <div className="py-3 space-y-2">
+              <p className="text-xs text-[var(--color-text-muted)]">
+                Works with Ollama, LM Studio (<code>http://localhost:1234/v1</code>),
+                <code> llama-server</code>, and vLLM. Don't have one yet?{" "}
+                <button
+                  type="button"
+                  onClick={() => openExternal("https://ollama.com/download")}
+                  className="underline hover:text-[var(--color-text)]"
+                >
+                  Install Ollama
+                </button>
+                , then pull a model (on 16 GB Macs stick to 4B-class — 9B and up
+                will OOM during summary):
+              </p>
+              <CommandSnippet command="ollama pull qwen3.5:4b" ariaLabel="Copy Ollama pull command" />
+            </div>
             <Row
               label="Thinking mode"
               description="Qwen 3+ reasons internally before answering — sometimes higher quality, but can take many minutes on a long meeting. Ollama only; other servers ignore it."

@@ -88,6 +88,12 @@ export type SettingsKey =
   | "local_llm_base_url"
   | "local_llm_model"
   | "local_llm_think"
+  // AI Chat provider (issue #44). Independent of the summary/STT provider.
+  // "openai" (cloud, shared OpenAI key) or "ollama" (local). The Ollama
+  // endpoint reuses `local_llm_base_url`; `chat_model` holds the active
+  // provider's model. Embedding model is auto-derived, not a setting.
+  | "chat_provider"
+  | "chat_model"
   | "theme"
   | "palette"
   | "developer_mode"
