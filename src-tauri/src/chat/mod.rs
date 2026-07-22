@@ -210,14 +210,10 @@ pub enum ChatEvent {
 ///
 /// Tauri-free by design: `db` is a plain connection handle and `sink` is a
 /// closure, so the deterministic tests drive this directly with `FakeChatAdapter`.
-#[allow(clippy::too_many_arguments)]
 pub async fn run_chat(
     db: &Db,
     adapter: &dyn ChatAdapter,
-    model: &str,
-    api_key: Option<&str>,
-    base_url: &str,
-    think: bool,
+    ctx: ChatCtx<'_>,
     conversation_id: &str,
     grounding: &str,
     user_text: &str,
@@ -238,8 +234,9 @@ pub async fn run_chat(
 
     let prompt = assemble_prompt(SYSTEM_PROMPT, grounding, &turns)?;
     eprintln!(
-        "[chat] provider={} model={model} turns={} grounding_chars={}",
+        "[chat] provider={} model={} turns={} grounding_chars={}",
         adapter.provider_id(),
+        ctx.model,
         turns.len(),
         grounding.len(),
     );
@@ -268,7 +265,6 @@ pub async fn run_chat(
 
     // 3. Stream. The adapter fires TextDelta events; forward each to the sink
     //    tagged with the assistant message + block id.
-    let ctx = ChatCtx { model, api_key, base_url, think };
     let stream_result = {
         let msg_id = assistant_id.clone();
         let block_id = assistant_block.clone();
@@ -339,18 +335,22 @@ mod tests {
     }
 
     #[test]
-    fn assemble_drops_oldest_turns_beyond_budget() {
-        let big = "a".repeat(HISTORY_CHAR_BUDGET);
+    fn assemble_keeps_recent_turns_and_drops_the_oldest_beyond_budget() {
+        // Newest + middle fit the history budget; the oldest (big) pushes the
+        // running total over it, so it's dropped while the more recent turns
+        // are kept. This proves the "as many recent turns as fit" behaviour,
+        // not merely "everything but the newest is dropped".
+        let big = "a".repeat(HISTORY_CHAR_BUDGET); // alone > budget once combined
         let turns = vec![
-            ChatTurn::new("user", "oldest"),
-            ChatTurn::new("assistant", big.clone()),
-            ChatTurn::new("user", "newest"),
+            ChatTurn::new("user", big),
+            ChatTurn::new("assistant", "middle-answer"),
+            ChatTurn::new("user", "newest-question"),
         ];
         let out = assemble_prompt(SYSTEM_PROMPT, "", &turns).unwrap();
-        // system + the big assistant turn + newest; "oldest" dropped.
         let texts: Vec<&str> = out.iter().map(|t| t.text.as_str()).collect();
-        assert!(texts.contains(&"newest"));
-        assert!(!texts.contains(&"oldest"));
+        assert!(texts.contains(&"newest-question"));
+        assert!(texts.contains(&"middle-answer"), "the fitting middle turn is kept");
+        assert!(!texts.iter().any(|t| t.len() == HISTORY_CHAR_BUDGET), "the oldest big turn is dropped");
     }
 
     #[test]
@@ -398,10 +398,7 @@ mod tests {
         run_chat(
             &dbh,
             &adapter,
-            "fake-model",
-            None,
-            "http://local",
-            false,
+            ChatCtx { model: "fake-model", api_key: None, base_url: "http://local", think: false },
             &conv.id,
             "GROUNDING",
             "What happened?",
@@ -450,7 +447,13 @@ mod tests {
             conv_id = conv.id.clone();
             let adapter = FakeChatAdapter::new(["answer"]);
             run_chat(
-                &dbh, &adapter, "m", None, "u", false, &conv.id, "G", "hi", |_| {},
+                &dbh,
+                &adapter,
+                ChatCtx { model: "m", api_key: None, base_url: "u", think: false },
+                &conv.id,
+                "G",
+                "hi",
+                |_| {},
             )
             .await
             .unwrap();
@@ -513,7 +516,13 @@ mod tests {
         };
         let adapter = FailingAdapter;
         let res = run_chat(
-            &dbh, &adapter, "m", None, "u", false, &conv.id, "G", "hi", |_| {},
+            &dbh,
+            &adapter,
+            ChatCtx { model: "m", api_key: None, base_url: "u", think: false },
+            &conv.id,
+            "G",
+            "hi",
+            |_| {},
         )
         .await;
         assert!(res.is_err());

@@ -414,6 +414,11 @@ export type ChatErrorEvent = { conversationId: string; message: string };
 export function onChatTextDelta(cb: (e: ChatTextDeltaEvent) => void): Promise<UnlistenFn> {
   return listen<ChatTextDeltaEvent>("chat_text_delta", (e) => cb(e.payload));
 }
+// Part of the wire contract and emitted by the backend after the assistant
+// row is finalised. The Note's ChatPanel drives completion off the chat_send
+// promise (it reloads history when the call resolves), so it doesn't subscribe
+// here — but the listener is part of the client's event surface for other
+// consumers (e.g. a future multi-pane view) and to mirror the cloud contract.
 export function onChatDone(cb: (e: ChatDoneEvent) => void): Promise<UnlistenFn> {
   return listen<ChatDoneEvent>("chat_done", (e) => cb(e.payload));
 }

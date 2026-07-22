@@ -59,5 +59,5 @@ export function useChatReadiness() {
     else ready = true;
   }
 
-  return { loading, ready, hint, provider };
+  return { loading, ready, hint, provider, model };
 }

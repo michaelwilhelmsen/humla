@@ -6,7 +6,7 @@
 //! assembly, budget, streaming orchestration) lives Tauri-free in `crate::chat`.
 
 use super::{DEFAULT_LOCAL_LLM_BASE_URL, DEFAULT_SUMMARY_MODEL};
-use crate::chat::{self, ChatEvent};
+use crate::chat::{self, ChatCtx, ChatEvent};
 use crate::db::{self, CHAT_SCOPE_NOTE, CHAT_TENANT_PERSONAL};
 use crate::openai;
 use crate::AppState;
@@ -27,20 +27,20 @@ fn resolve_chat(
     conn: &rusqlite::Connection,
     openai_api_key: Option<String>,
 ) -> anyhow::Result<ResolvedChat> {
-    let provider = db::get_setting(conn, "chat_provider")?
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "openai".into());
-    let model_setting = db::get_setting(conn, "chat_model")?
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
+    // Read a setting as a non-empty trimmed value, or None.
+    let setting = |key: &str| -> anyhow::Result<Option<String>> {
+        Ok(db::get_setting(conn, key)?
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()))
+    };
+
+    let provider = setting("chat_provider")?.unwrap_or_else(|| "openai".into());
+    let model_setting = setting("chat_model")?;
 
     match provider.as_str() {
         "ollama" => {
-            let base_url = db::get_setting(conn, "local_llm_base_url")?
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| DEFAULT_LOCAL_LLM_BASE_URL.to_string());
+            let base_url =
+                setting("local_llm_base_url")?.unwrap_or_else(|| DEFAULT_LOCAL_LLM_BASE_URL.to_string());
             let think = db::get_setting(conn, "local_llm_think")?
                 .map(|s| s.trim().eq_ignore_ascii_case("true"))
                 .unwrap_or(false);
@@ -112,8 +112,9 @@ pub async fn chat_send(
     message: String,
 ) -> Result<ChatSendResult, String> {
     let state: State<AppState> = app.state();
-    // Keychain read out of band — not inside the DB lock.
-    let openai_api_key = read_openai_key(&state)?;
+    // Keychain read out of band — not inside the DB lock. Chat reuses the
+    // shared OpenAI key (issue #44).
+    let openai_api_key = super::read_provider_api_key(&state, "openai")?;
 
     let (grounding, resolved, conversation_id) = {
         let conn = state.db.lock();
@@ -150,13 +151,16 @@ pub async fn chat_send(
         }
     };
 
+    let ctx = ChatCtx {
+        model: &resolved.model,
+        api_key: resolved.api_key.as_deref(),
+        base_url: &resolved.base_url,
+        think: resolved.think,
+    };
     let result = chat::run_chat(
         &state.db,
         adapter.as_ref(),
-        &resolved.model,
-        resolved.api_key.as_deref(),
-        &resolved.base_url,
-        resolved.think,
+        ctx,
         &conversation_id,
         &grounding.text,
         &message,
@@ -209,8 +213,4 @@ pub fn chat_history(state: State<AppState>, note_id: String) -> Result<Vec<ChatM
             created_at: m.created_at,
         })
         .collect())
-}
-
-fn read_openai_key(state: &State<AppState>) -> Result<Option<String>, String> {
-    super::read_provider_api_key(state, "openai")
 }

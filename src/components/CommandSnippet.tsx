@@ -30,7 +30,7 @@ export function CommandSnippet({
     <div className="flex items-center gap-2">
       <code
         className="flex-1 min-w-0 truncate px-3 py-2 rounded-md text-xs bg-[var(--color-pill-hover)]"
-        style={{ fontFamily: "var(--font-mono)" }}
+        style={{ fontFamily: "var(--font-code)" }}
       >
         {command}
       </code>

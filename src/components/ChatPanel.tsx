@@ -1,6 +1,7 @@
 import { memo, useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { open as openExternal } from "@tauri-apps/plugin-shell";
 import { AlertTriangle, MessageCircle, Send, Settings2 } from "lucide-react";
 import {
   ipc,
@@ -9,6 +10,7 @@ import {
   type ChatMessageDto,
 } from "../lib/ipc";
 import { useChatReadiness } from "./provider/useChatReadiness";
+import { CommandSnippet } from "./CommandSnippet";
 import { cn } from "../lib/cn";
 
 // Chat with a single Note (issue #46). A message list + input where the user
@@ -29,7 +31,7 @@ function partsText(m: ChatMessageDto): string {
 }
 
 export function ChatPanel({ noteId }: { noteId: string }) {
-  const { loading: readinessLoading, ready, hint } = useChatReadiness();
+  const { loading: readinessLoading, ready, hint, provider, model } = useChatReadiness();
   const [messages, setMessages] = useState<ChatMessageDto[]>([]);
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
@@ -138,17 +140,36 @@ export function ChatPanel({ noteId }: { noteId: string }) {
     }
   }
 
-  // Not yet configured → the readiness/setup prompt from #44.
+  // Not yet configured → the readiness/setup prompt from #44: say exactly
+  // what's missing, and for Ollama surface the same install link + copy-pull
+  // affordances the Settings tab uses. Key entry stays in Settings (sensitive
+  // + shared across features), so OpenAI shows a pointer there.
   if (!readinessLoading && !ready) {
+    const isOllama = provider === "ollama";
     return (
       <div className="flex-1 min-h-0 flex flex-col items-center justify-center gap-3 px-8 text-center">
         <Settings2 size={22} strokeWidth={1.5} className="text-[var(--color-text-disabled)]" />
         <p className="text-sm text-[var(--color-text-muted)]">
           {hint || "Set up an AI Chat provider in Settings → Chat to start chatting."}
         </p>
+        {isOllama && (
+          <div className="w-full max-w-sm flex flex-col gap-2">
+            <p className="text-xs text-[var(--color-text-disabled)]">
+              Don't have Ollama yet?{" "}
+              <button
+                type="button"
+                onClick={() => openExternal("https://ollama.com/download")}
+                className="underline hover:text-[var(--color-text)]"
+              >
+                Install Ollama
+              </button>
+              , then pull a chat model:
+            </p>
+            <CommandSnippet command={`ollama pull ${model || "qwen3.5:4b"}`} />
+          </div>
+        )}
         <p className="text-xs text-[var(--color-text-disabled)]">
-          Chat is configured in Settings → Chat, separately from your transcription and summary
-          providers.
+          Configured in Settings → Chat, separately from your transcription and summary providers.
         </p>
       </div>
     );
