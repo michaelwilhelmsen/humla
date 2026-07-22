@@ -70,7 +70,8 @@ describe("onboarding SummaryStep — local path", () => {
       await screen.findByText(/ollama isn't running/i),
     ).toBeInTheDocument();
     expect(screen.getByText(/waiting for ollama/i)).toBeInTheDocument();
-    // The copyable pull command for the recommended model.
+    // The copyable pull command for the recommended model, plus the 16 GB fallback.
+    expect(screen.getByText(/ollama pull gemma4:12b-mlx/i)).toBeInTheDocument();
     expect(screen.getByText(/ollama pull qwen3\.5:4b/i)).toBeInTheDocument();
   });
 
@@ -91,7 +92,8 @@ describe("onboarding SummaryStep — local path", () => {
 
     expect(await screen.findByText(/ollama is running/i)).toBeInTheDocument();
 
-    // The recommended model is preselected in the picker.
+    // Gemma (the headline recommendation) isn't installed here, so the picker
+    // preselects qwen3.5:4b — the 16 GB fallback — over the other installed model.
     const select = screen.getByLabelText("Model");
     expect(select).toHaveValue("qwen3.5:4b");
 

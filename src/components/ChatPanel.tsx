@@ -10,6 +10,7 @@ import {
   type ChatMessageDto,
 } from "../lib/ipc";
 import { useChatReadiness } from "./provider/useChatReadiness";
+import { RECOMMENDED_OLLAMA_MODEL } from "../lib/localModels";
 import { CommandSnippet } from "./CommandSnippet";
 import { cn } from "../lib/cn";
 
@@ -165,7 +166,7 @@ export function ChatPanel({ noteId }: { noteId: string }) {
               </button>
               , then pull a chat model:
             </p>
-            <CommandSnippet command={`ollama pull ${model || "qwen3.5:4b"}`} />
+            <CommandSnippet command={`ollama pull ${model || RECOMMENDED_OLLAMA_MODEL}`} />
           </div>
         )}
         <p className="text-xs text-[var(--color-text-disabled)]">

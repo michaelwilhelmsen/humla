@@ -6,6 +6,7 @@ import { SummaryPromptsManager } from "../components/SummaryPromptsManager";
 import { OllamaConnect } from "../../../components/provider/OllamaConnect";
 import { ProviderKeyCard } from "../../../components/provider/ProviderKeyCard";
 import { CommandSnippet } from "../../../components/CommandSnippet";
+import { RECOMMENDED_OLLAMA_MODEL, RECOMMENDED_OLLAMA_MODEL_16GB } from "../../../lib/localModels";
 import { SUMMARY_PRESETS, presetLabel } from "../../../lib/presets";
 import { SUMMARY_MODELS, SUMMARY_PROVIDERS } from "../types";
 import type { SettingsHook } from "../useSettings";
@@ -67,10 +68,16 @@ export function SummaryTab({
                 >
                   Install Ollama
                 </button>
-                , then pull a model (on 16 GB Macs stick to 4B-class — 9B and up
-                will OOM during summary):
+                , then pull the recommended model:
               </p>
-              <CommandSnippet command="ollama pull qwen3.5:4b" ariaLabel="Copy Ollama pull command" />
+              <CommandSnippet
+                command={`ollama pull ${RECOMMENDED_OLLAMA_MODEL}`}
+                ariaLabel="Copy Ollama pull command"
+              />
+              <p className="text-xs text-[var(--color-text-muted)]">
+                On a 16 GB Mac use <code>ollama pull {RECOMMENDED_OLLAMA_MODEL_16GB}</code> instead —{" "}
+                {RECOMMENDED_OLLAMA_MODEL} needs ~24 GB+; 9B and up will OOM during summary.
+              </p>
             </div>
             <Row
               label="Thinking mode"

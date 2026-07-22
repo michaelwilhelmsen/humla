@@ -7,6 +7,7 @@ import { CommandSnippet } from "../../../components/CommandSnippet";
 import { useOllamaProbe } from "../../../components/provider/useOllamaProbe";
 import { useProviderKey } from "../../../components/provider/useProviderKey";
 import { CHAT_PROVIDERS, SUMMARY_MODELS } from "../types";
+import { RECOMMENDED_OLLAMA_MODEL } from "../../../lib/localModels";
 import type { SettingsHook } from "../useSettings";
 
 // AI Chat provider setting (issue #44). A dedicated provider choice, separate
@@ -99,7 +100,7 @@ export function ChatTab({ s, update }: Pick<SettingsHook, "s" | "update">) {
               , then pull a tool-calling-capable model:
             </p>
             <CommandSnippet
-              command={`ollama pull ${s.chat_model || "qwen3.5:4b"}`}
+              command={`ollama pull ${s.chat_model || RECOMMENDED_OLLAMA_MODEL}`}
               ariaLabel="Copy Ollama pull command"
             />
           </div>

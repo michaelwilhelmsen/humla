@@ -30,15 +30,18 @@ import { useOllamaProbe } from "../../../components/provider/useOllamaProbe";
 import { useProviderKey } from "../../../components/provider/useProviderKey";
 import type { StepContext } from "../types";
 import { StepShell } from "../StepShell";
+import {
+  RECOMMENDED_OLLAMA_MODEL,
+  RECOMMENDED_OLLAMA_MODEL_16GB,
+} from "../../../lib/localModels";
 
 // Mirrors Settings → Summary defaults (settings/types.ts DEFAULTS).
 const DEFAULT_OPENAI_SUMMARY_MODEL = "gpt-5.4-mini";
 const DEFAULT_LOCAL_BASE_URL = "http://localhost:11434/v1";
-// The recommended Ollama model. Source: src/pages/settings/tabs/Summary.tsx
-// ("ollama pull qwen3.5:4b") — the Qwen 3.5 variant the sampling profile in
-// src-tauri/src/openai.rs is tuned for. `DEFAULTS.local_llm_model` is "" so
-// there's no single-string default setting; this is the recommended pull.
-const RECOMMENDED_OLLAMA_MODEL = "qwen3.5:4b";
+// Recommended Ollama models by RAM tier live in src/lib/localModels.ts
+// (imported above): gemma4:12b-mlx headline (~24GB+), qwen3.5:4b 16GB fallback.
+// `DEFAULTS.local_llm_model` is "" so there's no single-string default setting;
+// these are the recommended pulls.
 const OLLAMA_POLL_MS = 2000;
 
 type Option = "openai" | "local" | null;
@@ -97,6 +100,7 @@ export function SummaryStep({ ctx }: { ctx: StepContext }) {
     setSelectedModel((prev) => {
       if (prev && installed.includes(prev)) return prev;
       if (installed.includes(RECOMMENDED_OLLAMA_MODEL)) return RECOMMENDED_OLLAMA_MODEL;
+      if (installed.includes(RECOMMENDED_OLLAMA_MODEL_16GB)) return RECOMMENDED_OLLAMA_MODEL_16GB;
       return installed[0] ?? "";
     });
   }, [installed]);
@@ -374,6 +378,7 @@ export function SummaryStep({ ctx }: { ctx: StepContext }) {
                       </p>
                     </>
                   ) : !installed.includes(RECOMMENDED_OLLAMA_MODEL) &&
+                    !installed.includes(RECOMMENDED_OLLAMA_MODEL_16GB) &&
                     !selectedModel ? (
                     <>
                       <p className="text-xs leading-relaxed text-[var(--color-text-muted)]">
@@ -437,31 +442,37 @@ export function SummaryStep({ ctx }: { ctx: StepContext }) {
 
 function PullCommand({ copied, onCopy }: { copied: boolean; onCopy: () => void }) {
   return (
-    <div className="flex items-center gap-2">
-      <code
-        className="flex-1 min-w-0 truncate px-3 py-2 rounded-md text-xs bg-[var(--color-pill-hover)]"
-        style={{ fontFamily: "var(--font-mono)" }}
-      >
-        ollama pull {RECOMMENDED_OLLAMA_MODEL}
-      </code>
-      <button
-        type="button"
-        onClick={onCopy}
-        className="nd-btn shrink-0"
-        aria-label="Copy pull command"
-      >
-        {copied ? (
-          <>
-            <Check size={13} strokeWidth={2.5} />
-            Copied
-          </>
-        ) : (
-          <>
-            <Copy size={13} strokeWidth={2} />
-            Copy
-          </>
-        )}
-      </button>
+    <div className="flex flex-col gap-1.5">
+      <div className="flex items-center gap-2">
+        <code
+          className="flex-1 min-w-0 truncate px-3 py-2 rounded-md text-xs bg-[var(--color-pill-hover)]"
+          style={{ fontFamily: "var(--font-mono)" }}
+        >
+          ollama pull {RECOMMENDED_OLLAMA_MODEL}
+        </code>
+        <button
+          type="button"
+          onClick={onCopy}
+          className="nd-btn shrink-0"
+          aria-label="Copy pull command"
+        >
+          {copied ? (
+            <>
+              <Check size={13} strokeWidth={2.5} />
+              Copied
+            </>
+          ) : (
+            <>
+              <Copy size={13} strokeWidth={2} />
+              Copy
+            </>
+          )}
+        </button>
+      </div>
+      <p className="text-[11px] text-[var(--color-text-muted)]">
+        On a 16 GB Mac, use <code>ollama pull {RECOMMENDED_OLLAMA_MODEL_16GB}</code> instead
+        — {RECOMMENDED_OLLAMA_MODEL} needs ~24 GB+.
+      </p>
     </div>
   );
 }
@@ -487,7 +498,11 @@ function ModelSelect({
         {installed.map((m) => (
           <option key={m} value={m}>
             {m}
-            {m === RECOMMENDED_OLLAMA_MODEL ? " (recommended)" : ""}
+            {m === RECOMMENDED_OLLAMA_MODEL
+              ? " (recommended)"
+              : m === RECOMMENDED_OLLAMA_MODEL_16GB
+                ? " (16 GB Macs)"
+                : ""}
           </option>
         ))}
       </select>
