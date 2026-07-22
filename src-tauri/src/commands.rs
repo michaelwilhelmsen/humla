@@ -21,6 +21,7 @@ use tokio::sync::Semaphore;
 // submodules via `super::` / `crate::`.
 mod api_keys;
 mod assets;
+mod chat;
 mod cloud;
 mod export;
 // Live cloud-sync worker glue. Behind the `cloud` feature; `pub` so `run()` can
@@ -39,6 +40,7 @@ mod summary_prompts;
 mod transcription_config;
 pub use api_keys::*;
 pub use assets::*;
+pub use chat::*;
 pub use cloud::*;
 pub use export::*;
 pub use folders::*;

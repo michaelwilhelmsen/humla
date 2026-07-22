@@ -363,6 +363,14 @@ export const ipc = {
   recordingState: () => invoke<"idle" | "recording">("recording_state"),
   summarizeNote: (noteId: string) => invoke<void>("summarize_note", { noteId }),
 
+  // AI chat over a single Note (issue #46). `chatSend` runs one grounded,
+  // streamed completion — the answer arrives via chat_* events, so the
+  // resolved promise only carries the conversation id + a truncation flag.
+  // `chatHistory` reloads a Note's persisted conversation after restart.
+  chatSend: (noteId: string, message: string) =>
+    invoke<ChatSendResult>("chat_send", { noteId, message }),
+  chatHistory: (noteId: string) => invoke<ChatMessageDto[]>("chat_history", { noteId }),
+
   permissionsStatus: () => invoke<PermissionsStatus>("permissions_status"),
   permissionsRequest: (kind: PermissionKind) => invoke<PermissionsStatus>("permissions_request", { kind }),
   permissionsOpenSettings: (kind: PermissionKind) => invoke<void>("permissions_open_settings", { kind }),
@@ -379,6 +387,39 @@ export type PermissionsStatus = {
   microphone: PermissionStatus;
   screen: PermissionStatus;
 };
+
+// ── AI chat (issue #46) ──────────────────────────────────────────────────
+// A message's content is a typed parts array (opencode v2 shape). Only text
+// parts exist in this slice; reasoning/tool variants arrive with retrieval.
+export type ChatPart = { type: "text"; id: string; text: string };
+export type ChatMessageDto = {
+  id: string;
+  role: "user" | "assistant";
+  seq: number;
+  parts: ChatPart[];
+  createdAt: number;
+};
+export type ChatSendResult = { conversationId: string; truncated: boolean };
+
+// Slice-3 streaming events (subset of the #46 wire contract).
+export type ChatTextDeltaEvent = {
+  conversationId: string;
+  messageId: string;
+  blockId: string;
+  delta: string;
+};
+export type ChatDoneEvent = { conversationId: string; messageId: string };
+export type ChatErrorEvent = { conversationId: string; message: string };
+
+export function onChatTextDelta(cb: (e: ChatTextDeltaEvent) => void): Promise<UnlistenFn> {
+  return listen<ChatTextDeltaEvent>("chat_text_delta", (e) => cb(e.payload));
+}
+export function onChatDone(cb: (e: ChatDoneEvent) => void): Promise<UnlistenFn> {
+  return listen<ChatDoneEvent>("chat_done", (e) => cb(e.payload));
+}
+export function onChatError(cb: (e: ChatErrorEvent) => void): Promise<UnlistenFn> {
+  return listen<ChatErrorEvent>("chat_error", (e) => cb(e.payload));
+}
 
 export type TranscriptEvent = { noteId: string; text: string };
 export type SummaryEvent = { noteId: string; summary: string };

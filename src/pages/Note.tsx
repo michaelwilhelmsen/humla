@@ -17,6 +17,7 @@ import {
   FileText,
   Folder,
   Languages,
+  MessageCircle,
   MessageSquare,
   MoreHorizontal,
   PanelRight,
@@ -35,6 +36,7 @@ import { SpeakerLabels, speakerColorMap } from "../components/SpeakerLabels";
 import { RecordingSessions } from "../components/RecordingSessions";
 import { groupTimeline, resolveActivePill, formatSessionCaption } from "../lib/sessions";
 import { RecordingBar } from "../components/RecordingBar";
+import { ChatPanel } from "../components/ChatPanel";
 import type { LayoutOutletContext } from "../components/Layout";
 import { SkeletonLines } from "../components/Skeleton";
 import { NoteEditor } from "../components/Editor";
@@ -122,7 +124,7 @@ export function Note() {
   const [contentStream, setContentStream] = useState<string>("");
   const [thinkingExpanded, setThinkingExpanded] = useState<boolean>(true);
   const [panelOpen, setPanelOpen] = useState<boolean>(true);
-  const [activeTab, setActiveTab] = useState<"summary" | "transcript">("summary");
+  const [activeTab, setActiveTab] = useState<"summary" | "transcript" | "chat">("summary");
   const [panelWidth, setPanelWidth] = useState<number>(() => {
     const saved = typeof localStorage !== "undefined" ? Number(localStorage.getItem("humla.panelWidth")) : NaN;
     return saved >= 320 && saved <= 720 ? saved : 440;
@@ -803,6 +805,19 @@ export function Note() {
                 <MessageSquare size={14} strokeWidth={1.6} />
                 Transcript
               </button>
+              <button
+                type="button"
+                onClick={() => setActiveTab("chat")}
+                className={cn(
+                  "inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-[var(--radius)] text-[13px] font-medium transition-colors",
+                  activeTab === "chat"
+                    ? "bg-[var(--color-accent-soft)] text-[var(--color-accent-text)]"
+                    : "text-[var(--color-text-disabled)] hover:text-[var(--color-text-muted)]",
+                )}
+              >
+                <MessageCircle size={14} strokeWidth={1.6} />
+                Chat
+              </button>
             </div>
             <button
               type="button"
@@ -891,6 +906,8 @@ export function Note() {
                   />
                 )}
               </div>
+            ) : activeTab === "chat" ? (
+              <ChatPanel noteId={draft.id} />
             ) : (
               <div className="flex-1 min-h-0 flex flex-col px-4 py-4">
                 <div className="flex flex-wrap items-center gap-2 mb-4 shrink-0">

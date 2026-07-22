@@ -114,6 +114,36 @@ pub fn open(path: &Path) -> Result<Connection> {
         );
         CREATE INDEX IF NOT EXISTS idx_note_revisions_note
             ON note_revisions(note_id, created_at DESC);
+
+        -- AI chat (issue #46). opencode's v2 model: a conversation row plus one
+        -- messages row per message whose `content` is a typed JSON parts array
+        -- ordered by a monotonic `seq` (no separate parts table). The
+        -- conversation carries general scope/scope_id/tenant fields so later
+        -- breadths (folder-, client-, workspace-scoped chats) and tenants add
+        -- rows with no reshape. Slice-3 uses only scope='note' + tenant='personal'.
+        CREATE TABLE IF NOT EXISTS conversations (
+            id          TEXT PRIMARY KEY,
+            scope       TEXT NOT NULL,
+            scope_id    TEXT NOT NULL,
+            tenant      TEXT NOT NULL,
+            created_at  INTEGER NOT NULL,
+            updated_at  INTEGER NOT NULL
+        );
+        -- One conversation per (tenant, scope, scope_id) — e.g. one Personal
+        -- chat per Note. The get-or-create path relies on this uniqueness.
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_conversations_scope
+            ON conversations(tenant, scope, scope_id);
+
+        CREATE TABLE IF NOT EXISTS messages (
+            id              TEXT PRIMARY KEY,
+            conversation_id TEXT NOT NULL,
+            seq             INTEGER NOT NULL,
+            role            TEXT NOT NULL,
+            content         TEXT NOT NULL,
+            created_at      INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_messages_conversation
+            ON messages(conversation_id, seq);
         "#,
     )?;
     // Idempotent migrations for older schemas. ALTER TABLE adds columns
@@ -682,6 +712,176 @@ fn map_summary_prompt(row: &rusqlite::Row) -> rusqlite::Result<SummaryPrompt> {
         updated_at: row.get(4)?,
         workspace_id: row.get(5)?,
     })
+}
+
+// ── AI chat (issue #46) ────────────────────────────────────────────────────
+// Persistence for the chat skeleton: conversations + messages. See the schema
+// note in `open()` for the storage-shape rationale (opencode v2 model).
+
+/// General chat scope. Only `Note` is used in this slice; the enum exists so
+/// the string stored in `conversations.scope` is chosen in one place and later
+/// breadths (folder/client/workspace) add variants without touching call sites.
+pub const CHAT_SCOPE_NOTE: &str = "note";
+/// Only Personal is used in this slice; workspace tenants arrive with Teams.
+pub const CHAT_TENANT_PERSONAL: &str = "personal";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Conversation {
+    pub id: String,
+    pub scope: String,
+    pub scope_id: String,
+    pub tenant: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// One persisted message. `content` is the raw JSON parts array — the chat
+/// module owns the typed `Part` shape and (de)serialises it; db.rs stays
+/// agnostic and just stores the string, ordered within a conversation by `seq`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatMessage {
+    pub id: String,
+    pub conversation_id: String,
+    pub seq: i64,
+    pub role: String,
+    pub content: String,
+    pub created_at: i64,
+}
+
+fn map_conversation(row: &rusqlite::Row) -> rusqlite::Result<Conversation> {
+    Ok(Conversation {
+        id: row.get(0)?,
+        scope: row.get(1)?,
+        scope_id: row.get(2)?,
+        tenant: row.get(3)?,
+        created_at: row.get(4)?,
+        updated_at: row.get(5)?,
+    })
+}
+
+const CONVERSATION_COLS: &str = "id, scope, scope_id, tenant, created_at, updated_at";
+
+/// The existing conversation for a scope, or None. Used to reload history
+/// without creating an empty conversation just for opening the Chat tab.
+pub fn get_conversation(
+    conn: &Connection,
+    tenant: &str,
+    scope: &str,
+    scope_id: &str,
+) -> Result<Option<Conversation>> {
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {CONVERSATION_COLS} FROM conversations
+         WHERE tenant = ?1 AND scope = ?2 AND scope_id = ?3",
+    ))?;
+    match stmt.query_row(params![tenant, scope, scope_id], map_conversation) {
+        Ok(c) => Ok(Some(c)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Get the conversation for a scope, creating it lazily if absent. The unique
+/// index on (tenant, scope, scope_id) makes this the single conversation for a
+/// Note — there is no conversation-list / "new chat" concept in this slice.
+pub fn get_or_create_conversation(
+    conn: &Connection,
+    tenant: &str,
+    scope: &str,
+    scope_id: &str,
+) -> Result<Conversation> {
+    if let Some(c) = get_conversation(conn, tenant, scope, scope_id)? {
+        return Ok(c);
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = now_ms();
+    conn.execute(
+        "INSERT INTO conversations (id, scope, scope_id, tenant, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+        params![id, scope, scope_id, tenant, now],
+    )?;
+    get_conversation(conn, tenant, scope, scope_id)?
+        .ok_or_else(|| anyhow::anyhow!("conversation vanished after insert"))
+}
+
+fn map_chat_message(row: &rusqlite::Row) -> rusqlite::Result<ChatMessage> {
+    Ok(ChatMessage {
+        id: row.get(0)?,
+        conversation_id: row.get(1)?,
+        seq: row.get(2)?,
+        role: row.get(3)?,
+        content: row.get(4)?,
+        created_at: row.get(5)?,
+    })
+}
+
+const CHAT_MESSAGE_COLS: &str = "id, conversation_id, seq, role, content, created_at";
+
+/// The next monotonic `seq` for a conversation (max + 1, or 0 for the first
+/// message). Ordering is by `seq`, never by `created_at`, so two messages
+/// written in the same millisecond still have a stable order.
+pub fn next_message_seq(conn: &Connection, conversation_id: &str) -> Result<i64> {
+    let mut stmt = conn
+        .prepare_cached("SELECT COALESCE(MAX(seq) + 1, 0) FROM messages WHERE conversation_id = ?1")?;
+    let seq: i64 = stmt.query_row(params![conversation_id], |r| r.get(0))?;
+    Ok(seq)
+}
+
+/// Append a message with the given raw parts JSON. Also bumps the parent
+/// conversation's `updated_at` so recency ordering (later breadths) is cheap.
+pub fn insert_chat_message(
+    conn: &Connection,
+    conversation_id: &str,
+    role: &str,
+    content: &str,
+) -> Result<ChatMessage> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = now_ms();
+    let seq = next_message_seq(conn, conversation_id)?;
+    conn.execute(
+        "INSERT INTO messages (id, conversation_id, seq, role, content, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![id, conversation_id, seq, role, content, now],
+    )?;
+    conn.execute(
+        "UPDATE conversations SET updated_at = ?1 WHERE id = ?2",
+        params![now, conversation_id],
+    )?;
+    get_chat_message(conn, &id)
+}
+
+pub fn get_chat_message(conn: &Connection, id: &str) -> Result<ChatMessage> {
+    let mut stmt = conn
+        .prepare_cached(&format!("SELECT {CHAT_MESSAGE_COLS} FROM messages WHERE id = ?1"))?;
+    Ok(stmt.query_row(params![id], map_chat_message)?)
+}
+
+/// Overwrite a message's parts JSON. Used to finalise an assistant message
+/// once its streamed text is complete (the row is created empty so its id can
+/// ride the streaming deltas).
+pub fn update_chat_message_content(conn: &Connection, id: &str, content: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE messages SET content = ?1 WHERE id = ?2",
+        params![content, id],
+    )?;
+    Ok(())
+}
+
+/// Drop a message. Used to roll back an assistant row whose stream errored, so
+/// reloaded history never shows an empty half-written turn.
+pub fn delete_chat_message(conn: &Connection, id: &str) -> Result<()> {
+    conn.execute("DELETE FROM messages WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
+/// All messages in a conversation, oldest first (by `seq`).
+pub fn list_chat_messages(conn: &Connection, conversation_id: &str) -> Result<Vec<ChatMessage>> {
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {CHAT_MESSAGE_COLS} FROM messages WHERE conversation_id = ?1 ORDER BY seq",
+    ))?;
+    let rows = stmt
+        .query_map(params![conversation_id], map_chat_message)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
 }
 
 /// One-time migration: pull the legacy single `summary_prompt` setting

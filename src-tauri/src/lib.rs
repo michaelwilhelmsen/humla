@@ -10,6 +10,7 @@ mod recording;
 mod sessions;
 mod commands;
 mod stt;
+mod chat;
 pub mod sync;
 
 use std::sync::Arc;
@@ -320,6 +321,8 @@ where
             commands::recording_resume,
             commands::recording_state,
             commands::summarize_note,
+            commands::chat_send,
+            commands::chat_history,
             commands::permissions_status,
             commands::permissions_request,
             commands::permissions_open_settings,

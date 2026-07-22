@@ -229,7 +229,7 @@ struct ChatMessageOwned {
 /// Reasoning models: gpt-5.x family and the o-series. They reject the
 /// `temperature` parameter and accept extra knobs like `reasoning_effort`
 /// (which we leave at the API default).
-fn is_reasoning_model(model: &str) -> bool {
+pub(crate) fn is_reasoning_model(model: &str) -> bool {
     if let Some(rest) = model.strip_prefix("gpt-5") {
         // "gpt-5", "gpt-5-mini", "gpt-5-nano", "gpt-5.4", "gpt-5.4-mini",
         // "gpt-5.5", … all match. "gpt-50" (hypothetical future non-reasoning
@@ -242,6 +242,132 @@ fn is_reasoning_model(model: &str) -> bool {
     } else {
         false
     }
+}
+
+#[derive(Serialize)]
+struct ChatStreamRequest<'a> {
+    model: &'a str,
+    messages: Vec<ChatMessage<'a>>,
+    stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
+}
+
+// One Server-Sent-Events frame from OpenAI's streaming /chat/completions.
+// Each `data:` line (except the terminal `[DONE]`) is one of these; the
+// answer is assembled from `choices[0].delta.content`.
+#[derive(Deserialize)]
+struct ChatStreamFrame {
+    #[serde(default)]
+    choices: Vec<ChatStreamChoice>,
+}
+
+#[derive(Deserialize)]
+struct ChatStreamChoice {
+    #[serde(default)]
+    delta: ChatStreamDelta,
+}
+
+#[derive(Deserialize, Default)]
+struct ChatStreamDelta {
+    #[serde(default)]
+    content: Option<String>,
+}
+
+/// Stream a multi-turn chat completion from cloud OpenAI. The summary path
+/// deliberately doesn't stream cloud responses, but chat needs live tokens, so
+/// this uses `stream: true` and parses the SSE frames. `on_delta` fires once
+/// per content delta; the full assembled answer is returned.
+pub(crate) async fn openai_chat_stream<F>(
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    messages: &[(&str, &str)],
+    mut on_delta: F,
+) -> Result<String>
+where
+    F: FnMut(&str) + Send,
+{
+    let req = ChatStreamRequest {
+        model,
+        messages: messages
+            .iter()
+            .map(|(role, content)| ChatMessage { role, content })
+            .collect(),
+        stream: true,
+        // Reasoning models (gpt-5.x / o-series) reject a custom temperature.
+        temperature: if is_reasoning_model(model) { None } else { Some(0.3) },
+    };
+    let url = format!("{base_url}/chat/completions");
+    let started = std::time::Instant::now();
+    let r = summary_cloud_client()
+        .post(&url)
+        .bearer_auth(api_key)
+        .json(&req)
+        .send()
+        .await
+        .map_err(|e| {
+            if e.is_timeout() {
+                anyhow!("Timed out waiting for OpenAI. Try again.")
+            } else if e.is_connect() {
+                anyhow!("Couldn't reach OpenAI. Check your internet connection.")
+            } else {
+                anyhow!("Network error talking to OpenAI: {}", error_chain(&e))
+            }
+        })?;
+    let status = r.status();
+    if !status.is_success() {
+        let body = r.text().await.unwrap_or_default();
+        return Err(anyhow!("HTTP {status} from {base_url}: {body}"));
+    }
+
+    // SSE: newline-delimited `data: {json}` frames, terminated by `data: [DONE]`.
+    // Frames can split across byte chunks, so buffer and parse per line.
+    use futures_util::StreamExt;
+    let mut byte_stream = r.bytes_stream();
+    let mut buf = String::new();
+    let mut answer = String::new();
+    while let Some(chunk_res) = byte_stream.next().await {
+        let bytes = chunk_res.map_err(|e| anyhow!("stream read: {e}"))?;
+        buf.push_str(&String::from_utf8_lossy(&bytes));
+        while let Some(idx) = buf.find('\n') {
+            let line: String = buf.drain(..=idx).collect();
+            let line = line.trim();
+            let Some(data) = line.strip_prefix("data:") else {
+                continue;
+            };
+            let data = data.trim();
+            if data == "[DONE]" {
+                break;
+            }
+            let frame: ChatStreamFrame = match serde_json::from_str(data) {
+                Ok(v) => v,
+                // Skip keep-alive comments / unparseable heartbeats rather than
+                // aborting the whole answer over one odd frame.
+                Err(_) => continue,
+            };
+            if let Some(delta) = frame
+                .choices
+                .into_iter()
+                .next()
+                .and_then(|c| c.delta.content)
+            {
+                if !delta.is_empty() {
+                    answer.push_str(&delta);
+                    on_delta(&delta);
+                }
+            }
+        }
+    }
+    eprintln!(
+        "[llm] openai chat stream done in {:?}, {} chars",
+        started.elapsed(),
+        answer.len()
+    );
+    if answer.trim().is_empty() {
+        return Err(anyhow!("{model} returned an empty response"));
+    }
+    Ok(answer)
 }
 
 pub async fn summarize(
@@ -452,7 +578,7 @@ where
 /// `/v1/...`; the convention is the same host:port. Returns None for non-
 /// Ollama-shaped URLs (LM Studio at :1234, llama-server, vLLM) — those keep
 /// the OpenAI-compat path.
-fn ollama_native_url(openai_compat_url: &str) -> Option<String> {
+pub(crate) fn ollama_native_url(openai_compat_url: &str) -> Option<String> {
     // Heuristic: Ollama's default port is 11434. If the URL doesn't mention
     // it, assume the user is on a different runtime (LM Studio :1234, etc.)
     // and stay on OpenAI-compat. Users can override by pointing
@@ -564,6 +690,35 @@ async fn ollama_native_chat<F>(
     think: bool,
     system_prompt: &str,
     user_message: &str,
+    on_chunk: F,
+) -> Result<String>
+where
+    F: FnMut(StreamChunk) + Send,
+{
+    // Summaries are always a fixed system+user pair. The streaming core is
+    // shared with chat (which sends a multi-turn history) via a (role, content)
+    // slice so the Qwen sampling tuning + adaptive num_ctx live in one place.
+    ollama_chat_stream(
+        native_base,
+        model,
+        think,
+        &[("system", system_prompt), ("user", user_message)],
+        on_chunk,
+    )
+    .await
+}
+
+/// Stream a multi-turn chat completion from an Ollama server via its native
+/// `/api/chat` endpoint. Each `(role, content)` pair becomes a message in
+/// order. Shared by the summary path (system+user) and the chat command
+/// (system + reference + turns). `num_ctx` is sized adaptively from the total
+/// prompt length so long histories get a bigger KV cache without a flat 65K
+/// pinning multi-GB of RAM on tighter Macs.
+pub(crate) async fn ollama_chat_stream<F>(
+    native_base: &str,
+    model: &str,
+    think: bool,
+    messages: &[(&str, &str)],
     mut on_chunk: F,
 ) -> Result<String>
 where
@@ -571,6 +726,7 @@ where
 {
     let url = format!("{native_base}/chat");
     let num_predict: i32 = if think { 8192 } else { 4096 };
+    let prompt_chars: usize = messages.iter().map(|(_, c)| c.len()).sum();
     // Adaptive num_ctx: size the KV cache to the actual prompt + output
     // budget, not a fixed 65536. A flat 65K was killing Ollama on tighter
     // machines ("model runner has unexpectedly stopped") because the KV
@@ -581,7 +737,7 @@ where
     // [8192, 65536]. A typical 2-hour meeting (~20K input tokens) gets
     // 32K context — half the RAM of the old fixed value, still 10× more
     // than Ollama's silent-truncating 2048 default.
-    let approx_input_tokens = (system_prompt.len() + user_message.len()) / 4;
+    let approx_input_tokens = prompt_chars / 4;
     let need = approx_input_tokens + (num_predict as usize) + 512;
     let mut ctx: usize = 8192;
     while ctx < need && ctx < 65536 {
@@ -590,10 +746,10 @@ where
     let num_ctx = ctx as i32;
     let req = OllamaChatRequest {
         model,
-        messages: vec![
-            ChatMessage { role: "system", content: system_prompt },
-            ChatMessage { role: "user", content: user_message },
-        ],
+        messages: messages
+            .iter()
+            .map(|(role, content)| ChatMessage { role, content })
+            .collect(),
         stream: true,
         think,
         keep_alive: 0,
@@ -622,9 +778,8 @@ where
     };
     let started = std::time::Instant::now();
     eprintln!(
-        "[llm] POST {url} (ollama-native, streaming) model={model} think={think} system_chars={} user_chars={} num_ctx={num_ctx}",
-        system_prompt.len(),
-        user_message.len()
+        "[llm] POST {url} (ollama-native, streaming) model={model} think={think} messages={} prompt_chars={prompt_chars} num_ctx={num_ctx}",
+        messages.len()
     );
     let r = local_client()
         .post(&url)
