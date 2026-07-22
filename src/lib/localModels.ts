@@ -8,3 +8,16 @@
 // the Qwen-tuned sampling profile in src-tauri/src/openai.rs). Recommend by tier.
 export const RECOMMENDED_OLLAMA_MODEL = "gemma4:12b-mlx";
 export const RECOMMENDED_OLLAMA_MODEL_16GB = "qwen3.5:4b";
+
+// The local embedding model for semantic chat retrieval (issue #48). Small
+// (~600 MB) and the sole local embedder — no fallback. Optional: without it,
+// local chat still works keyword-only (semantic search degrades gracefully).
+export const EMBEDDING_OLLAMA_MODEL = "embeddinggemma";
+
+/// Whether an Ollama-installed model list already includes a given model,
+/// tag-insensitively (Ollama reports names like "embeddinggemma:latest").
+export function isModelInstalled(installed: string[] | null | undefined, model: string): boolean {
+  if (!installed) return false;
+  const base = model.split(":")[0];
+  return installed.some((m) => m === model || m.split(":")[0] === base);
+}

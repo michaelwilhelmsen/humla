@@ -28,11 +28,14 @@ import { Sparkles, Cloud, Server, Check, Copy, ExternalLink } from "lucide-react
 import { ipc } from "../../../lib/ipc";
 import { useOllamaProbe } from "../../../components/provider/useOllamaProbe";
 import { useProviderKey } from "../../../components/provider/useProviderKey";
+import { CommandSnippet } from "../../../components/CommandSnippet";
 import type { StepContext } from "../types";
 import { StepShell } from "../StepShell";
 import {
+  EMBEDDING_OLLAMA_MODEL,
   RECOMMENDED_OLLAMA_MODEL,
   RECOMMENDED_OLLAMA_MODEL_16GB,
+  isModelInstalled,
 } from "../../../lib/localModels";
 
 // Mirrors Settings → Summary defaults (settings/types.ts DEFAULTS).
@@ -423,6 +426,30 @@ export function SummaryStep({ ctx }: { ctx: StepContext }) {
                           Using <code>{selectedModel}</code>.
                         </p>
                       )}
+                    </>
+                  )}
+                </div>
+              )}
+
+              {/* Optional embedding model for semantic chat (issue #48). Never
+                  blocks setup — chat works keyword-only without it. */}
+              {reachable === true && (
+                <div className="mt-3 pt-3 border-t border-[var(--color-line)] space-y-1.5">
+                  {isModelInstalled(installed, EMBEDDING_OLLAMA_MODEL) ? (
+                    <p className="text-xs text-[var(--color-success)] flex items-center gap-1.5">
+                      <Check size={13} strokeWidth={2.5} />
+                      Semantic chat search ready ({EMBEDDING_OLLAMA_MODEL})
+                    </p>
+                  ) : (
+                    <>
+                      <p className="text-xs text-[var(--color-text-muted)]">
+                        Optional: for AI chat that finds answers by meaning, pull the small
+                        embedding model too.
+                      </p>
+                      <CommandSnippet
+                        command={`ollama pull ${EMBEDDING_OLLAMA_MODEL}`}
+                        ariaLabel="Copy embedding-model pull command"
+                      />
                     </>
                   )}
                 </div>

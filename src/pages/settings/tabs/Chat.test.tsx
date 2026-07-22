@@ -77,4 +77,22 @@ describe("ChatTab readiness", () => {
     fireEvent.click(screen.getByRole("button", { name: /Copy Ollama pull command/ }));
     expect(writeText).toHaveBeenCalledWith("ollama pull qwen3.5:4b");
   });
+
+  // Embedding model (issue #48) — a soft, non-blocking recommendation.
+  it("Ollama: prompts to pull embeddinggemma when it's missing, without blocking readiness", async () => {
+    mockTauri({ local_llm_list_models: () => ["qwen3.5:4b"] }); // chat model present, no embedder
+    render(<ChatTab s={settings({ chat_provider: "ollama", chat_model: "qwen3.5:4b" })} update={async () => {}} />);
+    // Still Ready — semantic is optional and degrades to keyword-only.
+    await waitFor(() => expect(screen.getByText("Ready ✓")).toBeInTheDocument());
+    expect(screen.getByText(/For semantic search/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Copy embedding-model pull command/ })).toBeInTheDocument();
+  });
+
+  it("Ollama: shows semantic search ready once embeddinggemma is installed", async () => {
+    mockTauri({ local_llm_list_models: () => ["qwen3.5:4b", "embeddinggemma:latest"] });
+    render(<ChatTab s={settings({ chat_provider: "ollama", chat_model: "qwen3.5:4b" })} update={async () => {}} />);
+    await waitFor(() => expect(screen.getByText(/Semantic search ready/)).toBeInTheDocument());
+    // Tag-insensitive match: "embeddinggemma:latest" satisfies "embeddinggemma".
+    expect(screen.queryByRole("button", { name: /Copy embedding-model pull command/ })).toBeNull();
+  });
 });
