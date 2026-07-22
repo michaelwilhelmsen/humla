@@ -1,15 +1,19 @@
 import { create } from "zustand";
-import { ipc, onRecordingDiagnostic, onRecordingError, onRecordingStatus, onSummary, onSummaryStatus, onTranscript, onTranscriptReplaced, onNotesChanged, onSyncStatus, onSyncConflict, onLocalWhisperProgress, onLocalWhisperDownloadError, type Folder, type Note, type RecordingDiagnostic, type RecordingStatus } from "./ipc";
+import { ipc, onRecordingDiagnostic, onRecordingError, onRecordingStatus, onSummary, onSummaryStatus, onTranscript, onTranscriptReplaced, onNotesChanged, onSyncStatus, onSyncConflict, onLocalWhisperProgress, onLocalWhisperDownloadError, type Client, type Folder, type Note, type RecordingDiagnostic, type RecordingStatus } from "./ipc";
 import { useCloudStore } from "./cloud";
 
 type NotesState = {
   notes: Note[];
   folders: Folder[];
+  clients: Client[];
   refresh: () => Promise<void>;
   refreshFolders: () => Promise<void>;
+  refreshClients: () => Promise<void>;
   upsertLocal: (note: Note) => void;
   upsertFolder: (folder: Folder) => void;
   removeFolder: (id: string) => void;
+  upsertClient: (client: Client) => void;
+  removeClient: (id: string) => void;
   appendTranscript: (id: string, text: string) => void;
   replaceTranscript: (id: string, text: string) => void;
   setSummary: (id: string, summary: string) => void;
@@ -19,13 +23,22 @@ type NotesState = {
 export const useNotesStore = create<NotesState>((set) => ({
   notes: [],
   folders: [],
+  clients: [],
   refresh: async () => {
-    const [notes, folders] = await Promise.all([ipc.listNotes(), ipc.listFolders()]);
-    set({ notes, folders });
+    const [notes, folders, clients] = await Promise.all([
+      ipc.listNotes(),
+      ipc.listFolders(),
+      ipc.listClients(),
+    ]);
+    set({ notes, folders, clients });
   },
   refreshFolders: async () => {
     const folders = await ipc.listFolders();
     set({ folders });
+  },
+  refreshClients: async () => {
+    const clients = await ipc.listClients();
+    set({ clients });
   },
   upsertFolder: (folder) =>
     set((s) => {
@@ -40,6 +53,20 @@ export const useNotesStore = create<NotesState>((set) => ({
       folders: s.folders.filter((f) => f.id !== id),
       // Notes in the deleted folder fall back to root.
       notes: s.notes.map((n) => (n.folder_id === id ? { ...n, folder_id: null } : n)),
+    })),
+  upsertClient: (client) =>
+    set((s) => {
+      const idx = s.clients.findIndex((c) => c.id === client.id);
+      if (idx === -1) return { clients: [...s.clients, client] };
+      const next = s.clients.slice();
+      next[idx] = client;
+      return { clients: next };
+    }),
+  removeClient: (id) =>
+    set((s) => ({
+      clients: s.clients.filter((c) => c.id !== id),
+      // Notes tagged with the deleted client fall back to untagged.
+      notes: s.notes.map((n) => (n.client_id === id ? { ...n, client_id: null } : n)),
     })),
   upsertLocal: (note) =>
     set((s) => {

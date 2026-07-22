@@ -13,6 +13,10 @@ pub struct Note {
     pub audio_path: Option<String>,
     pub summary_preset: String,
     pub folder_id: Option<String>,
+    // Optional Client tag (issue #43). NULL = untagged. Independent of
+    // `folder_id` — a Note can have any combination of the two.
+    #[serde(default)]
+    pub client_id: Option<String>,
     // Per-note transcription language. Empty string means "fall back to the
     // global language setting" — that's how pre-feature notes are handled
     // without a backfill migration.
@@ -57,6 +61,19 @@ pub struct Folder {
     pub workspace_id: String,
 }
 
+/// A Client (issue #43): who the other side of a meeting is. Same shape as
+/// `Folder` — the proven sync-ready row (UUID id, name, LWW `updated_at`,
+/// workspace scope). No local `deleted_at`; see the `clients` table comment.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Client {
+    pub id: String,
+    pub name: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+    #[serde(default)]
+    pub workspace_id: String,
+}
+
 pub fn open(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path)?;
     conn.execute_batch(
@@ -85,6 +102,20 @@ pub fn open(path: &Path) -> Result<Connection> {
             name        TEXT NOT NULL,
             created_at  INTEGER NOT NULL,
             updated_at  INTEGER NOT NULL
+        );
+
+        -- Client (issue #43): the real-world business relationship a Note is
+        -- optionally about, distinct from Folder. Mirrors `folders` exactly —
+        -- the proven sync-ready shape. Deliberately no local `deleted_at`:
+        -- deletion is a local hard-delete + un-tag of notes, with the remote
+        -- tombstone written by the sync outbox in the Client cloud-sync slice
+        -- (#49), so no local migration is needed when sync lands.
+        CREATE TABLE IF NOT EXISTS clients (
+            id           TEXT PRIMARY KEY,
+            name         TEXT NOT NULL,
+            created_at   INTEGER NOT NULL,
+            updated_at   INTEGER NOT NULL,
+            workspace_id TEXT NOT NULL DEFAULT ''
         );
 
         CREATE TABLE IF NOT EXISTS settings (
@@ -154,6 +185,10 @@ pub fn open(path: &Path) -> Result<Connection> {
         [],
     );
     let _ = conn.execute("ALTER TABLE notes ADD COLUMN folder_id TEXT", []);
+    // Client link (issue #43). Soft id reference, same shape as folder_id:
+    // NULL = untagged. No FK constraint so a client hard-delete just leaves
+    // dangling-free NULLs (delete_client un-tags first anyway).
+    let _ = conn.execute("ALTER TABLE notes ADD COLUMN client_id TEXT", []);
     let _ = conn.execute(
         "ALTER TABLE notes ADD COLUMN language TEXT NOT NULL DEFAULT ''",
         [],
@@ -200,6 +235,10 @@ pub fn open(path: &Path) -> Result<Connection> {
         [],
     )?;
     conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_notes_client ON notes(client_id)",
+        [],
+    )?;
+    conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_notes_workspace ON notes(workspace_id)",
         [],
     )?;
@@ -210,7 +249,12 @@ pub fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
-const NOTE_COLS: &str = "id, title, body, transcript, summary, audio_path, summary_preset, folder_id, language, summary_provider, expected_speakers, created_at, updated_at, owner, workspace_id, deleted_at";
+// NOTE: `client_id` is appended last (issue #43). It's selected here and set
+// only via `set_note_client` — never in an INSERT column list, so create/apply
+// paths default it to NULL safely. When Client cloud-sync lands (#49), the
+// remote-note apply path must include `client_id` in its upsert or a pulled
+// note would clobber a local tag.
+const NOTE_COLS: &str = "id, title, body, transcript, summary, audio_path, summary_preset, folder_id, language, summary_provider, expected_speakers, created_at, updated_at, owner, workspace_id, deleted_at, client_id";
 
 /// List live notes in the active workspace (`""` = Personal / local-only).
 /// Excludes trashed notes (`deleted_at` set). Scoping by workspace keeps one
@@ -341,6 +385,86 @@ pub fn delete_folder(conn: &Connection, id: &str) -> Result<Vec<String>> {
 
 fn map_folder(row: &rusqlite::Row) -> rusqlite::Result<Folder> {
     Ok(Folder {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        created_at: row.get(2)?,
+        updated_at: row.get(3)?,
+        workspace_id: row.get(4)?,
+    })
+}
+
+// ── Clients (issue #43) ─────────────────────────────────────────────────────
+// A direct mirror of the folder functions; kept separate (rather than a shared
+// generic) so the two entities can diverge later without untangling one path.
+
+pub fn list_clients(conn: &Connection, workspace: &str) -> Result<Vec<Client>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, name, created_at, updated_at, workspace_id FROM clients WHERE workspace_id = ?1 ORDER BY name COLLATE NOCASE",
+    )?;
+    let rows = stmt
+        .query_map(params![workspace], map_client)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+pub fn create_client(conn: &Connection, name: &str, workspace: &str) -> Result<Client> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = now_ms();
+    conn.execute(
+        "INSERT INTO clients (id, name, created_at, updated_at, workspace_id) VALUES (?1, ?2, ?3, ?3, ?4)",
+        params![id, name, now, workspace],
+    )?;
+    conn.query_row(
+        "SELECT id, name, created_at, updated_at, workspace_id FROM clients WHERE id = ?1",
+        params![id],
+        map_client,
+    )
+    .map_err(Into::into)
+}
+
+pub fn rename_client(conn: &Connection, id: &str, name: &str) -> Result<()> {
+    let now = now_ms();
+    conn.execute(
+        "UPDATE clients SET name = ?1, updated_at = ?2 WHERE id = ?3",
+        params![name, now, id],
+    )?;
+    Ok(())
+}
+
+/// Delete a Client. Its notes fall back to no Client (`client_id = NULL`)
+/// rather than being deleted; their `updated_at` is bumped so a sync layer
+/// re-pushes them. Returns the ids of the un-tagged notes so the caller can
+/// notify sync. Mirrors `delete_folder`.
+pub fn delete_client(conn: &Connection, id: &str) -> Result<Vec<String>> {
+    let now = now_ms();
+    let untagged: Vec<String> = {
+        let mut stmt = conn.prepare("SELECT id FROM notes WHERE client_id = ?1")?;
+        let rows = stmt
+            .query_map(params![id], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    conn.execute(
+        "UPDATE notes SET client_id = NULL, updated_at = ?2 WHERE client_id = ?1",
+        params![id, now],
+    )?;
+    conn.execute("DELETE FROM clients WHERE id = ?1", params![id])?;
+    Ok(untagged)
+}
+
+/// Assign or clear a note's Client. `None` writes SQL NULL (untag),
+/// `Some(id)` assigns. Mirrors `move_note` for folders.
+pub fn set_note_client(conn: &Connection, id: &str, client_id: Option<&str>) -> Result<()> {
+    let now = now_ms();
+    conn.execute(
+        "UPDATE notes SET client_id = ?1, updated_at = ?2 WHERE id = ?3",
+        params![client_id, now, id],
+    )?;
+    Ok(())
+}
+
+fn map_client(row: &rusqlite::Row) -> rusqlite::Result<Client> {
+    Ok(Client {
         id: row.get(0)?,
         name: row.get(1)?,
         created_at: row.get(2)?,
@@ -1081,6 +1205,7 @@ fn map_note(row: &rusqlite::Row) -> rusqlite::Result<Note> {
         owner: row.get(13)?,
         workspace_id: row.get(14)?,
         deleted_at: row.get(15)?,
+        client_id: row.get(16)?,
     })
 }
 
@@ -1108,6 +1233,70 @@ mod tests {
         assert_eq!(list_folders(&conn, "wsA").unwrap().len(), 1);
         assert_eq!(list_folders(&conn, "").unwrap().len(), 1);
         assert_eq!(list_folders(&conn, "wsB").unwrap().len(), 0);
+    }
+
+    #[test]
+    fn client_crud_and_note_tagging_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("clients.sqlite")).unwrap();
+
+        // create
+        let acme = create_client(&conn, "Acme Inc", "").unwrap();
+        let globex = create_client(&conn, "Globex", "").unwrap();
+        assert_eq!(list_clients(&conn, "").unwrap().len(), 2);
+
+        let note = create_note(&conn, "en", "meeting", "").unwrap();
+        assert_eq!(get_note(&conn, &note.id).unwrap().client_id, None, "new note is untagged");
+
+        // assign
+        set_note_client(&conn, &note.id, Some(&acme.id)).unwrap();
+        assert_eq!(
+            get_note(&conn, &note.id).unwrap().client_id.as_deref(),
+            Some(acme.id.as_str())
+        );
+
+        // reassign
+        set_note_client(&conn, &note.id, Some(&globex.id)).unwrap();
+        assert_eq!(
+            get_note(&conn, &note.id).unwrap().client_id.as_deref(),
+            Some(globex.id.as_str())
+        );
+
+        // unassign
+        set_note_client(&conn, &note.id, None).unwrap();
+        assert_eq!(get_note(&conn, &note.id).unwrap().client_id, None);
+
+        // rename
+        rename_client(&conn, &acme.id, "Acme LLC").unwrap();
+        let renamed = list_clients(&conn, "").unwrap().into_iter().find(|c| c.id == acme.id).unwrap();
+        assert_eq!(renamed.name, "Acme LLC");
+
+        // delete un-tags the client's notes (never deletes them) and returns
+        // the affected note ids.
+        set_note_client(&conn, &note.id, Some(&globex.id)).unwrap();
+        let untagged = delete_client(&conn, &globex.id).unwrap();
+        assert_eq!(untagged, vec![note.id.clone()], "delete returns the un-tagged note ids");
+        assert!(
+            list_clients(&conn, "").unwrap().iter().all(|c| c.id != globex.id),
+            "the client row is gone"
+        );
+        assert!(get_note(&conn, &note.id).is_ok(), "the note survives the client delete");
+        assert_eq!(
+            get_note(&conn, &note.id).unwrap().client_id,
+            None,
+            "the note falls back to no client"
+        );
+    }
+
+    #[test]
+    fn list_clients_is_scoped_to_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("client_scope.sqlite")).unwrap();
+        create_client(&conn, "WS A client", "wsA").unwrap();
+        create_client(&conn, "Personal client", "").unwrap();
+        assert_eq!(list_clients(&conn, "wsA").unwrap().len(), 1);
+        assert_eq!(list_clients(&conn, "").unwrap().len(), 1);
+        assert_eq!(list_clients(&conn, "wsB").unwrap().len(), 0);
     }
 
     #[test]

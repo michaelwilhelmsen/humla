@@ -24,6 +24,7 @@ export function mockTauri(handlers: Record<string, Handler> = {}) {
       case "notes_list":
       case "notes_list_trash":
       case "folders_list":
+      case "clients_list":
       case "summary_prompts_list":
       case "local_whisper_models":
       case "note_audio_files":

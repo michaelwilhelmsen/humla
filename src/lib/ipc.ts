@@ -34,6 +34,8 @@ export type Note = {
   workspace_id: string;
   // Soft-delete timestamp (ms) when the note is in the Trash; null/absent = live.
   deleted_at?: number | null;
+  // Optional Client tag (issue #43). null = untagged. Independent of folder_id.
+  client_id?: string | null;
 };
 
 export type NoteRevision = {
@@ -47,6 +49,15 @@ export type NoteRevision = {
 };
 
 export type Folder = {
+  id: string;
+  name: string;
+  created_at: number;
+  updated_at: number;
+};
+
+// A Client (issue #43): who a Note is about. Same shape as Folder on the wire;
+// workspace_id is backend-only and omitted here.
+export type Client = {
   id: string;
   name: string;
   created_at: number;
@@ -251,6 +262,16 @@ export const ipc = {
   renameFolder: (id: string, name: string) =>
     invoke<void>("folders_rename", { id, name }),
   deleteFolder: (id: string) => invoke<void>("folders_delete", { id }),
+
+  // Clients (issue #43) — mirror the folder methods. deleteClient un-tags the
+  // client's notes (never deletes them); setNoteClient assigns/clears a note's
+  // client (null = untag).
+  listClients: () => invoke<Client[]>("clients_list"),
+  createClient: (name: string) => invoke<Client>("clients_create", { name }),
+  renameClient: (id: string, name: string) => invoke<void>("clients_rename", { id, name }),
+  deleteClient: (id: string) => invoke<void>("clients_delete", { id }),
+  setNoteClient: (id: string, clientId: string | null) =>
+    invoke<void>("notes_set_client", { id, clientId }),
 
   getSetting: (key: SettingsKey) => invoke<string | null>("settings_get", { key }),
   setSetting: (key: SettingsKey, value: string) => invoke<void>("settings_set", { key, value }),

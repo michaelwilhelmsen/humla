@@ -4,6 +4,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
+  Building2,
   Calendar,
   CircleCheck,
   Eye,
@@ -37,6 +38,7 @@ import { RecordingSessions } from "../components/RecordingSessions";
 import { groupTimeline, resolveActivePill, formatSessionCaption } from "../lib/sessions";
 import { RecordingBar } from "../components/RecordingBar";
 import { ChatPanel } from "../components/ChatPanel";
+import { SelectablePopover } from "../components/SelectablePopover";
 import type { LayoutOutletContext } from "../components/Layout";
 import { SkeletonLines } from "../components/Skeleton";
 import { NoteEditor } from "../components/Editor";
@@ -663,6 +665,16 @@ export function Note() {
               }}
             />
           </span>
+          <ClientPicker
+            value={draft.client_id ?? null}
+            onChange={async (clientId) => {
+              if (!draft || readOnly) return;
+              const next = { ...draft, client_id: clientId };
+              setDraft(next);
+              await ipc.setNoteClient(draft.id, clientId);
+              upsert(next);
+            }}
+          />
           {recActive ? (
             <span className="nd-meta" style={{ color: "var(--color-record)", fontWeight: 500 }}>
               <span
@@ -1325,6 +1337,62 @@ function FolderPicker({
         <option value="__new__">+ New folder…</option>
       </select>
     </>
+  );
+}
+
+// Per-Note Client picker (issue #43). Built on the reusable
+// SelectablePopover primitive: assign / reassign / unassign plus full inline
+// create / rename / delete — all Client management lives here (there's no
+// browse-by-Client surface). Mirrors FolderPicker's placement but is richer,
+// which is why it uses the popover primitive rather than a native <select>.
+function ClientPicker({
+  value,
+  onChange,
+}: {
+  value: string | null;
+  onChange: (clientId: string | null) => void;
+}) {
+  const clients = useNotesStore((s) => s.clients);
+  const upsertClient = useNotesStore((s) => s.upsertClient);
+  const removeClient = useNotesStore((s) => s.removeClient);
+  const current = value ? clients.find((c) => c.id === value) : null;
+
+  return (
+    <SelectablePopover
+      ariaLabel="Client"
+      trigger={
+        <span className="nd-meta is-interactive">
+          <Building2 size={14} strokeWidth={1.6} />
+          <span className="truncate" style={{ maxWidth: 150 }}>
+            {current?.name ?? "No client"}
+          </span>
+          <ChevronDown size={12} strokeWidth={2} />
+        </span>
+      }
+      items={clients.map((c) => ({ id: c.id, label: c.name }))}
+      activeId={value}
+      onSelect={onChange}
+      noneLabel="No client"
+      createLabel="New client"
+      createPlaceholder="Client name"
+      onCreate={async (name) => {
+        const client = await ipc.createClient(name);
+        upsertClient(client);
+        onChange(client.id);
+      }}
+      onRename={async (id, name) => {
+        await ipc.renameClient(id, name);
+        const existing = useNotesStore.getState().clients.find((c) => c.id === id);
+        if (existing) upsertClient({ ...existing, name });
+      }}
+      onDelete={async (id) => {
+        await ipc.deleteClient(id);
+        removeClient(id);
+        // If the deleted Client was this note's, reflect the un-tag locally
+        // (the backend already un-tagged it during delete).
+        if (value === id) onChange(null);
+      }}
+    />
   );
 }
 
