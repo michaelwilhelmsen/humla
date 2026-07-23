@@ -634,6 +634,62 @@ struct OllamaChatRequest<'a> {
 // frequency_penalty at default 0; we override only because their tuning
 // targets benchmark prompts where content runaway is rare. Long structured
 // summaries on small models hit it more often.
+/// The model-family-dependent sampling knobs (issue #51). `num_predict` /
+/// `num_ctx` are sized adaptively at the call site and are NOT part of this —
+/// only the family-specific tuning lives here.
+struct SamplingProfile {
+    temperature: f32,
+    top_p: f32,
+    top_k: i32,
+    min_p: f32,
+    presence_penalty: f32,
+    frequency_penalty: f32,
+    repeat_penalty: f32,
+}
+
+/// Whether a model id is from the Qwen family. The loop-breaker sampling below
+/// is tuned specifically for Qwen 3.x's thinking-phase loop class and must not
+/// be applied to other families (issue #51). Case-insensitive substring match
+/// so tags like `qwen3.5:4b` / `Qwen2.5-Instruct` all resolve.
+fn is_qwen_model(model: &str) -> bool {
+    model.to_ascii_lowercase().contains("qwen")
+}
+
+/// Model-aware sampling profile for the Ollama native chat/summary path
+/// (issue #51). Qwen keeps its loop-breaker tuning; every other family (gemma,
+/// llama, …) gets neutral defaults — so a non-Qwen model, e.g. the now-
+/// recommended `gemma4:12b-mlx`, isn't run under penalties chosen for Qwen. The
+/// `think`/non-think split raises temperature + top_p in the thinking phase
+/// (sampling diversity is the escape hatch from deterministic loop branches).
+fn sampling_profile(model: &str, think: bool) -> SamplingProfile {
+    if is_qwen_model(model) {
+        // Qwen 3.5 loop-breaker (unchanged behaviour): presence_penalty=1.5
+        // breaks thinking-phase loops; frequency_penalty=0.5 + repeat_penalty=1.0
+        // handle content-phase token loops. See the module notes above.
+        SamplingProfile {
+            temperature: if think { 1.0 } else { 0.7 },
+            top_p: if think { 0.95 } else { 0.8 },
+            top_k: 20,
+            min_p: 0.0,
+            presence_penalty: 1.5,
+            frequency_penalty: 0.5,
+            repeat_penalty: 1.0,
+        }
+    } else {
+        // Neutral defaults for non-Qwen families: standard repetition handling
+        // (Ollama's default repeat_penalty=1.1), no Qwen-specific penalties.
+        SamplingProfile {
+            temperature: if think { 1.0 } else { 0.7 },
+            top_p: if think { 0.95 } else { 0.9 },
+            top_k: 40,
+            min_p: 0.0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            repeat_penalty: 1.1,
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct OllamaOptions {
     temperature: f32,
@@ -744,6 +800,12 @@ where
         ctx *= 2;
     }
     let num_ctx = ctx as i32;
+    // Sampling is model-family-aware (issue #51): Qwen gets its loop-breaker
+    // tuning, other families neutral defaults. Higher temp in thinking mode is
+    // counter-intuitive but deliberate — determinism (low temp) is what locks a
+    // model into the same loop branch each step; sampling diversity is the
+    // escape hatch (with penalties preventing it from wandering into repetition).
+    let profile = sampling_profile(model, think);
     let req = OllamaChatRequest {
         model,
         messages: messages
@@ -754,19 +816,13 @@ where
         think,
         keep_alive: 0,
         options: OllamaOptions {
-            // Mode-specific temp + top_p per Qwen team. Higher temp in
-            // thinking is counter-intuitive but their reasoning is that
-            // determinism (low temp) is exactly what locks the model into
-            // the same loop branch each step — sampling diversity is the
-            // escape hatch, with presence_penalty preventing it from
-            // wandering into repetition.
-            temperature: if think { 1.0 } else { 0.7 },
-            top_p: if think { 0.95 } else { 0.8 },
-            top_k: 20,
-            min_p: 0.0,
-            presence_penalty: 1.5,
-            frequency_penalty: 0.5,
-            repeat_penalty: 1.0,
+            temperature: profile.temperature,
+            top_p: profile.top_p,
+            top_k: profile.top_k,
+            min_p: profile.min_p,
+            presence_penalty: profile.presence_penalty,
+            frequency_penalty: profile.frequency_penalty,
+            repeat_penalty: profile.repeat_penalty,
             // Thinking burns thousands of reasoning tokens before the final
             // answer; 4096 is enough for the fast path, 8192 gives thinking
             // headroom while still failing fast on degenerate loops (was
@@ -1322,6 +1378,46 @@ pub(crate) async fn openai_embed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn qwen_family_detected() {
+        for m in ["qwen3.5:4b", "qwen3.5:9b", "Qwen2.5-Instruct", "QWEN3", "myorg/qwen-custom"] {
+            assert!(is_qwen_model(m), "expected qwen: {m}");
+        }
+        for m in ["gemma4:12b-mlx", "llama3.2:3b", "gpt-5.4", "mistral", "phi4"] {
+            assert!(!is_qwen_model(m), "expected non-qwen: {m}");
+        }
+    }
+
+    #[test]
+    fn qwen_keeps_the_loop_breaker_profile() {
+        // The Qwen-specific penalties are what break its thinking/content loops —
+        // they must stay exactly as before for qwen* models (#51).
+        for think in [false, true] {
+            let p = sampling_profile("qwen3.5:4b", think);
+            assert_eq!(p.presence_penalty, 1.5);
+            assert_eq!(p.frequency_penalty, 0.5);
+            assert_eq!(p.repeat_penalty, 1.0);
+            assert_eq!(p.top_k, 20);
+        }
+        // The think/non-think temp + top_p split is preserved.
+        assert_eq!(sampling_profile("qwen3.5:4b", true).temperature, 1.0);
+        assert_eq!(sampling_profile("qwen3.5:4b", false).temperature, 0.7);
+        assert_eq!(sampling_profile("qwen3.5:4b", false).top_p, 0.8);
+    }
+
+    #[test]
+    fn non_qwen_gets_neutral_sampling_not_qwen_penalties() {
+        // gemma4:12b-mlx (the recommended local model) must NOT run under the
+        // Qwen loop-breaker penalties (#51).
+        for think in [false, true] {
+            let p = sampling_profile("gemma4:12b-mlx", think);
+            assert_eq!(p.presence_penalty, 0.0, "no Qwen presence penalty");
+            assert_eq!(p.frequency_penalty, 0.0, "no Qwen frequency penalty");
+            assert_eq!(p.repeat_penalty, 1.1, "standard repetition handling");
+            assert_eq!(p.top_k, 40);
+        }
+    }
 
     #[test]
     fn reasoning_models_detected() {
