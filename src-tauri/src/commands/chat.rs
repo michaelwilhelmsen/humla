@@ -162,18 +162,46 @@ pub fn chat_reindex_note(app: AppHandle, note_id: String) -> Result<(), String> 
     Ok(())
 }
 
-/// Resolve the retrieval breadth the user picked in the Scope popover into a
-/// server-enforced `ToolScope`. "folder" resolves to the anchor Note's folder;
-/// a folder-less Note falls back to Note breadth (there's no folder to widen
-/// to). Anything unrecognised is treated as the safe single-Note breadth.
-fn resolve_scope(breadth: &str, note: &db::Note) -> ToolScope {
-    match breadth {
-        "all" => ToolScope::All,
+/// Whether a Note currently sits in a (non-empty) folder.
+fn note_has_folder(note: &db::Note) -> bool {
+    note.folder_id.as_deref().is_some_and(|f| !f.is_empty())
+}
+
+/// Read the breadth a turn runs at, self-healing a stale value as a side effect
+/// (issue #58). The name says `heal_and_read` because this MUTATES: a stored
+/// "folder" breadth on a Note that no longer has a folder is reset to "note"
+/// (persisted here) so the stored value, the request scope, and the Scope chip
+/// never diverge. The folder-edge policy for this issue is auto-heal, not a
+/// request-time error, so removing a Note's folder never breaks chat behind the
+/// user's back. Errors loudly on an unrecognised stored value rather than
+/// clamping — a corrupt row is a bug, not a note-scope turn.
+fn heal_and_read_breadth(
+    conn: &rusqlite::Connection,
+    conversation_id: &str,
+    stored: &str,
+    note: &db::Note,
+) -> Result<String, String> {
+    let breadth = chat::validate_breadth(stored)?;
+    if breadth == "folder" && !note_has_folder(note) {
+        db::set_conversation_breadth(conn, conversation_id, "note").map_err(|e| e.to_string())?;
+        return Ok("note".into());
+    }
+    Ok(breadth.to_string())
+}
+
+/// Resolve an (already-effective) breadth into a server-enforced `ToolScope`.
+/// "folder" resolves to the anchor Note's folder. Unrecognised breadths and a
+/// folder breadth without a folder are loud errors (issue #58) rather than a
+/// silent clamp to Note — in practice `heal_and_read_breadth` heals the
+/// folder-less case upstream, so those arms are belt-and-suspenders.
+fn resolve_scope(breadth: &str, note: &db::Note) -> Result<ToolScope, String> {
+    match chat::validate_breadth(breadth)? {
+        "all" => Ok(ToolScope::All),
         "folder" => match note.folder_id.as_deref() {
-            Some(folder_id) if !folder_id.is_empty() => ToolScope::Folder(folder_id.to_string()),
-            _ => ToolScope::Note(note.id.clone()),
+            Some(folder_id) if !folder_id.is_empty() => Ok(ToolScope::Folder(folder_id.to_string())),
+            _ => Err("This note isn't in a folder, so \"Folder\" scope isn't available.".into()),
         },
-        _ => ToolScope::Note(note.id.clone()),
+        _ => Ok(ToolScope::Note(note.id.clone())),
     }
 }
 
@@ -309,14 +337,85 @@ pub struct ChatSendResult {
     truncated: bool,
 }
 
-/// The chat tenant a turn runs in (issue #50). `"personal"` (default) is the
-/// on-device, never-gated path; `"workspace"` delegates to the humla-cloud
-/// endpoint for the currently-selected workspace. The frontend only ever sends
-/// these two values — it can't name a *different* workspace — so the no-cross-
-/// tenant invariant (story 5/19) is enforced by always resolving "workspace" to
-/// the active workspace server-side.
-fn is_workspace_tenant(tenant: &Option<String>) -> bool {
-    tenant.as_deref() == Some("workspace")
+/// The loaded chat context (issue #58): Personal (on-device) or one specific
+/// workspace (Teams/cloud). This type is the SINGLE owner of the "active
+/// workspace, else Personal" rule — every chat command derives its context via
+/// `ChatContext::load` instead of re-checking `active_workspace` emptiness
+/// itself. There is no user-chosen tenant; it follows the sidebar workspace.
+enum ChatContext {
+    Personal,
+    Workspace(String),
+}
+
+impl ChatContext {
+    /// Derive the context from the active workspace setting — the one place the
+    /// rule lives.
+    fn load(conn: &rusqlite::Connection) -> Self {
+        let workspace = super::cloud::active_workspace(conn);
+        if workspace.is_empty() {
+            ChatContext::Personal
+        } else {
+            ChatContext::Workspace(workspace)
+        }
+    }
+
+    /// The `conversations.tenant` string for this context.
+    fn tenant(&self) -> &str {
+        match self {
+            ChatContext::Personal => CHAT_TENANT_PERSONAL,
+            ChatContext::Workspace(id) => id,
+        }
+    }
+
+    /// The workspace id when this is a workspace context, else None. Presence of
+    /// a workspace is what routes a turn to the cloud (Teams) path.
+    fn workspace(&self) -> Option<&str> {
+        match self {
+            ChatContext::Personal => None,
+            ChatContext::Workspace(id) => Some(id),
+        }
+    }
+}
+
+/// Persist the Scope chip's breadth on the current context's conversation
+/// (issue #58) — the single source of truth for retrieval breadth. Validates
+/// the value loudly (garbage → Err), then get-or-creates the conversation for
+/// the loaded context (Personal or the active workspace) and writes the column.
+#[tauri::command]
+pub fn chat_set_breadth(
+    app: AppHandle,
+    note_id: String,
+    breadth: String,
+) -> Result<(), String> {
+    chat::validate_breadth(&breadth)?;
+    let state: State<AppState> = app.state();
+    let conn = state.db.lock();
+    let ctx = ChatContext::load(&conn);
+    let conversation =
+        db::get_or_create_conversation(&conn, ctx.tenant(), CHAT_SCOPE_NOTE, &note_id)
+            .map_err(|e| e.to_string())?;
+    db::set_conversation_breadth(&conn, &conversation.id, &breadth).map_err(|e| e.to_string())
+}
+
+/// Read the persisted breadth for the current context's conversation so the
+/// Scope chip initialises from the backend in one round trip (issue #58).
+/// Returns the safe "note" default when no conversation exists yet. NOTE: this
+/// read may PERSIST a heal — a stale "folder" breadth (the Note's folder was
+/// since removed) is reset to "note" via `heal_and_read_breadth` so the chip
+/// shows the corrected value; the heal-on-read is intentional.
+#[tauri::command]
+pub fn chat_get_breadth(app: AppHandle, note_id: String) -> Result<String, String> {
+    let state: State<AppState> = app.state();
+    let conn = state.db.lock();
+    let ctx = ChatContext::load(&conn);
+    let Some(conversation) =
+        db::get_conversation(&conn, ctx.tenant(), CHAT_SCOPE_NOTE, &note_id)
+            .map_err(|e| e.to_string())?
+    else {
+        return Ok("note".into());
+    };
+    let note = db::get_note(&conn, &note_id).map_err(|e| e.to_string())?;
+    heal_and_read_breadth(&conn, &conversation.id, &conversation.breadth, &note)
 }
 
 #[tauri::command]
@@ -324,17 +423,19 @@ pub async fn chat_send(
     app: AppHandle,
     note_id: String,
     message: String,
-    scope: Option<String>,
-    tenant: Option<String>,
 ) -> Result<ChatSendResult, String> {
-    let breadth = scope.unwrap_or_else(|| "note".into());
-    // Workspace (Teams) chat delegates to the cloud endpoint (issue #50);
-    // Personal chat stays fully on-device below.
-    if is_workspace_tenant(&tenant) {
-        return chat_send_cloud(app, note_id, message, breadth).await;
+    let state: State<AppState> = app.state();
+    // Chat is pinned to the loaded context (issue #58): a loaded workspace →
+    // the Teams (cloud) path; Personal (no workspace) → the on-device path
+    // below. There is no user-chosen tenant — it follows the sidebar workspace.
+    let in_workspace = {
+        let conn = state.db.lock();
+        ChatContext::load(&conn).workspace().is_some()
+    };
+    if in_workspace {
+        return chat_send_cloud(app, note_id, message).await;
     }
 
-    let state: State<AppState> = app.state();
     // Keychain read out of band — not inside the DB lock. Chat reuses the
     // shared OpenAI key (issue #44).
     let openai_api_key = super::read_provider_api_key(&state, "openai")?;
@@ -342,10 +443,12 @@ pub async fn chat_send(
     let (grounding, resolved, conversation_id, tool_scope, workspace) = {
         let conn = state.db.lock();
         let note = db::get_note(&conn, &note_id).map_err(|e| e.to_string())?;
-        let workspace = super::cloud::active_workspace(&conn);
+        // We branched to the Personal path above (no active workspace), so the
+        // tenant is Personal and there's no workspace to scope tools to.
+        let workspace = String::new();
         let resolved = resolve_chat(&conn, openai_api_key).map_err(|e| e.to_string())?;
-        // Conversation is keyed by the anchor Note; breadth is a live filter
-        // within it, not a new conversation (issue #47).
+        // Conversation is keyed by the anchor Note; breadth is a persisted live
+        // filter within it, not a new conversation (issues #47/#58).
         let conversation =
             db::get_or_create_conversation(&conn, CHAT_TENANT_PERSONAL, CHAT_SCOPE_NOTE, &note_id)
                 .map_err(|e| e.to_string())?;
@@ -354,7 +457,11 @@ pub async fn chat_send(
         // if a content-settled checkpoint hasn't fired yet.
         let body_text = crate::html_text::html_to_text(&note.body);
         let _ = db::reindex_note(&conn, &note.id, &body_text, &note.transcript, &note.summary);
-        let tool_scope = resolve_scope(&breadth, &note);
+        // Breadth is read from the conversation row (single source of truth),
+        // self-healed against the Note's current folder.
+        let breadth =
+            heal_and_read_breadth(&conn, &conversation.id, &conversation.breadth, &note)?;
+        let tool_scope = resolve_scope(&breadth, &note)?;
         let grounding = chat::build_grounding(&body_text, &note.transcript, &note.summary);
         (grounding, resolved, conversation.id, tool_scope, workspace)
     };
@@ -460,20 +567,23 @@ async fn chat_send_cloud(
     app: AppHandle,
     note_id: String,
     message: String,
-    breadth: String,
 ) -> Result<ChatSendResult, String> {
     let state: State<AppState> = app.state();
-    let (workspace, folder_id, title, conversation) = {
+    let (workspace, folder_id, title, conversation, breadth) = {
         let conn = state.db.lock();
-        let workspace = super::cloud::active_workspace(&conn);
-        if workspace.is_empty() {
+        let ctx = ChatContext::load(&conn);
+        let Some(workspace) = ctx.workspace() else {
             return Err("No workspace selected — switch to a workspace to use Team chat.".into());
-        }
+        };
         let note = db::get_note(&conn, &note_id).map_err(|e| e.to_string())?;
         let conversation =
-            db::get_or_create_conversation(&conn, &workspace, CHAT_SCOPE_NOTE, &note_id)
+            db::get_or_create_conversation(&conn, workspace, CHAT_SCOPE_NOTE, &note_id)
                 .map_err(|e| e.to_string())?;
-        (workspace, note.folder_id.clone(), note.title.clone(), conversation)
+        // Breadth is read from the (workspace) conversation row and self-healed
+        // against the Note's folder, exactly like the Personal path (issue #58).
+        let breadth =
+            heal_and_read_breadth(&conn, &conversation.id, &conversation.breadth, &note)?;
+        (workspace.to_string(), note.folder_id.clone(), note.title.clone(), conversation, breadth)
     };
 
     let body = chat::cloud::build_cloud_request(
@@ -484,7 +594,7 @@ async fn chat_send_cloud(
         &breadth,
         &note_id,
         folder_id.as_deref(),
-    );
+    )?;
 
     // Stream the turn, retrying once after a 401 (a stale cached token → forget
     // it and re-authenticate from stored credentials, mirroring cloud.rs).
@@ -648,19 +758,20 @@ pub struct ChatMessageDto {
 pub async fn chat_history(
     app: AppHandle,
     note_id: String,
-    tenant: Option<String>,
 ) -> Result<Vec<ChatMessageDto>, String> {
     let state: State<AppState> = app.state();
-    if is_workspace_tenant(&tenant) {
+    // Chat follows the loaded context (issue #58): a loaded workspace reads its
+    // server-authoritative conversation; Personal reads the local table.
+    let ctx = {
+        let conn = state.db.lock();
+        ChatContext::load(&conn)
+    };
+    if let Some(workspace) = ctx.workspace() {
         // Resolve the workspace conversation's server id, then read its messages
         // through PocketBase (the source of truth for shared conversations).
         let remote_id = {
             let conn = state.db.lock();
-            let workspace = super::cloud::active_workspace(&conn);
-            if workspace.is_empty() {
-                return Ok(Vec::new());
-            }
-            db::get_conversation(&conn, &workspace, CHAT_SCOPE_NOTE, &note_id)
+            db::get_conversation(&conn, workspace, CHAT_SCOPE_NOTE, &note_id)
                 .map_err(|e| e.to_string())?
                 .and_then(|c| c.remote_id)
         };
@@ -709,6 +820,78 @@ fn map_remote_message(rec: &serde_json::Value) -> Option<ChatMessageDto> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Insert a Note with an explicit folder assignment, for scope tests.
+    fn note_in_folder(conn: &rusqlite::Connection, folder: Option<&str>) -> db::Note {
+        let note = db::create_note(conn, "en", "meeting", "").unwrap();
+        if let Some(f) = folder {
+            db::move_note(conn, &note.id, Some(f)).unwrap();
+        }
+        db::get_note(conn, &note.id).unwrap()
+    }
+
+    #[test]
+    fn resolve_scope_maps_valid_breadths_and_errors_on_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = db::open(&dir.path().join("scope.sqlite")).unwrap();
+        let folder = db::create_folder(&conn, "Team", "").unwrap();
+        let with_folder = note_in_folder(&conn, Some(&folder.id));
+        let no_folder = note_in_folder(&conn, None);
+
+        assert!(matches!(resolve_scope("all", &no_folder).unwrap(), ToolScope::All));
+        assert!(matches!(resolve_scope("note", &no_folder).unwrap(), ToolScope::Note(_)));
+        match resolve_scope("folder", &with_folder).unwrap() {
+            ToolScope::Folder(id) => assert_eq!(id, folder.id),
+            other => panic!("expected Folder scope, got {other:?}"),
+        }
+        // Unknown breadth is loud (issue #58) — the old `_ => Note` clamp is gone.
+        assert!(resolve_scope("everything", &no_folder).is_err());
+        // Folder breadth on a folder-less note errors rather than clamping.
+        assert!(resolve_scope("folder", &no_folder).is_err());
+    }
+
+    #[test]
+    fn heal_and_read_breadth_self_heals_a_stale_folder_breadth_to_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = db::open(&dir.path().join("heal.sqlite")).unwrap();
+        let note = note_in_folder(&conn, None); // no folder
+        let conv =
+            db::get_or_create_conversation(&conn, CHAT_TENANT_PERSONAL, CHAT_SCOPE_NOTE, &note.id)
+                .unwrap();
+        // Simulate a breadth stored while the note still had a folder, then lost it.
+        db::set_conversation_breadth(&conn, &conv.id, "folder").unwrap();
+
+        let effective = heal_and_read_breadth(&conn, &conv.id, "folder", &note).unwrap();
+        assert_eq!(effective, "note", "stale folder breadth heals to note");
+        // The heal is persisted, so the chip and the request never diverge.
+        let reloaded =
+            db::get_conversation(&conn, CHAT_TENANT_PERSONAL, CHAT_SCOPE_NOTE, &note.id)
+                .unwrap()
+                .unwrap();
+        assert_eq!(reloaded.breadth, "note");
+    }
+
+    #[test]
+    fn heal_and_read_breadth_keeps_a_valid_breadth_and_errors_on_garbage() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = db::open(&dir.path().join("eff.sqlite")).unwrap();
+        let folder = db::create_folder(&conn, "Team", "").unwrap();
+        let note = note_in_folder(&conn, Some(&folder.id));
+        let conv =
+            db::get_or_create_conversation(&conn, CHAT_TENANT_PERSONAL, CHAT_SCOPE_NOTE, &note.id)
+                .unwrap();
+        assert_eq!(
+            heal_and_read_breadth(&conn, &conv.id, "folder", &note).unwrap(),
+            "folder",
+            "folder breadth survives when the folder is present"
+        );
+        assert_eq!(
+            heal_and_read_breadth(&conn, &conv.id, "all", &note).unwrap(),
+            "all"
+        );
+        // A corrupt stored value errors, never silently clamps to note.
+        assert!(heal_and_read_breadth(&conn, &conv.id, "bogus", &note).is_err());
+    }
 
     #[test]
     fn embedding_models_are_recognised() {
@@ -775,7 +958,8 @@ mod tests {
             "all",
             "roundtrip-anchor",
             None,
-        );
+        )
+        .expect("all-breadth request builds");
         let resp = client
             .post(format!("{}/api/chat", chat.trim_end_matches('/')))
             .bearer_auth(token)

@@ -143,49 +143,62 @@ describe("ChatPanel retrieval UI (#47)", () => {
   });
 });
 
-describe("ChatPanel Teams tenant (#50)", () => {
-  it("hides the tenant row when signed out of the cloud", async () => {
+describe("ChatPanel context pinning (#58)", () => {
+  it("renders no tenant picker — chat is pinned to the loaded context", async () => {
     mockTauri({ provider_key_get: () => "sk-test", chat_history: () => [] });
+    signIntoWorkspace("Acme Team");
     renderPanel();
     await screen.findByPlaceholderText(/Ask about your notes/);
-    // Personal is implicit — no tenant selector is shown at all.
+    // The old Personal/Workspace selector is gone entirely.
     expect(screen.queryByRole("button", { name: "Chat tenant" })).toBeNull();
   });
 
-  it("offers Personal + the active workspace once signed in", async () => {
+  it("shows the workspace name as a non-interactive context indicator", async () => {
     mockTauri({ provider_key_get: () => "sk-test", chat_history: () => [] });
     signIntoWorkspace("Acme Team");
     renderPanel();
-    const trigger = await screen.findByRole("button", { name: "Chat tenant" });
-    // Closed, the trigger shows the current tenant (Personal).
-    expect(trigger).toHaveTextContent("Personal");
-    fireEvent.click(trigger);
-    // Open, it offers the workspace you're in — the only one it can (no cross-tenant).
-    await waitFor(() => expect(screen.getByText("Acme Team")).toBeInTheDocument());
-    expect(screen.getAllByText("Personal").length).toBeGreaterThanOrEqual(1);
+    // The indicator shows where chat goes; it is not a button (no popover).
+    const indicator = await screen.findByLabelText("Chat context");
+    expect(indicator).toHaveTextContent("Acme Team");
+    expect(indicator.tagName).not.toBe("BUTTON");
   });
 
-  it("sends with the workspace tenant after switching to it", async () => {
-    let sentTenant: string | undefined;
+  it("shows Personal as the context indicator when signed out", async () => {
+    mockTauri({ provider_key_get: () => "sk-test", chat_history: () => [] });
+    renderPanel();
+    const indicator = await screen.findByLabelText("Chat context");
+    expect(indicator).toHaveTextContent("Personal");
+  });
+});
+
+describe("ChatPanel scope breadth (#58)", () => {
+  it("initialises the scope chip from the persisted breadth", async () => {
     mockTauri({
       provider_key_get: () => "sk-test",
       chat_history: () => [],
-      chat_send: (args) => {
-        sentTenant = (args as { tenant?: string }).tenant;
-        return { conversationId: "c1", truncated: false };
+      chat_get_breadth: () => "all",
+    });
+    renderPanel();
+    // The chip reflects the backend's persisted breadth, not the "note" default.
+    const trigger = await screen.findByRole("button", { name: "Chat scope" });
+    await waitFor(() => expect(trigger).toHaveTextContent("All notes"));
+  });
+
+  it("persists a breadth change via chatSetBreadth", async () => {
+    let setArgs: { noteId?: string; breadth?: string } | undefined;
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () => [],
+      chat_get_breadth: () => "note",
+      chat_set_breadth: (args) => {
+        setArgs = args as { noteId?: string; breadth?: string };
+        return undefined;
       },
     });
-    signIntoWorkspace("Acme Team");
     renderPanel();
-
-    // Switch the tenant to the workspace.
-    fireEvent.click(await screen.findByRole("button", { name: "Chat tenant" }));
-    fireEvent.click(await screen.findByText("Acme Team"));
-
-    const input = await screen.findByPlaceholderText(/Ask about your notes/);
-    fireEvent.change(input, { target: { value: "what did the team decide?" } });
-    fireEvent.click(screen.getByRole("button", { name: "Send" }));
-
-    await waitFor(() => expect(sentTenant).toBe("workspace"));
+    fireEvent.click(await screen.findByRole("button", { name: "Chat scope" }));
+    fireEvent.click(await screen.findByText("All notes"));
+    await waitFor(() => expect(setArgs?.breadth).toBe("all"));
+    expect(setArgs?.noteId).toBe("n1");
   });
 });

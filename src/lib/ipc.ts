@@ -388,18 +388,21 @@ export const ipc = {
   // streamed completion — the answer arrives via chat_* events, so the
   // resolved promise only carries the conversation id + a truncation flag.
   // `chatHistory` reloads a Note's persisted conversation after restart.
-  // `scope` is the Scope-popover breadth ("note" | "folder" | "all"), a live
-  // filter on retrieval within the same conversation (issue #47). `tenant`
-  // (issue #50) selects Personal (on-device) vs the active Workspace (Teams,
-  // delegated to the cloud endpoint); switching it is a different conversation.
-  chatSend: (
-    noteId: string,
-    message: string,
-    scope: ChatScope = "note",
-    tenant: ChatTenant = "personal",
-  ) => invoke<ChatSendResult>("chat_send", { noteId, message, scope, tenant }),
-  chatHistory: (noteId: string, tenant: ChatTenant = "personal") =>
-    invoke<ChatMessageDto[]>("chat_history", { noteId, tenant }),
+  //
+  // Chat is pinned to the loaded context (issue #58): the backend derives the
+  // tenant from the active workspace (Personal when none), so neither call
+  // takes a tenant. Retrieval breadth ("note" | "folder" | "all") is persisted
+  // on the conversation server-side — `chatSetBreadth` writes it, `chatGetBreadth`
+  // reads it back to initialise the Scope chip. `chatSend` no longer carries a
+  // scope: it reads the persisted breadth, so the UI can never diverge from it.
+  chatSend: (noteId: string, message: string) =>
+    invoke<ChatSendResult>("chat_send", { noteId, message }),
+  chatHistory: (noteId: string) => invoke<ChatMessageDto[]>("chat_history", { noteId }),
+  // Persist / read the Scope chip's breadth on the current context's
+  // conversation (issue #58). The single source of truth for retrieval breadth.
+  chatSetBreadth: (noteId: string, breadth: ChatScope) =>
+    invoke<void>("chat_set_breadth", { noteId, breadth }),
+  chatGetBreadth: (noteId: string) => invoke<ChatScope>("chat_get_breadth", { noteId }),
   // Rebuild a Note's retrieval index — called on Note-view unmount so edits
   // that didn't trigger summarize/diarize still land in search.
   chatReindexNote: (noteId: string) => invoke<void>("chat_reindex_note", { noteId }),
@@ -444,12 +447,9 @@ export type ChatMessageDto = {
   createdAt: number;
 };
 export type ChatSendResult = { conversationId: string; truncated: boolean };
-// Retrieval breadth chosen in the Scope popover (issue #47).
+// Retrieval breadth chosen in the Scope popover (issue #47), persisted per
+// conversation on the backend (issue #58).
 export type ChatScope = "note" | "folder" | "all";
-// Chat tenant chosen in the Scope popover (issue #50). "personal" runs on-device
-// and is never gated; "workspace" delegates to the cloud endpoint for the
-// currently-selected workspace (the only workspace it can ever reach).
-export type ChatTenant = "personal" | "workspace";
 
 // Streaming events (the #46 wire contract + #47 tool/citation events).
 export type ChatTextDeltaEvent = {

@@ -26,6 +26,23 @@ use crate::db;
 
 type Db = Arc<Mutex<Connection>>;
 
+/// The three valid retrieval breadths (issue #58) — the vocabulary shared by the
+/// conversation row, the Scope chip, and both request builders. Any other value
+/// is a bug (a stale DB row, a bad IPC arg, a future value an older client
+/// doesn't know) and must surface loudly, never silently clamp to note (the
+/// class of bug the issue is about). This is the single validation point: the
+/// write command (`chat_set_breadth`), the local scope resolver, and the cloud
+/// request builder (`cloud::build_cloud_request`) all funnel through it, so the
+/// "Unrecognized chat scope" message exists in exactly one place.
+pub fn validate_breadth(breadth: &str) -> Result<&str, String> {
+    match breadth {
+        "note" | "folder" | "all" => Ok(breadth),
+        other => Err(format!(
+            "Unrecognized chat scope {other:?} — expected \"note\", \"folder\" or \"all\"."
+        )),
+    }
+}
+
 // ── Typed message parts ─────────────────────────────────────────────────────
 // `messages.content` is a JSON array of these, ordered by the row's `seq`. Only
 // `Text` exists in this slice; `reasoning` / `tool` variants (see the wire
@@ -472,6 +489,19 @@ fn ctx_ref<'a>(ctx: &ChatCtx<'a>) -> ChatCtx<'a> {
 mod tests {
     use super::adapter::{ChatStep, ToolCall};
     use super::*;
+
+    #[test]
+    fn validate_breadth_accepts_the_vocabulary_and_rejects_garbage() {
+        for b in ["note", "folder", "all"] {
+            assert_eq!(validate_breadth(b).unwrap(), b);
+        }
+        // Issue #58: garbage is a loud error naming the offending value, never a
+        // silent clamp to note. This is the single owner of that error message.
+        for bad in ["", "everything", "Note", "all_notes", "workspace"] {
+            let err = validate_breadth(bad).unwrap_err();
+            assert!(err.contains(&format!("{bad:?}")), "surfaces the bad value: {err}");
+        }
+    }
 
     #[test]
     fn grounding_labels_blank_sections_and_frames_as_reference() {
