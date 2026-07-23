@@ -283,6 +283,16 @@ pub fn open(path: &Path) -> Result<Connection> {
     // conversations never set it. Its messages live server-side (read-through),
     // never in the local `messages` table.
     let _ = conn.execute("ALTER TABLE conversations ADD COLUMN remote_id TEXT", []);
+    // Persisted retrieval breadth per conversation (issue #58). The Scope chip
+    // ("This note" / "Folder: X" / "All notes") used to be component-local UI
+    // state that silently reset on note-change, tenant switch and panel remount;
+    // storing it on the conversation makes the backend the single source of
+    // truth so the chosen breadth survives turns, tab switches and restarts.
+    // NOT NULL DEFAULT 'note' back-fills existing rows with the safe breadth.
+    let _ = conn.execute(
+        "ALTER TABLE conversations ADD COLUMN breadth TEXT NOT NULL DEFAULT 'note'",
+        [],
+    );
     // Index is created AFTER the ALTERs so it's safe on both fresh DBs and
     // older DBs that needed the column added.
     conn.execute(
@@ -914,6 +924,10 @@ pub struct Conversation {
     /// (issue #50); NULL for Personal conversations and until the first
     /// workspace turn creates the server record.
     pub remote_id: Option<String>,
+    /// Persisted retrieval breadth (issue #58): "note" | "folder" | "all". The
+    /// single source of truth for the Scope chip; a live filter on retrieval
+    /// within the conversation, not a conversation-identity dimension.
+    pub breadth: String,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -938,12 +952,14 @@ fn map_conversation(row: &rusqlite::Row) -> rusqlite::Result<Conversation> {
         scope_id: row.get(2)?,
         tenant: row.get(3)?,
         remote_id: row.get(4)?,
-        created_at: row.get(5)?,
-        updated_at: row.get(6)?,
+        breadth: row.get(5)?,
+        created_at: row.get(6)?,
+        updated_at: row.get(7)?,
     })
 }
 
-const CONVERSATION_COLS: &str = "id, scope, scope_id, tenant, remote_id, created_at, updated_at";
+const CONVERSATION_COLS: &str =
+    "id, scope, scope_id, tenant, remote_id, breadth, created_at, updated_at";
 
 /// The existing conversation for a scope, or None. Used to reload history
 /// without creating an empty conversation just for opening the Chat tab.
@@ -994,6 +1010,17 @@ pub fn set_conversation_remote_id(conn: &Connection, id: &str, remote_id: &str) 
     conn.execute(
         "UPDATE conversations SET remote_id = ?1 WHERE id = ?2",
         params![remote_id, id],
+    )?;
+    Ok(())
+}
+
+/// Persist a conversation's retrieval breadth (issue #58). The command layer
+/// validates the value against the {note, folder, all} vocabulary before
+/// calling this, so db.rs stays agnostic and just stores the string.
+pub fn set_conversation_breadth(conn: &Connection, id: &str, breadth: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE conversations SET breadth = ?1 WHERE id = ?2",
+        params![breadth, id],
     )?;
     Ok(())
 }
@@ -1849,6 +1876,38 @@ mod tests {
         // The personal conversation is untouched by the workspace one's remote id.
         let personal_reload = get_conversation(&conn, CHAT_TENANT_PERSONAL, CHAT_SCOPE_NOTE, "note1").unwrap().unwrap();
         assert!(personal_reload.remote_id.is_none());
+    }
+
+    /// A conversation defaults to "note" breadth and the stored value survives a
+    /// reload (issue #58). Re-running `open()` on the same file is idempotent —
+    /// the breadth ALTER is a no-op the second time and the persisted value is
+    /// intact (proving the column back-fills without clobbering existing rows).
+    #[test]
+    fn conversation_breadth_defaults_and_persists_idempotently() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("breadth.sqlite");
+        let conv_id = {
+            let conn = open(&path).unwrap();
+            let conv =
+                get_or_create_conversation(&conn, CHAT_TENANT_PERSONAL, CHAT_SCOPE_NOTE, "note1")
+                    .unwrap();
+            assert_eq!(conv.breadth, "note", "new conversations default to note breadth");
+            set_conversation_breadth(&conn, &conv.id, "all").unwrap();
+            let reloaded =
+                get_conversation(&conn, CHAT_TENANT_PERSONAL, CHAT_SCOPE_NOTE, "note1")
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(reloaded.breadth, "all", "the stored breadth round-trips");
+            conv.id
+        };
+        // Re-open the same DB file: migrations must be idempotent and the stored
+        // breadth must not be reset by the (repeated) ALTER TABLE.
+        let conn = open(&path).unwrap();
+        let reloaded = get_conversation(&conn, CHAT_TENANT_PERSONAL, CHAT_SCOPE_NOTE, "note1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(reloaded.id, conv_id);
+        assert_eq!(reloaded.breadth, "all", "breadth survives a re-open (idempotent migration)");
     }
 
     #[test]

@@ -13,7 +13,6 @@ import {
   type ChatCitation,
   type ChatMessageDto,
   type ChatScope,
-  type ChatTenant,
 } from "../lib/ipc";
 import { useNotesStore } from "../lib/store";
 import { useCloudStore } from "../lib/cloud";
@@ -80,8 +79,9 @@ export function ChatPanel({ noteId }: { noteId: string }) {
   const [liveCitations, setLiveCitations] = useState<ChatCitation[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [truncated, setTruncated] = useState(false);
+  // Scope chip breadth. Display state only — the backend conversation row is the
+  // source of truth (issue #58); this mirrors it and is (re)initialised from it.
   const [scope, setScope] = useState<ChatScope>("note");
-  const [tenant, setTenant] = useState<ChatTenant>("personal");
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const sendingRef = useRef(false);
 
@@ -92,16 +92,23 @@ export function ChatPanel({ noteId }: { noteId: string }) {
     return fid ? s.folders.find((f) => f.id === fid) ?? null : null;
   });
 
-  // Team (workspace) chat is offered only when signed into a cloud workspace
-  // (issue #50). The tenant row can never name a *different* workspace than the
-  // active one — so a conversation can't cross tenants (story 5/19).
+  // Chat is pinned to the loaded context (issue #58). The chat follows the
+  // active workspace (Personal when none) — there's no tenant picker; the
+  // sidebar WorkspaceSwitcher is the only way to change where chat goes. We read
+  // the current workspace id to re-key the load effect (a switch reloads the
+  // other context's conversation) and the name for the context indicator.
   const workspaceName = useCloudStore((s) =>
     s.status.logged_in ? s.status.current_workspace?.name ?? null : null,
   );
+  const workspaceId = useCloudStore((s) =>
+    s.status.logged_in ? s.status.current_workspace?.id ?? null : null,
+  );
 
-  // Load persisted history on mount / note change, and clear transient state.
-  // On unmount / note change, rebuild the note's retrieval index so edits made
-  // in this session are searchable next time (content-settled checkpoint).
+  // Load persisted history + breadth on mount, note change, and workspace
+  // switch, clearing transient state. Keying on the workspace id makes a context
+  // switch reload the right conversation — this replaces the old per-tenant
+  // reset that lived in `changeTenant`. On unmount / change, rebuild the note's
+  // retrieval index so edits made this session are searchable next time.
   useEffect(() => {
     let cancelled = false;
     setInput("");
@@ -111,48 +118,36 @@ export function ChatPanel({ noteId }: { noteId: string }) {
     setError(null);
     setTruncated(false);
     setSending(false);
-    setScope("note");
-    setTenant("personal");
     sendingRef.current = false;
     ipc
-      .chatHistory(noteId, "personal")
+      .chatHistory(noteId)
       .then((h) => {
         if (!cancelled) setMessages(h);
       })
       .catch(() => {
         if (!cancelled) setMessages([]);
       });
+    // Initialise the chip from the backend's persisted breadth in one round
+    // trip; fall back to "note" if it can't be read.
+    ipc
+      .chatGetBreadth(noteId)
+      .then((b) => {
+        if (!cancelled && b) setScope(b);
+      })
+      .catch(() => {
+        if (!cancelled) setScope("note");
+      });
     return () => {
       cancelled = true;
       void ipc.chatReindexNote(noteId).catch(() => {});
     };
-  }, [noteId]);
+  }, [noteId, workspaceId]);
 
-  // If the workspace goes away (sign-out / switch) while a Team conversation is
-  // open, fall back to Personal so we never send to a stale tenant.
-  useEffect(() => {
-    if (tenant === "workspace" && !workspaceName) changeTenant("personal");
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [workspaceName]);
-
-  // Switching tenant starts a fresh conversation in that tenant (issue #50):
-  // reset transient state and read-through that tenant's history.
-  function changeTenant(next: ChatTenant) {
-    if (next === tenant) return;
-    setTenant(next);
-    setStreaming("");
-    setActivity(null);
-    setLiveCitations([]);
-    setError(null);
-    setTruncated(false);
-    setInput("");
-    setScope("note");
-    setSending(false);
-    sendingRef.current = false;
-    ipc
-      .chatHistory(noteId, next)
-      .then(setMessages)
-      .catch(() => setMessages([]));
+  // Persist a breadth change to the conversation (issue #58): update the chip
+  // optimistically, then write it through so the next turn reads the new value.
+  function selectBreadth(next: ChatScope) {
+    setScope(next);
+    void ipc.chatSetBreadth(noteId, next).catch((e) => setError(String(e)));
   }
 
   // Stream subscription. Bound once; cancelled-flag + claim keeps it StrictMode-
@@ -215,13 +210,13 @@ export function ChatPanel({ noteId }: { noteId: string }) {
     };
     setMessages((m) => [...m, optimistic]);
     try {
-      const result = await ipc.chatSend(noteId, text, scope, tenant);
-      setMessages(await ipc.chatHistory(noteId, tenant));
+      const result = await ipc.chatSend(noteId, text);
+      setMessages(await ipc.chatHistory(noteId));
       setTruncated(result.truncated);
     } catch (e) {
       setError((prev) => prev ?? String(e));
       try {
-        setMessages(await ipc.chatHistory(noteId, tenant));
+        setMessages(await ipc.chatHistory(noteId));
       } catch {
         /* keep the optimistic view */
       }
@@ -277,10 +272,8 @@ export function ChatPanel({ noteId }: { noteId: string }) {
     <div className="flex-1 min-h-0 flex flex-col">
       <ScopeBar
         scope={scope}
-        onScope={setScope}
+        onScope={selectBreadth}
         folderName={folder?.name ?? null}
-        tenant={tenant}
-        onTenant={changeTenant}
         workspaceName={workspaceName}
       />
 
@@ -352,23 +345,21 @@ export function ChatPanel({ noteId }: { noteId: string }) {
   );
 }
 
-// Tenant + breadth selectors at the top of the chat. The tenant row (Personal /
-// the active workspace) only appears when signed into a workspace (issue #50);
+// Context indicator + breadth selector at the top of the chat. The chat is
+// pinned to the loaded context (issue #58): a non-interactive indicator shows
+// where chat goes (the active workspace name, or "Personal") — there is no
+// tenant picker, since the sidebar WorkspaceSwitcher is the source of truth.
 // "This folder" only appears when the note has a folder (nothing to widen to
 // otherwise).
 function ScopeBar({
   scope,
   onScope,
   folderName,
-  tenant,
-  onTenant,
   workspaceName,
 }: {
   scope: ChatScope;
   onScope: (s: ChatScope) => void;
   folderName: string | null;
-  tenant: ChatTenant;
-  onTenant: (t: ChatTenant) => void;
   workspaceName: string | null;
 }) {
   const items: PopoverItem[] = [
@@ -380,32 +371,20 @@ function ScopeBar({
   const activeId = scope === "folder" && !folderName ? "note" : scope;
   const label = items.find((i) => i.id === activeId)?.label ?? "This note";
 
-  const tenantItems: PopoverItem[] = [
-    { id: "personal", label: "Personal" },
-    ...(workspaceName ? [{ id: "workspace", label: workspaceName }] : []),
-  ];
-  const activeTenant = tenant === "workspace" && !workspaceName ? "personal" : tenant;
-  const tenantLabel =
-    tenantItems.find((i) => i.id === activeTenant)?.label ?? "Personal";
-
   return (
     <div className="shrink-0 flex items-center gap-2 px-4 py-2 border-b border-[var(--color-line)]">
-      {workspaceName && (
-        <>
-          <SelectablePopover
-            ariaLabel="Chat tenant"
-            items={tenantItems}
-            activeId={activeTenant}
-            onSelect={(id) => onTenant((id as ChatTenant) ?? "personal")}
-            trigger={
-              <span className="nd-chip inline-flex items-center gap-1 text-xs cursor-pointer">
-                {tenantLabel}
-              </span>
-            }
-          />
-          <span className="text-xs text-[var(--color-text-disabled)]">·</span>
-        </>
-      )}
+      <span
+        aria-label="Chat context"
+        title={
+          workspaceName
+            ? `Chatting in ${workspaceName} — follows the workspace loaded in the sidebar`
+            : "Chatting in Personal (on-device)"
+        }
+        className="nd-chip inline-flex items-center gap-1 text-xs"
+      >
+        {workspaceName ?? "Personal"}
+      </span>
+      <span className="text-xs text-[var(--color-text-disabled)]">·</span>
       <span className="text-xs text-[var(--color-text-disabled)]">Search</span>
       <SelectablePopover
         ariaLabel="Chat scope"

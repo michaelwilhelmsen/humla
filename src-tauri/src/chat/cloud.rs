@@ -16,8 +16,15 @@ use serde_json::{json, Value};
 /// server's conversation record id (None/empty on the first turn → the server
 /// creates one and returns it). The anchor `note_id` is always sent inside
 /// `scope` for grounding; `folder_id` rides only when the breadth is folder.
-/// Mirrors the desktop breadth clamp: a folder-less note under "folder" breadth
-/// falls back to "note".
+///
+/// The breadth is threaded through *verbatim* — no silent clamp (issue #58).
+/// It's validated through the shared `super::validate_breadth` (the single owner
+/// of the "Unrecognized chat scope" message), so an unknown value errors there;
+/// a "folder" breadth without a folder_id is a distinct error (the desktop's
+/// `heal_and_read_breadth` heals the folder-less case to "note" upstream, so
+/// that arm is a strict guard that shouldn't fire in practice). This is what
+/// lets breadth "all" reach the server as `scope.breadth == "all"` instead of
+/// degrading to the anchor note.
 pub fn build_cloud_request(
     remote_conversation_id: Option<&str>,
     workspace_id: &str,
@@ -26,20 +33,33 @@ pub fn build_cloud_request(
     breadth: &str,
     note_id: &str,
     folder_id: Option<&str>,
-) -> Value {
-    // Default to the safe single-Note breadth; widen only on an explicit,
-    // well-formed request. `note_id` stays in every scope so the server can
-    // ground on the anchor Note regardless of breadth.
-    let mut scope = json!({ "breadth": "note", "note_id": note_id });
-    match breadth {
-        "all" => scope = json!({ "breadth": "all", "note_id": note_id }),
-        "folder" => {
-            if let Some(f) = folder_id.filter(|f| !f.is_empty()) {
-                scope = json!({ "breadth": "folder", "note_id": note_id, "folder_id": f });
+) -> Result<Value, String> {
+    // Reject an unknown breadth through the shared validator — one owner of the
+    // vocabulary and its error, no duplicated match/message here.
+    super::validate_breadth(breadth)?;
+    // `note_id` stays in every scope so the server can ground on the anchor
+    // Note regardless of breadth (under "all" the server ignores it by design).
+    let scope = match breadth {
+        "note" => json!({ "breadth": "note", "note_id": note_id }),
+        "all" => json!({ "breadth": "all", "note_id": note_id }),
+        "folder" => match folder_id.filter(|f| !f.is_empty()) {
+            Some(f) => json!({ "breadth": "folder", "note_id": note_id, "folder_id": f }),
+            None => {
+                return Err(
+                    "\"Folder\" scope needs a folder, but this note isn't in one.".into()
+                )
             }
+        },
+        // Every value `validate_breadth` accepts is handled above. A value that
+        // passes validation but lands here means the vocabulary grew without
+        // this builder keeping up — fail loudly (a distinct message, not the
+        // validator's), never `unreachable!()` that could mask the gap.
+        other => {
+            return Err(format!(
+                "chat scope {other:?} is valid but not handled by the cloud request builder"
+            ))
         }
-        _ => {}
-    }
+    };
     let mut body = json!({
         "workspace_id": workspace_id,
         "message": message,
@@ -51,7 +71,7 @@ pub fn build_cloud_request(
     if let Some(t) = title.filter(|s| !s.is_empty()) {
         body["title"] = json!(t);
     }
-    body
+    Ok(body)
 }
 
 /// Parse one SSE event block into `(event name, data payload)`. Matches the
@@ -158,7 +178,7 @@ mod tests {
 
     #[test]
     fn request_defaults_to_note_breadth_with_grounding_anchor() {
-        let b = build_cloud_request(None, "ws1", "hi", None, "note", "n1", None);
+        let b = build_cloud_request(None, "ws1", "hi", None, "note", "n1", None).unwrap();
         assert_eq!(b["workspace_id"], "ws1");
         assert_eq!(b["message"], "hi");
         assert_eq!(b["scope"], json!({ "breadth": "note", "note_id": "n1" }));
@@ -168,27 +188,43 @@ mod tests {
 
     #[test]
     fn request_carries_remote_id_and_title_when_present() {
-        let b = build_cloud_request(Some("srv123"), "ws1", "hi", Some("Kickoff"), "note", "n1", None);
+        let b =
+            build_cloud_request(Some("srv123"), "ws1", "hi", Some("Kickoff"), "note", "n1", None)
+                .unwrap();
         assert_eq!(b["conversation_id"], "srv123");
         assert_eq!(b["title"], "Kickoff");
         // Empty strings are dropped, not sent.
-        let b2 = build_cloud_request(Some(""), "ws1", "hi", Some(""), "note", "n1", None);
+        let b2 = build_cloud_request(Some(""), "ws1", "hi", Some(""), "note", "n1", None).unwrap();
         assert!(b2.get("conversation_id").is_none());
         assert!(b2.get("title").is_none());
     }
 
     #[test]
-    fn request_folder_breadth_needs_a_folder_else_falls_back_to_note() {
-        let with = build_cloud_request(None, "ws1", "hi", None, "folder", "n1", Some("f1"));
+    fn request_folder_breadth_carries_the_folder_id() {
+        let with =
+            build_cloud_request(None, "ws1", "hi", None, "folder", "n1", Some("f1")).unwrap();
         assert_eq!(with["scope"], json!({ "breadth": "folder", "note_id": "n1", "folder_id": "f1" }));
-        // A folder-less note under folder breadth clamps to note (no folder to widen to).
-        let without = build_cloud_request(None, "ws1", "hi", None, "folder", "n1", None);
-        assert_eq!(without["scope"], json!({ "breadth": "note", "note_id": "n1" }));
+    }
+
+    #[test]
+    fn request_folder_breadth_without_a_folder_is_an_error_not_a_clamp() {
+        // Issue #58: no silent degradation. The desktop heals the folder-less
+        // case to "note" upstream, so this strict guard shouldn't fire — but if
+        // it's reached it errors loudly rather than quietly narrowing to note.
+        let err = build_cloud_request(None, "ws1", "hi", None, "folder", "n1", None).unwrap_err();
+        assert!(err.to_lowercase().contains("folder"), "names the missing folder: {err}");
+    }
+
+    #[test]
+    fn request_unrecognized_breadth_is_an_error() {
+        // Issue #58: the former `_ => {}` fall-through silently clamped to note.
+        let err = build_cloud_request(None, "ws1", "hi", None, "everything", "n1", None).unwrap_err();
+        assert!(err.contains("everything"), "the offending value is surfaced: {err}");
     }
 
     #[test]
     fn request_all_breadth_keeps_the_grounding_anchor() {
-        let b = build_cloud_request(None, "ws1", "hi", None, "all", "n1", None);
+        let b = build_cloud_request(None, "ws1", "hi", None, "all", "n1", None).unwrap();
         assert_eq!(b["scope"], json!({ "breadth": "all", "note_id": "n1" }));
     }
 
