@@ -5,6 +5,7 @@
 //! `commands::chat`; everything here is Tauri-free so it's unit-testable.
 
 mod adapter;
+pub mod cloud;
 mod providers;
 mod tools;
 

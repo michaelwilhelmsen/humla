@@ -276,6 +276,13 @@ pub fn open(path: &Path) -> Result<Connection> {
     // instead of dropping the row so it's recoverable; remote tombstones land
     // here too. Note lists filter `deleted_at IS NULL`.
     let _ = conn.execute("ALTER TABLE notes ADD COLUMN deleted_at INTEGER", []);
+    // Workspace (Teams) chat (issue #50). A workspace conversation is
+    // server-authoritative: the local row is just a (tenant, scope, scope_id)
+    // handle whose `remote_id` maps to the humla-cloud conversation record id.
+    // NULL until the first turn creates the server conversation. Personal
+    // conversations never set it. Its messages live server-side (read-through),
+    // never in the local `messages` table.
+    let _ = conn.execute("ALTER TABLE conversations ADD COLUMN remote_id TEXT", []);
     // Index is created AFTER the ALTERs so it's safe on both fresh DBs and
     // older DBs that needed the column added.
     conn.execute(
@@ -903,6 +910,10 @@ pub struct Conversation {
     pub scope: String,
     pub scope_id: String,
     pub tenant: String,
+    /// humla-cloud conversation record id for a workspace (Teams) conversation
+    /// (issue #50); NULL for Personal conversations and until the first
+    /// workspace turn creates the server record.
+    pub remote_id: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -926,12 +937,13 @@ fn map_conversation(row: &rusqlite::Row) -> rusqlite::Result<Conversation> {
         scope: row.get(1)?,
         scope_id: row.get(2)?,
         tenant: row.get(3)?,
-        created_at: row.get(4)?,
-        updated_at: row.get(5)?,
+        remote_id: row.get(4)?,
+        created_at: row.get(5)?,
+        updated_at: row.get(6)?,
     })
 }
 
-const CONVERSATION_COLS: &str = "id, scope, scope_id, tenant, created_at, updated_at";
+const CONVERSATION_COLS: &str = "id, scope, scope_id, tenant, remote_id, created_at, updated_at";
 
 /// The existing conversation for a scope, or None. Used to reload history
 /// without creating an empty conversation just for opening the Chat tab.
@@ -973,6 +985,17 @@ pub fn get_or_create_conversation(
     )?;
     get_conversation(conn, tenant, scope, scope_id)?
         .ok_or_else(|| anyhow::anyhow!("conversation vanished after insert"))
+}
+
+/// Record the humla-cloud conversation record id for a workspace conversation
+/// (issue #50), so later turns resume it and read-through history can find it.
+/// Idempotent — a repeat with the same id is a no-op write.
+pub fn set_conversation_remote_id(conn: &Connection, id: &str, remote_id: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE conversations SET remote_id = ?1 WHERE id = ?2",
+        params![remote_id, id],
+    )?;
+    Ok(())
 }
 
 fn map_chat_message(row: &rusqlite::Row) -> rusqlite::Result<ChatMessage> {
@@ -1805,6 +1828,27 @@ mod tests {
         assert_eq!(list_folders(&conn, "wsA").unwrap().len(), 1);
         assert_eq!(list_folders(&conn, "").unwrap().len(), 1);
         assert_eq!(list_folders(&conn, "wsB").unwrap().len(), 0);
+    }
+
+    /// A workspace (Teams) conversation is keyed by tenant and carries a
+    /// remote_id once the server creates it (issue #50). Personal and workspace
+    /// conversations for the same Note are distinct rows; remote_id starts NULL.
+    #[test]
+    fn conversation_remote_id_round_trips_and_tenant_scopes() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("conv.sqlite")).unwrap();
+
+        let personal = get_or_create_conversation(&conn, CHAT_TENANT_PERSONAL, CHAT_SCOPE_NOTE, "note1").unwrap();
+        let workspace = get_or_create_conversation(&conn, "wsA", CHAT_SCOPE_NOTE, "note1").unwrap();
+        assert_ne!(personal.id, workspace.id, "same Note, different tenant → distinct conversations");
+        assert!(workspace.remote_id.is_none(), "no server id until the first turn");
+
+        set_conversation_remote_id(&conn, &workspace.id, "srvConv123").unwrap();
+        let reloaded = get_conversation(&conn, "wsA", CHAT_SCOPE_NOTE, "note1").unwrap().unwrap();
+        assert_eq!(reloaded.remote_id.as_deref(), Some("srvConv123"));
+        // The personal conversation is untouched by the workspace one's remote id.
+        let personal_reload = get_conversation(&conn, CHAT_TENANT_PERSONAL, CHAT_SCOPE_NOTE, "note1").unwrap().unwrap();
+        assert!(personal_reload.remote_id.is_none());
     }
 
     #[test]
