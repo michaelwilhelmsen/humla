@@ -13,8 +13,10 @@ import {
   type ChatCitation,
   type ChatMessageDto,
   type ChatScope,
+  type ChatTenant,
 } from "../lib/ipc";
 import { useNotesStore } from "../lib/store";
+import { useCloudStore } from "../lib/cloud";
 import { useChatReadiness } from "./provider/useChatReadiness";
 import { SelectablePopover, type PopoverItem } from "./SelectablePopover";
 import { RECOMMENDED_OLLAMA_MODEL } from "../lib/localModels";
@@ -79,6 +81,7 @@ export function ChatPanel({ noteId }: { noteId: string }) {
   const [error, setError] = useState<string | null>(null);
   const [truncated, setTruncated] = useState(false);
   const [scope, setScope] = useState<ChatScope>("note");
+  const [tenant, setTenant] = useState<ChatTenant>("personal");
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const sendingRef = useRef(false);
 
@@ -88,6 +91,13 @@ export function ChatPanel({ noteId }: { noteId: string }) {
     const fid = note?.folder_id;
     return fid ? s.folders.find((f) => f.id === fid) ?? null : null;
   });
+
+  // Team (workspace) chat is offered only when signed into a cloud workspace
+  // (issue #50). The tenant row can never name a *different* workspace than the
+  // active one — so a conversation can't cross tenants (story 5/19).
+  const workspaceName = useCloudStore((s) =>
+    s.status.logged_in ? s.status.current_workspace?.name ?? null : null,
+  );
 
   // Load persisted history on mount / note change, and clear transient state.
   // On unmount / note change, rebuild the note's retrieval index so edits made
@@ -102,9 +112,10 @@ export function ChatPanel({ noteId }: { noteId: string }) {
     setTruncated(false);
     setSending(false);
     setScope("note");
+    setTenant("personal");
     sendingRef.current = false;
     ipc
-      .chatHistory(noteId)
+      .chatHistory(noteId, "personal")
       .then((h) => {
         if (!cancelled) setMessages(h);
       })
@@ -116,6 +127,33 @@ export function ChatPanel({ noteId }: { noteId: string }) {
       void ipc.chatReindexNote(noteId).catch(() => {});
     };
   }, [noteId]);
+
+  // If the workspace goes away (sign-out / switch) while a Team conversation is
+  // open, fall back to Personal so we never send to a stale tenant.
+  useEffect(() => {
+    if (tenant === "workspace" && !workspaceName) changeTenant("personal");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [workspaceName]);
+
+  // Switching tenant starts a fresh conversation in that tenant (issue #50):
+  // reset transient state and read-through that tenant's history.
+  function changeTenant(next: ChatTenant) {
+    if (next === tenant) return;
+    setTenant(next);
+    setStreaming("");
+    setActivity(null);
+    setLiveCitations([]);
+    setError(null);
+    setTruncated(false);
+    setInput("");
+    setScope("note");
+    setSending(false);
+    sendingRef.current = false;
+    ipc
+      .chatHistory(noteId, next)
+      .then(setMessages)
+      .catch(() => setMessages([]));
+  }
 
   // Stream subscription. Bound once; cancelled-flag + claim keeps it StrictMode-
   // and async-listen-safe. Deltas/activity accepted only while our send is live.
@@ -177,13 +215,13 @@ export function ChatPanel({ noteId }: { noteId: string }) {
     };
     setMessages((m) => [...m, optimistic]);
     try {
-      const result = await ipc.chatSend(noteId, text, scope);
-      setMessages(await ipc.chatHistory(noteId));
+      const result = await ipc.chatSend(noteId, text, scope, tenant);
+      setMessages(await ipc.chatHistory(noteId, tenant));
       setTruncated(result.truncated);
     } catch (e) {
       setError((prev) => prev ?? String(e));
       try {
-        setMessages(await ipc.chatHistory(noteId));
+        setMessages(await ipc.chatHistory(noteId, tenant));
       } catch {
         /* keep the optimistic view */
       }
@@ -237,7 +275,14 @@ export function ChatPanel({ noteId }: { noteId: string }) {
 
   return (
     <div className="flex-1 min-h-0 flex flex-col">
-      <ScopeBar scope={scope} onScope={setScope} folderName={folder?.name ?? null} />
+      <ScopeBar
+        scope={scope}
+        onScope={setScope}
+        folderName={folder?.name ?? null}
+        tenant={tenant}
+        onTenant={changeTenant}
+        workspaceName={workspaceName}
+      />
 
       <div ref={scrollRef} className="flex-1 min-h-0 overflow-y-auto px-4 py-4 flex flex-col gap-3">
         {messages.length === 0 && !sending ? (
@@ -307,16 +352,24 @@ export function ChatPanel({ noteId }: { noteId: string }) {
   );
 }
 
-// Breadth selector at the top of the chat. "This folder" only appears when the
-// note actually has a folder (there's nothing to widen to otherwise).
+// Tenant + breadth selectors at the top of the chat. The tenant row (Personal /
+// the active workspace) only appears when signed into a workspace (issue #50);
+// "This folder" only appears when the note has a folder (nothing to widen to
+// otherwise).
 function ScopeBar({
   scope,
   onScope,
   folderName,
+  tenant,
+  onTenant,
+  workspaceName,
 }: {
   scope: ChatScope;
   onScope: (s: ChatScope) => void;
   folderName: string | null;
+  tenant: ChatTenant;
+  onTenant: (t: ChatTenant) => void;
+  workspaceName: string | null;
 }) {
   const items: PopoverItem[] = [
     { id: "note", label: "This note" },
@@ -327,8 +380,32 @@ function ScopeBar({
   const activeId = scope === "folder" && !folderName ? "note" : scope;
   const label = items.find((i) => i.id === activeId)?.label ?? "This note";
 
+  const tenantItems: PopoverItem[] = [
+    { id: "personal", label: "Personal" },
+    ...(workspaceName ? [{ id: "workspace", label: workspaceName }] : []),
+  ];
+  const activeTenant = tenant === "workspace" && !workspaceName ? "personal" : tenant;
+  const tenantLabel =
+    tenantItems.find((i) => i.id === activeTenant)?.label ?? "Personal";
+
   return (
     <div className="shrink-0 flex items-center gap-2 px-4 py-2 border-b border-[var(--color-line)]">
+      {workspaceName && (
+        <>
+          <SelectablePopover
+            ariaLabel="Chat tenant"
+            items={tenantItems}
+            activeId={activeTenant}
+            onSelect={(id) => onTenant((id as ChatTenant) ?? "personal")}
+            trigger={
+              <span className="nd-chip inline-flex items-center gap-1 text-xs cursor-pointer">
+                {tenantLabel}
+              </span>
+            }
+          />
+          <span className="text-xs text-[var(--color-text-disabled)]">·</span>
+        </>
+      )}
       <span className="text-xs text-[var(--color-text-disabled)]">Search</span>
       <SelectablePopover
         ariaLabel="Chat scope"

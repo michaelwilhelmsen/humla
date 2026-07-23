@@ -320,6 +320,45 @@ async fn ensure_session(state: &State<'_, AppState>) -> Result<(String, Session)
     Ok((base, session))
 }
 
+/// Cloud `(base_url, auth token)` for a command that calls the server directly
+/// (Teams chat, issue #50). Reuses the cached session and the auto-login-from-
+/// Keychain path. The token may be stale — a 401 from the endpoint should call
+/// [`forget_session`] and retry once, mirroring `pb_json`'s reactive refresh.
+pub(crate) async fn cloud_session(state: &State<'_, AppState>) -> Result<(String, String), String> {
+    let (base, session) = ensure_session(state).await?;
+    Ok((base, session.token))
+}
+
+/// Drop the cached session so the next [`cloud_session`] re-authenticates from
+/// stored credentials — call after a 401 from a direct endpoint call.
+pub(crate) fn forget_session() {
+    *SESSION.lock().unwrap() = None;
+}
+
+/// Read-through fetch of a workspace conversation's messages (issue #50).
+/// Workspace chat is server-authoritative: history lives in PocketBase's
+/// member-readable `chat_messages`, scoped by the caller's token. Returns the
+/// raw records sorted by `seq`; the chat command maps them to the UI DTO.
+pub(crate) async fn fetch_chat_messages(
+    state: &State<'_, AppState>,
+    conversation_id: &str,
+) -> Result<Vec<serde_json::Value>, String> {
+    let (base, session) = ensure_session(state).await?;
+    let filter = format!("conversation=\"{conversation_id}\"");
+    let val = authed_get(
+        &base,
+        &session.token,
+        "/api/collections/chat_messages/records",
+        &[("filter", filter.as_str()), ("sort", "seq"), ("perPage", "200")],
+    )
+    .await?;
+    Ok(val
+        .get("items")
+        .and_then(|i| i.as_array())
+        .cloned()
+        .unwrap_or_default())
+}
+
 // ---- role / relation helpers -----------------------------------------------
 
 fn ids(val: &serde_json::Value, field: &str) -> Vec<String> {

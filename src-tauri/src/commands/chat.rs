@@ -309,18 +309,35 @@ pub struct ChatSendResult {
     truncated: bool,
 }
 
+/// The chat tenant a turn runs in (issue #50). `"personal"` (default) is the
+/// on-device, never-gated path; `"workspace"` delegates to the humla-cloud
+/// endpoint for the currently-selected workspace. The frontend only ever sends
+/// these two values — it can't name a *different* workspace — so the no-cross-
+/// tenant invariant (story 5/19) is enforced by always resolving "workspace" to
+/// the active workspace server-side.
+fn is_workspace_tenant(tenant: &Option<String>) -> bool {
+    tenant.as_deref() == Some("workspace")
+}
+
 #[tauri::command]
 pub async fn chat_send(
     app: AppHandle,
     note_id: String,
     message: String,
     scope: Option<String>,
+    tenant: Option<String>,
 ) -> Result<ChatSendResult, String> {
+    let breadth = scope.unwrap_or_else(|| "note".into());
+    // Workspace (Teams) chat delegates to the cloud endpoint (issue #50);
+    // Personal chat stays fully on-device below.
+    if is_workspace_tenant(&tenant) {
+        return chat_send_cloud(app, note_id, message, breadth).await;
+    }
+
     let state: State<AppState> = app.state();
     // Keychain read out of band — not inside the DB lock. Chat reuses the
     // shared OpenAI key (issue #44).
     let openai_api_key = super::read_provider_api_key(&state, "openai")?;
-    let breadth = scope.unwrap_or_else(|| "note".into());
 
     let (grounding, resolved, conversation_id, tool_scope, workspace) = {
         let conn = state.db.lock();
@@ -422,20 +439,236 @@ pub async fn chat_send(
     }
 }
 
+/// Result of one streamed workspace turn against the cloud endpoint.
+struct CloudTurn {
+    /// A non-2xx preflight response `(status, reason, error)` — the turn never
+    /// streamed (blocked or malformed). None once the SSE stream opened.
+    preflight: Option<(u16, String, String)>,
+    /// The server's conversation record id, learned from the streamed events —
+    /// persisted as the local conversation's `remote_id` so later turns resume.
+    server_conversation_id: Option<String>,
+}
+
+/// Workspace (Teams) chat turn (issue #50): delegate to the deployed humla-cloud
+/// `POST /api/chat`, stream the SSE response, and re-emit it on the SAME `chat_*`
+/// events the local loop uses (story 18). The conversation is server-
+/// authoritative — its messages live in the cloud (read-through via
+/// `chat_history`); locally we keep only a handle row whose `remote_id` maps to
+/// the server conversation. `"workspace"` always resolves to the *active*
+/// workspace, so a turn can never reach a different tenant (story 5/19).
+async fn chat_send_cloud(
+    app: AppHandle,
+    note_id: String,
+    message: String,
+    breadth: String,
+) -> Result<ChatSendResult, String> {
+    let state: State<AppState> = app.state();
+    let (workspace, folder_id, title, conversation) = {
+        let conn = state.db.lock();
+        let workspace = super::cloud::active_workspace(&conn);
+        if workspace.is_empty() {
+            return Err("No workspace selected — switch to a workspace to use Team chat.".into());
+        }
+        let note = db::get_note(&conn, &note_id).map_err(|e| e.to_string())?;
+        let conversation =
+            db::get_or_create_conversation(&conn, &workspace, CHAT_SCOPE_NOTE, &note_id)
+                .map_err(|e| e.to_string())?;
+        (workspace, note.folder_id.clone(), note.title.clone(), conversation)
+    };
+
+    let body = chat::cloud::build_cloud_request(
+        conversation.remote_id.as_deref(),
+        &workspace,
+        &message,
+        Some(&title),
+        &breadth,
+        &note_id,
+        folder_id.as_deref(),
+    );
+
+    // Stream the turn, retrying once after a 401 (a stale cached token → forget
+    // it and re-authenticate from stored credentials, mirroring cloud.rs).
+    let mut attempt = 0u8;
+    let outcome = loop {
+        let (base, token) = super::cloud::cloud_session(&state).await?;
+        let turn = stream_cloud_turn(&app, &base, &token, &body, &conversation.id).await;
+        match turn {
+            Ok(t) => {
+                if matches!(&t.preflight, Some((401, _, _))) && attempt == 0 {
+                    super::cloud::forget_session();
+                    attempt += 1;
+                    continue;
+                }
+                break t;
+            }
+            Err(e) => {
+                let _ = app.emit(
+                    "chat_error",
+                    ChatErrorPayload { conversation_id: conversation.id.clone(), message: e.clone() },
+                );
+                return Err(e);
+            }
+        }
+    };
+
+    if let Some((_, reason, server_msg)) = outcome.preflight {
+        let text = chat::cloud::cloud_chat_error_message(&reason, &server_msg);
+        let _ = app.emit(
+            "chat_error",
+            ChatErrorPayload { conversation_id: conversation.id.clone(), message: text.clone() },
+        );
+        return Err(text);
+    }
+
+    // Remember the server conversation id for resume + read-through history.
+    if let Some(server_id) = outcome.server_conversation_id {
+        if conversation.remote_id.as_deref() != Some(server_id.as_str()) {
+            let conn = state.db.lock();
+            let _ = db::set_conversation_remote_id(&conn, &conversation.id, &server_id);
+        }
+    }
+
+    // Truncation is a server concern for workspace turns; the client just relays.
+    Ok(ChatSendResult { conversation_id: conversation.id, truncated: false })
+}
+
+/// POST the turn and pump the SSE response, re-emitting each event on the
+/// matching `chat_*` Tauri event. Server event payloads already carry the
+/// frontend-shaped camelCase fields; we only re-stamp `conversationId` to the
+/// LOCAL conversation id (so the UI keys turns the same across tenants) and
+/// capture the server's id to persist. A non-2xx response is returned as a
+/// structured preflight error instead of a stream.
+async fn stream_cloud_turn(
+    app: &AppHandle,
+    base: &str,
+    token: &str,
+    body: &serde_json::Value,
+    local_conversation_id: &str,
+) -> Result<CloudTurn, String> {
+    use futures_util::StreamExt;
+    let resp = reqwest::Client::new()
+        .post(format!("{}/api/chat", base.trim_end_matches('/')))
+        .bearer_auth(token)
+        .json(body)
+        .send()
+        .await
+        .map_err(|e| format!("Couldn't reach Team chat: {e}"))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let val: serde_json::Value = resp.json().await.unwrap_or_default();
+        let reason = val.get("reason").and_then(|r| r.as_str()).unwrap_or_default().to_string();
+        let server_msg = val.get("error").and_then(|m| m.as_str()).unwrap_or_default().to_string();
+        return Ok(CloudTurn {
+            preflight: Some((status.as_u16(), reason, server_msg)),
+            server_conversation_id: None,
+        });
+    }
+
+    // Degraded fallback (AC2): if a 2xx response isn't an SSE stream, treat it as
+    // a non-streamed whole-turn — emit the answer as one chunk + done, so the UI
+    // completes rather than hanging on a stream that never frames.
+    let is_sse = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|ct| ct.contains("text/event-stream"))
+        .unwrap_or(false);
+    if !is_sse {
+        let body = resp.text().await.unwrap_or_default();
+        let answer = chat::cloud::whole_turn_answer(&body);
+        let message_id = uuid::Uuid::new_v4().to_string();
+        let _ = app.emit(
+            "chat_text_delta",
+            serde_json::json!({
+                "conversationId": local_conversation_id,
+                "messageId": message_id,
+                "blockId": uuid::Uuid::new_v4().to_string(),
+                "delta": answer,
+            }),
+        );
+        let _ = app.emit(
+            "chat_done",
+            serde_json::json!({ "conversationId": local_conversation_id, "messageId": message_id }),
+        );
+        return Ok(CloudTurn { preflight: None, server_conversation_id: None });
+    }
+
+    // Buffer raw bytes and frame on the byte terminator, decoding only COMPLETE
+    // frames — so a multibyte codepoint split across two network chunks (e.g. a
+    // Norwegian å in a streamed delta) is never mangled by a mid-character decode.
+    let mut byte_stream = resp.bytes_stream();
+    let mut buf: Vec<u8> = Vec::new();
+    let mut server_conversation_id: Option<String> = None;
+    while let Some(chunk) = byte_stream.next().await {
+        let bytes = chunk.map_err(|e| format!("Team chat stream error: {e}"))?;
+        buf.extend_from_slice(&bytes);
+        while let Some((idx, delim)) = chat::cloud::find_event_end(&buf) {
+            let frame: Vec<u8> = buf.drain(..idx + delim).collect();
+            let text = String::from_utf8_lossy(&frame[..idx]);
+            let Some((event, data)) = chat::cloud::parse_sse_frame(&text) else { continue };
+            let Ok(mut payload) = serde_json::from_str::<serde_json::Value>(&data) else { continue };
+            if server_conversation_id.is_none() {
+                if let Some(sid) = payload.get("conversationId").and_then(|c| c.as_str()) {
+                    if !sid.is_empty() {
+                        server_conversation_id = Some(sid.to_string());
+                    }
+                }
+            }
+            if let Some(obj) = payload.as_object_mut() {
+                obj.insert("conversationId".into(), serde_json::json!(local_conversation_id));
+            }
+            if let Some(tauri_event) = chat::cloud::tauri_event_for(&event) {
+                let _ = app.emit(tauri_event, payload);
+            }
+        }
+    }
+    Ok(CloudTurn { preflight: None, server_conversation_id })
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChatMessageDto {
     id: String,
     role: String,
     seq: i64,
-    parts: Vec<chat::Part>,
+    /// Raw opencode-v2 parts JSON. Passed through verbatim: the local path
+    /// serialises its `Vec<chat::Part>` into this value; the workspace read-
+    /// through passes PocketBase's stored parts straight through (already the
+    /// frontend-shaped camelCase), so tool/citation parts render either way.
+    parts: serde_json::Value,
     created_at: i64,
 }
 
 /// Reload a Note's conversation (empty if none exists yet). Drives history
-/// restore when the Chat tab opens or after an app restart.
+/// restore when the Chat tab opens or after an app restart. For a workspace
+/// tenant (issue #50) this is a read-through of the server-authoritative
+/// conversation — messages live in the cloud, not the local `messages` table.
 #[tauri::command]
-pub fn chat_history(state: State<AppState>, note_id: String) -> Result<Vec<ChatMessageDto>, String> {
+pub async fn chat_history(
+    app: AppHandle,
+    note_id: String,
+    tenant: Option<String>,
+) -> Result<Vec<ChatMessageDto>, String> {
+    let state: State<AppState> = app.state();
+    if is_workspace_tenant(&tenant) {
+        // Resolve the workspace conversation's server id, then read its messages
+        // through PocketBase (the source of truth for shared conversations).
+        let remote_id = {
+            let conn = state.db.lock();
+            let workspace = super::cloud::active_workspace(&conn);
+            if workspace.is_empty() {
+                return Ok(Vec::new());
+            }
+            db::get_conversation(&conn, &workspace, CHAT_SCOPE_NOTE, &note_id)
+                .map_err(|e| e.to_string())?
+                .and_then(|c| c.remote_id)
+        };
+        let Some(remote_id) = remote_id else { return Ok(Vec::new()) };
+        let records = super::cloud::fetch_chat_messages(&state, &remote_id).await?;
+        return Ok(records.iter().filter_map(map_remote_message).collect());
+    }
+
     let conn = state.db.lock();
     let Some(conversation) =
         db::get_conversation(&conn, CHAT_TENANT_PERSONAL, CHAT_SCOPE_NOTE, &note_id)
@@ -450,10 +683,27 @@ pub fn chat_history(state: State<AppState>, note_id: String) -> Result<Vec<ChatM
             id: m.id,
             role: m.role,
             seq: m.seq,
-            parts: chat::parse_parts(&m.content),
+            parts: serde_json::to_value(chat::parse_parts(&m.content)).unwrap_or_default(),
             created_at: m.created_at,
         })
         .collect())
+}
+
+/// Map one PocketBase `chat_messages` record (read-through) to the UI DTO. Its
+/// `parts` are already the frontend-shaped opencode-v2 JSON, so they pass
+/// through untouched; `created` (RFC3339 autodate) becomes epoch-ms.
+fn map_remote_message(rec: &serde_json::Value) -> Option<ChatMessageDto> {
+    let id = rec.get("id")?.as_str()?.to_string();
+    let role = rec.get("role").and_then(|r| r.as_str()).unwrap_or("assistant").to_string();
+    let seq = rec.get("seq").and_then(|s| s.as_i64()).unwrap_or(0);
+    let parts = rec.get("parts").cloned().unwrap_or_else(|| serde_json::json!([]));
+    let created_at = rec
+        .get("created")
+        .and_then(|c| c.as_str())
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|d| d.timestamp_millis())
+        .unwrap_or(0);
+    Some(ChatMessageDto { id, role, seq, parts, created_at })
 }
 
 #[cfg(test)]
@@ -480,5 +730,84 @@ mod tests {
         assert!(res.is_err());
         let err = res.err().unwrap().to_string();
         assert!(err.contains("embedding model"), "clear guidance, not a raw 400: {err}");
+    }
+
+    /// Cross-repo round-trip of a real workspace `chat_send` against a live
+    /// humla-cloud stack (issue #50, AC6), matching the env-gated shape of the
+    /// cloud-sync roundtrips: skipped unless the HUMLA_TEST_* vars point at a
+    /// booted server (PocketBase + chat-service + an LLM key). It authenticates,
+    /// POSTs `/api/chat`, and pumps the SSE stream through the SAME pure helpers
+    /// `stream_cloud_turn` uses — asserting the turn reaches a terminal `done`
+    /// and carries a conversation id. Plain `cargo test` (no env) skips it.
+    #[tokio::test]
+    async fn cloud_chat_roundtrip() {
+        use futures_util::StreamExt;
+        let (Ok(pb), Ok(chat), Ok(email), Ok(pass), Ok(ws)) = (
+            std::env::var("HUMLA_TEST_PB_URL"),
+            std::env::var("HUMLA_TEST_CHAT_URL"),
+            std::env::var("HUMLA_TEST_EMAIL"),
+            std::env::var("HUMLA_TEST_PASSWORD"),
+            std::env::var("HUMLA_TEST_WORKSPACE"),
+        ) else {
+            eprintln!("cloud_chat_roundtrip: skipped (set HUMLA_TEST_PB_URL/CHAT_URL/EMAIL/PASSWORD/WORKSPACE)");
+            return;
+        };
+        let client = reqwest::Client::new();
+
+        // 1. Authenticate against PocketBase for a real user token.
+        let auth: serde_json::Value = client
+            .post(format!("{pb}/api/collections/users/auth-with-password"))
+            .json(&serde_json::json!({ "identity": email, "password": pass }))
+            .send()
+            .await
+            .expect("auth send")
+            .json()
+            .await
+            .expect("auth json");
+        let token = auth.get("token").and_then(|t| t.as_str()).expect("token");
+
+        // 2. POST a workspace turn, built by the same request assembler the app uses.
+        let body = chat::cloud::build_cloud_request(
+            None,
+            &ws,
+            "In one sentence, what is this workspace about?",
+            Some("roundtrip test"),
+            "all",
+            "roundtrip-anchor",
+            None,
+        );
+        let resp = client
+            .post(format!("{}/api/chat", chat.trim_end_matches('/')))
+            .bearer_auth(token)
+            .json(&body)
+            .send()
+            .await
+            .expect("chat send");
+        assert!(resp.status().is_success(), "chat endpoint returned {}", resp.status());
+
+        // 3. Pump the SSE stream with the production helpers; assert we reach `done`.
+        let mut stream = resp.bytes_stream();
+        let mut buf: Vec<u8> = Vec::new();
+        let mut conversation_id: Option<String> = None;
+        let mut saw_done = false;
+        while let Some(chunk) = stream.next().await {
+            buf.extend_from_slice(&chunk.expect("chunk"));
+            while let Some((idx, delim)) = chat::cloud::find_event_end(&buf) {
+                let frame: Vec<u8> = buf.drain(..idx + delim).collect();
+                let text = String::from_utf8_lossy(&frame[..idx]);
+                let Some((event, data)) = chat::cloud::parse_sse_frame(&text) else { continue };
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
+                    if let Some(id) = v.get("conversationId").and_then(|c| c.as_str()) {
+                        conversation_id.get_or_insert_with(|| id.to_string());
+                    }
+                }
+                if event == "done" {
+                    saw_done = true;
+                }
+                assert_ne!(event, "error", "server streamed an error: {data}");
+            }
+        }
+        assert!(saw_done, "the turn never reached a terminal `done` event");
+        assert!(conversation_id.is_some(), "no conversation id was streamed");
     }
 }

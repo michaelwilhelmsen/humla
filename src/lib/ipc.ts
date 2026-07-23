@@ -389,10 +389,17 @@ export const ipc = {
   // resolved promise only carries the conversation id + a truncation flag.
   // `chatHistory` reloads a Note's persisted conversation after restart.
   // `scope` is the Scope-popover breadth ("note" | "folder" | "all"), a live
-  // filter on retrieval within the same conversation (issue #47).
-  chatSend: (noteId: string, message: string, scope: ChatScope = "note") =>
-    invoke<ChatSendResult>("chat_send", { noteId, message, scope }),
-  chatHistory: (noteId: string) => invoke<ChatMessageDto[]>("chat_history", { noteId }),
+  // filter on retrieval within the same conversation (issue #47). `tenant`
+  // (issue #50) selects Personal (on-device) vs the active Workspace (Teams,
+  // delegated to the cloud endpoint); switching it is a different conversation.
+  chatSend: (
+    noteId: string,
+    message: string,
+    scope: ChatScope = "note",
+    tenant: ChatTenant = "personal",
+  ) => invoke<ChatSendResult>("chat_send", { noteId, message, scope, tenant }),
+  chatHistory: (noteId: string, tenant: ChatTenant = "personal") =>
+    invoke<ChatMessageDto[]>("chat_history", { noteId, tenant }),
   // Rebuild a Note's retrieval index — called on Note-view unmount so edits
   // that didn't trigger summarize/diarize still land in search.
   chatReindexNote: (noteId: string) => invoke<void>("chat_reindex_note", { noteId }),
@@ -439,6 +446,10 @@ export type ChatMessageDto = {
 export type ChatSendResult = { conversationId: string; truncated: boolean };
 // Retrieval breadth chosen in the Scope popover (issue #47).
 export type ChatScope = "note" | "folder" | "all";
+// Chat tenant chosen in the Scope popover (issue #50). "personal" runs on-device
+// and is never gated; "workspace" delegates to the cloud endpoint for the
+// currently-selected workspace (the only workspace it can ever reach).
+export type ChatTenant = "personal" | "workspace";
 
 // Streaming events (the #46 wire contract + #47 tool/citation events).
 export type ChatTextDeltaEvent = {
