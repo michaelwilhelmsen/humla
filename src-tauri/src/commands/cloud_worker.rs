@@ -205,6 +205,16 @@ impl SyncObserver for CloudObserver {
             h.enqueue_folder_delete(id);
         }
     }
+    fn client_upserted(&self, id: &str) {
+        if let Some(h) = self.mgr.handle() {
+            h.enqueue_client_upsert(id);
+        }
+    }
+    fn client_deleted(&self, id: &str) {
+        if let Some(h) = self.mgr.handle() {
+            h.enqueue_client_delete(id);
+        }
+    }
     fn summary_prompt_upserted(&self, id: &str) {
         if let Some(h) = self.mgr.handle() {
             h.enqueue_prompt_upsert(id);

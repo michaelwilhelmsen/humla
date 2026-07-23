@@ -1,11 +1,11 @@
 //! Client CRUD commands (issue #43), plus the note→client assignment. Thin
 //! wrappers over `db::*`, surfaced via `commands::clients_*` / `notes_set_client`.
 //!
-//! Local-only in this slice: Clients themselves are NOT synced yet, so there
-//! are no `client_upserted`/`client_deleted` sync pings (those arrive with the
-//! Client cloud-sync slice #49). Note re-pushes on un-tag/assign DO fire —
-//! they mirror `notes_move`/`folders_delete`, since a note's `updated_at` is
-//! bumped and notes already sync.
+//! Clients sync workspace-scoped, mirroring folders (issue #49): create/rename
+//! ping `client_upserted`, delete pings `client_deleted` (a hard local delete →
+//! the observer must tombstone the remote record). Un-tag/assign also re-push
+//! the affected notes, since a note's `updated_at` is bumped and its
+//! `client_id` reference travels with it.
 
 use super::err;
 use crate::db;
@@ -25,9 +25,13 @@ pub fn clients_create(state: State<AppState>, name: String) -> Result<db::Client
     if trimmed.is_empty() {
         return Err("Client name cannot be empty".into());
     }
-    let conn = state.db.lock();
-    let workspace = super::cloud::active_workspace(&conn);
-    db::create_client(&conn, trimmed, &workspace).map_err(err)
+    let client = {
+        let conn = state.db.lock();
+        let workspace = super::cloud::active_workspace(&conn);
+        db::create_client(&conn, trimmed, &workspace).map_err(err)?
+    };
+    state.sync.client_upserted(&client.id);
+    Ok(client)
 }
 
 #[tauri::command]
@@ -36,8 +40,12 @@ pub fn clients_rename(state: State<AppState>, id: String, name: String) -> Resul
     if trimmed.is_empty() {
         return Err("Client name cannot be empty".into());
     }
-    let conn = state.db.lock();
-    db::rename_client(&conn, &id, trimmed).map_err(err)
+    {
+        let conn = state.db.lock();
+        db::rename_client(&conn, &id, trimmed).map_err(err)?;
+    }
+    state.sync.client_upserted(&id);
+    Ok(())
 }
 
 #[tauri::command]
@@ -46,8 +54,9 @@ pub fn clients_delete(state: State<AppState>, id: String) -> Result<(), String> 
         let conn = state.db.lock();
         db::delete_client(&conn, &id).map_err(err)?
     };
+    state.sync.client_deleted(&id);
     // delete_client un-tags this client's notes and bumps their updated_at;
-    // re-push each so the change propagates once notes sync.
+    // re-push each so the un-tag propagates once notes sync.
     for note_id in &untagged {
         state.sync.note_upserted(note_id);
     }

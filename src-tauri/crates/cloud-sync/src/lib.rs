@@ -7,8 +7,8 @@
 //! methods here, owns the worker lifecycle (start/restart on login + workspace
 //! switch), and passes a `notify` closure that emits the Tauri refresh event.
 //!
-//! Syncs three entities — notes, folders, summary_prompts — all keyed on
-//! `client_id` (the local SQLite UUID; PocketBase's own 15-char ids can't hold
+//! Syncs four entities — notes, folders, clients, summary_prompts — all keyed
+//! on `client_id` (the local SQLite UUID; PocketBase's own 15-char ids can't hold
 //! a UUID). `client_updated_at` is the last-write-wins key; PocketBase's
 //! `updated` autodate is the pull cursor; `deleted` is a tombstone.
 //!
@@ -78,6 +78,12 @@ impl CloudSync {
     pub fn enqueue_folder_delete(&self, id: &str) {
         let _ = self.tx.send(Op::Folder { id: id.to_string(), delete: true });
     }
+    pub fn enqueue_client_upsert(&self, id: &str) {
+        let _ = self.tx.send(Op::Client { id: id.to_string(), delete: false });
+    }
+    pub fn enqueue_client_delete(&self, id: &str) {
+        let _ = self.tx.send(Op::Client { id: id.to_string(), delete: true });
+    }
     pub fn enqueue_prompt_upsert(&self, id: &str) {
         let _ = self.tx.send(Op::Prompt { id: id.to_string(), delete: false });
     }
@@ -116,6 +122,7 @@ impl CloudSync {
 enum Op {
     Note { id: String, delete: bool },
     Folder { id: String, delete: bool },
+    Client { id: String, delete: bool },
     Prompt { id: String, delete: bool },
     NoteMove { id: String, from: String, to: String },
     Session { note_id: String, session_id: String, delete: bool },
@@ -254,6 +261,7 @@ impl Worker {
         match op {
             Op::Note { id, delete } => self.enqueue_simple("note", "notes", &id, delete),
             Op::Folder { id, delete } => self.enqueue_simple("folder", "folders", &id, delete),
+            Op::Client { id, delete } => self.enqueue_simple("client", "clients", &id, delete),
             Op::Prompt { id, delete } => self.enqueue_simple("prompt", "summary_prompts", &id, delete),
             Op::NoteMove { id, from, to } => {
                 // A move = tombstone in the old workspace + (re)create in the new
@@ -366,6 +374,8 @@ impl Worker {
                 ("note", "delete") => self.push_delete("notes", &entity_id, &workspace).await,
                 ("folder", "upsert") => self.push_folder(&entity_id, &workspace).await,
                 ("folder", "delete") => self.push_delete("folders", &entity_id, &workspace).await,
+                ("client", "upsert") => self.push_client(&entity_id, &workspace).await,
+                ("client", "delete") => self.push_delete("clients", &entity_id, &workspace).await,
                 ("prompt", "upsert") => self.push_prompt(&entity_id, &workspace).await,
                 ("prompt", "delete") => self.push_delete("summary_prompts", &entity_id, &workspace).await,
                 ("session", "upsert") => {
@@ -480,6 +490,11 @@ impl Worker {
             "language": note.language,
             "summary_preset": note.summary_preset,
             "folder_client_id": note.folder_id.unwrap_or_default(),
+            // Soft reference to the note's Client (issue #49). Named by the same
+            // `<entity>_client_id` rule as `folder_client_id`: it holds the
+            // referenced Client's `client_id`. (The note's OWN id is the plain
+            // `client_id` field above — hence the stutter.) Empty = untagged.
+            "client_client_id": note.client_id.unwrap_or_default(),
             "expected_speakers": note.expected_speakers.unwrap_or(0),
             "created_at": note.created_at,
             "client_updated_at": client_updated_at,
@@ -519,6 +534,21 @@ impl Worker {
             "deleted": false,
         });
         self.upsert_record("folders", uuid, workspace, &auth.token, body).await
+    }
+
+    async fn push_client(&self, uuid: &str, workspace: &str) -> Result<()> {
+        let Some(c) = self.snapshot_client(uuid)? else {
+            return Ok(());
+        };
+        let auth = self.ensure_auth().await?;
+        let body = json!({
+            "client_id": uuid,
+            "workspace": workspace,
+            "name": c.name,
+            "client_updated_at": c.updated_at,
+            "deleted": false,
+        });
+        self.upsert_record("clients", uuid, workspace, &auth.token, body).await
     }
 
     async fn push_prompt(&self, uuid: &str, workspace: &str) -> Result<()> {
@@ -731,6 +761,9 @@ impl Worker {
             .pull_collection("folders", "folders_cursor", &auth.token, |v| self.apply_remote_folder_json(v))
             .await?;
         changed |= self
+            .pull_collection("clients", "clients_cursor", &auth.token, |v| self.apply_remote_client_json(v))
+            .await?;
+        changed |= self
             .pull_collection("summary_prompts", "prompts_cursor", &auth.token, |v| {
                 self.apply_remote_prompt_json(v)
             })
@@ -844,6 +877,11 @@ impl Worker {
         self.apply_remote_folder(&f)
     }
 
+    fn apply_remote_client_json(&self, v: &serde_json::Value) -> Result<()> {
+        let c: RemoteClient = serde_json::from_value(v.clone())?;
+        self.apply_remote_client(&c)
+    }
+
     fn apply_remote_prompt_json(&self, v: &serde_json::Value) -> Result<()> {
         let p: RemotePrompt = serde_json::from_value(v.clone())?;
         self.apply_remote_prompt(&p)
@@ -913,10 +951,10 @@ impl Worker {
                         conn.execute(
                             "INSERT INTO notes
                                 (id, title, body, transcript, summary, audio_path, summary_preset,
-                                 folder_id, language, summary_provider, expected_speakers, owner,
+                                 folder_id, client_id, language, summary_provider, expected_speakers, owner,
                                  workspace_id, created_at, updated_at)
                              SELECT ?1, title || ' (conflict copy)', body, transcript, summary,
-                                 audio_path, summary_preset, folder_id, language, summary_provider,
+                                 audio_path, summary_preset, folder_id, client_id, language, summary_provider,
                                  expected_speakers, '', '', created_at, ?2
                              FROM notes WHERE id = ?3",
                             rusqlite::params![copy_id, now_ms(), n.client_id],
@@ -941,16 +979,24 @@ impl Worker {
         } else {
             Some(n.folder_client_id.as_str())
         };
+        // The note's Client tag (issue #49). `client_client_id` holds the
+        // referenced Client's client_id (see the push body); empty = untagged →
+        // SQL NULL, same shape as `folder`.
+        let client = if n.client_client_id.is_empty() {
+            None
+        } else {
+            Some(n.client_client_id.as_str())
+        };
         let speakers = if n.expected_speakers > 0 { Some(n.expected_speakers) } else { None };
         conn.execute(
             "INSERT INTO notes
                 (id, title, body, transcript, summary, audio_path, summary_preset,
-                 folder_id, language, summary_provider, expected_speakers, owner, workspace_id, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, '', ?9, ?12, ?13, ?10, ?11)
+                 folder_id, client_id, language, summary_provider, expected_speakers, owner, workspace_id, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?14, ?8, '', ?9, ?12, ?13, ?10, ?11)
              ON CONFLICT(id) DO UPDATE SET
                 title=excluded.title, body=excluded.body, transcript=excluded.transcript,
                 summary=excluded.summary, summary_preset=excluded.summary_preset,
-                folder_id=excluded.folder_id, language=excluded.language,
+                folder_id=excluded.folder_id, client_id=excluded.client_id, language=excluded.language,
                 expected_speakers=excluded.expected_speakers, owner=excluded.owner,
                 updated_at=excluded.updated_at, deleted_at=NULL
              WHERE excluded.updated_at >= notes.updated_at",
@@ -968,6 +1014,7 @@ impl Worker {
                 n.client_updated_at,
                 n.owner,
                 self.config.workspace_id,
+                client,
             ],
         )?;
         drop(conn); // release before firing the callback
@@ -998,6 +1045,36 @@ impl Worker {
              ON CONFLICT(id) DO UPDATE SET name=excluded.name, updated_at=excluded.updated_at
              WHERE excluded.updated_at >= folders.updated_at",
             rusqlite::params![f.client_id, f.name, f.client_updated_at, self.config.workspace_id],
+        )?;
+        Ok(())
+    }
+
+    fn apply_remote_client(&self, c: &RemoteClient) -> Result<()> {
+        if !is_safe_id(&c.client_id) {
+            eprintln!("cloud-sync: skipping pulled client with unsafe client_id");
+            return Ok(());
+        }
+        let conn = self.db.lock();
+        if c.deleted {
+            // Hard local delete (clients has no local `deleted_at`), scoped to the
+            // pulled workspace, mirroring `apply_remote_folder`. A note that still
+            // references this client keeps a dangling `client_id`; the deleting
+            // device also re-pushes each un-tagged note, so the reference clears
+            // once those pulls land.
+            conn.execute(
+                "DELETE FROM clients WHERE id = ?1 AND workspace_id = ?2",
+                rusqlite::params![c.client_id, self.config.workspace_id],
+            )?;
+            return Ok(());
+        }
+        // clients has no separate client-created_at column synced; seed it from
+        // client_updated_at on first insert.
+        conn.execute(
+            "INSERT INTO clients (id, name, created_at, updated_at, workspace_id)
+             VALUES (?1, ?2, ?3, ?3, ?4)
+             ON CONFLICT(id) DO UPDATE SET name=excluded.name, updated_at=excluded.updated_at
+             WHERE excluded.updated_at >= clients.updated_at",
+            rusqlite::params![c.client_id, c.name, c.client_updated_at, self.config.workspace_id],
         )?;
         Ok(())
     }
@@ -1073,7 +1150,7 @@ impl Worker {
         let conn = self.db.lock();
         conn.query_row(
             "SELECT title, body, transcript, summary, language, summary_preset,
-                    folder_id, expected_speakers, created_at, updated_at, owner
+                    folder_id, expected_speakers, created_at, updated_at, owner, client_id
              FROM notes WHERE id = ?1",
             rusqlite::params![uuid],
             |r| {
@@ -1089,6 +1166,7 @@ impl Worker {
                     created_at: r.get(8)?,
                     updated_at: r.get(9)?,
                     owner: r.get(10)?,
+                    client_id: r.get(11)?,
                 })
             },
         )
@@ -1102,6 +1180,17 @@ impl Worker {
             "SELECT name, updated_at FROM folders WHERE id = ?1",
             rusqlite::params![uuid],
             |r| Ok(FolderRow { name: r.get(0)?, updated_at: r.get(1)? }),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    fn snapshot_client(&self, uuid: &str) -> Result<Option<ClientRow>> {
+        let conn = self.db.lock();
+        conn.query_row(
+            "SELECT name, updated_at FROM clients WHERE id = ?1",
+            rusqlite::params![uuid],
+            |r| Ok(ClientRow { name: r.get(0)?, updated_at: r.get(1)? }),
         )
         .optional()
         .map_err(Into::into)
@@ -1146,6 +1235,7 @@ struct NoteRow {
     language: String,
     summary_preset: String,
     folder_id: Option<String>,
+    client_id: Option<String>,
     expected_speakers: Option<i64>,
     created_at: i64,
     updated_at: i64,
@@ -1153,6 +1243,11 @@ struct NoteRow {
 }
 
 struct FolderRow {
+    name: String,
+    updated_at: i64,
+}
+
+struct ClientRow {
     name: String,
     updated_at: i64,
 }
@@ -1175,6 +1270,7 @@ struct RemoteNote {
     language: String,
     summary_preset: String,
     folder_client_id: String,
+    client_client_id: String,
     expected_speakers: i64,
     owner: String,
     created_at: i64,
@@ -1184,6 +1280,15 @@ struct RemoteNote {
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct RemoteFolder {
+    client_id: String,
+    deleted: bool,
+    name: String,
+    client_updated_at: i64,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct RemoteClient {
     client_id: String,
     deleted: bool,
     name: String,
@@ -1483,7 +1588,7 @@ async fn realtime_once(
                             .bearer_auth(token)
                             .json(&json!({
                                 "clientId": client_id,
-                                "subscriptions": ["notes", "folders", "summary_prompts"],
+                                "subscriptions": ["notes", "folders", "clients", "summary_prompts"],
                             }))
                             .send()
                             .await?;
@@ -1568,10 +1673,15 @@ mod it {
                 summary_preset TEXT NOT NULL DEFAULT 'meeting', folder_id TEXT,
                 language TEXT NOT NULL DEFAULT '', summary_provider TEXT NOT NULL DEFAULT '',
                 expected_speakers INTEGER, owner TEXT NOT NULL DEFAULT '',
-                workspace_id TEXT NOT NULL DEFAULT '', deleted_at INTEGER,
+                workspace_id TEXT NOT NULL DEFAULT '', deleted_at INTEGER, client_id TEXT,
                 created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
             );
             CREATE TABLE folders (
+                id TEXT PRIMARY KEY, name TEXT NOT NULL,
+                workspace_id TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE clients (
                 id TEXT PRIMARY KEY, name TEXT NOT NULL,
                 workspace_id TEXT NOT NULL DEFAULT '',
                 created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
@@ -1646,6 +1756,131 @@ mod it {
         assert_eq!(count, 1, "three enqueues collapse to one pending row");
         assert_eq!(op, "delete", "latest op wins");
         assert_eq!(ws, "wsX", "upsert captured the note's own workspace");
+    }
+
+    /// A client upsert enqueues one row keyed on the client id, capturing its
+    /// own workspace; a repeat coalesces. Mirrors the note/folder path (#49).
+    #[test]
+    fn client_enqueue_captures_workspace_and_coalesces() {
+        let db = test_db();
+        let w = worker(db.clone(), offline_config("wsC"));
+        {
+            let conn = db.lock();
+            conn.execute(
+                "INSERT INTO clients (id, name, workspace_id, created_at, updated_at) VALUES ('c1', 'Acme', 'wsC', 1, 1)",
+                [],
+            )
+            .unwrap();
+        }
+        w.enqueue(Op::Client { id: "c1".into(), delete: false }).unwrap();
+        w.enqueue(Op::Client { id: "c1".into(), delete: false }).unwrap();
+
+        let conn = db.lock();
+        let (count, op, ws): (i64, String, String) = conn
+            .query_row(
+                "SELECT COUNT(*), MAX(op), MAX(workspace) FROM sync_outbox WHERE entity='client' AND entity_id='c1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "repeat client enqueues collapse to one row");
+        assert_eq!(op, "upsert", "latest op wins");
+        assert_eq!(ws, "wsC", "upsert captured the client's own workspace");
+    }
+
+    /// apply_remote_client writes locally (no network): insert, LWW-guarded
+    /// rename, stale-pull rejection, tombstone delete, and unsafe-id skip (#49).
+    #[test]
+    fn apply_remote_client_upserts_tombstones_and_respects_lww() {
+        let db = test_db();
+        let w = worker(db.clone(), offline_config("wsC"));
+
+        w.apply_remote_client(&RemoteClient {
+            client_id: "c1".into(), deleted: false, name: "Acme".into(), client_updated_at: 10,
+        })
+        .unwrap();
+        assert_eq!(scalar(&db, "SELECT name FROM clients WHERE id = ?1", "c1").as_deref(), Some("Acme"));
+
+        // Newer rename wins.
+        w.apply_remote_client(&RemoteClient {
+            client_id: "c1".into(), deleted: false, name: "Acme Corp".into(), client_updated_at: 20,
+        })
+        .unwrap();
+        assert_eq!(scalar(&db, "SELECT name FROM clients WHERE id = ?1", "c1").as_deref(), Some("Acme Corp"));
+
+        // Stale update is ignored (last-write-wins guard).
+        w.apply_remote_client(&RemoteClient {
+            client_id: "c1".into(), deleted: false, name: "Stale".into(), client_updated_at: 5,
+        })
+        .unwrap();
+        assert_eq!(
+            scalar(&db, "SELECT name FROM clients WHERE id = ?1", "c1").as_deref(),
+            Some("Acme Corp"),
+            "a stale pull can't clobber a newer local row"
+        );
+
+        // Tombstone removes it.
+        w.apply_remote_client(&RemoteClient {
+            client_id: "c1".into(), deleted: true, name: String::new(), client_updated_at: 30,
+        })
+        .unwrap();
+        assert_eq!(scalar(&db, "SELECT name FROM clients WHERE id = ?1", "c1"), None);
+
+        // A non-UUID id from the server is rejected, never written.
+        w.apply_remote_client(&RemoteClient {
+            client_id: "../../etc".into(), deleted: false, name: "evil".into(), client_updated_at: 40,
+        })
+        .unwrap();
+        let count: i64 = {
+            let conn = db.lock();
+            conn.query_row("SELECT COUNT(*) FROM clients", [], |r| r.get(0)).unwrap()
+        };
+        assert_eq!(count, 0, "unsafe client_id is rejected");
+    }
+
+    /// A pulled note carries its Client reference into `notes.client_id`, and an
+    /// empty reference clears the tag — the same shape `folder_client_id` uses.
+    #[test]
+    fn note_carries_client_id_through_apply() {
+        let db = test_db();
+        let w = worker(db.clone(), offline_config("wsC"));
+
+        w.apply_remote_note(&RemoteNote {
+            client_id: "n1".into(),
+            title: "Kickoff".into(),
+            client_client_id: "c1".into(),
+            created_at: 5,
+            client_updated_at: 10,
+            owner: "u1".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            scalar(&db, "SELECT client_id FROM notes WHERE id = ?1", "n1").as_deref(),
+            Some("c1"),
+            "the Client tag arrives on the note"
+        );
+
+        // A newer version with no reference un-tags the note (NULL, not "").
+        w.apply_remote_note(&RemoteNote {
+            client_id: "n1".into(),
+            title: "Kickoff".into(),
+            client_client_id: String::new(),
+            created_at: 5,
+            client_updated_at: 20,
+            owner: "u1".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        let is_null: bool = {
+            let conn = db.lock();
+            conn.query_row("SELECT client_id IS NULL FROM notes WHERE id = 'n1'", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap()
+                == 1
+        };
+        assert!(is_null, "an empty reference clears the tag");
     }
 
     /// Session outbox entity_id packing round-trips, and a malformed value
@@ -2047,6 +2282,51 @@ mod it {
         w.write_state("folders_cursor", "").unwrap();
         w.pull_collection("folders", "folders_cursor", &auth.token, |v| w.apply_remote_folder_json(v)).await.expect("pull2");
         assert_eq!(scalar(&db, "SELECT name FROM folders WHERE id = ?1", &uuid), None);
+    }
+
+    /// Client create → rename → pull, a note's Client assignment surviving the
+    /// note roundtrip, then tombstone — the full #49 round-trip against a live PB.
+    #[tokio::test]
+    async fn client_roundtrip() {
+        let Some(config) = env_config() else {
+            eprintln!("client_roundtrip: skipped");
+            return;
+        };
+        let db = test_db();
+        let w = worker(db.clone(), config);
+        let ws = w.config.workspace_id.clone();
+        let uuid = format!("client-{}", now_ms());
+        { let conn = db.lock(); conn.execute("INSERT INTO clients (id, name, created_at, updated_at) VALUES (?1, 'Acme Inc', 10, 10)", rusqlite::params![uuid]).unwrap(); }
+        let auth = w.ensure_auth().await.expect("auth");
+        w.push_client(&uuid, &ws).await.expect("push_client");
+        assert!(w.find_remote_id("clients", &uuid, &ws, &auth.token).await.expect("find").is_some());
+
+        // Rename pushes an update; a fresh pull observes the new name.
+        { let conn = db.lock(); conn.execute("UPDATE clients SET name='Acme Corp', updated_at=20 WHERE id=?1", rusqlite::params![uuid]).unwrap(); }
+        w.push_client(&uuid, &ws).await.expect("push_client rename");
+        { let conn = db.lock(); conn.execute("DELETE FROM clients WHERE id = ?1", rusqlite::params![uuid]).unwrap(); }
+        w.write_state("clients_cursor", "").unwrap();
+        w.pull_collection("clients", "clients_cursor", &auth.token, |v| w.apply_remote_client_json(v)).await.expect("pull");
+        assert_eq!(scalar(&db, "SELECT name FROM clients WHERE id = ?1", &uuid).as_deref(), Some("Acme Corp"));
+
+        // A note's Client assignment travels as `client_client_id` and lands back
+        // on `notes.client_id` after a push → PB → pull roundtrip.
+        let note = format!("note-{}", now_ms());
+        { let conn = db.lock(); conn.execute("INSERT INTO notes (id, title, client_id, summary_preset, language, workspace_id, created_at, updated_at) VALUES (?1, 'Tagged', ?2, 'meeting', 'en', ?3, 10, 10)", rusqlite::params![note, uuid, ws]).unwrap(); }
+        w.push_note(&note, &ws).await.expect("push_note");
+        { let conn = db.lock(); conn.execute("DELETE FROM notes WHERE id = ?1", rusqlite::params![note]).unwrap(); }
+        w.write_state("notes_cursor", "").unwrap();
+        w.pull_collection("notes", "notes_cursor", &auth.token, |v| w.apply_remote_note_json(v)).await.expect("pull note");
+        assert_eq!(
+            scalar(&db, "SELECT client_id FROM notes WHERE id = ?1", &note).as_deref(),
+            Some(uuid.as_str()),
+            "the Client tag survives the note roundtrip"
+        );
+
+        w.push_delete("clients", &uuid, &ws).await.expect("delete");
+        w.write_state("clients_cursor", "").unwrap();
+        w.pull_collection("clients", "clients_cursor", &auth.token, |v| w.apply_remote_client_json(v)).await.expect("pull2");
+        assert_eq!(scalar(&db, "SELECT name FROM clients WHERE id = ?1", &uuid), None);
     }
 
     #[tokio::test]

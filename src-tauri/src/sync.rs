@@ -41,6 +41,14 @@ pub trait SyncObserver: Send + Sync {
     /// A folder was deleted. `id` is the now-removed folder id.
     fn folder_deleted(&self, _id: &str) {}
 
+    /// A client was created or renamed. `id` is the client id.
+    fn client_upserted(&self, _id: &str) {}
+
+    /// A client was deleted. `id` is the now-removed client id. Local deletes are
+    /// hard `DELETE`s, so an implementation must record a tombstone here or the
+    /// deletion will never propagate to other devices.
+    fn client_deleted(&self, _id: &str) {}
+
     /// A custom summary prompt was created or updated. `id` is the prompt id.
     fn summary_prompt_upserted(&self, _id: &str) {}
 
