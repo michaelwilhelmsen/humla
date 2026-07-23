@@ -74,16 +74,36 @@ pub fn parse_sse_frame(block: &str) -> Option<(String, String)> {
 /// Byte index + length of the first SSE event terminator (`\n\n` or `\r\n\r\n`)
 /// in `buf`, or None if no complete event has arrived yet. Picks whichever
 /// terminator appears first, so a proxy that rewrites line endings still frames
-/// correctly. The caller drains `idx + len` bytes and parses `buf[..idx]`.
-pub fn find_event_end(buf: &str) -> Option<(usize, usize)> {
-    let lf = buf.find("\n\n").map(|i| (i, 2));
-    let crlf = buf.find("\r\n\r\n").map(|i| (i, 4));
+/// correctly. Operates on BYTES (not `&str`) so the caller can buffer raw
+/// network chunks and decode only *complete* frames — a multibyte codepoint
+/// split across two chunks is never lossily decoded mid-character. The caller
+/// drains `idx + len` bytes and decodes `buf[..idx]`.
+pub fn find_event_end(buf: &[u8]) -> Option<(usize, usize)> {
+    let lf = buf.windows(2).position(|w| w == b"\n\n").map(|i| (i, 2));
+    let crlf = buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| (i, 4));
     match (lf, crlf) {
         (Some(a), Some(b)) => Some(if a.0 <= b.0 { a } else { b }),
         (Some(a), None) => Some(a),
         (None, Some(b)) => Some(b),
         (None, None) => None,
     }
+}
+
+/// Extract a human answer from a non-streamed whole-turn body (the AC2 degraded
+/// fallback, when a 2xx response isn't an SSE stream). Tries the obvious text
+/// fields, then falls back to the raw body so the UI shows *something* and
+/// completes rather than hanging on a stream that never frames.
+pub fn whole_turn_answer(body: &str) -> String {
+    if let Ok(v) = serde_json::from_str::<Value>(body) {
+        for key in ["answer", "message", "text", "content"] {
+            if let Some(s) = v.get(key).and_then(|x| x.as_str()) {
+                if !s.trim().is_empty() {
+                    return s.to_string();
+                }
+            }
+        }
+    }
+    body.trim().to_string()
 }
 
 /// Map a server SSE event name to the Tauri `chat_*` event the frontend already
@@ -187,11 +207,37 @@ mod tests {
 
     #[test]
     fn finds_the_first_event_terminator() {
-        assert_eq!(find_event_end("event: a\ndata: 1\n\nrest"), Some((16, 2)));
+        assert_eq!(find_event_end(b"event: a\ndata: 1\n\nrest"), Some((16, 2)));
         // CRLF framing.
-        assert_eq!(find_event_end("event: a\r\ndata: 1\r\n\r\nrest"), Some((17, 4)));
+        assert_eq!(find_event_end(b"event: a\r\ndata: 1\r\n\r\nrest"), Some((17, 4)));
         // Incomplete — no blank line yet.
-        assert_eq!(find_event_end("event: a\ndata: 1\n"), None);
+        assert_eq!(find_event_end(b"event: a\ndata: 1\n"), None);
+    }
+
+    #[test]
+    fn only_complete_frames_are_decoded_so_split_utf8_survives() {
+        // A Norwegian "å" (0xC3 0xA5) split across two network chunks. Framing on
+        // bytes means we only decode once the whole frame (and codepoint) arrived.
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice("event: text_delta\ndata: {\"delta\":\"m\u{00e5}".as_bytes());
+        let split = buf.len() - 1; // land mid-codepoint
+        let (head, tail) = buf.split_at(split);
+        assert!(find_event_end(head).is_none(), "no complete frame yet");
+        let mut acc = head.to_vec();
+        acc.extend_from_slice(tail);
+        acc.extend_from_slice("te\"}\n\n".as_bytes());
+        let (idx, delim) = find_event_end(&acc).expect("frame complete");
+        let text = String::from_utf8_lossy(&acc[..idx]);
+        let (_, data) = parse_sse_frame(&text).unwrap();
+        assert!(data.contains("m\u{00e5}te"), "å survived the chunk split: {data}");
+        assert_eq!(delim, 2);
+    }
+
+    #[test]
+    fn whole_turn_answer_prefers_a_text_field_then_falls_back_to_raw() {
+        assert_eq!(whole_turn_answer(r#"{"answer":"hi there"}"#), "hi there");
+        assert_eq!(whole_turn_answer(r#"{"message":"yo"}"#), "yo");
+        assert_eq!(whole_turn_answer("plain text body"), "plain text body");
     }
 
     #[test]

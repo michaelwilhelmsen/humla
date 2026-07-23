@@ -565,16 +565,48 @@ async fn stream_cloud_turn(
         });
     }
 
+    // Degraded fallback (AC2): if a 2xx response isn't an SSE stream, treat it as
+    // a non-streamed whole-turn — emit the answer as one chunk + done, so the UI
+    // completes rather than hanging on a stream that never frames.
+    let is_sse = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|ct| ct.contains("text/event-stream"))
+        .unwrap_or(false);
+    if !is_sse {
+        let body = resp.text().await.unwrap_or_default();
+        let answer = chat::cloud::whole_turn_answer(&body);
+        let message_id = uuid::Uuid::new_v4().to_string();
+        let _ = app.emit(
+            "chat_text_delta",
+            serde_json::json!({
+                "conversationId": local_conversation_id,
+                "messageId": message_id,
+                "blockId": uuid::Uuid::new_v4().to_string(),
+                "delta": answer,
+            }),
+        );
+        let _ = app.emit(
+            "chat_done",
+            serde_json::json!({ "conversationId": local_conversation_id, "messageId": message_id }),
+        );
+        return Ok(CloudTurn { preflight: None, server_conversation_id: None });
+    }
+
+    // Buffer raw bytes and frame on the byte terminator, decoding only COMPLETE
+    // frames — so a multibyte codepoint split across two network chunks (e.g. a
+    // Norwegian å in a streamed delta) is never mangled by a mid-character decode.
     let mut byte_stream = resp.bytes_stream();
-    let mut buf = String::new();
+    let mut buf: Vec<u8> = Vec::new();
     let mut server_conversation_id: Option<String> = None;
     while let Some(chunk) = byte_stream.next().await {
         let bytes = chunk.map_err(|e| format!("Team chat stream error: {e}"))?;
-        buf.push_str(&String::from_utf8_lossy(&bytes));
+        buf.extend_from_slice(&bytes);
         while let Some((idx, delim)) = chat::cloud::find_event_end(&buf) {
-            let frame: String = buf.drain(..idx + delim).collect();
-            let block = &frame[..idx];
-            let Some((event, data)) = chat::cloud::parse_sse_frame(block) else { continue };
+            let frame: Vec<u8> = buf.drain(..idx + delim).collect();
+            let text = String::from_utf8_lossy(&frame[..idx]);
+            let Some((event, data)) = chat::cloud::parse_sse_frame(&text) else { continue };
             let Ok(mut payload) = serde_json::from_str::<serde_json::Value>(&data) else { continue };
             if server_conversation_id.is_none() {
                 if let Some(sid) = payload.get("conversationId").and_then(|c| c.as_str()) {
@@ -755,14 +787,15 @@ mod tests {
 
         // 3. Pump the SSE stream with the production helpers; assert we reach `done`.
         let mut stream = resp.bytes_stream();
-        let mut buf = String::new();
+        let mut buf: Vec<u8> = Vec::new();
         let mut conversation_id: Option<String> = None;
         let mut saw_done = false;
         while let Some(chunk) = stream.next().await {
-            buf.push_str(&String::from_utf8_lossy(&chunk.expect("chunk")));
+            buf.extend_from_slice(&chunk.expect("chunk"));
             while let Some((idx, delim)) = chat::cloud::find_event_end(&buf) {
-                let frame: String = buf.drain(..idx + delim).collect();
-                let Some((event, data)) = chat::cloud::parse_sse_frame(&frame[..idx]) else { continue };
+                let frame: Vec<u8> = buf.drain(..idx + delim).collect();
+                let text = String::from_utf8_lossy(&frame[..idx]);
+                let Some((event, data)) = chat::cloud::parse_sse_frame(&text) else { continue };
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
                     if let Some(id) = v.get("conversationId").and_then(|c| c.as_str()) {
                         conversation_id.get_or_insert_with(|| id.to_string());
