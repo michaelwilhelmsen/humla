@@ -3,7 +3,15 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { useNavigate } from "react-router-dom";
 import { open as openExternal } from "@tauri-apps/plugin-shell";
-import { AlertTriangle, FileText, Loader2, MessageCircle, Send, Settings2 } from "lucide-react";
+import {
+  AlertTriangle,
+  ChevronDown,
+  CornerDownLeft,
+  FileText,
+  Loader2,
+  MessageCircle,
+  Settings2,
+} from "lucide-react";
 import {
   ipc,
   onChatCitations,
@@ -67,6 +75,43 @@ function toolActivityLabel(name: string): string {
       return "Browsing your notes…";
     default:
       return "Working…";
+  }
+}
+
+// Past-tense, aggregated summary of the tools an assistant turn used (#63), for
+// a persistent one-line receipt above the answer (like Claude Desktop's tool
+// rows), e.g. "Searched your notes · Read 2 notes". Returns null when the turn
+// used no tools. History, not progress — the caller renders it un-animated,
+// unlike the live activity line.
+function summarizeToolUse(m: ChatMessageDto): string | null {
+  const counts = new Map<string, number>();
+  for (const p of m.parts) {
+    if (p.type === "tool") counts.set(p.name, (counts.get(p.name) ?? 0) + 1);
+  }
+  if (counts.size === 0) return null;
+  const seen = new Set<string>();
+  const segments: string[] = [];
+  for (const [name, n] of counts) {
+    const label = toolPastLabel(name, n);
+    // Collapse duplicate labels (e.g. two distinct unknown tools → one "Used a tool").
+    if (!seen.has(label)) {
+      seen.add(label);
+      segments.push(label);
+    }
+  }
+  return segments.join(" · ");
+}
+
+function toolPastLabel(name: string, count: number): string {
+  switch (name) {
+    case "search_notes":
+      return "Searched your notes";
+    case "get_note":
+      return count === 1 ? "Read a note" : `Read ${count} notes`;
+    case "list_notes":
+      return "Browsed your notes";
+    default:
+      return "Used a tool";
   }
 }
 
@@ -448,12 +493,18 @@ export function ChatPanel({
 
   return (
     <div className="flex-1 min-h-0 flex flex-col">
-      <ScopeBar
-        scope={scope}
-        onScope={selectBreadth}
-        folderName={folder?.name ?? null}
-        workspaceName={workspaceName}
-      />
+      {/* Workspace context signal (#63): nothing in Personal; one muted line in
+          a workspace. It sits OUTSIDE the scroll container as a fixed flex item,
+          so it stays visible as a privacy signal while messages scroll beneath
+          it. It must own its vertical space with a bottom hairline, or scrolled
+          bubbles butt straight up against the text with no separation. No
+          breadth/tenant chrome here — breadth moved to the composer, and the
+          tenant is pinned to the loaded workspace (#58). */}
+      {workspaceName && (
+        <div className="shrink-0 px-4 py-2 border-b border-[var(--color-line)] text-xs text-[var(--color-text-muted)]">
+          Chatting in {workspaceName} · visible to members
+        </div>
+      )}
 
       <div ref={scrollRef} className="flex-1 min-h-0 overflow-y-auto px-4 py-4 flex flex-col gap-3">
         {messages.length === 0 && !sending ? (
@@ -465,7 +516,13 @@ export function ChatPanel({
           </div>
         ) : (
           messages.map((m) => (
-            <Bubble key={m.id} role={m.role} text={partsText(m)} citations={messageCitations(m)} />
+            <Bubble
+              key={m.id}
+              role={m.role}
+              text={partsText(m)}
+              citations={messageCitations(m)}
+              toolSummary={summarizeToolUse(m)}
+            />
           ))
         )}
         {sending && streaming.length > 0 && (
@@ -473,12 +530,20 @@ export function ChatPanel({
         )}
         {activity && (
           <div className="self-start flex items-center gap-1.5 text-xs text-[var(--color-text-muted)] px-1">
-            <Loader2 size={12} strokeWidth={2} className="animate-spin" />
-            {activity}
+            <Loader2
+              size={12}
+              strokeWidth={2}
+              aria-hidden="true"
+              className="animate-spin motion-reduce:animate-none"
+            />
+            {/* Same soft pulse as "Thinking…"; static under prefers-reduced-motion. */}
+            <span className="animate-pulse motion-reduce:animate-none">{activity}</span>
           </div>
         )}
         {showTyping && (
-          <div className="self-start text-xs text-[var(--color-text-muted)] px-1">Thinking…</div>
+          <div className="self-start text-xs text-[var(--color-text-muted)] px-1">
+            <span className="animate-pulse motion-reduce:animate-none">Thinking…</span>
+          </div>
         )}
       </div>
 
@@ -495,50 +560,68 @@ export function ChatPanel({
         </div>
       )}
 
-      <div className="shrink-0 border-t border-[var(--color-line)] p-2.5 flex items-end gap-2">
-        <textarea
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={onKeyDown}
-          rows={1}
-          placeholder="Ask about your notes…"
-          disabled={sending}
-          className="flex-1 resize-none max-h-40 bg-transparent text-sm leading-relaxed px-2 py-1.5 outline-none placeholder:text-[var(--color-text-disabled)] disabled:opacity-60"
-        />
-        <button
-          type="button"
-          onClick={() => void send()}
-          disabled={sending || input.trim().length === 0}
-          title="Send"
-          aria-label="Send"
-          className={cn(
-            "nd-btn-icon shrink-0",
-            (sending || input.trim().length === 0) && "opacity-40 pointer-events-none",
-          )}
-        >
-          <Send size={16} strokeWidth={1.7} />
-        </button>
+      <div className="shrink-0 border-t border-[var(--color-line)] p-2.5 flex flex-col gap-1.5">
+        {/* Send button lives INSIDE the input (Claude-Desktop style): the input
+            spans the full composer width, and the button is absolutely pinned to
+            its right edge. The textarea is `block` so it has no inline-block
+            baseline gap — the relative wrapper's height then equals the visible
+            input's height, and `top-1/2 -translate-y-1/2` centres the button
+            against the true input height (no pixel nudging). The small icon-button
+            variant (28px) fits comfortably inside without touching the edges. */}
+        <div className="relative">
+          <textarea
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            onKeyDown={onKeyDown}
+            rows={1}
+            placeholder="Ask about your notes…"
+            disabled={sending}
+            className="block w-full resize-none max-h-40 bg-transparent text-sm leading-relaxed pl-2 pr-11 py-2 outline-none placeholder:text-[var(--color-text-disabled)] disabled:opacity-60"
+          />
+          <button
+            type="button"
+            onClick={() => void send()}
+            disabled={sending || input.trim().length === 0}
+            title="Send"
+            aria-label="Send"
+            className={cn(
+              "nd-btn-icon nd-btn-icon-sm absolute right-1.5 top-1/2 -translate-y-1/2",
+              (sending || input.trim().length === 0) && "opacity-40 pointer-events-none",
+            )}
+          >
+            <CornerDownLeft size={16} strokeWidth={1.7} />
+          </button>
+        </div>
+        {/* Composer control row (#63): breadth picker at bottom-left. Right side
+            is intentionally empty for now — justify-between reserves it for the
+            monthly turn-allowance display coming in a later issue, so adding it
+            won't need a layout restructure. */}
+        <div className="flex items-center justify-between px-1">
+          <BreadthPicker
+            scope={scope}
+            onScope={selectBreadth}
+            folderName={folder?.name ?? null}
+          />
+        </div>
       </div>
     </div>
   );
 }
 
-// Context indicator + breadth selector at the top of the chat. The chat is
-// pinned to the loaded context (issue #58): a non-interactive indicator shows
-// where chat goes (the active workspace name, or "Personal") — there is no
-// tenant picker, since the sidebar WorkspaceSwitcher is the source of truth.
-// "This folder" only appears when the note has a folder (nothing to widen to
-// otherwise).
-function ScopeBar({
+// Retrieval-breadth picker for the composer (#63). A quiet, sentence-case
+// labelled dropdown — not a chip, not bordered — that always shows the current
+// breadth on the trigger (fixing the old bug where the active value only
+// appeared inside the popover). Semantics unchanged (issue #58): per-
+// conversation, persisted via chat_set_breadth. "Folder: {name}" only appears
+// when the note has a folder (nothing to widen to otherwise).
+function BreadthPicker({
   scope,
   onScope,
   folderName,
-  workspaceName,
 }: {
   scope: ChatScope;
   onScope: (s: ChatScope) => void;
   folderName: string | null;
-  workspaceName: string | null;
 }) {
   const items: PopoverItem[] = [
     { id: "note", label: "This note" },
@@ -550,32 +633,18 @@ function ScopeBar({
   const label = items.find((i) => i.id === activeId)?.label ?? "This note";
 
   return (
-    <div className="shrink-0 flex items-center gap-2 px-4 py-2 border-b border-[var(--color-line)]">
-      <span
-        aria-label="Chat context"
-        title={
-          workspaceName
-            ? `Chatting in ${workspaceName} — follows the workspace loaded in the sidebar`
-            : "Chatting in Personal (on-device)"
-        }
-        className="nd-chip inline-flex items-center gap-1 text-xs"
-      >
-        {workspaceName ?? "Personal"}
-      </span>
-      <span className="text-xs text-[var(--color-text-disabled)]">·</span>
-      <span className="text-xs text-[var(--color-text-disabled)]">Search</span>
-      <SelectablePopover
-        ariaLabel="Chat scope"
-        items={items}
-        activeId={activeId}
-        onSelect={(id) => onScope((id as ChatScope) ?? "note")}
-        trigger={
-          <span className="nd-chip inline-flex items-center gap-1 text-xs cursor-pointer">
-            {label}
-          </span>
-        }
-      />
-    </div>
+    <SelectablePopover
+      ariaLabel="Chat scope"
+      items={items}
+      activeId={activeId}
+      onSelect={(id) => onScope((id as ChatScope) ?? "note")}
+      trigger={
+        <span className="inline-flex items-center gap-1 text-xs text-[var(--color-text-muted)] cursor-pointer hover:text-[var(--color-text)] transition-colors">
+          {label}
+          <ChevronDown size={12} strokeWidth={2} aria-hidden="true" className="shrink-0" />
+        </span>
+      }
+    />
   );
 }
 
@@ -583,32 +652,41 @@ function Bubble({
   role,
   text,
   citations,
+  toolSummary,
 }: {
   role: "user" | "assistant";
   text: string;
   citations: ChatCitation[];
+  // Persistent tool-use receipt for an assistant turn (#63), null when none.
+  toolSummary?: string | null;
 }) {
-  const isUser = role === "user";
-  return (
-    <div className={cn("flex flex-col", isUser ? "items-end" : "items-start")}>
-      <div
-        className={cn(
-          "max-w-[85%] rounded-[var(--radius-card)] px-3 py-2 text-sm leading-relaxed",
-          isUser
-            ? "bg-[var(--color-accent-soft)] text-[var(--color-accent-text)]"
-            : "bg-[var(--color-pill-hover)] text-[var(--color-text)]",
-        )}
-      >
-        {isUser ? (
+  // User turns keep a right-aligned bubble (now the quiet gray pair — authorship
+  // reads from alignment, #64). Assistant turns are plain full-width blocks on
+  // the canvas, Claude-Desktop style: no bubble, no background — just the answer,
+  // its tool-use receipt above, and citation chips below.
+  if (role === "user") {
+    return (
+      <div className="flex flex-col items-end">
+        <div className="max-w-[85%] rounded-[var(--radius-card)] px-3 py-2 text-sm leading-relaxed bg-[var(--color-pill-hover)] text-[var(--color-text)]">
           <span className="whitespace-pre-wrap">{text}</span>
-        ) : (
-          <div className="prose-summary">
-            <Markdown source={text} />
-          </div>
-        )}
+        </div>
       </div>
-      {!isUser && citations.length > 0 && (
-        <div className="mt-1.5 flex flex-wrap gap-1.5 max-w-[85%]">
+    );
+  }
+  return (
+    <div className="flex flex-col">
+      {toolSummary && (
+        // Reads like a paragraph of the answer: same body size (text-sm) and
+        // left edge as the answer block (no inset), with margin above and below
+        // so it isn't flush against neighbouring turns. Muted, since it's a
+        // secondary receipt of what the assistant did (#63).
+        <div className="my-1.5 text-sm text-[var(--color-text-muted)]">{toolSummary}</div>
+      )}
+      <div className="prose-summary text-sm leading-relaxed text-[var(--color-text)]">
+        <Markdown source={text} />
+      </div>
+      {citations.length > 0 && (
+        <div className="mt-1.5 flex flex-wrap gap-1.5">
           {citations.map((c) => (
             <CitationChip key={c.noteId} citation={c} />
           ))}
@@ -627,9 +705,11 @@ function CitationChip({ citation }: { citation: ChatCitation }) {
       type="button"
       onClick={() => navigate(`/note/${citation.noteId}`)}
       title={`Open “${title}” (${date})`}
-      className="nd-chip inline-flex items-center gap-1 text-xs cursor-pointer hover:text-[var(--color-text)]"
+      // Sentence-case, quiet chip built from existing tokens (no nd-chip, so no
+      // uppercase mono per design/REFACTOR.md typography rules, #63).
+      className="inline-flex items-center gap-1 rounded-[var(--radius)] border border-[var(--color-line-visible)] bg-[var(--color-surface)] px-2 py-1 text-xs text-[var(--color-text-muted)] cursor-pointer transition-colors hover:text-[var(--color-text)] hover:border-[var(--color-text-muted)]"
     >
-      <FileText size={11} strokeWidth={1.7} className="shrink-0" />
+      <FileText size={11} strokeWidth={1.7} aria-hidden="true" className="shrink-0" />
       <span className="truncate max-w-[16rem]">{title}</span>
     </button>
   );

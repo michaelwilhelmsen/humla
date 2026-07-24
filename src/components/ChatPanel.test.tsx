@@ -3,8 +3,17 @@ import { render, screen, fireEvent, waitFor, act } from "@testing-library/react"
 import { MemoryRouter } from "react-router-dom";
 import { ChatPanel, type ChatSessionControls } from "./ChatPanel";
 import { mockTauri } from "../test/tauri";
-import type { ChatMessageDto } from "../lib/ipc";
+import type { ChatMessageDto, Folder, Note } from "../lib/ipc";
 import { useCloudStore, DISCONNECTED } from "../lib/cloud";
+import { useNotesStore } from "../lib/store";
+
+// A minimal note carrying a folder, so the composer breadth picker's
+// "Folder: {name}" option appears (#63). Only the fields ChatPanel reads matter.
+function seedNoteWithFolder(noteId = "n1", folderName = "Roadmap") {
+  const note = { id: noteId, folder_id: "f1" } as unknown as Note;
+  const folder = { id: "f1", name: folderName } as unknown as Folder;
+  useNotesStore.setState({ notes: [note], folders: [folder] });
+}
 
 // Populate the cloud store as if signed into a workspace, so the Teams tenant
 // row appears (issue #50).
@@ -48,6 +57,21 @@ function assistantWithCitation(text: string): ChatMessageDto {
   };
 }
 
+// An assistant turn that ran one or more tools (#63), for the persistent
+// tool-use receipt above the answer.
+function assistantWithTools(text: string, tools: string[]): ChatMessageDto {
+  return {
+    id: "a3",
+    role: "assistant",
+    seq: 1,
+    parts: [
+      ...tools.map((name, i) => ({ type: "tool" as const, id: `t${i}`, name, result: "ok" })),
+      { type: "text" as const, id: "b1", text },
+    ],
+    createdAt: 3,
+  };
+}
+
 // `chat_history` returns { conversationId, messages } since #61; a non-empty
 // history implies a resolved session id.
 function history(messages: ChatMessageDto[] = []) {
@@ -84,6 +108,8 @@ beforeEach(() => {
   mockTauri();
   // Default: signed out, so Personal is the only tenant unless a test opts in.
   useCloudStore.setState({ status: DISCONNECTED });
+  // No note/folder seeded by default (breadth picker shows no folder option).
+  useNotesStore.setState({ notes: [], folders: [] });
 });
 
 describe("ChatPanel readiness", () => {
@@ -179,21 +205,25 @@ describe("ChatPanel context pinning (#58)", () => {
     expect(screen.queryByRole("button", { name: "Chat tenant" })).toBeNull();
   });
 
-  it("shows the workspace name as a non-interactive context indicator", async () => {
+  it("shows the workspace context line in a workspace (#63)", async () => {
     mockTauri({ provider_key_get: () => "sk-test", chat_history: () => history() });
     signIntoWorkspace("Acme Team");
     renderPanel();
-    // The indicator shows where chat goes; it is not a button (no popover).
-    const indicator = await screen.findByLabelText("Chat context");
-    expect(indicator).toHaveTextContent("Acme Team");
-    expect(indicator.tagName).not.toBe("BUTTON");
+    // A muted line above the thread, exact copy per the ticket.
+    const line = await screen.findByText("Chatting in Acme Team · visible to members");
+    expect(line).toBeInTheDocument();
+    // It owns its vertical space with a bottom hairline so scrolled message
+    // content passes beneath a proper boundary rather than colliding with it.
+    expect(line.className).toContain("border-b");
   });
 
-  it("shows Personal as the context indicator when signed out", async () => {
+  it("renders no context line in personal (signed out) (#63)", async () => {
     mockTauri({ provider_key_get: () => "sk-test", chat_history: () => history() });
     renderPanel();
-    const indicator = await screen.findByLabelText("Chat context");
-    expect(indicator).toHaveTextContent("Personal");
+    await screen.findByPlaceholderText(/Ask about your notes/);
+    // Personal context shows nothing — no indicator at all.
+    expect(screen.queryByText(/visible to members/)).toBeNull();
+    expect(screen.queryByText(/Chatting in/)).toBeNull();
   });
 });
 
@@ -378,5 +408,113 @@ describe("ChatPanel scope breadth (#58)", () => {
     fireEvent.click(await screen.findByText("All notes"));
     await waitFor(() => expect(setArgs?.breadth).toBe("all"));
     expect(setArgs?.noteId).toBe("n1");
+  });
+});
+
+describe("ChatPanel composer breadth + chrome (#63)", () => {
+  it("shows the current breadth on the composer trigger (not just inside the popover)", async () => {
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () => history(),
+      chat_get_breadth: () => "all",
+    });
+    renderPanel();
+    const trigger = await screen.findByRole("button", { name: "Chat scope" });
+    // The active breadth is always visible on the trigger itself.
+    await waitFor(() => expect(trigger).toHaveTextContent("All notes"));
+  });
+
+  it("offers 'Folder: {name}' only when the note has a folder", async () => {
+    seedNoteWithFolder("n1", "Roadmap");
+    mockTauri({ provider_key_get: () => "sk-test", chat_history: () => history() });
+    renderPanel();
+    fireEvent.click(await screen.findByRole("button", { name: "Chat scope" }));
+    expect(await screen.findByText("Folder: Roadmap")).toBeInTheDocument();
+  });
+
+  it("renders the citation chip without the uppercase-mono nd-chip class", async () => {
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () =>
+        history([userMsg("what happened?"), assistantWithCitation("Here's what I found.")]),
+    });
+    renderPanel();
+    const chip = await screen.findByRole("button", { name: /Kickoff notes/ });
+    expect(chip.className).not.toContain("nd-chip");
+  });
+
+  it("shows a persistent, aggregated tool-use line above a tool-using answer", async () => {
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () =>
+        history([
+          userMsg("what happened?"),
+          assistantWithTools("Here's the answer.", ["search_notes", "get_note", "get_note"]),
+        ]),
+    });
+    renderPanel();
+    await screen.findByText("Here's the answer.");
+    // Aggregated, past-tense, one line — search then a pluralised read count.
+    const line = screen.getByText("Searched your notes · Read 2 notes");
+    expect(line).toBeInTheDocument();
+    // Reads like body text: same size as the answer (text-sm, not text-xs) and
+    // flush-left with the answer block (no px inset), with paragraph margins.
+    expect(line.className).toContain("text-sm");
+    expect(line.className).not.toContain("text-xs");
+    expect(line.className).not.toContain("px-1");
+  });
+
+  it("shows no tool-use line for an answer that used no tools", async () => {
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () => history([userMsg("hi"), assistantMsg("Plain answer.")]),
+    });
+    renderPanel();
+    await screen.findByText("Plain answer.");
+    expect(
+      screen.queryByText(/Searched your notes|Read a note|Read \d+ notes|Browsed your notes|Used a tool/),
+    ).toBeNull();
+  });
+
+  it("drops the assistant bubble and puts user messages in the gray bubble", async () => {
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () => history([userMsg("my question"), assistantMsg("the answer")]),
+    });
+    renderPanel();
+    // User turn: right-aligned gray bubble (not the old amber accent pair).
+    const userBubble = (await screen.findByText("my question")).parentElement!;
+    expect(userBubble.className).toContain("bg-[var(--color-pill-hover)]");
+    expect(userBubble.className).not.toContain("accent-soft");
+    // Assistant turn: plain block, no bubble background / rounding.
+    const answerBlock = screen.getByText("the answer").parentElement!;
+    expect(answerBlock.className).toContain("prose-summary");
+    expect(answerBlock.className).not.toContain("rounded-[var(--radius-card)]");
+    expect(answerBlock.className).not.toContain("bg-[var(--color-pill-hover)]");
+  });
+
+  it("animates the thinking indicator with a reduced-motion guard", async () => {
+    let releaseSend: (() => void) | null = null;
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () => history(),
+      chat_send: () =>
+        new Promise((resolve) => {
+          releaseSend = () => resolve({ conversationId: "c1", truncated: false });
+        }),
+    });
+    renderPanel();
+    const input = await screen.findByPlaceholderText(/Ask about your notes/);
+    fireEvent.change(input, { target: { value: "hi" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    // While the send is in flight the thinking line shows, animated but gated
+    // behind prefers-reduced-motion. The activity line shares these classes.
+    const thinking = await screen.findByText("Thinking…");
+    expect(thinking.className).toContain("animate-pulse");
+    expect(thinking.className).toContain("motion-reduce:animate-none");
+    await act(async () => {
+      releaseSend?.();
+      await Promise.resolve();
+    });
   });
 });
