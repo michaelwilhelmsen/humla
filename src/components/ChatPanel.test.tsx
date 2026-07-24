@@ -624,3 +624,171 @@ describe("ChatPanel composer breadth + chrome (#63)", () => {
     });
   });
 });
+
+describe("ChatPanel turn allowance (#69)", () => {
+  it("shows the workspace turn allowance bottom-right of the composer", async () => {
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () => history(),
+      chat_usage: () => ({ used: 2, cap: 3, periodEnd: 0 }),
+    });
+    signIntoWorkspace("Acme Team");
+    renderPanel();
+    expect(await screen.findByText("2/3 turns")).toBeInTheDocument();
+  });
+
+  it("renders no allowance in personal context", async () => {
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () => history(),
+      // Even if the backend returned a reading, personal must never show it.
+      chat_usage: () => ({ used: 2, cap: 3, periodEnd: 0 }),
+    });
+    renderPanel();
+    await screen.findByPlaceholderText(/ask about your notes/i);
+    expect(screen.queryByText(/turns/)).toBeNull();
+  });
+
+  it("hides the allowance when the backend returns null (unmetered / unavailable)", async () => {
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () => history(),
+      chat_usage: () => null,
+    });
+    signIntoWorkspace("Acme Team");
+    renderPanel();
+    await screen.findByPlaceholderText(/ask about your notes/i);
+    expect(screen.queryByText(/turns/)).toBeNull();
+  });
+
+  it("refreshes the allowance after a completed send", async () => {
+    let sent = false;
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_send: () => {
+        sent = true;
+        return { conversationId: "c1", truncated: false };
+      },
+      chat_history: () => history(sent ? [userMsg("q"), assistantMsg("a")] : []),
+      // Allowance consumed by the completed turn: 2/3 before, 3/3 after.
+      chat_usage: () => ({ used: sent ? 3 : 2, cap: 3, periodEnd: 0 }),
+    });
+    signIntoWorkspace("Acme Team");
+    renderPanel();
+    expect(await screen.findByText("2/3 turns")).toBeInTheDocument();
+    const input = await screen.findByRole("textbox", { name: /ask about your notes/i });
+    fireEvent.change(input, { target: { value: "q" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    await waitFor(() => expect(screen.getByText("3/3 turns")).toBeInTheDocument());
+  });
+
+  it("clears the old workspace's meter on a workspace switch until the new fetch resolves", async () => {
+    let releaseB: (() => void) | null = null;
+    let phase: "A" | "B" = "A";
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () => history(),
+      chat_usage: () =>
+        phase === "A"
+          ? { used: 2, cap: 3, periodEnd: 0 }
+          : new Promise((resolve) => {
+              releaseB = () => resolve({ used: 1, cap: 9, periodEnd: 0 });
+            }),
+    });
+    signIntoWorkspace("Acme Team");
+    renderPanel();
+    expect(await screen.findByText("2/3 turns")).toBeInTheDocument();
+
+    // Switch to a different workspace whose usage fetch is still pending.
+    phase = "B";
+    act(() => {
+      const ws = { id: "ws2", name: "Beta Team", role: "owner" as const, plan_status: "active" as const };
+      useCloudStore.setState({
+        status: {
+          ...DISCONNECTED,
+          configured: true,
+          logged_in: true,
+          base_url: "https://sync.humla.team",
+          current_workspace: ws,
+          workspaces: [ws],
+        },
+      });
+    });
+    // The old workspace's numbers must not linger while B's fetch is pending.
+    await waitFor(() => expect(screen.queryByText("2/3 turns")).toBeNull());
+    expect(screen.queryByText(/turns/)).toBeNull();
+
+    // Once B resolves, its own numbers appear.
+    await act(async () => {
+      releaseB?.();
+      await Promise.resolve();
+    });
+    expect(await screen.findByText("1/9 turns")).toBeInTheDocument();
+  });
+
+  it("hides the meter when the usage fetch throws", async () => {
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () => history(),
+      chat_usage: () => {
+        throw new Error("usage boom");
+      },
+    });
+    signIntoWorkspace("Acme Team");
+    renderPanel();
+    await screen.findByPlaceholderText(/ask about your notes/i);
+    expect(screen.queryByText(/turns/)).toBeNull();
+  });
+
+  it("does not refetch the meter when a send fails", async () => {
+    let usageCalls = 0;
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () => history(),
+      chat_send: () => {
+        throw new Error("send failed");
+      },
+      chat_usage: () => {
+        usageCalls += 1;
+        return { used: 2, cap: 3, periodEnd: 0 };
+      },
+    });
+    signIntoWorkspace("Acme Team");
+    renderPanel();
+    expect(await screen.findByText("2/3 turns")).toBeInTheDocument();
+    const callsAfterMount = usageCalls;
+    const input = await screen.findByRole("textbox", { name: /ask about your notes/i });
+    fireEvent.change(input, { target: { value: "q" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    await screen.findByText(/send failed/);
+    // The failed send took the catch path — the meter is not refreshed.
+    expect(usageCalls).toBe(callsAfterMount);
+  });
+
+  it("colours the meter with the danger tone at the cap (#69)", async () => {
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () => history(),
+      chat_usage: () => ({ used: 3, cap: 3, periodEnd: 0 }),
+    });
+    signIntoWorkspace("Acme Team");
+    renderPanel();
+    const meter = await screen.findByText("3/3 turns");
+    expect(meter.className).toContain("text-[var(--color-status-danger)]");
+  });
+});
+
+describe("ChatPanel breadth icons (#69)", () => {
+  it("shows the active scope's icon on the breadth trigger", async () => {
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () => history(),
+      chat_get_breadth: () => "all",
+    });
+    renderPanel();
+    const trigger = await screen.findByRole("button", { name: "Chat scope" });
+    await waitFor(() => expect(trigger).toHaveTextContent("All notes"));
+    // "All notes" → the Files glyph (distinct from FileText / ChevronDown).
+    expect(trigger.querySelector(".lucide-files")).not.toBeNull();
+  });
+});

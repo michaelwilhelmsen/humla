@@ -418,6 +418,10 @@ export const ipc = {
     invoke<void>("chat_set_breadth", { noteId, conversationId, breadth }),
   chatGetBreadth: (noteId: string, conversationId: string | null = null) =>
     invoke<ChatScope>("chat_get_breadth", { noteId, conversationId }),
+  // Workspace turn allowance for the composer meter (issue #69). null in personal
+  // context, and on any unavailable/error/unmetered outcome — a meter never
+  // errors the pane, so the caller just hides the display when this is null.
+  chatUsage: () => invoke<ChatUsage | null>("chat_usage"),
   // Rebuild a Note's retrieval index — called on Note-view unmount so edits
   // that didn't trigger summarize/diarize still land in search.
   chatReindexNote: (noteId: string) => invoke<void>("chat_reindex_note", { noteId }),
@@ -477,6 +481,9 @@ export type ConversationMeta = {
 // Retrieval breadth chosen in the Scope popover (issue #47), persisted per
 // conversation on the backend (issue #58).
 export type ChatScope = "note" | "folder" | "all";
+// Workspace turn allowance for the composer meter (issue #69). Only ever present
+// for a metered workspace; personal/unmetered/unavailable resolve to null.
+export type ChatUsage = { used: number; cap: number; periodEnd: number };
 
 // Streaming events (the #46 wire contract + #47 tool/citation events).
 export type ChatTextDeltaEvent = {

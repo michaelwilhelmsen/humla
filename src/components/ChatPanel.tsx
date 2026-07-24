@@ -8,6 +8,8 @@ import {
   ChevronDown,
   CornerDownLeft,
   FileText,
+  Files,
+  Folder,
   Loader2,
   MessageCircle,
   Settings2,
@@ -21,12 +23,14 @@ import {
   type ChatCitation,
   type ChatMessageDto,
   type ChatScope,
+  type ChatUsage,
   type ConversationMeta,
 } from "../lib/ipc";
 import { useNotesStore } from "../lib/store";
 import { useCloudStore } from "../lib/cloud";
 import { useChatReadiness } from "./provider/useChatReadiness";
 import { SelectablePopover, type PopoverItem } from "./SelectablePopover";
+import { usageTone } from "../lib/chatSessions";
 import { RECOMMENDED_OLLAMA_MODEL } from "../lib/localModels";
 import { CommandSnippet } from "./CommandSnippet";
 import { cn } from "../lib/cn";
@@ -166,6 +170,9 @@ export function ChatPanel({
   // list replacement; normal sends (appended turns, streamed deltas) leave it
   // false so those stay announced (#64).
   const [bulkLoading, setBulkLoading] = useState(false);
+  // Workspace turn allowance for the composer meter (issue #69). null in personal
+  // context and on any unavailable/error/unmetered outcome → the display hides.
+  const [usage, setUsage] = useState<ChatUsage | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
   // The composer is auto-focused exactly once per mount, on the first transition
@@ -287,6 +294,27 @@ export function ChatPanel({
     s.status.logged_in ? s.status.current_workspace?.id ?? null : null,
   );
 
+  // Fetch the workspace turn allowance for the composer meter (issue #69). Only
+  // in a workspace — personal chat is unmetered, so we skip the round-trip and
+  // clear the display. Gen-guarded so a slow response can't land after a switch.
+  // The backend already collapses every unavailable/error/unmetered case to
+  // null, so we just mirror whatever it returns (null hides the display).
+  const refreshUsage = useCallback(
+    async (gen: number) => {
+      if (!workspaceId) {
+        setUsage(null);
+        return;
+      }
+      try {
+        const u = await ipc.chatUsage();
+        if (gen === switchGenRef.current) setUsage(u);
+      } catch {
+        if (gen === switchGenRef.current) setUsage(null);
+      }
+    },
+    [workspaceId],
+  );
+
   // Load persisted history + breadth on mount, note change, and workspace
   // switch, clearing transient state. Keying on the workspace id makes a context
   // switch reload the right conversation — this replaces the old per-tenant
@@ -301,6 +329,10 @@ export function ChatPanel({
     // Hide the history affordance until the fresh list is known (no flicker of
     // the previous note's conversations on switch, #62).
     setConversations([]);
+    // Clear the turn meter until the new context's fetch resolves (#69). Scoped
+    // to this effect, not resetTransient: usage is per-WORKSPACE, so clearing on
+    // every per-conversation "+"/history switch would flicker it needlessly.
+    setUsage(null);
     // Defer SR announcements until the initial message list has loaded (#64).
     setBulkLoading(true);
     // Both async loads gate on the gen as well as `cancelled`: an in-flight
@@ -334,11 +366,12 @@ export function ChatPanel({
         if (!cancelled && gen === switchGenRef.current) setScope("note");
       });
     void reloadConversationList(gen);
+    void refreshUsage(gen);
     return () => {
       cancelled = true;
       void ipc.chatReindexNote(noteId).catch(() => {});
     };
-  }, [noteId, workspaceId, reloadConversationList, resetTransient]);
+  }, [noteId, workspaceId, reloadConversationList, refreshUsage, resetTransient]);
 
   // Persist a breadth change to the conversation (issue #58): update the chip
   // optimistically, then write it through so the next turn reads the new value.
@@ -470,6 +503,8 @@ export function ChatPanel({
       // A first turn creates the conversation and bumps message counts — refresh
       // the list so the history popover + its visibility rule stay current (#62).
       void reloadConversationList(gen);
+      // A completed turn consumes allowance — refresh the composer meter (#69).
+      void refreshUsage(gen);
     } catch (e) {
       if (gen !== switchGenRef.current) return;
       setError((prev) => prev ?? String(e));
@@ -648,16 +683,32 @@ export function ChatPanel({
             <CornerDownLeft size={16} strokeWidth={1.7} />
           </button>
         </div>
-        {/* Composer control row (#63): breadth picker at bottom-left. Right side
-            is intentionally empty for now — justify-between reserves it for the
-            monthly turn-allowance display coming in a later issue, so adding it
-            won't need a layout restructure. */}
+        {/* Composer control row: breadth picker bottom-left, workspace turn
+            allowance bottom-right (#69). The meter shows only in a metered
+            workspace — `usage` is null in personal context and on any
+            unavailable/error/unmetered outcome, so nothing renders then. */}
         <div className="flex items-center justify-between px-1">
           <BreadthPicker
             scope={scope}
             onScope={selectBreadth}
             folderName={folder?.name ?? null}
           />
+          {usage && (
+            <span
+              className={cn(
+                "text-xs tabular-nums",
+                // Colour-only status by fraction consumed (#69) — AAA on the
+                // panel surface in both themes. Size/weight unchanged.
+                {
+                  default: "text-[var(--color-text-muted)]",
+                  warning: "text-[var(--color-status-warning)]",
+                  danger: "text-[var(--color-status-danger)]",
+                }[usageTone(usage.used, usage.cap)],
+              )}
+            >
+              {usage.used}/{usage.cap} turns
+            </span>
+          )}
         </div>
       </div>
     </div>
@@ -679,14 +730,24 @@ function BreadthPicker({
   onScope: (s: ChatScope) => void;
   folderName: string | null;
 }) {
+  // Per-scope icons so the options read at a glance (#69). Colour inherited.
   const items: PopoverItem[] = [
-    { id: "note", label: "This note" },
-    ...(folderName ? [{ id: "folder", label: `Folder: ${folderName}` }] : []),
-    { id: "all", label: "All notes" },
+    { id: "note", label: "This note", icon: <FileText size={14} strokeWidth={1.7} aria-hidden="true" /> },
+    ...(folderName
+      ? [
+          {
+            id: "folder",
+            label: `Folder: ${folderName}`,
+            icon: <Folder size={14} strokeWidth={1.7} aria-hidden="true" />,
+          },
+        ]
+      : []),
+    { id: "all", label: "All notes", icon: <Files size={14} strokeWidth={1.7} aria-hidden="true" /> },
   ];
   // If the folder disappears while "folder" is selected, fall back to "note".
   const activeId = scope === "folder" && !folderName ? "note" : scope;
-  const label = items.find((i) => i.id === activeId)?.label ?? "This note";
+  const active = items.find((i) => i.id === activeId);
+  const label = active?.label ?? "This note";
 
   return (
     <SelectablePopover
@@ -696,6 +757,7 @@ function BreadthPicker({
       onSelect={(id) => onScope((id as ChatScope) ?? "note")}
       trigger={
         <span className="inline-flex items-center gap-1 text-xs text-[var(--color-text-muted)] cursor-pointer hover:text-[var(--color-text)] transition-colors">
+          {active?.icon}
           {label}
           <ChevronDown size={12} strokeWidth={2} aria-hidden="true" className="shrink-0" />
         </span>

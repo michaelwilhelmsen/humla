@@ -10,6 +10,7 @@
 //! user-message mapping — so they're unit-testable. The streaming orchestration
 //! (reqwest + emit + remote-id persistence) lives in `commands::chat`.
 
+use serde::Serialize;
 use serde_json::{json, Value};
 
 /// Build the JSON body for `POST /api/chat`. `remote_conversation_id` is the
@@ -172,9 +173,60 @@ pub fn cloud_chat_error_message(reason: &str, server_message: &str) -> String {
     }
 }
 
+/// The workspace turn allowance shown in the composer (issue #69). Serialized
+/// camelCase for the frontend (`{ used, cap, periodEnd }`).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageDto {
+    pub used: i64,
+    pub cap: i64,
+    pub period_end: i64,
+}
+
+/// Map a 200 usage body to a display DTO, or None when there's nothing to show.
+/// The meter is best-effort — it must never surface an error — so anything that
+/// isn't a clean metered reading maps to None:
+///   - `{ unmetered: true }`            → None (no allowance to display)
+///   - error shapes `{ reason, … }`     → None (no used/cap fields)
+///   - missing `used_turns`/`cap_turns` → None
+///   - `{ unmetered:false, used_turns, cap_turns[, period_end] }` → Some
+pub fn parse_usage(body: &Value) -> Option<UsageDto> {
+    if body.get("unmetered").and_then(|v| v.as_bool()) == Some(true) {
+        return None;
+    }
+    let used = body.get("used_turns").and_then(|v| v.as_i64())?;
+    let cap = body.get("cap_turns").and_then(|v| v.as_i64())?;
+    let period_end = body.get("period_end").and_then(|v| v.as_i64()).unwrap_or(0);
+    Some(UsageDto { used, cap, period_end })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_usage_maps_metered_some_and_everything_else_none() {
+        // Metered → Some with the counts.
+        assert_eq!(
+            parse_usage(&json!({
+                "unmetered": false, "used_turns": 2, "cap_turns": 3, "period_end": 1893456000
+            })),
+            Some(UsageDto { used: 2, cap: 3, period_end: 1893456000 })
+        );
+        // period_end optional → defaults to 0, still metered.
+        assert_eq!(
+            parse_usage(&json!({ "unmetered": false, "used_turns": 0, "cap_turns": 5 })),
+            Some(UsageDto { used: 0, cap: 5, period_end: 0 })
+        );
+        // Unmetered → nothing to show.
+        assert_eq!(parse_usage(&json!({ "unmetered": true })), None);
+        // Error shapes carry no used/cap → None.
+        assert_eq!(parse_usage(&json!({ "reason": "not_a_member", "error": "x" })), None);
+        assert_eq!(parse_usage(&json!({ "reason": "subscription_lapsed" })), None);
+        // Partial / malformed → None.
+        assert_eq!(parse_usage(&json!({ "used_turns": 2 })), None);
+        assert_eq!(parse_usage(&json!({})), None);
+    }
 
     #[test]
     fn request_defaults_to_note_breadth_with_grounding_anchor() {

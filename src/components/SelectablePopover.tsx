@@ -18,6 +18,8 @@ export type PopoverItem = {
   label: string;
   /** Optional muted second line under the label (e.g. a relative date, #62). */
   description?: string;
+  /** Optional leading icon rendered before the label (e.g. a scope glyph, #69). */
+  icon?: ReactNode;
 };
 
 type Props = {
@@ -279,6 +281,11 @@ export function SelectablePopover({
                       aria-hidden
                       className={"shrink-0 " + (selected ? "text-[var(--color-accent-text)]" : "opacity-0")}
                     />
+                    {item.icon && (
+                      <span className="shrink-0 inline-flex" aria-hidden="true">
+                        {item.icon}
+                      </span>
+                    )}
                     <span className="flex min-w-0 flex-col">
                       <span className="truncate">{item.label}</span>
                       {item.description && (

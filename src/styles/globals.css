@@ -70,6 +70,12 @@
   --color-warning-text: #8a6a1a;      /* readable gold for warning-as-text (light) */
   --color-speaker-4: #c0463f;         /* speaker red (4th, cycling) */
 
+  /* Usage-meter status colours (#69) — AAA (>=7:1) on --color-surface, the
+     panel/composer background. Warm gold + red hues darkened for the light
+     canvas; distinct from --color-warning/-danger, which don't clear AAA. */
+  --color-status-warning: #69531a;    /* 7.29:1 on #fffef9 */
+  --color-status-danger: #9f2c25;     /* 7.27:1 on #fffef9 */
+
   --color-ink: var(--color-text);
   --color-ink-muted: var(--color-text-muted);
 
@@ -114,6 +120,11 @@
     --color-warning-text: #ddb255;
     --color-speaker-4: #e07a72;
 
+    /* Usage-meter status colours (#69) — AAA (>=7:1) on --color-surface #2a2418,
+       the panel/composer background. Warm hues lightened for the dark canvas. */
+    --color-status-warning: #d3ae4c;  /* 7.28:1 on #2a2418 */
+    --color-status-danger: #e8a09c;   /* 7.29:1 on #2a2418 */
+
     --color-ink: var(--color-text);
     --color-ink-muted: var(--color-text-muted);
 
@@ -125,6 +136,10 @@
 
 /* === DARK explicit === */
 :root[data-theme="dark"] {
+  /* Usage-meter status colours (#69) — AAA (>=7:1) on --color-surface #2a2418,
+     the panel/composer background. Warm hues lightened for the dark canvas. */
+  --color-status-warning: #d3ae4c;  /* 7.28:1 on #2a2418 */
+  --color-status-danger: #e8a09c;   /* 7.29:1 on #2a2418 */
   --color-canvas: #0e0c08;
   --color-sidebar-bg: #1d1912;
   --color-surface: #2a2418;
