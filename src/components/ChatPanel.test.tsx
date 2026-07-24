@@ -4,8 +4,36 @@ import { MemoryRouter } from "react-router-dom";
 import { ChatPanel, type ChatSessionControls } from "./ChatPanel";
 import { mockTauri } from "../test/tauri";
 import type { ChatMessageDto, Folder, Note } from "../lib/ipc";
-import { useCloudStore, DISCONNECTED } from "../lib/cloud";
+import { useCloudStore, DISCONNECTED, type CloudRole } from "../lib/cloud";
 import { useNotesStore } from "../lib/store";
+
+// Signed into a MANAGED (billing-enabled) workspace with the given role, so the
+// BYOK activation pane (#76) applies. The roster's owner is "Ada" for
+// member-facing "ask {owner}" copy.
+function signInBillingWorkspace(role: CloudRole = "owner") {
+  const ws = { id: "ws1", name: "Acme Team", role, plan_status: "active" as const };
+  useCloudStore.setState({
+    status: {
+      ...DISCONNECTED,
+      configured: true,
+      logged_in: true,
+      base_url: "https://sync.humla.team",
+      current_workspace: ws,
+      workspaces: [ws],
+      billing_enabled: true,
+    },
+    members: { u1: { id: "u1", name: "Ada", email: "ada@acme.com", role: "owner" } },
+  });
+}
+
+const UNCONFIGURED_KEY = { configured: false, last4: null, setBy: null, setAt: null, keyHealth: null };
+const CONFIGURED_KEY = {
+  configured: true,
+  last4: "n3Kq",
+  setBy: "u1",
+  setAt: null,
+  keyHealth: "ok",
+};
 
 // A minimal note carrying a folder, so the composer breadth picker's
 // "Folder: {name}" option appears (#63). Only the fields ChatPanel reads matter.
@@ -740,29 +768,25 @@ describe("ChatPanel turn allowance (#69)", () => {
     expect(screen.queryByText(/turns/)).toBeNull();
   });
 
-  it("does not refetch the meter when a send fails", async () => {
-    let usageCalls = 0;
+  it("keeps the meter value after a failed send (a failed turn consumes nothing)", async () => {
     mockTauri({
       provider_key_get: () => "sk-test",
       chat_history: () => history(),
       chat_send: () => {
         throw new Error("send failed");
       },
-      chat_usage: () => {
-        usageCalls += 1;
-        return { used: 2, cap: 3, periodEnd: 0 };
-      },
+      // The server value is unchanged by a failed turn; #76 re-detects activation
+      // in the catch (which reads usage), but the displayed number stays 2/3.
+      chat_usage: () => ({ used: 2, cap: 3, periodEnd: 0 }),
     });
     signIntoWorkspace("Acme Team");
     renderPanel();
     expect(await screen.findByText("2/3 turns")).toBeInTheDocument();
-    const callsAfterMount = usageCalls;
     const input = await screen.findByRole("textbox", { name: /ask about your notes/i });
     fireEvent.change(input, { target: { value: "q" } });
     fireEvent.click(screen.getByRole("button", { name: "Send" }));
     await screen.findByText(/send failed/);
-    // The failed send took the catch path — the meter is not refreshed.
-    expect(usageCalls).toBe(callsAfterMount);
+    expect(screen.getByText("2/3 turns")).toBeInTheDocument();
   });
 
   it("colours the meter with the danger tone at the cap (#69)", async () => {
@@ -790,5 +814,128 @@ describe("ChatPanel breadth icons (#69)", () => {
     await waitFor(() => expect(trigger).toHaveTextContent("All notes"));
     // "All notes" → the Files glyph (distinct from FileText / ChevronDown).
     expect(trigger.querySelector(".lucide-files")).not.toBeNull();
+  });
+});
+
+describe("ChatPanel workspace activation (#76)", () => {
+  it("owner sees the activation pane with key entry when not activated", async () => {
+    mockTauri({
+      chat_history: () => history(),
+      chat_key_meta: () => UNCONFIGURED_KEY,
+      chat_usage: () => null,
+    });
+    signInBillingWorkspace("owner");
+    renderPanel();
+    // Values-first line respecting the claim boundary ("your OpenAI relationship").
+    expect(await screen.findByText(/your OpenAI relationship/)).toBeInTheDocument();
+    expect(screen.getByLabelText("OpenAI API key")).toBeInTheDocument();
+    // The composer is replaced by the activation state.
+    expect(screen.queryByPlaceholderText(/Ask about your notes/)).toBeNull();
+  });
+
+  it("member sees an ask-owner message with nothing actionable", async () => {
+    mockTauri({
+      chat_history: () => history(),
+      chat_key_meta: () => UNCONFIGURED_KEY,
+      chat_usage: () => null,
+    });
+    signInBillingWorkspace("member");
+    renderPanel();
+    expect(await screen.findByText(/ask Ada/)).toBeInTheDocument();
+    expect(screen.queryByLabelText("OpenAI API key")).toBeNull();
+    expect(screen.queryByPlaceholderText(/Ask about your notes/)).toBeNull();
+  });
+
+  it("flips to the composer after the owner activates, without a reload", async () => {
+    mockTauri({
+      chat_history: () => history(),
+      chat_key_meta: () => UNCONFIGURED_KEY,
+      chat_usage: () => null,
+      chat_key_set: () => CONFIGURED_KEY,
+    });
+    signInBillingWorkspace("owner");
+    renderPanel();
+    const input = await screen.findByLabelText("OpenAI API key");
+    fireEvent.change(input, { target: { value: "sk-abc" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    // Composer appears in place (same instance — no reload); entry gone.
+    expect(await screen.findByPlaceholderText(/Ask about your notes/)).toBeInTheDocument();
+    expect(screen.queryByLabelText("OpenAI API key")).toBeNull();
+  });
+
+  it("keeps history readable while unactivated", async () => {
+    mockTauri({
+      chat_history: () => history([userMsg("earlier q"), assistantMsg("earlier a")]),
+      chat_key_meta: () => UNCONFIGURED_KEY,
+      chat_usage: () => null,
+    });
+    signInBillingWorkspace("member");
+    renderPanel();
+    // Past conversation renders even though chat isn't activated…
+    expect(await screen.findByText("earlier a")).toBeInTheDocument();
+    expect(screen.getByText("earlier q")).toBeInTheDocument();
+    // …and the activation state shows instead of the composer.
+    expect(screen.getByText(/ask Ada/)).toBeInTheDocument();
+  });
+
+  it("shows the composer (not the pane) when the workspace key is configured", async () => {
+    mockTauri({
+      chat_history: () => history(),
+      chat_key_meta: () => CONFIGURED_KEY,
+      chat_usage: () => null,
+    });
+    signInBillingWorkspace("owner");
+    renderPanel();
+    expect(await screen.findByPlaceholderText(/Ask about your notes/)).toBeInTheDocument();
+    expect(screen.queryByLabelText("OpenAI API key")).toBeNull();
+  });
+
+  it("never shows the activation pane on a self-host server (billing disabled)", async () => {
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () => history(),
+      chat_key_meta: () => UNCONFIGURED_KEY,
+      chat_usage: () => null,
+    });
+    signIntoWorkspace("Acme Team"); // billing_enabled false → self-host posture
+    renderPanel();
+    expect(await screen.findByPlaceholderText(/Ask about your notes/)).toBeInTheDocument();
+    expect(screen.queryByText(/your OpenAI relationship/)).toBeNull();
+  });
+
+  it("lets a member without a personal key send in an activated workspace", async () => {
+    let sent = false;
+    mockTauri({
+      provider_key_get: () => null, // no personal key → personal readiness is false
+      chat_history: () => history(sent ? [userMsg("q"), assistantMsg("a")] : []),
+      chat_key_meta: () => CONFIGURED_KEY, // workspace is activated
+      chat_usage: () => null,
+      chat_send: () => {
+        sent = true;
+        return { conversationId: "c1", truncated: false };
+      },
+    });
+    signInBillingWorkspace("member");
+    renderPanel();
+    const input = await screen.findByPlaceholderText(/Ask about your notes/);
+    fireEvent.change(input, { target: { value: "q" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    // The send must reach the backend — the workspace runs on the workspace key,
+    // not the member's (absent) personal key.
+    await waitFor(() => expect(sent).toBe(true));
+  });
+
+  it("lets a workspace member without a personal key reach the pane (no personal setup prompt)", async () => {
+    mockTauri({
+      provider_key_get: () => null,
+      chat_history: () => history(),
+      chat_key_meta: () => UNCONFIGURED_KEY,
+      chat_usage: () => null,
+    });
+    signInBillingWorkspace("member");
+    renderPanel();
+    expect(await screen.findByText(/ask Ada/)).toBeInTheDocument();
+    // NOT the personal "Add your OpenAI key" setup prompt.
+    expect(screen.queryByText(/Add your OpenAI key/)).toBeNull();
   });
 });

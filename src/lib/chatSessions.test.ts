@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { relativeTime, conversationTitle, usageTone } from "./chatSessions";
+import { relativeTime, conversationTitle, usageTone, liveChatErrorCopy } from "./chatSessions";
 
 const NOW = new Date("2026-07-24T12:00:00").getTime();
 const secs = (n: number) => NOW - n * 1000;
@@ -93,5 +93,37 @@ describe("usageTone", () => {
   it("is default for a non-positive cap (total edge)", () => {
     expect(usageTone(0, 0)).toBe("default");
     expect(usageTone(2, 0)).toBe("default");
+  });
+});
+
+describe("liveChatErrorCopy", () => {
+  const owner = { isOwner: true, ownerName: "Ada" };
+  const member = { isOwner: false, ownerName: "Ada" };
+
+  it("gives the owner a fix path and the member an ask-owner line for a rejected key", () => {
+    expect(liveChatErrorCopy("byok_key_invalid", owner)).toMatch(/Organization → Workspace chat/);
+    expect(liveChatErrorCopy("byok_key_invalid", member)).toMatch(/ask Ada/);
+  });
+
+  it("distinguishes provider quota from the managed add-on upsell", () => {
+    const o = liveChatErrorCopy("byok_provider_quota", owner)!;
+    const m = liveChatErrorCopy("byok_provider_quota", member)!;
+    expect(o).toMatch(/out of quota/);
+    expect(m).toMatch(/ask Ada/);
+    // Never the managed add-on's upsell wording.
+    expect(o).not.toMatch(/add-on/);
+    expect(m).not.toMatch(/add-on/);
+  });
+
+  it("treats an unavailable key as transient for everyone", () => {
+    expect(liveChatErrorCopy("byok_key_unavailable", owner)).toMatch(/try again shortly/);
+    expect(liveChatErrorCopy("byok_key_unavailable", member)).toMatch(/try again shortly/);
+  });
+
+  it("returns null for reasons outside the taxonomy (caller falls back)", () => {
+    expect(liveChatErrorCopy("quota_exhausted", owner)).toBeNull();
+    expect(liveChatErrorCopy("chat_not_activated", owner)).toBeNull();
+    expect(liveChatErrorCopy(undefined, owner)).toBeNull();
+    expect(liveChatErrorCopy("", owner)).toBeNull();
   });
 });

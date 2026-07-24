@@ -159,6 +159,27 @@ pub fn cloud_chat_error_message(reason: &str, server_message: &str) -> String {
                 .to_string()
         }
         "not_a_member" => "You're not a member of this workspace.".to_string(),
+        // BYOK-first reasons (issue #76). Distinct from the managed add-on's
+        // `quota_exhausted` upsell above. The client renders role-aware copy for
+        // these when it has the reason code; these strings are the fallback and
+        // the send-rejection text.
+        "chat_not_activated" => {
+            "Workspace chat isn't activated yet — the owner can turn it on in workspace settings."
+                .to_string()
+        }
+        "byok_key_invalid" => {
+            "This workspace's OpenAI key was rejected — the owner can re-enter it in workspace \
+             settings."
+                .to_string()
+        }
+        "byok_provider_quota" => {
+            "This workspace's OpenAI account is out of quota — the owner can check it in workspace \
+             settings."
+                .to_string()
+        }
+        "byok_key_unavailable" => {
+            "Workspace chat is temporarily unavailable — try again shortly.".to_string()
+        }
         "chat_disabled" | "chat_unavailable" | "index_unavailable" => {
             "Team chat isn't available on this server.".to_string()
         }
@@ -418,6 +439,23 @@ mod tests {
     }
 
     #[test]
+    fn error_frame_relays_the_top_level_reason_to_the_client() {
+        // The server's mid-turn SSE error frame carries a top-level `reason`
+        // (byok_key_invalid / byok_provider_quota). Framing → "error" → chat_error,
+        // and JSON parse keeps `reason` so the client's chat_error payload (which
+        // the stream pump re-emits verbatim, only re-stamping conversationId) can
+        // drive the role-aware BYOK error copy (#76).
+        let (event, data) = parse_sse_frame(
+            "event: error\ndata: {\"reason\":\"byok_key_invalid\",\"message\":\"nope\"}",
+        )
+        .unwrap();
+        assert_eq!(event, "error");
+        assert_eq!(tauri_event_for(&event), Some("chat_error"));
+        let v: Value = serde_json::from_str(&data).unwrap();
+        assert_eq!(v.get("reason").and_then(|r| r.as_str()), Some("byok_key_invalid"));
+    }
+
+    #[test]
     fn finds_the_first_event_terminator() {
         assert_eq!(find_event_end(b"event: a\ndata: 1\n\nrest"), Some((16, 2)));
         // CRLF framing.
@@ -469,5 +507,25 @@ mod tests {
         assert!(q.contains("add-on"), "quota block names the chat add-on: {q}");
         assert_eq!(cloud_chat_error_message("weird_reason", "raw server text"), "raw server text");
         assert!(!cloud_chat_error_message("weird_reason", "  ").is_empty());
+    }
+
+    #[test]
+    fn byok_reasons_map_to_distinct_messages_not_the_addon_upsell() {
+        let na = cloud_chat_error_message("chat_not_activated", "");
+        let invalid = cloud_chat_error_message("byok_key_invalid", "");
+        let quota = cloud_chat_error_message("byok_provider_quota", "");
+        let unavail = cloud_chat_error_message("byok_key_unavailable", "");
+        // Each is distinct and non-generic.
+        for m in [&na, &invalid, &quota, &unavail] {
+            assert_ne!(*m, "Team chat failed — please try again.");
+        }
+        assert!(na.to_lowercase().contains("activated"));
+        assert!(invalid.to_lowercase().contains("rejected"));
+        assert!(quota.to_lowercase().contains("quota"));
+        assert!(unavail.to_lowercase().contains("try again"));
+        // None of them reuse the managed add-on's upsell copy.
+        for m in [&na, &invalid, &quota, &unavail] {
+            assert!(!m.contains("add-on"), "BYOK reason must not name the managed add-on: {m}");
+        }
     }
 }
