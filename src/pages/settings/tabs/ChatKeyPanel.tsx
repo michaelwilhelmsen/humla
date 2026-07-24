@@ -1,6 +1,12 @@
 import { useCallback, useEffect, useState } from "react";
 import { AlertTriangle } from "lucide-react";
-import { cloudApi, useCloudStore, type ChatKeyMeta, type CloudWorkspace } from "../../../lib/cloud";
+import {
+  cloudApi,
+  formatSeatPrice,
+  useCloudStore,
+  type ChatKeyMeta,
+  type CloudWorkspace,
+} from "../../../lib/cloud";
 import { ipc, type ChatUsage } from "../../../lib/ipc";
 import { Btn } from "../components/Btn";
 
@@ -26,10 +32,15 @@ function whenSet(raw: string | null): string {
 
 export function ChatKeyPanel({ ws }: { ws: CloudWorkspace }) {
   const members = useCloudStore((s) => s.members);
+  const addon = useCloudStore((s) => s.status.chat_addon);
   const isOwner = ws.role === "owner";
 
   const [meta, setMeta] = useState<ChatKeyMeta | null>(null);
   const [usage, setUsage] = useState<ChatUsage | null>(null);
+  // Whether a personal OpenAI key is stored (Settings → Providers). Gates the
+  // "use it for this workspace" shortcut — the key itself never enters the
+  // webview (a Rust command reads the Keychain and does the test-on-save, #75).
+  const [hasPersonalKey, setHasPersonalKey] = useState(false);
   const [loading, setLoading] = useState(true);
   const [keyDraft, setKeyDraft] = useState("");
   const [rotating, setRotating] = useState(false);
@@ -47,14 +58,17 @@ export function ChatKeyPanel({ ws }: { ws: CloudWorkspace }) {
       setError(null);
       try {
         // Usage tells BYOK (unmetered → null) apart from the managed add-on
-        // (metered → numbers); the meta drives the BYOK state itself.
-        const [m, u] = await Promise.all([
+        // (metered → numbers); the meta drives the BYOK state itself. The key
+        // status ("stored" | null) gates the from-Keychain shortcut.
+        const [m, u, personalKey] = await Promise.all([
           cloudApi.chatKeyMeta(ws.id),
           ipc.chatUsage().catch(() => null),
+          ipc.getProviderKey("openai").catch(() => null),
         ]);
         if (cancelled()) return;
         setMeta(m);
         setUsage(u);
+        setHasPersonalKey(personalKey != null);
       } catch (e) {
         if (cancelled()) return;
         setError(String(e));
@@ -100,6 +114,27 @@ export function ChatKeyPanel({ ws }: { ws: CloudWorkspace }) {
     } catch (e) {
       // The Rust layer maps reason codes to a short message; show it verbatim.
       // (Never contains the key.) Keep the draft so the owner can correct it.
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // Set the workspace key from the personal Keychain key — the key is read and
+  // POSTed entirely in Rust (never touches the webview). Same result handling
+  // as a manual save.
+  async function useKeychain() {
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const m = await cloudApi.chatKeySetFromKeychain(ws.id);
+      setKeyDraft("");
+      setRotating(false);
+      setMeta(m);
+      setUsage(null);
+      setNotice("Key saved and verified.");
+    } catch (e) {
       setError(String(e));
     } finally {
       setBusy(false);
@@ -157,11 +192,25 @@ export function ChatKeyPanel({ ws }: { ws: CloudWorkspace }) {
         Your key is sent straight to the server, tested against OpenAI, and stored encrypted — it's
         never kept on this device. Chat then runs on your OpenAI account, free and unmetered.
       </p>
+      {hasPersonalKey && (
+        <div className="flex flex-col gap-1 pt-1">
+          <Btn onClick={useKeychain} disabled={busy}>
+            {busy ? "Saving…" : "Use the OpenAI key from Settings"}
+          </Btn>
+          <p className="text-xs text-[var(--color-text-muted)] leading-relaxed">
+            Shares the key from Settings → Providers with this workspace. Everyone's chat then runs
+            on your OpenAI account.
+          </p>
+        </div>
+      )}
     </div>
   );
 
   return (
     <div className="flex flex-col gap-3 py-3.5">
+      <p className="text-xs text-[var(--color-text-muted)] leading-relaxed">
+        Chat over this workspace's shared meeting history.
+      </p>
       {meta.configured ? (
         <>
           <p className="text-sm">
@@ -238,15 +287,21 @@ export function ChatKeyPanel({ ws }: { ws: CloudWorkspace }) {
       ) : (
         <>
           <p className="text-sm">
-            {isOwner ? "Chat isn't activated for this workspace yet." : "Chat isn't activated yet."}
+            {isOwner
+              ? "Workspace chat isn't activated for this workspace yet."
+              : "Workspace chat isn't activated yet."}
           </p>
           {isOwner ? (
             <>
               {entry}
-              <p className="text-xs text-[var(--color-text-muted)] leading-relaxed">
-                Prefer not to manage a key? The managed add-on runs chat on Humla's key with a
-                per-period turn allowance.
-              </p>
+              {addon?.available && (
+                <p className="text-xs text-[var(--color-text-muted)] leading-relaxed">
+                  Prefer not to manage a key? The managed add-on
+                  {addon.price_cents != null &&
+                    ` (${formatSeatPrice(addon.price_cents, addon.currency)}/mo)`}{" "}
+                  runs chat on Humla's key — see Billing above.
+                </p>
+              )}
             </>
           ) : (
             <p className="text-xs text-[var(--color-text-muted)]">Ask {ownerName} to turn it on.</p>

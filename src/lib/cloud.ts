@@ -58,6 +58,17 @@ export type CloudStatus = {
   seat_price_cents?: number | null;
   /** Lowercase ISO currency for seat_price_cents (e.g. "usd"). Absent when unknown. */
   seat_currency?: string | null;
+  /** Managed chat add-on config, when the server advertises it (issue #75).
+   *  null/absent → self-host or not configured; the add-on pitch is dropped. */
+  chat_addon?: ChatAddon | null;
+};
+
+/** Managed chat add-on advertised in the server's billing config (issue #75). */
+export type ChatAddon = {
+  available: boolean;
+  price_id?: string | null;
+  price_cents?: number | null;
+  currency?: string | null;
 };
 
 export const cloudApi = {
@@ -106,6 +117,10 @@ export const cloudApi = {
   /** Owner-only set/rotate — server test-on-saves and returns fresh metadata. */
   chatKeySet: (workspaceId: string, apiKey: string) =>
     invoke<ChatKeyMeta>("chat_key_set", { workspaceId, apiKey }),
+  /** Owner-only set/rotate using the personal OpenAI key from the Keychain —
+   *  the key is read in Rust and never enters the webview (issue #75). */
+  chatKeySetFromKeychain: (workspaceId: string) =>
+    invoke<ChatKeyMeta>("chat_key_set_from_keychain", { workspaceId }),
   /** Owner-only remove — returns the unconfigured metadata. */
   chatKeyRemove: (workspaceId: string) => invoke<ChatKeyMeta>("chat_key_delete", { workspaceId }),
 };
@@ -120,6 +135,7 @@ export const DISCONNECTED: CloudStatus = {
   billing_enabled: false,
   seat_price_cents: null,
   seat_currency: null,
+  chat_addon: null,
 };
 
 type CloudState = {

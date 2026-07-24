@@ -442,7 +442,7 @@ export function OrganizationTab() {
         </Section>
       )}
 
-      <Section title="Chat">
+      <Section title="Workspace chat">
         <ChatKeyPanel ws={ws} />
       </Section>
 

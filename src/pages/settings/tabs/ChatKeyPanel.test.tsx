@@ -42,7 +42,9 @@ describe("ChatKeyPanel — owner (#75)", () => {
     mockTauri({ chat_key_meta: () => UNCONFIGURED, chat_usage: () => null });
     renderPanel("owner");
     expect(await screen.findByLabelText("OpenAI API key")).toBeInTheDocument();
-    expect(screen.getByText(/isn't activated/)).toBeInTheDocument();
+    expect(screen.getByText(/Workspace chat isn't activated/)).toBeInTheDocument();
+    // Disambiguation line from the workspace-vs-personal split.
+    expect(screen.getByText(/Chat over this workspace's shared meeting history/)).toBeInTheDocument();
   });
 
   it("saves a key, shows it verified, and clears the input", async () => {
@@ -170,6 +172,85 @@ describe("ChatKeyPanel — owner (#75)", () => {
     renderPanel("owner");
     expect(await screen.findByText(/Humla's managed key/)).toBeInTheDocument();
     expect(screen.getByText(/5\/100 turns this period/)).toBeInTheDocument();
+  });
+});
+
+describe("ChatKeyPanel — Settings-key shortcut + add-on pitch (#75)", () => {
+  it("offers the Settings-key shortcut only when a personal key is stored", async () => {
+    mockTauri({
+      chat_key_meta: () => UNCONFIGURED,
+      chat_usage: () => null,
+      provider_key_get: () => "stored",
+    });
+    renderPanel("owner");
+    expect(
+      await screen.findByRole("button", { name: /Use the OpenAI key from Settings/ }),
+    ).toBeInTheDocument();
+  });
+
+  it("hides the Settings-key shortcut when no personal key is stored", async () => {
+    mockTauri({
+      chat_key_meta: () => UNCONFIGURED,
+      chat_usage: () => null,
+      provider_key_get: () => null,
+    });
+    renderPanel("owner");
+    await screen.findByLabelText("OpenAI API key");
+    expect(screen.queryByRole("button", { name: /Use the OpenAI key from Settings/ })).toBeNull();
+  });
+
+  it("activates from the Keychain key via the shortcut (key never enters the webview)", async () => {
+    let called = false;
+    mockTauri({
+      chat_key_meta: () => UNCONFIGURED,
+      chat_usage: () => null,
+      provider_key_get: () => "stored",
+      chat_key_set_from_keychain: () => {
+        called = true;
+        return configured({ last4: "kc42" });
+      },
+    });
+    renderPanel("owner");
+    fireEvent.click(await screen.findByRole("button", { name: /Use the OpenAI key from Settings/ }));
+    expect(await screen.findByText(/Key ending kc42/)).toBeInTheDocument();
+    expect(called).toBe(true);
+  });
+
+  it("stays unactivated and shows the error if Keychain activation fails", async () => {
+    mockTauri({
+      chat_key_meta: () => UNCONFIGURED,
+      chat_usage: () => null,
+      provider_key_get: () => "stored",
+      chat_key_set_from_keychain: () => {
+        throw "OpenAI rejected this key.";
+      },
+    });
+    renderPanel("owner");
+    fireEvent.click(await screen.findByRole("button", { name: /Use the OpenAI key from Settings/ }));
+    expect(await screen.findByText("OpenAI rejected this key.")).toBeInTheDocument();
+    // Entry (and shortcut) remain so the owner can retry.
+    expect(screen.getByLabelText("OpenAI API key")).toBeInTheDocument();
+  });
+
+  it("shows the managed add-on pitch with price when the server advertises it", async () => {
+    mockTauri({ chat_key_meta: () => UNCONFIGURED, chat_usage: () => null });
+    useCloudStore.setState({
+      status: {
+        ...DISCONNECTED,
+        chat_addon: { available: true, price_id: "p1", price_cents: 900, currency: "usd" },
+      },
+    });
+    renderPanel("owner");
+    const pitch = await screen.findByText(/The managed add-on/);
+    expect(pitch).toHaveTextContent("$9/mo");
+    expect(pitch).toHaveTextContent("see Billing above");
+  });
+
+  it("drops the add-on pitch when the server doesn't advertise it", async () => {
+    mockTauri({ chat_key_meta: () => UNCONFIGURED, chat_usage: () => null });
+    renderPanel("owner");
+    await screen.findByLabelText("OpenAI API key");
+    expect(screen.queryByText(/managed add-on/)).toBeNull();
   });
 });
 

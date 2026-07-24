@@ -360,6 +360,7 @@ where
             commands::chat_usage,
             commands::chat_key_meta,
             commands::chat_key_set,
+            commands::chat_key_set_from_keychain,
             commands::chat_key_delete,
             commands::chat_reindex_note,
             commands::permissions_status,

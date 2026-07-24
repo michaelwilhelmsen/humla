@@ -724,20 +724,19 @@ pub async fn chat_key_meta(
     }
 }
 
-/// Owner-only set/rotate of the workspace OpenAI key. The server test-on-saves
-/// it (OpenAI GET /v1/models) and returns the fresh metadata. The `api_key`
-/// never leaves this request body — not logged, not stored, not in errors.
-#[tauri::command]
-pub async fn chat_key_set(
-    app: AppHandle,
-    workspace_id: String,
-    api_key: String,
+/// POST a key to the set/rotate hook (server test-on-saves it against OpenAI)
+/// and map the response. Shared by the manual-entry and from-Keychain commands
+/// so the test-on-save path is identical. The `api_key` never leaves this
+/// request body — not logged, not stored, not in error strings.
+async fn chat_key_set_inner(
+    state: &State<'_, AppState>,
+    workspace_id: &str,
+    api_key: &str,
 ) -> Result<chat::cloud::ChatKeyMeta, String> {
-    let state: State<AppState> = app.state();
     let body = serde_json::json!({ "workspace_id": workspace_id, "api_key": api_key });
     let mut attempt = 0u8;
     loop {
-        let (base, token) = super::cloud::cloud_session(&state).await?;
+        let (base, token) = super::cloud::cloud_session(state).await?;
         let resp = reqwest::Client::new()
             .post(format!("{}/api/humla/chat/key", base.trim_end_matches('/')))
             .bearer_auth(&token)
@@ -757,6 +756,34 @@ pub async fn chat_key_set(
         let meta: serde_json::Value = resp.json().await.unwrap_or_default();
         return Ok(chat::cloud::parse_key_meta(&meta));
     }
+}
+
+/// Owner-only set/rotate of the workspace OpenAI key, from a key the owner typed
+/// into the composer. The `api_key` transits Rust memory only.
+#[tauri::command]
+pub async fn chat_key_set(
+    app: AppHandle,
+    workspace_id: String,
+    api_key: String,
+) -> Result<chat::cloud::ChatKeyMeta, String> {
+    let state: State<AppState> = app.state();
+    chat_key_set_inner(&state, &workspace_id, &api_key).await
+}
+
+/// Owner-only set/rotate using the personal OpenAI key already in the macOS
+/// Keychain (issue #75). Sharing a personal key with a team is a deliberate act,
+/// so the UI gates this behind an explicit button. The key is read in Rust and
+/// runs the same test-on-save path as `chat_key_set` — it NEVER enters the
+/// webview.
+#[tauri::command]
+pub async fn chat_key_set_from_keychain(
+    app: AppHandle,
+    workspace_id: String,
+) -> Result<chat::cloud::ChatKeyMeta, String> {
+    let state: State<AppState> = app.state();
+    let key = super::read_provider_api_key(&state, "openai")?
+        .ok_or("No OpenAI key is stored in Settings → Providers.")?;
+    chat_key_set_inner(&state, &workspace_id, &key).await
 }
 
 /// Owner-only remove of the workspace OpenAI key. Returns the (unconfigured)

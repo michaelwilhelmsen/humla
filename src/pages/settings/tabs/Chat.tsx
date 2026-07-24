@@ -54,6 +54,10 @@ export function ChatTab({ s, update }: Pick<SettingsHook, "s" | "update">) {
 
   return (
     <Section title="AI Chat">
+      <p className="text-xs text-[var(--color-text-muted)] leading-relaxed py-3.5">
+        These settings cover chat over your personal notes. Workspace (Teams) chat is configured
+        per workspace under Organization → Workspace chat.
+      </p>
       <Row
         label="Provider"
         description="Ask questions grounded in your notes. Cloud (OpenAI) uses your key; Local (Ollama) runs fully offline. Independent of your transcription and summary providers."
@@ -81,7 +85,7 @@ export function ChatTab({ s, update }: Pick<SettingsHook, "s" | "update">) {
           />
           <ProviderKeyCard
             provider="openai"
-            description="Reused across cloud transcription, summaries, and chat — one key."
+            description="Reused across cloud transcription, summaries, and chat — one key. Workspace chat uses the workspace's own key."
           />
         </>
       )}

@@ -87,6 +87,21 @@ pub struct CloudStatus {
     /// Lowercase ISO currency for `seat_price_cents` (e.g. "usd"). `None` when
     /// unknown; the formatter falls back to USD.
     pub seat_currency: Option<String>,
+    /// Managed chat add-on config, advertised when the server has it set up
+    /// (issue #75). `None` on self-host / older servers → the client drops the
+    /// add-on pitch entirely.
+    pub chat_addon: Option<ChatAddon>,
+}
+
+/// The managed chat add-on the server advertises in its billing config (#75).
+/// `available` gates the add-on pitch; the price fields format it; `price_id`
+/// is for the future purchase UI (activation is via Stripe today).
+#[derive(Serialize, Default, PartialEq, Debug)]
+pub struct ChatAddon {
+    pub available: bool,
+    pub price_id: Option<String>,
+    pub price_cents: Option<u32>,
+    pub currency: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -456,6 +471,33 @@ struct BillingConfig {
     enabled: bool,
     seat_price_cents: Option<u32>,
     seat_currency: Option<String>,
+    chat_addon: Option<ChatAddon>,
+}
+
+/// Parse the `chat_addon` object from the billing config (issue #75). Returns
+/// None when the key is absent (self-host / add-on not configured) so the client
+/// drops the pitch; a present-but-malformed object degrades to `available:false`.
+fn parse_chat_addon(val: &serde_json::Value) -> Option<ChatAddon> {
+    let obj = val.get("chat_addon")?.as_object()?;
+    Some(ChatAddon {
+        available: obj.get("available").and_then(|v| v.as_bool()).unwrap_or(false),
+        price_id: obj
+            .get("price_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_string),
+        // Stripe `unit_amount` in cents; accept int/float, drop negatives/NaN.
+        price_cents: obj
+            .get("price_cents")
+            .and_then(|v| v.as_f64())
+            .filter(|n| n.is_finite() && *n >= 0.0)
+            .map(|n| n.round() as u32),
+        currency: obj
+            .get("currency")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_string),
+    })
 }
 
 /// Read the public billing config. Any failure (older server, network) degrades
@@ -481,7 +523,8 @@ async fn fetch_billing_config(base: &str) -> BillingConfig {
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .filter(|s| !s.trim().is_empty());
-    BillingConfig { enabled, seat_price_cents, seat_currency }
+    let chat_addon = parse_chat_addon(&val);
+    BillingConfig { enabled, seat_price_cents, seat_currency, chat_addon }
 }
 
 // ---- commands --------------------------------------------------------------
@@ -503,6 +546,7 @@ pub async fn cloud_status(state: State<'_, AppState>) -> Result<CloudStatus, Str
             billing_enabled: false,
             seat_price_cents: None,
             seat_currency: None,
+            chat_addon: None,
         });
     };
 
@@ -548,6 +592,7 @@ pub async fn cloud_status(state: State<'_, AppState>) -> Result<CloudStatus, Str
         billing_enabled: billing.enabled,
         seat_price_cents: billing.seat_price_cents,
         seat_currency: billing.seat_currency,
+        chat_addon: billing.chat_addon,
     })
 }
 
@@ -1873,6 +1918,35 @@ pub fn cloud_pending_note_ids(state: State<'_, AppState>) -> Result<Vec<String>,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_chat_addon_maps_available_absent_and_malformed() {
+        // Available, fully specified.
+        assert_eq!(
+            parse_chat_addon(&serde_json::json!({
+                "chat_addon": { "available": true, "price_id": "price_1", "price_cents": 900, "currency": "usd" }
+            })),
+            Some(ChatAddon {
+                available: true,
+                price_id: Some("price_1".into()),
+                price_cents: Some(900),
+                currency: Some("usd".into()),
+            })
+        );
+        // Key absent (self-host / not configured) → None (pitch dropped).
+        assert_eq!(parse_chat_addon(&serde_json::json!({ "enabled": true })), None);
+        // Present but not available → Some with available:false (no pitch).
+        assert_eq!(
+            parse_chat_addon(&serde_json::json!({ "chat_addon": { "available": false } })),
+            Some(ChatAddon::default())
+        );
+        // Malformed price / currency → dropped, still parses.
+        let m = parse_chat_addon(&serde_json::json!({
+            "chat_addon": { "available": true, "price_cents": -1, "currency": "" }
+        }))
+        .unwrap();
+        assert!(m.available && m.price_cents.is_none() && m.currency.is_none());
+    }
 
     /// Minimal `RemoteSession` builder — only `client_id` matters for the
     /// path-traversal guard; the rest are placeholders.
