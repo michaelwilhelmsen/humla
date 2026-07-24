@@ -48,6 +48,12 @@ function assistantWithCitation(text: string): ChatMessageDto {
   };
 }
 
+// `chat_history` returns { conversationId, messages } since #61; a non-empty
+// history implies a resolved session id.
+function history(messages: ChatMessageDto[] = []) {
+  return { conversationId: messages.length ? "c1" : null, messages };
+}
+
 function renderPanel(noteId = "n1") {
   return render(
     <MemoryRouter>
@@ -70,7 +76,7 @@ describe("ChatPanel readiness", () => {
   });
 
   it("shows the input + empty state once a key is present", async () => {
-    mockTauri({ provider_key_get: () => "sk-test", chat_history: () => [] });
+    mockTauri({ provider_key_get: () => "sk-test", chat_history: () => history() });
     renderPanel();
     await waitFor(() =>
       expect(screen.getByPlaceholderText(/Ask about your notes/)).toBeInTheDocument(),
@@ -88,7 +94,8 @@ describe("ChatPanel send", () => {
         sent = true;
         return { conversationId: "c1", truncated: false };
       },
-      chat_history: () => (sent ? [userMsg("What happened?"), assistantMsg("A summary.")] : []),
+      chat_history: () =>
+        history(sent ? [userMsg("What happened?"), assistantMsg("A summary.")] : []),
     });
     renderPanel();
 
@@ -108,7 +115,7 @@ describe("ChatPanel send", () => {
         sent = true;
         return { conversationId: "c1", truncated: true };
       },
-      chat_history: () => (sent ? [userMsg("hi"), assistantMsg("hello")] : []),
+      chat_history: () => history(sent ? [userMsg("hi"), assistantMsg("hello")] : []),
     });
     renderPanel();
     const input = await screen.findByPlaceholderText(/Ask about your notes/);
@@ -124,7 +131,8 @@ describe("ChatPanel retrieval UI (#47)", () => {
   it("renders a citation chip for a cited note", async () => {
     mockTauri({
       provider_key_get: () => "sk-test",
-      chat_history: () => [userMsg("what happened?"), assistantWithCitation("Here's what I found.")],
+      chat_history: () =>
+        history([userMsg("what happened?"), assistantWithCitation("Here's what I found.")]),
     });
     renderPanel();
     await waitFor(() => expect(screen.getByText("Here's what I found.")).toBeInTheDocument());
@@ -133,7 +141,7 @@ describe("ChatPanel retrieval UI (#47)", () => {
   });
 
   it("offers the scope breadths in the Scope popover", async () => {
-    mockTauri({ provider_key_get: () => "sk-test", chat_history: () => [] });
+    mockTauri({ provider_key_get: () => "sk-test", chat_history: () => history() });
     renderPanel();
     const trigger = await screen.findByRole("button", { name: "Chat scope" });
     fireEvent.click(trigger);
@@ -145,7 +153,7 @@ describe("ChatPanel retrieval UI (#47)", () => {
 
 describe("ChatPanel context pinning (#58)", () => {
   it("renders no tenant picker — chat is pinned to the loaded context", async () => {
-    mockTauri({ provider_key_get: () => "sk-test", chat_history: () => [] });
+    mockTauri({ provider_key_get: () => "sk-test", chat_history: () => history() });
     signIntoWorkspace("Acme Team");
     renderPanel();
     await screen.findByPlaceholderText(/Ask about your notes/);
@@ -154,7 +162,7 @@ describe("ChatPanel context pinning (#58)", () => {
   });
 
   it("shows the workspace name as a non-interactive context indicator", async () => {
-    mockTauri({ provider_key_get: () => "sk-test", chat_history: () => [] });
+    mockTauri({ provider_key_get: () => "sk-test", chat_history: () => history() });
     signIntoWorkspace("Acme Team");
     renderPanel();
     // The indicator shows where chat goes; it is not a button (no popover).
@@ -164,7 +172,7 @@ describe("ChatPanel context pinning (#58)", () => {
   });
 
   it("shows Personal as the context indicator when signed out", async () => {
-    mockTauri({ provider_key_get: () => "sk-test", chat_history: () => [] });
+    mockTauri({ provider_key_get: () => "sk-test", chat_history: () => history() });
     renderPanel();
     const indicator = await screen.findByLabelText("Chat context");
     expect(indicator).toHaveTextContent("Personal");
@@ -175,7 +183,7 @@ describe("ChatPanel scope breadth (#58)", () => {
   it("initialises the scope chip from the persisted breadth", async () => {
     mockTauri({
       provider_key_get: () => "sk-test",
-      chat_history: () => [],
+      chat_history: () => history(),
       chat_get_breadth: () => "all",
     });
     renderPanel();
@@ -188,7 +196,7 @@ describe("ChatPanel scope breadth (#58)", () => {
     let setArgs: { noteId?: string; breadth?: string } | undefined;
     mockTauri({
       provider_key_get: () => "sk-test",
-      chat_history: () => [],
+      chat_history: () => history(),
       chat_get_breadth: () => "note",
       chat_set_breadth: (args) => {
         setArgs = args as { noteId?: string; breadth?: string };

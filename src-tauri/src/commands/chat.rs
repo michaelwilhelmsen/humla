@@ -377,14 +377,200 @@ impl ChatContext {
     }
 }
 
-/// Persist the Scope chip's breadth on the current context's conversation
-/// (issue #58) — the single source of truth for retrieval breadth. Validates
-/// the value loudly (garbage → Err), then get-or-creates the conversation for
-/// the loaded context (Personal or the active workspace) and writes the column.
+// ── Chat sessions (issue #61) ───────────────────────────────────────────────
+// Multiple conversations ("sessions") per Note. The active session is the most-
+// recently-updated one; an explicit command creates a fresh one. There is no
+// deletion command — a deliberate v1 decision.
+
+/// One row in the session list. `id` is always the LOCAL conversation id (for a
+/// workspace session that's the handle row, its `remote_id` mapping to the
+/// server record), so `chat_history` / `chat_send` / breadth all key on the
+/// same id across tenants. `title` is resolved (stored title, else a date
+/// fallback) so a not-yet-titled session still shows something.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationMeta {
+    id: String,
+    title: String,
+    breadth: String,
+    updated_at: i64,
+    message_count: i64,
+}
+
+/// `chat_history` result (issue #61): the messages plus the conversation they
+/// were resolved to, so the panel learns which session it's on. `conversation_id`
+/// is None when the Note has no session yet (opening the tab creates nothing).
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatHistoryResult {
+    conversation_id: Option<String>,
+    messages: Vec<ChatMessageDto>,
+}
+
+/// A conversation's display title: its stored title, else a derived date label
+/// (an untitled session — e.g. one just created — still reads sensibly).
+fn resolved_title(c: &db::Conversation) -> String {
+    match c.title.as_deref() {
+        Some(t) if !t.trim().is_empty() => t.to_string(),
+        _ => chat::derive_title(None, c.created_at),
+    }
+}
+
+/// Whether a conversation has no stored title yet — the first user message
+/// should set it (issue #61).
+fn resolved_title_is_unset(c: &db::Conversation) -> bool {
+    c.title.as_deref().map_or(true, |t| t.trim().is_empty())
+}
+
+/// Build a session-list entry for a local (personal or workspace-handle) row.
+fn conversation_meta(
+    conn: &rusqlite::Connection,
+    c: &db::Conversation,
+) -> Result<ConversationMeta, String> {
+    let message_count =
+        db::conversation_message_count(conn, &c.id).map_err(|e| e.to_string())?;
+    Ok(ConversationMeta {
+        id: c.id.clone(),
+        title: resolved_title(c),
+        breadth: c.breadth.clone(),
+        updated_at: c.updated_at,
+        message_count,
+    })
+}
+
+/// The breadth a new session inherits (issue #61): the Note's most-recent
+/// session's breadth, or "note" for the Note's first-ever session.
+fn inherited_breadth(conn: &rusqlite::Connection, tenant: &str, note_id: &str) -> String {
+    db::latest_conversation(conn, tenant, CHAT_SCOPE_NOTE, note_id)
+        .ok()
+        .flatten()
+        .map(|c| c.breadth)
+        .unwrap_or_else(|| "note".to_string())
+}
+
+/// Resolve the session a command targets WITHOUT creating one (None when the
+/// Note has no session yet). `explicit` targets a specific session; otherwise
+/// the most-recently-updated one is the active session.
+///
+/// An explicit id is validated to belong to the expected (tenant, note) scope —
+/// a mismatched id is a clean error, never a silent cross-scope operation (which
+/// would, e.g., heal breadth against the wrong Note). A not-found explicit id is
+/// treated as "no session" (None) so the caller falls back to the active one.
+fn resolve_existing(
+    conn: &rusqlite::Connection,
+    tenant: &str,
+    note_id: &str,
+    explicit: Option<&str>,
+) -> Result<Option<db::Conversation>, String> {
+    if let Some(id) = explicit {
+        let Some(c) = db::get_conversation_by_id(conn, id).map_err(|e| e.to_string())? else {
+            return Ok(None);
+        };
+        if c.tenant != tenant || c.scope != CHAT_SCOPE_NOTE || c.scope_id != note_id {
+            return Err("That chat session doesn't belong to this note.".into());
+        }
+        return Ok(Some(c));
+    }
+    db::latest_conversation(conn, tenant, CHAT_SCOPE_NOTE, note_id).map_err(|e| e.to_string())
+}
+
+/// Resolve the active session, lazily creating the Note's FIRST session when
+/// none exists (breadth defaults to "note"). Used by send + set-breadth so the
+/// first turn / first breadth write materialises the session on demand.
+fn resolve_or_create(
+    conn: &rusqlite::Connection,
+    tenant: &str,
+    note_id: &str,
+    explicit: Option<&str>,
+) -> Result<db::Conversation, String> {
+    if let Some(c) = resolve_existing(conn, tenant, note_id, explicit)? {
+        return Ok(c);
+    }
+    let breadth = inherited_breadth(conn, tenant, note_id);
+    db::create_conversation(conn, tenant, CHAT_SCOPE_NOTE, note_id, &breadth)
+        .map_err(|e| e.to_string())
+}
+
+/// Resolve the "new session" for a Note in the personal scope (issue #61),
+/// honoring the no-op guard: if the most-recent session has no messages, reuse
+/// it instead of piling up empty sessions; otherwise create a fresh one that
+/// inherits breadth from the most-recent session.
+fn new_personal_conversation(
+    conn: &rusqlite::Connection,
+    note_id: &str,
+) -> Result<db::Conversation, String> {
+    if let Some(latest) =
+        db::latest_conversation(conn, CHAT_TENANT_PERSONAL, CHAT_SCOPE_NOTE, note_id)
+            .map_err(|e| e.to_string())?
+    {
+        if db::conversation_message_count(conn, &latest.id).map_err(|e| e.to_string())? == 0 {
+            return Ok(latest);
+        }
+    }
+    let breadth = inherited_breadth(conn, CHAT_TENANT_PERSONAL, note_id);
+    db::create_conversation(conn, CHAT_TENANT_PERSONAL, CHAT_SCOPE_NOTE, note_id, &breadth)
+        .map_err(|e| e.to_string())
+}
+
+/// List a Note's chat sessions, most-recently-updated first (issue #61).
+/// Personal reads local SQLite; a workspace reads the server-authoritative list
+/// (see [`list_conversations_cloud`]). Opening/listing creates nothing.
+#[tauri::command]
+pub async fn chat_list_conversations(
+    app: AppHandle,
+    note_id: String,
+) -> Result<Vec<ConversationMeta>, String> {
+    let state: State<AppState> = app.state();
+    let ctx = {
+        let conn = state.db.lock();
+        ChatContext::load(&conn)
+    };
+    match ctx.workspace() {
+        None => {
+            let conn = state.db.lock();
+            let convs =
+                db::list_conversations(&conn, CHAT_TENANT_PERSONAL, CHAT_SCOPE_NOTE, &note_id)
+                    .map_err(|e| e.to_string())?;
+            convs.iter().map(|c| conversation_meta(&conn, c)).collect()
+        }
+        Some(ws) => list_conversations_cloud(&state, ws, &note_id).await,
+    }
+}
+
+/// Create a fresh chat session for a Note (issue #61). Personal creates a local
+/// row (with the no-op guard reusing an empty most-recent session); a workspace
+/// delegates to the server (see [`new_conversation_cloud`]).
+#[tauri::command]
+pub async fn chat_new_conversation(
+    app: AppHandle,
+    note_id: String,
+) -> Result<ConversationMeta, String> {
+    let state: State<AppState> = app.state();
+    let ctx = {
+        let conn = state.db.lock();
+        ChatContext::load(&conn)
+    };
+    match ctx.workspace() {
+        None => {
+            let conn = state.db.lock();
+            let conv = new_personal_conversation(&conn, &note_id)?;
+            conversation_meta(&conn, &conv)
+        }
+        Some(ws) => new_conversation_cloud(&state, ws, &note_id).await,
+    }
+}
+
+/// Persist the Scope chip's breadth on a conversation (issue #58) — the single
+/// source of truth for retrieval breadth. Validates the value loudly (garbage →
+/// Err), resolves the target session (`conversation_id` when the panel has one,
+/// else the active/most-recent session, lazily creating the Note's first
+/// session so a breadth chosen before the first turn survives — issue #61), and
+/// writes the column.
 #[tauri::command]
 pub fn chat_set_breadth(
     app: AppHandle,
     note_id: String,
+    conversation_id: Option<String>,
     breadth: String,
 ) -> Result<(), String> {
     chat::validate_breadth(&breadth)?;
@@ -392,26 +578,34 @@ pub fn chat_set_breadth(
     let conn = state.db.lock();
     let ctx = ChatContext::load(&conn);
     let conversation =
-        db::get_or_create_conversation(&conn, ctx.tenant(), CHAT_SCOPE_NOTE, &note_id)
-            .map_err(|e| e.to_string())?;
+        resolve_or_create(&conn, ctx.tenant(), &note_id, conversation_id.as_deref())?;
     db::set_conversation_breadth(&conn, &conversation.id, &breadth).map_err(|e| e.to_string())
 }
 
-/// Read the persisted breadth for the current context's conversation so the
-/// Scope chip initialises from the backend in one round trip (issue #58).
-/// Returns the safe "note" default when no conversation exists yet. NOTE: this
-/// read may PERSIST a heal — a stale "folder" breadth (the Note's folder was
-/// since removed) is reset to "note" via `heal_and_read_breadth` so the chip
-/// shows the corrected value; the heal-on-read is intentional.
+/// Read the persisted breadth for a conversation so the Scope chip initialises
+/// from the backend in one round trip (issue #58). Resolves `conversation_id`
+/// when the panel has one, else the active/most-recent session; when the Note
+/// has no session yet it returns the would-be-inherited default (issue #61) so
+/// the chip shows something sane WITHOUT creating a row. NOTE: this read may
+/// PERSIST a heal — a stale "folder" breadth (the Note's folder was since
+/// removed) is reset to "note" via `heal_and_read_breadth`; the heal-on-read is
+/// intentional.
 #[tauri::command]
-pub fn chat_get_breadth(app: AppHandle, note_id: String) -> Result<String, String> {
+pub fn chat_get_breadth(
+    app: AppHandle,
+    note_id: String,
+    conversation_id: Option<String>,
+) -> Result<String, String> {
     let state: State<AppState> = app.state();
     let conn = state.db.lock();
     let ctx = ChatContext::load(&conn);
     let Some(conversation) =
-        db::get_conversation(&conn, ctx.tenant(), CHAT_SCOPE_NOTE, &note_id)
-            .map_err(|e| e.to_string())?
+        resolve_existing(&conn, ctx.tenant(), &note_id, conversation_id.as_deref())?
     else {
+        // No session yet → the Note's first conversation defaults to "note",
+        // which is also what `inherited_breadth` returns here (its
+        // `latest_conversation` read would be redundant — `resolve_existing`
+        // just established there's no session).
         return Ok("note".into());
     };
     let note = db::get_note(&conn, &note_id).map_err(|e| e.to_string())?;
@@ -422,6 +616,7 @@ pub fn chat_get_breadth(app: AppHandle, note_id: String) -> Result<String, Strin
 pub async fn chat_send(
     app: AppHandle,
     note_id: String,
+    conversation_id: Option<String>,
     message: String,
 ) -> Result<ChatSendResult, String> {
     let state: State<AppState> = app.state();
@@ -433,7 +628,7 @@ pub async fn chat_send(
         ChatContext::load(&conn).workspace().is_some()
     };
     if in_workspace {
-        return chat_send_cloud(app, note_id, message).await;
+        return chat_send_cloud(app, note_id, conversation_id, message).await;
     }
 
     // Keychain read out of band — not inside the DB lock. Chat reuses the
@@ -447,11 +642,17 @@ pub async fn chat_send(
         // tenant is Personal and there's no workspace to scope tools to.
         let workspace = String::new();
         let resolved = resolve_chat(&conn, openai_api_key).map_err(|e| e.to_string())?;
-        // Conversation is keyed by the anchor Note; breadth is a persisted live
-        // filter within it, not a new conversation (issues #47/#58).
+        // Resolve the target session (issue #61): an explicit id, else the
+        // active/most-recent one, lazily creating the Note's first session on
+        // the first send. Breadth is a persisted live filter within it.
         let conversation =
-            db::get_or_create_conversation(&conn, CHAT_TENANT_PERSONAL, CHAT_SCOPE_NOTE, &note_id)
-                .map_err(|e| e.to_string())?;
+            resolve_or_create(&conn, CHAT_TENANT_PERSONAL, &note_id, conversation_id.as_deref())?;
+        // Set the personal session's title once, from its first user message
+        // (issue #61). Guarded on an empty title so later turns never rewrite it.
+        if resolved_title_is_unset(&conversation) {
+            let title = chat::derive_title(Some(&message), conversation.created_at);
+            let _ = db::set_conversation_title(&conn, &conversation.id, &title);
+        }
         // Keep the anchor Note searchable — reindex it now so "this Note" and
         // any broader search always find the note the user is looking at, even
         // if a content-settled checkpoint hasn't fired yet.
@@ -566,6 +767,7 @@ struct CloudTurn {
 async fn chat_send_cloud(
     app: AppHandle,
     note_id: String,
+    conversation_id: Option<String>,
     message: String,
 ) -> Result<ChatSendResult, String> {
     let state: State<AppState> = app.state();
@@ -576,9 +778,10 @@ async fn chat_send_cloud(
             return Err("No workspace selected — switch to a workspace to use Team chat.".into());
         };
         let note = db::get_note(&conn, &note_id).map_err(|e| e.to_string())?;
-        let conversation =
-            db::get_or_create_conversation(&conn, workspace, CHAT_SCOPE_NOTE, &note_id)
-                .map_err(|e| e.to_string())?;
+        // Resolve the target workspace-handle session (issue #61): an explicit
+        // id, else the active/most-recent handle, lazily creating one (remote_id
+        // filled from the server's response below) on the first turn.
+        let conversation = resolve_or_create(&conn, workspace, &note_id, conversation_id.as_deref())?;
         // Breadth is read from the (workspace) conversation row and self-healed
         // against the Note's folder, exactly like the Personal path (issue #58).
         let breadth =
@@ -750,15 +953,20 @@ pub struct ChatMessageDto {
     created_at: i64,
 }
 
-/// Reload a Note's conversation (empty if none exists yet). Drives history
-/// restore when the Chat tab opens or after an app restart. For a workspace
-/// tenant (issue #50) this is a read-through of the server-authoritative
-/// conversation — messages live in the cloud, not the local `messages` table.
+/// Reload a Note's conversation and report which session it resolved to (issue
+/// #61). `conversation_id` targets a specific session; None resolves the
+/// active/most-recent one (this is what keeps the single-thread panel working).
+/// When the Note has no session yet, returns empty messages + `conversationId:
+/// None` WITHOUT creating a row — merely opening the Chat tab must persist
+/// nothing. For a workspace tenant (issue #50) the messages are a read-through
+/// of the server-authoritative conversation (via the handle's `remote_id`);
+/// they never live in the local `messages` table.
 #[tauri::command]
 pub async fn chat_history(
     app: AppHandle,
     note_id: String,
-) -> Result<Vec<ChatMessageDto>, String> {
+    conversation_id: Option<String>,
+) -> Result<ChatHistoryResult, String> {
     let state: State<AppState> = app.state();
     // Chat follows the loaded context (issue #58): a loaded workspace reads its
     // server-authoritative conversation; Personal reads the local table.
@@ -766,29 +974,36 @@ pub async fn chat_history(
         let conn = state.db.lock();
         ChatContext::load(&conn)
     };
+
     if let Some(workspace) = ctx.workspace() {
-        // Resolve the workspace conversation's server id, then read its messages
-        // through PocketBase (the source of truth for shared conversations).
-        let remote_id = {
+        // Resolve the target workspace handle (explicit id, else most-recent),
+        // then read its messages through PocketBase (source of truth for shared
+        // conversations). No handle → nothing persisted yet, so empty + None.
+        let handle = {
             let conn = state.db.lock();
-            db::get_conversation(&conn, workspace, CHAT_SCOPE_NOTE, &note_id)
-                .map_err(|e| e.to_string())?
-                .and_then(|c| c.remote_id)
+            resolve_existing(&conn, workspace, &note_id, conversation_id.as_deref())?
         };
-        let Some(remote_id) = remote_id else { return Ok(Vec::new()) };
-        let records = super::cloud::fetch_chat_messages(&state, &remote_id).await?;
-        return Ok(records.iter().filter_map(map_remote_message).collect());
+        let Some(handle) = handle else {
+            return Ok(ChatHistoryResult { conversation_id: None, messages: Vec::new() });
+        };
+        let messages = match handle.remote_id.as_deref() {
+            Some(remote_id) => {
+                let records = super::cloud::fetch_chat_messages(&state, remote_id).await?;
+                records.iter().filter_map(map_remote_message).collect()
+            }
+            None => Vec::new(),
+        };
+        return Ok(ChatHistoryResult { conversation_id: Some(handle.id), messages });
     }
 
     let conn = state.db.lock();
     let Some(conversation) =
-        db::get_conversation(&conn, CHAT_TENANT_PERSONAL, CHAT_SCOPE_NOTE, &note_id)
-            .map_err(|e| e.to_string())?
+        resolve_existing(&conn, CHAT_TENANT_PERSONAL, &note_id, conversation_id.as_deref())?
     else {
-        return Ok(Vec::new());
+        return Ok(ChatHistoryResult { conversation_id: None, messages: Vec::new() });
     };
     let messages = db::list_chat_messages(&conn, &conversation.id).map_err(|e| e.to_string())?;
-    Ok(messages
+    let messages = messages
         .into_iter()
         .map(|m| ChatMessageDto {
             id: m.id,
@@ -797,7 +1012,8 @@ pub async fn chat_history(
             parts: serde_json::to_value(chat::parse_parts(&m.content)).unwrap_or_default(),
             created_at: m.created_at,
         })
-        .collect())
+        .collect();
+    Ok(ChatHistoryResult { conversation_id: Some(conversation.id), messages })
 }
 
 /// Map one PocketBase `chat_messages` record (read-through) to the UI DTO. Its
@@ -815,6 +1031,314 @@ fn map_remote_message(rec: &serde_json::Value) -> Option<ChatMessageDto> {
         .map(|d| d.timestamp_millis())
         .unwrap_or(0);
     Some(ChatMessageDto { id, role, seq, parts, created_at })
+}
+
+// ── Workspace (Teams) session list/create — humla-cloud#19 contract ──────────
+//
+// Workspace conversations are server-authoritative (issue #50); the desktop
+// keeps a local handle row per server conversation, whose `remote_id` maps to
+// the server record. The two routes below are PocketBase HOOKS under `/api/humla`
+// (NOT the chat service `/api/chat*`, which the prod Caddyfile routes to a
+// separate service that has no such route). PocketBase bearer token, JSON
+// bodies. Timestamps are PocketBase-native `created` / `updated`, parsed the
+// same way as the `chat_messages` read-through (`map_remote_message`).
+//
+//   GET /api/humla/chat/conversations?workspace_id=<ws>&note_id=<note>
+//     Authorization: Bearer <pb_token>
+//     → 200 { "conversations": [ {
+//           "id":            <server conversation record id>,
+//           "title":         <string, may be empty>,
+//           "breadth":       "note" | "folder" | "all",
+//           "created":       <PB datetime>,
+//           "updated":       <PB datetime>,
+//           "message_count": <int>,
+//           "created_by":    <pb user id>
+//         }, … ] }          // ordered most-recently-updated first (-updated)
+//     Membership is enforced by the token; a non-member → 403 { reason:"not_a_member", error }.
+//
+//   POST /api/humla/chat/conversations
+//     Authorization: Bearer <pb_token>
+//     Content-Type: application/json
+//     { "workspace_id": <ws>, "note_id": <note>, "breadth": "note"|"folder"|"all" }
+//     → 200 <conversation>          // FLAT object, same shape as a GET list item;
+//                                   // there is NO { "conversation": … } wrapper.
+//     The server is a DUMB creator: it creates unconditionally and honors the
+//     POST `breadth`. The no-op guard is therefore CLIENT-side (see
+//     `new_conversation_cloud`): list first, and if the most-recent session has
+//     zero messages, reuse it instead of POSTing. Errors mirror `/api/chat`'s
+//     preflight shape { reason, error }.
+//
+// Legacy merge (pre-#19): conversations that predate #19 have NO server-side note
+// association, so the per-note GET omits them until one "adopting turn" — the
+// persist route stamps `note` one-way from the send scope's note_id, only when
+// currently empty. The client therefore UNIONS the server list with local handle
+// rows for (tenant=workspace, scope_id=note) whose `remote_id` is absent from the
+// server response (dedup by remote_id — `unlisted_legacy_handles`), using the
+// local row's breadth/updated_at (title may be empty this slice). Resolving the
+// most-recent session needs no extra work: those legacy threads already exist as
+// local handle rows, so `latest_conversation` surfaces them — a legacy-only note
+// still resolves its thread, `chat_history` reads it through by `remote_id`, and
+// the first send continues it (after which the server adopts it into the list).
+//
+// Identity: metas returned to the frontend use the LOCAL handle id (reconciled by
+// `remote_id`), so history/send/breadth all key on the same id across tenants.
+//
+// 404 fallback: a self-hosted server without these routes degrades to the legacy
+// single-conversation read-through (`legacy_workspace_sessions`).
+
+/// Get-or-create the LOCAL handle row for a server conversation (issue #61),
+/// matched by `remote_id`. A new handle adopts the server's breadth; an existing
+/// one is returned untouched. Keeps server conversations from being duplicated
+/// locally as the session list reconciles them.
+fn ensure_workspace_handle(
+    conn: &rusqlite::Connection,
+    workspace: &str,
+    note_id: &str,
+    remote_id: &str,
+    breadth: &str,
+) -> Result<db::Conversation, String> {
+    if let Some(c) = db::get_conversation_by_remote_id(conn, workspace, remote_id)
+        .map_err(|e| e.to_string())?
+    {
+        return Ok(c);
+    }
+    let breadth = chat::validate_breadth(breadth).unwrap_or("note");
+    let handle = db::create_conversation(conn, workspace, CHAT_SCOPE_NOTE, note_id, breadth)
+        .map_err(|e| e.to_string())?;
+    db::set_conversation_remote_id(conn, &handle.id, remote_id).map_err(|e| e.to_string())?;
+    Ok(handle)
+}
+
+/// Parse a PocketBase timestamp to epoch-ms (0 on failure). Matches the
+/// `chat_messages` read-through's handling (`map_remote_message`) so all
+/// server-sourced dates use one parser.
+fn pb_timestamp_ms(v: Option<&serde_json::Value>) -> i64 {
+    v.and_then(|x| x.as_str())
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|d| d.timestamp_millis())
+        .unwrap_or(0)
+}
+
+/// Map one server conversation JSON to a session-list entry, reconciling it to
+/// its local handle so the returned `id` is local. Handles both the GET list
+/// items and the FLAT POST-create response (same shape).
+fn cloud_conversation_meta(
+    state: &State<AppState>,
+    workspace: &str,
+    note_id: &str,
+    item: &serde_json::Value,
+) -> Result<ConversationMeta, String> {
+    let remote_id = item
+        .get("id")
+        .and_then(|v| v.as_str())
+        .ok_or("Team chat returned a conversation without an id")?;
+    let breadth = item.get("breadth").and_then(|v| v.as_str()).unwrap_or("note");
+    let handle = {
+        let conn = state.db.lock();
+        ensure_workspace_handle(&conn, workspace, note_id, remote_id, breadth)?
+    };
+    Ok(ConversationMeta {
+        id: handle.id,
+        title: item.get("title").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+        breadth: breadth.to_string(),
+        updated_at: pb_timestamp_ms(item.get("updated")),
+        message_count: item.get("message_count").and_then(|v| v.as_i64()).unwrap_or(0),
+    })
+}
+
+/// Local workspace handles the server GET omitted — the legacy-merge core (issue
+/// #61). A handle is "unlisted" when it has a `remote_id` (so it maps to a real
+/// server conversation) that is NOT among the server's returned ids. Pure so the
+/// union/dedup logic is unit-testable without HTTP.
+fn unlisted_legacy_handles<'a>(
+    server_remote_ids: &std::collections::HashSet<String>,
+    local_handles: &'a [db::Conversation],
+) -> Vec<&'a db::Conversation> {
+    local_handles
+        .iter()
+        .filter(|h| {
+            h.remote_id
+                .as_deref()
+                .is_some_and(|rid| !server_remote_ids.contains(rid))
+        })
+        .collect()
+}
+
+/// List a workspace Note's sessions from humla-cloud (issue #61). GETs the server
+/// list (one-shot 401 re-auth, 404 → legacy fallback), reconciles each to a local
+/// handle, then UNIONS in local handles the server omitted (pre-#19 threads not
+/// yet adopted — their message count is read through). Most-recently-updated
+/// first.
+async fn list_conversations_cloud(
+    state: &State<'_, AppState>,
+    workspace: &str,
+    note_id: &str,
+) -> Result<Vec<ConversationMeta>, String> {
+    let mut attempt = 0u8;
+    let val = loop {
+        let (base, token) = super::cloud::cloud_session(state).await?;
+        let resp = reqwest::Client::new()
+            .get(format!("{}/api/humla/chat/conversations", base.trim_end_matches('/')))
+            .bearer_auth(&token)
+            .query(&[("workspace_id", workspace), ("note_id", note_id)])
+            .send()
+            .await
+            .map_err(|e| format!("Couldn't reach Team chat: {e}"))?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return legacy_workspace_sessions(state, workspace, note_id).await;
+        }
+        if status == reqwest::StatusCode::UNAUTHORIZED && attempt == 0 {
+            super::cloud::forget_session();
+            attempt += 1;
+            continue;
+        }
+        if !status.is_success() {
+            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+            let reason = body.get("reason").and_then(|r| r.as_str()).unwrap_or_default();
+            let server_msg = body.get("error").and_then(|m| m.as_str()).unwrap_or_default();
+            return Err(chat::cloud::cloud_chat_error_message(reason, server_msg));
+        }
+        break resp.json::<serde_json::Value>().await.unwrap_or_default();
+    };
+
+    let items = val.get("conversations").and_then(|c| c.as_array()).cloned().unwrap_or_default();
+    let mut metas: Vec<ConversationMeta> = Vec::with_capacity(items.len());
+    let mut server_remote_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for item in &items {
+        if let Some(rid) = item.get("id").and_then(|v| v.as_str()) {
+            server_remote_ids.insert(rid.to_string());
+        }
+        metas.push(cloud_conversation_meta(state, workspace, note_id, item)?);
+    }
+
+    // Union: local handles the server GET omitted (pre-#19, not yet adopted).
+    // Snapshot the fields we need up front so no borrow / db lock crosses the
+    // read-through `.await`.
+    let legacy: Vec<(String, String, String, i64, String)> = {
+        let conn = state.db.lock();
+        let local_handles =
+            db::list_conversations(&conn, workspace, CHAT_SCOPE_NOTE, note_id).map_err(|e| e.to_string())?;
+        unlisted_legacy_handles(&server_remote_ids, &local_handles)
+            .into_iter()
+            .map(|h| {
+                (
+                    h.id.clone(),
+                    h.remote_id.clone().unwrap_or_default(),
+                    h.breadth.clone(),
+                    h.updated_at,
+                    resolved_title(h),
+                )
+            })
+            .collect()
+    };
+    for (id, remote_id, breadth, updated_at, title) in legacy {
+        // A legacy handle has a remote_id, so it has server messages; read the
+        // real count so the no-op guard never reuses a non-empty legacy thread.
+        let message_count = super::cloud::fetch_chat_messages(state, &remote_id)
+            .await
+            .map(|r| r.len() as i64)
+            .unwrap_or(0);
+        metas.push(ConversationMeta { id, title, breadth, updated_at, message_count });
+    }
+
+    // Server list is already -updated; re-sort so merged legacy entries land in
+    // the right place (id break-ties deterministically).
+    metas.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then_with(|| b.id.cmp(&a.id)));
+    Ok(metas)
+}
+
+/// The pre-#19 fallback: the note's single workspace handle (if it exists) as a
+/// one-element session list, its message count read through from the server.
+async fn legacy_workspace_sessions(
+    state: &State<'_, AppState>,
+    workspace: &str,
+    note_id: &str,
+) -> Result<Vec<ConversationMeta>, String> {
+    let handle = {
+        let conn = state.db.lock();
+        db::latest_conversation(&conn, workspace, CHAT_SCOPE_NOTE, note_id)
+            .map_err(|e| e.to_string())?
+    };
+    let Some(handle) = handle else { return Ok(Vec::new()) };
+    let message_count = match handle.remote_id.as_deref() {
+        Some(remote_id) => {
+            super::cloud::fetch_chat_messages(state, remote_id).await.map(|r| r.len() as i64).unwrap_or(0)
+        }
+        None => 0,
+    };
+    Ok(vec![ConversationMeta {
+        title: resolved_title(&handle),
+        id: handle.id,
+        breadth: handle.breadth,
+        updated_at: handle.updated_at,
+        message_count,
+    }])
+}
+
+/// Create a workspace session via humla-cloud (issue #61). The server is a dumb
+/// creator, so the no-op guard is CLIENT-side: list first (server ∪ legacy) and,
+/// if the most-recent session is empty, reuse it instead of POSTing. Otherwise
+/// POST — inheriting breadth from the Note's most-recent workspace session, which
+/// the server honors — and reconcile the FLAT response to a local handle. A 404
+/// (route absent on an older server) is a clean error: a server-authoritative
+/// conversation can't be created without the server.
+async fn new_conversation_cloud(
+    state: &State<'_, AppState>,
+    workspace: &str,
+    note_id: &str,
+) -> Result<ConversationMeta, String> {
+    // Client-side no-op guard: reuse the empty most-recent session if there is
+    // one (the list already unions server + legacy and is most-recent-first).
+    let existing = list_conversations_cloud(state, workspace, note_id).await?;
+    if let Some(most_recent) = existing.into_iter().next() {
+        if most_recent.message_count == 0 {
+            return Ok(most_recent);
+        }
+    }
+
+    // Inherit breadth from the Note's most-recent session in THIS workspace,
+    // just like the personal path ("note" only when there's no prior session).
+    let breadth = {
+        let conn = state.db.lock();
+        inherited_breadth(&conn, workspace, note_id)
+    };
+    let body = serde_json::json!({
+        "workspace_id": workspace,
+        "note_id": note_id,
+        "breadth": breadth,
+    });
+    let mut attempt = 0u8;
+    let val = loop {
+        let (base, token) = super::cloud::cloud_session(state).await?;
+        let resp = reqwest::Client::new()
+            .post(format!("{}/api/humla/chat/conversations", base.trim_end_matches('/')))
+            .bearer_auth(&token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("Couldn't reach Team chat: {e}"))?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Err("Starting a new Team chat needs a newer server — this workspace's server \
+                        doesn't support multiple chat sessions yet."
+                .into());
+        }
+        if status == reqwest::StatusCode::UNAUTHORIZED && attempt == 0 {
+            super::cloud::forget_session();
+            attempt += 1;
+            continue;
+        }
+        if !status.is_success() {
+            let b: serde_json::Value = resp.json().await.unwrap_or_default();
+            let reason = b.get("reason").and_then(|r| r.as_str()).unwrap_or_default();
+            let server_msg = b.get("error").and_then(|m| m.as_str()).unwrap_or_default();
+            return Err(chat::cloud::cloud_chat_error_message(reason, server_msg));
+        }
+        // The POST response is the conversation object itself — no wrapper.
+        break resp.json::<serde_json::Value>().await.unwrap_or_default();
+    };
+    cloud_conversation_meta(state, workspace, note_id, &val)
 }
 
 #[cfg(test)]
@@ -856,7 +1380,7 @@ mod tests {
         let conn = db::open(&dir.path().join("heal.sqlite")).unwrap();
         let note = note_in_folder(&conn, None); // no folder
         let conv =
-            db::get_or_create_conversation(&conn, CHAT_TENANT_PERSONAL, CHAT_SCOPE_NOTE, &note.id)
+            db::create_conversation(&conn, CHAT_TENANT_PERSONAL, CHAT_SCOPE_NOTE, &note.id, "note")
                 .unwrap();
         // Simulate a breadth stored while the note still had a folder, then lost it.
         db::set_conversation_breadth(&conn, &conv.id, "folder").unwrap();
@@ -865,7 +1389,7 @@ mod tests {
         assert_eq!(effective, "note", "stale folder breadth heals to note");
         // The heal is persisted, so the chip and the request never diverge.
         let reloaded =
-            db::get_conversation(&conn, CHAT_TENANT_PERSONAL, CHAT_SCOPE_NOTE, &note.id)
+            db::latest_conversation(&conn, CHAT_TENANT_PERSONAL, CHAT_SCOPE_NOTE, &note.id)
                 .unwrap()
                 .unwrap();
         assert_eq!(reloaded.breadth, "note");
@@ -878,7 +1402,7 @@ mod tests {
         let folder = db::create_folder(&conn, "Team", "").unwrap();
         let note = note_in_folder(&conn, Some(&folder.id));
         let conv =
-            db::get_or_create_conversation(&conn, CHAT_TENANT_PERSONAL, CHAT_SCOPE_NOTE, &note.id)
+            db::create_conversation(&conn, CHAT_TENANT_PERSONAL, CHAT_SCOPE_NOTE, &note.id, "note")
                 .unwrap();
         assert_eq!(
             heal_and_read_breadth(&conn, &conv.id, "folder", &note).unwrap(),
@@ -913,6 +1437,126 @@ mod tests {
         assert!(res.is_err());
         let err = res.err().unwrap().to_string();
         assert!(err.contains("embedding model"), "clear guidance, not a raw 400: {err}");
+    }
+
+    /// A user turn (for tests that need a session to have messages).
+    fn add_user_message(conn: &rusqlite::Connection, conversation_id: &str, text: &str) {
+        db::insert_chat_message(conn, conversation_id, "user", &chat::text_parts_json("b", text))
+            .unwrap();
+    }
+
+    #[test]
+    fn first_session_defaults_breadth_to_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = db::open(&dir.path().join("first.sqlite")).unwrap();
+        // A Note with no sessions → the first new session defaults to "note".
+        let conv = new_personal_conversation(&conn, "n1").unwrap();
+        assert_eq!(conv.breadth, "note");
+        assert_eq!(db::conversation_message_count(&conn, &conv.id).unwrap(), 0);
+    }
+
+    #[test]
+    fn new_session_inherits_breadth_from_the_most_recent() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = db::open(&dir.path().join("inherit.sqlite")).unwrap();
+        let first =
+            db::create_conversation(&conn, CHAT_TENANT_PERSONAL, CHAT_SCOPE_NOTE, "n1", "note")
+                .unwrap();
+        db::set_conversation_breadth(&conn, &first.id, "all").unwrap();
+        // The most-recent session has messages, so the guard doesn't reuse it.
+        add_user_message(&conn, &first.id, "hi");
+
+        let second = new_personal_conversation(&conn, "n1").unwrap();
+        assert_ne!(second.id, first.id, "a genuinely new session was created");
+        assert_eq!(second.breadth, "all", "breadth is inherited from the most recent session");
+    }
+
+    #[test]
+    fn new_chat_no_ops_when_the_most_recent_session_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = db::open(&dir.path().join("noop.sqlite")).unwrap();
+        let first =
+            db::create_conversation(&conn, CHAT_TENANT_PERSONAL, CHAT_SCOPE_NOTE, "n1", "note")
+                .unwrap();
+        // No messages on the most-recent session → "new chat" returns it as-is.
+        let again = new_personal_conversation(&conn, "n1").unwrap();
+        assert_eq!(again.id, first.id, "an empty most-recent session is reused, not duplicated");
+        assert_eq!(
+            db::list_conversations(&conn, CHAT_TENANT_PERSONAL, CHAT_SCOPE_NOTE, "n1").unwrap().len(),
+            1,
+            "no empty duplicate session was created"
+        );
+    }
+
+    #[test]
+    fn inherited_breadth_resolves_per_tenant_for_a_workspace() {
+        // The workspace create path inherits breadth the same way as personal,
+        // scoped to the workspace tenant (issue #61 fix 2). "note" only when the
+        // Note has no prior session in that tenant.
+        let dir = tempfile::tempdir().unwrap();
+        let conn = db::open(&dir.path().join("wsbreadth.sqlite")).unwrap();
+        assert_eq!(inherited_breadth(&conn, "wsA", "n1"), "note", "first-ever session defaults to note");
+        let conv =
+            db::create_conversation(&conn, "wsA", CHAT_SCOPE_NOTE, "n1", "note").unwrap();
+        db::set_conversation_breadth(&conn, &conv.id, "all").unwrap();
+        assert_eq!(inherited_breadth(&conn, "wsA", "n1"), "all", "inherits the workspace session's breadth");
+        // A different tenant's breadth doesn't leak across.
+        assert_eq!(inherited_breadth(&conn, CHAT_TENANT_PERSONAL, "n1"), "note");
+    }
+
+    #[test]
+    fn resolve_existing_rejects_a_cross_scope_conversation_id() {
+        // An explicit id from another Note/tenant must be a clean error, never a
+        // silent cross-scope operation (issue #61 fix 3).
+        let dir = tempfile::tempdir().unwrap();
+        let conn = db::open(&dir.path().join("xscope.sqlite")).unwrap();
+        let n1 = db::create_conversation(&conn, CHAT_TENANT_PERSONAL, CHAT_SCOPE_NOTE, "n1", "note").unwrap();
+
+        // Matching (tenant, note) resolves.
+        let ok = resolve_existing(&conn, CHAT_TENANT_PERSONAL, "n1", Some(&n1.id)).unwrap();
+        assert_eq!(ok.unwrap().id, n1.id);
+        // Wrong note → error.
+        assert!(resolve_existing(&conn, CHAT_TENANT_PERSONAL, "n2", Some(&n1.id)).is_err());
+        // Wrong tenant → error.
+        assert!(resolve_existing(&conn, "wsA", "n1", Some(&n1.id)).is_err());
+        // An unknown id is not an error — falls back to the active session (None).
+        assert!(resolve_existing(&conn, CHAT_TENANT_PERSONAL, "n1", Some("missing")).unwrap().is_none());
+    }
+
+    #[test]
+    fn unlisted_legacy_handles_unions_only_the_server_omitted_remote_ids() {
+        // Legacy-merge core (issue #61 fix 5): surface local handles whose
+        // remote_id the server GET omitted, deduped by remote_id; skip handles
+        // already in the server list and handles with no remote_id (never sent).
+        fn handle(id: &str, remote: Option<&str>) -> db::Conversation {
+            db::Conversation {
+                id: id.to_string(),
+                scope: CHAT_SCOPE_NOTE.to_string(),
+                scope_id: "n1".to_string(),
+                tenant: "wsA".to_string(),
+                remote_id: remote.map(String::from),
+                breadth: "note".to_string(),
+                title: None,
+                created_at: 0,
+                updated_at: 0,
+            }
+        }
+        let local = vec![
+            handle("h_srv", Some("srv1")),  // already in server list → skip
+            handle("h_legacy", Some("srv2")), // server omitted → surface
+            handle("h_unsent", None),        // never sent (no remote_id) → skip
+        ];
+        let server_ids: std::collections::HashSet<String> = ["srv1".to_string()].into_iter().collect();
+        let unlisted = unlisted_legacy_handles(&server_ids, &local);
+        assert_eq!(unlisted.len(), 1, "only the server-omitted, remote-id'd handle");
+        assert_eq!(unlisted[0].id, "h_legacy");
+
+        // Empty server list → every remote-id'd handle is legacy; the unsent one
+        // is still skipped.
+        let none: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let unlisted = unlisted_legacy_handles(&none, &local);
+        let ids: Vec<&str> = unlisted.iter().map(|h| h.id.as_str()).collect();
+        assert_eq!(ids, vec!["h_srv", "h_legacy"]);
     }
 
     /// Cross-repo round-trip of a real workspace `chat_send` against a live

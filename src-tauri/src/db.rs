@@ -160,10 +160,14 @@ pub fn open(path: &Path) -> Result<Connection> {
             created_at  INTEGER NOT NULL,
             updated_at  INTEGER NOT NULL
         );
-        -- One conversation per (tenant, scope, scope_id) — e.g. one Personal
-        -- chat per Note. The get-or-create path relies on this uniqueness.
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_conversations_scope
-            ON conversations(tenant, scope, scope_id);
+        -- Multiple conversations ("sessions") per (tenant, scope, scope_id) are
+        -- allowed since #61: the active one is the most-recently-updated row, and
+        -- an explicit command creates a fresh one. The old UNIQUE index
+        -- `idx_conversations_scope` that enforced one-per-scope is dropped below
+        -- (idempotent migration); this non-unique index (a DIFFERENT name, so the
+        -- DROP can't clobber it) keeps the most-recent lookup cheap.
+        CREATE INDEX IF NOT EXISTS idx_conversations_recent
+            ON conversations(tenant, scope, scope_id, updated_at DESC);
 
         CREATE TABLE IF NOT EXISTS messages (
             id              TEXT PRIMARY KEY,
@@ -293,6 +297,21 @@ pub fn open(path: &Path) -> Result<Connection> {
         "ALTER TABLE conversations ADD COLUMN breadth TEXT NOT NULL DEFAULT 'note'",
         [],
     );
+    // Chat sessions (issue #61). Two idempotent steps:
+    //   1. Drop the old UNIQUE index that pinned one conversation per
+    //      (tenant, scope, scope_id) — sessions need many per scope now. IF
+    //      EXISTS makes this a no-op on fresh DBs and on reruns.
+    //   2. Add a nullable `title` column. Nullable (no default) so a freshly
+    //      created conversation carries NULL until its first user message sets
+    //      it (`set_conversation_title`); the backfill below fills legacy rows.
+    let _ = conn.execute("DROP INDEX IF EXISTS idx_conversations_scope", []);
+    let _ = conn.execute("ALTER TABLE conversations ADD COLUMN title TEXT", []);
+    // Back-fill titles for pre-#61 conversations ONCE — guarded by a settings
+    // flag inside the fn so it can't re-run on later launches (that would
+    // date-title empty conversations created after the migration and block their
+    // first-message title). Existing threads keep their identity: title derived
+    // from the oldest user message, date fallback when empty.
+    backfill_conversation_titles(&conn)?;
     // Index is created AFTER the ALTERs so it's safe on both fresh DBs and
     // older DBs that needed the column added.
     conn.execute(
@@ -928,6 +947,10 @@ pub struct Conversation {
     /// single source of truth for the Scope chip; a live filter on retrieval
     /// within the conversation, not a conversation-identity dimension.
     pub breadth: String,
+    /// Session title (issue #61). NULL until the first user message sets it
+    /// (personal scope) or the migration back-fills it; the session list falls
+    /// back to a derived date label when it's still absent.
+    pub title: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -953,17 +976,21 @@ fn map_conversation(row: &rusqlite::Row) -> rusqlite::Result<Conversation> {
         tenant: row.get(3)?,
         remote_id: row.get(4)?,
         breadth: row.get(5)?,
-        created_at: row.get(6)?,
-        updated_at: row.get(7)?,
+        title: row.get(6)?,
+        created_at: row.get(7)?,
+        updated_at: row.get(8)?,
     })
 }
 
 const CONVERSATION_COLS: &str =
-    "id, scope, scope_id, tenant, remote_id, breadth, created_at, updated_at";
+    "id, scope, scope_id, tenant, remote_id, breadth, title, created_at, updated_at";
 
-/// The existing conversation for a scope, or None. Used to reload history
-/// without creating an empty conversation just for opening the Chat tab.
-pub fn get_conversation(
+/// The most-recently-updated conversation ("active session") for a scope, or
+/// None (issue #61). This replaces the old get-or-create: opening the Chat tab
+/// resolves the active session with this and never creates a row as a side
+/// effect. `updated_at` is bumped on every message append, so the newest thread
+/// wins; `created_at` then `id` break ties deterministically.
+pub fn latest_conversation(
     conn: &Connection,
     tenant: &str,
     scope: &str,
@@ -971,7 +998,8 @@ pub fn get_conversation(
 ) -> Result<Option<Conversation>> {
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT {CONVERSATION_COLS} FROM conversations
-         WHERE tenant = ?1 AND scope = ?2 AND scope_id = ?3",
+         WHERE tenant = ?1 AND scope = ?2 AND scope_id = ?3
+         ORDER BY updated_at DESC, created_at DESC, id DESC LIMIT 1",
     ))?;
     match stmt.query_row(params![tenant, scope, scope_id], map_conversation) {
         Ok(c) => Ok(Some(c)),
@@ -980,27 +1008,139 @@ pub fn get_conversation(
     }
 }
 
-/// Get the conversation for a scope, creating it lazily if absent. The unique
-/// index on (tenant, scope, scope_id) makes this the single conversation for a
-/// Note — there is no conversation-list / "new chat" concept in this slice.
-pub fn get_or_create_conversation(
+/// All conversations for a scope, most-recently-updated first (issue #61) — the
+/// backing query for the session list.
+pub fn list_conversations(
     conn: &Connection,
     tenant: &str,
     scope: &str,
     scope_id: &str,
-) -> Result<Conversation> {
-    if let Some(c) = get_conversation(conn, tenant, scope, scope_id)? {
-        return Ok(c);
+) -> Result<Vec<Conversation>> {
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {CONVERSATION_COLS} FROM conversations
+         WHERE tenant = ?1 AND scope = ?2 AND scope_id = ?3
+         ORDER BY updated_at DESC, created_at DESC, id DESC",
+    ))?;
+    let rows = stmt
+        .query_map(params![tenant, scope, scope_id], map_conversation)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// One conversation by its primary key, or None (issue #61). Used to resolve an
+/// explicit `conversation_id` from the frontend.
+pub fn get_conversation_by_id(conn: &Connection, id: &str) -> Result<Option<Conversation>> {
+    let mut stmt = conn
+        .prepare_cached(&format!("SELECT {CONVERSATION_COLS} FROM conversations WHERE id = ?1"))?;
+    match stmt.query_row(params![id], map_conversation) {
+        Ok(c) => Ok(Some(c)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
     }
+}
+
+/// The workspace handle whose `remote_id` maps to a given server conversation
+/// (issue #61). Lets the session-list reconcile server-authoritative workspace
+/// conversations back to their local handle rows without duplicating them.
+pub fn get_conversation_by_remote_id(
+    conn: &Connection,
+    tenant: &str,
+    remote_id: &str,
+) -> Result<Option<Conversation>> {
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {CONVERSATION_COLS} FROM conversations WHERE tenant = ?1 AND remote_id = ?2",
+    ))?;
+    match stmt.query_row(params![tenant, remote_id], map_conversation) {
+        Ok(c) => Ok(Some(c)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Create a fresh conversation with an explicit initial breadth (issue #61),
+/// returning the inserted row. Title starts NULL (set from the first user
+/// message); remote_id starts NULL (set later for a workspace handle).
+pub fn create_conversation(
+    conn: &Connection,
+    tenant: &str,
+    scope: &str,
+    scope_id: &str,
+    breadth: &str,
+) -> Result<Conversation> {
     let id = uuid::Uuid::new_v4().to_string();
     let now = now_ms();
     conn.execute(
-        "INSERT INTO conversations (id, scope, scope_id, tenant, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
-        params![id, scope, scope_id, tenant, now],
+        "INSERT INTO conversations (id, scope, scope_id, tenant, breadth, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+        params![id, scope, scope_id, tenant, breadth, now],
     )?;
-    get_conversation(conn, tenant, scope, scope_id)?
+    get_conversation_by_id(conn, &id)?
         .ok_or_else(|| anyhow::anyhow!("conversation vanished after insert"))
+}
+
+/// Number of persisted messages in a conversation (issue #61) — feeds the
+/// session-list `message_count` and the new-chat no-op guard.
+pub fn conversation_message_count(conn: &Connection, conversation_id: &str) -> Result<i64> {
+    let mut stmt = conn
+        .prepare_cached("SELECT COUNT(*) FROM messages WHERE conversation_id = ?1")?;
+    Ok(stmt.query_row(params![conversation_id], |r| r.get(0))?)
+}
+
+/// Set a conversation's title (issue #61). Personal scope sets this once from
+/// the first user message at send time; the migration back-fill also calls it.
+pub fn set_conversation_title(conn: &Connection, id: &str, title: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE conversations SET title = ?1 WHERE id = ?2",
+        params![title, id],
+    )?;
+    Ok(())
+}
+
+/// Back-fill titles for conversations that predate the `title` column (issue
+/// #61). For each NULL-title row, derive a title from its oldest user message
+/// (whitespace-collapsed, char-boundary-truncated) or a date fallback when the
+/// conversation has no user message.
+///
+/// Guarded by a one-time `chat_titles_backfilled_v1` flag (the repo's migration-
+/// flag pattern) so it runs EXACTLY ONCE, not on every launch. Running it every
+/// open would date-title empty conversations created after the migration, and
+/// that non-NULL date title would then block the send-time message-derived
+/// title. After the one run, conversations created later keep NULL title until
+/// their first user message sets it.
+fn backfill_conversation_titles(conn: &Connection) -> Result<()> {
+    const FLAG: &str = "chat_titles_backfilled_v1";
+    if get_setting(conn, FLAG)?.as_deref() == Some("true") {
+        return Ok(());
+    }
+    let pending: Vec<(String, i64)> = {
+        let mut stmt =
+            conn.prepare("SELECT id, created_at FROM conversations WHERE title IS NULL")?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    for (conv_id, created_at) in pending {
+        let content: Option<String> = conn
+            .query_row(
+                "SELECT content FROM messages WHERE conversation_id = ?1 AND role = 'user'
+                 ORDER BY seq LIMIT 1",
+                params![conv_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let text = content.map(|c| crate::chat::parts_plain_text(&c));
+        let title = crate::chat::derive_title(
+            text.as_deref().filter(|t| !t.trim().is_empty()),
+            created_at,
+        );
+        conn.execute(
+            "UPDATE conversations SET title = ?1 WHERE id = ?2",
+            params![title, conv_id],
+        )?;
+    }
+    set_setting(conn, FLAG, "true")?;
+    Ok(())
 }
 
 /// Record the humla-cloud conversation record id for a workspace conversation
@@ -1865,16 +2005,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let conn = open(&dir.path().join("conv.sqlite")).unwrap();
 
-        let personal = get_or_create_conversation(&conn, CHAT_TENANT_PERSONAL, CHAT_SCOPE_NOTE, "note1").unwrap();
-        let workspace = get_or_create_conversation(&conn, "wsA", CHAT_SCOPE_NOTE, "note1").unwrap();
+        let personal = create_conversation(&conn, CHAT_TENANT_PERSONAL, CHAT_SCOPE_NOTE, "note1", "note").unwrap();
+        let workspace = create_conversation(&conn, "wsA", CHAT_SCOPE_NOTE, "note1", "note").unwrap();
         assert_ne!(personal.id, workspace.id, "same Note, different tenant → distinct conversations");
         assert!(workspace.remote_id.is_none(), "no server id until the first turn");
 
         set_conversation_remote_id(&conn, &workspace.id, "srvConv123").unwrap();
-        let reloaded = get_conversation(&conn, "wsA", CHAT_SCOPE_NOTE, "note1").unwrap().unwrap();
+        let reloaded = latest_conversation(&conn, "wsA", CHAT_SCOPE_NOTE, "note1").unwrap().unwrap();
         assert_eq!(reloaded.remote_id.as_deref(), Some("srvConv123"));
+        // Round-trips by its server id too (the workspace session-list reconcile).
+        let by_remote = get_conversation_by_remote_id(&conn, "wsA", "srvConv123").unwrap().unwrap();
+        assert_eq!(by_remote.id, workspace.id);
         // The personal conversation is untouched by the workspace one's remote id.
-        let personal_reload = get_conversation(&conn, CHAT_TENANT_PERSONAL, CHAT_SCOPE_NOTE, "note1").unwrap().unwrap();
+        let personal_reload = latest_conversation(&conn, CHAT_TENANT_PERSONAL, CHAT_SCOPE_NOTE, "note1").unwrap().unwrap();
         assert!(personal_reload.remote_id.is_none());
     }
 
@@ -1889,12 +2032,12 @@ mod tests {
         let conv_id = {
             let conn = open(&path).unwrap();
             let conv =
-                get_or_create_conversation(&conn, CHAT_TENANT_PERSONAL, CHAT_SCOPE_NOTE, "note1")
+                create_conversation(&conn, CHAT_TENANT_PERSONAL, CHAT_SCOPE_NOTE, "note1", "note")
                     .unwrap();
             assert_eq!(conv.breadth, "note", "new conversations default to note breadth");
             set_conversation_breadth(&conn, &conv.id, "all").unwrap();
             let reloaded =
-                get_conversation(&conn, CHAT_TENANT_PERSONAL, CHAT_SCOPE_NOTE, "note1")
+                latest_conversation(&conn, CHAT_TENANT_PERSONAL, CHAT_SCOPE_NOTE, "note1")
                     .unwrap()
                     .unwrap();
             assert_eq!(reloaded.breadth, "all", "the stored breadth round-trips");
@@ -1903,11 +2046,105 @@ mod tests {
         // Re-open the same DB file: migrations must be idempotent and the stored
         // breadth must not be reset by the (repeated) ALTER TABLE.
         let conn = open(&path).unwrap();
-        let reloaded = get_conversation(&conn, CHAT_TENANT_PERSONAL, CHAT_SCOPE_NOTE, "note1")
+        let reloaded = latest_conversation(&conn, CHAT_TENANT_PERSONAL, CHAT_SCOPE_NOTE, "note1")
             .unwrap()
             .unwrap();
         assert_eq!(reloaded.id, conv_id);
         assert_eq!(reloaded.breadth, "all", "breadth survives a re-open (idempotent migration)");
+    }
+
+    /// Migration idempotency + first-session preservation (issue #61). Seeds a
+    /// pre-#61 DB — the old UNIQUE `idx_conversations_scope`, no `title` column,
+    /// a conversation with a user message and an empty one — then runs `open()`
+    /// (the migrations) twice and asserts: the unique index is dropped, titles
+    /// back-fill (from the oldest user message, char-truncated; date fallback for
+    /// the empty one), and the existing thread is preserved as the note's single
+    /// (first) session. Reopening is a no-op on already-titled rows.
+    #[test]
+    fn migration_drops_unique_index_and_backfills_titles_idempotently() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mig.sqlite");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE conversations (
+                    id TEXT PRIMARY KEY, scope TEXT NOT NULL, scope_id TEXT NOT NULL,
+                    tenant TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+                    remote_id TEXT, breadth TEXT NOT NULL DEFAULT 'note'
+                );
+                CREATE UNIQUE INDEX idx_conversations_scope
+                    ON conversations(tenant, scope, scope_id);
+                CREATE TABLE messages (
+                    id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, seq INTEGER NOT NULL,
+                    role TEXT NOT NULL, content TEXT NOT NULL, created_at INTEGER NOT NULL
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO conversations (id, scope, scope_id, tenant, created_at, updated_at)
+                 VALUES ('conv1','note','n1','personal',1000,2000)",
+                [],
+            )
+            .unwrap();
+            let parts = crate::chat::text_parts_json("b0", "  Discuss the Q3 roadmap  and next steps ");
+            conn.execute(
+                "INSERT INTO messages (id, conversation_id, seq, role, content, created_at)
+                 VALUES ('m1','conv1',0,'user',?1,1500)",
+                params![parts],
+            )
+            .unwrap();
+            // An empty conversation (no messages) → date fallback from created_at.
+            conn.execute(
+                "INSERT INTO conversations (id, scope, scope_id, tenant, created_at, updated_at)
+                 VALUES ('conv2','note','n2','personal',0,0)",
+                [],
+            )
+            .unwrap();
+        }
+
+        // Run migrations twice — must be idempotent.
+        for _ in 0..2 {
+            let conn = open(&path).unwrap();
+            let has_unique: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type = 'index' AND name = 'idx_conversations_scope'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(has_unique, 0, "the old unique index is dropped");
+        }
+
+        let conn = open(&path).unwrap();
+        // Title back-filled from the oldest user message: whitespace collapsed.
+        let conv1 = get_conversation_by_id(&conn, "conv1").unwrap().unwrap();
+        assert_eq!(conv1.title.as_deref(), Some("Discuss the Q3 roadmap and next steps"));
+        // The existing thread is preserved as the note's single (first) session.
+        let latest = latest_conversation(&conn, "personal", "note", "n1").unwrap().unwrap();
+        assert_eq!(latest.id, "conv1");
+        assert_eq!(list_conversations(&conn, "personal", "note", "n1").unwrap().len(), 1);
+        // The empty conversation gets the date fallback (created_at = epoch 0).
+        let conv2 = get_conversation_by_id(&conn, "conv2").unwrap().unwrap();
+        assert_eq!(conv2.title.as_deref(), Some("Chat 1970-01-01"));
+
+        // The backfill ran ONCE and set its flag.
+        assert_eq!(get_setting(&conn, "chat_titles_backfilled_v1").unwrap().as_deref(), Some("true"));
+
+        // A conversation created AFTER the backfill flag is set must NOT be
+        // date-titled by a later launch — it keeps NULL title until its first
+        // user message titles it (the hazard fix).
+        let fresh = create_conversation(&conn, "personal", "note", "n3", "note").unwrap();
+        assert!(fresh.title.is_none(), "a new empty conversation starts untitled");
+        drop(conn);
+        let conn = open(&path).unwrap(); // reopen: backfill is skipped by the flag
+        let fresh = get_conversation_by_id(&conn, &fresh.id).unwrap().unwrap();
+        assert!(fresh.title.is_none(), "reopen must not date-title a post-migration conversation");
+        // First user message titles it (mirrors chat_send's send-time titling).
+        let title = crate::chat::derive_title(Some("What is the plan?"), fresh.created_at);
+        set_conversation_title(&conn, &fresh.id, &title).unwrap();
+        let titled = get_conversation_by_id(&conn, &fresh.id).unwrap().unwrap();
+        assert_eq!(titled.title.as_deref(), Some("What is the plan?"), "message-derived title, not a date");
     }
 
     #[test]

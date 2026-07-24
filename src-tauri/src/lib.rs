@@ -353,6 +353,8 @@ where
             commands::summarize_note,
             commands::chat_send,
             commands::chat_history,
+            commands::chat_list_conversations,
+            commands::chat_new_conversation,
             commands::chat_set_breadth,
             commands::chat_get_breadth,
             commands::chat_reindex_note,
