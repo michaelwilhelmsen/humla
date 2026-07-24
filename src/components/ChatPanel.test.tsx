@@ -411,6 +411,112 @@ describe("ChatPanel scope breadth (#58)", () => {
   });
 });
 
+describe("ChatPanel accessibility + contrast (#64)", () => {
+  it("exposes the message area as an aria-live log", async () => {
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () => history([userMsg("q"), assistantMsg("a")]),
+    });
+    renderPanel();
+    await screen.findByText("a");
+    const log = screen.getByRole("log");
+    expect(log).toHaveAttribute("aria-live", "polite");
+  });
+
+  it("renders messages as a list with visually-hidden author labels", async () => {
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () => history([userMsg("my question"), assistantMsg("the answer")]),
+    });
+    renderPanel();
+    await screen.findByText("the answer");
+    expect(screen.getByRole("list")).toBeInTheDocument();
+    expect(screen.getAllByRole("listitem")).toHaveLength(2);
+    // Authorship never depends on colour/alignment alone.
+    expect(screen.getByText("You:")).toBeInTheDocument();
+    expect(screen.getByText("Assistant:")).toBeInTheDocument();
+  });
+
+  it("gives the composer textarea an accessible name", async () => {
+    mockTauri({ provider_key_get: () => "sk-test", chat_history: () => history() });
+    renderPanel();
+    expect(
+      await screen.findByRole("textbox", { name: /ask about your notes/i }),
+    ).toBeInTheDocument();
+  });
+
+  it("focuses the composer when the pane is ready", async () => {
+    mockTauri({ provider_key_get: () => "sk-test", chat_history: () => history() });
+    renderPanel();
+    const input = await screen.findByRole("textbox", { name: /ask about your notes/i });
+    await waitFor(() => expect(document.activeElement).toBe(input));
+  });
+
+  it("returns focus to the composer after starting a new chat", async () => {
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () => history([userMsg("q"), assistantMsg("a")]),
+      chat_list_conversations: () => [
+        { id: "c1", title: "First", breadth: "note", updatedAt: 5, messageCount: 2 },
+      ],
+      chat_new_conversation: () => ({
+        id: "c2",
+        title: "",
+        breadth: "note",
+        updatedAt: 9,
+        messageCount: 0,
+      }),
+    });
+    const controls = renderWithControls();
+    await screen.findByText("a");
+    await waitFor(() => expect(controls.current).not.toBeNull());
+    await act(async () => {
+      await controls.current!.newChat();
+    });
+    const input = screen.getByRole("textbox", { name: /ask about your notes/i });
+    await waitFor(() => expect(document.activeElement).toBe(input));
+  });
+
+  it("uses the muted (not disabled) placeholder colour on the composer", async () => {
+    mockTauri({ provider_key_get: () => "sk-test", chat_history: () => history() });
+    renderPanel();
+    const input = await screen.findByRole("textbox", { name: /ask about your notes/i });
+    expect(input.className).toContain("placeholder:text-[var(--color-text-muted)]");
+    expect(input.className).not.toContain("text-disabled");
+  });
+
+  it("marks the log busy during a bulk load and clears it once messages land", async () => {
+    // Hold the initial history load open so the bulk-load window is observable.
+    let releaseHistory: (() => void) | null = null;
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () =>
+        new Promise((resolve) => {
+          releaseHistory = () => resolve({ conversationId: null, messages: [] });
+        }),
+    });
+    renderPanel();
+    const log = await screen.findByRole("log");
+    // Busy while the wholesale list load is pending — SR defers announcing it.
+    expect(log).toHaveAttribute("aria-busy", "true");
+    await act(async () => {
+      releaseHistory?.();
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(log).toHaveAttribute("aria-busy", "false"));
+  });
+
+  it("gives the composer a visible focus-within treatment", async () => {
+    mockTauri({ provider_key_get: () => "sk-test", chat_history: () => history() });
+    renderPanel();
+    const input = await screen.findByRole("textbox", { name: /ask about your notes/i });
+    // The textarea has no native outline, so its wrapper shows focus.
+    expect(input.parentElement?.className).toContain(
+      "focus-within:border-[var(--color-text-muted)]",
+    );
+  });
+});
+
 describe("ChatPanel composer breadth + chrome (#63)", () => {
   it("shows the current breadth on the composer trigger (not just inside the popover)", async () => {
     mockTauri({
