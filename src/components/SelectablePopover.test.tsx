@@ -186,6 +186,24 @@ describe("SelectablePopover", () => {
     expect(document.activeElement).toBe(outside);
   });
 
+  it("renders an optional leading icon in menu rows (#69)", () => {
+    const withIcons = [
+      { id: "c1", label: "This note", icon: <span data-testid="row-icon" /> },
+      { id: "c2", label: "All notes", icon: <span data-testid="row-icon" /> },
+    ];
+    render(
+      <SelectablePopover
+        ariaLabel="Chat scope"
+        trigger={<span>This note</span>}
+        items={withIcons}
+        activeId="c1"
+        onSelect={vi.fn()}
+      />,
+    );
+    open("Chat scope");
+    expect(screen.getAllByTestId("row-icon")).toHaveLength(2);
+  });
+
   it("is a plain checkmark menu when no edit callbacks are given (Scope-popover mode)", () => {
     render(
       <SelectablePopover ariaLabel="Scope" trigger={<span>All notes</span>} items={items} activeId="c1" onSelect={vi.fn()} />,

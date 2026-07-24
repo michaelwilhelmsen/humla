@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { relativeTime, conversationTitle } from "./chatSessions";
+import { relativeTime, conversationTitle, usageTone } from "./chatSessions";
 
 const NOW = new Date("2026-07-24T12:00:00").getTime();
 const secs = (n: number) => NOW - n * 1000;
@@ -70,5 +70,28 @@ describe("conversationTitle", () => {
   it("falls back to 'New chat' for an empty or whitespace title", () => {
     expect(conversationTitle({ title: "" })).toBe("New chat");
     expect(conversationTitle({ title: "   " })).toBe("New chat");
+  });
+});
+
+describe("usageTone", () => {
+  it("stays default below 70%", () => {
+    expect(usageTone(0, 100)).toBe("default");
+    expect(usageTone(69, 100)).toBe("default");
+  });
+
+  it("warns from 70% to 89%", () => {
+    expect(usageTone(70, 100)).toBe("warning");
+    expect(usageTone(89, 100)).toBe("warning");
+  });
+
+  it("goes danger at 90% and once used reaches or passes the cap", () => {
+    expect(usageTone(90, 100)).toBe("danger");
+    expect(usageTone(100, 100)).toBe("danger");
+    expect(usageTone(5, 3)).toBe("danger");
+  });
+
+  it("is default for a non-positive cap (total edge)", () => {
+    expect(usageTone(0, 0)).toBe("default");
+    expect(usageTone(2, 0)).toBe("default");
   });
 });

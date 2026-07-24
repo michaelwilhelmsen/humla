@@ -39,3 +39,16 @@ export function relativeTime(ts: number, now: number = Date.now()): string {
 export function conversationTitle(meta: { title: string }): string {
   return meta.title.trim() || "New chat";
 }
+
+// The colour tone for the usage meter by fraction of allowance consumed (#69):
+// default below 70%, warning at 70–89%, danger at >=90% (and once used >= cap).
+// A non-positive cap has no meaningful fraction → default (shouldn't happen for
+// a metered workspace, but keeps the function total).
+export type UsageTone = "default" | "warning" | "danger";
+export function usageTone(used: number, cap: number): UsageTone {
+  if (cap <= 0) return "default";
+  const ratio = used / cap;
+  if (used >= cap || ratio >= 0.9) return "danger";
+  if (ratio >= 0.7) return "warning";
+  return "default";
+}

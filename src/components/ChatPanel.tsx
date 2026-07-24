@@ -8,6 +8,8 @@ import {
   ChevronDown,
   CornerDownLeft,
   FileText,
+  Files,
+  Folder,
   Loader2,
   MessageCircle,
   Settings2,
@@ -28,6 +30,7 @@ import { useNotesStore } from "../lib/store";
 import { useCloudStore } from "../lib/cloud";
 import { useChatReadiness } from "./provider/useChatReadiness";
 import { SelectablePopover, type PopoverItem } from "./SelectablePopover";
+import { usageTone } from "../lib/chatSessions";
 import { RECOMMENDED_OLLAMA_MODEL } from "../lib/localModels";
 import { CommandSnippet } from "./CommandSnippet";
 import { cn } from "../lib/cn";
@@ -691,7 +694,18 @@ export function ChatPanel({
             folderName={folder?.name ?? null}
           />
           {usage && (
-            <span className="text-xs text-[var(--color-text-muted)] tabular-nums">
+            <span
+              className={cn(
+                "text-xs tabular-nums",
+                // Colour-only status by fraction consumed (#69) — AAA on the
+                // panel surface in both themes. Size/weight unchanged.
+                {
+                  default: "text-[var(--color-text-muted)]",
+                  warning: "text-[var(--color-status-warning)]",
+                  danger: "text-[var(--color-status-danger)]",
+                }[usageTone(usage.used, usage.cap)],
+              )}
+            >
               {usage.used}/{usage.cap} turns
             </span>
           )}
@@ -716,14 +730,24 @@ function BreadthPicker({
   onScope: (s: ChatScope) => void;
   folderName: string | null;
 }) {
+  // Per-scope icons so the options read at a glance (#69). Colour inherited.
   const items: PopoverItem[] = [
-    { id: "note", label: "This note" },
-    ...(folderName ? [{ id: "folder", label: `Folder: ${folderName}` }] : []),
-    { id: "all", label: "All notes" },
+    { id: "note", label: "This note", icon: <FileText size={14} strokeWidth={1.7} aria-hidden="true" /> },
+    ...(folderName
+      ? [
+          {
+            id: "folder",
+            label: `Folder: ${folderName}`,
+            icon: <Folder size={14} strokeWidth={1.7} aria-hidden="true" />,
+          },
+        ]
+      : []),
+    { id: "all", label: "All notes", icon: <Files size={14} strokeWidth={1.7} aria-hidden="true" /> },
   ];
   // If the folder disappears while "folder" is selected, fall back to "note".
   const activeId = scope === "folder" && !folderName ? "note" : scope;
-  const label = items.find((i) => i.id === activeId)?.label ?? "This note";
+  const active = items.find((i) => i.id === activeId);
+  const label = active?.label ?? "This note";
 
   return (
     <SelectablePopover
@@ -733,6 +757,7 @@ function BreadthPicker({
       onSelect={(id) => onScope((id as ChatScope) ?? "note")}
       trigger={
         <span className="inline-flex items-center gap-1 text-xs text-[var(--color-text-muted)] cursor-pointer hover:text-[var(--color-text)] transition-colors">
+          {active?.icon}
           {label}
           <ChevronDown size={12} strokeWidth={2} aria-hidden="true" className="shrink-0" />
         </span>

@@ -764,4 +764,31 @@ describe("ChatPanel turn allowance (#69)", () => {
     // The failed send took the catch path — the meter is not refreshed.
     expect(usageCalls).toBe(callsAfterMount);
   });
+
+  it("colours the meter with the danger tone at the cap (#69)", async () => {
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () => history(),
+      chat_usage: () => ({ used: 3, cap: 3, periodEnd: 0 }),
+    });
+    signIntoWorkspace("Acme Team");
+    renderPanel();
+    const meter = await screen.findByText("3/3 turns");
+    expect(meter.className).toContain("text-[var(--color-status-danger)]");
+  });
+});
+
+describe("ChatPanel breadth icons (#69)", () => {
+  it("shows the active scope's icon on the breadth trigger", async () => {
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () => history(),
+      chat_get_breadth: () => "all",
+    });
+    renderPanel();
+    const trigger = await screen.findByRole("button", { name: "Chat scope" });
+    await waitFor(() => expect(trigger).toHaveTextContent("All notes"));
+    // "All notes" → the Files glyph (distinct from FileText / ChevronDown).
+    expect(trigger.querySelector(".lucide-files")).not.toBeNull();
+  });
 });
