@@ -22,6 +22,7 @@ import {
   MessageSquare,
   MoreHorizontal,
   PanelRight,
+  Plus,
   RefreshCw,
   Sparkles,
   Users,
@@ -37,8 +38,9 @@ import { SpeakerLabels, speakerColorMap } from "../components/SpeakerLabels";
 import { RecordingSessions } from "../components/RecordingSessions";
 import { groupTimeline, resolveActivePill, formatSessionCaption } from "../lib/sessions";
 import { RecordingBar } from "../components/RecordingBar";
-import { ChatPanel } from "../components/ChatPanel";
+import { ChatPanel, type ChatSessionControls } from "../components/ChatPanel";
 import { SelectablePopover } from "../components/SelectablePopover";
+import { conversationTitle, relativeTime } from "../lib/chatSessions";
 import type { LayoutOutletContext } from "../components/Layout";
 import { SkeletonLines } from "../components/Skeleton";
 import { NoteEditor } from "../components/Editor";
@@ -127,6 +129,11 @@ export function Note() {
   const [thinkingExpanded, setThinkingExpanded] = useState<boolean>(true);
   const [panelOpen, setPanelOpen] = useState<boolean>(true);
   const [activeTab, setActiveTab] = useState<"summary" | "transcript" | "chat">("summary");
+  // Chat session chrome for the panel header (issue #62). ChatPanel owns all
+  // chat state and publishes this projection up; the header's +/history buttons
+  // render purely from it. null = no chat chrome (provider not ready / no tab).
+  const [chatControls, setChatControls] = useState<ChatSessionControls | null>(null);
+  const handleChatControls = useCallback((c: ChatSessionControls | null) => setChatControls(c), []);
   const [panelWidth, setPanelWidth] = useState<number>(() => {
     const saved = typeof localStorage !== "undefined" ? Number(localStorage.getItem("humla.panelWidth")) : NaN;
     return saved >= 320 && saved <= 720 ? saved : 440;
@@ -831,6 +838,9 @@ export function Note() {
                 Chat
               </button>
             </div>
+            {activeTab === "chat" && chatControls?.noteId === draft.id && (
+              <ChatHistoryControls controls={chatControls} />
+            )}
             <button
               type="button"
               onClick={() => setPanelOpen(false)}
@@ -919,7 +929,7 @@ export function Note() {
                 )}
               </div>
             ) : activeTab === "chat" ? (
-              <ChatPanel noteId={draft.id} />
+              <ChatPanel noteId={draft.id} onControls={handleChatControls} />
             ) : (
               <div className="flex-1 min-h-0 flex flex-col px-4 py-4">
                 <div className="flex flex-wrap items-center gap-2 mb-4 shrink-0">
@@ -1341,6 +1351,52 @@ function FolderPicker({
 }
 
 // Per-Note Client picker (issue #43). Built on the reusable
+// Chat session chrome for the panel header (issue #62): a "+" that starts a
+// fresh conversation and a history button opening a popover of this Note's
+// conversations (title + relative date, most recent first, current one marked).
+// Selecting one loads it. The history button is hidden for a lone empty
+// conversation — the panel decides that via `canBrowseHistory`. All state lives
+// in ChatPanel; this only renders the projection it publishes.
+function ChatHistoryControls({ controls }: { controls: ChatSessionControls }) {
+  const { conversations, activeConversationId, canBrowseHistory, newChat, openConversation } =
+    controls;
+  const items = [...conversations]
+    .sort((a, b) => b.updatedAt - a.updatedAt)
+    .map((c) => ({
+      id: c.id,
+      label: conversationTitle(c),
+      description: relativeTime(c.updatedAt),
+    }));
+  return (
+    <div className="flex items-center gap-0.5">
+      <button
+        type="button"
+        onClick={() => void newChat()}
+        title="New chat"
+        aria-label="New chat"
+        className="nd-btn-icon"
+      >
+        <Plus size={16} strokeWidth={1.7} aria-hidden="true" />
+      </button>
+      {canBrowseHistory && (
+        <SelectablePopover
+          ariaLabel="Chat history"
+          items={items}
+          activeId={activeConversationId}
+          onSelect={(id) => {
+            if (id) void openConversation(id);
+          }}
+          trigger={
+            <span className="nd-btn-icon" title="Chat history">
+              <History size={16} strokeWidth={1.7} aria-hidden="true" />
+            </span>
+          }
+        />
+      )}
+    </div>
+  );
+}
+
 // SelectablePopover primitive: assign / reassign / unassign plus full inline
 // create / rename / delete — all Client management lives here (there's no
 // browse-by-Client surface). Mirrors FolderPicker's placement but is richer,

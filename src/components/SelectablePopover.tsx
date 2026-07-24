@@ -13,7 +13,12 @@ import { Check, Pencil, Trash2, Plus } from "lucide-react";
 // when there's no room below, and closes on outside-click / Escape / scroll.
 // No new UI dependency.
 
-export type PopoverItem = { id: string; label: string };
+export type PopoverItem = {
+  id: string;
+  label: string;
+  /** Optional muted second line under the label (e.g. a relative date, #62). */
+  description?: string;
+};
 
 type Props = {
   trigger: ReactNode;
@@ -248,7 +253,14 @@ export function SelectablePopover({
                       aria-hidden
                       className={"shrink-0 " + (selected ? "text-[var(--color-accent-text)]" : "opacity-0")}
                     />
-                    <span className="truncate">{item.label}</span>
+                    <span className="flex min-w-0 flex-col">
+                      <span className="truncate">{item.label}</span>
+                      {item.description && (
+                        <span className="truncate text-xs text-[var(--color-text-muted)]">
+                          {item.description}
+                        </span>
+                      )}
+                    </span>
                   </button>
                   {editable && (
                     <span className="flex items-center opacity-0 group-hover:opacity-100 transition-opacity pr-1">

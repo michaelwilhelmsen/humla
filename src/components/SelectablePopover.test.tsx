@@ -101,6 +101,27 @@ describe("SelectablePopover", () => {
     expect(onDelete).toHaveBeenCalledWith("c2");
   });
 
+  it("renders an optional secondary description line under a row (#62)", () => {
+    const withDesc = [
+      { id: "c1", label: "Kickoff questions", description: "5m ago" },
+      { id: "c2", label: "New chat", description: "yesterday" },
+    ];
+    render(
+      <SelectablePopover
+        ariaLabel="Chat history"
+        trigger={<span>History</span>}
+        items={withDesc}
+        activeId="c1"
+        onSelect={vi.fn()}
+      />,
+    );
+    open("Chat history");
+    // Both the primary label and its relative-date secondary line render.
+    expect(screen.getByRole("menuitemradio", { name: /Kickoff questions/ })).toBeInTheDocument();
+    expect(screen.getByText("5m ago")).toBeInTheDocument();
+    expect(screen.getByText("yesterday")).toBeInTheDocument();
+  });
+
   it("is a plain checkmark menu when no edit callbacks are given (Scope-popover mode)", () => {
     render(
       <SelectablePopover ariaLabel="Scope" trigger={<span>All notes</span>} items={items} activeId="c1" onSelect={vi.fn()} />,
