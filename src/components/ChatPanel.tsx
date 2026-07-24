@@ -6,10 +6,10 @@ import { open as openExternal } from "@tauri-apps/plugin-shell";
 import {
   AlertTriangle,
   ChevronDown,
+  CornerDownLeft,
   FileText,
   Loader2,
   MessageCircle,
-  Send,
   Settings2,
 } from "lucide-react";
 import {
@@ -75,6 +75,43 @@ function toolActivityLabel(name: string): string {
       return "Browsing your notes…";
     default:
       return "Working…";
+  }
+}
+
+// Past-tense, aggregated summary of the tools an assistant turn used (#63), for
+// a persistent one-line receipt above the answer (like Claude Desktop's tool
+// rows), e.g. "Searched your notes · Read 2 notes". Returns null when the turn
+// used no tools. History, not progress — the caller renders it un-animated,
+// unlike the live activity line.
+function summarizeToolUse(m: ChatMessageDto): string | null {
+  const counts = new Map<string, number>();
+  for (const p of m.parts) {
+    if (p.type === "tool") counts.set(p.name, (counts.get(p.name) ?? 0) + 1);
+  }
+  if (counts.size === 0) return null;
+  const seen = new Set<string>();
+  const segments: string[] = [];
+  for (const [name, n] of counts) {
+    const label = toolPastLabel(name, n);
+    // Collapse duplicate labels (e.g. two distinct unknown tools → one "Used a tool").
+    if (!seen.has(label)) {
+      seen.add(label);
+      segments.push(label);
+    }
+  }
+  return segments.join(" · ");
+}
+
+function toolPastLabel(name: string, count: number): string {
+  switch (name) {
+    case "search_notes":
+      return "Searched your notes";
+    case "get_note":
+      return count === 1 ? "Read a note" : `Read ${count} notes`;
+    case "list_notes":
+      return "Browsed your notes";
+    default:
+      return "Used a tool";
   }
 }
 
@@ -457,10 +494,14 @@ export function ChatPanel({
   return (
     <div className="flex-1 min-h-0 flex flex-col">
       {/* Workspace context signal (#63): nothing in Personal; one muted line in
-          a workspace. No breadth/tenant chrome here — breadth moved to the
-          composer, and the tenant is pinned to the loaded workspace (#58). */}
+          a workspace. It sits OUTSIDE the scroll container as a fixed flex item,
+          so it stays visible as a privacy signal while messages scroll beneath
+          it. It must own its vertical space with a bottom hairline, or scrolled
+          bubbles butt straight up against the text with no separation. No
+          breadth/tenant chrome here — breadth moved to the composer, and the
+          tenant is pinned to the loaded workspace (#58). */}
       {workspaceName && (
-        <div className="shrink-0 px-4 pt-3 text-xs text-[var(--color-text-muted)]">
+        <div className="shrink-0 px-4 py-2 border-b border-[var(--color-line)] text-xs text-[var(--color-text-muted)]">
           Chatting in {workspaceName} · visible to members
         </div>
       )}
@@ -475,7 +516,13 @@ export function ChatPanel({
           </div>
         ) : (
           messages.map((m) => (
-            <Bubble key={m.id} role={m.role} text={partsText(m)} citations={messageCitations(m)} />
+            <Bubble
+              key={m.id}
+              role={m.role}
+              text={partsText(m)}
+              citations={messageCitations(m)}
+              toolSummary={summarizeToolUse(m)}
+            />
           ))
         )}
         {sending && streaming.length > 0 && (
@@ -514,7 +561,12 @@ export function ChatPanel({
       )}
 
       <div className="shrink-0 border-t border-[var(--color-line)] p-2.5 flex flex-col gap-1.5">
-        <div className="flex items-end gap-2">
+        {/* Send button lives INSIDE the input (Claude-Desktop style): the input
+            spans the full composer width, and the button is absolutely pinned to
+            its right edge. The textarea is single-line (rows=1, no auto-grow — it
+            scrolls internally), so the button is vertically centred; pr clears
+            the button so text never runs under it. */}
+        <div className="relative">
           <textarea
             value={input}
             onChange={(e) => setInput(e.target.value)}
@@ -522,7 +574,7 @@ export function ChatPanel({
             rows={1}
             placeholder="Ask about your notes…"
             disabled={sending}
-            className="flex-1 resize-none max-h-40 bg-transparent text-sm leading-relaxed px-2 py-1.5 outline-none placeholder:text-[var(--color-text-disabled)] disabled:opacity-60"
+            className="w-full resize-none max-h-40 bg-transparent text-sm leading-relaxed pl-2 pr-12 py-2 outline-none placeholder:text-[var(--color-text-disabled)] disabled:opacity-60"
           />
           <button
             type="button"
@@ -531,17 +583,18 @@ export function ChatPanel({
             title="Send"
             aria-label="Send"
             className={cn(
-              "nd-btn-icon shrink-0",
+              "nd-btn-icon absolute right-1.5 top-1/2 -translate-y-1/2",
               (sending || input.trim().length === 0) && "opacity-40 pointer-events-none",
             )}
           >
-            <Send size={16} strokeWidth={1.7} />
+            <CornerDownLeft size={16} strokeWidth={1.7} />
           </button>
         </div>
-        {/* Breadth picker, bottom-left (#63): the retrieval breadth was a chip in
-            the deleted ScopeBar row; it now lives in the composer as a quiet
-            labelled dropdown that always shows the current value. */}
-        <div className="flex items-center px-1">
+        {/* Composer control row (#63): breadth picker at bottom-left. Right side
+            is intentionally empty for now — justify-between reserves it for the
+            monthly turn-allowance display coming in a later issue, so adding it
+            won't need a layout restructure. */}
+        <div className="flex items-center justify-between px-1">
           <BreadthPicker
             scope={scope}
             onScope={selectBreadth}
@@ -597,32 +650,37 @@ function Bubble({
   role,
   text,
   citations,
+  toolSummary,
 }: {
   role: "user" | "assistant";
   text: string;
   citations: ChatCitation[];
+  // Persistent tool-use receipt for an assistant turn (#63), null when none.
+  toolSummary?: string | null;
 }) {
-  const isUser = role === "user";
-  return (
-    <div className={cn("flex flex-col", isUser ? "items-end" : "items-start")}>
-      <div
-        className={cn(
-          "max-w-[85%] rounded-[var(--radius-card)] px-3 py-2 text-sm leading-relaxed",
-          isUser
-            ? "bg-[var(--color-accent-soft)] text-[var(--color-accent-text)]"
-            : "bg-[var(--color-pill-hover)] text-[var(--color-text)]",
-        )}
-      >
-        {isUser ? (
+  // User turns keep a right-aligned bubble (now the quiet gray pair — authorship
+  // reads from alignment, #64). Assistant turns are plain full-width blocks on
+  // the canvas, Claude-Desktop style: no bubble, no background — just the answer,
+  // its tool-use receipt above, and citation chips below.
+  if (role === "user") {
+    return (
+      <div className="flex flex-col items-end">
+        <div className="max-w-[85%] rounded-[var(--radius-card)] px-3 py-2 text-sm leading-relaxed bg-[var(--color-pill-hover)] text-[var(--color-text)]">
           <span className="whitespace-pre-wrap">{text}</span>
-        ) : (
-          <div className="prose-summary">
-            <Markdown source={text} />
-          </div>
-        )}
+        </div>
       </div>
-      {!isUser && citations.length > 0 && (
-        <div className="mt-1.5 flex flex-wrap gap-1.5 max-w-[85%]">
+    );
+  }
+  return (
+    <div className="flex flex-col">
+      {toolSummary && (
+        <div className="mb-1 px-1 text-xs text-[var(--color-text-muted)]">{toolSummary}</div>
+      )}
+      <div className="prose-summary text-sm leading-relaxed text-[var(--color-text)]">
+        <Markdown source={text} />
+      </div>
+      {citations.length > 0 && (
+        <div className="mt-1.5 flex flex-wrap gap-1.5">
           {citations.map((c) => (
             <CitationChip key={c.noteId} citation={c} />
           ))}

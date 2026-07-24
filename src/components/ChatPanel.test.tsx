@@ -57,6 +57,21 @@ function assistantWithCitation(text: string): ChatMessageDto {
   };
 }
 
+// An assistant turn that ran one or more tools (#63), for the persistent
+// tool-use receipt above the answer.
+function assistantWithTools(text: string, tools: string[]): ChatMessageDto {
+  return {
+    id: "a3",
+    role: "assistant",
+    seq: 1,
+    parts: [
+      ...tools.map((name, i) => ({ type: "tool" as const, id: `t${i}`, name, result: "ok" })),
+      { type: "text" as const, id: "b1", text },
+    ],
+    createdAt: 3,
+  };
+}
+
 // `chat_history` returns { conversationId, messages } since #61; a non-empty
 // history implies a resolved session id.
 function history(messages: ChatMessageDto[] = []) {
@@ -195,9 +210,11 @@ describe("ChatPanel context pinning (#58)", () => {
     signIntoWorkspace("Acme Team");
     renderPanel();
     // A muted line above the thread, exact copy per the ticket.
-    expect(
-      await screen.findByText("Chatting in Acme Team · visible to members"),
-    ).toBeInTheDocument();
+    const line = await screen.findByText("Chatting in Acme Team · visible to members");
+    expect(line).toBeInTheDocument();
+    // It owns its vertical space with a bottom hairline so scrolled message
+    // content passes beneath a proper boundary rather than colliding with it.
+    expect(line.className).toContain("border-b");
   });
 
   it("renders no context line in personal (signed out) (#63)", async () => {
@@ -424,6 +441,50 @@ describe("ChatPanel composer breadth + chrome (#63)", () => {
     renderPanel();
     const chip = await screen.findByRole("button", { name: /Kickoff notes/ });
     expect(chip.className).not.toContain("nd-chip");
+  });
+
+  it("shows a persistent, aggregated tool-use line above a tool-using answer", async () => {
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () =>
+        history([
+          userMsg("what happened?"),
+          assistantWithTools("Here's the answer.", ["search_notes", "get_note", "get_note"]),
+        ]),
+    });
+    renderPanel();
+    await screen.findByText("Here's the answer.");
+    // Aggregated, past-tense, one line — search then a pluralised read count.
+    expect(screen.getByText("Searched your notes · Read 2 notes")).toBeInTheDocument();
+  });
+
+  it("shows no tool-use line for an answer that used no tools", async () => {
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () => history([userMsg("hi"), assistantMsg("Plain answer.")]),
+    });
+    renderPanel();
+    await screen.findByText("Plain answer.");
+    expect(
+      screen.queryByText(/Searched your notes|Read a note|Read \d+ notes|Browsed your notes|Used a tool/),
+    ).toBeNull();
+  });
+
+  it("drops the assistant bubble and puts user messages in the gray bubble", async () => {
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () => history([userMsg("my question"), assistantMsg("the answer")]),
+    });
+    renderPanel();
+    // User turn: right-aligned gray bubble (not the old amber accent pair).
+    const userBubble = (await screen.findByText("my question")).parentElement!;
+    expect(userBubble.className).toContain("bg-[var(--color-pill-hover)]");
+    expect(userBubble.className).not.toContain("accent-soft");
+    // Assistant turn: plain block, no bubble background / rounding.
+    const answerBlock = screen.getByText("the answer").parentElement!;
+    expect(answerBlock.className).toContain("prose-summary");
+    expect(answerBlock.className).not.toContain("rounded-[var(--radius-card)]");
+    expect(answerBlock.className).not.toContain("bg-[var(--color-pill-hover)]");
   });
 
   it("animates the thinking indicator with a reduced-motion guard", async () => {
