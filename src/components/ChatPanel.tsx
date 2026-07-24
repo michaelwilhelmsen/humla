@@ -72,6 +72,10 @@ function toolActivityLabel(name: string): string {
 export function ChatPanel({ noteId }: { noteId: string }) {
   const { loading: readinessLoading, ready, hint, provider, model } = useChatReadiness();
   const [messages, setMessages] = useState<ChatMessageDto[]>([]);
+  // The session the panel is on (issue #61). Single-threaded for now: it tracks
+  // the note's active/most-recent conversation, captured from the history load
+  // and the send result. null until resolved (or when the note has none yet).
+  const [conversationId, setConversationId] = useState<string | null>(null);
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
   const [streaming, setStreaming] = useState("");
@@ -119,10 +123,16 @@ export function ChatPanel({ noteId }: { noteId: string }) {
     setTruncated(false);
     setSending(false);
     sendingRef.current = false;
+    setConversationId(null);
+    // Load the active session's history and remember which session it resolved
+    // to (issue #61), so subsequent sends/breadth writes target the same one.
     ipc
       .chatHistory(noteId)
       .then((h) => {
-        if (!cancelled) setMessages(h);
+        if (!cancelled) {
+          setMessages(h.messages);
+          setConversationId(h.conversationId);
+        }
       })
       .catch(() => {
         if (!cancelled) setMessages([]);
@@ -147,7 +157,7 @@ export function ChatPanel({ noteId }: { noteId: string }) {
   // optimistically, then write it through so the next turn reads the new value.
   function selectBreadth(next: ChatScope) {
     setScope(next);
-    void ipc.chatSetBreadth(noteId, next).catch((e) => setError(String(e)));
+    void ipc.chatSetBreadth(noteId, conversationId, next).catch((e) => setError(String(e)));
   }
 
   // Stream subscription. Bound once; cancelled-flag + claim keeps it StrictMode-
@@ -210,13 +220,18 @@ export function ChatPanel({ noteId }: { noteId: string }) {
     };
     setMessages((m) => [...m, optimistic]);
     try {
-      const result = await ipc.chatSend(noteId, text);
-      setMessages(await ipc.chatHistory(noteId));
+      // Send to the resolved session (null lazily creates the note's first one),
+      // capturing the id the backend landed on so the reload targets it (#61).
+      const result = await ipc.chatSend(noteId, conversationId, text);
+      setConversationId(result.conversationId);
+      const h = await ipc.chatHistory(noteId, result.conversationId);
+      setMessages(h.messages);
       setTruncated(result.truncated);
     } catch (e) {
       setError((prev) => prev ?? String(e));
       try {
-        setMessages(await ipc.chatHistory(noteId));
+        const h = await ipc.chatHistory(noteId, conversationId);
+        setMessages(h.messages);
       } catch {
         /* keep the optimistic view */
       }

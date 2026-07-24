@@ -90,6 +90,42 @@ pub fn parse_parts(content: &str) -> Vec<Part> {
     serde_json::from_str(content).unwrap_or_default()
 }
 
+/// Flatten a stored `messages.content` (parts JSON) to its plain text. The
+/// conversation-title backfill uses this to read a message's text without
+/// db.rs needing to know the parts shape.
+pub fn parts_plain_text(content: &str) -> String {
+    parts_to_text(&parse_parts(content))
+}
+
+/// Longest conversation title we keep (chars, not bytes). Long enough to be a
+/// recognisable label, short enough for a session list row.
+pub const TITLE_MAX_CHARS: usize = 40;
+
+/// Derive a conversation title (issue #61). Given the first user message's text
+/// (if any) and the conversation's `created_at` for the empty-conversation
+/// fallback: collapse all whitespace/newline runs to single spaces, trim, and
+/// truncate to `TITLE_MAX_CHARS` on a Rust `char` boundary — appending "…" when
+/// truncated (so Norwegian text and emoji never panic or split mid-codepoint).
+/// A conversation with no user message (or blank text) falls back to
+/// "Chat YYYY-MM-DD" from `created_at` (UTC, for a deterministic label).
+pub fn derive_title(first_user_text: Option<&str>, created_at_ms: i64) -> String {
+    if let Some(text) = first_user_text {
+        let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        if !collapsed.is_empty() {
+            return if collapsed.chars().count() > TITLE_MAX_CHARS {
+                let kept: String = collapsed.chars().take(TITLE_MAX_CHARS).collect();
+                format!("{kept}…")
+            } else {
+                collapsed
+            };
+        }
+    }
+    let date = chrono::DateTime::from_timestamp_millis(created_at_ms)
+        .map(|d| d.format("%Y-%m-%d").to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    format!("Chat {date}")
+}
+
 /// Flatten a parts array to plain text (concatenate text parts; tool parts are
 /// not replayed to the model as history — only the final answer text is). Used
 /// to feed prior turns back into the prompt.
@@ -491,6 +527,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn derive_title_collapses_whitespace_and_trims() {
+        assert_eq!(derive_title(Some("  hello   world \n foo "), 0), "hello world foo");
+        assert_eq!(derive_title(Some("single"), 0), "single");
+    }
+
+    #[test]
+    fn derive_title_truncates_on_a_char_boundary_with_an_ellipsis() {
+        let forty = "a".repeat(TITLE_MAX_CHARS);
+        assert_eq!(derive_title(Some(&forty), 0), forty, "exactly 40 chars is kept verbatim");
+        let forty_one = "a".repeat(TITLE_MAX_CHARS + 1);
+        assert_eq!(derive_title(Some(&forty_one), 0), format!("{}…", "a".repeat(TITLE_MAX_CHARS)));
+    }
+
+    #[test]
+    fn derive_title_never_splits_multibyte_chars() {
+        // Norwegian + emoji: truncation must land on a char boundary, never panic.
+        let emoji = "😀".repeat(50);
+        let t = derive_title(Some(&emoji), 0);
+        assert_eq!(t.chars().count(), TITLE_MAX_CHARS + 1, "40 emoji + the ellipsis");
+        let nordic = "æ ø å ".repeat(20);
+        let t = derive_title(Some(&nordic), 0);
+        assert!(t.chars().count() <= TITLE_MAX_CHARS + 1);
+    }
+
+    #[test]
+    fn derive_title_falls_back_to_a_date_for_empty_conversations() {
+        assert_eq!(derive_title(None, 0), "Chat 1970-01-01");
+        assert_eq!(derive_title(Some("   \n\t  "), 0), "Chat 1970-01-01", "blank text is no title");
+    }
+
+    #[test]
+    fn parts_plain_text_reads_a_stored_message_body() {
+        let json = text_parts_json("b0", "the meeting body");
+        assert_eq!(parts_plain_text(&json), "the meeting body");
+        // A legacy/garbage row yields empty text rather than erroring.
+        assert_eq!(parts_plain_text("not json"), "");
+    }
+
+    #[test]
     fn validate_breadth_accepts_the_vocabulary_and_rejects_garbage() {
         for b in ["note", "folder", "all"] {
             assert_eq!(validate_breadth(b).unwrap(), b);
@@ -604,7 +679,7 @@ mod tests {
 
     fn conv(dbh: &Db, scope_id: &str) -> String {
         let conn = dbh.lock();
-        db::get_or_create_conversation(&conn, CHAT_TENANT_PERSONAL, CHAT_SCOPE_NOTE, scope_id)
+        db::create_conversation(&conn, CHAT_TENANT_PERSONAL, CHAT_SCOPE_NOTE, scope_id, "note")
             .unwrap()
             .id
     }
@@ -660,7 +735,7 @@ mod tests {
         }
         let path = dir.path().join("notes.sqlite");
         let conn = db::open(&path).unwrap();
-        let reloaded = db::get_conversation(&conn, CHAT_TENANT_PERSONAL, CHAT_SCOPE_NOTE, "note-1")
+        let reloaded = db::latest_conversation(&conn, CHAT_TENANT_PERSONAL, CHAT_SCOPE_NOTE, "note-1")
             .unwrap()
             .expect("conversation survives restart");
         assert_eq!(reloaded.id, conv_id);
@@ -670,15 +745,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn one_conversation_per_note() {
+    async fn latest_conversation_tracks_the_most_recently_updated_session() {
+        // Sessions (issue #61): a Note can have several conversations; the active
+        // one resolved by `latest_conversation` is whichever was updated last, and
+        // a message append is what bumps `updated_at`.
         let dir = tempfile::tempdir().unwrap();
         let (dbh, _path) = temp_db(&dir);
         let conn = dbh.lock();
         let a =
-            db::get_or_create_conversation(&conn, CHAT_TENANT_PERSONAL, CHAT_SCOPE_NOTE, "note-1").unwrap();
+            db::create_conversation(&conn, CHAT_TENANT_PERSONAL, CHAT_SCOPE_NOTE, "note-1", "note").unwrap();
         let b =
-            db::get_or_create_conversation(&conn, CHAT_TENANT_PERSONAL, CHAT_SCOPE_NOTE, "note-1").unwrap();
-        assert_eq!(a.id, b.id, "same Note reuses its single conversation");
+            db::create_conversation(&conn, CHAT_TENANT_PERSONAL, CHAT_SCOPE_NOTE, "note-1", "note").unwrap();
+        assert_ne!(a.id, b.id, "each call creates a distinct session");
+        // Sleep so the append lands on a strictly-later millisecond than either
+        // creation (timestamps are ms-resolution), keeping the assertion stable.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        db::insert_chat_message(&conn, &a.id, "user", &text_parts_json("blk", "hi")).unwrap();
+        let bumped = db::get_conversation_by_id(&conn, &a.id).unwrap().unwrap();
+        assert!(bumped.updated_at > a.updated_at, "a message append bumps updated_at");
+        let latest =
+            db::latest_conversation(&conn, CHAT_TENANT_PERSONAL, CHAT_SCOPE_NOTE, "note-1").unwrap().unwrap();
+        assert_eq!(latest.id, a.id, "the just-updated session is the active one");
+        assert_eq!(
+            db::list_conversations(&conn, CHAT_TENANT_PERSONAL, CHAT_SCOPE_NOTE, "note-1").unwrap().len(),
+            2
+        );
     }
 
     #[tokio::test]

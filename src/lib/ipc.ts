@@ -387,22 +387,37 @@ export const ipc = {
   // AI chat over a single Note (issue #46). `chatSend` runs one grounded,
   // streamed completion — the answer arrives via chat_* events, so the
   // resolved promise only carries the conversation id + a truncation flag.
-  // `chatHistory` reloads a Note's persisted conversation after restart.
+  // `chatHistory` reloads a conversation and reports which one it resolved to.
+  //
+  // Chat sessions (issue #61): a Note can have multiple conversations. Each call
+  // takes an optional `conversationId` — omit it (or pass null) to target the
+  // active/most-recent session; opening the tab creates nothing. `chatHistory`
+  // returns the resolved `conversationId` so the panel learns which session it's
+  // on; `chatSend` returns it too (lazy-creating on the first turn).
   //
   // Chat is pinned to the loaded context (issue #58): the backend derives the
-  // tenant from the active workspace (Personal when none), so neither call
-  // takes a tenant. Retrieval breadth ("note" | "folder" | "all") is persisted
-  // on the conversation server-side — `chatSetBreadth` writes it, `chatGetBreadth`
-  // reads it back to initialise the Scope chip. `chatSend` no longer carries a
-  // scope: it reads the persisted breadth, so the UI can never diverge from it.
-  chatSend: (noteId: string, message: string) =>
-    invoke<ChatSendResult>("chat_send", { noteId, message }),
-  chatHistory: (noteId: string) => invoke<ChatMessageDto[]>("chat_history", { noteId }),
-  // Persist / read the Scope chip's breadth on the current context's
-  // conversation (issue #58). The single source of truth for retrieval breadth.
-  chatSetBreadth: (noteId: string, breadth: ChatScope) =>
-    invoke<void>("chat_set_breadth", { noteId, breadth }),
-  chatGetBreadth: (noteId: string) => invoke<ChatScope>("chat_get_breadth", { noteId }),
+  // tenant from the active workspace (Personal when none), so no call takes a
+  // tenant. Retrieval breadth ("note" | "folder" | "all") is persisted on the
+  // conversation server-side — `chatSetBreadth` writes it, `chatGetBreadth` reads
+  // it back to initialise the Scope chip. `chatSend` carries no scope: it reads
+  // the persisted breadth, so the UI can never diverge from it.
+  chatSend: (noteId: string, conversationId: string | null, message: string) =>
+    invoke<ChatSendResult>("chat_send", { noteId, conversationId, message }),
+  chatHistory: (noteId: string, conversationId: string | null = null) =>
+    invoke<ChatHistory>("chat_history", { noteId, conversationId }),
+  // List / create chat sessions for a Note (issue #61). Personal reads local
+  // SQLite; a workspace reads/creates server-authoritative sessions. There is no
+  // delete command — a deliberate v1 decision.
+  chatListConversations: (noteId: string) =>
+    invoke<ConversationMeta[]>("chat_list_conversations", { noteId }),
+  chatNewConversation: (noteId: string) =>
+    invoke<ConversationMeta>("chat_new_conversation", { noteId }),
+  // Persist / read the Scope chip's breadth on a conversation (issue #58/#61).
+  // The single source of truth for retrieval breadth.
+  chatSetBreadth: (noteId: string, conversationId: string | null, breadth: ChatScope) =>
+    invoke<void>("chat_set_breadth", { noteId, conversationId, breadth }),
+  chatGetBreadth: (noteId: string, conversationId: string | null = null) =>
+    invoke<ChatScope>("chat_get_breadth", { noteId, conversationId }),
   // Rebuild a Note's retrieval index — called on Note-view unmount so edits
   // that didn't trigger summarize/diarize still land in search.
   chatReindexNote: (noteId: string) => invoke<void>("chat_reindex_note", { noteId }),
@@ -447,6 +462,18 @@ export type ChatMessageDto = {
   createdAt: number;
 };
 export type ChatSendResult = { conversationId: string; truncated: boolean };
+// `chatHistory` result (issue #61): the messages plus the conversation they were
+// resolved to. `conversationId` is null when the Note has no session yet.
+export type ChatHistory = { conversationId: string | null; messages: ChatMessageDto[] };
+// One chat session in the list (issue #61). `title` is resolved server/back-end
+// side (stored title, else a date fallback), so it always renders.
+export type ConversationMeta = {
+  id: string;
+  title: string;
+  breadth: ChatScope;
+  updatedAt: number;
+  messageCount: number;
+};
 // Retrieval breadth chosen in the Scope popover (issue #47), persisted per
 // conversation on the backend (issue #58).
 export type ChatScope = "note" | "folder" | "all";
