@@ -455,7 +455,13 @@ describe("ChatPanel composer breadth + chrome (#63)", () => {
     renderPanel();
     await screen.findByText("Here's the answer.");
     // Aggregated, past-tense, one line — search then a pluralised read count.
-    expect(screen.getByText("Searched your notes · Read 2 notes")).toBeInTheDocument();
+    const line = screen.getByText("Searched your notes · Read 2 notes");
+    expect(line).toBeInTheDocument();
+    // Reads like body text: same size as the answer (text-sm, not text-xs) and
+    // flush-left with the answer block (no px inset), with paragraph margins.
+    expect(line.className).toContain("text-sm");
+    expect(line.className).not.toContain("text-xs");
+    expect(line.className).not.toContain("px-1");
   });
 
   it("shows no tool-use line for an answer that used no tools", async () => {

@@ -563,9 +563,11 @@ export function ChatPanel({
       <div className="shrink-0 border-t border-[var(--color-line)] p-2.5 flex flex-col gap-1.5">
         {/* Send button lives INSIDE the input (Claude-Desktop style): the input
             spans the full composer width, and the button is absolutely pinned to
-            its right edge. The textarea is single-line (rows=1, no auto-grow — it
-            scrolls internally), so the button is vertically centred; pr clears
-            the button so text never runs under it. */}
+            its right edge. The textarea is `block` so it has no inline-block
+            baseline gap — the relative wrapper's height then equals the visible
+            input's height, and `top-1/2 -translate-y-1/2` centres the button
+            against the true input height (no pixel nudging). The small icon-button
+            variant (28px) fits comfortably inside without touching the edges. */}
         <div className="relative">
           <textarea
             value={input}
@@ -574,7 +576,7 @@ export function ChatPanel({
             rows={1}
             placeholder="Ask about your notes…"
             disabled={sending}
-            className="w-full resize-none max-h-40 bg-transparent text-sm leading-relaxed pl-2 pr-12 py-2 outline-none placeholder:text-[var(--color-text-disabled)] disabled:opacity-60"
+            className="block w-full resize-none max-h-40 bg-transparent text-sm leading-relaxed pl-2 pr-11 py-2 outline-none placeholder:text-[var(--color-text-disabled)] disabled:opacity-60"
           />
           <button
             type="button"
@@ -583,7 +585,7 @@ export function ChatPanel({
             title="Send"
             aria-label="Send"
             className={cn(
-              "nd-btn-icon absolute right-1.5 top-1/2 -translate-y-1/2",
+              "nd-btn-icon nd-btn-icon-sm absolute right-1.5 top-1/2 -translate-y-1/2",
               (sending || input.trim().length === 0) && "opacity-40 pointer-events-none",
             )}
           >
@@ -674,7 +676,11 @@ function Bubble({
   return (
     <div className="flex flex-col">
       {toolSummary && (
-        <div className="mb-1 px-1 text-xs text-[var(--color-text-muted)]">{toolSummary}</div>
+        // Reads like a paragraph of the answer: same body size (text-sm) and
+        // left edge as the answer block (no inset), with margin above and below
+        // so it isn't flush against neighbouring turns. Muted, since it's a
+        // secondary receipt of what the assistant did (#63).
+        <div className="my-1.5 text-sm text-[var(--color-text-muted)]">{toolSummary}</div>
       )}
       <div className="prose-summary text-sm leading-relaxed text-[var(--color-text)]">
         <Markdown source={text} />
