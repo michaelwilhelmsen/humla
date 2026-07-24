@@ -30,6 +30,19 @@ export type CloudWorkspace = {
 };
 export type CloudMember = { id: string; email: string; name: string; role: CloudRole };
 
+/**
+ * Workspace chat-key metadata (BYOK, issue #75). The key value is never exposed
+ * — only this metadata. `keyHealth` ("ok" | "failing" | …) drives the
+ * degradation warning; `setBy` is a user id resolved to a name in the UI.
+ */
+export type ChatKeyMeta = {
+  configured: boolean;
+  last4: string | null;
+  setBy: string | null;
+  setAt: string | null;
+  keyHealth: string | null;
+};
+
 export type CloudStatus = {
   /** A server URL is configured. */
   configured: boolean;
@@ -45,6 +58,17 @@ export type CloudStatus = {
   seat_price_cents?: number | null;
   /** Lowercase ISO currency for seat_price_cents (e.g. "usd"). Absent when unknown. */
   seat_currency?: string | null;
+  /** Managed chat add-on config, when the server advertises it (issue #75).
+   *  null/absent → self-host or not configured; the add-on pitch is dropped. */
+  chat_addon?: ChatAddon | null;
+};
+
+/** Managed chat add-on advertised in the server's billing config (issue #75). */
+export type ChatAddon = {
+  available: boolean;
+  price_id?: string | null;
+  price_cents?: number | null;
+  currency?: string | null;
 };
 
 export const cloudApi = {
@@ -88,6 +112,17 @@ export const cloudApi = {
   /** Open the Stripe Customer Portal for a subscribed workspace; returns a URL. */
   billingPortal: (workspaceId: string) =>
     invoke<string>("cloud_billing_portal", { workspaceId }),
+  /** Workspace chat-key metadata (member-readable, issue #75). Never the key. */
+  chatKeyMeta: (workspaceId: string) => invoke<ChatKeyMeta>("chat_key_meta", { workspaceId }),
+  /** Owner-only set/rotate — server test-on-saves and returns fresh metadata. */
+  chatKeySet: (workspaceId: string, apiKey: string) =>
+    invoke<ChatKeyMeta>("chat_key_set", { workspaceId, apiKey }),
+  /** Owner-only set/rotate using the personal OpenAI key from the Keychain —
+   *  the key is read in Rust and never enters the webview (issue #75). */
+  chatKeySetFromKeychain: (workspaceId: string) =>
+    invoke<ChatKeyMeta>("chat_key_set_from_keychain", { workspaceId }),
+  /** Owner-only remove — returns the unconfigured metadata. */
+  chatKeyRemove: (workspaceId: string) => invoke<ChatKeyMeta>("chat_key_delete", { workspaceId }),
 };
 
 export const DISCONNECTED: CloudStatus = {
@@ -100,6 +135,7 @@ export const DISCONNECTED: CloudStatus = {
   billing_enabled: false,
   seat_price_cents: null,
   seat_currency: null,
+  chat_addon: null,
 };
 
 type CloudState = {

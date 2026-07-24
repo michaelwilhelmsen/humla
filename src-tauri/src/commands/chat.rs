@@ -671,6 +671,153 @@ async fn usage_cloud(state: &State<'_, AppState>, workspace: &str) -> Option<cha
     }
 }
 
+// ── Workspace chat key (BYOK, issue #75) ─────────────────────────────────────
+// Owner-only set/rotate/remove + member-readable metadata, via the PocketBase
+// hook routes under /api/humla/chat/key* (same base/token/one-shot-401-retry as
+// the other cloud chat calls). The key value transits Rust memory only: it goes
+// straight into the POST body and is never logged, stored, or put in an error
+// string. Only metadata comes back (the server's REST read rule returns null).
+
+/// Map a non-2xx chat-key response to a user message. Reads only `reason`/`error`
+/// from the server body (never the submitted key), via `chat_key_error_message`.
+async fn chat_key_error(resp: reqwest::Response) -> String {
+    let body: serde_json::Value = resp.json().await.unwrap_or_default();
+    let reason = body.get("reason").and_then(|r| r.as_str()).unwrap_or_default();
+    let server_msg = body.get("error").and_then(|m| m.as_str()).unwrap_or_default();
+    chat::cloud::chat_key_error_message(reason, server_msg)
+}
+
+/// Read a workspace's chat-key metadata (member-readable). Never returns the key
+/// — only `{ configured, last4, set_by, set_at, key_health }`. A 404 (route
+/// absent on an older/self-hosted server) reads as "not activated" so settings
+/// degrades gracefully; genuine HTTP failures error with a mapped message.
+#[tauri::command]
+pub async fn chat_key_meta(
+    app: AppHandle,
+    workspace_id: String,
+) -> Result<chat::cloud::ChatKeyMeta, String> {
+    let state: State<AppState> = app.state();
+    let mut attempt = 0u8;
+    loop {
+        let (base, token) = super::cloud::cloud_session(&state).await?;
+        let resp = reqwest::Client::new()
+            .get(format!("{}/api/humla/chat/key/meta", base.trim_end_matches('/')))
+            .bearer_auth(&token)
+            .query(&[("workspace_id", workspace_id.as_str())])
+            .send()
+            .await
+            .map_err(|e| format!("Couldn't reach Team chat: {e}"))?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(chat::cloud::ChatKeyMeta::default());
+        }
+        if status == reqwest::StatusCode::UNAUTHORIZED && attempt == 0 {
+            super::cloud::forget_session();
+            attempt += 1;
+            continue;
+        }
+        if !status.is_success() {
+            return Err(chat_key_error(resp).await);
+        }
+        let body: serde_json::Value = resp.json().await.unwrap_or_default();
+        return Ok(chat::cloud::parse_key_meta(&body));
+    }
+}
+
+/// POST a key to the set/rotate hook (server test-on-saves it against OpenAI)
+/// and map the response. Shared by the manual-entry and from-Keychain commands
+/// so the test-on-save path is identical. The `api_key` never leaves this
+/// request body — not logged, not stored, not in error strings.
+async fn chat_key_set_inner(
+    state: &State<'_, AppState>,
+    workspace_id: &str,
+    api_key: &str,
+) -> Result<chat::cloud::ChatKeyMeta, String> {
+    let body = serde_json::json!({ "workspace_id": workspace_id, "api_key": api_key });
+    let mut attempt = 0u8;
+    loop {
+        let (base, token) = super::cloud::cloud_session(state).await?;
+        let resp = reqwest::Client::new()
+            .post(format!("{}/api/humla/chat/key", base.trim_end_matches('/')))
+            .bearer_auth(&token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("Couldn't reach Team chat: {e}"))?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED && attempt == 0 {
+            super::cloud::forget_session();
+            attempt += 1;
+            continue;
+        }
+        if !status.is_success() {
+            return Err(chat_key_error(resp).await);
+        }
+        let meta: serde_json::Value = resp.json().await.unwrap_or_default();
+        return Ok(chat::cloud::parse_key_meta(&meta));
+    }
+}
+
+/// Owner-only set/rotate of the workspace OpenAI key, from a key the owner typed
+/// into the composer. The `api_key` transits Rust memory only.
+#[tauri::command]
+pub async fn chat_key_set(
+    app: AppHandle,
+    workspace_id: String,
+    api_key: String,
+) -> Result<chat::cloud::ChatKeyMeta, String> {
+    let state: State<AppState> = app.state();
+    chat_key_set_inner(&state, &workspace_id, &api_key).await
+}
+
+/// Owner-only set/rotate using the personal OpenAI key already in the macOS
+/// Keychain (issue #75). Sharing a personal key with a team is a deliberate act,
+/// so the UI gates this behind an explicit button. The key is read in Rust and
+/// runs the same test-on-save path as `chat_key_set` — it NEVER enters the
+/// webview.
+#[tauri::command]
+pub async fn chat_key_set_from_keychain(
+    app: AppHandle,
+    workspace_id: String,
+) -> Result<chat::cloud::ChatKeyMeta, String> {
+    let state: State<AppState> = app.state();
+    let key = super::read_provider_api_key(&state, "openai")?
+        .ok_or("No OpenAI key is stored in Settings → Providers.")?;
+    chat_key_set_inner(&state, &workspace_id, &key).await
+}
+
+/// Owner-only remove of the workspace OpenAI key. Returns the (unconfigured)
+/// metadata so the UI updates in place.
+#[tauri::command]
+pub async fn chat_key_delete(
+    app: AppHandle,
+    workspace_id: String,
+) -> Result<chat::cloud::ChatKeyMeta, String> {
+    let state: State<AppState> = app.state();
+    let mut attempt = 0u8;
+    loop {
+        let (base, token) = super::cloud::cloud_session(&state).await?;
+        let resp = reqwest::Client::new()
+            .delete(format!("{}/api/humla/chat/key", base.trim_end_matches('/')))
+            .bearer_auth(&token)
+            .query(&[("workspace_id", workspace_id.as_str())])
+            .send()
+            .await
+            .map_err(|e| format!("Couldn't reach Team chat: {e}"))?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED && attempt == 0 {
+            super::cloud::forget_session();
+            attempt += 1;
+            continue;
+        }
+        if !status.is_success() {
+            return Err(chat_key_error(resp).await);
+        }
+        let body: serde_json::Value = resp.json().await.unwrap_or_default();
+        return Ok(chat::cloud::parse_key_meta(&body));
+    }
+}
+
 #[tauri::command]
 pub async fn chat_send(
     app: AppHandle,

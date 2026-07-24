@@ -200,6 +200,85 @@ pub fn parse_usage(body: &Value) -> Option<UsageDto> {
     Some(UsageDto { used, cap, period_end })
 }
 
+// ── Workspace chat key (BYOK, issue #75) ─────────────────────────────────────
+
+/// Metadata about a workspace's OpenAI key, shown in workspace settings. The
+/// key value itself is NEVER returned by the server (REST read rule is null) or
+/// stored client-side — only this metadata. Serialized camelCase for the
+/// frontend (`{ configured, last4, setBy, setAt, keyHealth }`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatKeyMeta {
+    pub configured: bool,
+    /// Last 4 chars of the stored key (display only), when configured.
+    pub last4: Option<String>,
+    /// User id who set/rotated the key (resolved to a name in the UI).
+    pub set_by: Option<String>,
+    /// When it was set (server timestamp — string or number, passed through).
+    pub set_at: Option<String>,
+    /// "ok" | "failing" | … — drives the degradation warning.
+    pub key_health: Option<String>,
+}
+
+fn str_field(body: &Value, key: &str) -> Option<String> {
+    body.get(key).and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(str::to_string)
+}
+
+/// A scalar (string or number) field as a string — set_at may be an RFC3339
+/// string or an epoch number depending on the server; the UI formats it best-
+/// effort, so pass whichever through as text.
+fn scalar_field(body: &Value, key: &str) -> Option<String> {
+    match body.get(key) {
+        Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+        Some(Value::Number(n)) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+/// Map a chat-key set/meta/delete 200 body to the metadata DTO. `configured`
+/// defaults false, so both `{configured:false,…}` and a malformed body read as
+/// "not activated" — never an error (the caller surfaces genuine HTTP failures
+/// separately).
+pub fn parse_key_meta(body: &Value) -> ChatKeyMeta {
+    ChatKeyMeta {
+        configured: body.get("configured").and_then(|v| v.as_bool()).unwrap_or(false),
+        last4: str_field(body, "last4"),
+        set_by: str_field(body, "set_by"),
+        set_at: scalar_field(body, "set_at"),
+        key_health: str_field(body, "key_health"),
+    }
+}
+
+/// Turn a chat-key preflight error (`{reason, error}`) into a short, sentence-
+/// case user message (issue #75). Distinct from `cloud_chat_error_message` (turn
+/// errors). NEVER includes the submitted key — it maps by reason code, and the
+/// fallback only passes the server's own `error` text (which never carries the
+/// key) or a generic line.
+pub fn chat_key_error_message(reason: &str, server_message: &str) -> String {
+    match reason {
+        "byok_key_invalid" => "OpenAI rejected this key.".to_string(),
+        "byok_validation_unreachable" => {
+            "Couldn't reach OpenAI to validate — try again.".to_string()
+        }
+        "byok_validation_failed" => "Couldn't validate the key — try again.".to_string(),
+        "key_encryption_unconfigured" => {
+            "Server missing its key-encryption secret — contact support.".to_string()
+        }
+        "forbidden" => "Only the workspace owner can manage the chat key.".to_string(),
+        "not_a_member" => "You're not a member of this workspace.".to_string(),
+        "unauthorized" => "Please sign in again.".to_string(),
+        "bad_request" => "That doesn't look like a valid key.".to_string(),
+        _ => {
+            let m = server_message.trim();
+            if m.is_empty() {
+                "Couldn't save the key — please try again.".to_string()
+            } else {
+                m.to_string()
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,6 +305,51 @@ mod tests {
         // Partial / malformed → None.
         assert_eq!(parse_usage(&json!({ "used_turns": 2 })), None);
         assert_eq!(parse_usage(&json!({})), None);
+    }
+
+    #[test]
+    fn parse_key_meta_reads_configured_and_unconfigured_shapes() {
+        // Configured (set success / meta) → all fields.
+        let m = parse_key_meta(&json!({
+            "configured": true, "last4": "n3Kq", "set_by": "u1",
+            "set_at": "2026-07-24T10:00:00Z", "key_health": "ok"
+        }));
+        assert_eq!(
+            m,
+            ChatKeyMeta {
+                configured: true,
+                last4: Some("n3Kq".into()),
+                set_by: Some("u1".into()),
+                set_at: Some("2026-07-24T10:00:00Z".into()),
+                key_health: Some("ok".into()),
+            }
+        );
+        // Degraded health surfaces so the UI can warn.
+        assert_eq!(
+            parse_key_meta(&json!({ "configured": true, "last4": "ab12", "key_health": "failing" }))
+                .key_health,
+            Some("failing".into())
+        );
+        // Unconfigured / delete response → not activated, no error.
+        assert_eq!(parse_key_meta(&json!({ "configured": false })), ChatKeyMeta::default());
+        // set_at may be numeric (epoch) — passed through as text.
+        assert_eq!(
+            parse_key_meta(&json!({ "configured": true, "set_at": 1893456000 })).set_at,
+            Some("1893456000".into())
+        );
+        // Malformed → not activated.
+        assert_eq!(parse_key_meta(&json!({})), ChatKeyMeta::default());
+    }
+
+    #[test]
+    fn chat_key_error_message_maps_reasons_without_leaking_the_key() {
+        assert_eq!(chat_key_error_message("byok_key_invalid", ""), "OpenAI rejected this key.");
+        assert!(chat_key_error_message("byok_validation_unreachable", "").contains("reach OpenAI"));
+        assert!(chat_key_error_message("key_encryption_unconfigured", "").contains("contact support"));
+        assert!(chat_key_error_message("forbidden", "").to_lowercase().contains("owner"));
+        // Unknown reason falls back to the server's own message (never the key).
+        assert_eq!(chat_key_error_message("weird", "server said no"), "server said no");
+        assert!(!chat_key_error_message("weird", "   ").is_empty());
     }
 
     #[test]
