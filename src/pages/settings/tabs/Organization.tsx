@@ -16,6 +16,7 @@ import { Row, Section } from "../components/Section";
 import { Btn } from "../components/Btn";
 import { Select } from "../components/Select";
 import { ValuePill } from "../components/ValuePill";
+import { ChatKeyPanel } from "./ChatKeyPanel";
 
 const inputCls =
   "flex-1 min-w-0 text-sm px-3 py-2 rounded-md border border-[var(--color-line-visible)] bg-[var(--color-surface)] focus:border-[var(--color-text-muted)] transition-colors";
@@ -440,6 +441,10 @@ export function OrganizationTab() {
           />
         </Section>
       )}
+
+      <Section title="Chat">
+        <ChatKeyPanel ws={ws} />
+      </Section>
 
       <Section title={`Members${members.length ? ` · ${members.length}` : ""}`}>
         {loading && <div className="text-sm text-[var(--color-text-muted)] py-3.5">Loading…</div>}
