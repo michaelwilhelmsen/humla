@@ -1381,6 +1381,7 @@ function ChatHistoryControls({ controls }: { controls: ChatSessionControls }) {
       {canBrowseHistory && (
         <SelectablePopover
           ariaLabel="Chat history"
+          align="end"
           items={items}
           activeId={activeConversationId}
           onSelect={(id) => {

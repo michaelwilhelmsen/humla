@@ -36,6 +36,13 @@ type Props = {
   createPlaceholder?: string;
   /** Accessible name for the trigger. */
   ariaLabel?: string;
+  /**
+   * Horizontal anchor. "start" (default) pins the menu's left edge to the
+   * trigger's left edge (existing behavior). "end" pins its right edge to the
+   * trigger's right edge, so a right-aligned trigger opens leftward instead of
+   * overflowing the viewport (#62).
+   */
+  align?: "start" | "end";
 };
 
 export function SelectablePopover({
@@ -50,6 +57,7 @@ export function SelectablePopover({
   createLabel = "New",
   createPlaceholder = "Name",
   ariaLabel,
+  align = "start",
 }: Props) {
   const [open, setOpen] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -60,7 +68,9 @@ export function SelectablePopover({
   const [pos, setPos] = useState<{
     top?: number;
     bottom?: number;
-    left: number;
+    // Exactly one of left/right is set, per `align`.
+    left?: number;
+    right?: number;
     minWidth: number;
     maxHeight: number;
   } | null>(null);
@@ -87,14 +97,17 @@ export function SelectablePopover({
     const preferredMax = 280;
     const spaceBelow = window.innerHeight - rect.bottom - gap - edgeMargin;
     const spaceAbove = rect.top - gap - edgeMargin;
-    const left = rect.left;
+    // Anchor the left edge to the trigger's left ("start") or the right edge to
+    // the trigger's right ("end") so a right-aligned trigger opens leftward.
+    const anchor =
+      align === "end" ? { right: window.innerWidth - rect.right } : { left: rect.left };
     const minWidth = Math.max(rect.width, 200);
     if (spaceBelow >= Math.min(preferredMax, 150) || spaceBelow >= spaceAbove) {
-      setPos({ top: rect.bottom + gap, left, minWidth, maxHeight: Math.max(120, Math.min(preferredMax, spaceBelow)) });
+      setPos({ ...anchor, top: rect.bottom + gap, minWidth, maxHeight: Math.max(120, Math.min(preferredMax, spaceBelow)) });
     } else {
-      setPos({ bottom: window.innerHeight - rect.top + gap, left, minWidth, maxHeight: Math.max(120, Math.min(preferredMax, spaceAbove)) });
+      setPos({ ...anchor, bottom: window.innerHeight - rect.top + gap, minWidth, maxHeight: Math.max(120, Math.min(preferredMax, spaceAbove)) });
     }
-  }, [open]);
+  }, [open, align]);
 
   useEffect(() => {
     if (!open) return;
@@ -180,6 +193,7 @@ export function SelectablePopover({
               top: pos.top,
               bottom: pos.bottom,
               left: pos.left,
+              right: pos.right,
               minWidth: pos.minWidth,
               maxHeight: pos.maxHeight,
             }}

@@ -122,6 +122,35 @@ describe("SelectablePopover", () => {
     expect(screen.getByText("yesterday")).toBeInTheDocument();
   });
 
+  it("anchors the menu's left edge to the trigger by default", () => {
+    render(
+      <SelectablePopover ariaLabel="Menu" trigger={<span>Open</span>} items={items} activeId="c1" onSelect={vi.fn()} />,
+    );
+    open("Menu");
+    const menu = screen.getByRole("menu");
+    // left is pinned (0px in jsdom's zero-rect), right is left unset.
+    expect(menu.style.left).toBe("0px");
+    expect(menu.style.right).toBe("");
+  });
+
+  it("anchors the menu's right edge to the trigger with align='end' (#62)", () => {
+    render(
+      <SelectablePopover
+        ariaLabel="Menu"
+        align="end"
+        trigger={<span>Open</span>}
+        items={items}
+        activeId="c1"
+        onSelect={vi.fn()}
+      />,
+    );
+    open("Menu");
+    const menu = screen.getByRole("menu");
+    // right is pinned, left is left unset — so it opens leftward, not past the edge.
+    expect(menu.style.right).not.toBe("");
+    expect(menu.style.left).toBe("");
+  });
+
   it("is a plain checkmark menu when no edit callbacks are given (Scope-popover mode)", () => {
     render(
       <SelectablePopover ariaLabel="Scope" trigger={<span>All notes</span>} items={items} activeId="c1" onSelect={vi.fn()} />,
