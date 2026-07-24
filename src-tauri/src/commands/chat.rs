@@ -612,6 +612,65 @@ pub fn chat_get_breadth(
     heal_and_read_breadth(&conn, &conversation.id, &conversation.breadth, &note)
 }
 
+/// Workspace turn-allowance for the composer meter (issue #69). Personal chat is
+/// unmetered by design → `None` with no HTTP. In a workspace, GET the chat
+/// service's usage endpoint (same base/token/one-shot-401-retry as the other
+/// cloud chat calls). A meter must NEVER error the pane, so EVERY outcome that
+/// isn't a clean metered reading maps to `None` (the client hides the display):
+///
+/// | Case                                   | Result         |
+/// |----------------------------------------|----------------|
+/// | Personal context                       | None (no HTTP) |
+/// | Not configured / not signed in         | None           |
+/// | Network error                          | None           |
+/// | 401 (after the one-shot re-auth retry) | None           |
+/// | 404 (route absent on an older server)  | None           |
+/// | 400 / 402 / 403 / 5xx                  | None           |
+/// | 200 `{ unmetered: true }`              | None           |
+/// | 200 malformed body                     | None           |
+/// | 200 `{ used_turns, cap_turns, … }`     | Some(UsageDto) |
+#[tauri::command]
+pub async fn chat_usage(app: AppHandle) -> Result<Option<chat::cloud::UsageDto>, String> {
+    let state: State<AppState> = app.state();
+    let workspace = {
+        let conn = state.db.lock();
+        match ChatContext::load(&conn) {
+            ChatContext::Personal => return Ok(None),
+            ChatContext::Workspace(id) => id,
+        }
+    };
+    Ok(usage_cloud(&state, &workspace).await)
+}
+
+/// GET the usage endpoint, collapsing every non-metered outcome to `None` so the
+/// meter can only ever report or silently hide (issue #69). See [`chat_usage`]
+/// for the full mapping. One-shot 401 re-auth mirrors the other cloud calls.
+async fn usage_cloud(state: &State<'_, AppState>, workspace: &str) -> Option<chat::cloud::UsageDto> {
+    let mut attempt = 0u8;
+    loop {
+        let (base, token) = super::cloud::cloud_session(state).await.ok()?;
+        let resp = reqwest::Client::new()
+            .get(format!("{}/api/chat/usage", base.trim_end_matches('/')))
+            .bearer_auth(&token)
+            .query(&[("workspace_id", workspace)])
+            .send()
+            .await
+            .ok()?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED && attempt == 0 {
+            super::cloud::forget_session();
+            attempt += 1;
+            continue;
+        }
+        if !status.is_success() {
+            // 404 / 402 / 403 / 400 / 5xx / repeated-401 → hide, never error.
+            return None;
+        }
+        let body: serde_json::Value = resp.json().await.ok()?;
+        return chat::cloud::parse_usage(&body);
+    }
+}
+
 #[tauri::command]
 pub async fn chat_send(
     app: AppHandle,

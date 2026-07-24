@@ -357,6 +357,7 @@ where
             commands::chat_new_conversation,
             commands::chat_set_breadth,
             commands::chat_get_breadth,
+            commands::chat_usage,
             commands::chat_reindex_note,
             commands::permissions_status,
             commands::permissions_request,
