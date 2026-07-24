@@ -27,10 +27,11 @@ import {
   type ConversationMeta,
 } from "../lib/ipc";
 import { useNotesStore } from "../lib/store";
-import { useCloudStore } from "../lib/cloud";
+import { cloudApi, formatSeatPrice, useCloudStore, type ChatAddon, type ChatKeyMeta } from "../lib/cloud";
 import { useChatReadiness } from "./provider/useChatReadiness";
 import { SelectablePopover, type PopoverItem } from "./SelectablePopover";
-import { usageTone } from "../lib/chatSessions";
+import { ChatKeyEntry } from "./ChatKeyEntry";
+import { usageTone, liveChatErrorCopy } from "../lib/chatSessions";
 import { RECOMMENDED_OLLAMA_MODEL } from "../lib/localModels";
 import { CommandSnippet } from "./CommandSnippet";
 import { cn } from "../lib/cn";
@@ -161,6 +162,11 @@ export function ChatPanel({
   const [activity, setActivity] = useState<string | null>(null);
   const [liveCitations, setLiveCitations] = useState<ChatCitation[]>([]);
   const [error, setError] = useState<string | null>(null);
+  // Machine reason for the last error (issue #76) → drives role-aware BYOK copy
+  // in the live pane. null when cleared; the personal loop and unknown errors
+  // report an empty reason, which liveChatErrorCopy treats the same (falls back
+  // to the server message).
+  const [errorReason, setErrorReason] = useState<string | null>(null);
   const [truncated, setTruncated] = useState(false);
   // Scope chip breadth. Display state only — the backend conversation row is the
   // source of truth (issue #58); this mirrors it and is (re)initialised from it.
@@ -173,6 +179,10 @@ export function ChatPanel({
   // Workspace turn allowance for the composer meter (issue #69). null in personal
   // context and on any unavailable/error/unmetered outcome → the display hides.
   const [usage, setUsage] = useState<ChatUsage | null>(null);
+  // Workspace BYOK key metadata (issue #76). `undefined` = still checking (only
+  // in a managed workspace, to avoid flashing the composer before we know), then
+  // a `ChatKeyMeta` or `null`. Feeds the activation-pane decision.
+  const [keyMeta, setKeyMeta] = useState<ChatKeyMeta | null | undefined>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
   // The composer is auto-focused exactly once per mount, on the first transition
@@ -218,6 +228,7 @@ export function ChatPanel({
     setActivity(null);
     setLiveCitations([]);
     setError(null);
+    setErrorReason(null);
     setTruncated(false);
   }, []);
 
@@ -293,26 +304,60 @@ export function ChatPanel({
   const workspaceId = useCloudStore((s) =>
     s.status.logged_in ? s.status.current_workspace?.id ?? null : null,
   );
+  // BYOK activation surface (issue #76). `billingEnabled` marks the managed
+  // (humla-cloud) server — the only place the activation pane applies; on self-
+  // host it never shows (chat_disabled keeps its existing behaviour). Role +
+  // members drive owner-vs-member copy; the add-on config drives the pitch.
+  const billingEnabled = useCloudStore((s) => s.status.billing_enabled);
+  const wsRole = useCloudStore((s) => s.status.current_workspace?.role ?? null);
+  const members = useCloudStore((s) => s.members);
+  const addon = useCloudStore((s) => s.status.chat_addon ?? null);
+  const inWorkspace = !!workspaceId;
+  const isOwner = wsRole === "owner";
+  const ownerMember = Object.values(members).find((m) => m.role === "owner");
+  const ownerName = ownerMember ? ownerMember.name || ownerMember.email : "the workspace owner";
+  // Personal chat gates on personal readiness (a configured provider/key);
+  // workspace chat does NOT — it runs on the workspace key, so a member without
+  // a personal key still reaches the pane (composer or activation state, #76).
+  const paneUsable = inWorkspace || ready;
 
-  // Fetch the workspace turn allowance for the composer meter (issue #69). Only
-  // in a workspace — personal chat is unmetered, so we skip the round-trip and
-  // clear the display. Gen-guarded so a slow response can't land after a switch.
-  // The backend already collapses every unavailable/error/unmetered case to
-  // null, so we just mirror whatever it returns (null hides the display).
-  const refreshUsage = useCallback(
+  // Activation gating (#76). Only on the managed server + a workspace. While the
+  // key metadata is still loading (undefined) show neither composer nor pane, so
+  // the composer doesn't flash before we know. `notActivated` = no key + no
+  // add-on (usage null). Self-host / personal never reach here. Computed here
+  // (above the effects) so the auto-focus effect can depend on it.
+  const billingWorkspace = inWorkspace && billingEnabled;
+  const activationLoading = billingWorkspace && keyMeta === undefined;
+  const notActivated = billingWorkspace && keyMeta != null && !keyMeta.configured && !usage;
+
+  // Fetch, gen-guarded, the workspace turn allowance for the composer meter
+  // (#69) and — on the managed server — the BYOK key metadata for the activation
+  // decision (#76). Personal → clear both, no round-trip. The backend collapses
+  // every unavailable/error/unmetered usage case to null (the meter hides).
+  const refreshActivation = useCallback(
     async (gen: number) => {
       if (!workspaceId) {
         setUsage(null);
+        setKeyMeta(null);
         return;
       }
       try {
-        const u = await ipc.chatUsage();
-        if (gen === switchGenRef.current) setUsage(u);
+        const [u, m] = await Promise.all([
+          ipc.chatUsage(),
+          billingEnabled ? cloudApi.chatKeyMeta(workspaceId) : Promise.resolve(null),
+        ]);
+        if (gen === switchGenRef.current) {
+          setUsage(u);
+          setKeyMeta(m);
+        }
       } catch {
-        if (gen === switchGenRef.current) setUsage(null);
+        if (gen === switchGenRef.current) {
+          setUsage(null);
+          setKeyMeta(null);
+        }
       }
     },
-    [workspaceId],
+    [workspaceId, billingEnabled],
   );
 
   // Load persisted history + breadth on mount, note change, and workspace
@@ -333,6 +378,9 @@ export function ChatPanel({
     // to this effect, not resetTransient: usage is per-WORKSPACE, so clearing on
     // every per-conversation "+"/history switch would flicker it needlessly.
     setUsage(null);
+    // Mark activation "checking" on a managed workspace so the footer shows
+    // neither composer nor pane until we know (#76); clear it otherwise.
+    setKeyMeta(billingEnabled && !!workspaceId ? undefined : null);
     // Defer SR announcements until the initial message list has loaded (#64).
     setBulkLoading(true);
     // Both async loads gate on the gen as well as `cancelled`: an in-flight
@@ -366,18 +414,28 @@ export function ChatPanel({
         if (!cancelled && gen === switchGenRef.current) setScope("note");
       });
     void reloadConversationList(gen);
-    void refreshUsage(gen);
+    void refreshActivation(gen);
     return () => {
       cancelled = true;
       void ipc.chatReindexNote(noteId).catch(() => {});
     };
-  }, [noteId, workspaceId, reloadConversationList, refreshUsage, resetTransient]);
+  }, [noteId, workspaceId, billingEnabled, reloadConversationList, refreshActivation, resetTransient]);
 
   // Persist a breadth change to the conversation (issue #58): update the chip
   // optimistically, then write it through so the next turn reads the new value.
   function selectBreadth(next: ChatScope) {
     setScope(next);
     void ipc.chatSetBreadth(noteId, conversationId, next).catch((e) => setError(String(e)));
+  }
+
+  // Owner activated chat from the pane (#76): the entry reports fresh metadata →
+  // flip to the composer WITHOUT a reload (BYOK is unmetered). Clear any prior
+  // activation error so the live pane starts clean.
+  function handleActivated(m: ChatKeyMeta) {
+    setKeyMeta(m);
+    setUsage(null);
+    setError(null);
+    setErrorReason(null);
   }
 
   // Stream subscription. Bound once; cancelled-flag + claim keeps it StrictMode-
@@ -407,7 +465,10 @@ export function ChatPanel({
       }
     }).then(claim);
     onChatError((e) => {
-      if (sendingRef.current) setError(e.message);
+      if (sendingRef.current) {
+        setError(e.message);
+        setErrorReason(e.reason ?? null);
+      }
     }).then(claim);
     return () => {
       cancelled = true;
@@ -425,11 +486,14 @@ export function ChatPanel({
   // mount so the Ollama readiness probe re-flipping ready false→true doesn't
   // steal focus from the note body while the user is typing there.
   useEffect(() => {
-    if (ready && !hasAutoFocusedRef.current) {
+    // Only "consume" the one-per-mount focus once the composer actually mounted
+    // (inputRef present) — otherwise the activation pane / loading state would
+    // eat it and the composer would never get focused when it appears (#76).
+    if (!hasAutoFocusedRef.current && inputRef.current) {
       hasAutoFocusedRef.current = true;
-      inputRef.current?.focus();
+      inputRef.current.focus();
     }
-  }, [ready]);
+  }, [paneUsable, notActivated, activationLoading]);
 
   // Publish the session controls to the owner (Note header) whenever the list,
   // the active conversation, or its emptiness changes. Only while ready — no
@@ -437,7 +501,9 @@ export function ChatPanel({
   // render nothing. Actions are stable, so this fires only on real data changes.
   useEffect(() => {
     if (!onControls) return;
-    if (!ready) {
+    // Publish whenever the chat UI is usable — including an unactivated workspace,
+    // so history (popover) stays reachable during the cutover (#76).
+    if (!paneUsable) {
       onControls(null);
       return;
     }
@@ -459,7 +525,7 @@ export function ChatPanel({
     });
   }, [
     onControls,
-    ready,
+    paneUsable,
     noteId,
     conversations,
     conversationId,
@@ -470,7 +536,10 @@ export function ChatPanel({
 
   async function send() {
     const text = input.trim();
-    if (!text || sending || !ready) return;
+    // Mirror the render gate, NOT personal readiness (#76): a workspace send runs
+    // on the workspace key, so it must not require a personal provider key — an
+    // owner who typed the key or any member can send in an activated workspace.
+    if (!text || sending || !paneUsable) return;
     setInput("");
     setError(null);
     setStreaming("");
@@ -503,11 +572,16 @@ export function ChatPanel({
       // A first turn creates the conversation and bumps message counts — refresh
       // the list so the history popover + its visibility rule stay current (#62).
       void reloadConversationList(gen);
-      // A completed turn consumes allowance — refresh the composer meter (#69).
-      void refreshUsage(gen);
+      // A completed turn consumes allowance — refresh the meter (#69).
+      void refreshActivation(gen);
     } catch (e) {
       if (gen !== switchGenRef.current) return;
       setError((prev) => prev ?? String(e));
+      // Authoritative activation fallback (#76): a send can fail with
+      // chat_not_activated if the proactive check was stale — re-detect so the
+      // pane flips in. (byok_* failures leave the key configured, so this stays
+      // on the live pane and the error copy shows instead.)
+      void refreshActivation(gen);
       try {
         const h = await ipc.chatHistory(noteId, conversationId);
         if (gen === switchGenRef.current) setMessages(h.messages);
@@ -531,7 +605,9 @@ export function ChatPanel({
     }
   }
 
-  if (!readinessLoading && !ready) {
+  // Personal chat gates on personal readiness; workspace chat never shows this
+  // setup prompt (it runs on the workspace key, activated via the pane below).
+  if (!inWorkspace && !readinessLoading && !ready) {
     const isOllama = provider === "ollama";
     return (
       <div className="flex-1 min-h-0 flex flex-col items-center justify-center gap-3 px-8 text-center">
@@ -563,6 +639,9 @@ export function ChatPanel({
   }
 
   const showTyping = sending && streaming.length === 0 && !activity;
+
+  // Role-aware BYOK error copy when we have the reason; else the server message.
+  const errorView = liveChatErrorCopy(errorReason, { isOwner, ownerName }) ?? error;
 
   return (
     <div className="flex-1 min-h-0 flex flex-col">
@@ -634,10 +713,10 @@ export function ChatPanel({
         )}
       </div>
 
-      {error && (
+      {!notActivated && errorView && (
         <div className="mx-4 mb-2 flex items-start gap-2 rounded-[var(--radius)] bg-[var(--color-accent-soft)] px-3 py-2 text-xs text-[var(--color-accent-text)]">
           <AlertTriangle size={13} strokeWidth={1.7} className="mt-px shrink-0" />
-          <span>{error}</span>
+          <span>{errorView}</span>
         </div>
       )}
       {truncated && !error && (
@@ -647,6 +726,22 @@ export function ChatPanel({
         </div>
       )}
 
+      {activationLoading ? (
+        <div className="shrink-0 border-t border-[var(--color-line)] p-4 text-sm text-[var(--color-text-muted)]">
+          Checking chat activation…
+        </div>
+      ) : notActivated ? (
+        <ActivationPane
+          // Remount on workspace switch so the entry draft is destroyed
+          // synchronously — belt-and-suspenders draft isolation (#76).
+          key={workspaceId as string}
+          workspaceId={workspaceId as string}
+          isOwner={isOwner}
+          ownerName={ownerName}
+          addon={addon}
+          onActivated={handleActivated}
+        />
+      ) : (
       <div className="shrink-0 border-t border-[var(--color-line)] p-2.5 flex flex-col gap-1.5">
         {/* Send button lives INSIDE the input (Claude-Desktop style): the input
             spans the full composer width, and the button is absolutely pinned to
@@ -711,6 +806,53 @@ export function ChatPanel({
           )}
         </div>
       </div>
+      )}
+    </div>
+  );
+}
+
+// Role-aware activation pane for an unactivated workspace (#76). Replaces the
+// composer while history stays readable above. Owner: a values-first line + the
+// shared key entry (+ the managed add-on as the alternative when the server
+// offers it). Member: nothing actionable, just who to ask. The privacy line
+// respects the PRD claim boundary — "your OpenAI relationship", not "we can't
+// see your data".
+function ActivationPane({
+  workspaceId,
+  isOwner,
+  ownerName,
+  addon,
+  onActivated,
+}: {
+  workspaceId: string;
+  isOwner: boolean;
+  ownerName: string;
+  addon: ChatAddon | null;
+  onActivated: (meta: ChatKeyMeta) => void;
+}) {
+  return (
+    <div className="shrink-0 border-t border-[var(--color-line)] p-4 flex flex-col gap-3">
+      {isOwner ? (
+        <>
+          <p className="text-sm leading-relaxed">
+            Turn on chat for this workspace with your own OpenAI key — your team's chat runs on your
+            OpenAI relationship, free and unmetered.
+          </p>
+          <ChatKeyEntry workspaceId={workspaceId} onActivated={onActivated} />
+          {addon?.available && (
+            <p className="text-xs text-[var(--color-text-muted)] leading-relaxed">
+              Prefer not to manage a key? The managed add-on
+              {addon.price_cents != null &&
+                ` (${formatSeatPrice(addon.price_cents, addon.currency)}/mo)`}{" "}
+              runs chat on Humla's key — set it up in Organization → Workspace chat.
+            </p>
+          )}
+        </>
+      ) : (
+        <p className="text-sm text-[var(--color-text-muted)]">
+          Chat isn't activated for this workspace yet — ask {ownerName}.
+        </p>
+      )}
     </div>
   );
 }

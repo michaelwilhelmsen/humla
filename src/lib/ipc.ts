@@ -493,7 +493,13 @@ export type ChatTextDeltaEvent = {
   delta: string;
 };
 export type ChatDoneEvent = { conversationId: string; messageId: string };
-export type ChatErrorEvent = { conversationId: string; message: string };
+export type ChatErrorEvent = {
+  conversationId: string;
+  message: string;
+  // Machine reason code (issue #76) so the pane can render role-aware BYOK
+  // error copy. Empty/absent for the personal loop and unknown errors.
+  reason?: string;
+};
 export type ChatToolActivityEvent = {
   conversationId: string;
   messageId: string;

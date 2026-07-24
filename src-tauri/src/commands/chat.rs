@@ -305,6 +305,11 @@ struct ChatDonePayload {
 struct ChatErrorPayload {
     conversation_id: String,
     message: String,
+    /// Machine reason code (issue #76) so the client can render role-aware copy
+    /// for the BYOK error taxonomy (byok_key_invalid / byok_provider_quota /
+    /// byok_key_unavailable / chat_not_activated). Empty when unknown.
+    #[serde(default)]
+    reason: String,
 }
 
 /// Tool activity between steps — drives the "searching your notes…" progress
@@ -946,7 +951,11 @@ pub async fn chat_send(
             let message = e.to_string();
             let _ = app.emit(
                 "chat_error",
-                ChatErrorPayload { conversation_id: conversation_id.clone(), message: message.clone() },
+                ChatErrorPayload {
+                    conversation_id: conversation_id.clone(),
+                    message: message.clone(),
+                    reason: String::new(),
+                },
             );
             Err(message)
         }
@@ -1023,7 +1032,11 @@ async fn chat_send_cloud(
             Err(e) => {
                 let _ = app.emit(
                     "chat_error",
-                    ChatErrorPayload { conversation_id: conversation.id.clone(), message: e.clone() },
+                    ChatErrorPayload {
+                        conversation_id: conversation.id.clone(),
+                        message: e.clone(),
+                        reason: String::new(),
+                    },
                 );
                 return Err(e);
             }
@@ -1034,7 +1047,11 @@ async fn chat_send_cloud(
         let text = chat::cloud::cloud_chat_error_message(&reason, &server_msg);
         let _ = app.emit(
             "chat_error",
-            ChatErrorPayload { conversation_id: conversation.id.clone(), message: text.clone() },
+            ChatErrorPayload {
+                conversation_id: conversation.id.clone(),
+                message: text.clone(),
+                reason: reason.clone(),
+            },
         );
         return Err(text);
     }

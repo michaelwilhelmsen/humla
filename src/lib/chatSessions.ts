@@ -52,3 +52,30 @@ export function usageTone(used: number, cap: number): UsageTone {
   if (ratio >= 0.7) return "warning";
   return "default";
 }
+
+// Role-aware copy for the BYOK error taxonomy in the LIVE chat pane (#76): the
+// workspace key was rejected / its OpenAI account is out of quota / the key is
+// transiently unavailable. Owner gets a fix path (workspace settings); a member
+// gets "ask {owner}". Returns null for any other reason (incl. the managed
+// add-on's `quota_exhausted`, which keeps its own upsell copy) so the caller
+// falls back to the server-mapped message string.
+export function liveChatErrorCopy(
+  reason: string | null | undefined,
+  opts: { isOwner: boolean; ownerName: string },
+): string | null {
+  const { isOwner, ownerName } = opts;
+  switch (reason) {
+    case "byok_key_invalid":
+      return isOwner
+        ? "This workspace's OpenAI key was rejected. Re-enter it in Organization → Workspace chat."
+        : `This workspace's OpenAI key was rejected — ask ${ownerName} to fix it.`;
+    case "byok_provider_quota":
+      return isOwner
+        ? "This workspace's OpenAI account is out of quota. Check it in Organization → Workspace chat."
+        : `This workspace's OpenAI account is out of quota — ask ${ownerName} to check it.`;
+    case "byok_key_unavailable":
+      return "Workspace chat is temporarily unavailable — try again shortly.";
+    default:
+      return null;
+  }
+}
