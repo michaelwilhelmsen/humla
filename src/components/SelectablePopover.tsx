@@ -65,6 +65,7 @@ export function SelectablePopover({
   const [draft, setDraft] = useState("");
   const rootRef = useRef<HTMLDivElement>(null);
   const popoverRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
   const [pos, setPos] = useState<{
     top?: number;
     bottom?: number;
@@ -125,7 +126,7 @@ export function SelectablePopover({
           setCreating(false);
           setDraft("");
         } else {
-          setOpen(false);
+          closeAndRestore();
         }
       }
     };
@@ -144,6 +145,16 @@ export function SelectablePopover({
       window.removeEventListener("resize", onScroll);
     };
   }, [open, editingId, creating]);
+
+  // Close and return focus to the trigger. Used only for deliberate,
+  // keyboard-reachable closes (item select, Escape) so keyboard users don't drop
+  // to <body> when the menu unmounts (#64). Incidental closes — click-away and
+  // scroll — use plain setOpen(false) so they don't yank focus from a mouse user
+  // who clicked elsewhere.
+  const closeAndRestore = () => {
+    setOpen(false);
+    triggerRef.current?.focus();
+  };
 
   const editable = !!(onCreate || onRename || onDelete);
 
@@ -173,6 +184,7 @@ export function SelectablePopover({
   return (
     <div ref={rootRef} className="relative inline-flex">
       <button
+        ref={triggerRef}
         type="button"
         aria-haspopup="menu"
         aria-expanded={open}
@@ -206,7 +218,7 @@ export function SelectablePopover({
                 aria-checked={activeId === null}
                 onClick={() => {
                   onSelect(null);
-                  setOpen(false);
+                  closeAndRestore();
                 }}
                 className={
                   rowBase +
@@ -250,7 +262,7 @@ export function SelectablePopover({
                     aria-checked={selected}
                     onClick={() => {
                       onSelect(item.id);
-                      setOpen(false);
+                      closeAndRestore();
                     }}
                     className={
                       rowBase +

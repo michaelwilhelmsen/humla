@@ -805,7 +805,7 @@ export function Note() {
                   "inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-[var(--radius)] text-[13px] font-medium transition-colors",
                   activeTab === "summary"
                     ? "bg-[var(--color-accent-soft)] text-[var(--color-accent-text)]"
-                    : "text-[var(--color-text-disabled)] hover:text-[var(--color-text-muted)]",
+                    : "text-[var(--color-text-muted)] hover:text-[var(--color-text)]",
                 )}
               >
                 <FileText size={14} strokeWidth={1.6} />
@@ -818,7 +818,7 @@ export function Note() {
                   "inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-[var(--radius)] text-[13px] font-medium transition-colors",
                   activeTab === "transcript"
                     ? "bg-[var(--color-accent-soft)] text-[var(--color-accent-text)]"
-                    : "text-[var(--color-text-disabled)] hover:text-[var(--color-text-muted)]",
+                    : "text-[var(--color-text-muted)] hover:text-[var(--color-text)]",
                 )}
               >
                 <MessageSquare size={14} strokeWidth={1.6} />
@@ -831,7 +831,7 @@ export function Note() {
                   "inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-[var(--radius)] text-[13px] font-medium transition-colors",
                   activeTab === "chat"
                     ? "bg-[var(--color-accent-soft)] text-[var(--color-accent-text)]"
-                    : "text-[var(--color-text-disabled)] hover:text-[var(--color-text-muted)]",
+                    : "text-[var(--color-text-muted)] hover:text-[var(--color-text)]",
                 )}
               >
                 <MessageCircle size={14} strokeWidth={1.6} />

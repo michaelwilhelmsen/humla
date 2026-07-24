@@ -161,7 +161,17 @@ export function ChatPanel({
   // Scope chip breadth. Display state only — the backend conversation row is the
   // source of truth (issue #58); this mirrors it and is (re)initialised from it.
   const [scope, setScope] = useState<ChatScope>("note");
+  // A bulk load/switch is in flight (initial load, "+", history select). Drives
+  // aria-busy on the log so a screen reader doesn't announce a wholesale message-
+  // list replacement; normal sends (appended turns, streamed deltas) leave it
+  // false so those stay announced (#64).
+  const [bulkLoading, setBulkLoading] = useState(false);
   const scrollRef = useRef<HTMLDivElement | null>(null);
+  const inputRef = useRef<HTMLTextAreaElement | null>(null);
+  // The composer is auto-focused exactly once per mount, on the first transition
+  // to ready. Guards against the Ollama readiness probe (polls every 2s) flipping
+  // ready false→true and yanking focus out of the note body mid-typing (#64).
+  const hasAutoFocusedRef = useRef(false);
   const sendingRef = useRef(false);
   // Bumped on every context switch (note/workspace load, "+", history select).
   // In-flight async work (a streaming send, a history fetch) captures the gen
@@ -210,6 +220,8 @@ export function ChatPanel({
   const beginSwitch = useCallback((): number => {
     const gen = ++switchGenRef.current;
     resetTransient();
+    // The message list is about to be wholesale-replaced — defer SR announcements.
+    setBulkLoading(true);
     return gen;
   }, [resetTransient]);
 
@@ -229,6 +241,11 @@ export function ChatPanel({
       void reloadConversationList(gen);
     } catch (e) {
       if (gen === switchGenRef.current) setError(String(e));
+    } finally {
+      if (gen === switchGenRef.current) setBulkLoading(false);
+      // Return focus to the composer after the switch so keyboard users aren't
+      // dropped into the void (#64).
+      inputRef.current?.focus();
     }
   }, [noteId, beginSwitch, reloadConversationList]);
 
@@ -249,6 +266,10 @@ export function ChatPanel({
         if (b) setScope(b);
       } catch {
         if (gen === switchGenRef.current) setMessages([]);
+      } finally {
+        if (gen === switchGenRef.current) setBulkLoading(false);
+        // Return focus to the composer after loading the conversation (#64).
+        inputRef.current?.focus();
       }
     },
     [noteId, beginSwitch],
@@ -280,6 +301,8 @@ export function ChatPanel({
     // Hide the history affordance until the fresh list is known (no flicker of
     // the previous note's conversations on switch, #62).
     setConversations([]);
+    // Defer SR announcements until the initial message list has loaded (#64).
+    setBulkLoading(true);
     // Both async loads gate on the gen as well as `cancelled`: an in-flight
     // initial fetch could otherwise resolve after the user hits "+" / opens a
     // history entry and clobber the just-switched-to conversation (#62). The gen
@@ -291,10 +314,14 @@ export function ChatPanel({
         if (!cancelled && gen === switchGenRef.current) {
           setMessages(h.messages);
           setConversationId(h.conversationId);
+          setBulkLoading(false);
         }
       })
       .catch(() => {
-        if (!cancelled && gen === switchGenRef.current) setMessages([]);
+        if (!cancelled && gen === switchGenRef.current) {
+          setMessages([]);
+          setBulkLoading(false);
+        }
       });
     // Initialise the chip from the backend's persisted breadth in one round
     // trip; fall back to "note" if it can't be read.
@@ -359,6 +386,17 @@ export function ChatPanel({
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
   }, [messages, streaming, sending, activity]);
+
+  // Focus the composer the FIRST time the pane becomes usable (issue #64):
+  // opening the Chat tab lands the cursor in the input. Guarded to one focus per
+  // mount so the Ollama readiness probe re-flipping ready false→true doesn't
+  // steal focus from the note body while the user is typing there.
+  useEffect(() => {
+    if (ready && !hasAutoFocusedRef.current) {
+      hasAutoFocusedRef.current = true;
+      inputRef.current?.focus();
+    }
+  }, [ready]);
 
   // Publish the session controls to the owner (Note header) whenever the list,
   // the active conversation, or its emptiness changes. Only while ready — no
@@ -473,7 +511,7 @@ export function ChatPanel({
               <button
                 type="button"
                 onClick={() => openExternal("https://ollama.com/download")}
-                className="underline hover:text-[var(--color-text)]"
+                className="underline text-[var(--color-text-muted)] hover:text-[var(--color-text)]"
               >
                 Install Ollama
               </button>
@@ -506,7 +544,16 @@ export function ChatPanel({
         </div>
       )}
 
-      <div ref={scrollRef} className="flex-1 min-h-0 overflow-y-auto px-4 py-4 flex flex-col gap-3">
+      {/* Message area as an aria-live log (#64): streamed deltas, "Thinking…"
+          and tool-activity lines are announced politely to screen readers. */}
+      <div
+        ref={scrollRef}
+        role="log"
+        aria-live="polite"
+        aria-busy={bulkLoading}
+        aria-label="Chat messages"
+        className="flex-1 min-h-0 overflow-y-auto px-4 py-4 flex flex-col gap-3"
+      >
         {messages.length === 0 && !sending ? (
           <div className="flex-1 flex flex-col items-center justify-center gap-3 px-6 text-center">
             <MessageCircle size={22} strokeWidth={1.5} className="text-[var(--color-text-disabled)]" />
@@ -515,18 +562,23 @@ export function ChatPanel({
             </p>
           </div>
         ) : (
-          messages.map((m) => (
-            <Bubble
-              key={m.id}
-              role={m.role}
-              text={partsText(m)}
-              citations={messageCitations(m)}
-              toolSummary={summarizeToolUse(m)}
-            />
-          ))
-        )}
-        {sending && streaming.length > 0 && (
-          <Bubble role="assistant" text={streaming} citations={liveCitations} />
+          <ul className="flex flex-col gap-3 list-none">
+            {messages.map((m) => (
+              <li key={m.id}>
+                <Bubble
+                  role={m.role}
+                  text={partsText(m)}
+                  citations={messageCitations(m)}
+                  toolSummary={summarizeToolUse(m)}
+                />
+              </li>
+            ))}
+            {sending && streaming.length > 0 && (
+              <li>
+                <Bubble role="assistant" text={streaming} citations={liveCitations} />
+              </li>
+            )}
+          </ul>
         )}
         {activity && (
           <div className="self-start flex items-center gap-1.5 text-xs text-[var(--color-text-muted)] px-1">
@@ -567,16 +619,20 @@ export function ChatPanel({
             baseline gap — the relative wrapper's height then equals the visible
             input's height, and `top-1/2 -translate-y-1/2` centres the button
             against the true input height (no pixel nudging). The small icon-button
-            variant (28px) fits comfortably inside without touching the edges. */}
-        <div className="relative">
+            variant (28px) fits comfortably inside without touching the edges.
+            The textarea has no native outline, so a token-based focus-within
+            border on the wrapper makes keyboard focus visible (#64). */}
+        <div className="relative rounded-[var(--radius)] border border-transparent transition-colors focus-within:border-[var(--color-text-muted)]">
           <textarea
+            ref={inputRef}
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={onKeyDown}
             rows={1}
             placeholder="Ask about your notes…"
+            aria-label="Ask about your notes"
             disabled={sending}
-            className="block w-full resize-none max-h-40 bg-transparent text-sm leading-relaxed pl-2 pr-11 py-2 outline-none placeholder:text-[var(--color-text-disabled)] disabled:opacity-60"
+            className="block w-full resize-none max-h-40 bg-transparent text-sm leading-relaxed pl-2 pr-11 py-2 outline-none placeholder:text-[var(--color-text-muted)] disabled:opacity-60"
           />
           <button
             type="button"
@@ -668,6 +724,9 @@ function Bubble({
     return (
       <div className="flex flex-col items-end">
         <div className="max-w-[85%] rounded-[var(--radius-card)] px-3 py-2 text-sm leading-relaxed bg-[var(--color-pill-hover)] text-[var(--color-text)]">
+          {/* Author label for screen readers — authorship no longer depends on
+              colour/alignment alone (#64). */}
+          <span className="sr-only">You: </span>
           <span className="whitespace-pre-wrap">{text}</span>
         </div>
       </div>
@@ -675,6 +734,7 @@ function Bubble({
   }
   return (
     <div className="flex flex-col">
+      <span className="sr-only">Assistant: </span>
       {toolSummary && (
         // Reads like a paragraph of the answer: same body size (text-sm) and
         // left edge as the answer block (no inset), with margin above and below

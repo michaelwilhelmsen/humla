@@ -151,6 +151,41 @@ describe("SelectablePopover", () => {
     expect(menu.style.left).toBe("");
   });
 
+  it("restores focus to the trigger after selecting an item (#64)", () => {
+    render(
+      <SelectablePopover ariaLabel="Client" trigger={<span>Acme</span>} items={items} activeId="c1" onSelect={vi.fn()} />,
+    );
+    const trigger = screen.getByRole("button", { name: "Client" });
+    fireEvent.click(trigger);
+    fireEvent.click(screen.getByRole("menuitemradio", { name: /Globex/ }));
+    expect(document.activeElement).toBe(trigger);
+  });
+
+  it("restores focus to the trigger on Escape (#64)", () => {
+    render(
+      <SelectablePopover ariaLabel="Client" trigger={<span>Acme</span>} items={items} activeId="c1" onSelect={vi.fn()} />,
+    );
+    const trigger = screen.getByRole("button", { name: "Client" });
+    fireEvent.click(trigger);
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(document.activeElement).toBe(trigger);
+  });
+
+  it("does not steal focus from a mouse click-away (#64)", () => {
+    render(
+      <div>
+        <button>outside</button>
+        <SelectablePopover ariaLabel="Client" trigger={<span>Acme</span>} items={items} activeId="c1" onSelect={vi.fn()} />
+      </div>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Client" }));
+    const outside = screen.getByRole("button", { name: "outside" });
+    outside.focus();
+    // Clicking away closes the menu but must not yank focus to the trigger.
+    fireEvent.mouseDown(document.body);
+    expect(document.activeElement).toBe(outside);
+  });
+
   it("is a plain checkmark menu when no edit callbacks are given (Scope-popover mode)", () => {
     render(
       <SelectablePopover ariaLabel="Scope" trigger={<span>All notes</span>} items={items} activeId="c1" onSelect={vi.fn()} />,
