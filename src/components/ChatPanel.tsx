@@ -1,4 +1,4 @@
-import { memo, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { useNavigate } from "react-router-dom";
@@ -13,6 +13,7 @@ import {
   type ChatCitation,
   type ChatMessageDto,
   type ChatScope,
+  type ConversationMeta,
 } from "../lib/ipc";
 import { useNotesStore } from "../lib/store";
 import { useCloudStore } from "../lib/cloud";
@@ -69,9 +70,38 @@ function toolActivityLabel(name: string): string {
   }
 }
 
-export function ChatPanel({ noteId }: { noteId: string }) {
+// What the panel publishes upward so the Note header (owner of the +/history
+// buttons per #62) can render session chrome without duplicating any chat
+// state: the conversation list + which one is active, a visibility flag for the
+// history affordance, and the two actions the header triggers. ChatPanel stays
+// the sole owner of conversationId/messages; this is a read-only projection plus
+// action callbacks.
+export type ChatSessionControls = {
+  /** The note these controls belong to — lets the header ignore a stale
+   *  projection for one frame after a note switch. */
+  noteId: string;
+  conversations: ConversationMeta[];
+  activeConversationId: string | null;
+  /** Lone-empty-conversation rule (#62): nothing worth browsing → header hides history. */
+  canBrowseHistory: boolean;
+  newChat: () => Promise<void>;
+  openConversation: (id: string) => Promise<void>;
+};
+
+export function ChatPanel({
+  noteId,
+  onControls,
+}: {
+  noteId: string;
+  onControls?: (controls: ChatSessionControls | null) => void;
+}) {
   const { loading: readinessLoading, ready, hint, provider, model } = useChatReadiness();
   const [messages, setMessages] = useState<ChatMessageDto[]>([]);
+  // This Note's conversations (issue #61/#62), most-recent first from the
+  // backend (local rows in Personal; server list merged in a workspace). Feeds
+  // the history popover and the history-visibility rule. Reset to [] on note /
+  // workspace switch so the header hides until the fresh list is known.
+  const [conversations, setConversations] = useState<ConversationMeta[]>([]);
   // The session the panel is on (issue #61). Single-threaded for now: it tracks
   // the note's active/most-recent conversation, captured from the history load
   // and the send result. null until resolved (or when the note has none yet).
@@ -88,6 +118,11 @@ export function ChatPanel({ noteId }: { noteId: string }) {
   const [scope, setScope] = useState<ChatScope>("note");
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const sendingRef = useRef(false);
+  // Bumped on every context switch (note/workspace load, "+", history select).
+  // In-flight async work (a streaming send, a history fetch) captures the gen
+  // at start and drops its writes if the gen moved — so a stale response can't
+  // leak into the conversation the user switched to (#62).
+  const switchGenRef = useRef(0);
 
   // The anchor note's folder drives the "this folder" scope option.
   const folder = useNotesStore((s) => {
@@ -95,6 +130,84 @@ export function ChatPanel({ noteId }: { noteId: string }) {
     const fid = note?.folder_id;
     return fid ? s.folders.find((f) => f.id === fid) ?? null : null;
   });
+
+  // Re-fetch the note's conversation list. Guarded by the switch gen so a slow
+  // list load can't clobber the list after a note/workspace switch. Stable per
+  // note so the callbacks and publish effect below keep stable identities.
+  const reloadConversationList = useCallback(
+    async (gen: number) => {
+      try {
+        const list = await ipc.chatListConversations(noteId);
+        if (gen === switchGenRef.current && Array.isArray(list)) setConversations(list);
+      } catch {
+        /* keep the prior list */
+      }
+    },
+    [noteId],
+  );
+
+  // Clear the transient per-turn UI (streaming/activity/errors) and stop
+  // accepting stream deltas. Shared by the note-switch load effect and every
+  // in-pane switch so the reset stays in one place.
+  const resetTransient = useCallback(() => {
+    sendingRef.current = false;
+    setSending(false);
+    setStreaming("");
+    setActivity(null);
+    setLiveCitations([]);
+    setError(null);
+    setTruncated(false);
+  }, []);
+
+  // Advance the switch gen (dropping any in-flight send/history writes) and
+  // reset transient UI. Shared by "+" and history select so a switch mid-stream
+  // can't bleed into the loaded conversation.
+  const beginSwitch = useCallback((): number => {
+    const gen = ++switchGenRef.current;
+    resetTransient();
+    return gen;
+  }, [resetTransient]);
+
+  // "+" — start (or reuse) a fresh conversation and switch the pane to it. The
+  // backend no-ops when the most-recent conversation is already empty, returning
+  // it instead of creating a duplicate; either way we land on `meta` with an
+  // empty message list and its inherited breadth reflected in the Scope chip.
+  const newChat = useCallback(async () => {
+    const gen = beginSwitch();
+    try {
+      const meta = await ipc.chatNewConversation(noteId);
+      if (gen !== switchGenRef.current || !meta) return;
+      setConversationId(meta.id);
+      setMessages([]);
+      setScope(meta.breadth ?? "note");
+      setConversations((prev) => [meta, ...prev.filter((c) => c.id !== meta.id)]);
+      void reloadConversationList(gen);
+    } catch (e) {
+      if (gen === switchGenRef.current) setError(String(e));
+    }
+  }, [noteId, beginSwitch, reloadConversationList]);
+
+  // Load a conversation chosen from the history popover: its messages and its
+  // own stored breadth (so the Scope chip tracks the loaded conversation, #62).
+  const openConversation = useCallback(
+    async (id: string) => {
+      const gen = beginSwitch();
+      setConversationId(id);
+      try {
+        const [h, b] = await Promise.all([
+          ipc.chatHistory(noteId, id),
+          ipc.chatGetBreadth(noteId, id),
+        ]);
+        if (gen !== switchGenRef.current) return;
+        setMessages(h?.messages ?? []);
+        if (h?.conversationId) setConversationId(h.conversationId);
+        if (b) setScope(b);
+      } catch {
+        if (gen === switchGenRef.current) setMessages([]);
+      }
+    },
+    [noteId, beginSwitch],
+  );
 
   // Chat is pinned to the loaded context (issue #58). The chat follows the
   // active workspace (Personal when none) — there's no tenant picker; the
@@ -114,44 +227,46 @@ export function ChatPanel({ noteId }: { noteId: string }) {
   // reset that lived in `changeTenant`. On unmount / change, rebuild the note's
   // retrieval index so edits made this session are searchable next time.
   useEffect(() => {
+    const gen = ++switchGenRef.current;
     let cancelled = false;
     setInput("");
-    setStreaming("");
-    setActivity(null);
-    setLiveCitations([]);
-    setError(null);
-    setTruncated(false);
-    setSending(false);
-    sendingRef.current = false;
+    resetTransient();
     setConversationId(null);
-    // Load the active session's history and remember which session it resolved
-    // to (issue #61), so subsequent sends/breadth writes target the same one.
+    // Hide the history affordance until the fresh list is known (no flicker of
+    // the previous note's conversations on switch, #62).
+    setConversations([]);
+    // Both async loads gate on the gen as well as `cancelled`: an in-flight
+    // initial fetch could otherwise resolve after the user hits "+" / opens a
+    // history entry and clobber the just-switched-to conversation (#62). The gen
+    // moves on every switch; `cancelled` alone doesn't (beginSwitch never flips
+    // it), so we need both.
     ipc
       .chatHistory(noteId)
       .then((h) => {
-        if (!cancelled) {
+        if (!cancelled && gen === switchGenRef.current) {
           setMessages(h.messages);
           setConversationId(h.conversationId);
         }
       })
       .catch(() => {
-        if (!cancelled) setMessages([]);
+        if (!cancelled && gen === switchGenRef.current) setMessages([]);
       });
     // Initialise the chip from the backend's persisted breadth in one round
     // trip; fall back to "note" if it can't be read.
     ipc
       .chatGetBreadth(noteId)
       .then((b) => {
-        if (!cancelled && b) setScope(b);
+        if (!cancelled && gen === switchGenRef.current && b) setScope(b);
       })
       .catch(() => {
-        if (!cancelled) setScope("note");
+        if (!cancelled && gen === switchGenRef.current) setScope("note");
       });
+    void reloadConversationList(gen);
     return () => {
       cancelled = true;
       void ipc.chatReindexNote(noteId).catch(() => {});
     };
-  }, [noteId, workspaceId]);
+  }, [noteId, workspaceId, reloadConversationList, resetTransient]);
 
   // Persist a breadth change to the conversation (issue #58): update the chip
   // optimistically, then write it through so the next turn reads the new value.
@@ -200,6 +315,43 @@ export function ChatPanel({ noteId }: { noteId: string }) {
     if (el) el.scrollTop = el.scrollHeight;
   }, [messages, streaming, sending, activity]);
 
+  // Publish the session controls to the owner (Note header) whenever the list,
+  // the active conversation, or its emptiness changes. Only while ready — no
+  // chat chrome before a provider is configured. `null` tells the header to
+  // render nothing. Actions are stable, so this fires only on real data changes.
+  useEffect(() => {
+    if (!onControls) return;
+    if (!ready) {
+      onControls(null);
+      return;
+    }
+    // Hide only for a lone empty conversation: nothing to browse. Show once
+    // there's a second conversation (incl. a teammate's), any stored non-empty
+    // conversation, or a live just-sent turn. Keyed off list content rather than
+    // the resolved active id so it doesn't flicker while history resolves (#62).
+    const canBrowseHistory =
+      conversations.length > 1 ||
+      conversations.some((c) => c.messageCount > 0) ||
+      messages.length > 0;
+    onControls({
+      noteId,
+      conversations,
+      activeConversationId: conversationId,
+      canBrowseHistory,
+      newChat,
+      openConversation,
+    });
+  }, [
+    onControls,
+    ready,
+    noteId,
+    conversations,
+    conversationId,
+    messages.length,
+    newChat,
+    openConversation,
+  ]);
+
   async function send() {
     const text = input.trim();
     if (!text || sending || !ready) return;
@@ -211,6 +363,9 @@ export function ChatPanel({ noteId }: { noteId: string }) {
     setTruncated(false);
     setSending(true);
     sendingRef.current = true;
+    // Snapshot the switch gen: if the user opens another conversation or hits
+    // "+" mid-send, the gen moves and we drop this turn's writes (#62).
+    const gen = switchGenRef.current;
     const optimistic: ChatMessageDto = {
       id: `optimistic-${Date.now()}`,
       role: "user",
@@ -223,23 +378,31 @@ export function ChatPanel({ noteId }: { noteId: string }) {
       // Send to the resolved session (null lazily creates the note's first one),
       // capturing the id the backend landed on so the reload targets it (#61).
       const result = await ipc.chatSend(noteId, conversationId, text);
+      if (gen !== switchGenRef.current) return;
       setConversationId(result.conversationId);
       const h = await ipc.chatHistory(noteId, result.conversationId);
+      if (gen !== switchGenRef.current) return;
       setMessages(h.messages);
       setTruncated(result.truncated);
+      // A first turn creates the conversation and bumps message counts — refresh
+      // the list so the history popover + its visibility rule stay current (#62).
+      void reloadConversationList(gen);
     } catch (e) {
+      if (gen !== switchGenRef.current) return;
       setError((prev) => prev ?? String(e));
       try {
         const h = await ipc.chatHistory(noteId, conversationId);
-        setMessages(h.messages);
+        if (gen === switchGenRef.current) setMessages(h.messages);
       } catch {
         /* keep the optimistic view */
       }
     } finally {
-      setStreaming("");
-      setActivity(null);
-      setSending(false);
-      sendingRef.current = false;
+      if (gen === switchGenRef.current) {
+        setStreaming("");
+        setActivity(null);
+        setSending(false);
+        sendingRef.current = false;
+      }
     }
   }
 

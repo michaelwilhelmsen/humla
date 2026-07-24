@@ -101,6 +101,56 @@ describe("SelectablePopover", () => {
     expect(onDelete).toHaveBeenCalledWith("c2");
   });
 
+  it("renders an optional secondary description line under a row (#62)", () => {
+    const withDesc = [
+      { id: "c1", label: "Kickoff questions", description: "5m ago" },
+      { id: "c2", label: "New chat", description: "yesterday" },
+    ];
+    render(
+      <SelectablePopover
+        ariaLabel="Chat history"
+        trigger={<span>History</span>}
+        items={withDesc}
+        activeId="c1"
+        onSelect={vi.fn()}
+      />,
+    );
+    open("Chat history");
+    // Both the primary label and its relative-date secondary line render.
+    expect(screen.getByRole("menuitemradio", { name: /Kickoff questions/ })).toBeInTheDocument();
+    expect(screen.getByText("5m ago")).toBeInTheDocument();
+    expect(screen.getByText("yesterday")).toBeInTheDocument();
+  });
+
+  it("anchors the menu's left edge to the trigger by default", () => {
+    render(
+      <SelectablePopover ariaLabel="Menu" trigger={<span>Open</span>} items={items} activeId="c1" onSelect={vi.fn()} />,
+    );
+    open("Menu");
+    const menu = screen.getByRole("menu");
+    // left is pinned (0px in jsdom's zero-rect), right is left unset.
+    expect(menu.style.left).toBe("0px");
+    expect(menu.style.right).toBe("");
+  });
+
+  it("anchors the menu's right edge to the trigger with align='end' (#62)", () => {
+    render(
+      <SelectablePopover
+        ariaLabel="Menu"
+        align="end"
+        trigger={<span>Open</span>}
+        items={items}
+        activeId="c1"
+        onSelect={vi.fn()}
+      />,
+    );
+    open("Menu");
+    const menu = screen.getByRole("menu");
+    // right is pinned, left is left unset — so it opens leftward, not past the edge.
+    expect(menu.style.right).not.toBe("");
+    expect(menu.style.left).toBe("");
+  });
+
   it("is a plain checkmark menu when no edit callbacks are given (Scope-popover mode)", () => {
     render(
       <SelectablePopover ariaLabel="Scope" trigger={<span>All notes</span>} items={items} activeId="c1" onSelect={vi.fn()} />,

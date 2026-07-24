@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach } from "vitest";
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
-import { ChatPanel } from "./ChatPanel";
+import { ChatPanel, type ChatSessionControls } from "./ChatPanel";
 import { mockTauri } from "../test/tauri";
 import type { ChatMessageDto } from "../lib/ipc";
 import { useCloudStore, DISCONNECTED } from "../lib/cloud";
@@ -60,6 +60,24 @@ function renderPanel(noteId = "n1") {
       <ChatPanel noteId={noteId} />
     </MemoryRouter>,
   );
+}
+
+// Render capturing the header controls ChatPanel publishes (#62). The buttons
+// live in the Note header; testing through the controls contract keeps
+// ChatPanel's session behavior self-contained.
+function renderWithControls(noteId = "n1") {
+  const captured: { current: ChatSessionControls | null } = { current: null };
+  render(
+    <MemoryRouter>
+      <ChatPanel
+        noteId={noteId}
+        onControls={(c) => {
+          captured.current = c;
+        }}
+      />
+    </MemoryRouter>,
+  );
+  return captured;
 }
 
 beforeEach(() => {
@@ -176,6 +194,158 @@ describe("ChatPanel context pinning (#58)", () => {
     renderPanel();
     const indicator = await screen.findByLabelText("Chat context");
     expect(indicator).toHaveTextContent("Personal");
+  });
+});
+
+describe("ChatPanel sessions (#62)", () => {
+  it("hides the history affordance for a lone empty conversation", async () => {
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () => ({ conversationId: "c1", messages: [] }),
+      chat_list_conversations: () => [
+        { id: "c1", title: "", breadth: "note", updatedAt: 1, messageCount: 0 },
+      ],
+    });
+    const controls = renderWithControls();
+    await screen.findByPlaceholderText(/Ask about your notes/);
+    await waitFor(() => expect(controls.current).not.toBeNull());
+    expect(controls.current?.canBrowseHistory).toBe(false);
+  });
+
+  it("shows history once the note has another conversation", async () => {
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () => ({ conversationId: "c1", messages: [] }),
+      chat_list_conversations: () => [
+        { id: "c1", title: "", breadth: "note", updatedAt: 20, messageCount: 0 },
+        { id: "c2", title: "Earlier chat", breadth: "note", updatedAt: 10, messageCount: 4 },
+      ],
+    });
+    const controls = renderWithControls();
+    await screen.findByPlaceholderText(/Ask about your notes/);
+    await waitFor(() => expect(controls.current?.canBrowseHistory).toBe(true));
+    expect(controls.current?.conversations).toHaveLength(2);
+    expect(controls.current?.activeConversationId).toBe("c1");
+  });
+
+  it("'+' starts a fresh conversation and switches the pane to it", async () => {
+    let created = false;
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () => ({
+        conversationId: "c1",
+        messages: [userMsg("Old question?"), assistantMsg("Old answer.")],
+      }),
+      chat_list_conversations: () => [
+        { id: "c1", title: "First", breadth: "note", updatedAt: 5, messageCount: 2 },
+      ],
+      chat_new_conversation: () => {
+        created = true;
+        // Inherits the prior breadth ("all") per #61.
+        return { id: "c2", title: "", breadth: "all", updatedAt: 9, messageCount: 0 };
+      },
+    });
+    const controls = renderWithControls();
+    await screen.findByText("Old answer.");
+    await waitFor(() => expect(controls.current).not.toBeNull());
+
+    await act(async () => {
+      await controls.current!.newChat();
+    });
+
+    expect(created).toBe(true);
+    // The pane is now the fresh, empty conversation.
+    expect(screen.queryByText("Old answer.")).toBeNull();
+    expect(screen.getByText(/Ask anything about your notes/)).toBeInTheDocument();
+    await waitFor(() => expect(controls.current?.activeConversationId).toBe("c2"));
+    // Inherited breadth is reflected in the Scope chip.
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Chat scope" })).toHaveTextContent("All notes"),
+    );
+  });
+
+  it("a slow initial history load can't clobber a conversation started with '+'", async () => {
+    // Hold the mount history fetch open so it resolves AFTER newChat() lands.
+    let releaseInitialHistory: (() => void) | null = null;
+    let historyCalls = 0;
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: (args) => {
+        const cid = (args as { conversationId?: string | null }).conversationId ?? null;
+        historyCalls += 1;
+        if (cid === null && historyCalls === 1) {
+          return new Promise((resolve) => {
+            releaseInitialHistory = () =>
+              resolve({
+                conversationId: "c1",
+                messages: [userMsg("Old question?"), assistantMsg("Stale answer.")],
+              });
+          });
+        }
+        return { conversationId: cid ?? "c1", messages: [] };
+      },
+      chat_list_conversations: () => [
+        { id: "c1", title: "First", breadth: "note", updatedAt: 5, messageCount: 2 },
+      ],
+      chat_new_conversation: () => ({
+        id: "c2",
+        title: "",
+        breadth: "note",
+        updatedAt: 9,
+        messageCount: 0,
+      }),
+    });
+    const controls = renderWithControls();
+    await waitFor(() => expect(controls.current).not.toBeNull());
+
+    // Switch to a fresh conversation while the initial history is still pending.
+    await act(async () => {
+      await controls.current!.newChat();
+    });
+    expect(controls.current?.activeConversationId).toBe("c2");
+
+    // Now let the stale initial fetch resolve — it must be ignored.
+    await act(async () => {
+      releaseInitialHistory?.();
+      await Promise.resolve();
+    });
+    expect(screen.queryByText("Stale answer.")).toBeNull();
+    expect(controls.current?.activeConversationId).toBe("c2");
+  });
+
+  it("loads a chosen conversation's messages and its stored breadth", async () => {
+    const historyArgs: (string | null)[] = [];
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: (args) => {
+        const cid = (args as { conversationId?: string | null }).conversationId ?? null;
+        historyArgs.push(cid);
+        return cid === "c2"
+          ? { conversationId: "c2", messages: [userMsg("Q2"), assistantMsg("Answer two.")] }
+          : { conversationId: "c1", messages: [userMsg("Q1"), assistantMsg("Answer one.")] };
+      },
+      chat_get_breadth: (args) =>
+        (args as { conversationId?: string | null }).conversationId === "c2" ? "all" : "note",
+      chat_list_conversations: () => [
+        { id: "c1", title: "First", breadth: "note", updatedAt: 20, messageCount: 2 },
+        { id: "c2", title: "Second", breadth: "all", updatedAt: 10, messageCount: 2 },
+      ],
+    });
+    const controls = renderWithControls();
+    await screen.findByText("Answer one.");
+    await waitFor(() => expect(controls.current).not.toBeNull());
+
+    await act(async () => {
+      await controls.current!.openConversation("c2");
+    });
+
+    await waitFor(() => expect(screen.getByText("Answer two.")).toBeInTheDocument());
+    expect(screen.queryByText("Answer one.")).toBeNull();
+    expect(historyArgs).toContain("c2");
+    // The Scope chip tracks the loaded conversation's stored breadth.
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Chat scope" })).toHaveTextContent("All notes"),
+    );
   });
 });
 
