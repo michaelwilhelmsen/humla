@@ -3,8 +3,17 @@ import { render, screen, fireEvent, waitFor, act } from "@testing-library/react"
 import { MemoryRouter } from "react-router-dom";
 import { ChatPanel, type ChatSessionControls } from "./ChatPanel";
 import { mockTauri } from "../test/tauri";
-import type { ChatMessageDto } from "../lib/ipc";
+import type { ChatMessageDto, Folder, Note } from "../lib/ipc";
 import { useCloudStore, DISCONNECTED } from "../lib/cloud";
+import { useNotesStore } from "../lib/store";
+
+// A minimal note carrying a folder, so the composer breadth picker's
+// "Folder: {name}" option appears (#63). Only the fields ChatPanel reads matter.
+function seedNoteWithFolder(noteId = "n1", folderName = "Roadmap") {
+  const note = { id: noteId, folder_id: "f1" } as unknown as Note;
+  const folder = { id: "f1", name: folderName } as unknown as Folder;
+  useNotesStore.setState({ notes: [note], folders: [folder] });
+}
 
 // Populate the cloud store as if signed into a workspace, so the Teams tenant
 // row appears (issue #50).
@@ -84,6 +93,8 @@ beforeEach(() => {
   mockTauri();
   // Default: signed out, so Personal is the only tenant unless a test opts in.
   useCloudStore.setState({ status: DISCONNECTED });
+  // No note/folder seeded by default (breadth picker shows no folder option).
+  useNotesStore.setState({ notes: [], folders: [] });
 });
 
 describe("ChatPanel readiness", () => {
@@ -179,21 +190,23 @@ describe("ChatPanel context pinning (#58)", () => {
     expect(screen.queryByRole("button", { name: "Chat tenant" })).toBeNull();
   });
 
-  it("shows the workspace name as a non-interactive context indicator", async () => {
+  it("shows the workspace context line in a workspace (#63)", async () => {
     mockTauri({ provider_key_get: () => "sk-test", chat_history: () => history() });
     signIntoWorkspace("Acme Team");
     renderPanel();
-    // The indicator shows where chat goes; it is not a button (no popover).
-    const indicator = await screen.findByLabelText("Chat context");
-    expect(indicator).toHaveTextContent("Acme Team");
-    expect(indicator.tagName).not.toBe("BUTTON");
+    // A muted line above the thread, exact copy per the ticket.
+    expect(
+      await screen.findByText("Chatting in Acme Team · visible to members"),
+    ).toBeInTheDocument();
   });
 
-  it("shows Personal as the context indicator when signed out", async () => {
+  it("renders no context line in personal (signed out) (#63)", async () => {
     mockTauri({ provider_key_get: () => "sk-test", chat_history: () => history() });
     renderPanel();
-    const indicator = await screen.findByLabelText("Chat context");
-    expect(indicator).toHaveTextContent("Personal");
+    await screen.findByPlaceholderText(/Ask about your notes/);
+    // Personal context shows nothing — no indicator at all.
+    expect(screen.queryByText(/visible to members/)).toBeNull();
+    expect(screen.queryByText(/Chatting in/)).toBeNull();
   });
 });
 
@@ -378,5 +391,63 @@ describe("ChatPanel scope breadth (#58)", () => {
     fireEvent.click(await screen.findByText("All notes"));
     await waitFor(() => expect(setArgs?.breadth).toBe("all"));
     expect(setArgs?.noteId).toBe("n1");
+  });
+});
+
+describe("ChatPanel composer breadth + chrome (#63)", () => {
+  it("shows the current breadth on the composer trigger (not just inside the popover)", async () => {
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () => history(),
+      chat_get_breadth: () => "all",
+    });
+    renderPanel();
+    const trigger = await screen.findByRole("button", { name: "Chat scope" });
+    // The active breadth is always visible on the trigger itself.
+    await waitFor(() => expect(trigger).toHaveTextContent("All notes"));
+  });
+
+  it("offers 'Folder: {name}' only when the note has a folder", async () => {
+    seedNoteWithFolder("n1", "Roadmap");
+    mockTauri({ provider_key_get: () => "sk-test", chat_history: () => history() });
+    renderPanel();
+    fireEvent.click(await screen.findByRole("button", { name: "Chat scope" }));
+    expect(await screen.findByText("Folder: Roadmap")).toBeInTheDocument();
+  });
+
+  it("renders the citation chip without the uppercase-mono nd-chip class", async () => {
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () =>
+        history([userMsg("what happened?"), assistantWithCitation("Here's what I found.")]),
+    });
+    renderPanel();
+    const chip = await screen.findByRole("button", { name: /Kickoff notes/ });
+    expect(chip.className).not.toContain("nd-chip");
+  });
+
+  it("animates the thinking indicator with a reduced-motion guard", async () => {
+    let releaseSend: (() => void) | null = null;
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () => history(),
+      chat_send: () =>
+        new Promise((resolve) => {
+          releaseSend = () => resolve({ conversationId: "c1", truncated: false });
+        }),
+    });
+    renderPanel();
+    const input = await screen.findByPlaceholderText(/Ask about your notes/);
+    fireEvent.change(input, { target: { value: "hi" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    // While the send is in flight the thinking line shows, animated but gated
+    // behind prefers-reduced-motion. The activity line shares these classes.
+    const thinking = await screen.findByText("Thinking…");
+    expect(thinking.className).toContain("animate-pulse");
+    expect(thinking.className).toContain("motion-reduce:animate-none");
+    await act(async () => {
+      releaseSend?.();
+      await Promise.resolve();
+    });
   });
 });
