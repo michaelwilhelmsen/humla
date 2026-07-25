@@ -7,7 +7,7 @@
 
 <p align="center">
   <a href="https://github.com/michaelwilhelmsen/humla/releases/latest">
-    <img alt="Humla — your notes and an AI summary side by side" src="docs/screenshot-summary.png" width="900">
+    <img alt="Humla — open-source meeting notes for Mac. No bot. Private. Local." src="docs/og.png" width="900">
   </a>
 </p>
 
