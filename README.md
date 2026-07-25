@@ -73,11 +73,20 @@ Two engines, both free and on-device:
 
 ### Summarises with both your notes and the transcript
 
-When you click *Summarize*, the model gets your typed notes **and** the transcript as separate inputs, with instructions to favour your notes for intent and the transcript for facts. Pick a preset — Meeting / 1:1 / Lecture / Interview / Brainstorm / Voice memo — or write your own.
+When you click *Summarize*, the model gets your typed notes **and** the transcript as two separate labelled inputs — `[Notater]` and `[Transkripsjon]`, tagged *user-written* and *auto* so it knows which is which. Pick a preset — Meeting / 1:1 / Lecture / Interview / Brainstorm / Voice memo — or write your own.
 
 The summary can run on:
 - **OpenAI** — gpt-5.x reasoning models, gpt-4o, and others.
 - **Any OpenAI-compatible local server** — Ollama, LM Studio, llama.cpp, vLLM. Sensitive meetings can stay 100% on-device.
+
+### Ask your notes — and see where the answer came from
+
+Every note has a **Chat** tab that answers questions about your meetings. It isn't a canned prompt over one transcript: the assistant runs a real retrieval loop, **searching and reading your notes** to ground its answer, then **cites the notes it used** as chips you can click straight through to.
+
+- **Hybrid retrieval** — full-text keyword search *and* semantic (embedding) search over your notes, so it finds things you didn't phrase exactly right.
+- **Choose how wide it looks** — this note, this folder, or all your notes, per conversation.
+- **See its work** — it shows what it searched and read, so an answer is auditable rather than a black box.
+- **Local or cloud** — point it at Ollama for fully on-device chat, or OpenAI. Configured under Settings → Chat, separately from your transcription and summary providers.
 
 ### Stays out of your way
 
@@ -97,7 +106,7 @@ The defaults are designed so nothing leaves your machine unless you tell it to.
 - **Recorded audio:**
   - During the recording, audio is held in a per-recording temp directory.
   - After you stop, Humla saves a mixed `playback.wav` per note to `~/Library/Application Support/no.humla.app/recordings/<note_id>/` so you can play the meeting back with word-by-word transcript highlight. The temp directory is then deleted.
-  - The raw per-source streams (separate mic + system WAVs) are *not* kept by default. Turn on Settings → Audio retention to keep those too — useful for re-running diarization at different thresholds.
+  - The raw per-source streams (separate mic + system WAVs) are *not* kept by default. Turn on Settings → Recording → Audio retention to keep those too — useful for re-running diarization at different thresholds.
 - **API keys** are stored in the macOS **Keychain** (one entry per provider — OpenAI, Deepgram, Groq), not in plaintext on disk.
 - **Model downloads** are one-time fetches from HuggingFace; the files live in `~/Library/Application Support/no.humla.app/models/` and `~/Library/Application Support/FluidAudio/Models/`.
 
@@ -111,7 +120,7 @@ The sync engine speaks to a **[PocketBase](https://pocketbase.io)** backend (a s
 
 ### Option 1 — Humla Cloud (managed)
 
-The hosted option: sign up in-app, nothing to set up. Team workspaces are a paid subscription (**$7/month per workspace**, via Stripe) with a **14-day free trial**; your local/Personal notes are always free. The convenient path — you run no infrastructure.
+The hosted option: sign up in-app, nothing to set up. Team workspaces are a paid subscription — **$5 per user / month**, via Stripe — with a **14-day free trial**; your local/Personal notes are always free. That's about a third of what Granola or Otter charge per seat. The convenient path — you run no infrastructure.
 
 ### Option 2 — Self-host (free)
 
@@ -128,9 +137,9 @@ For a real deployment, put PocketBase behind HTTPS (a reverse proxy) and point i
 3. **Grant permissions** on first record: Microphone, and (for capturing system audio) Screen Recording. You'll need to relaunch after granting Screen Recording.
 4. **Pick your providers** in Settings → Transcription:
    - Local Whisper alone is great if you don't want any cloud calls — click *Download* on a model (~500 MB–1.1 GB depending on which one).
-   - OR add an API key for OpenAI / Deepgram / Groq under Settings → API keys.
+   - OR add an API key for OpenAI / Deepgram / Groq — keys live inline under the provider you pick, and go straight to the macOS Keychain.
 5. *Optional*: download a speaker-diarization model under Settings → Transcription → Speaker diarization (~30 MB).
-6. *Optional*: point Humla at a local LLM server (Ollama / LM Studio / llama.cpp) under Settings → AI Summary if you want fully on-device summaries.
+6. *Optional*: point Humla at a local LLM server (Ollama / LM Studio / llama.cpp) under Settings → Summary for fully on-device summaries, and under Settings → Chat for fully on-device chat.
 
 That's it. Click *Record* to start, *Stop* when you're done, *Summarize* when you want notes.
 
@@ -161,7 +170,7 @@ Humla auto-updates: existing installs detect new releases on launch and prompt t
 └─────────────────────────────────────────────────────────────┘
 ```
 
-In plain language: when you hit Record, a small native Swift helper captures your microphone and your system audio as two separate streams, splits each one into short clips at natural speech pauses, and feeds the clips to whichever transcription engine you picked. Your typed notes are saved continuously alongside the transcript. When you stop, Humla runs speaker identification offline (still no audio leaves your Mac) and labels the transcript. *Summarize* sends your notes + the transcript to your chosen LLM and produces a structured Markdown summary.
+In plain language: when you hit Record, a small native Swift helper captures your microphone and your system audio as two separate streams, splits each one into short clips at natural speech pauses, and feeds the clips to whichever transcription engine you picked. Your typed notes are saved continuously alongside the transcript. When you stop, Humla runs speaker identification offline (still no audio leaves your Mac) and labels the transcript. *Summarize* sends your notes + the transcript to your chosen LLM and produces a structured Markdown summary. Notes are also indexed for search — full-text plus embeddings — which is what the Chat tab draws on when it goes looking for an answer.
 
 For a deep dive into the architecture — module map, data flow, gotchas — see [`CLAUDE.md`](CLAUDE.md).
 
@@ -200,9 +209,12 @@ humla/
 ├── src/                        # React frontend (Tiptap + Zustand)
 ├── src-tauri/                  # Rust backend (Tauri 2)
 │   ├── src/
-│   │   ├── commands.rs         # Tauri commands, recording lifecycle
+│   │   ├── commands.rs         # recording lifecycle, chunk transcription, diarize-on-stop
+│   │   ├── commands/           # command groups: notes, folders, settings, chat, clients,
+│   │   │                       #   cloud, export, models, summary, api_keys, …
 │   │   ├── recording.rs        # session state, per-source trails
 │   │   ├── stt/                # STT adapter abstraction (OpenAI/Local/Deepgram/Groq)
+│   │   ├── chat/               # agentic note-chat: tool loop, retrieval, providers
 │   │   ├── diarize.rs          # speaker-diarize sidecar wrapper
 │   │   ├── local_whisper.rs    # whisper-rs + Metal model registry
 │   │   └── openai.rs           # OpenAI HTTP client + summary endpoint
@@ -217,6 +229,7 @@ humla/
 - **App shell** — Tauri 2, Rust 1.85, reqwest (rustls-tls), rusqlite (bundled), tokio
 - **Local Whisper** — `whisper-rs` 0.16 (binds `whisper.cpp`) with the `metal` feature; `large-v3-turbo-q5` default plus alternative multilingual models and NB Whisper Large for Norwegian
 - **Speaker diarization** — FluidAudio Swift package; pyannote community-1 + VBx clustering with PLDA, *or* NVIDIA Sortformer; CoreML on Apple Neural Engine
+- **Note chat** — agentic tool loop over three retrieval tools; hybrid search combining SQLite **FTS5** keyword ranking with semantic embedding similarity; OpenAI or Ollama as the chat provider
 - **Audio capture** — Swift, `AVAudioEngine`, `ScreenCaptureKit`; sandbox-detached via `setsid` so TCC permissions bind to the sidecar binary
 
 ## Acknowledgements

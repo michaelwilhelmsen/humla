@@ -1,5 +1,12 @@
 # Humla UI/UX redesign — implementation brief
 
+> ## ⚠️ HISTORICAL — shipped in v0.30.0. Two things below are now WRONG.
+>
+> 1. **The accent is Humla gold `#ffdc6c`, NOT ink**, and it does *not* invert in dark mode (same value both themes). Text/icon uses take `--color-accent-text`; filled uses take `--color-accent` + `--color-on-accent`. §2 below is superseded.
+> 2. **`.nd-action`, `.nd-prop-*`, `.nd-select` and `.rec-bar` no longer exist** — deleted as dead CSS after the refactor.
+>
+> `CLAUDE.md` (Frontend → Design system) is the current source of truth. Keep this file for the layout/structure rationale only.
+
 ## Goal
 Refactor the Humla frontend to the new design. This is a **visual + structural UX refactor only** — preserve every existing behavior (recording, transcription, diarization, summarization, cloud sync, version history, playback, speaker rename, read-only / recording-lock / pending-sync states). **No backend, IPC, or schema changes.**
 
