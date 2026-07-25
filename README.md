@@ -1,11 +1,6 @@
 <h1 align="center">Humla</h1>
 
 <p align="center">
-  <em>Your meetings, transcribed and summarised on your Mac.</em><br>
-  <em>Your audio. Your keys. Your data.</em>
-</p>
-
-<p align="center">
   <a href="https://github.com/michaelwilhelmsen/humla/releases/latest">
     <img alt="Humla — open-source meeting notes for Mac. No bot. Private. Local." src="docs/og.png" width="900">
   </a>
