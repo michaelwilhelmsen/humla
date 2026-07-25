@@ -131,7 +131,12 @@ impl ChatAdapter for OpenAiChatAdapter {
             ctx.model,
             &wire_messages,
             &wire_tools,
-            |delta| on_event(ChatStreamEvent::TextDelta(delta.to_string())),
+            // Returning false breaks the SSE loop, so a stop lands mid-answer
+            // and the partial that already streamed is what comes back (#80).
+            |delta| {
+                on_event(ChatStreamEvent::TextDelta(delta.to_string()));
+                !ctx.cancel.is_cancelled()
+            },
         )
         .await?;
         Ok(emit_step(text, raw, on_event))
@@ -168,10 +173,47 @@ impl ChatAdapter for OllamaChatAdapter {
             ctx.model,
             &wire_messages,
             &wire_tools,
-            |delta| on_event(ChatStreamEvent::TextDelta(delta.to_string())),
+            // Buffered, so this fires once at the end and the bool is moot —
+            // `agentic_loop` aborts an in-flight Ollama step by racing it
+            // against the cancel flag instead (#80).
+            |delta| {
+                on_event(ChatStreamEvent::TextDelta(delta.to_string()));
+                !ctx.cancel.is_cancelled()
+            },
         )
         .await?;
         Ok(emit_step(text, raw, on_event))
+    }
+}
+
+/// Test adapter that emits one text delta and then never returns, standing in
+/// for a provider mid-answer (or a buffered Ollama call that can't be
+/// interrupted from inside). Used to exercise the stop path where the step
+/// future is dropped: its return value is lost, so the partial must survive via
+/// the deltas the caller already accumulated (issue #80).
+#[cfg(test)]
+pub struct StallingChatAdapter {
+    pub text: String,
+}
+
+#[cfg(test)]
+#[async_trait]
+impl ChatAdapter for StallingChatAdapter {
+    fn provider_id(&self) -> &'static str {
+        "stalling"
+    }
+
+    async fn step(
+        &self,
+        _ctx: ChatCtx<'_>,
+        _messages: &[ChatTurn],
+        _tools: &[ToolSpec],
+        on_event: &mut (dyn FnMut(ChatStreamEvent) + Send),
+    ) -> Result<ChatStep> {
+        on_event(ChatStreamEvent::TextDelta(self.text.clone()));
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
     }
 }
 

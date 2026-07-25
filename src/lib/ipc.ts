@@ -403,6 +403,10 @@ export const ipc = {
   // the persisted breadth, so the UI can never diverge from it.
   chatSend: (noteId: string, conversationId: string | null, message: string) =>
     invoke<ChatSendResult>("chat_send", { noteId, conversationId, message }),
+  // Stop the turn streaming in a Note's pane (issue #80). A no-op when nothing
+  // is in flight, so a stray click can't error. Any text that already streamed
+  // is kept; a stop before the first token leaves only the user's message.
+  chatCancel: (noteId: string) => invoke<void>("chat_cancel", { noteId }),
   chatHistory: (noteId: string, conversationId: string | null = null) =>
     invoke<ChatHistory>("chat_history", { noteId, conversationId }),
   // List / create chat sessions for a Note (issue #61). Personal reads local

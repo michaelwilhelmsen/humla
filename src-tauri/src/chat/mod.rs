@@ -9,11 +9,11 @@ pub mod cloud;
 mod providers;
 mod tools;
 
-pub use adapter::{ChatAdapter, ChatCtx, ChatStreamEvent, ChatTurn, ToolSpec};
+pub use adapter::{CancelFlag, ChatAdapter, ChatCtx, ChatStreamEvent, ChatTurn, ToolSpec};
 pub use providers::{OllamaChatAdapter, OpenAiChatAdapter};
 pub use tools::{execute_tool, tool_specs, Citation, ToolScope};
 #[cfg(test)]
-pub use providers::FakeChatAdapter;
+pub use providers::{FakeChatAdapter, StallingChatAdapter};
 
 use anyhow::Result;
 use parking_lot::Mutex;
@@ -379,7 +379,19 @@ pub async fn run_chat(
 
     // 4. Finalise or roll back.
     match result {
-        Ok(parts) => {
+        // A stop with nothing streamed yet (issue #80): drop the placeholder so
+        // the thread shows the bare user turn — which reads correctly as "I
+        // aborted that" — rather than an empty assistant bubble. A stop *after*
+        // text arrived keeps the partial, since the user stopped because they'd
+        // read enough and deleting what they just read would be hostile.
+        Ok(LoopOut { parts, cancelled: true }) if parts.is_empty() => {
+            let conn = db.lock();
+            let _ = db::delete_chat_message(&conn, &assistant_id);
+            drop(conn);
+            sink(ChatEvent::Done { message_id: assistant_id });
+            Ok(())
+        }
+        Ok(LoopOut { parts, .. }) => {
             let conn = db.lock();
             db::update_chat_message_content(&conn, &assistant_id, &parts_json(&parts))?;
             drop(conn);
@@ -391,6 +403,25 @@ pub async fn run_chat(
             let _ = db::delete_chat_message(&conn, &assistant_id);
             Err(e)
         }
+    }
+}
+
+/// What the step loop produced. `cancelled` distinguishes a user stop from a
+/// natural finish, so the caller can tell an empty partial (nothing to keep)
+/// from a genuine "found nothing" answer.
+struct LoopOut {
+    parts: Vec<Part>,
+    cancelled: bool,
+}
+
+/// Resolves once the flag is set. `CancelFlag` is a plain atomic with no waker,
+/// so this polls; the interval only bounds how long an un-interruptible provider
+/// call keeps running after a stop, and every streaming provider beats it via
+/// its delta callback anyway.
+async fn poll_until_cancelled(flag: &CancelFlag) {
+    const TICK: std::time::Duration = std::time::Duration::from_millis(100);
+    while !flag.is_cancelled() {
+        tokio::time::sleep(TICK).await;
     }
 }
 
@@ -409,12 +440,19 @@ async fn agentic_loop(
     answer_block: &str,
     embedder: Option<&dyn crate::embed::EmbeddingAdapter>,
     sink: &mut (impl FnMut(ChatEvent) + Send),
-) -> Result<Vec<Part>> {
+) -> Result<LoopOut> {
     let mut working = base;
     let mut parts: Vec<Part> = Vec::new();
     let mut answer = String::new();
+    let mut cancelled = false;
 
     for step in 0..MAX_STEPS {
+        // Stopped between steps (issue #80) — most likely during a tool call.
+        // Bail before spending another provider round-trip.
+        if ctx.cancel.is_cancelled() {
+            cancelled = true;
+            break;
+        }
         let final_step = step == MAX_STEPS - 1;
         let tools: &[ToolSpec] = if final_step { &[] } else { specs };
         if final_step {
@@ -423,11 +461,19 @@ async fn agentic_loop(
 
         // Collect events from this step: stream text deltas straight through;
         // tool-call events are handled from the returned ChatStep below.
+        //
+        // Deltas are also accumulated into `streamed`, which lives OUTSIDE the
+        // step future. That matters for the stop path below: if the future is
+        // dropped mid-flight its return value is lost, but whatever the user
+        // already saw on screen is still here to persist (issue #80).
+        let streamed = std::sync::Arc::new(parking_lot::Mutex::new(String::new()));
         let step_result = {
             let msg_id = assistant_id.to_string();
             let block = answer_block.to_string();
+            let seen = std::sync::Arc::clone(&streamed);
             let mut on_event = |ev: ChatStreamEvent| {
                 if let ChatStreamEvent::TextDelta(delta) = ev {
+                    seen.lock().push_str(&delta);
                     sink(ChatEvent::TextDelta {
                         message_id: msg_id.clone(),
                         block_id: block.clone(),
@@ -435,9 +481,33 @@ async fn agentic_loop(
                     });
                 }
             };
-            adapter.step(ctx_ref(&ctx), &working, tools, &mut on_event).await
+            // Race the step against the stop signal. The cloud adapter usually
+            // stops itself first (its delta callback breaks the SSE loop, which
+            // is promptest), but Ollama's step is buffered and un-interruptible
+            // from inside — dropping the future here is what actually ends the
+            // request, so a local model can't hold the user hostage.
+            tokio::select! {
+                biased;
+                r = adapter.step(ctx_ref(&ctx), &working, tools, &mut on_event) => Some(r),
+                () = poll_until_cancelled(ctx.cancel) => None,
+            }
+        };
+        let Some(step_result) = step_result else {
+            // Aborted mid-step: keep what the user already read.
+            answer = streamed.lock().clone();
+            cancelled = true;
+            break;
         };
         let out = step_result?;
+
+        // Stopped mid-answer: the adapter's delta callback returned false and
+        // broke the provider's stream loop, so `out.text` is whatever streamed
+        // before the stop. That partial IS the answer (issue #80).
+        if ctx.cancel.is_cancelled() {
+            answer = out.text;
+            cancelled = true;
+            break;
+        }
 
         // No tool calls (or the forced final step) → this step's text IS the
         // answer. Prose emitted alongside tool calls on earlier steps is
@@ -505,6 +575,14 @@ async fn agentic_loop(
         }
     }
 
+    // A stop before any text arrived has nothing worth keeping — report it as
+    // empty parts and let the caller drop the placeholder. Notably this does NOT
+    // fall through to the "couldn't find an answer" text below: the user stopped
+    // it, so claiming a failed search would be a lie (issue #80).
+    if cancelled && answer.trim().is_empty() {
+        return Ok(LoopOut { parts: Vec::new(), cancelled });
+    }
+
     let final_text = if answer.trim().is_empty() {
         "I couldn't find an answer to that in your notes.".to_string()
     } else {
@@ -513,13 +591,19 @@ async fn agentic_loop(
     // If nothing streamed (e.g. Ollama buffered its only text on the final
     // step, or a fallback answer), make sure the UI still receives it.
     parts.push(Part::Text { id: answer_block.to_string(), text: final_text });
-    Ok(parts)
+    Ok(LoopOut { parts, cancelled })
 }
 
 /// Reborrow a `ChatCtx` for another `adapter.step` call (the ctx holds only
 /// borrows, so this is a cheap copy of those borrows).
 fn ctx_ref<'a>(ctx: &ChatCtx<'a>) -> ChatCtx<'a> {
-    ChatCtx { model: ctx.model, api_key: ctx.api_key, base_url: ctx.base_url, think: ctx.think }
+    ChatCtx {
+        model: ctx.model,
+        api_key: ctx.api_key,
+        base_url: ctx.base_url,
+        think: ctx.think,
+        cancel: ctx.cancel,
+    }
 }
 
 #[cfg(test)]
@@ -696,8 +780,22 @@ mod tests {
             .id
     }
 
-    const FAKE_CTX: ChatCtx<'static> =
-        ChatCtx { model: "fake", api_key: None, base_url: "http://local", think: false };
+    /// Never set, for the tests that aren't about stopping. A `static` because
+    /// `FAKE_CTX` is a `const` and so needs a `'static` borrow.
+    static NEVER_CANCELLED: CancelFlag = CancelFlag::new();
+
+    const FAKE_CTX: ChatCtx<'static> = ChatCtx {
+        model: "fake",
+        api_key: None,
+        base_url: "http://local",
+        think: false,
+        cancel: &NEVER_CANCELLED,
+    };
+
+    /// `FAKE_CTX` with a stop signal the test controls.
+    fn cancellable_ctx(flag: &CancelFlag) -> ChatCtx<'_> {
+        ChatCtx { cancel: flag, ..FAKE_CTX }
+    }
 
     #[tokio::test]
     async fn run_chat_persists_both_messages_and_streams_answer() {
@@ -852,6 +950,126 @@ mod tests {
         let parts = parse_parts(&msgs[1].content);
         assert!(matches!(parts.first(), Some(Part::Tool { name, .. }) if name == "search_notes"));
         assert!(matches!(parts.last(), Some(Part::Text { text, .. }) if text.contains("budget")));
+    }
+
+    // ── Stop a streaming turn (issue #80) ───────────────────────────────────
+
+    #[tokio::test]
+    async fn a_stop_before_any_text_leaves_only_the_user_turn() {
+        // Nothing streamed, so there's nothing worth keeping: the assistant
+        // placeholder is dropped and the thread shows the bare user turn. In
+        // particular it must NOT persist the "couldn't find an answer" fallback
+        // — the user stopped it; claiming a failed search would be a lie.
+        let dir = tempfile::tempdir().unwrap();
+        let (dbh, _path) = temp_db(&dir);
+        let conv_id = conv(&dbh, "all");
+
+        let flag = CancelFlag::new();
+        flag.cancel();
+        let adapter = FakeChatAdapter::new(["never reached"]);
+        run_chat(
+            &dbh,
+            &adapter,
+            cancellable_ctx(&flag),
+            &conv_id,
+            "",
+            &ToolScope::All,
+            "",
+            None,
+            "stop me",
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        let conn = dbh.lock();
+        let msgs = db::list_chat_messages(&conn, &conv_id).unwrap();
+        assert_eq!(msgs.len(), 1, "only the user turn survives");
+        assert_eq!(msgs[0].role, "user");
+    }
+
+    #[tokio::test]
+    async fn a_stop_between_steps_halts_the_loop() {
+        // Cancelling while a tool call is running must not spend another
+        // provider round-trip: the scripted answering step never runs.
+        let dir = tempfile::tempdir().unwrap();
+        let (dbh, _path) = temp_db(&dir);
+        seed_note(&dbh, "Anything", "some searchable content here");
+        let conv_id = conv(&dbh, "all");
+
+        let flag = CancelFlag::new();
+        let adapter = FakeChatAdapter::scripted(vec![
+            FakeChatAdapter::tool_step("c1", "search_notes", r#"{"query":"content"}"#),
+            FakeChatAdapter::text_step("THIS STEP MUST NOT RUN"),
+        ]);
+        run_chat(
+            &dbh,
+            &adapter,
+            cancellable_ctx(&flag),
+            &conv_id,
+            "",
+            &ToolScope::All,
+            "",
+            None,
+            "search then stop",
+            // The tool finished; stop before the next step is dispatched.
+            |ev| {
+                if matches!(ev, ChatEvent::ToolActivity { .. }) {
+                    flag.cancel();
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        let conn = dbh.lock();
+        let msgs = db::list_chat_messages(&conn, &conv_id).unwrap();
+        assert_eq!(msgs.len(), 1, "no text streamed, so no assistant turn is kept");
+        assert!(
+            !msgs.iter().any(|m| m.content.contains("THIS STEP MUST NOT RUN")),
+            "the loop stopped instead of running the next step",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stop_mid_answer_keeps_what_the_user_already_read() {
+        // The provider is still streaming when the stop lands, so its step
+        // future is dropped and its return value is lost. The partial must
+        // survive via the deltas already accumulated — deleting text the user
+        // just read would be hostile.
+        let dir = tempfile::tempdir().unwrap();
+        let (dbh, _path) = temp_db(&dir);
+        let conv_id = conv(&dbh, "all");
+
+        let flag = CancelFlag::new();
+        let adapter = StallingChatAdapter { text: "Half an answer".into() };
+        run_chat(
+            &dbh,
+            &adapter,
+            cancellable_ctx(&flag),
+            &conv_id,
+            "",
+            &ToolScope::All,
+            "",
+            None,
+            "start answering then stop",
+            |ev| {
+                if matches!(ev, ChatEvent::TextDelta { .. }) {
+                    flag.cancel();
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        let conn = dbh.lock();
+        let msgs = db::list_chat_messages(&conn, &conv_id).unwrap();
+        assert_eq!(msgs.len(), 2, "the partial assistant turn is kept");
+        let parts = parse_parts(&msgs[1].content);
+        assert!(
+            matches!(parts.last(), Some(Part::Text { text, .. }) if text == "Half an answer"),
+            "persisted the partial verbatim, got {parts:?}",
+        );
     }
 
     #[tokio::test]

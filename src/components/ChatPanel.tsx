@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { useNavigate } from "react-router-dom";
@@ -13,6 +13,7 @@ import {
   Loader2,
   MessageCircle,
   Settings2,
+  Square,
 } from "lucide-react";
 import {
   ipc,
@@ -31,7 +32,8 @@ import { cloudApi, formatSeatPrice, useCloudStore, type ChatAddon, type ChatKeyM
 import { useChatReadiness } from "./provider/useChatReadiness";
 import { SelectablePopover, type PopoverItem } from "./SelectablePopover";
 import { ChatKeyEntry } from "./ChatKeyEntry";
-import { usageTone, liveChatErrorCopy } from "../lib/chatSessions";
+import { usageTone, liveChatErrorCopy, groundingLikelyTruncated } from "../lib/chatSessions";
+import { NOTE_PROMPTS, opensPromptPicker, type ChatPrompt } from "../lib/chatPrompts";
 import { RECOMMENDED_OLLAMA_MODEL } from "../lib/localModels";
 import { CommandSnippet } from "./CommandSnippet";
 import { cn } from "../lib/cn";
@@ -171,6 +173,10 @@ export function ChatPanel({
   // Scope chip breadth. Display state only — the backend conversation row is the
   // source of truth (issue #58); this mirrors it and is (re)initialised from it.
   const [scope, setScope] = useState<ChatScope>("note");
+  // Prompt picker visibility (#80). Opened by typing "/" into an empty composer;
+  // the picker owns the keys while it's up (it takes focus), so the composer's
+  // own key handler doesn't need to know about Escape.
+  const [promptsOpen, setPromptsOpen] = useState(false);
   // A bulk load/switch is in flight (initial load, "+", history select). Drives
   // aria-busy on the log so a screen reader doesn't announce a wholesale message-
   // list replacement; normal sends (appended turns, streamed deltas) leave it
@@ -202,6 +208,23 @@ export function ChatPanel({
     const fid = note?.folder_id;
     return fid ? s.folders.find((f) => f.id === fid) ?? null : null;
   });
+
+  // The anchor note itself, for the pre-emptive truncation hint (#80). Selected
+  // as the stored object — a derived `{...}` literal would be a fresh snapshot
+  // on every call and spin useSyncExternalStore into an update loop.
+  const anchorNote = useNotesStore((s) => s.notes.find((n) => n.id === noteId) ?? null);
+  const likelyTruncated = useMemo(() => {
+    if (!anchorNote) return false;
+    // Body is HTML in the store but plain text in the prompt — measure the text,
+    // or tag-heavy markup would trip the hint far too early.
+    const el = document.createElement("div");
+    el.innerHTML = anchorNote.body ?? "";
+    return groundingLikelyTruncated({
+      bodyText: el.textContent || "",
+      transcript: anchorNote.transcript ?? "",
+      summary: anchorNote.summary ?? "",
+    });
+  }, [anchorNote]);
 
   // Re-fetch the note's conversation list. Guarded by the switch gen so a slow
   // list load can't clobber the list after a note/workspace switch. Stable per
@@ -598,11 +621,36 @@ export function ChatPanel({
     }
   }
 
+  // Stop the streaming turn (#80). Fire-and-forget: the command is a no-op when
+  // nothing is in flight, and `sending` is cleared by the send's own completion
+  // path — the backend still finishes the turn by persisting whatever streamed.
+  const cancel = useCallback(() => {
+    void ipc.chatCancel(noteId).catch(() => {});
+  }, [noteId]);
+
   function onKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
+    // "/" on an empty composer opens the prompt picker; mid-sentence it stays a
+    // literal slash (see opensPromptPicker).
+    if (!sending && opensPromptPicker(e.key, input)) {
+      e.preventDefault();
+      setPromptsOpen(true);
+      return;
+    }
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
-      void send();
+      // Mid-turn, Enter stops rather than queueing a second turn.
+      if (sending) cancel();
+      else void send();
     }
+  }
+
+  // Fill the composer from a picked prompt and hand focus back, so the user can
+  // edit before sending rather than firing blind. Not a hook — deliberately not
+  // named `use*`.
+  function applyPrompt(p: ChatPrompt) {
+    setPromptsOpen(false);
+    setInput(p.prompt);
+    inputRef.current?.focus();
   }
 
   // Personal chat gates on personal readiness; workspace chat never shows this
@@ -719,6 +767,10 @@ export function ChatPanel({
           <span>{errorView}</span>
         </div>
       )}
+      {/* Authoritative post-turn truncation report. Kept even when the
+          composer's pre-emptive hint is showing: the hint is an estimate and a
+          warning ("may omit"), this is the confirmation that it actually
+          happened. Suppressing it would leave the user unsure which. */}
       {truncated && !error && (
         <div className="mx-4 mb-2 text-xs text-[var(--color-text-muted)]">
           Note content was truncated to fit the context budget — the answer may miss details near
@@ -742,7 +794,23 @@ export function ChatPanel({
           onActivated={handleActivated}
         />
       ) : (
-      <div className="shrink-0 border-t border-[var(--color-line)] p-2.5 flex flex-col gap-1.5">
+      <div className="relative shrink-0 border-t border-[var(--color-line)] p-2.5 flex flex-col gap-1.5">
+        {/* Prompt picker (#80). Rendered in-flow above the composer rather than
+            through SelectablePopover: that component is a click-to-select value
+            picker with no controlled-open and no arrow-key nav, and bending it
+            into a keyboard command menu would have put the Client and Breadth
+            pickers at risk. The composer is pinned to the bottom of a
+            fixed-width panel, so this needs no portal or flip logic either. */}
+        {promptsOpen && (
+          <PromptPicker
+            prompts={NOTE_PROMPTS}
+            onPick={applyPrompt}
+            onDismiss={() => {
+              setPromptsOpen(false);
+              inputRef.current?.focus();
+            }}
+          />
+        )}
         {/* Send button lives INSIDE the input (Claude-Desktop style): the input
             spans the full composer width, and the button is absolutely pinned to
             its right edge. The textarea is `block` so it has no inline-block
@@ -759,35 +827,78 @@ export function ChatPanel({
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={onKeyDown}
             rows={1}
-            placeholder="Ask about your notes…"
+            // Stays enabled while a turn streams so Enter can stop it (#80) —
+            // `send` no-ops on `sending`, so this can't queue a second turn.
+            placeholder={sending ? "Streaming — press Enter to stop" : "Ask about your notes…"}
             aria-label="Ask about your notes"
-            disabled={sending}
-            className="block w-full resize-none max-h-40 bg-transparent text-sm leading-relaxed pl-2 pr-11 py-2 outline-none placeholder:text-[var(--color-text-muted)] disabled:opacity-60"
+            className="block w-full resize-none max-h-40 bg-transparent text-sm leading-relaxed pl-2 pr-11 py-2 outline-none placeholder:text-[var(--color-text-muted)]"
           />
-          <button
-            type="button"
-            onClick={() => void send()}
-            disabled={sending || input.trim().length === 0}
-            title="Send"
-            aria-label="Send"
-            className={cn(
-              "nd-btn-icon nd-btn-icon-sm absolute right-1.5 top-1/2 -translate-y-1/2",
-              (sending || input.trim().length === 0) && "opacity-40 pointer-events-none",
-            )}
-          >
-            <CornerDownLeft size={16} strokeWidth={1.7} />
-          </button>
+          {/* Send morphs into Stop while streaming (#80), so the same spot is
+              always the turn's primary control. */}
+          {sending ? (
+            <button
+              type="button"
+              onClick={cancel}
+              title="Stop"
+              aria-label="Stop generating"
+              className="nd-btn-icon nd-btn-icon-sm absolute right-1.5 top-1/2 -translate-y-1/2"
+            >
+              <Square size={13} strokeWidth={2} fill="currentColor" />
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={() => void send()}
+              disabled={input.trim().length === 0}
+              title="Send"
+              aria-label="Send"
+              className={cn(
+                "nd-btn-icon nd-btn-icon-sm absolute right-1.5 top-1/2 -translate-y-1/2",
+                input.trim().length === 0 && "opacity-40 pointer-events-none",
+              )}
+            >
+              <CornerDownLeft size={16} strokeWidth={1.7} />
+            </button>
+          )}
         </div>
         {/* Composer control row: breadth picker bottom-left, workspace turn
             allowance bottom-right (#69). The meter shows only in a metered
             workspace — `usage` is null in personal context and on any
             unavailable/error/unmetered outcome, so nothing renders then. */}
-        <div className="flex items-center justify-between px-1">
-          <BreadthPicker
-            scope={scope}
-            onScope={selectBreadth}
-            folderName={folder?.name ?? null}
-          />
+        <div className="flex items-center justify-between gap-2 px-1">
+          <div className="flex min-w-0 items-center gap-2">
+            <BreadthPicker
+              scope={scope}
+              onScope={selectBreadth}
+              folderName={folder?.name ?? null}
+            />
+            {/* Which model is about to answer (#80) — previously invisible
+                without opening Settings. Muted, not disabled: --color-text-
+                disabled fails contrast on interactive text (see #65).
+                Personal only: a workspace turn runs on the server's model, and
+                `model` here is the LOCAL chat_model setting, so showing it in a
+                workspace would name a model that isn't answering. */}
+            {!inWorkspace && model && (
+              <span
+                data-testid="chat-model-indicator"
+                title={`Answering with ${model} (${provider}) — change it in Settings → Chat`}
+                className="truncate text-xs text-[var(--color-text-muted)]"
+              >
+                {model}
+              </span>
+            )}
+            {/* Truncation warned BEFORE the turn, not only after it (#80). An
+                estimate, hence "may" — the post-turn banner stays authoritative. */}
+            {likelyTruncated && (
+              <span
+                data-testid="chat-truncation-hint"
+                title="Long note — the reference block is trimmed to fit the context budget, so detail near the end may be missing."
+                className="shrink-0 text-xs text-[var(--color-text-muted)]"
+              >
+                · may omit part of this note
+              </span>
+            )}
+          </div>
           {usage && (
             <span
               className={cn(
@@ -853,6 +964,87 @@ function ActivationPane({
           Chat isn't activated for this workspace yet — ask {ownerName}.
         </p>
       )}
+    </div>
+  );
+}
+
+// The "/" prompt menu (#80). A keyboard-first command menu: arrow keys move,
+// Enter picks, Escape dismisses. Deliberately NOT SelectablePopover — that's a
+// click-to-select value picker with internal open state and no key nav; see the
+// call site for why sharing it would have been the wrong trade.
+function PromptPicker({
+  prompts,
+  onPick,
+  onDismiss,
+}: {
+  prompts: ChatPrompt[];
+  onPick: (p: ChatPrompt) => void;
+  onDismiss: () => void;
+}) {
+  const [active, setActive] = useState(0);
+  const listRef = useRef<HTMLDivElement | null>(null);
+
+  // Own the keys while open. Bound on the list (which takes focus) so the
+  // composer's own handler doesn't also see them.
+  useEffect(() => {
+    listRef.current?.focus();
+  }, []);
+
+  function onKeyDown(e: React.KeyboardEvent<HTMLDivElement>) {
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      setActive((i) => (i + 1) % prompts.length);
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      setActive((i) => (i - 1 + prompts.length) % prompts.length);
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      onPick(prompts[active]);
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      onDismiss();
+    }
+  }
+
+  return (
+    <div
+      ref={listRef}
+      role="listbox"
+      aria-label="Prompts"
+      // Focus sits on the list, so the active row is announced via
+      // activedescendant rather than by moving focus between options.
+      aria-activedescendant={`chat-prompt-${active}`}
+      tabIndex={-1}
+      onKeyDown={onKeyDown}
+      onBlur={onDismiss}
+      className="absolute inset-x-2.5 bottom-full z-20 mb-1.5 overflow-hidden rounded-[var(--radius-card)] border border-[var(--color-line-visible)] bg-[var(--color-surface-raised)] p-1 shadow-[var(--shadow-md)] outline-none"
+    >
+      <div className="px-2 pb-1 pt-0.5 text-[11px] font-medium text-[var(--color-text-muted)]">
+        Prompts
+      </div>
+      {prompts.map((p, i) => (
+        <button
+          key={p.label}
+          id={`chat-prompt-${i}`}
+          type="button"
+          role="option"
+          aria-selected={i === active}
+          // mousedown, not click: the list's onBlur would dismiss before a click
+          // resolved, so the pick would never land.
+          onMouseDown={(e) => {
+            e.preventDefault();
+            onPick(p);
+          }}
+          onMouseEnter={() => setActive(i)}
+          className={cn(
+            "flex w-full flex-col items-start gap-0.5 rounded-[var(--radius)] px-2 py-1.5 text-left",
+            i === active && "bg-[var(--color-pill-hover)]",
+          )}
+        >
+          <span className="text-[13px] text-[var(--color-text)]">{p.label}</span>
+          <span className="text-xs text-[var(--color-text-muted)]">{p.description}</span>
+        </button>
+      ))}
     </div>
   );
 }

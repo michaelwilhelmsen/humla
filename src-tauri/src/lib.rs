@@ -60,6 +60,12 @@ pub struct AppState {
     /// `unify_note_speakers` (a leaf — never across another unify), so it can't
     /// deadlock the post-stop chain.
     pub unify_locks: Arc<Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Stop signals for in-flight chat turns (issue #80), keyed by the pane the
+    /// turn belongs to — today the anchor note id, since a note's Chat tab can
+    /// have at most one turn running. `chat_send` registers a flag for the
+    /// duration of the turn and removes it after; `chat_cancel` sets it, and
+    /// no-ops when the key is absent (nothing in flight to stop).
+    pub chat_cancels: Arc<Mutex<std::collections::HashMap<String, Arc<chat::CancelFlag>>>>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -160,6 +166,7 @@ where
                 sync,
                 manifest_lock: Arc::new(tokio::sync::Mutex::new(())),
                 unify_locks: Arc::new(Mutex::new(std::collections::HashMap::new())),
+                chat_cancels: Arc::new(Mutex::new(std::collections::HashMap::new())),
             });
 
             let menu = build_menu(app.handle())?;
@@ -352,6 +359,7 @@ where
             commands::recording_state,
             commands::summarize_note,
             commands::chat_send,
+            commands::chat_cancel,
             commands::chat_history,
             commands::chat_list_conversations,
             commands::chat_new_conversation,

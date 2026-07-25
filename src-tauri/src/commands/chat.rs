@@ -757,6 +757,57 @@ pub async fn chat_key_delete(
     Ok(chat::cloud::parse_key_meta(&body))
 }
 
+/// Registers an in-flight turn's stop signal for a pane and clears it on drop,
+/// so no early return can leak an entry that would let a later `chat_cancel`
+/// abort the *next* turn (issue #80).
+struct TurnCancel {
+    registry: Arc<Mutex<std::collections::HashMap<String, Arc<chat::CancelFlag>>>>,
+    key: String,
+    flag: Arc<chat::CancelFlag>,
+}
+
+impl TurnCancel {
+    fn register(state: &State<'_, AppState>, key: &str) -> Self {
+        let flag = Arc::new(chat::CancelFlag::new());
+        let registry = Arc::clone(&state.chat_cancels);
+        // A fresh send for the same pane replaces any stale entry.
+        registry.lock().insert(key.to_string(), Arc::clone(&flag));
+        Self { registry, key: key.to_string(), flag }
+    }
+
+    fn flag(&self) -> &chat::CancelFlag {
+        &self.flag
+    }
+}
+
+impl Drop for TurnCancel {
+    fn drop(&mut self) {
+        let mut map = self.registry.lock();
+        // Only clear OUR flag: a newer send for this pane may already have
+        // replaced it, and removing that one would make its stop button dead.
+        let ours = map.get(&self.key).is_some_and(|f| Arc::ptr_eq(f, &self.flag));
+        if ours {
+            map.remove(&self.key);
+        }
+    }
+}
+
+/// Stop the turn currently streaming in a pane. A no-op when nothing is in
+/// flight, so a stray click can't error. The partial answer (if any text
+/// arrived) is kept — see `chat::run_chat`.
+///
+/// Note this is a *client-side* stop for a workspace turn: the stream is
+/// dropped, but the server finishes generating and the tokens are really spent,
+/// so a metered turn still counts. A server-side cancel is the follow-up.
+#[tauri::command]
+pub fn chat_cancel(app: AppHandle, note_id: String) -> Result<(), String> {
+    let state: State<AppState> = app.state();
+    if let Some(flag) = state.chat_cancels.lock().get(&note_id) {
+        flag.cancel();
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn chat_send(
     app: AppHandle,
@@ -859,11 +910,15 @@ pub async fn chat_send(
         }
     };
 
+    // Register the stop signal for this pane; dropped (and cleared) when the
+    // turn finishes, however it finishes (issue #80).
+    let turn = TurnCancel::register(&state, &note_id);
     let ctx = ChatCtx {
         model: &resolved.model,
         api_key: resolved.api_key.as_deref(),
         base_url: &resolved.base_url,
         think: resolved.think,
+        cancel: turn.flag(),
     };
     let result = chat::run_chat(
         &state.db,
@@ -950,10 +1005,18 @@ async fn chat_send_cloud(
 
     // Stream the turn, retrying once after a 401 (a stale cached token → forget
     // it and re-authenticate from stored credentials, mirroring cloud.rs).
+    // Stop signal for this pane (issue #80). A workspace stop is client-side
+    // only: it ends the stream so tokens stop appearing, but the server keeps
+    // generating and finishes the turn, so a metered turn still counts and the
+    // history reload afterwards shows the server's complete answer rather than
+    // the partial. A server-side cancel is the follow-up (humla-cloud#26).
+    let turn_cancel = TurnCancel::register(&state, &note_id);
     let mut attempt = 0u8;
     let outcome = loop {
         let (base, token) = super::cloud::cloud_session(&state).await?;
-        let turn = stream_cloud_turn(&app, &base, &token, &body, &conversation.id).await;
+        let turn =
+            stream_cloud_turn(&app, &base, &token, &body, &conversation.id, turn_cancel.flag())
+                .await;
         match turn {
             Ok(t) => {
                 if matches!(&t.preflight, Some((401, _, _))) && attempt == 0 {
@@ -1014,6 +1077,7 @@ async fn stream_cloud_turn(
     token: &str,
     body: &serde_json::Value,
     local_conversation_id: &str,
+    cancel: &chat::CancelFlag,
 ) -> Result<CloudTurn, String> {
     use futures_util::StreamExt;
     let resp = reqwest::Client::new()
@@ -1071,6 +1135,12 @@ async fn stream_cloud_turn(
     let mut buf: Vec<u8> = Vec::new();
     let mut server_conversation_id: Option<String> = None;
     while let Some(chunk) = byte_stream.next().await {
+        // Stopped: drop the stream so deltas stop reaching the UI (issue #80).
+        // Anything already framed has been emitted; the server finishes its turn
+        // regardless, so this is a UI stop, not a billing one.
+        if cancel.is_cancelled() {
+            break;
+        }
         let bytes = chunk.map_err(|e| format!("Team chat stream error: {e}"))?;
         buf.extend_from_slice(&bytes);
         while let Some((idx, delim)) = chat::cloud::find_event_end(&buf) {

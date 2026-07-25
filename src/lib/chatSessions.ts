@@ -40,6 +40,40 @@ export function conversationTitle(meta: { title: string }): string {
   return meta.title.trim() || "New chat";
 }
 
+// Mirror of the backend's `GROUNDING_CHAR_BUDGET` (`chat/mod.rs`). Kept in sync
+// by hand — it only drives an advisory hint, so a drift makes the warning
+// slightly early or late, never wrong in a way that loses data.
+export const GROUNDING_CHAR_BUDGET = 24_000;
+
+// The backend measures the *assembled* reference block, which also carries the
+// injection-posture preamble and the three `[Notes]` / `[Transcript]` /
+// `[Summary]` headers. Budgeting for that keeps the estimate from missing a band
+// of notes that truncate only once the scaffold is counted. Approximate on
+// purpose — the wording isn't mirrored, just its rough size.
+const SCAFFOLD_CHARS = 250;
+
+/** How much note text fits before the backend starts trimming. */
+export const GROUNDING_TEXT_BUDGET = GROUNDING_CHAR_BUDGET - SCAFFOLD_CHARS;
+
+/**
+ * Whether this note's reference block is likely to be truncated before the model
+ * sees all of it (issue #80).
+ *
+ * The backend reports truncation authoritatively, but only *after* a turn — too
+ * late to be useful. This estimates the same budget from the same three sources
+ * so the composer can warn before the user spends a turn. An estimate, hence the
+ * hint says "may": the budget is a fixed backend constant (not model-dependent),
+ * but the scaffold allowance above is approximate.
+ */
+export function groundingLikelyTruncated(parts: {
+  bodyText: string;
+  transcript: string;
+  summary: string;
+}): boolean {
+  const total = parts.bodyText.length + parts.transcript.length + parts.summary.length;
+  return total > GROUNDING_TEXT_BUDGET;
+}
+
 // The colour tone for the usage meter by fraction of allowance consumed (#69):
 // default below 70%, warning at 70–89%, danger at >=90% (and once used >= cap).
 // A non-positive cap has no meaningful fraction → default (shouldn't happen for

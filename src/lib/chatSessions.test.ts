@@ -1,5 +1,13 @@
 import { describe, it, expect } from "vitest";
-import { relativeTime, conversationTitle, usageTone, liveChatErrorCopy } from "./chatSessions";
+import {
+  relativeTime,
+  conversationTitle,
+  usageTone,
+  liveChatErrorCopy,
+  groundingLikelyTruncated,
+  GROUNDING_CHAR_BUDGET,
+  GROUNDING_TEXT_BUDGET,
+} from "./chatSessions";
 
 const NOW = new Date("2026-07-24T12:00:00").getTime();
 const secs = (n: number) => NOW - n * 1000;
@@ -125,5 +133,39 @@ describe("liveChatErrorCopy", () => {
     expect(liveChatErrorCopy("chat_not_activated", owner)).toBeNull();
     expect(liveChatErrorCopy(undefined, owner)).toBeNull();
     expect(liveChatErrorCopy("", owner)).toBeNull();
+  });
+});
+
+describe("groundingLikelyTruncated", () => {
+  const parts = (bodyText = "", transcript = "", summary = "") => ({
+    bodyText,
+    transcript,
+    summary,
+  });
+
+  it("is false for an empty note", () => {
+    expect(groundingLikelyTruncated(parts())).toBe(false);
+  });
+
+  it("is false right up to the budget and true just past it", () => {
+    const at = "x".repeat(GROUNDING_TEXT_BUDGET);
+    expect(groundingLikelyTruncated(parts(at))).toBe(false);
+    expect(groundingLikelyTruncated(parts(at + "x"))).toBe(true);
+  });
+
+  it("leaves room for the block's scaffold, so it fires before the raw budget", () => {
+    // The backend measures the assembled block (preamble + section headers), so
+    // note text alone can be under 24k and still truncate.
+    const justUnderRaw = "x".repeat(GROUNDING_CHAR_BUDGET - 1);
+    expect(justUnderRaw.length).toBeLessThan(GROUNDING_CHAR_BUDGET);
+    expect(groundingLikelyTruncated(parts(justUnderRaw))).toBe(true);
+  });
+
+  it("sums all three sources rather than checking the largest", () => {
+    // No single source is over budget, but together they are — this is the case
+    // a per-field check would miss.
+    const third = "x".repeat(Math.ceil(GROUNDING_TEXT_BUDGET / 3) + 10);
+    expect(groundingLikelyTruncated(parts(third))).toBe(false);
+    expect(groundingLikelyTruncated(parts(third, third, third))).toBe(true);
   });
 });

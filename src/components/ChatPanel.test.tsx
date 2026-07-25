@@ -939,3 +939,212 @@ describe("ChatPanel workspace activation (#76)", () => {
     expect(screen.queryByText(/Add your OpenAI key/)).toBeNull();
   });
 });
+
+// A note whose reference block is comfortably over GROUNDING_CHAR_BUDGET, so the
+// composer's pre-emptive truncation hint applies (#80).
+function seedLongNote(noteId = "n1") {
+  const note = { id: noteId, transcript: "x".repeat(30_000) } as unknown as Note;
+  useNotesStore.setState({ notes: [note], folders: [] });
+}
+
+describe("ChatPanel composer chrome (#80)", () => {
+  it("shows which model is about to answer", async () => {
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () => history(),
+      settings_get: (args) => {
+        const key = (args as { key?: string }).key;
+        if (key === "chat_model") return "gpt-5.1";
+        if (key === "onboarding_completed") return "true";
+        return null;
+      },
+    });
+    renderPanel();
+    await waitFor(() =>
+      expect(screen.getByTestId("chat-model-indicator")).toHaveTextContent("gpt-5.1"),
+    );
+  });
+
+  it("hides the model in a workspace, where the server picks it", async () => {
+    // `model` is the LOCAL chat_model setting; a workspace turn runs on the
+    // server's model, so naming the local one would be actively misleading.
+    signIntoWorkspace();
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () => history(),
+      settings_get: (args) => {
+        const key = (args as { key?: string }).key;
+        if (key === "chat_model") return "gpt-5.1";
+        if (key === "onboarding_completed") return "true";
+        return null;
+      },
+    });
+    renderPanel();
+    await screen.findByPlaceholderText(/Ask about your notes/);
+    expect(screen.queryByTestId("chat-model-indicator")).toBeNull();
+  });
+
+  it("warns that a long note may be trimmed BEFORE a turn is spent", async () => {
+    seedLongNote();
+    mockTauri({ provider_key_get: () => "sk-test", chat_history: () => history() });
+    renderPanel();
+    await waitFor(() =>
+      expect(screen.getByTestId("chat-truncation-hint")).toBeInTheDocument(),
+    );
+  });
+
+  it("does not warn for a note that fits", async () => {
+    seedNoteWithFolder();
+    mockTauri({ provider_key_get: () => "sk-test", chat_history: () => history() });
+    renderPanel();
+    await screen.findByPlaceholderText(/Ask about your notes/);
+    expect(screen.queryByTestId("chat-truncation-hint")).toBeNull();
+  });
+
+  it("keeps the confirmed truncation banner alongside the pre-turn hint", async () => {
+    // The hint is an estimate and a warning ("may omit"); the banner is the
+    // confirmation it actually happened. Dropping either leaves the user unsure
+    // which of the two they're looking at.
+    seedLongNote();
+    let sent = false;
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_send: () => {
+        sent = true;
+        return { conversationId: "c1", truncated: true };
+      },
+      chat_history: () => history(sent ? [userMsg("hi"), assistantMsg("hello")] : []),
+    });
+    renderPanel();
+    const input = await screen.findByPlaceholderText(/Ask about your notes/);
+    fireEvent.change(input, { target: { value: "hi" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    await waitFor(() => expect(screen.getByText("hello")).toBeInTheDocument());
+    expect(screen.getByTestId("chat-truncation-hint")).toBeInTheDocument();
+    expect(screen.getByText(/truncated to fit the context budget/)).toBeInTheDocument();
+  });
+});
+
+describe("ChatPanel prompt picker (#80)", () => {
+  async function openPicker() {
+    mockTauri({ provider_key_get: () => "sk-test", chat_history: () => history() });
+    renderPanel();
+    const input = await screen.findByPlaceholderText(/Ask about your notes/);
+    fireEvent.keyDown(input, { key: "/" });
+    return input;
+  }
+
+  it("opens on '/' typed into an empty composer", async () => {
+    await openPicker();
+    expect(await screen.findByRole("listbox", { name: "Prompts" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: /Key decisions/ })).toBeInTheDocument();
+  });
+
+  it("ignores '/' typed mid-sentence so 'and/or' still works", async () => {
+    mockTauri({ provider_key_get: () => "sk-test", chat_history: () => history() });
+    renderPanel();
+    const input = await screen.findByPlaceholderText(/Ask about your notes/);
+    fireEvent.change(input, { target: { value: "and" } });
+    fireEvent.keyDown(input, { key: "/" });
+    expect(screen.queryByRole("listbox", { name: "Prompts" })).toBeNull();
+  });
+
+  it("fills the composer with the picked prompt instead of sending it blind", async () => {
+    let sends = 0;
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () => history(),
+      chat_send: () => {
+        sends += 1;
+        return { conversationId: "c1", truncated: false };
+      },
+    });
+    renderPanel();
+    const input = await screen.findByPlaceholderText(/Ask about your notes/);
+    fireEvent.keyDown(input, { key: "/" });
+    const option = await screen.findByRole("option", { name: /Action items/ });
+    fireEvent.mouseDown(option);
+
+    await waitFor(() =>
+      expect((input as HTMLTextAreaElement).value).toMatch(/action items/i),
+    );
+    expect(sends).toBe(0);
+    expect(screen.queryByRole("listbox", { name: "Prompts" })).toBeNull();
+  });
+
+  it("moves the selection with the arrow keys", async () => {
+    await openPicker();
+    const list = await screen.findByRole("listbox", { name: "Prompts" });
+    const first = screen.getByRole("option", { name: /Key decisions/ });
+    const second = screen.getByRole("option", { name: /Action items/ });
+    expect(first).toHaveAttribute("aria-selected", "true");
+    fireEvent.keyDown(list, { key: "ArrowDown" });
+    expect(second).toHaveAttribute("aria-selected", "true");
+    fireEvent.keyDown(list, { key: "ArrowUp" });
+    expect(first).toHaveAttribute("aria-selected", "true");
+  });
+});
+
+describe("ChatPanel stop (#80)", () => {
+  // A send that stays in flight until released, so the turn is observably
+  // streaming.
+  function pendingSend() {
+    let release: (() => void) | null = null;
+    const cancels: unknown[] = [];
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () => history(),
+      chat_send: () =>
+        new Promise((resolve) => {
+          release = () => resolve({ conversationId: "c1", truncated: false });
+        }),
+      chat_cancel: (args) => {
+        cancels.push(args);
+        return null;
+      },
+    });
+    return { cancels, release: () => release?.() };
+  }
+
+  it("swaps Send for Stop while a turn streams", async () => {
+    const { release } = pendingSend();
+    renderPanel();
+    const input = await screen.findByPlaceholderText(/Ask about your notes/);
+    fireEvent.change(input, { target: { value: "hi" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Stop generating" })).toBeInTheDocument(),
+    );
+    expect(screen.queryByRole("button", { name: "Send" })).toBeNull();
+    await act(async () => release());
+  });
+
+  it("asks the backend to stop the turn for this note", async () => {
+    const { cancels, release } = pendingSend();
+    renderPanel();
+    const input = await screen.findByPlaceholderText(/Ask about your notes/);
+    fireEvent.change(input, { target: { value: "hi" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    const stop = await screen.findByRole("button", { name: "Stop generating" });
+    fireEvent.click(stop);
+
+    await waitFor(() => expect(cancels).toHaveLength(1));
+    expect(cancels[0]).toEqual({ noteId: "n1" });
+    await act(async () => release());
+  });
+
+  it("stops on Enter mid-turn instead of queueing a second one", async () => {
+    const { cancels, release } = pendingSend();
+    renderPanel();
+    const input = await screen.findByPlaceholderText(/Ask about your notes/);
+    fireEvent.change(input, { target: { value: "hi" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    await screen.findByRole("button", { name: "Stop generating" });
+
+    fireEvent.keyDown(screen.getByPlaceholderText(/press Enter to stop/), { key: "Enter" });
+    await waitFor(() => expect(cancels).toHaveLength(1));
+    await act(async () => release());
+  });
+});

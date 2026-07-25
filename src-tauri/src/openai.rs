@@ -1008,6 +1008,10 @@ struct ToolStreamChoice {
 /// Run one cloud-OpenAI step with tool-calling. Streams answer tokens via
 /// `on_delta`; buffers streamed tool-call fragments and returns them assembled.
 /// `tools` is a slice of OpenAI tool-def objects (empty = force a text answer).
+///
+/// `on_delta` returns whether to keep reading: `false` stops the stream and
+/// returns the partial answer accumulated so far, which is how a user stop
+/// aborts a turn mid-answer instead of after it (issue #80).
 pub(crate) async fn openai_chat_step<F>(
     base_url: &str,
     api_key: &str,
@@ -1017,7 +1021,7 @@ pub(crate) async fn openai_chat_step<F>(
     mut on_delta: F,
 ) -> Result<(String, Vec<RawToolCall>)>
 where
-    F: FnMut(&str) + Send,
+    F: FnMut(&str) -> bool + Send,
 {
     let req = ToolChatRequest {
         model,
@@ -1054,6 +1058,9 @@ where
     let mut answer = String::new();
     // Accumulate tool-call fragments by index → (id, name, arguments).
     let mut calls: Vec<(String, String, String)> = Vec::new();
+    // Set when `on_delta` asks to stop; breaks both loops and returns the
+    // partial answer (issue #80).
+    let mut stop = false;
     while let Some(chunk_res) = byte_stream.next().await {
         let bytes = chunk_res.map_err(|e| anyhow!("stream read: {e}"))?;
         buf.push_str(&String::from_utf8_lossy(&bytes));
@@ -1073,7 +1080,10 @@ where
             if let Some(delta) = choice.delta.content {
                 if !delta.is_empty() {
                     answer.push_str(&delta);
-                    on_delta(&delta);
+                    if !on_delta(&delta) {
+                        stop = true;
+                        break;
+                    }
                 }
             }
             for frag in choice.delta.tool_calls {
@@ -1093,6 +1103,11 @@ where
                     }
                 }
             }
+        }
+        // Checked here, not at the top of the loop: at the top we'd first await
+        // one more network chunk before noticing the stop.
+        if stop {
+            break;
         }
     }
 
@@ -1162,6 +1177,12 @@ struct OllamaToolFn {
     arguments: Value,
 }
 
+/// One Ollama step, via its native `/api/chat`. Unlike the cloud path this is
+/// **not** streamed (`stream: false`) — the answer is buffered and handed to
+/// `on_delta` in one piece, so its return value can't abort anything. A user
+/// stop mid-step is handled a level up, by `agentic_loop` racing this call
+/// against the cancel flag (issue #80); the bool is returned only to keep one
+/// callback shape across both providers.
 pub(crate) async fn ollama_chat_step<F>(
     native_base: &str,
     model: &str,
@@ -1170,7 +1191,7 @@ pub(crate) async fn ollama_chat_step<F>(
     mut on_delta: F,
 ) -> Result<(String, Vec<RawToolCall>)>
 where
-    F: FnMut(&str) + Send,
+    F: FnMut(&str) -> bool + Send,
 {
     let url = format!("{native_base}/chat");
     let prompt_chars: usize = messages
@@ -1237,7 +1258,7 @@ where
         .collect();
     let content = trim_runaway_repetition(&resp.message.content);
     if !content.is_empty() {
-        on_delta(&content);
+        let _ = on_delta(&content);
     }
     eprintln!(
         "[chat] ollama step done in {:?}: {} chars, {} tool calls",

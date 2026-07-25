@@ -69,6 +69,39 @@ pub struct ToolSpec {
     pub parameters: serde_json::Value,
 }
 
+/// Cooperative cancellation for one in-flight turn (issue #80).
+///
+/// Set from the `chat_cancel` command; observed in two places, because either
+/// alone leaves a visible stall: `agentic_loop` checks it between steps (so a
+/// stop during a tool call doesn't run the next provider round-trip), and each
+/// adapter's delta callback returns `false` once it's set, which breaks the
+/// provider's stream loop mid-answer.
+///
+/// A plain `AtomicBool` rather than an `Arc<AtomicBool>` so that
+/// [`CancelFlag::new`] is `const`, which lets a caller hold one in a `static`
+/// (the test-only never-cancelled ctx needs exactly that).
+pub struct CancelFlag(std::sync::atomic::AtomicBool);
+
+impl CancelFlag {
+    pub const fn new() -> Self {
+        Self(std::sync::atomic::AtomicBool::new(false))
+    }
+
+    pub fn cancel(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl Default for CancelFlag {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Per-call provider inputs, borrowed. `base_url` is the OpenAI-compat base
 /// (cloud OpenAI's, or the local server's); `think` toggles reasoning on
 /// providers that support it (Ollama/Qwen).
@@ -77,6 +110,8 @@ pub struct ChatCtx<'a> {
     pub api_key: Option<&'a str>,
     pub base_url: &'a str,
     pub think: bool,
+    /// Observed per stream delta and between agentic steps; see [`CancelFlag`].
+    pub cancel: &'a CancelFlag,
 }
 
 /// Normalized streamed output during one step. `TextDelta` streams the answer
