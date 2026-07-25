@@ -350,6 +350,140 @@ pub(crate) fn forget_session() {
     *SESSION.lock().unwrap() = None;
 }
 
+// ---- direct endpoint requests (chat service + hook routes) ------------------
+// The chat surfaces don't go through the records API, so `pb_json` and the
+// `authed_*` helpers above don't serve them: they call the chat service and the
+// PocketBase hook routes directly, and every one of those calls needs the same
+// skeleton — resolve the session, bearer the PB token, re-authenticate once on a
+// 401, then read either the JSON body or the server's `{reason, error}` pair.
+// `cloud_get_json` / `cloud_post_json` / `cloud_delete_json` own that skeleton so
+// each call site is left with only what actually differs: its 404 behavior and
+// its error taxonomy (issue #72). The one direct call that can't use them is
+// `chat_send_cloud`, which streams SSE rather than returning a JSON body.
+
+/// Why a direct cloud request didn't produce a JSON body.
+///
+/// Transport and session failures arrive pre-rendered (they're already
+/// user-facing strings). A non-2xx keeps its `status` — so a caller can branch
+/// on 404, the "route absent on an older/self-hosted server" signal — and hands
+/// back the server's `{reason, error}` pair verbatim, because the chat surfaces
+/// map the same reasons to different wording (workspace chat through
+/// `cloud_chat_error_message`, the BYOK key routes through
+/// `chat_key_error_message`). Use [`CloudReqError::message`] to render.
+#[derive(Debug)]
+pub(crate) enum CloudReqError {
+    /// Not configured / not signed in / network failure — already a user message.
+    Unreachable(String),
+    /// A non-2xx response, including a 401 that survived the one-shot re-auth.
+    Status {
+        status: reqwest::StatusCode,
+        reason: String,
+        server_message: String,
+    },
+}
+
+impl CloudReqError {
+    /// True only for a 404 — the endpoint isn't on this server.
+    pub(crate) fn is_not_found(&self) -> bool {
+        matches!(self, Self::Status { status, .. } if *status == reqwest::StatusCode::NOT_FOUND)
+    }
+
+    /// Render with the caller's error taxonomy: a transport/session failure
+    /// passes through verbatim, a server status maps its `{reason, error}` pair
+    /// through `map` (e.g. `chat::cloud::cloud_chat_error_message`).
+    pub(crate) fn message(self, map: fn(&str, &str) -> String) -> String {
+        match self {
+            Self::Unreachable(m) => m,
+            Self::Status { reason, server_message, .. } => map(&reason, &server_message),
+        }
+    }
+}
+
+/// A direct request: the verb plus what it carries. One value, so a body can't
+/// be handed to a GET or query pairs to a POST.
+#[derive(Clone, Copy)]
+enum Request<'a> {
+    Get(&'a [(&'a str, &'a str)]),
+    Post(&'a serde_json::Value),
+    Delete(&'a [(&'a str, &'a str)]),
+}
+
+/// GET a direct cloud endpoint as JSON. `path` is absolute (`/api/chat/usage`).
+pub(crate) async fn cloud_get_json(
+    state: &State<'_, AppState>,
+    path: &str,
+    query: &[(&str, &str)],
+) -> Result<serde_json::Value, CloudReqError> {
+    request_json(state, path, Request::Get(query)).await
+}
+
+/// POST a JSON body to a direct cloud endpoint. `path` is absolute.
+pub(crate) async fn cloud_post_json(
+    state: &State<'_, AppState>,
+    path: &str,
+    body: &serde_json::Value,
+) -> Result<serde_json::Value, CloudReqError> {
+    request_json(state, path, Request::Post(body)).await
+}
+
+/// DELETE a direct cloud endpoint, reading the JSON body it returns. `path` is
+/// absolute. (Unlike [`authed_delete`], these hook routes answer with a body.)
+pub(crate) async fn cloud_delete_json(
+    state: &State<'_, AppState>,
+    path: &str,
+    query: &[(&str, &str)],
+) -> Result<serde_json::Value, CloudReqError> {
+    request_json(state, path, Request::Delete(query)).await
+}
+
+/// The shared skeleton: session → bearer → send → one-shot 401 re-auth → JSON.
+/// A malformed body is `Value::Null` rather than an error, matching the call
+/// sites' own `unwrap_or_default` (their parsers already treat a missing field
+/// as absent), so a garbled response degrades instead of surfacing a parse error.
+async fn request_json(
+    state: &State<'_, AppState>,
+    path: &str,
+    request: Request<'_>,
+) -> Result<serde_json::Value, CloudReqError> {
+    let mut attempt = 0u8;
+    loop {
+        let (base, token) = cloud_session(state).await.map_err(CloudReqError::Unreachable)?;
+        let url = format!("{}{}", base.trim_end_matches('/'), path);
+        let req = match request {
+            Request::Get(q) => http().get(url).query(q),
+            Request::Post(b) => http().post(url).json(b),
+            Request::Delete(q) => http().delete(url).query(q),
+        };
+        let resp = req
+            .bearer_auth(&token)
+            .send()
+            .await
+            .map_err(|e| CloudReqError::Unreachable(format!("Couldn't reach Team chat: {e}")))?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED && attempt == 0 {
+            // Stale token — drop the cached session and retry once with a fresh one.
+            forget_session();
+            attempt += 1;
+            continue;
+        }
+        if !status.is_success() {
+            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+            let field = |k: &str| {
+                body.get(k)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            return Err(CloudReqError::Status {
+                status,
+                reason: field("reason"),
+                server_message: field("error"),
+            });
+        }
+        return Ok(resp.json().await.unwrap_or_default());
+    }
+}
+
 /// Read-through fetch of a workspace conversation's messages (issue #50).
 /// Workspace chat is server-authoritative: history lives in PocketBase's
 /// member-readable `chat_messages`, scoped by the caller's token. Returns the
@@ -1946,6 +2080,60 @@ mod tests {
         }))
         .unwrap();
         assert!(m.available && m.price_cents.is_none() && m.currency.is_none());
+    }
+
+    /// A 404 is the "route absent on an older/self-hosted server" signal the
+    /// chat callers branch on (legacy session fallback / "needs a newer
+    /// server"), so it must be distinguishable from every other failure.
+    #[test]
+    fn only_a_404_status_reads_as_not_found() {
+        assert!(CloudReqError::Status {
+            status: reqwest::StatusCode::NOT_FOUND,
+            reason: String::new(),
+            server_message: String::new(),
+        }
+        .is_not_found());
+        assert!(!CloudReqError::Status {
+            status: reqwest::StatusCode::PAYMENT_REQUIRED,
+            reason: "cap_reached".into(),
+            server_message: String::new(),
+        }
+        .is_not_found());
+        // A network / not-signed-in failure is never a missing route.
+        assert!(!CloudReqError::Unreachable("Not signed in.".into()).is_not_found());
+    }
+
+    /// Rendering routes by variant: a transport/session failure is already a
+    /// user message and passes through verbatim, while a server status hands its
+    /// `{reason, error}` pair to the caller's own taxonomy.
+    #[test]
+    fn message_passes_transport_through_and_maps_server_reasons() {
+        fn map(reason: &str, server_message: &str) -> String {
+            format!("mapped:{reason}/{server_message}")
+        }
+        assert_eq!(
+            CloudReqError::Unreachable("Couldn't reach Team chat: dns error".into()).message(map),
+            "Couldn't reach Team chat: dns error"
+        );
+        assert_eq!(
+            CloudReqError::Status {
+                status: reqwest::StatusCode::FORBIDDEN,
+                reason: "not_owner".into(),
+                server_message: "only the owner may".into(),
+            }
+            .message(map),
+            "mapped:not_owner/only the owner may"
+        );
+        // An empty body still maps — the taxonomy owns the fallback wording.
+        assert_eq!(
+            CloudReqError::Status {
+                status: reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                reason: String::new(),
+                server_message: String::new(),
+            }
+            .message(map),
+            "mapped:/"
+        );
     }
 
     /// Minimal `RemoteSession` builder — only `client_id` matters for the

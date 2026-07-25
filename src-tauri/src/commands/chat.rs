@@ -651,46 +651,24 @@ pub async fn chat_usage(app: AppHandle) -> Result<Option<chat::cloud::UsageDto>,
 /// meter can only ever report or silently hide (issue #69). See [`chat_usage`]
 /// for the full mapping. One-shot 401 re-auth mirrors the other cloud calls.
 async fn usage_cloud(state: &State<'_, AppState>, workspace: &str) -> Option<chat::cloud::UsageDto> {
-    let mut attempt = 0u8;
-    loop {
-        let (base, token) = super::cloud::cloud_session(state).await.ok()?;
-        let resp = reqwest::Client::new()
-            .get(format!("{}/api/chat/usage", base.trim_end_matches('/')))
-            .bearer_auth(&token)
-            .query(&[("workspace_id", workspace)])
-            .send()
+    // Every failure — 404 / 402 / 403 / 400 / 5xx / repeated-401 / unreachable —
+    // collapses to `None` here, so the meter hides rather than errors.
+    let body =
+        super::cloud::cloud_get_json(state, "/api/chat/usage", &[("workspace_id", workspace)])
             .await
             .ok()?;
-        let status = resp.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED && attempt == 0 {
-            super::cloud::forget_session();
-            attempt += 1;
-            continue;
-        }
-        if !status.is_success() {
-            // 404 / 402 / 403 / 400 / 5xx / repeated-401 → hide, never error.
-            return None;
-        }
-        let body: serde_json::Value = resp.json().await.ok()?;
-        return chat::cloud::parse_usage(&body);
-    }
+    chat::cloud::parse_usage(&body)
 }
 
 // ── Workspace chat key (BYOK, issue #75) ─────────────────────────────────────
 // Owner-only set/rotate/remove + member-readable metadata, via the PocketBase
-// hook routes under /api/humla/chat/key* (same base/token/one-shot-401-retry as
-// the other cloud chat calls). The key value transits Rust memory only: it goes
-// straight into the POST body and is never logged, stored, or put in an error
-// string. Only metadata comes back (the server's REST read rule returns null).
-
-/// Map a non-2xx chat-key response to a user message. Reads only `reason`/`error`
-/// from the server body (never the submitted key), via `chat_key_error_message`.
-async fn chat_key_error(resp: reqwest::Response) -> String {
-    let body: serde_json::Value = resp.json().await.unwrap_or_default();
-    let reason = body.get("reason").and_then(|r| r.as_str()).unwrap_or_default();
-    let server_msg = body.get("error").and_then(|m| m.as_str()).unwrap_or_default();
-    chat::cloud::chat_key_error_message(reason, server_msg)
-}
+// hook routes under /api/humla/chat/key* — through the same `cloud_*_json`
+// helpers (base/token/one-shot-401-retry) as the other cloud chat calls, mapped
+// with the key taxonomy `chat_key_error_message`. The key value transits Rust
+// memory only: it goes straight into the POST body and is never logged, stored,
+// or put in an error string — a failure is rendered from the server's
+// `reason`/`error` fields alone, never from the submitted key. Only metadata
+// comes back (the server's REST read rule returns null).
 
 /// Read a workspace's chat-key metadata (member-readable). Never returns the key
 /// — only `{ configured, last4, set_by, set_at, key_health }`. A 404 (route
@@ -702,31 +680,19 @@ pub async fn chat_key_meta(
     workspace_id: String,
 ) -> Result<chat::cloud::ChatKeyMeta, String> {
     let state: State<AppState> = app.state();
-    let mut attempt = 0u8;
-    loop {
-        let (base, token) = super::cloud::cloud_session(&state).await?;
-        let resp = reqwest::Client::new()
-            .get(format!("{}/api/humla/chat/key/meta", base.trim_end_matches('/')))
-            .bearer_auth(&token)
-            .query(&[("workspace_id", workspace_id.as_str())])
-            .send()
-            .await
-            .map_err(|e| format!("Couldn't reach Team chat: {e}"))?;
-        let status = resp.status();
-        if status == reqwest::StatusCode::NOT_FOUND {
-            return Ok(chat::cloud::ChatKeyMeta::default());
-        }
-        if status == reqwest::StatusCode::UNAUTHORIZED && attempt == 0 {
-            super::cloud::forget_session();
-            attempt += 1;
-            continue;
-        }
-        if !status.is_success() {
-            return Err(chat_key_error(resp).await);
-        }
-        let body: serde_json::Value = resp.json().await.unwrap_or_default();
-        return Ok(chat::cloud::parse_key_meta(&body));
-    }
+    let body = match super::cloud::cloud_get_json(
+        &state,
+        "/api/humla/chat/key/meta",
+        &[("workspace_id", workspace_id.as_str())],
+    )
+    .await
+    {
+        Ok(body) => body,
+        // Route absent → "not activated" rather than an error.
+        Err(e) if e.is_not_found() => return Ok(chat::cloud::ChatKeyMeta::default()),
+        Err(e) => return Err(e.message(chat::cloud::chat_key_error_message)),
+    };
+    Ok(chat::cloud::parse_key_meta(&body))
 }
 
 /// POST a key to the set/rotate hook (server test-on-saves it against OpenAI)
@@ -739,28 +705,10 @@ async fn chat_key_set_inner(
     api_key: &str,
 ) -> Result<chat::cloud::ChatKeyMeta, String> {
     let body = serde_json::json!({ "workspace_id": workspace_id, "api_key": api_key });
-    let mut attempt = 0u8;
-    loop {
-        let (base, token) = super::cloud::cloud_session(state).await?;
-        let resp = reqwest::Client::new()
-            .post(format!("{}/api/humla/chat/key", base.trim_end_matches('/')))
-            .bearer_auth(&token)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| format!("Couldn't reach Team chat: {e}"))?;
-        let status = resp.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED && attempt == 0 {
-            super::cloud::forget_session();
-            attempt += 1;
-            continue;
-        }
-        if !status.is_success() {
-            return Err(chat_key_error(resp).await);
-        }
-        let meta: serde_json::Value = resp.json().await.unwrap_or_default();
-        return Ok(chat::cloud::parse_key_meta(&meta));
-    }
+    let meta = super::cloud::cloud_post_json(state, "/api/humla/chat/key", &body)
+        .await
+        .map_err(|e| e.message(chat::cloud::chat_key_error_message))?;
+    Ok(chat::cloud::parse_key_meta(&meta))
 }
 
 /// Owner-only set/rotate of the workspace OpenAI key, from a key the owner typed
@@ -799,28 +747,14 @@ pub async fn chat_key_delete(
     workspace_id: String,
 ) -> Result<chat::cloud::ChatKeyMeta, String> {
     let state: State<AppState> = app.state();
-    let mut attempt = 0u8;
-    loop {
-        let (base, token) = super::cloud::cloud_session(&state).await?;
-        let resp = reqwest::Client::new()
-            .delete(format!("{}/api/humla/chat/key", base.trim_end_matches('/')))
-            .bearer_auth(&token)
-            .query(&[("workspace_id", workspace_id.as_str())])
-            .send()
-            .await
-            .map_err(|e| format!("Couldn't reach Team chat: {e}"))?;
-        let status = resp.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED && attempt == 0 {
-            super::cloud::forget_session();
-            attempt += 1;
-            continue;
-        }
-        if !status.is_success() {
-            return Err(chat_key_error(resp).await);
-        }
-        let body: serde_json::Value = resp.json().await.unwrap_or_default();
-        return Ok(chat::cloud::parse_key_meta(&body));
-    }
+    let body = super::cloud::cloud_delete_json(
+        &state,
+        "/api/humla/chat/key",
+        &[("workspace_id", workspace_id.as_str())],
+    )
+    .await
+    .map_err(|e| e.message(chat::cloud::chat_key_error_message))?;
+    Ok(chat::cloud::parse_key_meta(&body))
 }
 
 #[tauri::command]
@@ -1397,32 +1331,19 @@ async fn list_conversations_cloud(
     workspace: &str,
     note_id: &str,
 ) -> Result<Vec<ConversationMeta>, String> {
-    let mut attempt = 0u8;
-    let val = loop {
-        let (base, token) = super::cloud::cloud_session(state).await?;
-        let resp = reqwest::Client::new()
-            .get(format!("{}/api/humla/chat/conversations", base.trim_end_matches('/')))
-            .bearer_auth(&token)
-            .query(&[("workspace_id", workspace), ("note_id", note_id)])
-            .send()
-            .await
-            .map_err(|e| format!("Couldn't reach Team chat: {e}"))?;
-        let status = resp.status();
-        if status == reqwest::StatusCode::NOT_FOUND {
-            return legacy_workspace_sessions(state, workspace, note_id).await;
+    let val = match super::cloud::cloud_get_json(
+        state,
+        "/api/humla/chat/conversations",
+        &[("workspace_id", workspace), ("note_id", note_id)],
+    )
+    .await
+    {
+        Ok(val) => val,
+        // Route absent (pre-#19 server) → the single-handle fallback.
+        Err(e) if e.is_not_found() => {
+            return legacy_workspace_sessions(state, workspace, note_id).await
         }
-        if status == reqwest::StatusCode::UNAUTHORIZED && attempt == 0 {
-            super::cloud::forget_session();
-            attempt += 1;
-            continue;
-        }
-        if !status.is_success() {
-            let body: serde_json::Value = resp.json().await.unwrap_or_default();
-            let reason = body.get("reason").and_then(|r| r.as_str()).unwrap_or_default();
-            let server_msg = body.get("error").and_then(|m| m.as_str()).unwrap_or_default();
-            return Err(chat::cloud::cloud_chat_error_message(reason, server_msg));
-        }
-        break resp.json::<serde_json::Value>().await.unwrap_or_default();
+        Err(e) => return Err(e.message(chat::cloud::cloud_chat_error_message)),
     };
 
     let items = val.get("conversations").and_then(|c| c.as_array()).cloned().unwrap_or_default();
@@ -1531,35 +1452,17 @@ async fn new_conversation_cloud(
         "note_id": note_id,
         "breadth": breadth,
     });
-    let mut attempt = 0u8;
-    let val = loop {
-        let (base, token) = super::cloud::cloud_session(state).await?;
-        let resp = reqwest::Client::new()
-            .post(format!("{}/api/humla/chat/conversations", base.trim_end_matches('/')))
-            .bearer_auth(&token)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| format!("Couldn't reach Team chat: {e}"))?;
-        let status = resp.status();
-        if status == reqwest::StatusCode::NOT_FOUND {
+    // The POST response is the conversation object itself — no wrapper.
+    let val = match super::cloud::cloud_post_json(state, "/api/humla/chat/conversations", &body)
+        .await
+    {
+        Ok(val) => val,
+        Err(e) if e.is_not_found() => {
             return Err("Starting a new Team chat needs a newer server — this workspace's server \
                         doesn't support multiple chat sessions yet."
-                .into());
+                .into())
         }
-        if status == reqwest::StatusCode::UNAUTHORIZED && attempt == 0 {
-            super::cloud::forget_session();
-            attempt += 1;
-            continue;
-        }
-        if !status.is_success() {
-            let b: serde_json::Value = resp.json().await.unwrap_or_default();
-            let reason = b.get("reason").and_then(|r| r.as_str()).unwrap_or_default();
-            let server_msg = b.get("error").and_then(|m| m.as_str()).unwrap_or_default();
-            return Err(chat::cloud::cloud_chat_error_message(reason, server_msg));
-        }
-        // The POST response is the conversation object itself — no wrapper.
-        break resp.json::<serde_json::Value>().await.unwrap_or_default();
+        Err(e) => return Err(e.message(chat::cloud::cloud_chat_error_message)),
     };
     cloud_conversation_meta(state, workspace, note_id, &val)
 }
