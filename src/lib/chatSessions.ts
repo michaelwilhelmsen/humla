@@ -3,6 +3,7 @@
 // enough to hoist to a shared module if a second caller ever appears; for now
 // the chat history list is its only consumer.
 
+
 // A short, human relative timestamp: "just now" / "5m ago" / "3h ago" /
 // "yesterday" / "4d ago", then a locale date past a week (with the year only
 // when it differs). `now` is injectable for deterministic tests.

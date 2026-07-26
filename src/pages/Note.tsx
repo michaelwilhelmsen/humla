@@ -41,6 +41,7 @@ import { RecordingBar } from "../components/RecordingBar";
 import { ChatPanel, type ChatSessionControls } from "../components/ChatPanel";
 import { SelectablePopover } from "../components/SelectablePopover";
 import { conversationTitle, relativeTime } from "../lib/chatSessions";
+import { targetKey, type ChatTarget } from "../lib/chatTarget";
 import type { LayoutOutletContext } from "../components/Layout";
 import { SkeletonLines } from "../components/Skeleton";
 import { NoteEditor } from "../components/Editor";
@@ -134,6 +135,15 @@ export function Note() {
   // render purely from it. null = no chat chrome (provider not ready / no tab).
   const [chatControls, setChatControls] = useState<ChatSessionControls | null>(null);
   const handleChatControls = useCallback((c: ChatSessionControls | null) => setChatControls(c), []);
+  // This pane is always note-anchored (#94); the library-wide surface is #95.
+  // Memoised so the panel isn't handed a fresh object on every Note render, and
+  // null until the note loads — deliberately NOT `noteId: ""`, which is the
+  // sentinel #82's decision record forbids and #93's backend rejects outright.
+  const chatTarget = useMemo<ChatTarget | null>(
+    () => (draft ? { kind: "note", noteId: draft.id } : null),
+    [draft?.id],
+  );
+  const chatTargetKey = chatTarget ? targetKey(chatTarget) : null;
   const [panelWidth, setPanelWidth] = useState<number>(() => {
     const saved = typeof localStorage !== "undefined" ? Number(localStorage.getItem("humla.panelWidth")) : NaN;
     return saved >= 320 && saved <= 720 ? saved : 440;
@@ -838,7 +848,7 @@ export function Note() {
                 Chat
               </button>
             </div>
-            {activeTab === "chat" && chatControls?.noteId === draft.id && (
+            {activeTab === "chat" && chatControls?.targetKey === chatTargetKey && (
               <ChatHistoryControls controls={chatControls} />
             )}
             <button
@@ -929,7 +939,7 @@ export function Note() {
                 )}
               </div>
             ) : activeTab === "chat" ? (
-              <ChatPanel noteId={draft.id} onControls={handleChatControls} />
+              chatTarget && <ChatPanel target={chatTarget} onControls={handleChatControls} />
             ) : (
               <div className="flex-1 min-h-0 flex flex-col px-4 py-4">
                 <div className="flex flex-wrap items-center gap-2 mb-4 shrink-0">

@@ -401,26 +401,30 @@ export const ipc = {
   // conversation server-side — `chatSetBreadth` writes it, `chatGetBreadth` reads
   // it back to initialise the Scope chip. `chatSend` carries no scope: it reads
   // the persisted breadth, so the UI can never diverge from it.
-  chatSend: (noteId: string, conversationId: string | null, message: string) =>
+  // Every chat command takes `noteId: string | null`, where **null means the whole
+  // library** (#93). The backend reads an absent note id as the global scope and
+  // REJECTS an empty string, so null is the only correct way to say "no anchor" —
+  // never "".
+  chatSend: (noteId: string | null, conversationId: string | null, message: string) =>
     invoke<ChatSendResult>("chat_send", { noteId, conversationId, message }),
-  // Stop the turn streaming in a Note's pane (issue #80). A no-op when nothing
-  // is in flight, so a stray click can't error. Any text that already streamed
-  // is kept; a stop before the first token leaves only the user's message.
-  chatCancel: (noteId: string) => invoke<void>("chat_cancel", { noteId }),
-  chatHistory: (noteId: string, conversationId: string | null = null) =>
+  // Stop the turn streaming in a pane (issue #80). A no-op when nothing is in
+  // flight, so a stray click can't error. Any text that already streamed is kept;
+  // a stop before the first token leaves only the user's message.
+  chatCancel: (noteId: string | null) => invoke<void>("chat_cancel", { noteId }),
+  chatHistory: (noteId: string | null, conversationId: string | null = null) =>
     invoke<ChatHistory>("chat_history", { noteId, conversationId }),
-  // List / create chat sessions for a Note (issue #61). Personal reads local
+  // List / create chat sessions for a target (issue #61). Personal reads local
   // SQLite; a workspace reads/creates server-authoritative sessions. There is no
   // delete command — a deliberate v1 decision.
-  chatListConversations: (noteId: string) =>
+  chatListConversations: (noteId: string | null) =>
     invoke<ConversationMeta[]>("chat_list_conversations", { noteId }),
-  chatNewConversation: (noteId: string) =>
+  chatNewConversation: (noteId: string | null) =>
     invoke<ConversationMeta>("chat_new_conversation", { noteId }),
   // Persist / read the Scope chip's breadth on a conversation (issue #58/#61).
   // The single source of truth for retrieval breadth.
-  chatSetBreadth: (noteId: string, conversationId: string | null, breadth: ChatScope) =>
+  chatSetBreadth: (noteId: string | null, conversationId: string | null, breadth: ChatScope) =>
     invoke<void>("chat_set_breadth", { noteId, conversationId, breadth }),
-  chatGetBreadth: (noteId: string, conversationId: string | null = null) =>
+  chatGetBreadth: (noteId: string | null, conversationId: string | null = null) =>
     invoke<ChatScope>("chat_get_breadth", { noteId, conversationId }),
   // Workspace turn allowance for the composer meter (issue #69). null in personal
   // context, and on any unavailable/error/unmetered outcome — a meter never

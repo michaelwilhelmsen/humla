@@ -25,7 +25,7 @@ import { ChatPanel } from "./ChatPanel";
 function panel() {
   return (
     <MemoryRouter>
-      <ChatPanel noteId="n1" />
+      <ChatPanel target={{ kind: "note", noteId: "n1" }} />
     </MemoryRouter>
   );
 }
