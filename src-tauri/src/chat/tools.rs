@@ -12,9 +12,9 @@
 //! - **This file is Personal-only, and mirrors `humla-cloud/chat-service/src/
 //!   tools.ts`.** Workspace turns retrieve server-side, so every schema change
 //!   here needs the same change there, verified pairwise. That rule was quietly
-//!   false until #105: `client_id` meant a Client (a group of notes) here and a
-//!   single note's sync key there — same name, same slot, opposite cardinality.
-//!   It now means the same group-of-notes on both paths.
+//!   false until #105: `client_id` selected every note tagged with a Client here
+//!   and a single note's sync key there — same name, same slot, opposite
+//!   cardinality. It now means the same set of notes on both paths.
 //! - **The breadth clamp wins.** The Scope popover's breadth (this Note / this
 //!   Folder / all) is enforced server-side via `ToolScope`; the model's own
 //!   filter params can only narrow *within* an "all" scope, never widen past
@@ -105,16 +105,17 @@ const GET_NOTE_CHARS: usize = 6_000;
 pub fn tool_specs() -> Vec<ToolSpec> {
     let filters = json!({
         "folder_id": { "type": "string", "description": "Optional: restrict to one folder id." },
-        // A Client is a GROUP of notes (one customer/account). Ids come from
-        // list_notes rows, which name each note's client — the model can only pass
-        // an id it has seen, so the two have to ship together (#105).
+        // A Client is the business relationship a Note is about, so this filter spans
+        // EVERY note tagged with it, not one note. Ids come from list_notes rows, which
+        // name each note's Client — the model can only pass an id it has seen, so the
+        // two ship together (#105).
         "client_id": { "type": "string", "description": "Optional: restrict to notes tagged with one client id, as shown in list_notes rows." },
         // RELATIVE, not absolute dates: an absolute range needs the model to do date
         // arithmetic, and a hallucinated year returns silently-empty results. Both
         // ends count back from today, so a window that ENDS in the past is still
         // expressible without either side knowing the calendar (#106).
-        "within_days": { "type": "integer", "description": "Optional: only notes from the last N days (e.g. 7 for last week)." },
-        "until_days": { "type": "integer", "description": "Optional: exclude notes from the last N days, so the window ends in the past. With within_days it makes a past window: within_days 35 + until_days 7 = the four weeks before last week." },
+        ARG_WITHIN: { "type": "integer", "description": "Optional: only notes from the last N days (e.g. 7 for last week)." },
+        ARG_UNTIL: { "type": "integer", "description": "Optional: exclude notes from the last N days, so the window ends in the past. With within_days it makes a past window: within_days 35 + until_days 7 = the four weeks before last week." },
     });
     vec![
         ToolSpec {
@@ -126,8 +127,8 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                     "query": { "type": "string", "description": "Keywords to search for." },
                     "folder_id": filters["folder_id"],
                     "client_id": filters["client_id"],
-                    "within_days": filters["within_days"],
-                    "until_days": filters["until_days"],
+                    ARG_WITHIN: filters[ARG_WITHIN],
+                    ARG_UNTIL: filters[ARG_UNTIL],
                 },
                 "required": ["query"],
             }),
@@ -151,8 +152,8 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                 "properties": {
                     "folder_id": filters["folder_id"],
                     "client_id": filters["client_id"],
-                    "within_days": filters["within_days"],
-                    "until_days": filters["until_days"],
+                    ARG_WITHIN: filters[ARG_WITHIN],
+                    ARG_UNTIL: filters[ARG_UNTIL],
                 },
             }),
         },
@@ -210,7 +211,15 @@ fn window_edge(args: &Value, key: &str, now_ms: i64) -> Option<i64> {
 ///
 /// Checked AFTER clamping, so the verdict describes the window that would actually
 /// run rather than the raw numbers.
-fn validate_window(args: &Value, now_ms: i64) -> Result<(), String> {
+///
+/// Takes the scope so the breadth rule lives with the check rather than at each call
+/// site: under `Note` breadth the window is dropped entirely (see [`resolve_filter`]),
+/// so an inverted window there is an argument on a filter that doesn't exist, and is
+/// ignored like the rest of it.
+fn validate_window(scope: &ToolScope, args: &Value, now_ms: i64) -> Result<(), String> {
+    if matches!(scope, ToolScope::Note(_)) {
+        return Ok(());
+    }
     let (Some(since), Some(until)) = (window_since(args, now_ms), window_until(args, now_ms))
     else {
         return Ok(());
@@ -218,7 +227,7 @@ fn validate_window(args: &Value, now_ms: i64) -> Result<(), String> {
     if until <= since {
         return Err(format!(
             "{ARG_UNTIL} must be smaller than {ARG_WITHIN} — both count back from today, so \
-             until_days marks where the window ENDS. For the four weeks before last week: \
+             {ARG_UNTIL} marks where the window ENDS. For the four weeks before last week: \
              {ARG_WITHIN} 35, {ARG_UNTIL} 7."
         ));
     }
@@ -256,14 +265,6 @@ fn resolve_filter<'a>(scope: &'a ToolScope, args: &'a Value, now_ms: i64) -> Not
             ..Default::default()
         },
     }
-}
-
-/// Whether the date window applies at all under this breadth. Under `Note` breadth
-/// it is dropped entirely (see [`resolve_filter`]), so an inverted window there is
-/// an argument on a filter that doesn't exist — ignored like the rest of it, rather
-/// than erroring on something we were never going to apply.
-fn window_applies(scope: &ToolScope) -> bool {
-    !matches!(scope, ToolScope::Note(_))
 }
 
 fn fmt_date(ms: i64) -> String {
@@ -324,10 +325,8 @@ fn run_search(
     let Some(query) = str_arg(args, "query") else {
         return ToolOutcome::error("search_notes needs a non-empty \"query\" string.");
     };
-    if window_applies(scope) {
-        if let Err(msg) = validate_window(args, now_ms) {
-            return ToolOutcome::error(msg);
-        }
+    if let Err(msg) = validate_window(scope, args, now_ms) {
+        return ToolOutcome::error(msg);
     }
     let filter = resolve_filter(scope, args, now_ms);
     let outcome = match db::hybrid_search_chunks(
@@ -359,8 +358,7 @@ fn run_search(
         };
         return ToolOutcome::ok(text, Vec::new());
     }
-    let notes_shown = distinct_notes(&hits);
-    let mut lines = vec![search_header(query, matched_notes, hits.len(), notes_shown)];
+    let mut lines = vec![search_header(query, matched_notes, &hits)];
     for (i, h) in hits.iter().enumerate() {
         lines.push(format!(
             "{}. \"{}\" ({}, {}): {}",
@@ -395,32 +393,37 @@ fn distinct_notes(hits: &[db::ChunkHit]) -> usize {
     ids.len()
 }
 
-/// The line a search result opens with, keeping three numbers apart that the model
-/// otherwise conflates: how many notes MATCHED, how many excerpts it is being shown,
-/// and how many notes those excerpts came from.
+/// The line a search result opens with, keeping the library-wide match count apart
+/// from what is actually on screen. Without the count, top-k is indistinguishable
+/// from the whole truth (see [`db::SearchOutcome`]).
 ///
-/// Without the first number, top-k is indistinguishable from the whole truth —
-/// "which problems recur across at least three meetings" is uncountable, and a
-/// thing absent from eight excerpts reads exactly like a thing absent from the
-/// library. When the count is unknown (no keyword predicate to count — see
-/// `db::count_matching_notes`) we claim nothing rather than implying zero.
-fn search_header(
-    query: &str,
-    matched: Option<usize>,
-    excerpts: usize,
-    notes_shown: usize,
-) -> String {
+/// The count and the hits measure different sets, which is the trap here: the count
+/// is the KEYWORD predicate, while the hits are keyword and semantic fused. So the
+/// two are stated as separate facts and no claim is made that relates them — except
+/// the one that always holds. `matched > notes_shown` means at least one matching
+/// note is not on screen, so "there are more" is safe; the converse is NOT (a
+/// well-ranked semantic hit can displace a keyword match even when the counts would
+/// allow "all of them"), so that sentence is simply never written.
+fn search_header(query: &str, matched: Option<usize>, hits: &[db::ChunkHit]) -> String {
+    let excerpts = hits.len();
+    let notes_shown = distinct_notes(hits);
     match matched {
-        Some(m) if m > notes_shown => format!(
-            "{m} note(s) matched \"{query}\". Showing {excerpts} excerpt(s) from the \
-             {notes_shown} most relevant:"
-        ),
-        // Everything that matched is on screen. Saying so is what makes a complete
-        // result legible AS complete, so a count over these notes is safe to state.
-        Some(m) => format!(
-            "{m} note(s) matched \"{query}\" — all {m} are below. Showing {excerpts} excerpt(s):"
-        ),
         None => format!("Found {excerpts} relevant excerpt(s) from {notes_shown} note(s):"),
+        // Nothing matched the wording, yet notes came back: the semantic leg found
+        // them. "0 matched" on its own would read as an absence the excerpts below
+        // flatly contradict.
+        Some(0) => format!(
+            "0 notes contain \"{query}\". The {notes_shown} note(s) below are related by meaning, \
+             not by those words — do not report this as the topic being absent. Showing \
+             {excerpts} excerpt(s):"
+        ),
+        Some(m) if m > notes_shown => format!(
+            "{m} notes match \"{query}\" — more than the {notes_shown} below. Showing {excerpts} \
+             excerpt(s) from the most relevant:"
+        ),
+        Some(m) => {
+            format!("{m} notes match \"{query}\". Showing {excerpts} excerpt(s) from {notes_shown} note(s):")
+        }
     }
 }
 
@@ -506,10 +509,8 @@ fn run_list(
     args: &Value,
     now_ms: i64,
 ) -> ToolOutcome {
-    if window_applies(scope) {
-        if let Err(msg) = validate_window(args, now_ms) {
-            return ToolOutcome::error(msg);
-        }
+    if let Err(msg) = validate_window(scope, args, now_ms) {
+        return ToolOutcome::error(msg);
     }
     let filter = resolve_filter(scope, args, now_ms);
     // Fetch one past the cap so a truncated listing can say so rather than reading
@@ -967,20 +968,54 @@ mod tests {
 
     /// Eight excerpts out of forty matching notes and eight out of eight look
     /// identical without this, and the model has no way to tell which it got.
+    /// Hits for the header tests: `notes` distinct notes, one excerpt each.
+    fn hits_over(notes: usize) -> Vec<db::ChunkHit> {
+        (0..notes)
+            .map(|i| db::ChunkHit {
+                note_id: format!("n{i}"),
+                note_title: String::new(),
+                note_created_at: 0,
+                source: String::new(),
+                text: String::new(),
+                rank: 0.0,
+            })
+            .collect()
+    }
+
     #[test]
     fn the_search_header_separates_matched_from_returned() {
         // More matched than shown — the count is the whole point.
-        let many = search_header("budget", Some(12), 8, 5);
-        assert!(many.contains("12 note(s) matched"), "{many}");
-        assert!(many.contains("8 excerpt(s)"), "{many}");
-        assert!(many.contains('5'), "{many}");
-        // Everything that matched is on screen — say so, so "is this all?" is answered.
-        let all = search_header("budget", Some(3), 4, 3);
-        assert!(all.contains("all 3"), "{all}");
-        // No countable predicate (semantic-only): claim no count rather than "0".
-        let unknown = search_header("budget", None, 8, 5);
-        assert!(!unknown.contains("matched"), "{unknown}");
-        assert!(unknown.contains("8 relevant excerpt(s)"), "{unknown}");
+        let many = search_header("budget", Some(12), &hits_over(5));
+        assert!(many.contains("12 notes match"), "{many}");
+        assert!(many.contains("more than the 5"), "{many}");
+        // Fewer matched than shown, or as many: both numbers, no claim relating them.
+        let few = search_header("budget", Some(3), &hits_over(3));
+        assert!(few.contains("3 notes match"), "{few}");
+        assert!(!few.contains("more than"), "{few}");
+        // No countable predicate: claim no count rather than "0".
+        let unknown = search_header("budget", None, &hits_over(5));
+        assert!(!unknown.contains("match"), "{unknown}");
+        assert!(unknown.contains("5 relevant excerpt(s)"), "{unknown}");
+    }
+
+    /// The count is the KEYWORD predicate; the hits are keyword AND semantic fused.
+    /// So `matched` can be lower than what's on screen — and the earlier wording
+    /// turned that into "0 note(s) matched — all 0 are below" printed above real
+    /// excerpts, which inverts the one thing #106 is for.
+    #[test]
+    fn a_zero_keyword_count_with_semantic_hits_does_not_claim_the_topic_is_absent() {
+        let header = search_header("budget", Some(0), &hits_over(3));
+        assert!(header.contains("0 notes contain"), "{header}");
+        assert!(header.contains("related by meaning"), "{header}");
+        assert!(
+            header.contains("do not report this as the topic being absent"),
+            "the excerpts below flatly contradict an absence claim: {header}"
+        );
+        // Never assert completeness from a count that measures a different set.
+        for shown in 1..=4 {
+            let h = search_header("budget", Some(2), &hits_over(shown));
+            assert!(!h.contains("all "), "{h}");
+        }
     }
 
     #[test]
@@ -991,7 +1026,7 @@ mod tests {
         }
         let out = exec(&conn, "", &ToolScope::All, TOOL_SEARCH, &json!({ "query": "budget" }));
         assert!(!out.is_error);
-        assert!(out.model_text.contains("4 note(s) matched"), "{}", out.model_text);
+        assert!(out.model_text.contains("4 notes match"), "{}", out.model_text);
     }
 
     /// The misleading case #106 calls out: absence from a top-k list reads exactly
@@ -1022,11 +1057,12 @@ mod tests {
 }
 
 #[cfg(test)]
-mod pairwise {
+mod pairwise_tests {
+    use super::*;
     /// The tool surface as one printable string: tools in declaration order, args
     /// alphabetical, `!` marking required.
     fn surface() -> String {
-        super::tool_specs()
+        tool_specs()
             .into_iter()
             .map(|s| {
                 let props = s.parameters["properties"].as_object().cloned().unwrap_or_default();

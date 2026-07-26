@@ -1642,6 +1642,15 @@ pub fn rrf_fuse(lists: &[Vec<String>], k: f64) -> Vec<(String, f64)> {
     fused
 }
 
+/// The keyword leg's FROM/WHERE, shared by the ranking query and the match count so
+/// the two can't drift apart on what "matching" means — the count would then describe
+/// a different set from the hits it is printed above. `?1` is the FTS match
+/// expression, `?2` the workspace.
+const KEYWORD_FROM_WHERE: &str = "FROM note_chunks_fts f \
+     JOIN note_chunks c ON c.id = f.chunk_id \
+     JOIN notes n ON n.id = c.note_id \
+     WHERE note_chunks_fts MATCH ?1 AND n.workspace_id = ?2 AND n.deleted_at IS NULL";
+
 /// A chunk hit that carries its stable chunk id (for fusion) alongside the
 /// citation fields.
 struct IdentifiedHit {
@@ -1662,12 +1671,9 @@ fn keyword_ranked(
         return Ok(Vec::new());
     };
     use rusqlite::types::Value;
-    let mut sql = String::from(
+    let mut sql = format!(
         "SELECT c.id, n.id, n.title, n.created_at, c.source, c.text, bm25(note_chunks_fts) AS rank \
-         FROM note_chunks_fts f \
-         JOIN note_chunks c ON c.id = f.chunk_id \
-         JOIN notes n ON n.id = c.note_id \
-         WHERE note_chunks_fts MATCH ?1 AND n.workspace_id = ?2 AND n.deleted_at IS NULL",
+         {KEYWORD_FROM_WHERE}"
     );
     let mut args: Vec<Value> = vec![Value::Text(match_expr), Value::Text(workspace.to_string())];
     push_note_filters(&mut sql, &mut args, filter, "n");
@@ -1895,12 +1901,7 @@ fn count_matching_notes(
         return Ok(None);
     };
     use rusqlite::types::Value;
-    let mut sql = String::from(
-        "SELECT COUNT(DISTINCT c.note_id) FROM note_chunks_fts f \
-         JOIN note_chunks c ON c.id = f.chunk_id \
-         JOIN notes n ON n.id = c.note_id \
-         WHERE note_chunks_fts MATCH ?1 AND n.workspace_id = ?2 AND n.deleted_at IS NULL",
-    );
+    let mut sql = format!("SELECT COUNT(DISTINCT c.note_id) {KEYWORD_FROM_WHERE}");
     let mut args: Vec<Value> = vec![Value::Text(match_expr), Value::Text(workspace.to_string())];
     push_note_filters(&mut sql, &mut args, filter, "n");
     let count: i64 = conn.query_row(&sql, rusqlite::params_from_iter(args), |row| row.get(0))?;
