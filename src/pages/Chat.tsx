@@ -16,7 +16,7 @@
 // local-only majority) and a scope picker (its only option would be "All notes";
 // narrowing stays a tool argument the model chooses, per #81).
 
-import { useMemo, useState } from "react";
+import { useState } from "react";
 import { Plus } from "lucide-react";
 import { ChatPanel, type ChatSessionControls } from "../components/ChatPanel";
 import { conversationRows } from "../lib/chatSessions";
@@ -34,26 +34,22 @@ const GLOBAL_TARGET: ChatTarget = { kind: "global" };
 // revisiting only once someone actually keeps 20+ conversations.
 const RECENTS_LIMIT = 10;
 
-export default function Chat() {
+export function Chat() {
   // The panel publishes its session projection upward (#62); here it feeds the
   // Recents rail instead of the Note header's popover.
   const [controls, setControls] = useState<ChatSessionControls | null>(null);
 
-  const rows = useMemo(() => {
-    // `canBrowseHistory` is the panel's lone-empty-conversation rule: a single
-    // untouched conversation isn't history worth listing. Reused rather than
-    // reimplemented, so the rail and the Note header agree on what counts.
-    if (!controls?.canBrowseHistory) return [];
-    return conversationRows(controls.conversations, controls.activeConversationId).slice(
-      0,
-      RECENTS_LIMIT,
-    );
-  }, [controls]);
+  // `canBrowseHistory` is the panel's lone-empty-conversation rule: a single
+  // untouched conversation isn't history worth listing. Reused rather than
+  // reimplemented, so the rail and the Note header agree on what counts.
+  const rows = controls?.canBrowseHistory
+    ? conversationRows(controls.conversations, controls.activeConversationId).slice(0, RECENTS_LIMIT)
+    : [];
 
   return (
     <div className="h-full flex flex-col overflow-hidden">
       <div className="shrink-0 max-w-[1040px] mx-auto w-full px-8 pt-14">
-        <h1 className="px-2 text-[25px] font-semibold tracking-[-0.022em]">Chat</h1>
+        <h1 className="px-2 text-[25px] font-semibold tracking-[-0.022em] truncate">Chat</h1>
       </div>
 
       {/* The page opens on the composer: no display heading, no hero. The panel
@@ -77,7 +73,10 @@ export default function Chat() {
               disabled={!controls}
               title="New chat"
               aria-label="New chat"
-              className="nd-btn-icon"
+              // `.nd-btn-icon` has no `:disabled` rule and its hover isn't
+              // guarded, so a bare `disabled` would still light up on hover while
+              // doing nothing. Same dimming the send button uses.
+              className={cn("nd-btn-icon", !controls && "opacity-40 pointer-events-none")}
             >
               <Plus size={16} strokeWidth={1.7} aria-hidden="true" />
             </button>

@@ -1,9 +1,9 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
-import Chat from "./Chat";
+import { Chat } from "./Chat";
 import { mockTauri } from "../test/tauri";
-import { useCloudStore, DISCONNECTED } from "../lib/cloud";
+import { useCloudStore, DISCONNECTED, type CloudRole } from "../lib/cloud";
 import { useNotesStore } from "../lib/store";
 import type { ConversationMeta, Note } from "../lib/ipc";
 
@@ -31,9 +31,23 @@ function renderChat() {
   );
 }
 
+function signIntoWorkspace(role: CloudRole = "owner") {
+  const ws = { id: "ws1", name: "Acme Team", role, plan_status: "active" as const };
+  useCloudStore.setState({
+    status: {
+      ...DISCONNECTED,
+      configured: true,
+      logged_in: true,
+      base_url: "https://sync.humla.team",
+      current_workspace: ws,
+      workspaces: [ws],
+    },
+  });
+}
+
 beforeEach(() => {
   mockTauri();
-  useCloudStore.setState({ status: DISCONNECTED });
+  useCloudStore.setState({ status: DISCONNECTED, syncStatus: null });
   // Default: a library with notes, already loaded — the ordinary case.
   seedNotes(3);
 });
@@ -159,8 +173,8 @@ describe("/chat page", () => {
   });
 });
 
-describe("/chat with an empty library", () => {
-  it("disables the composer and says there is nothing to search", async () => {
+describe("/chat with nothing to retrieve", () => {
+  it("holds the composer and says there is nothing to search", async () => {
     useNotesStore.setState({ notes: [], loaded: true });
     mockTauri({
       provider_key_get: () => "sk-test",
@@ -169,7 +183,11 @@ describe("/chat with an empty library", () => {
     renderChat();
 
     const input = await screen.findByLabelText("Ask about your notes");
-    expect(input).toBeDisabled();
+    // readOnly, not disabled: `disabled` drops the control out of the tab order,
+    // so a keyboard or screen-reader user would never reach the placeholder that
+    // explains why they can't type.
+    expect(input).toHaveAttribute("readonly");
+    expect(input).toHaveAttribute("aria-disabled", "true");
     expect(screen.getByPlaceholderText("Nothing to search yet")).toBeInTheDocument();
     // The standing invitation is replaced, not merely supplemented — it would
     // otherwise invite a question whose only answer is "I couldn't find anything".
@@ -177,7 +195,32 @@ describe("/chat with an empty library", () => {
     expect(screen.queryByText(/Ask anything about your notes/)).toBeNull();
   });
 
-  it("keeps the composer enabled while the first load is still in flight", async () => {
+  it("holds it in a workspace too, where a wasted turn is metered", async () => {
+    signIntoWorkspace();
+    useNotesStore.setState({ notes: [], loaded: true });
+    mockTauri({ chat_history: () => ({ conversationId: null, messages: [] }) });
+    renderChat();
+
+    const input = await screen.findByLabelText("Ask about your notes");
+    expect(input).toHaveAttribute("aria-disabled", "true");
+  });
+
+  it("says notes are still arriving, not that there are none, mid-sync", async () => {
+    // An empty local mirror during a workspace pull is not evidence of an empty
+    // workspace — claiming "No notes yet" there would be a false statement about
+    // someone's library.
+    signIntoWorkspace();
+    useNotesStore.setState({ notes: [], loaded: true });
+    useCloudStore.setState({ syncStatus: "syncing" });
+    mockTauri({ chat_history: () => ({ conversationId: null, messages: [] }) });
+    renderChat();
+
+    expect(await screen.findByText(/Still syncing your notes/)).toBeInTheDocument();
+    expect(screen.queryByText(/No notes yet\./)).toBeNull();
+    expect(screen.getByLabelText("Ask about your notes")).toHaveAttribute("aria-disabled", "true");
+  });
+
+  it("leaves the composer open while the first load is still in flight", async () => {
     // notes: [] with loaded: false is "we don't know yet", not "empty" — claiming
     // an empty library here would fire on every launch for one frame.
     useNotesStore.setState({ notes: [], loaded: false });
@@ -188,6 +231,21 @@ describe("/chat with an empty library", () => {
     renderChat();
 
     const input = await screen.findByPlaceholderText(/Ask about your notes/);
-    expect(input).not.toBeDisabled();
+    expect(input).not.toHaveAttribute("readonly");
+    expect(input).not.toHaveAttribute("aria-disabled");
+  });
+});
+
+describe("/chat breadth chrome", () => {
+  it("shows no scope picker — its only option would be 'All notes'", async () => {
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () => ({ conversationId: null, messages: [] }),
+    });
+    renderChat();
+
+    await screen.findByPlaceholderText(/Ask about your notes/);
+    expect(screen.queryByLabelText("Chat scope")).toBeNull();
+    expect(screen.queryByText("All notes")).toBeNull();
   });
 });

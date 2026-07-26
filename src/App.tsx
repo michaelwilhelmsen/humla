@@ -10,7 +10,7 @@ import { useEffect, useState } from "react";
 import { Layout } from "./components/Layout";
 import { Home } from "./pages/Home";
 import { AllNotes } from "./pages/AllNotes";
-import Chat from "./pages/Chat";
+import { Chat } from "./pages/Chat";
 import { Note } from "./pages/Note";
 import { Folder } from "./pages/Folder";
 import { Trash } from "./pages/Trash";

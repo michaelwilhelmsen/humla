@@ -230,19 +230,10 @@ export function ChatPanel({
   const anchorNote = useNotesStore((s) =>
     noteId === null ? null : s.notes.find((n) => n.id === noteId) ?? null,
   );
-  // Nothing in the library to retrieve from, so the standing invitation would
-  // invite a question whose only honest answer is "I couldn't find anything" —
-  // and in a metered workspace that costs a turn to discover (#95).
-  //
-  // Three conditions, each load-bearing. A NOTE pane can't be affected: its
-  // anchor is grounding, so there is always something to answer from. In a
-  // WORKSPACE, retrieval runs server-side over the workspace index, so a local
-  // store that looks empty may simply not have synced yet — whether that index is
-  // genuinely empty or still backfilling is `index_state`'s to report, with its
-  // own copy, not this pane's to guess from local rows. And `loaded` separates an
-  // empty library from one whose first load hasn't landed.
-  // (`inWorkspace` isn't in scope until the cloud selectors below, so the flag
-  // itself is derived there.)
+  // Is there anything at all to retrieve from? `loaded` matters as much as the
+  // count: `notes: []` on its own also means "the first load hasn't landed", and
+  // acting on that would fire for a frame on every launch. (The full rule is
+  // derived below as `nothingToSearch`, once the cloud selectors are in scope.)
   const libraryEmpty = useNotesStore((s) => s.loaded && s.notes.length === 0);
 
   const likelyTruncated = useMemo(() => {
@@ -375,8 +366,26 @@ export function ChatPanel({
   // workspace chat does NOT — it runs on the workspace key, so a member without
   // a personal key still reaches the pane (composer or activation state, #76).
   const paneUsable = inWorkspace || ready;
-  // See `libraryEmpty` above for why all three conditions are needed.
-  const nothingToSearch = target.kind === "global" && !inWorkspace && libraryEmpty;
+
+  // A library-wide pane with nothing to retrieve from would otherwise show the
+  // standing invitation — inviting a question whose only honest answer is "I
+  // couldn't find anything", which in a metered workspace costs a turn to
+  // discover (#95). So the composer holds instead, in one of two states.
+  //
+  // A NOTE pane never reaches either: its anchor note IS grounding, so there is
+  // always something to answer from.
+  //
+  // `syncing` splits them. A workspace pulls its notes down after a switch, so a
+  // local mirror that looks empty mid-pull isn't evidence of an empty workspace —
+  // that gets the still-arriving copy rather than a claim about the library. This
+  // is a client-side stand-in for the server's `index_state`, which reports
+  // "empty" (backfilling) vs "quarantined" vs "ready" authoritatively but isn't
+  // wired to the client yet; until it is, sync state is the honest local proxy.
+  const syncing = useCloudStore((s) => s.syncStatus) === "syncing";
+  const globalPane = target.kind === "global";
+  const nothingToSearch = globalPane && libraryEmpty && !syncing;
+  const notesStillArriving = globalPane && libraryEmpty && syncing;
+  const composerHeld = nothingToSearch || notesStillArriving;
 
   // Activation gating (#76). Only on the managed server + a workspace. While the
   // key metadata is still loading (undefined) show neither composer nor pane, so
@@ -756,9 +765,11 @@ export function ChatPanel({
           <div className="flex-1 flex flex-col items-center justify-center gap-3 px-6 text-center">
             <MessageCircle size={22} strokeWidth={1.5} className="text-[var(--color-text-disabled)]" />
             <p className="text-sm text-[var(--color-text-muted)]">
-              {nothingToSearch
-                ? "No notes yet. Record or import a meeting, then ask about it here."
-                : "Ask anything about your notes — it searches, reads, and cites them to answer."}
+              {notesStillArriving
+                ? "Still syncing your notes — this will be ready in a moment."
+                : nothingToSearch
+                  ? "No notes yet. Record or import a meeting, then ask about it here."
+                  : "Ask anything about your notes — it searches, reads, and cites them to answer."}
             </p>
           </div>
         ) : (
@@ -866,19 +877,27 @@ export function ChatPanel({
             onKeyDown={onKeyDown}
             rows={1}
             // Stays enabled while a turn streams so Enter can stop it (#80) —
-            // `send` no-ops on `sending`, so this can't queue a second turn. An
-            // empty library is the one case that does disable it (#95): there is
-            // nothing to retrieve, so every question has the same dead end.
-            disabled={nothingToSearch}
+            // `send` no-ops on `sending`, so this can't queue a second turn.
+            //
+            // Nothing to retrieve from is the one case that closes the composer
+            // (#95). `readOnly` + `aria-disabled` rather than `disabled`, because
+            // `disabled` drops the control out of the tab order — a keyboard or
+            // screen-reader user would then never reach the placeholder saying
+            // WHY they can't type. Nothing can be entered either way, so `send`
+            // stays unreachable: it no-ops on empty input.
+            readOnly={composerHeld}
+            aria-disabled={composerHeld || undefined}
             placeholder={
-              nothingToSearch
-                ? "Nothing to search yet"
-                : sending
-                  ? "Streaming — press Enter to stop"
-                  : "Ask about your notes…"
+              notesStillArriving
+                ? "Syncing your notes…"
+                : nothingToSearch
+                  ? "Nothing to search yet"
+                  : sending
+                    ? "Streaming — press Enter to stop"
+                    : "Ask about your notes…"
             }
             aria-label="Ask about your notes"
-            className="block w-full resize-none max-h-40 bg-transparent text-sm leading-relaxed pl-2 pr-11 py-2 outline-none placeholder:text-[var(--color-text-muted)] disabled:cursor-not-allowed"
+            className="block w-full resize-none max-h-40 bg-transparent text-sm leading-relaxed pl-2 pr-11 py-2 outline-none placeholder:text-[var(--color-text-muted)] read-only:cursor-not-allowed"
           />
           {/* Send morphs into Stop while streaming (#80), so the same spot is
               always the turn's primary control. */}
@@ -1144,6 +1163,13 @@ function BreadthPicker({
       : []),
     { id: "all", label: "All notes", icon: <Files size={14} strokeWidth={1.7} aria-hidden="true" /> },
   ];
+  // One option is not a choice: a picker whose only entry is "All notes" is noise,
+  // so a library-wide pane shows no breadth chrome at all (#95). Narrowing is
+  // still available there — as a tool argument the model chooses (#81), not as a
+  // control. A pane WITH an anchor always has at least "This note" + "All notes",
+  // so this never hides the picker where it does work.
+  if (items.length < 2) return null;
+
   // If the folder disappears while "folder" is selected — or the pane has no
   // anchor at all — fall back to the pane's own default.
   const selectable = items.some((i) => i.id === scope);

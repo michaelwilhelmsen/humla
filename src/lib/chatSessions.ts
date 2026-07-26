@@ -1,7 +1,8 @@
-// Display helpers for the chat history popover (issue #62). Kept pure and
-// framework-free so they unit-test without rendering. `relativeTime` is generic
-// enough to hoist to a shared module if a second caller ever appears; for now
-// the chat history list is its only consumer.
+// Display helpers for the chat conversation lists (issue #62, extended for
+// `/chat`'s Recents in #95). Kept pure and framework-free so they unit-test
+// without rendering — the only import is a type, so nothing runtime comes with it.
+
+import type { ConversationMeta } from "./ipc";
 
 
 // A short, human relative timestamp: "just now" / "5m ago" / "3h ago" /
@@ -41,6 +42,11 @@ export function conversationTitle(meta: { title: string }): string {
   return meta.title.trim() || "New chat";
 }
 
+/** The conversation fields a row is built from — named once rather than spelled
+ *  out structurally at every call site. A `Pick` of the real DTO so a field
+ *  rename on the backend contract surfaces here rather than silently diverging. */
+export type ConversationFields = Pick<ConversationMeta, "id" | "title" | "updatedAt">;
+
 /** One row of a conversation list, ready to render. */
 export type ConversationRow = {
   id: string;
@@ -64,7 +70,7 @@ export type ConversationRow = {
  * own `activeId` and simply ignores the extra field.
  */
 export function conversationRows(
-  conversations: { id: string; title: string; updatedAt: number }[],
+  conversations: ConversationFields[],
   activeId: string | null,
   now: number = Date.now(),
 ): ConversationRow[] {

@@ -479,31 +479,31 @@ describe("ChatPanel with a library-wide target (#94)", () => {
     }
   });
 
-  it("defaults its scope to all notes and offers no anchor-dependent option", async () => {
+  it("shows no breadth chrome at all, so no anchor-dependent option can appear", async () => {
     // A library-wide conversation has no anchor to narrow to, so BOTH "This note"
-    // and "Folder: …" are meaningless — and offering either would let the chip
-    // show a breadth the backend's `check_anchor` is guaranteed to reject, so the
-    // chip would end up lying about what the next turn will search. Seeding a note
-    // with a folder proves the options are absent because there's no ANCHOR, not
-    // because no folder exists.
+    // and "Folder: …" are meaningless — offering either would let the chip show a
+    // breadth the backend's `check_anchor` is guaranteed to reject, i.e. lie about
+    // what the next turn will search. #94 suppressed those two options, which left
+    // a one-option picker; #95 removed the picker itself, since a dropdown whose
+    // only entry is "All notes" is noise. Seeding a note WITH a folder proves the
+    // options are gone because there's no anchor, not because no folder exists.
     seedNoteWithFolder();
     mockTauri({
       provider_key_get: () => "sk-test",
       chat_history: () => history(),
-      // The backend can't be read → the pane must fall back to "all", not "note".
+      // Unreadable stored breadth: the pane must still come up (falling back to
+      // "all"), not error or stall.
       chat_get_breadth: () => {
         throw new Error("unavailable");
       },
     });
     renderGlobal();
 
-    const scopeButton = await screen.findByRole("button", { name: "Chat scope" });
-    await waitFor(() => expect(scopeButton).toHaveTextContent(/all notes/i));
-    fireEvent.click(scopeButton);
+    await screen.findByPlaceholderText(/Ask about your notes/);
+    expect(screen.queryByRole("button", { name: "Chat scope" })).toBeNull();
     expect(screen.queryByText(/^Folder:/)).toBeNull();
     expect(screen.queryByText("This note")).toBeNull();
-    // "All notes" is the only option (it appears twice — the trigger and the row).
-    expect(screen.getAllByText("All notes").length).toBeGreaterThan(0);
+    expect(screen.queryByText("All notes")).toBeNull();
   });
 
   it("keeps the note pane's own scope options intact", async () => {
