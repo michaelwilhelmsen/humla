@@ -117,10 +117,22 @@ describe("/chat page", () => {
     renderChat();
 
     await screen.findByPlaceholderText(/Ask about your notes/);
-    expect(await screen.findByRole("button", { name: /Outstanding actions/ })).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: /Needs my attention/ })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Client status/ })).toBeInTheDocument();
     // "What I missed" only makes sense with a note on screen to have missed.
     expect(screen.queryByText("What I missed")).toBeNull();
+  });
+
+  it("says how to reach the prompts again once the cards are gone", async () => {
+    // The "/" menu shipped in #80 and was mentioned nowhere, so it was
+    // discoverable only by accident.
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () => ({ conversationId: null, messages: [] }),
+    });
+    renderChat();
+
+    expect(await screen.findByText(/in the composer for these any time/)).toBeInTheDocument();
   });
 
   it("fills the composer from a card rather than spending a turn", async () => {
@@ -157,7 +169,7 @@ describe("/chat page", () => {
     fireEvent.keyDown(input, { key: "/" });
 
     const menu = await screen.findByRole("listbox", { name: "Prompts" });
-    for (const label of ["Outstanding actions", "Weekly recap", "Client status", "Decisions log"]) {
+    for (const label of ["Needs my attention", "Weekly recap", "Client status", "Decisions log"]) {
       expect(within(menu).getByText(label)).toBeInTheDocument();
     }
   });

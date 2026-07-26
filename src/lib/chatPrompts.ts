@@ -60,9 +60,17 @@ export const NOTE_PROMPTS: ChatPrompt[] = [
 // other three, which are one-click.
 export const LIBRARY_PROMPTS: ChatPrompt[] = [
   {
-    label: "Outstanding actions",
-    description: "Still open across recent meetings",
-    prompt: "What action items are still open across my recent meetings?",
+    // Deliberately "what needs attention" rather than "list the open actions".
+    // An enumerating prompt gets an enumeration back — every item, evenly
+    // weighted; asking what needs attention makes the model filter, which is the
+    // only useful behaviour once a library has months in it. The citation clause
+    // rides on the prompt rather than the system message on purpose: terse system
+    // prompts beat constraint-heavy ones on the small local models, which turn a
+    // list of rules into a checklist they re-litigate while thinking.
+    label: "Needs my attention",
+    description: "Unresolved, blocked, or waiting on you",
+    prompt:
+      "Review my meetings from the last 30 days and tell me what needs my attention now — not everything that happened. Focus on unresolved commitments, blocked work, decisions waiting for me, deadlines, contradictions, and issues that keep coming back. Cite the meeting for each item.",
   },
   {
     label: "Weekly recap",

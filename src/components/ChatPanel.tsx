@@ -892,7 +892,16 @@ export function ChatPanel({
                 Suppressed when there's nothing to retrieve — offering four
                 questions with the same dead-end answer would be a tease. */}
             {onPage && !composerHeld && (
-              <PromptCards prompts={promptsFor(target)} onPick={applyPrompt} />
+              <>
+                <PromptCards prompts={promptsFor(target)} onPick={applyPrompt} />
+                {/* The "/" menu has been reachable since #80 and mentioned
+                    nowhere, so nobody who didn't read the changelog knows it
+                    exists. The new-chat screen is where it's worth saying: the
+                    cards are right there to give "these" a referent. */}
+                <p className="text-xs text-[var(--color-text-disabled)]">
+                  Type <span className="font-medium">/</span> in the composer for these any time.
+                </p>
+              </>
             )}
           </div>
         ) : (
