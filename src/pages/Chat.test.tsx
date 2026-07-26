@@ -70,8 +70,10 @@ describe("/chat page", () => {
     await waitFor(() =>
       expect(screen.getByPlaceholderText(/Ask about your notes/)).toBeInTheDocument(),
     );
-    // No greeting and no display heading — just the page title (#95).
-    expect(screen.getByRole("heading", { name: "Chat" })).toBeInTheDocument();
+    // No greeting and no page heading at all: the title lives in the app bar,
+    // and a second "Chat" beneath it would be the same word twice (#95).
+    expect(screen.queryByRole("heading")).toBeNull();
+    expect(screen.getByTitle("Chat")).toBeInTheDocument();
     // An ABSENT note id is what the backend reads as the global scope; an empty
     // string is rejected (#93), so this assertion is the wire contract. The window
     // is the first page — the list is uncapped and pages in as it scrolls.
@@ -187,8 +189,7 @@ describe("/chat header", () => {
     expect(screen.queryByText(/visible to members/)).toBeNull();
   });
 
-  it("says Personal and Private outside a workspace, with the library size", async () => {
-    seedNotes(17);
+  it("says Personal and Private outside a workspace", async () => {
     mockTauri({
       provider_key_get: () => "sk-test",
       chat_history: () => ({ conversationId: null, messages: [] }),
@@ -197,7 +198,22 @@ describe("/chat header", () => {
 
     expect(await screen.findByText("Personal")).toBeInTheDocument();
     expect(screen.getByText("Private")).toBeInTheDocument();
-    expect(screen.getByText("17 notes")).toBeInTheDocument();
+  });
+
+  it("names the open conversation, and falls back to \"Chat\" for a fresh one", async () => {
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () => ({ conversationId: "c1", messages: [] }),
+      chat_list_conversations: () => [
+        { id: "c1", title: "Budget questions", breadth: "all", updatedAt: 2, messageCount: 4 },
+        // Untitled until the backend derives one from the first turn.
+        { id: "c2", title: "", breadth: "all", updatedAt: 1, messageCount: 0 },
+      ],
+    });
+    renderChat();
+
+    expect(await screen.findByTitle("Budget questions")).toBeInTheDocument();
+    expect(screen.queryByTitle("Chat")).toBeNull();
   });
 
   it("names the answering model in the header, not the composer row", async () => {
@@ -219,11 +235,10 @@ describe("/chat header", () => {
     expect(screen.queryByTestId("chat-model-indicator")).toBeNull();
   });
 
-  it("claims no library size or model in a workspace", async () => {
-    // Retrieval is server-side there: the local mirror can lag, and the local
-    // chat_model isn't what answers (#80). Both would be claims we can't make.
+  it("claims no model in a workspace", async () => {
+    // The turn runs on the server's model there, so naming the local chat_model
+    // would name something that isn't answering (#80).
     signIntoWorkspace();
-    seedNotes(17);
     mockTauri({
       chat_history: () => ({ conversationId: null, messages: [] }),
       settings_get: (args) => {
@@ -236,34 +251,46 @@ describe("/chat header", () => {
     renderChat();
 
     await screen.findByText("Acme Team");
-    expect(screen.queryByText("17 notes")).toBeNull();
     expect(screen.queryByText("gpt-5.1")).toBeNull();
   });
 });
 
 describe("/chat session chrome placement", () => {
-  // Exactly one home at a time: the sidebar owns the list and the "+" while it's
-  // open; collapsed, it takes them with it, so the popover fallback appears in the
-  // page header instead. Two "new chat" buttons on one screen is a puzzle.
-  it("stays out of the page header while the sidebar is open", async () => {
+  // Actions live in the app bar, as they do in the Note view, so "new chat" has
+  // one home whatever the sidebar is doing. History is the exception: the sidebar
+  // list IS the history while it's open, and the popover beside it would be the
+  // same thing twice.
+  it("keeps new chat in the bar whether or not the sidebar is open", async () => {
     mockTauri({
       provider_key_get: () => "sk-test",
       chat_history: () => ({ conversationId: null, messages: [] }),
+      chat_list_conversations: () => [
+        { id: "c1", title: "Earlier", breadth: "all", updatedAt: 2, messageCount: 4 },
+        { id: "c2", title: "Later", breadth: "all", updatedAt: 3, messageCount: 2 },
+      ],
     });
     renderChat(false);
 
-    await screen.findByPlaceholderText(/Ask about your notes/);
-    expect(screen.queryByLabelText("New chat")).toBeNull();
+    expect(await screen.findByLabelText("New chat")).toBeInTheDocument();
+    // Two conversations, so history WOULD be offerable — it's the visible sidebar
+    // list that suppresses the popover, not a lack of history.
+    expect(screen.queryByTitle("Chat history")).toBeNull();
   });
 
-  it("appears in the page header once the sidebar is collapsed", async () => {
+  it("adds the history popover once the sidebar is collapsed", async () => {
     mockTauri({
       provider_key_get: () => "sk-test",
       chat_history: () => ({ conversationId: null, messages: [] }),
+      chat_list_conversations: () => [
+        { id: "c1", title: "Earlier", breadth: "all", updatedAt: 2, messageCount: 4 },
+        { id: "c2", title: "Later", breadth: "all", updatedAt: 3, messageCount: 2 },
+      ],
     });
     renderChat(true);
 
     expect(await screen.findByLabelText("New chat")).toBeInTheDocument();
+    // Collapsed, the popover is the only way back to a past thread.
+    expect(await screen.findByTitle("Chat history")).toBeInTheDocument();
   });
 });
 

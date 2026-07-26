@@ -74,7 +74,15 @@ describe("ChatConversations", () => {
     // "No conversations yet" would be a claim we can't make yet — the pane may
     // still be mounting, or chat may not be configured.
     expect(screen.queryByText("No conversations yet")).toBeNull();
-    expect(screen.getByLabelText("New chat")).toBeDisabled();
+  });
+
+  it("offers no actions of its own — the app bar owns those", () => {
+    // The section is the list. "New chat" lives in the title-bar row with the
+    // other actions, so it isn't rendered twice on one screen.
+    publish({ conversations: [conversation({ id: "c-a", title: "Alpha" })] });
+    render(<ChatConversations />);
+
+    expect(screen.queryByLabelText("New chat")).toBeNull();
   });
 
   it("lists conversations most-recent first and marks the active one", () => {
@@ -123,7 +131,7 @@ describe("ChatConversations", () => {
     expect(screen.queryByRole("listitem")).toBeNull();
   });
 
-  it("loads the conversation whose row is clicked, and starts a new one from +", () => {
+  it("loads the conversation whose row is clicked", () => {
     const controls = publish({
       conversations: [conversation({ id: "c-a", title: "Alpha", updatedAt: 2 })],
     });
@@ -131,9 +139,6 @@ describe("ChatConversations", () => {
 
     fireEvent.click(screen.getByText("Alpha"));
     expect(controls.openConversation).toHaveBeenCalledWith("c-a");
-
-    fireEvent.click(screen.getByLabelText("New chat"));
-    expect(controls.newChat).toHaveBeenCalled();
   });
 
   describe("paging", () => {

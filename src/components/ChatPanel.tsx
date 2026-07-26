@@ -476,6 +476,13 @@ export function ChatPanel({
   const nothingToSearch = globalPane && libraryEmpty && !syncing;
   const notesStillArriving = globalPane && libraryEmpty && syncing;
   const composerHeld = nothingToSearch || notesStillArriving;
+  // Does the composer's control row have anything in it? The breadth picker needs
+  // an anchor to offer a second option (#95), the model chip is panel-only and
+  // Personal-only (#80), the truncation hint needs an anchor note, and the turn
+  // meter needs a metered workspace (#69). On `/chat` in Personal that's nothing
+  // at all — so don't render the row and leave a gap where content isn't.
+  const showComposerControls =
+    noteId !== null || (!onPage && !inWorkspace && !!model) || !!usage;
 
   // Activation gating (#76). Only on the managed server + a workspace. While the
   // key metadata is still loading (undefined) show neither composer nor pane, so
@@ -1012,7 +1019,7 @@ export function ChatPanel({
             // box, so the two don't nest into a double border.
             onPage
               ? ""
-              : "border border-[var(--color-line)] transition-colors focus-within:border-[var(--color-text-muted)]",
+              : "border border-transparent transition-colors focus-within:border-[var(--color-text-muted)]",
           )}
         >
           <textarea
@@ -1042,14 +1049,17 @@ export function ChatPanel({
                     : "Ask about your notes…"
             }
             aria-label="Ask about your notes"
-            // `.nd-bare` is the documented opt-out from the global
-            // `select, textarea` surface in globals.css — an UNLAYERED rule, so it
-            // beat every utility here: this textarea has been carrying its own 1px
-            // border, input background and 8px/12px padding all along, which is why
-            // the page variant's composer box read as double-bordered and why the
-            // padding utilities below looked ignored. The wrapper owns the surface
-            // (see the focus-visible comment above); the field itself is bare.
-            className="nd-bare block w-full resize-none max-h-40 text-sm leading-relaxed pl-2 pr-11 py-2 outline-none placeholder:text-[var(--color-text-muted)] read-only:cursor-not-allowed"
+            // The global `select, textarea` rule in globals.css is UNLAYERED, so it
+            // outranks every utility here and hands this field a border, a fill and
+            // 8px/12px padding whether we ask or not. In the PANEL that lands inside
+            // the wrapper's own transparent border and has been the Note tab's look
+            // since #46 — so leave it exactly alone. On the PAGE the composer box is
+            // the surface, so the field opts out through a rule of the same kind
+            // (`.nd-chat-input`), which also owns its padding.
+            className={cn(
+              "block w-full resize-none max-h-40 text-sm leading-relaxed outline-none placeholder:text-[var(--color-text-muted)] read-only:cursor-not-allowed",
+              onPage ? "nd-chat-input" : "bg-transparent pl-2 pr-11 py-2",
+            )}
           />
           {/* Send morphs into Stop while streaming (#80), so the same spot is
               always the turn's primary control. */}
@@ -1082,7 +1092,12 @@ export function ChatPanel({
         {/* Composer control row: breadth picker bottom-left, workspace turn
             allowance bottom-right (#69). The meter shows only in a metered
             workspace — `usage` is null in personal context and on any
-            unavailable/error/unmetered outcome, so nothing renders then. */}
+            unavailable/error/unmetered outcome, so nothing renders then.
+            Skipped entirely when every one of its children would be absent, which
+            on `/chat` in Personal is all of them: an empty flex row still costs
+            the container's gap, and that showed up as an unexplained band under
+            the composer that looked like space reserved for something. */}
+        {showComposerControls && (
         <div className="flex items-center justify-between gap-2 px-1">
           <div className="flex min-w-0 items-center gap-2">
             <BreadthPicker
@@ -1139,6 +1154,7 @@ export function ChatPanel({
             </span>
           )}
         </div>
+        )}
       </div>
       )}
     </div>

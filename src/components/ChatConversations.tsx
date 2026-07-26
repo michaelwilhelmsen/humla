@@ -15,7 +15,6 @@
 // publishes and asks for more when the bottom comes into view.
 
 import { useEffect, useRef } from "react";
-import { Plus } from "lucide-react";
 import { useGlobalChatStore } from "../lib/globalChat";
 import { conversationRows } from "../lib/chatSessions";
 import { cn } from "../lib/cn";
@@ -56,22 +55,9 @@ export function ChatConversations() {
 
   return (
     <>
-      <div className="nd-label flex items-center justify-between px-2 pb-1.5">
-        <span>Conversations</span>
-        <button
-          type="button"
-          onClick={() => void controls?.newChat()}
-          disabled={!controls}
-          aria-label="New chat"
-          title="New chat"
-          className={cn(
-            "grid place-items-center w-5 h-5 rounded-full text-[var(--color-text-muted)] hover:text-[var(--color-text)] hover:bg-[var(--color-pill-hover)] transition-colors",
-            !controls && "opacity-40 pointer-events-none",
-          )}
-        >
-          <Plus size={14} strokeWidth={2} />
-        </button>
-      </div>
+      {/* Label only. "New chat" lives in the app bar with the other actions, the
+          way the Note view puts its actions there — the sidebar is the list. */}
+      <div className="nd-label px-2 pb-1.5">Conversations</div>
 
       {controls && rows.length === 0 && (
         <div className="px-2 py-3 text-xs text-[var(--color-text-disabled)]">
@@ -80,9 +66,9 @@ export function ChatConversations() {
       )}
 
       {rows.length > 0 && (
-        // Read-only rows: selecting one loads it, and "+" is the only other move.
-        // No rename or delete — in a workspace, who may remove a conversation
-        // every member can see is still an open question (#60).
+        // Read-only rows: selecting one loads it, and "new chat" in the app bar is
+        // the only other move. No rename or delete — in a workspace, who may remove
+        // a conversation every member can see is still an open question (#60).
         <ul className="list-none">
           {rows.map((row) => (
             <li key={row.id}>

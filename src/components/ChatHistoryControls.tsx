@@ -17,7 +17,18 @@ import { SelectablePopover } from "./SelectablePopover";
 import type { ChatSessionControls } from "./ChatPanel";
 import { conversationRows } from "../lib/chatSessions";
 
-export function ChatHistoryControls({ controls }: { controls: ChatSessionControls }) {
+export function ChatHistoryControls({
+  controls,
+  showHistory = true,
+}: {
+  controls: ChatSessionControls;
+  /** Whether to offer the history popover alongside "+" (#95).
+   *
+   *  `/chat` sets this false while its sidebar list is visible: that list already
+   *  IS the history, and a popover beside it would be the same thing rendered
+   *  twice. The Note header has no list, so it keeps the default. */
+  showHistory?: boolean;
+}) {
   const { conversations, activeConversationId, canBrowseHistory, newChat, openConversation } =
     controls;
   // Same projection the `/chat` sidebar list renders from (#95) — ordering, the
@@ -39,7 +50,7 @@ export function ChatHistoryControls({ controls }: { controls: ChatSessionControl
       >
         <Plus size={16} strokeWidth={1.7} aria-hidden="true" />
       </button>
-      {canBrowseHistory && (
+      {showHistory && canBrowseHistory && (
         <SelectablePopover
           ariaLabel="Chat history"
           align="end"
