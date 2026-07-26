@@ -926,12 +926,71 @@ fn map_summary_prompt(row: &rusqlite::Row) -> rusqlite::Result<SummaryPrompt> {
 // Persistence for the chat skeleton: conversations + messages. See the schema
 // note in `open()` for the storage-shape rationale (opencode v2 model).
 
-/// General chat scope. Only `Note` is used in this slice; the enum exists so
-/// the string stored in `conversations.scope` is chosen in one place and later
-/// breadths (folder/client/workspace) add variants without touching call sites.
+/// General chat scope — the string stored in `conversations.scope`, chosen in
+/// one place so later scopes (folder/client) add variants without touching call
+/// sites. `global` arrived with #93; folder and client are still unbuilt.
 pub const CHAT_SCOPE_NOTE: &str = "note";
+pub const CHAT_SCOPE_GLOBAL: &str = "global";
+/// `scope_id` for the one global conversation set per tenant. A fixed sentinel
+/// rather than an empty string: the composite key is `(tenant, scope, scope_id)`,
+/// and an empty id already reads as "absent" in too many places to also mean
+/// "the whole library". Never shown to the user, never sent to the server — the
+/// cloud carries its own `scope` field (humla-cloud#26).
+pub const CHAT_GLOBAL_SCOPE_ID: &str = "__global__";
 /// Only Personal is used in this slice; workspace tenants arrive with Teams.
 pub const CHAT_TENANT_PERSONAL: &str = "personal";
+
+/// What a chat conversation is *about*: one Note, or the whole library.
+///
+/// This is the single place `(scope, scope_id)` is derived, so a caller can no
+/// longer accidentally pair a global scope with a note's id. Constructed from the
+/// IPC boundary via [`ChatTarget::from_note_id`], where **absent** means global
+/// and **empty** is an error — the distinction that keeps `""` from quietly
+/// becoming "everything" (the same trap humla-cloud#26 avoided server-side).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChatTarget {
+    Note(String),
+    Global,
+}
+
+impl ChatTarget {
+    /// Parse the optional note id an IPC command received.
+    pub fn from_note_id(note_id: Option<String>) -> Result<Self, String> {
+        match note_id {
+            None => Ok(Self::Global),
+            Some(id) if id.trim().is_empty() => Err(
+                "A chat target needs a note id, or none at all for the whole library — \
+                 an empty id is neither."
+                    .into(),
+            ),
+            Some(id) => Ok(Self::Note(id)),
+        }
+    }
+
+    pub fn scope(&self) -> &'static str {
+        match self {
+            Self::Note(_) => CHAT_SCOPE_NOTE,
+            Self::Global => CHAT_SCOPE_GLOBAL,
+        }
+    }
+
+    pub fn scope_id(&self) -> &str {
+        match self {
+            Self::Note(id) => id,
+            Self::Global => CHAT_GLOBAL_SCOPE_ID,
+        }
+    }
+
+    /// The anchor note id, or None for a global target. Callers that genuinely
+    /// need a note (grounding, folder breadth) go through this and handle None
+    /// rather than reaching for `scope_id`.
+    pub fn note_id(&self) -> Option<&str> {
+        match self {
+            Self::Note(id) => Some(id),
+            Self::Global => None,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Conversation {
@@ -2981,6 +3040,85 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].id, *recent);
         assert_ne!(listed[0].id, *ancient);
+    }
+
+    // ── #93: global chat scope ──────────────────────────────────────────────
+
+    #[test]
+    fn chat_target_derives_scope_and_scope_id_together() {
+        let note = ChatTarget::Note("n1".into());
+        assert_eq!((note.scope(), note.scope_id()), (CHAT_SCOPE_NOTE, "n1"));
+        assert_eq!((ChatTarget::Global.scope(), ChatTarget::Global.scope_id()), (CHAT_SCOPE_GLOBAL, CHAT_GLOBAL_SCOPE_ID));
+        // A global target has no anchor; callers needing one must handle None.
+        assert_eq!(note.note_id(), Some("n1"));
+        assert_eq!(ChatTarget::Global.note_id(), None);
+    }
+
+    /// Absent means global; EMPTY is an error. Letting `""` mean global is the
+    /// trap humla-cloud#26 avoided server-side — a typo must not silently become
+    /// a library-wide conversation.
+    #[test]
+    fn an_absent_note_id_is_global_but_an_empty_one_is_an_error() {
+        assert_eq!(ChatTarget::from_note_id(None).unwrap(), ChatTarget::Global);
+        assert_eq!(
+            ChatTarget::from_note_id(Some("n1".into())).unwrap(),
+            ChatTarget::Note("n1".into())
+        );
+        for empty in ["", "   ", "\t"] {
+            let err = ChatTarget::from_note_id(Some(empty.into())).unwrap_err();
+            assert!(err.contains("empty id"), "got: {err}");
+        }
+    }
+
+    /// The composite key is `(tenant, scope, scope_id)`, so a global thread and a
+    /// note thread never see each other even within one tenant — and a note whose
+    /// id somehow equalled the sentinel still wouldn't collide, because the scope
+    /// differs.
+    #[test]
+    fn global_and_note_conversations_do_not_leak_into_each_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("scopes.sqlite")).unwrap();
+
+        let note = ChatTarget::Note("n1".into());
+        let global = ChatTarget::Global;
+        let mk = |t: &ChatTarget| {
+            create_conversation(&conn, CHAT_TENANT_PERSONAL, t.scope(), t.scope_id(), "all")
+                .unwrap()
+        };
+        let note_conv = mk(&note);
+        let global_conv = mk(&global);
+        assert_ne!(note_conv.id, global_conv.id);
+
+        let listed = |t: &ChatTarget| {
+            list_conversations(&conn, CHAT_TENANT_PERSONAL, t.scope(), t.scope_id())
+                .unwrap()
+                .into_iter()
+                .map(|c| c.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(listed(&note), vec![note_conv.id.clone()]);
+        assert_eq!(listed(&global), vec![global_conv.id.clone()]);
+
+        // …and the same holds per tenant: a workspace's global set is its own.
+        let ws_global =
+            create_conversation(&conn, "wsA", global.scope(), global.scope_id(), "all").unwrap();
+        assert_eq!(listed(&global), vec![global_conv.id.clone()], "personal is unaffected");
+        assert_eq!(
+            list_conversations(&conn, "wsA", global.scope(), global.scope_id()).unwrap().len(),
+            1
+        );
+        assert_eq!(
+            latest_conversation(&conn, "wsA", global.scope(), global.scope_id())
+                .unwrap()
+                .unwrap()
+                .id,
+            ws_global.id
+        );
+        // A note id colliding with the sentinel still can't reach the global set.
+        let collide = ChatTarget::Note(CHAT_GLOBAL_SCOPE_ID.into());
+        let collide_conv = mk(&collide);
+        assert_eq!(listed(&collide), vec![collide_conv.id]);
+        assert_eq!(listed(&global), vec![global_conv.id], "the scope column separates them");
     }
 
     #[test]
