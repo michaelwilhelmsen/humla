@@ -660,6 +660,23 @@ export function ChatPanel({
     }
   }, [paneUsable, notActivated, activationLoading]);
 
+  // Grow the composer with the text. `rows={1}` sets the floor and `max-h-40` the
+  // ceiling, but nothing in between: without this a wrapped question scrolls
+  // inside a one-line box, so the user can't see what they're about to send.
+  // Height has to be measured, hence an effect rather than CSS — `field-sizing`
+  // isn't available in this webview. Reset to `auto` first so the box shrinks back
+  // when text is deleted or cleared after a send; `max-height` still caps it, and
+  // the textarea scrolls past that.
+  //
+  // Not unit-tested on purpose: jsdom reports `scrollHeight` as 0, so any
+  // assertion here would pass for the wrong reason.
+  useEffect(() => {
+    const el = inputRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${el.scrollHeight}px`;
+  }, [input]);
+
   // Publish the session controls to the owner (Note header) whenever the list,
   // the active conversation, or its emptiness changes. Only while ready — no
   // chat chrome before a provider is configured. `null` tells the header to
