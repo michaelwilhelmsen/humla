@@ -85,7 +85,13 @@ describe("ChatConversations", () => {
     expect(screen.queryByLabelText("New chat")).toBeNull();
   });
 
+  // The clock is frozen for this one: "50 hours ago" is 2 calendar days back or 3
+  // depending on the time of day it runs, so the row's relative label flipped
+  // between "2d ago" and "3d ago" and the suite failed after ~22:00 local. A
+  // relative-time assertion has to pin the instant it is relative TO.
   it("lists conversations most-recent first and marks the active one", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-26T12:00:00Z"));
     const now = Date.now();
     publish({
       activeConversationId: "c-mid",
@@ -106,6 +112,7 @@ describe("ChatConversations", () => {
     const current = screen.getAllByRole("button", { current: true });
     expect(current).toHaveLength(1);
     expect(current[0].textContent).toContain("Client status");
+    vi.useRealTimers();
   });
 
   it("does not cap the list", () => {
