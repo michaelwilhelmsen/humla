@@ -1020,3 +1020,54 @@ mod tests {
         assert_eq!(since, NOW - MAX_WINDOW_DAYS * DAY);
     }
 }
+
+#[cfg(test)]
+mod pairwise {
+    /// The tool surface as one printable string: tools in declaration order, args
+    /// alphabetical, `!` marking required.
+    fn surface() -> String {
+        super::tool_specs()
+            .into_iter()
+            .map(|s| {
+                let props = s.parameters["properties"].as_object().cloned().unwrap_or_default();
+                let required: Vec<&str> = s.parameters["required"]
+                    .as_array()
+                    .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                    .unwrap_or_default();
+                let mut args: Vec<String> = props
+                    .iter()
+                    .map(|(name, schema)| {
+                        let ty = schema["type"].as_str().unwrap_or("?");
+                        let bang = if required.contains(&name.as_str()) { "!" } else { "" };
+                        format!("{name}:{ty}{bang}")
+                    })
+                    .collect();
+                args.sort();
+                format!("{}({})", s.name, args.join(", "))
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The tool surface, PINNED — and pinned to the same literal in
+    /// `humla-cloud/chat-service/src/tools.test.ts`.
+    ///
+    /// Workspace turns retrieve server-side, so these two schemas have to stay
+    /// equivalent, and #105 is what a one-sided change looks like when nothing
+    /// pins it: `client_id` drifted to mean a Client here and a single note there,
+    /// and every test on both sides still passed. Renaming a tool, adding or
+    /// removing an argument, or changing a type or a required list now fails here
+    /// until the pair is updated together — and the literal is short enough to
+    /// diff against the other repo by eye.
+    ///
+    /// Only the SHAPE is pinned. Tool descriptions differ by tenant on purpose
+    /// ("the user's meeting notes" vs "the workspace's"), so they aren't included.
+    #[test]
+    fn the_tool_surface_is_identical_to_the_cloud_schema() {
+        let expected = "\
+search_notes(client_id:string, folder_id:string, query:string!, until_days:integer, within_days:integer)
+get_note(note_id:string!)
+list_notes(client_id:string, folder_id:string, until_days:integer, within_days:integer)";
+        assert_eq!(surface(), expected, "\nupdate humla-cloud/chat-service/src/tools.test.ts in lockstep");
+    }
+}
