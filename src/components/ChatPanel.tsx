@@ -157,13 +157,33 @@ export type ChatSessionControls = {
   loadMore: () => Promise<void>;
 };
 
+/** Which host the panel is rendering into (issue #95).
+ *
+ *  `panel` is the Note's right-hand context card: narrow, already inside a
+ *  bordered surface, and the only place its own tenant line can go — so it keeps
+ *  its internal gutters and hairlines.
+ *
+ *  `page` is the `/chat` route: the page owns the gutter and the header, so the
+ *  panel drops both its horizontal padding and its separators and lets the
+ *  content run edge to edge. Wide enough, too, for the prompt cards a narrow
+ *  panel can't fit.
+ *
+ *  A variant rather than a scatter of booleans: every difference below follows
+ *  from which host is responsible for the chrome, and that's one fact. */
+export type ChatPanelVariant = "panel" | "page";
+
 export function ChatPanel({
   target,
   onControls,
+  variant = "panel",
 }: {
   target: ChatTarget;
   onControls?: (controls: ChatSessionControls | null) => void;
+  variant?: ChatPanelVariant;
 }) {
+  const onPage = variant === "page";
+  // The page supplies its own gutter, so the panel's own padding would double it.
+  const gutter = onPage ? "" : "px-4";
   // The anchor note id for IPC — null means the whole library (#93). This is also
   // the pane's dependency identity: it's already a stable scalar and `null` is
   // exactly "global", so a change in it is exactly a change of target. Depending on
@@ -813,7 +833,7 @@ export function ChatPanel({
           bubbles butt straight up against the text with no separation. No
           breadth/tenant chrome here — breadth moved to the composer, and the
           tenant is pinned to the loaded workspace (#58). */}
-      {workspaceName && (
+      {workspaceName && !onPage && (
         <div className="shrink-0 px-4 py-2 border-b border-[var(--color-line)] text-xs text-[var(--color-text-muted)]">
           Chatting in {workspaceName} · visible to members
         </div>
@@ -827,10 +847,15 @@ export function ChatPanel({
         aria-live="polite"
         aria-busy={bulkLoading}
         aria-label="Chat messages"
-        className="flex-1 min-h-0 overflow-y-auto px-4 py-4 flex flex-col gap-3"
+        className={cn("flex-1 min-h-0 overflow-y-auto py-4 flex flex-col gap-3", gutter)}
       >
         {messages.length === 0 && !sending ? (
-          <div className="flex-1 flex flex-col items-center justify-center gap-3 px-6 text-center">
+          <div
+            className={cn(
+              "flex-1 flex flex-col items-center justify-center gap-3 text-center",
+              onPage ? "gap-5" : "px-6",
+            )}
+          >
             <MessageCircle size={22} strokeWidth={1.5} className="text-[var(--color-text-disabled)]" />
             <p className="text-sm text-[var(--color-text-muted)]">
               {notesStillArriving
@@ -839,6 +864,17 @@ export function ChatPanel({
                   ? "No notes yet. Record or import a meeting, then ask about it here."
                   : "Ask anything about your notes — it searches, reads, and cites them to answer."}
             </p>
+            {/* The same prompts the "/" menu offers (#80), shown up front on a new
+                chat — a blank page tells a first-time user nothing about what this
+                can do, and on a library-wide surface the useful questions are the
+                least guessable ones. Cards only in the page variant: the Note's
+                context panel can be 320px wide, where a grid of them would be
+                unreadable, and its "/" menu is a keystroke away regardless.
+                Suppressed when there's nothing to retrieve — offering four
+                questions with the same dead-end answer would be a tease. */}
+            {onPage && !composerHeld && (
+              <PromptCards prompts={promptsFor(target)} onPick={applyPrompt} />
+            )}
           </div>
         ) : (
           <ul className="flex flex-col gap-3 list-none">
@@ -879,7 +915,12 @@ export function ChatPanel({
       </div>
 
       {!notActivated && errorView && (
-        <div className="mx-4 mb-2 flex items-start gap-2 rounded-[var(--radius)] bg-[var(--color-accent-soft)] px-3 py-2 text-xs text-[var(--color-accent-text)]">
+        <div
+          className={cn(
+            "mb-2 flex items-start gap-2 rounded-[var(--radius)] bg-[var(--color-accent-soft)] px-3 py-2 text-xs text-[var(--color-accent-text)]",
+            onPage ? "" : "mx-4",
+          )}
+        >
           <AlertTriangle size={13} strokeWidth={1.7} className="mt-px shrink-0" />
           <span>{errorView}</span>
         </div>
@@ -889,14 +930,19 @@ export function ChatPanel({
           warning ("may omit"), this is the confirmation that it actually
           happened. Suppressing it would leave the user unsure which. */}
       {truncated && !error && (
-        <div className="mx-4 mb-2 text-xs text-[var(--color-text-muted)]">
+        <div className={cn("mb-2 text-xs text-[var(--color-text-muted)]", onPage ? "" : "mx-4")}>
           Note content was truncated to fit the context budget — the answer may miss details near
           the end.
         </div>
       )}
 
       {activationLoading ? (
-        <div className="shrink-0 border-t border-[var(--color-line)] p-4 text-sm text-[var(--color-text-muted)]">
+        <div
+          className={cn(
+            "shrink-0 p-4 text-sm text-[var(--color-text-muted)]",
+            onPage ? "" : "border-t border-[var(--color-line)]",
+          )}
+        >
           Checking chat activation…
         </div>
       ) : notActivated ? (
@@ -911,7 +957,17 @@ export function ChatPanel({
           onActivated={handleActivated}
         />
       ) : (
-      <div className="relative shrink-0 border-t border-[var(--color-line)] p-2.5 flex flex-col gap-1.5">
+      <div
+        className={cn(
+          "relative shrink-0 p-2.5 flex flex-col gap-1.5",
+          // On the page the composer is its own rounded box — the Codex/Claude
+          // Desktop shape — instead of a hairline drawn across the whole pane.
+          // A box reads as "type here"; a separator just divides two empty areas.
+          onPage
+            ? "rounded-[var(--radius-card)] border border-[var(--color-line-visible)] bg-[var(--color-surface)] transition-colors focus-within:border-[var(--color-text-muted)]"
+            : "border-t border-[var(--color-line)]",
+        )}
+      >
         {/* Prompt picker (#80). Rendered in-flow above the composer rather than
             through SelectablePopover: that component is a click-to-select value
             picker with no controlled-open and no arrow-key nav, and bending it
@@ -937,7 +993,16 @@ export function ChatPanel({
             variant (28px) fits comfortably inside without touching the edges.
             The textarea has no native outline, so a token-based focus-within
             border on the wrapper makes keyboard focus visible (#64). */}
-        <div className="relative rounded-[var(--radius)] border border-transparent transition-colors focus-within:border-[var(--color-text-muted)]">
+        <div
+          className={cn(
+            "relative rounded-[var(--radius)]",
+            // The page variant hoists this focus treatment out to the composer
+            // box, so the two don't nest into a double border.
+            onPage
+              ? ""
+              : "border border-transparent transition-colors focus-within:border-[var(--color-text-muted)]",
+          )}
+        >
           <textarea
             ref={inputRef}
             value={input}
@@ -1108,6 +1173,41 @@ function ActivationPane({
 // Enter picks, Escape dismisses. Deliberately NOT SelectablePopover — that's a
 // click-to-select value picker with internal open state and no key nav; see the
 // call site for why sharing it would have been the wrong trade.
+// The prompt set as cards, for a new chat on the `/chat` page (issue #95, after
+// the Codex-style new-chat screen). Same prompts and same `onPick` as the "/"
+// menu — this is a second surface for one list, not a second list.
+//
+// Picking one FILLS the composer rather than sending it, exactly as the menu
+// does: these are starting points, and a card that spends a turn (a metered one,
+// in a workspace) on a question you hadn't finished thinking about would be a
+// trap. The user can edit and press Enter.
+function PromptCards({
+  prompts,
+  onPick,
+}: {
+  prompts: ChatPrompt[];
+  onPick: (p: ChatPrompt) => void;
+}) {
+  return (
+    <ul className="grid w-full max-w-[520px] grid-cols-2 gap-2 list-none">
+      {prompts.map((p) => (
+        <li key={p.label}>
+          <button
+            type="button"
+            onClick={() => onPick(p)}
+            className="h-full w-full rounded-[var(--radius-card)] border border-[var(--color-line)] bg-[var(--color-surface)] px-3 py-2.5 text-left transition-colors hover:border-[var(--color-line-visible)] hover:bg-[var(--color-pill-hover)]"
+          >
+            <span className="block text-[13px] font-medium text-[var(--color-text)]">{p.label}</span>
+            <span className="mt-0.5 block text-xs leading-snug text-[var(--color-text-muted)]">
+              {p.description}
+            </span>
+          </button>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
 function PromptPicker({
   prompts,
   onPick,

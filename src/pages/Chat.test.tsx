@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from "vitest";
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, Outlet, Route, Routes } from "react-router-dom";
 import { Chat } from "./Chat";
 import { mockTauri } from "../test/tauri";
@@ -105,7 +105,46 @@ describe("/chat page", () => {
     expect(useGlobalChatStore.getState().controls).toBeNull();
   });
 
-  it("offers the library prompt set, not the note-scoped one", async () => {
+  it("shows the library prompts as cards on a new chat", async () => {
+    // A blank page tells a first-time user nothing about what this can do, and on
+    // a library-wide surface the useful questions are the least guessable ones.
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () => ({ conversationId: null, messages: [] }),
+    });
+    renderChat();
+
+    await screen.findByPlaceholderText(/Ask about your notes/);
+    expect(await screen.findByRole("button", { name: /Outstanding actions/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Client status/ })).toBeInTheDocument();
+    // "What I missed" only makes sense with a note on screen to have missed.
+    expect(screen.queryByText("What I missed")).toBeNull();
+  });
+
+  it("fills the composer from a card rather than spending a turn", async () => {
+    // These are starting points. A card that sent immediately — a metered turn, in
+    // a workspace — would commit the user to a question they hadn't finished
+    // thinking about.
+    let sent = false;
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () => ({ conversationId: null, messages: [] }),
+      chat_send: () => {
+        sent = true;
+        return { conversationId: "c1", truncated: false };
+      },
+    });
+    renderChat();
+
+    const input = await screen.findByPlaceholderText(/Ask about your notes/);
+    fireEvent.click(await screen.findByRole("button", { name: /Weekly recap/ }));
+
+    expect(input).toHaveValue("Recap this week across my meetings.");
+    expect(sent).toBe(false);
+  });
+
+  it("offers the same set from the '/' menu", async () => {
+    // One list, two surfaces — the cards are not a second set that could drift.
     mockTauri({
       provider_key_get: () => "sk-test",
       chat_history: () => ({ conversationId: null, messages: [] }),
@@ -115,10 +154,10 @@ describe("/chat page", () => {
     const input = await screen.findByPlaceholderText(/Ask about your notes/);
     fireEvent.keyDown(input, { key: "/" });
 
-    expect(await screen.findByText("Outstanding actions")).toBeInTheDocument();
-    expect(screen.getByText("Client status")).toBeInTheDocument();
-    // "What I missed" only makes sense with a note on screen to have missed.
-    expect(screen.queryByText("What I missed")).toBeNull();
+    const menu = await screen.findByRole("listbox", { name: "Prompts" });
+    for (const label of ["Outstanding actions", "Weekly recap", "Client status", "Decisions log"]) {
+      expect(within(menu).getByText(label)).toBeInTheDocument();
+    }
   });
 
   it("shows no scope picker — its only option would be 'All notes'", async () => {

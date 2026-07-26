@@ -254,8 +254,9 @@ export function Sidebar({ onCollapse }: { onCollapse: () => void }) {
           // conversation list is navigation, so this is where it belongs. Only the
           // section swaps — nav, search and the footer stay put, so nothing the
           // user needs to leave with disappears.
-          <div className="mt-3">
-            <Divider />
+          // No divider above it: the section label already separates it, and a
+          // hairline plus a label is two devices doing one job.
+          <div className="mt-4">
             <ChatConversations />
           </div>
         ) : (
