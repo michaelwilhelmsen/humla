@@ -34,7 +34,7 @@ import { SelectablePopover, type PopoverItem } from "./SelectablePopover";
 import { ChatKeyEntry } from "./ChatKeyEntry";
 import { usageTone, liveChatErrorCopy, groundingLikelyTruncated } from "../lib/chatSessions";
 import { targetNoteId, targetKey, targetDefaultScope, type ChatTarget } from "../lib/chatTarget";
-import { NOTE_PROMPTS, opensPromptPicker, type ChatPrompt } from "../lib/chatPrompts";
+import { opensPromptPicker, promptsFor, type ChatPrompt } from "../lib/chatPrompts";
 import { RECOMMENDED_OLLAMA_MODEL } from "../lib/localModels";
 import { CommandSnippet } from "./CommandSnippet";
 import { cn } from "../lib/cn";
@@ -43,6 +43,12 @@ import { cn } from "../lib/cn";
 // retrieval loop on the backend: it searches/reads notes with tools, streams
 // its answer, and cites the notes it drew from. A Scope popover controls how
 // broadly it searches (this note / this folder / all notes) as a live filter.
+
+// Conversations fetched per request (issue #95). `/chat` lists them uncapped in
+// the sidebar, so they arrive a page at a time as it scrolls. Sized to overfill
+// a tall sidebar on first paint — the point is to avoid loading hundreds, not to
+// make the common case take two round-trips.
+const PAGE_SIZE = 30;
 
 const Markdown = memo(function Markdown({ source }: { source: string }) {
   return <ReactMarkdown remarkPlugins={[remarkGfm]}>{source}</ReactMarkdown>;
@@ -138,17 +144,54 @@ export type ChatSessionControls = {
   activeConversationId: string | null;
   /** Lone-empty-conversation rule (#62): nothing worth browsing → header hides history. */
   canBrowseHistory: boolean;
+  /** Whether another page of conversations might exist (#95). False once a short
+   *  page has come back, so a list viewer knows when to stop asking. */
+  hasMore: boolean;
+  /** A page fetch is in flight — for a "loading…" line, and so a viewer doesn't
+   *  need its own guard against firing twice. */
+  loadingMore: boolean;
   newChat: () => Promise<void>;
   openConversation: (id: string) => Promise<void>;
+  /** Append the next page. Safe to call repeatedly: it no-ops while a fetch is in
+   *  flight or once the end is known, which a scroll observer relies on. */
+  loadMore: () => Promise<void>;
+  /** What the pane is about to answer with (#95), for a host that shows it in its
+   *  own header chrome instead of the composer row — `/chat` does.
+   *
+   *  Published rather than re-derived: `useChatReadiness` polls a local Ollama
+   *  server every 2s, so a second caller would double that probe to show one
+   *  label. Null in a workspace, where the turn runs on the SERVER's model and
+   *  this local setting would name something that isn't answering (#80). */
+  status: { provider: string; model: string } | null;
 };
+
+/** Which host the panel is rendering into (issue #95).
+ *
+ *  `panel` is the Note's right-hand context card: narrow, already inside a
+ *  bordered surface, and the only place its own tenant line can go — so it keeps
+ *  its internal gutters and hairlines.
+ *
+ *  `page` is the `/chat` route: the page owns the gutter and the header, so the
+ *  panel drops both its horizontal padding and its separators and lets the
+ *  content run edge to edge. Wide enough, too, for the prompt cards a narrow
+ *  panel can't fit.
+ *
+ *  A variant rather than a scatter of booleans: every difference below follows
+ *  from which host is responsible for the chrome, and that's one fact. */
+export type ChatPanelVariant = "panel" | "page";
 
 export function ChatPanel({
   target,
   onControls,
+  variant = "panel",
 }: {
   target: ChatTarget;
   onControls?: (controls: ChatSessionControls | null) => void;
+  variant?: ChatPanelVariant;
 }) {
+  const onPage = variant === "page";
+  // The page supplies its own gutter, so the panel's own padding would double it.
+  const gutter = onPage ? "" : "px-4";
   // The anchor note id for IPC — null means the whole library (#93). This is also
   // the pane's dependency identity: it's already a stable scalar and `null` is
   // exactly "global", so a change in it is exactly a change of target. Depending on
@@ -164,6 +207,16 @@ export function ChatPanel({
   // the history popover and the history-visibility rule. Reset to [] on note /
   // workspace switch so the header hides until the fresh list is known.
   const [conversations, setConversations] = useState<ConversationMeta[]>([]);
+  // Paging state for that list (#95). `hasMore` starts true so the first "load
+  // more" is allowed to try; it settles on the first short page.
+  const [hasMoreConversations, setHasMoreConversations] = useState(true);
+  const [loadingMoreConversations, setLoadingMoreConversations] = useState(false);
+  // Refs, not state, for the two values `loadMoreConversations` reads at call
+  // time: a ref can't hand a stale closure the wrong offset, and the in-flight
+  // flag has to be set synchronously to swallow a repeat call in the same tick.
+  const conversationsRef = useRef<ConversationMeta[]>([]);
+  conversationsRef.current = conversations;
+  const loadingMoreRef = useRef(false);
   // The session the panel is on (issue #61). Single-threaded for now: it tracks
   // the note's active/most-recent conversation, captured from the history load
   // and the send result. null until resolved (or when the note has none yet).
@@ -230,6 +283,12 @@ export function ChatPanel({
   const anchorNote = useNotesStore((s) =>
     noteId === null ? null : s.notes.find((n) => n.id === noteId) ?? null,
   );
+  // Is there anything at all to retrieve from? `loaded` matters as much as the
+  // count: `notes: []` on its own also means "the first load hasn't landed", and
+  // acting on that would fire for a frame on every launch. (The full rule is
+  // derived below as `nothingToSearch`, once the cloud selectors are in scope.)
+  const libraryEmpty = useNotesStore((s) => s.loaded && s.notes.length === 0);
+
   const likelyTruncated = useMemo(() => {
     if (!anchorNote) return false;
     // Body is HTML in the store but plain text in the prompt — measure the text,
@@ -243,20 +302,57 @@ export function ChatPanel({
     });
   }, [anchorNote]);
 
-  // Re-fetch the note's conversation list. Guarded by the switch gen so a slow
-  // list load can't clobber the list after a note/workspace switch. Stable per
-  // note so the callbacks and publish effect below keep stable identities.
+  // Re-fetch the FIRST page of the target's conversation list. Guarded by the
+  // switch gen so a slow list load can't clobber the list after a note/workspace
+  // switch. Stable per note so the callbacks and publish effect below keep stable
+  // identities.
+  //
+  // Always page one: every caller is a "something changed, show me the top of the
+  // list again" moment (initial load, "+", a send that retitled a thread), and the
+  // list is ordered most-recent first, so page one is where the change landed.
   const reloadConversationList = useCallback(
     async (gen: number) => {
       try {
-        const list = await ipc.chatListConversations(noteId);
-        if (gen === switchGenRef.current && Array.isArray(list)) setConversations(list);
+        const list = await ipc.chatListConversations(noteId, { limit: PAGE_SIZE, offset: 0 });
+        if (gen !== switchGenRef.current || !Array.isArray(list)) return;
+        setConversations(list);
+        setHasMoreConversations(list.length === PAGE_SIZE);
       } catch {
         /* keep the prior list */
       }
     },
     [noteId],
   );
+
+  // Append the next page (issue #95). A short page means the end: the backend
+  // returns fewer rows than asked for, and an empty page past the end, so this
+  // converges without needing a total count.
+  //
+  // Guarded three ways — an in-flight fetch, a known end, and the switch gen —
+  // because the sidebar's scroll observer can fire repeatedly for one gesture.
+  const loadMoreConversations = useCallback(async () => {
+    if (loadingMoreRef.current || !hasMoreConversations) return;
+    loadingMoreRef.current = true;
+    const gen = switchGenRef.current;
+    setLoadingMoreConversations(true);
+    try {
+      const offset = conversationsRef.current.length;
+      const next = await ipc.chatListConversations(noteId, { limit: PAGE_SIZE, offset });
+      if (gen !== switchGenRef.current || !Array.isArray(next)) return;
+      // De-dupe by id: a conversation that got bumped to page one between the two
+      // fetches would otherwise appear twice.
+      setConversations((prev) => {
+        const seen = new Set(prev.map((c) => c.id));
+        return [...prev, ...next.filter((c) => !seen.has(c.id))];
+      });
+      setHasMoreConversations(next.length === PAGE_SIZE);
+    } catch {
+      /* keep what we have; the observer will retry on the next scroll */
+    } finally {
+      loadingMoreRef.current = false;
+      setLoadingMoreConversations(false);
+    }
+  }, [noteId, hasMoreConversations]);
 
   // Clear the transient per-turn UI (streaming/activity/errors) and stop
   // accepting stream deltas. Shared by the note-switch load effect and every
@@ -360,6 +456,33 @@ export function ChatPanel({
   // workspace chat does NOT — it runs on the workspace key, so a member without
   // a personal key still reaches the pane (composer or activation state, #76).
   const paneUsable = inWorkspace || ready;
+
+  // A library-wide pane with nothing to retrieve from would otherwise show the
+  // standing invitation — inviting a question whose only honest answer is "I
+  // couldn't find anything", which in a metered workspace costs a turn to
+  // discover (#95). So the composer holds instead, in one of two states.
+  //
+  // A NOTE pane never reaches either: its anchor note IS grounding, so there is
+  // always something to answer from.
+  //
+  // `syncing` splits them. A workspace pulls its notes down after a switch, so a
+  // local mirror that looks empty mid-pull isn't evidence of an empty workspace —
+  // that gets the still-arriving copy rather than a claim about the library. This
+  // is a client-side stand-in for the server's `index_state`, which reports
+  // "empty" (backfilling) vs "quarantined" vs "ready" authoritatively but isn't
+  // wired to the client yet; until it is, sync state is the honest local proxy.
+  const syncing = useCloudStore((s) => s.syncStatus) === "syncing";
+  const globalPane = target.kind === "global";
+  const nothingToSearch = globalPane && libraryEmpty && !syncing;
+  const notesStillArriving = globalPane && libraryEmpty && syncing;
+  const composerHeld = nothingToSearch || notesStillArriving;
+  // Does the composer's control row have anything in it? The breadth picker needs
+  // an anchor to offer a second option (#95), the model chip is panel-only and
+  // Personal-only (#80), the truncation hint needs an anchor note, and the turn
+  // meter needs a metered workspace (#69). On `/chat` in Personal that's nothing
+  // at all — so don't render the row and leave a gap where content isn't.
+  const showComposerControls =
+    noteId !== null || (!onPage && !inWorkspace && !!model) || !!usage;
 
   // Activation gating (#76). Only on the managed server + a workspace. While the
   // key metadata is still loading (undefined) show neither composer nor pane, so
@@ -537,6 +660,23 @@ export function ChatPanel({
     }
   }, [paneUsable, notActivated, activationLoading]);
 
+  // Grow the composer with the text. `rows={1}` sets the floor and `max-h-40` the
+  // ceiling, but nothing in between: without this a wrapped question scrolls
+  // inside a one-line box, so the user can't see what they're about to send.
+  // Height has to be measured, hence an effect rather than CSS — `field-sizing`
+  // isn't available in this webview. Reset to `auto` first so the box shrinks back
+  // when text is deleted or cleared after a send; `max-height` still caps it, and
+  // the textarea scrolls past that.
+  //
+  // Not unit-tested on purpose: jsdom reports `scrollHeight` as 0, so any
+  // assertion here would pass for the wrong reason.
+  useEffect(() => {
+    const el = inputRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${el.scrollHeight}px`;
+  }, [input]);
+
   // Publish the session controls to the owner (Note header) whenever the list,
   // the active conversation, or its emptiness changes. Only while ready — no
   // chat chrome before a provider is configured. `null` tells the header to
@@ -562,8 +702,12 @@ export function ChatPanel({
       conversations,
       activeConversationId: conversationId,
       canBrowseHistory,
+      hasMore: hasMoreConversations,
+      loadingMore: loadingMoreConversations,
       newChat,
       openConversation,
+      loadMore: loadMoreConversations,
+      status: inWorkspace || !model ? null : { provider, model },
     });
   }, [
     onControls,
@@ -572,8 +716,14 @@ export function ChatPanel({
     conversations,
     conversationId,
     messages.length,
+    hasMoreConversations,
+    loadingMoreConversations,
     newChat,
     openConversation,
+    loadMoreConversations,
+    inWorkspace,
+    provider,
+    model,
   ]);
 
   async function send() {
@@ -719,7 +869,7 @@ export function ChatPanel({
           bubbles butt straight up against the text with no separation. No
           breadth/tenant chrome here — breadth moved to the composer, and the
           tenant is pinned to the loaded workspace (#58). */}
-      {workspaceName && (
+      {workspaceName && !onPage && (
         <div className="shrink-0 px-4 py-2 border-b border-[var(--color-line)] text-xs text-[var(--color-text-muted)]">
           Chatting in {workspaceName} · visible to members
         </div>
@@ -733,14 +883,43 @@ export function ChatPanel({
         aria-live="polite"
         aria-busy={bulkLoading}
         aria-label="Chat messages"
-        className="flex-1 min-h-0 overflow-y-auto px-4 py-4 flex flex-col gap-3"
+        className={cn("nd-scroll-hidden flex-1 min-h-0 overflow-y-auto py-4 flex flex-col gap-3", gutter)}
       >
         {messages.length === 0 && !sending ? (
-          <div className="flex-1 flex flex-col items-center justify-center gap-3 px-6 text-center">
+          <div
+            className={cn(
+              "flex-1 flex flex-col items-center justify-center gap-3 text-center",
+              onPage ? "gap-5" : "px-6",
+            )}
+          >
             <MessageCircle size={22} strokeWidth={1.5} className="text-[var(--color-text-disabled)]" />
             <p className="text-sm text-[var(--color-text-muted)]">
-              Ask anything about your notes — it searches, reads, and cites them to answer.
+              {notesStillArriving
+                ? "Still syncing your notes — this will be ready in a moment."
+                : nothingToSearch
+                  ? "No notes yet. Record or import a meeting, then ask about it here."
+                  : "Ask anything about your notes — it searches, reads, and cites them to answer."}
             </p>
+            {/* The same prompts the "/" menu offers (#80), shown up front on a new
+                chat — a blank page tells a first-time user nothing about what this
+                can do, and on a library-wide surface the useful questions are the
+                least guessable ones. Cards only in the page variant: the Note's
+                context panel can be 320px wide, where a grid of them would be
+                unreadable, and its "/" menu is a keystroke away regardless.
+                Suppressed when there's nothing to retrieve — offering four
+                questions with the same dead-end answer would be a tease. */}
+            {onPage && !composerHeld && (
+              <>
+                <PromptCards prompts={promptsFor(target)} onPick={applyPrompt} />
+                {/* The "/" menu has been reachable since #80 and mentioned
+                    nowhere, so nobody who didn't read the changelog knows it
+                    exists. The new-chat screen is where it's worth saying: the
+                    cards are right there to give "these" a referent. */}
+                <p className="text-xs text-[var(--color-text-disabled)]">
+                  Type <span className="font-medium">/</span> in the composer for these any time.
+                </p>
+              </>
+            )}
           </div>
         ) : (
           <ul className="flex flex-col gap-3 list-none">
@@ -781,7 +960,12 @@ export function ChatPanel({
       </div>
 
       {!notActivated && errorView && (
-        <div className="mx-4 mb-2 flex items-start gap-2 rounded-[var(--radius)] bg-[var(--color-accent-soft)] px-3 py-2 text-xs text-[var(--color-accent-text)]">
+        <div
+          className={cn(
+            "mb-2 flex items-start gap-2 rounded-[var(--radius)] bg-[var(--color-accent-soft)] px-3 py-2 text-xs text-[var(--color-accent-text)]",
+            onPage ? "" : "mx-4",
+          )}
+        >
           <AlertTriangle size={13} strokeWidth={1.7} className="mt-px shrink-0" />
           <span>{errorView}</span>
         </div>
@@ -791,14 +975,19 @@ export function ChatPanel({
           warning ("may omit"), this is the confirmation that it actually
           happened. Suppressing it would leave the user unsure which. */}
       {truncated && !error && (
-        <div className="mx-4 mb-2 text-xs text-[var(--color-text-muted)]">
+        <div className={cn("mb-2 text-xs text-[var(--color-text-muted)]", onPage ? "" : "mx-4")}>
           Note content was truncated to fit the context budget — the answer may miss details near
           the end.
         </div>
       )}
 
       {activationLoading ? (
-        <div className="shrink-0 border-t border-[var(--color-line)] p-4 text-sm text-[var(--color-text-muted)]">
+        <div
+          className={cn(
+            "shrink-0 p-4 text-sm text-[var(--color-text-muted)]",
+            onPage ? "" : "border-t border-[var(--color-line)]",
+          )}
+        >
           Checking chat activation…
         </div>
       ) : notActivated ? (
@@ -813,7 +1002,17 @@ export function ChatPanel({
           onActivated={handleActivated}
         />
       ) : (
-      <div className="relative shrink-0 border-t border-[var(--color-line)] p-2.5 flex flex-col gap-1.5">
+      <div
+        className={cn(
+          "relative shrink-0 p-2.5 flex flex-col gap-1.5",
+          // On the page the composer is its own rounded box — the Codex/Claude
+          // Desktop shape — instead of a hairline drawn across the whole pane.
+          // A box reads as "type here"; a separator just divides two empty areas.
+          onPage
+            ? "rounded-[var(--radius-card)] border border-[var(--color-line-visible)] bg-[var(--color-surface)] transition-colors focus-within:border-[var(--color-text-muted)]"
+            : "border-t border-[var(--color-line)]",
+        )}
+      >
         {/* Prompt picker (#80). Rendered in-flow above the composer rather than
             through SelectablePopover: that component is a click-to-select value
             picker with no controlled-open and no arrow-key nav, and bending it
@@ -822,7 +1021,7 @@ export function ChatPanel({
             fixed-width panel, so this needs no portal or flip logic either. */}
         {promptsOpen && (
           <PromptPicker
-            prompts={NOTE_PROMPTS}
+            prompts={promptsFor(target)}
             onPick={applyPrompt}
             onDismiss={() => {
               setPromptsOpen(false);
@@ -839,7 +1038,16 @@ export function ChatPanel({
             variant (28px) fits comfortably inside without touching the edges.
             The textarea has no native outline, so a token-based focus-within
             border on the wrapper makes keyboard focus visible (#64). */}
-        <div className="relative rounded-[var(--radius)] border border-transparent transition-colors focus-within:border-[var(--color-text-muted)]">
+        <div
+          className={cn(
+            "relative rounded-[var(--radius)]",
+            // The page variant hoists this focus treatment out to the composer
+            // box, so the two don't nest into a double border.
+            onPage
+              ? ""
+              : "border border-transparent transition-colors focus-within:border-[var(--color-text-muted)]",
+          )}
+        >
           <textarea
             ref={inputRef}
             value={input}
@@ -848,9 +1056,36 @@ export function ChatPanel({
             rows={1}
             // Stays enabled while a turn streams so Enter can stop it (#80) —
             // `send` no-ops on `sending`, so this can't queue a second turn.
-            placeholder={sending ? "Streaming — press Enter to stop" : "Ask about your notes…"}
+            //
+            // Nothing to retrieve from is the one case that closes the composer
+            // (#95). `readOnly` + `aria-disabled` rather than `disabled`, because
+            // `disabled` drops the control out of the tab order — a keyboard or
+            // screen-reader user would then never reach the placeholder saying
+            // WHY they can't type. Nothing can be entered either way, so `send`
+            // stays unreachable: it no-ops on empty input.
+            readOnly={composerHeld}
+            aria-disabled={composerHeld || undefined}
+            placeholder={
+              notesStillArriving
+                ? "Syncing your notes…"
+                : nothingToSearch
+                  ? "Nothing to search yet"
+                  : sending
+                    ? "Streaming — press Enter to stop"
+                    : "Ask about your notes…"
+            }
             aria-label="Ask about your notes"
-            className="block w-full resize-none max-h-40 bg-transparent text-sm leading-relaxed pl-2 pr-11 py-2 outline-none placeholder:text-[var(--color-text-muted)]"
+            // The global `select, textarea` rule in globals.css is UNLAYERED, so it
+            // outranks every utility here and hands this field a border, a fill and
+            // 8px/12px padding whether we ask or not. In the PANEL that lands inside
+            // the wrapper's own transparent border and has been the Note tab's look
+            // since #46 — so leave it exactly alone. On the PAGE the composer box is
+            // the surface, so the field opts out through a rule of the same kind
+            // (`.nd-chat-input`), which also owns its padding.
+            className={cn(
+              "block w-full resize-none max-h-40 text-sm leading-relaxed outline-none placeholder:text-[var(--color-text-muted)] read-only:cursor-not-allowed",
+              onPage ? "nd-chat-input" : "bg-transparent pl-2 pr-11 py-2",
+            )}
           />
           {/* Send morphs into Stop while streaming (#80), so the same spot is
               always the turn's primary control. */}
@@ -883,7 +1118,12 @@ export function ChatPanel({
         {/* Composer control row: breadth picker bottom-left, workspace turn
             allowance bottom-right (#69). The meter shows only in a metered
             workspace — `usage` is null in personal context and on any
-            unavailable/error/unmetered outcome, so nothing renders then. */}
+            unavailable/error/unmetered outcome, so nothing renders then.
+            Skipped entirely when every one of its children would be absent, which
+            on `/chat` in Personal is all of them: an empty flex row still costs
+            the container's gap, and that showed up as an unexplained band under
+            the composer that looked like space reserved for something. */}
+        {showComposerControls && (
         <div className="flex items-center justify-between gap-2 px-1">
           <div className="flex min-w-0 items-center gap-2">
             <BreadthPicker
@@ -898,8 +1138,11 @@ export function ChatPanel({
                 disabled fails contrast on interactive text (see #65).
                 Personal only: a workspace turn runs on the server's model, and
                 `model` here is the LOCAL chat_model setting, so showing it in a
-                workspace would name a model that isn't answering. */}
-            {!inWorkspace && model && (
+                workspace would name a model that isn't answering.
+                Not on the page, where it's published upward and shown in the
+                header's pill row — the same fact twice on one screen is clutter,
+                and the header is where that surface keeps its identity info. */}
+            {!onPage && !inWorkspace && model && (
               <span
                 data-testid="chat-model-indicator"
                 title={`Answering with ${model} (${provider}) — change it in Settings → Chat`}
@@ -937,6 +1180,7 @@ export function ChatPanel({
             </span>
           )}
         </div>
+        )}
       </div>
       )}
     </div>
@@ -993,6 +1237,41 @@ function ActivationPane({
 // Enter picks, Escape dismisses. Deliberately NOT SelectablePopover — that's a
 // click-to-select value picker with internal open state and no key nav; see the
 // call site for why sharing it would have been the wrong trade.
+// The prompt set as cards, for a new chat on the `/chat` page (issue #95, after
+// the Codex-style new-chat screen). Same prompts and same `onPick` as the "/"
+// menu — this is a second surface for one list, not a second list.
+//
+// Picking one FILLS the composer rather than sending it, exactly as the menu
+// does: these are starting points, and a card that spends a turn (a metered one,
+// in a workspace) on a question you hadn't finished thinking about would be a
+// trap. The user can edit and press Enter.
+function PromptCards({
+  prompts,
+  onPick,
+}: {
+  prompts: ChatPrompt[];
+  onPick: (p: ChatPrompt) => void;
+}) {
+  return (
+    <ul className="grid w-full max-w-[520px] grid-cols-2 gap-2 list-none">
+      {prompts.map((p) => (
+        <li key={p.label}>
+          <button
+            type="button"
+            onClick={() => onPick(p)}
+            className="h-full w-full rounded-[var(--radius-card)] border border-[var(--color-line)] bg-[var(--color-surface)] px-3 py-2.5 text-left transition-colors hover:border-[var(--color-line-visible)] hover:bg-[var(--color-pill-hover)]"
+          >
+            <span className="block text-[13px] font-medium text-[var(--color-text)]">{p.label}</span>
+            <span className="mt-0.5 block text-xs leading-snug text-[var(--color-text-muted)]">
+              {p.description}
+            </span>
+          </button>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
 function PromptPicker({
   prompts,
   onPick,
@@ -1116,6 +1395,13 @@ function BreadthPicker({
       : []),
     { id: "all", label: "All notes", icon: <Files size={14} strokeWidth={1.7} aria-hidden="true" /> },
   ];
+  // One option is not a choice: a picker whose only entry is "All notes" is noise,
+  // so a library-wide pane shows no breadth chrome at all (#95). Narrowing is
+  // still available there — as a tool argument the model chooses (#81), not as a
+  // control. A pane WITH an anchor always has at least "This note" + "All notes",
+  // so this never hides the picker where it does work.
+  if (items.length < 2) return null;
+
   // If the folder disappears while "folder" is selected — or the pane has no
   // anchor at all — fall back to the pane's own default.
   const selectable = items.some((i) => i.id === scope);

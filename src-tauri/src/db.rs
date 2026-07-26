@@ -1069,19 +1069,35 @@ pub fn latest_conversation(
 
 /// All conversations for a scope, most-recently-updated first (issue #61) — the
 /// backing query for the session list.
+/// A window over a conversation list, most-recent first (issue #95).
+///
+/// `/chat` lists conversations in the sidebar with no cap — a workspace could
+/// accumulate hundreds — so the list is fetched a page at a time as the user
+/// scrolls rather than all at once.
+#[derive(Debug, Clone, Copy)]
+pub struct Page {
+    pub limit: i64,
+    pub offset: i64,
+}
+
 pub fn list_conversations(
     conn: &Connection,
     tenant: &str,
     scope: &str,
     scope_id: &str,
+    page: Option<Page>,
 ) -> Result<Vec<Conversation>> {
+    // SQLite reads a negative LIMIT as "no limit", so an absent page needs no
+    // second query shape — one prepared statement serves both callers.
+    let (limit, offset) = page.map_or((-1, 0), |p| (p.limit, p.offset));
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT {CONVERSATION_COLS} FROM conversations
          WHERE tenant = ?1 AND scope = ?2 AND scope_id = ?3
-         ORDER BY updated_at DESC, created_at DESC, id DESC",
+         ORDER BY updated_at DESC, created_at DESC, id DESC
+         LIMIT ?4 OFFSET ?5",
     ))?;
     let rows = stmt
-        .query_map(params![tenant, scope, scope_id], map_conversation)?
+        .query_map(params![tenant, scope, scope_id, limit, offset], map_conversation)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
 }
@@ -2305,7 +2321,7 @@ mod tests {
         // The existing thread is preserved as the note's single (first) session.
         let latest = latest_conversation(&conn, "personal", "note", "n1").unwrap().unwrap();
         assert_eq!(latest.id, "conv1");
-        assert_eq!(list_conversations(&conn, "personal", "note", "n1").unwrap().len(), 1);
+        assert_eq!(list_conversations(&conn, "personal", "note", "n1", None).unwrap().len(), 1);
         // The empty conversation gets the date fallback (created_at = epoch 0).
         let conv2 = get_conversation_by_id(&conn, "conv2").unwrap().unwrap();
         assert_eq!(conv2.title.as_deref(), Some("Chat 1970-01-01"));
@@ -3142,6 +3158,56 @@ mod tests {
         }
     }
 
+    /// `/chat` lists conversations uncapped, so it fetches them a page at a time
+    /// (#95). The window must ride on the SAME ordering the unpaged list uses, or
+    /// scrolling would repeat and skip rows.
+    #[test]
+    fn conversation_pages_tile_the_list_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("pages.sqlite")).unwrap();
+
+        // Six global conversations, stamped so the intended order is unambiguous —
+        // rows created in one test share a timestamp, which would otherwise leave
+        // the tie broken only by id.
+        let mut ids = Vec::new();
+        for i in 0..6 {
+            let c =
+                create_conversation(&conn, CHAT_TENANT_PERSONAL, CHAT_SCOPE_GLOBAL, CHAT_GLOBAL_SCOPE_ID, "all")
+                    .unwrap();
+            conn.execute("UPDATE conversations SET updated_at = ?1 WHERE id = ?2", params![1_000 + i, c.id])
+                .unwrap();
+            ids.push(c.id);
+        }
+        ids.reverse(); // most-recently-updated first
+
+        let page = |limit: i64, offset: i64| {
+            list_conversations(
+                &conn,
+                CHAT_TENANT_PERSONAL,
+                CHAT_SCOPE_GLOBAL,
+                CHAT_GLOBAL_SCOPE_ID,
+                Some(Page { limit, offset }),
+            )
+            .unwrap()
+            .into_iter()
+            .map(|c| c.id)
+            .collect::<Vec<_>>()
+        };
+
+        // Successive pages tile the list exactly: no gap, no repeat.
+        assert_eq!([page(4, 0), page(4, 4)].concat(), ids);
+        // A page past the end is empty rather than an error — that's how the
+        // frontend learns to stop asking.
+        assert!(page(4, 8).is_empty());
+        // And no page at all still means everything.
+        assert_eq!(
+            list_conversations(&conn, CHAT_TENANT_PERSONAL, CHAT_SCOPE_GLOBAL, CHAT_GLOBAL_SCOPE_ID, None)
+                .unwrap()
+                .len(),
+            6,
+        );
+    }
+
     /// The composite key is `(tenant, scope, scope_id)`, so a global thread and a
     /// note thread never see each other even within one tenant — and a note whose
     /// id somehow equalled the sentinel still wouldn't collide, because the scope
@@ -3162,7 +3228,7 @@ mod tests {
         assert_ne!(note_conv.id, global_conv.id);
 
         let listed = |t: &ChatTarget| {
-            list_conversations(&conn, CHAT_TENANT_PERSONAL, t.scope(), t.scope_id())
+            list_conversations(&conn, CHAT_TENANT_PERSONAL, t.scope(), t.scope_id(), None)
                 .unwrap()
                 .into_iter()
                 .map(|c| c.id)
@@ -3176,7 +3242,7 @@ mod tests {
             create_conversation(&conn, "wsA", global.scope(), global.scope_id(), "all").unwrap();
         assert_eq!(listed(&global), vec![global_conv.id.clone()], "personal is unaffected");
         assert_eq!(
-            list_conversations(&conn, "wsA", global.scope(), global.scope_id()).unwrap().len(),
+            list_conversations(&conn, "wsA", global.scope(), global.scope_id(), None).unwrap().len(),
             1
         );
         assert_eq!(

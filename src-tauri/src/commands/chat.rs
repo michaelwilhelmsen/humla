@@ -611,8 +611,11 @@ fn new_personal_conversation(
 pub async fn chat_list_conversations(
     app: AppHandle,
     note_id: Option<String>,
+    limit: Option<u32>,
+    offset: Option<u32>,
 ) -> Result<Vec<ConversationMeta>, String> {
     let target = ChatTarget::from_note_id(note_id)?;
+    let page = conversation_page(limit, offset);
     let state: State<AppState> = app.state();
     let ctx = {
         let conn = state.db.lock();
@@ -626,12 +629,40 @@ pub async fn chat_list_conversations(
                 CHAT_TENANT_PERSONAL,
                 target.scope(),
                 target.scope_id(),
+                page,
             )
             .map_err(|e| e.to_string())?;
             convs.iter().map(|c| conversation_meta(&conn, c)).collect()
         }
-        Some(ws) => list_conversations_cloud(&state, ws, &target).await,
+        Some(ws) => {
+            let all = list_conversations_cloud(&state, ws, &target).await?;
+            Ok(apply_page(all, page))
+        }
     }
+}
+
+/// The requested window, or None for "everything" (issue #95).
+///
+/// A caller that omits `limit` gets the whole list — the Note header's history
+/// popover has always shown all of a note's conversations and there is no reason
+/// to change that. `offset` without `limit` is meaningless and ignored rather
+/// than errored: it can only come from our own frontend, and a dropped window is
+/// a longer list, never a wrong one.
+fn conversation_page(limit: Option<u32>, offset: Option<u32>) -> Option<db::Page> {
+    limit.map(|limit| db::Page { limit: limit.into(), offset: offset.unwrap_or(0).into() })
+}
+
+/// Apply a window to an already-materialised list.
+///
+/// The Personal path pages in SQL; a workspace can't yet, because the server's
+/// list route takes no paging parameters and hard-caps at 200 rows
+/// (`chat_sessions.pb.js`). So the workspace list is fetched whole and windowed
+/// here: the UI stays lazy and the DOM stays small, but the request doesn't
+/// shrink and a workspace past 200 conversations would silently lose the tail.
+/// Real server paging is tracked separately — see humla-cloud#33.
+fn apply_page<T>(all: Vec<T>, page: Option<db::Page>) -> Vec<T> {
+    let Some(page) = page else { return all };
+    all.into_iter().skip(page.offset as usize).take(page.limit as usize).collect()
 }
 
 /// Create a fresh chat session for a target (issue #61). Personal creates a local
@@ -1585,7 +1616,7 @@ async fn list_conversations_cloud(
     let legacy: Vec<(String, String, String, i64, String)> = {
         let conn = state.db.lock();
         let local_handles =
-            db::list_conversations(&conn, workspace, target.scope(), target.scope_id())
+            db::list_conversations(&conn, workspace, target.scope(), target.scope_id(), None)
                 .map_err(|e| e.to_string())?;
         unlisted_legacy_handles(&server_remote_ids, &local_handles)
             .into_iter()
@@ -1857,7 +1888,7 @@ mod tests {
         let n1 = new_personal_conversation(&conn, &note_target).unwrap();
         assert_ne!(n1.id, g1.id);
         let listed = |t: &ChatTarget| {
-            db::list_conversations(&conn, CHAT_TENANT_PERSONAL, t.scope(), t.scope_id())
+            db::list_conversations(&conn, CHAT_TENANT_PERSONAL, t.scope(), t.scope_id(), None)
                 .unwrap()
                 .into_iter()
                 .map(|c| c.id)
@@ -1983,7 +2014,7 @@ mod tests {
         let again = new_personal_conversation(&conn, &ChatTarget::Note("n1".into())).unwrap();
         assert_eq!(again.id, first.id, "an empty most-recent session is reused, not duplicated");
         assert_eq!(
-            db::list_conversations(&conn, CHAT_TENANT_PERSONAL, CHAT_SCOPE_NOTE, "n1").unwrap().len(),
+            db::list_conversations(&conn, CHAT_TENANT_PERSONAL, CHAT_SCOPE_NOTE, "n1", None).unwrap().len(),
             1,
             "no empty duplicate session was created"
         );

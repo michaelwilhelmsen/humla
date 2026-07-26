@@ -1,7 +1,8 @@
-// Display helpers for the chat history popover (issue #62). Kept pure and
-// framework-free so they unit-test without rendering. `relativeTime` is generic
-// enough to hoist to a shared module if a second caller ever appears; for now
-// the chat history list is its only consumer.
+// Display helpers for the chat conversation lists (issue #62, extended for
+// `/chat`'s Recents in #95). Kept pure and framework-free so they unit-test
+// without rendering — the only import is a type, so nothing runtime comes with it.
+
+import type { ConversationMeta } from "./ipc";
 
 
 // A short, human relative timestamp: "just now" / "5m ago" / "3h ago" /
@@ -39,6 +40,48 @@ export function relativeTime(ts: number, now: number = Date.now()): string {
 // label — the relative date rides alongside as the row's secondary line.
 export function conversationTitle(meta: { title: string }): string {
   return meta.title.trim() || "New chat";
+}
+
+/** The conversation fields a row is built from — named once rather than spelled
+ *  out structurally at every call site. A `Pick` of the real DTO so a field
+ *  rename on the backend contract surfaces here rather than silently diverging. */
+export type ConversationFields = Pick<ConversationMeta, "id" | "title" | "updatedAt">;
+
+/** One row of a conversation list, ready to render. */
+export type ConversationRow = {
+  id: string;
+  label: string;
+  description: string;
+  active: boolean;
+};
+
+/**
+ * The rows for a conversation list, most-recent first (issue #95).
+ *
+ * Two surfaces show the same list — the Note header's history popover and
+ * `/chat`'s Recents — and there is no row *component* to share between them
+ * (the popover renders a `{id, label, description}` projection through
+ * `SelectablePopover`; Recents renders its own markup). So the shared thing is
+ * this projection: one place that decides ordering, the empty-title fallback and
+ * the relative date, rather than two lists that drift apart.
+ *
+ * `now` is injectable for deterministic tests, and `active` rides along for
+ * callers that mark the current row themselves — `SelectablePopover` takes its
+ * own `activeId` and simply ignores the extra field.
+ */
+export function conversationRows(
+  conversations: ConversationFields[],
+  activeId: string | null,
+  now: number = Date.now(),
+): ConversationRow[] {
+  return [...conversations]
+    .sort((a, b) => b.updatedAt - a.updatedAt)
+    .map((c) => ({
+      id: c.id,
+      label: conversationTitle(c),
+      description: relativeTime(c.updatedAt, now),
+      active: c.id === activeId,
+    }));
 }
 
 // Mirror of the backend's `GROUNDING_CHAR_BUDGET` (`chat/mod.rs`). Kept in sync

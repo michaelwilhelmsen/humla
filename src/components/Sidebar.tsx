@@ -7,6 +7,7 @@ import {
   Folder as FolderIcon,
   FolderPlus,
   Home as HomeIcon,
+  MessageCircle,
   Plus,
   Search,
   Settings as SettingsIcon,
@@ -20,6 +21,7 @@ import { ContextMenu, ContextMenuItem } from "./ContextMenu";
 import { WorkspaceSwitcher } from "./WorkspaceSwitcher";
 import { SetupNag } from "./SetupNag";
 import { ImportDialog } from "./ImportDialog";
+import { ChatConversations } from "./ChatConversations";
 import { useCloudStore } from "../lib/cloud";
 
 // Humla mark sourced from humla-small.svg — single-path silhouette of
@@ -154,6 +156,9 @@ export function Sidebar({ onCollapse }: { onCollapse: () => void }) {
 
   const empty = folders.length === 0 && notes.length === 0;
   const noResults = searching && searchResults.length === 0;
+  // Search still wins over the route: searching notes from `/chat` is a reasonable
+  // thing to do, and its results navigate away anyway.
+  const onChat = location.pathname === "/chat";
 
   return (
     <div className="h-full flex flex-col px-2.5 pb-2.5">
@@ -209,6 +214,14 @@ export function Sidebar({ onCollapse }: { onCollapse: () => void }) {
             active={location.pathname === "/all-notes"}
             count={notes.length}
           />
+          {/* Chat sits directly under "All notes" — both are library-level
+              destinations, so they belong on the same tier (#95). */}
+          <NavItem
+            to="/chat"
+            icon={MessageCircle}
+            label="Chat"
+            active={location.pathname === "/chat"}
+          />
           <button
             type="button"
             onClick={importAudio}
@@ -234,6 +247,17 @@ export function Sidebar({ onCollapse }: { onCollapse: () => void }) {
                 folderName={n.folder_id ? folderById.get(n.folder_id)?.name : undefined}
               />
             ))}
+          </div>
+        ) : onChat ? (
+          // Route-dependent section (#95): on `/chat` the body below the nav items
+          // lists conversations instead of folders. Folders are inert there, and a
+          // conversation list is navigation, so this is where it belongs. Only the
+          // section swaps — nav, search and the footer stay put, so nothing the
+          // user needs to leave with disappears.
+          // No divider above it: the section label already separates it, and a
+          // hairline plus a label is two devices doing one job.
+          <div className="mt-4">
+            <ChatConversations />
           </div>
         ) : (
           <>

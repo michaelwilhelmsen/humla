@@ -22,7 +22,6 @@ import {
   MessageSquare,
   MoreHorizontal,
   PanelRight,
-  Plus,
   RefreshCw,
   Sparkles,
   Users,
@@ -40,7 +39,7 @@ import { groupTimeline, resolveActivePill, formatSessionCaption } from "../lib/s
 import { RecordingBar } from "../components/RecordingBar";
 import { ChatPanel, type ChatSessionControls } from "../components/ChatPanel";
 import { SelectablePopover } from "../components/SelectablePopover";
-import { conversationTitle, relativeTime } from "../lib/chatSessions";
+import { ChatHistoryControls } from "../components/ChatHistoryControls";
 import { targetKey, type ChatTarget } from "../lib/chatTarget";
 import type { LayoutOutletContext } from "../components/Layout";
 import { SkeletonLines } from "../components/Skeleton";
@@ -1360,54 +1359,7 @@ function FolderPicker({
   );
 }
 
-// Per-Note Client picker (issue #43). Built on the reusable
-// Chat session chrome for the panel header (issue #62): a "+" that starts a
-// fresh conversation and a history button opening a popover of this Note's
-// conversations (title + relative date, most recent first, current one marked).
-// Selecting one loads it. The history button is hidden for a lone empty
-// conversation — the panel decides that via `canBrowseHistory`. All state lives
-// in ChatPanel; this only renders the projection it publishes.
-function ChatHistoryControls({ controls }: { controls: ChatSessionControls }) {
-  const { conversations, activeConversationId, canBrowseHistory, newChat, openConversation } =
-    controls;
-  const items = [...conversations]
-    .sort((a, b) => b.updatedAt - a.updatedAt)
-    .map((c) => ({
-      id: c.id,
-      label: conversationTitle(c),
-      description: relativeTime(c.updatedAt),
-    }));
-  return (
-    <div className="flex items-center gap-0.5">
-      <button
-        type="button"
-        onClick={() => void newChat()}
-        title="New chat"
-        aria-label="New chat"
-        className="nd-btn-icon"
-      >
-        <Plus size={16} strokeWidth={1.7} aria-hidden="true" />
-      </button>
-      {canBrowseHistory && (
-        <SelectablePopover
-          ariaLabel="Chat history"
-          align="end"
-          items={items}
-          activeId={activeConversationId}
-          onSelect={(id) => {
-            if (id) void openConversation(id);
-          }}
-          trigger={
-            <span className="nd-btn-icon" title="Chat history">
-              <History size={16} strokeWidth={1.7} aria-hidden="true" />
-            </span>
-          }
-        />
-      )}
-    </div>
-  );
-}
-
+// Per-Note Client picker (issue #43).
 // SelectablePopover primitive: assign / reassign / unassign plus full inline
 // create / rename / delete — all Client management lives here (there's no
 // browse-by-Client surface). Mirrors FolderPicker's placement but is richer,

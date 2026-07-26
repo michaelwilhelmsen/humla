@@ -286,6 +286,93 @@ describe("ChatPanel sessions (#62)", () => {
     expect(controls.current?.activeConversationId).toBe("c1");
   });
 
+  // Paging (#95): `/chat` lists conversations uncapped in the sidebar, so the
+  // panel fetches them a page at a time. It owns the list, so it owns the paging.
+  describe("paging", () => {
+    const page = (from: number, count: number) =>
+      Array.from({ length: count }, (_, i) => ({
+        id: `c${from + i}`,
+        title: `Chat ${from + i}`,
+        breadth: "all" as const,
+        updatedAt: 1000 - (from + i),
+        messageCount: 2,
+      }));
+
+    // The panel's page size, inferred from the first request rather than hardcoded
+    // here — the constant is the panel's business, the tiling is what matters.
+    async function firstPage() {
+      let size = 0;
+      const seen: number[] = [];
+      mockTauri({
+        provider_key_get: () => "sk-test",
+        chat_history: () => history(),
+        chat_list_conversations: (args) => {
+          const { limit, offset } = args as { limit: number; offset: number };
+          size = limit;
+          seen.push(offset);
+          // A full page while rows remain, then a short one: that's how the panel
+          // learns where the end is, with no total count anywhere.
+          if (offset === 0) return page(0, limit);
+          if (offset === limit) return page(limit, 2);
+          return [];
+        },
+      });
+      const controls = renderWithControls();
+      await screen.findByPlaceholderText(/Ask about your notes/);
+      await waitFor(() => expect(controls.current?.conversations.length).toBe(size));
+      return { controls, size, seen };
+    }
+
+    it("appends the next page and then reports the end", async () => {
+      const { controls, size } = await firstPage();
+      expect(controls.current?.hasMore).toBe(true);
+
+      await act(async () => {
+        await controls.current!.loadMore();
+      });
+      await waitFor(() => expect(controls.current?.conversations.length).toBe(size + 2));
+      // A short page means the end; nothing further is requested.
+      expect(controls.current?.hasMore).toBe(false);
+      const before = controls.current!.conversations.length;
+      await act(async () => {
+        await controls.current!.loadMore();
+      });
+      expect(controls.current?.conversations.length).toBe(before);
+    });
+
+    it("asks for each page exactly once for one gesture", async () => {
+      const { controls, seen, size } = await firstPage();
+      // A scroll observer fires repeatedly; a second call while the first is in
+      // flight must not fetch the same window twice.
+      await act(async () => {
+        await Promise.all([controls.current!.loadMore(), controls.current!.loadMore()]);
+      });
+      expect(seen.filter((o) => o === size)).toHaveLength(1);
+    });
+
+    it("does not list a conversation twice when one is bumped between pages", async () => {
+      // A thread that gets a new message moves to page one, shifting the window —
+      // so page two can hand back a row already on screen.
+      mockTauri({
+        provider_key_get: () => "sk-test",
+        chat_history: () => history(),
+        chat_list_conversations: (args) => {
+          const { limit, offset } = args as { limit: number; offset: number };
+          return offset === 0 ? page(0, limit) : [...page(limit - 1, 1), ...page(limit, 1)];
+        },
+      });
+      const controls = renderWithControls();
+      await screen.findByPlaceholderText(/Ask about your notes/);
+      await waitFor(() => expect(controls.current!.conversations.length).toBeGreaterThan(0));
+
+      await act(async () => {
+        await controls.current!.loadMore();
+      });
+      const ids = controls.current!.conversations.map((c) => c.id);
+      expect(new Set(ids).size).toBe(ids.length);
+    });
+  });
+
   it("'+' starts a fresh conversation and switches the pane to it", async () => {
     let created = false;
     mockTauri({
@@ -479,31 +566,31 @@ describe("ChatPanel with a library-wide target (#94)", () => {
     }
   });
 
-  it("defaults its scope to all notes and offers no anchor-dependent option", async () => {
+  it("shows no breadth chrome at all, so no anchor-dependent option can appear", async () => {
     // A library-wide conversation has no anchor to narrow to, so BOTH "This note"
-    // and "Folder: …" are meaningless — and offering either would let the chip
-    // show a breadth the backend's `check_anchor` is guaranteed to reject, so the
-    // chip would end up lying about what the next turn will search. Seeding a note
-    // with a folder proves the options are absent because there's no ANCHOR, not
-    // because no folder exists.
+    // and "Folder: …" are meaningless — offering either would let the chip show a
+    // breadth the backend's `check_anchor` is guaranteed to reject, i.e. lie about
+    // what the next turn will search. #94 suppressed those two options, which left
+    // a one-option picker; #95 removed the picker itself, since a dropdown whose
+    // only entry is "All notes" is noise. Seeding a note WITH a folder proves the
+    // options are gone because there's no anchor, not because no folder exists.
     seedNoteWithFolder();
     mockTauri({
       provider_key_get: () => "sk-test",
       chat_history: () => history(),
-      // The backend can't be read → the pane must fall back to "all", not "note".
+      // Unreadable stored breadth: the pane must still come up (falling back to
+      // "all"), not error or stall.
       chat_get_breadth: () => {
         throw new Error("unavailable");
       },
     });
     renderGlobal();
 
-    const scopeButton = await screen.findByRole("button", { name: "Chat scope" });
-    await waitFor(() => expect(scopeButton).toHaveTextContent(/all notes/i));
-    fireEvent.click(scopeButton);
+    await screen.findByPlaceholderText(/Ask about your notes/);
+    expect(screen.queryByRole("button", { name: "Chat scope" })).toBeNull();
     expect(screen.queryByText(/^Folder:/)).toBeNull();
     expect(screen.queryByText("This note")).toBeNull();
-    // "All notes" is the only option (it appears twice — the trigger and the row).
-    expect(screen.getAllByText("All notes").length).toBeGreaterThan(0);
+    expect(screen.queryByText("All notes")).toBeNull();
   });
 
   it("keeps the note pane's own scope options intact", async () => {

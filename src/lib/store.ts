@@ -6,6 +6,13 @@ type NotesState = {
   notes: Note[];
   folders: Folder[];
   clients: Client[];
+  /** Whether `refresh` has completed at least once (issue #95).
+   *
+   *  Without this, `notes.length === 0` means either "the library is empty" or
+   *  "the first load hasn't landed yet", and a caller that acts on emptiness —
+   *  `/chat` disables its composer and says there's nothing to ask about — would
+   *  make that claim for a frame on every launch. */
+  loaded: boolean;
   refresh: () => Promise<void>;
   refreshFolders: () => Promise<void>;
   refreshClients: () => Promise<void>;
@@ -24,13 +31,14 @@ export const useNotesStore = create<NotesState>((set) => ({
   notes: [],
   folders: [],
   clients: [],
+  loaded: false,
   refresh: async () => {
     const [notes, folders, clients] = await Promise.all([
       ipc.listNotes(),
       ipc.listFolders(),
       ipc.listClients(),
     ]);
-    set({ notes, folders, clients });
+    set({ notes, folders, clients, loaded: true });
   },
   refreshFolders: async () => {
     const folders = await ipc.listFolders();

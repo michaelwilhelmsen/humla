@@ -242,7 +242,28 @@ select:focus, textarea:focus {
   border-radius: 0 !important;
 }
 
+/* The chat composer's field on the `/chat` page, where the composer BOX is the
+   surface (#95). The `select, textarea` rule above is unlayered, so it outranks
+   every Tailwind utility — a field inside a styled container has to opt out with
+   a rule of the same kind, and set its own padding while it's there. The right
+   inset is the room the send button needs; without it long text slides under the
+   button. `.nd-bare` is the wrong tool here: its `padding: 0 !important` would
+   beat any padding we then asked for. */
+.nd-chat-input {
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  padding: 8px 44px 8px 8px;
+}
+
 textarea { resize: none; }
+
+/* Scrolls without advertising it. For surfaces that auto-scroll and are read
+   rather than navigated — the chat log, whose bar would otherwise sit on top of
+   the answer's citation chips (#95). Not for lists the user has to explore:
+   there, the bar is the only hint there's more. */
+.nd-scroll-hidden { scrollbar-width: none; -ms-overflow-style: none; }
+.nd-scroll-hidden::-webkit-scrollbar { display: none; }
 
 input::placeholder, textarea::placeholder {
   color: var(--color-text-muted);

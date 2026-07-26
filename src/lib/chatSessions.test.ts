@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   relativeTime,
   conversationTitle,
+  conversationRows,
   usageTone,
   liveChatErrorCopy,
   groundingLikelyTruncated,
@@ -170,3 +171,44 @@ describe("groundingLikelyTruncated", () => {
   });
 });
 
+
+describe("conversationRows", () => {
+  const rows = (
+    convos: { id: string; title: string; updatedAt: number }[],
+    activeId: string | null = null,
+  ) => conversationRows(convos, activeId, NOW);
+
+  it("orders most-recent first regardless of the order given", () => {
+    const out = rows([
+      { id: "a", title: "Oldest", updatedAt: NOW - 5 * 86_400_000 },
+      { id: "b", title: "Newest", updatedAt: NOW - 60_000 },
+      { id: "c", title: "Middle", updatedAt: NOW - 3 * 3_600_000 },
+    ]);
+    expect(out.map((r) => r.id)).toEqual(["b", "c", "a"]);
+    expect(out.map((r) => r.description)).toEqual(["1m ago", "3h ago", "5d ago"]);
+  });
+
+  it("does not mutate the caller's array", () => {
+    const input = [
+      { id: "a", title: "A", updatedAt: 1 },
+      { id: "b", title: "B", updatedAt: 2 },
+    ];
+    rows(input);
+    expect(input.map((c) => c.id)).toEqual(["a", "b"]);
+  });
+
+  it("falls back to a label for an untitled conversation", () => {
+    expect(rows([{ id: "a", title: "   ", updatedAt: NOW }])[0].label).toBe("New chat");
+  });
+
+  it("marks exactly the active row, and none when there is no active id", () => {
+    const convos = [
+      { id: "a", title: "A", updatedAt: 2 },
+      { id: "b", title: "B", updatedAt: 1 },
+    ];
+    expect(rows(convos, "b").map((r) => r.active)).toEqual([false, true]);
+    expect(rows(convos, null).every((r) => !r.active)).toBe(true);
+    // An id that isn't in the list marks nothing rather than defaulting to first.
+    expect(rows(convos, "gone").every((r) => !r.active)).toBe(true);
+  });
+});
