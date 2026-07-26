@@ -219,9 +219,45 @@ const MAX_STEPS_PROMPT: &str = "You've reached the tool-use limit. Answer now us
 already gathered. If it isn't enough, say what you found and what's still missing — do not ask to \
 search again.";
 
-/// Hard cap on agentic steps (provider round-trips) in one turn. On the final
-/// step tools are dropped and a wrap-up is forced.
+/// Hard cap on agentic steps (provider round-trips) in one turn, INCLUDING the
+/// forced wrap-up. On the final step tools are dropped and a wrap-up is forced.
+///
+/// Two ceilings, because the two scopes are not the same problem (#81):
+///
+/// - A NOTE-scoped turn gets the whole anchor note injected as grounding, so
+///   retrieval is a bonus on top of an answer it can already give. 6 is ample.
+/// - A note-less turn (folder / all) has an EMPTY grounding slot, so the tools
+///   carry the entire answer. The loop it has to complete is list → skim → read
+///   several → synthesise, and `list_notes` + 5 × `get_note` alone exhausts 6 —
+///   tripping the wrap-up nudge mid-work.
+///
+/// Raising this was deliberately sequenced AFTER #66's bounded search retries, so
+/// the larger budget can't be spent on retry permutations.
 pub const MAX_STEPS: usize = 6;
+pub const MAX_STEPS_BROAD: usize = 12;
+
+/// The step ceiling for a scope — see [`MAX_STEPS`].
+pub fn max_steps_for(scope: &ToolScope) -> usize {
+    match scope {
+        ToolScope::Note(_) => MAX_STEPS,
+        ToolScope::Folder(_) | ToolScope::All => MAX_STEPS_BROAD,
+    }
+}
+
+/// The system prompt with today's date appended.
+///
+/// Every tool result carries absolute note dates ("2026-07-12"), which a model
+/// with no idea what today is cannot reason about — it can neither judge recency
+/// nor sanity-check what a `within_days` window returned. Composed here rather
+/// than baked into [`SYSTEM_PROMPT`] so the mirrored constant stays byte-identical
+/// across the two repos and the assembly stays testable with a fixed clock.
+pub fn system_prompt_with_date(now_ms: i64) -> String {
+    use chrono::{TimeZone, Utc};
+    match Utc.timestamp_millis_opt(now_ms).single() {
+        Some(dt) => format!("{SYSTEM_PROMPT}\n\nToday's date is {}.", dt.format("%Y-%m-%d")),
+        None => SYSTEM_PROMPT.to_string(),
+    }
+}
 
 /// Budget for prior turns. Older turns beyond it are dropped (oldest first).
 pub const HISTORY_CHAR_BUDGET: usize = 32_000;
@@ -360,7 +396,10 @@ pub async fn run_chat(
         .collect();
     turns.push(ChatTurn::new("user", user_text));
 
-    let base = assemble_prompt(SYSTEM_PROMPT, grounding, &turns)?;
+    // One clock reading per turn, shared by the prompt's date line and the tools'
+    // relative date window, so a turn can't disagree with itself about "now".
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let base = assemble_prompt(&system_prompt_with_date(now_ms), grounding, &turns)?;
     eprintln!(
         "[chat] provider={} model={} turns={} grounding_chars={}",
         adapter.provider_id(),
@@ -383,7 +422,7 @@ pub async fn run_chat(
     let specs = tool_specs();
     let result = agentic_loop(
         db, adapter, ctx, scope, workspace, &specs, base, &assistant_id, &answer_block, embedder,
-        &mut sink,
+        now_ms, &mut sink,
     )
     .await;
 
@@ -449,6 +488,7 @@ async fn agentic_loop(
     assistant_id: &str,
     answer_block: &str,
     embedder: Option<&dyn crate::embed::EmbeddingAdapter>,
+    now_ms: i64,
     sink: &mut (impl FnMut(ChatEvent) + Send),
 ) -> Result<LoopOut> {
     let mut working = base;
@@ -456,14 +496,15 @@ async fn agentic_loop(
     let mut answer = String::new();
     let mut cancelled = false;
 
-    for step in 0..MAX_STEPS {
+    let max_steps = max_steps_for(scope);
+    for step in 0..max_steps {
         // Stopped between steps (issue #80) — most likely during a tool call.
         // Bail before spending another provider round-trip.
         if ctx.cancel.is_cancelled() {
             cancelled = true;
             break;
         }
-        let final_step = step == MAX_STEPS - 1;
+        let final_step = step == max_steps - 1;
         let tools: &[ToolSpec] = if final_step { &[] } else { specs };
         if final_step {
             working.push(ChatTurn::new("system", MAX_STEPS_PROMPT));
@@ -560,7 +601,7 @@ async fn agentic_loop(
 
             let outcome = {
                 let conn = db.lock();
-                execute_tool(&conn, workspace, scope, &call.name, &args, query_vec.as_deref(), embed_model)
+                execute_tool(&conn, workspace, scope, &call.name, &args, query_vec.as_deref(), embed_model, now_ms)
             };
             sink(ChatEvent::ToolActivity {
                 message_id: assistant_id.to_string(),
@@ -1185,7 +1226,7 @@ mod tests {
         let conv_id = conv(&dbh, "all");
 
         // More tool steps than the cap; the loop must not run them all.
-        let steps: Vec<ChatStep> = (0..MAX_STEPS + 3)
+        let steps: Vec<ChatStep> = (0..MAX_STEPS_BROAD + 3)
             .map(|_| FakeChatAdapter::tool_step("c", "search_notes", r#"{"query":"content"}"#))
             .collect();
         let adapter = FakeChatAdapter::scripted(steps);
@@ -1196,8 +1237,64 @@ mod tests {
         let conn = dbh.lock();
         let parts = parse_parts(&db::list_chat_messages(&conn, &conv_id).unwrap()[1].content);
         let tool_parts = parts.iter().filter(|p| matches!(p, Part::Tool { .. })).count();
-        assert_eq!(tool_parts, MAX_STEPS - 1, "executed tools on every step but the forced-final one");
+        assert_eq!(
+            tool_parts,
+            MAX_STEPS_BROAD - 1,
+            "executed tools on every step but the forced-final one"
+        );
         assert!(matches!(parts.last(), Some(Part::Text { text, .. }) if !text.is_empty()), "ends with an answer");
+    }
+
+    /// #81: a note-less turn needs list → skim → read-several → synthesise, which
+    /// does not fit 6 steps. A note-scoped turn already has the anchor as
+    /// grounding, so its ceiling stays where it was.
+    #[tokio::test]
+    async fn note_scope_keeps_the_old_step_ceiling_while_broad_scopes_get_more() {
+        assert_eq!(max_steps_for(&ToolScope::Note("n".into())), MAX_STEPS);
+        assert_eq!(max_steps_for(&ToolScope::Folder("f".into())), MAX_STEPS_BROAD);
+        assert_eq!(max_steps_for(&ToolScope::All), MAX_STEPS_BROAD);
+        assert!(MAX_STEPS_BROAD > MAX_STEPS);
+
+        let dir = tempfile::tempdir().unwrap();
+        let (dbh, _path) = temp_db(&dir);
+        let anchor = seed_note(&dbh, "Anchor", "some searchable content here");
+        let conv_id = conv(&dbh, "note");
+
+        let steps: Vec<ChatStep> = (0..MAX_STEPS_BROAD + 3)
+            .map(|_| FakeChatAdapter::tool_step("c", "search_notes", r#"{"query":"content"}"#))
+            .collect();
+        let adapter = FakeChatAdapter::scripted(steps);
+        run_chat(
+            &dbh,
+            &adapter,
+            FAKE_CTX,
+            &conv_id,
+            "REF",
+            &ToolScope::Note(anchor),
+            "",
+            None,
+            "keep going",
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        let conn = dbh.lock();
+        let parts = parse_parts(&db::list_chat_messages(&conn, &conv_id).unwrap()[1].content);
+        let tool_parts = parts.iter().filter(|p| matches!(p, Part::Tool { .. })).count();
+        assert_eq!(tool_parts, MAX_STEPS - 1, "note scope is unchanged by the deeper budget");
+    }
+
+    #[test]
+    fn the_prompt_tells_the_model_todays_date_without_touching_the_mirrored_constant() {
+        let with_date = system_prompt_with_date(1_785_024_000_000); // 2026-07-26
+        assert!(with_date.starts_with(SYSTEM_PROMPT));
+        assert!(with_date.contains("Today's date is 2026-07-26."));
+        // Every tool result carries absolute note dates; without this line the
+        // model cannot tell whether "2026-07-12" is recent, nor sanity-check a
+        // within_days window. The constant itself stays byte-identical to the
+        // cloud side.
+        assert!(!SYSTEM_PROMPT.contains("Today's date"));
     }
 
     #[tokio::test]
