@@ -527,6 +527,13 @@ async fn agentic_loop(
     let mut answer = String::new();
     let mut cancelled = false;
 
+    // Every delta the user has seen this TURN, appended to across all steps.
+    // Turn scope, not step scope: a stop usually lands during the tool phase,
+    // and by then the model may already have streamed prose. In that branch no
+    // step return value exists to fall back on, so this trail is the only record
+    // of what was on screen (issue #98).
+    let streamed = std::sync::Arc::new(parking_lot::Mutex::new(String::new()));
+
     let max_steps = max_steps_for(scope);
     for step in 0..max_steps {
         // Stopped between steps (issue #80) — most likely during a tool call.
@@ -545,10 +552,9 @@ async fn agentic_loop(
         // tool-call events are handled from the returned ChatStep below.
         //
         // Deltas are also accumulated into `streamed`, which lives OUTSIDE the
-        // step future. That matters for the stop path below: if the future is
+        // step future. That matters for the stop paths below: if the future is
         // dropped mid-flight its return value is lost, but whatever the user
-        // already saw on screen is still here to persist (issue #80).
-        let streamed = std::sync::Arc::new(parking_lot::Mutex::new(String::new()));
+        // already saw on screen is still here to persist (issues #80, #98).
         let step_result = {
             let msg_id = assistant_id.to_string();
             let block = answer_block.to_string();
@@ -575,8 +581,8 @@ async fn agentic_loop(
             }
         };
         let Some(step_result) = step_result else {
-            // Aborted mid-step: keep what the user already read.
-            answer = streamed.lock().clone();
+            // Aborted mid-step: the future's return value is lost, so there is no
+            // clean step text — the fallback after the loop recovers the trail.
             cancelled = true;
             break;
         };
@@ -655,6 +661,21 @@ async fn agentic_loop(
                 is_error: outcome.is_error,
             });
         }
+    }
+
+    // Any stop that left no clean step text falls back to the delta trail — what
+    // the user actually read (issue #98). Ordering matters: a step that returned
+    // normally hands us its own final text, which is tidier than the raw trail
+    // (no earlier preamble spliced onto the answer), so that wins when present.
+    //
+    // This deliberately breaks the preamble-not-baked rule (#63): a turn that
+    // finishes persists only its final answer, but a turn the user STOPPED
+    // persists whatever was on screen, preamble included. #80's principle wins
+    // here — they stopped because they'd read enough, and deleting the text they
+    // just read would be hostile. The two rules genuinely conflict; this is the
+    // one place the stop rule takes precedence.
+    if cancelled && answer.trim().is_empty() {
+        answer = streamed.lock().clone();
     }
 
     // A stop before any text arrived has nothing worth keeping — report it as
@@ -1209,6 +1230,61 @@ mod tests {
         assert!(
             !msgs.iter().any(|m| m.content.contains("THIS STEP MUST NOT RUN")),
             "the loop stopped instead of running the next step",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stop_during_the_tool_phase_keeps_earlier_streamed_text() {
+        // Issue #98: the model narrated before its tool call, so text was on
+        // screen when the stop landed between steps. That branch assigns no
+        // answer of its own, so only the turn-scoped delta trail can save it —
+        // and the trail is what the user read, preamble or not.
+        let dir = tempfile::tempdir().unwrap();
+        let (dbh, _path) = temp_db(&dir);
+        seed_note(&dbh, "Anything", "some searchable content here");
+        let conv_id = conv(&dbh, "all");
+
+        let flag = CancelFlag::new();
+        let adapter = FakeChatAdapter::scripted(vec![
+            FakeChatAdapter::narrated_tool_step(
+                "Let me search your notes…",
+                "c1",
+                "search_notes",
+                r#"{"query":"content"}"#,
+            ),
+            FakeChatAdapter::text_step("THIS STEP MUST NOT RUN"),
+        ]);
+        run_chat(
+            &dbh,
+            &adapter,
+            cancellable_ctx(&flag),
+            &conv_id,
+            "",
+            &ToolScope::All,
+            "",
+            None,
+            "narrate, search, then stop",
+            // The tool finished; stop before the next step is dispatched.
+            |ev| {
+                if matches!(ev, ChatEvent::ToolActivity { .. }) {
+                    flag.cancel();
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        let conn = dbh.lock();
+        let msgs = db::list_chat_messages(&conn, &conv_id).unwrap();
+        assert_eq!(msgs.len(), 2, "text had streamed, so the partial turn is kept");
+        let parts = parse_parts(&msgs[1].content);
+        assert!(
+            matches!(parts.last(), Some(Part::Text { text, .. }) if text == "Let me search your notes…"),
+            "kept the narration the user read, got {parts:?}",
+        );
+        assert!(
+            !msgs.iter().any(|m| m.content.contains("THIS STEP MUST NOT RUN")),
+            "the loop still stopped instead of running the next step",
         );
     }
 
