@@ -43,6 +43,37 @@ pub fn validate_breadth(breadth: &str) -> Result<&str, String> {
     }
 }
 
+/// The breadth a target's first-ever conversation starts at. A library-wide
+/// conversation has no anchor to narrow to, so it is always `all` (#82 fixed v1 at
+/// all-notes-only); a Note's defaults to itself.
+///
+/// Lives here rather than on `ChatTarget` so the breadth vocabulary and its
+/// defaults stay in the module that owns `validate_breadth` — `db` shouldn't mint
+/// breadth strings it can't validate.
+pub fn default_breadth(target: &crate::db::ChatTarget) -> &'static str {
+    match target {
+        crate::db::ChatTarget::Note(_) => "note",
+        crate::db::ChatTarget::Global => "all",
+    }
+}
+
+/// Whether a breadth can run without an anchor note, in ONE place (#93).
+///
+/// Two server rules make this exact (humla-cloud#26): a note-less create must be
+/// breadth `all`, and a malformed `note_id` is a 400 under *every* breadth — so an
+/// anchor-less `note`/`folder` turn is our bug and must be caught before it
+/// becomes a failed request. Both request builders and the local resolver funnel
+/// through here so the message exists once, matching the discipline
+/// `validate_breadth` already sets.
+pub fn check_anchor(breadth: &str, has_anchor: bool) -> Result<(), String> {
+    if has_anchor || validate_breadth(breadth)? == "all" {
+        return Ok(());
+    }
+    Err(format!(
+        "chat breadth {breadth:?} needs an anchor note; only \"all\" can run without one"
+    ))
+}
+
 // ── Typed message parts ─────────────────────────────────────────────────────
 // `messages.content` is a JSON array of these, ordered by the row's `seq`. Only
 // `Text` exists in this slice; `reasoning` / `tool` variants (see the wire
@@ -711,6 +742,39 @@ mod tests {
         for bad in ["", "everything", "Note", "all_notes", "workspace"] {
             let err = validate_breadth(bad).unwrap_err();
             assert!(err.contains(&format!("{bad:?}")), "surfaces the bad value: {err}");
+        }
+    }
+
+    /// #93: the anchor rule has three callers (both cloud request builders and the
+    /// local resolver). This is its single owner, so the contract is asserted here
+    /// rather than three times over.
+    #[test]
+    fn check_anchor_allows_only_all_to_run_without_a_note() {
+        // With an anchor, every breadth is fine.
+        for b in ["note", "folder", "all"] {
+            assert!(check_anchor(b, true).is_ok(), "{b} with an anchor");
+        }
+        // Without one, only "all" — a note-less create of any other breadth is a
+        // 400 server-side (humla-cloud#26), so it's caught as our bug first.
+        assert!(check_anchor("all", false).is_ok());
+        for b in ["note", "folder"] {
+            let err = check_anchor(b, false).unwrap_err();
+            assert!(err.contains("needs an anchor note"), "{b}: {err}");
+        }
+        // Garbage still funnels through validate_breadth's message, not a second one.
+        let err = check_anchor("everything", false).unwrap_err();
+        assert!(err.contains("Unrecognized chat scope"), "got: {err}");
+    }
+
+    #[test]
+    fn a_library_wide_conversation_defaults_to_all_and_a_notes_to_note() {
+        use crate::db::ChatTarget;
+        assert_eq!(default_breadth(&ChatTarget::Global), "all");
+        assert_eq!(default_breadth(&ChatTarget::Note("n1".into())), "note");
+        // Both defaults must be values `validate_breadth` accepts — the reason this
+        // lives here rather than on `ChatTarget` in `db`.
+        for t in [ChatTarget::Global, ChatTarget::Note("n1".into())] {
+            assert!(validate_breadth(default_breadth(&t)).is_ok());
         }
     }
 
