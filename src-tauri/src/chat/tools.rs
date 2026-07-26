@@ -70,10 +70,22 @@ pub const TOOL_SEARCH: &str = "search_notes";
 pub const TOOL_GET: &str = "get_note";
 pub const TOOL_LIST: &str = "list_notes";
 
-/// Default and max hits returned per search / list, keeping tool results small
-/// enough to re-lower every step without blowing the context budget.
-const DEFAULT_LIMIT: usize = 6;
-const MAX_LIMIT: usize = 12;
+/// Hits returned per search, keeping tool results small enough to re-lower every
+/// step without blowing the context budget. Raised from 6 with #81's diversity
+/// pass: chunks are per-section, so a small budget spent on one well-matching note
+/// gave narrow coverage for a library-wide question.
+const SEARCH_LIMIT: usize = 8;
+/// Rows per listing, and the per-row summary budget. A listing is the cheap
+/// "skim before opening" move for a library-wide question, and 12 rows can't span
+/// a real library. Worst case is LIST_LIMIT × (row + summary) ≈ 8 KB — deliberately
+/// close to one `get_note` rather than to the prompt ceiling, because a listing is
+/// an index, not a substitute for reading.
+const LIST_LIMIT: usize = 40;
+const LIST_SUMMARY_CHARS: usize = 180;
+/// Upper bound on the relative date window, so the arithmetic can't underflow the
+/// epoch on an absurd `within_days`.
+const MAX_WINDOW_DAYS: i64 = 3_650;
+const MS_PER_DAY: i64 = 86_400_000;
 /// Per-excerpt / per-note text budget in the compact model view.
 const EXCERPT_CHARS: usize = 320;
 const GET_NOTE_CHARS: usize = 6_000;
@@ -85,6 +97,10 @@ pub fn tool_specs() -> Vec<ToolSpec> {
     let filters = json!({
         "folder_id": { "type": "string", "description": "Optional: restrict to one folder id." },
         "client_id": { "type": "string", "description": "Optional: restrict to notes tagged with one client id." },
+        // RELATIVE, not an absolute date range: the model would have to know today's
+        // date to build one, and a hallucinated year returns silently-empty results.
+        // "the last N days" needs no date arithmetic from it.
+        "within_days": { "type": "integer", "description": "Optional: only notes from the last N days (e.g. 7 for last week)." },
     });
     vec![
         ToolSpec {
@@ -96,6 +112,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                     "query": { "type": "string", "description": "Keywords to search for." },
                     "folder_id": filters["folder_id"],
                     "client_id": filters["client_id"],
+                    "within_days": filters["within_days"],
                 },
                 "required": ["query"],
             }),
@@ -113,12 +130,13 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: TOOL_LIST,
-            description: "List the user's notes (title + date) most-recent first, optionally filtered by folder or client.",
+            description: "List the user's notes (title + date + summary) most-recent first, optionally filtered by folder, client, or recency. Use this to skim what exists and pick which notes to open with get_note.",
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "folder_id": filters["folder_id"],
                     "client_id": filters["client_id"],
+                    "within_days": filters["within_days"],
                 },
             }),
         },
@@ -129,28 +147,48 @@ fn str_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
     args.get(key).and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty())
 }
 
-fn clamp_limit(args: &Value) -> usize {
-    args.get("limit")
-        .and_then(|v| v.as_u64())
-        .map(|n| (n as usize).clamp(1, MAX_LIMIT))
-        .unwrap_or(DEFAULT_LIMIT)
+/// Resolve the model's `within_days` into an absolute lower bound on note creation
+/// time. Accepts a numeric string too — small models routinely emit `"7"`. Returns
+/// `None` for anything absent or nonsensical, which reads as "no date filter"
+/// rather than as an error: a bad window should widen to everything, never silently
+/// narrow to nothing.
+fn window_since(args: &Value, now_ms: i64) -> Option<i64> {
+    let raw = args.get("within_days")?;
+    let days = raw
+        .as_i64()
+        .or_else(|| raw.as_f64().map(|f| f as i64))
+        .or_else(|| raw.as_str().and_then(|s| s.trim().parse::<i64>().ok()))?;
+    if days <= 0 {
+        return None;
+    }
+    Some(now_ms - days.min(MAX_WINDOW_DAYS) * MS_PER_DAY)
 }
 
 /// Resolve the effective `NoteFilter` from the breadth clamp + the model's own
 /// params. The clamp always wins: within `Note`/`Folder` breadth the model
 /// cannot reach past it; only within `All` do the model's params apply.
-fn resolve_filter<'a>(scope: &'a ToolScope, args: &'a Value) -> NoteFilter<'a> {
+/// A date window narrows WITHIN whatever the clamp allows — it can never reach
+/// past the user's chosen scope, only inside it.
+///
+/// It is dropped entirely under `Note` breadth. There is exactly one note in
+/// scope, so a window has nothing to narrow and can only take it away: a model
+/// passing `within_days: 7` while the user has an older note open would get zero
+/// hits searching the very note on screen.
+fn resolve_filter<'a>(scope: &'a ToolScope, args: &'a Value, now_ms: i64) -> NoteFilter<'a> {
+    let since_ms = window_since(args, now_ms);
     match scope {
         ToolScope::Note(id) => NoteFilter { note_id: Some(id), ..Default::default() },
         ToolScope::Folder(id) => NoteFilter {
             folder_id: Some(id),
             // A client narrowing still composes within the folder breadth.
             client_id: str_arg(args, "client_id"),
+            since_ms,
             ..Default::default()
         },
         ToolScope::All => NoteFilter {
             folder_id: str_arg(args, "folder_id"),
             client_id: str_arg(args, "client_id"),
+            since_ms,
             ..Default::default()
         },
     }
@@ -179,7 +217,9 @@ fn truncate(s: &str, max: usize) -> String {
 /// model reads and recovers from. `query_vec`/`embed_model` carry the search
 /// query's embedding when semantic retrieval is available (issue #48) — the
 /// caller embeds the query before taking the DB lock, since embedding is async;
-/// `None` degrades `search_notes` to keyword-only.
+/// `None` degrades `search_notes` to keyword-only. `now_ms` resolves the relative
+/// date window and is passed in (not read from the clock here) so the tests are
+/// deterministic.
 pub fn execute_tool(
     conn: &Connection,
     workspace: &str,
@@ -188,11 +228,12 @@ pub fn execute_tool(
     args: &Value,
     query_vec: Option<&[f32]>,
     embed_model: &str,
+    now_ms: i64,
 ) -> ToolOutcome {
     match name {
-        TOOL_SEARCH => run_search(conn, workspace, scope, args, query_vec, embed_model),
+        TOOL_SEARCH => run_search(conn, workspace, scope, args, query_vec, embed_model, now_ms),
         TOOL_GET => run_get(conn, workspace, scope, args),
-        TOOL_LIST => run_list(conn, workspace, scope, args),
+        TOOL_LIST => run_list(conn, workspace, scope, args, now_ms),
         other => ToolOutcome::error(format!(
             "Unknown tool \"{other}\". Available tools: {TOOL_SEARCH}, {TOOL_GET}, {TOOL_LIST}."
         )),
@@ -206,11 +247,12 @@ fn run_search(
     args: &Value,
     query_vec: Option<&[f32]>,
     embed_model: &str,
+    now_ms: i64,
 ) -> ToolOutcome {
     let Some(query) = str_arg(args, "query") else {
         return ToolOutcome::error("search_notes needs a non-empty \"query\" string.");
     };
-    let filter = resolve_filter(scope, args);
+    let filter = resolve_filter(scope, args, now_ms);
     let hits = match db::hybrid_search_chunks(
         conn,
         query,
@@ -218,7 +260,7 @@ fn run_search(
         embed_model,
         filter,
         workspace,
-        clamp_limit(args),
+        SEARCH_LIMIT,
     ) {
         Ok(h) => h,
         Err(e) => return ToolOutcome::error(format!("search failed: {e}")),
@@ -301,20 +343,61 @@ fn run_get(conn: &Connection, workspace: &str, scope: &ToolScope, args: &Value) 
     ToolOutcome::ok(text, vec![citation])
 }
 
-fn run_list(conn: &Connection, workspace: &str, scope: &ToolScope, args: &Value) -> ToolOutcome {
-    let filter = resolve_filter(scope, args);
-    let notes = match db::list_notes_filtered(conn, filter, workspace, clamp_limit(args)) {
+/// One note's summary, collapsed to a single line. Summaries are multi-line
+/// markdown; pasted raw they'd break the one-row-per-note shape the model reads.
+fn summary_of(summary: &str) -> String {
+    let collapsed = summary.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        String::new()
+    } else {
+        format!(" — {}", truncate(&collapsed, LIST_SUMMARY_CHARS))
+    }
+}
+
+fn run_list(
+    conn: &Connection,
+    workspace: &str,
+    scope: &ToolScope,
+    args: &Value,
+    now_ms: i64,
+) -> ToolOutcome {
+    let filter = resolve_filter(scope, args, now_ms);
+    // Fetch one past the cap so a truncated listing can say so rather than reading
+    // as complete — a capped listing that looks whole is how a model ends up
+    // asserting a note doesn't exist.
+    let notes = match db::list_notes_filtered(conn, filter, workspace, LIST_LIMIT + 1) {
         Ok(n) => n,
         Err(e) => return ToolOutcome::error(format!("list failed: {e}")),
     };
     if notes.is_empty() {
         return ToolOutcome::ok("No notes found in this scope.".to_string(), Vec::new());
     }
-    let mut lines = vec![format!("{} note(s):", notes.len())];
-    for (i, n) in notes.iter().enumerate() {
+    let overflow = notes.len() > LIST_LIMIT;
+    let kept = if overflow { &notes[..LIST_LIMIT] } else { &notes[..] };
+    let mut lines = vec![format!("{} note(s):", kept.len())];
+    // Title + date + id + a one-line summary, so the model can choose what to open
+    // without spending a get_note on every candidate (#81). This is a digest the
+    // model ASKED for, which is the distinction that keeps citations honest: it
+    // still has to open a note to assert anything specific about it.
+    for (i, n) in kept.iter().enumerate() {
         let title = if n.title.trim().is_empty() { "(untitled)" } else { n.title.trim() };
-        lines.push(format!("{}. \"{}\" ({}) [id: {}]", i + 1, title, fmt_date(n.created_at), n.id));
+        lines.push(format!(
+            "{}. \"{}\" ({}) [id: {}]{}",
+            i + 1,
+            title,
+            fmt_date(n.created_at),
+            n.id,
+            summary_of(&n.summary),
+        ));
     }
+    if overflow {
+        lines.push(format!(
+            "(more than {LIST_LIMIT} notes match — narrow by folder or within_days.)"
+        ));
+    }
+    // Deliberately NO citations. A listing is an index, not a source: the model has
+    // seen only a title and a summary line, so citing it would put a chip on a note
+    // nobody read. get_note and search_notes are what earn a citation.
     ToolOutcome::ok(lines.join("\n"), Vec::new())
 }
 
@@ -354,9 +437,25 @@ mod tests {
         db::open(&dir.path().join("t.sqlite")).unwrap()
     }
 
+    /// A fixed "now" so the date-window tests don't depend on the wall clock.
+    const NOW: i64 = 1_785_024_000_000; // 2026-07-26T00:00:00Z
+    const DAY: i64 = 86_400_000;
+
     /// Keyword-only tool call (no query embedding) — the common test path.
     fn exec(conn: &Connection, workspace: &str, scope: &ToolScope, name: &str, args: &Value) -> ToolOutcome {
-        execute_tool(conn, workspace, scope, name, args, None, "")
+        execute_tool(conn, workspace, scope, name, args, None, "", NOW)
+    }
+
+    /// Backdate a note's creation time — the date window filters on `created_at`,
+    /// which no public patch exposes.
+    fn set_created_at(conn: &Connection, id: &str, created_at: i64) {
+        conn.execute("UPDATE notes SET created_at = ?1 WHERE id = ?2", rusqlite::params![created_at, id])
+            .unwrap();
+    }
+
+    fn set_summary(conn: &Connection, id: &str, summary: &str) {
+        db::update_note(conn, id, &db::NotePatch { summary: Some(summary.into()), ..Default::default() })
+            .unwrap();
     }
 
     #[test]
@@ -456,5 +555,119 @@ mod tests {
         assert!(out.model_text.contains("First"));
         assert!(out.model_text.contains("Second"));
         assert!(out.model_text.contains("2 note(s)"));
+    }
+
+    // ── #81: summary listing, date window, hit diversity ────────────────────
+
+    /// Skimming is the cheap "which of these should I open?" move, so a listing
+    /// carries a summary line — but it is an INDEX, not a source. Citing a note the
+    /// model has only seen the title of would put a chip on something nobody read.
+    #[test]
+    fn list_notes_carries_a_one_line_summary_and_cites_nothing() {
+        let conn = open();
+        let id = seed(&conn, "Kickoff", "we launched");
+        set_summary(&conn, &id, "Launch slipped two weeks.\n\n- Owner: Ada\n- Risk: staffing");
+
+        let out = exec(&conn, "", &ToolScope::All, TOOL_LIST, &json!({}));
+        assert!(out.model_text.contains("Launch slipped two weeks. - Owner: Ada"));
+        // One row per note: a raw multi-line summary would break that shape.
+        assert_eq!(out.model_text.lines().count(), 2, "header + one row");
+        assert!(out.citations.is_empty(), "a listing is an index, not a cited source");
+    }
+
+    #[test]
+    fn list_notes_truncates_out_loud_rather_than_silently() {
+        let conn = open();
+        for i in 0..(LIST_LIMIT + 5) {
+            seed(&conn, &format!("Note {i}"), "body");
+        }
+        let out = exec(&conn, "", &ToolScope::All, TOOL_LIST, &json!({}));
+        assert!(out.model_text.contains(&format!("{LIST_LIMIT} note(s)")));
+        assert!(
+            out.model_text.contains("narrow by folder or within_days"),
+            "a capped listing that reads as complete is how a model asserts a note doesn't exist"
+        );
+    }
+
+    #[test]
+    fn within_days_narrows_search_and_listing_to_the_recent_window() {
+        let conn = open();
+        let recent = seed(&conn, "Recent budget", "the budget came up again");
+        let ancient = seed(&conn, "Ancient budget", "the budget came up back then");
+        set_created_at(&conn, &recent, NOW - 2 * DAY);
+        set_created_at(&conn, &ancient, NOW - 90 * DAY);
+
+        for tool in [TOOL_LIST, TOOL_SEARCH] {
+            let args = json!({ "query": "budget", "within_days": 7 });
+            let out = exec(&conn, "", &ToolScope::All, tool, &args);
+            assert!(out.model_text.contains("Recent"), "{tool} kept the recent note");
+            assert!(!out.model_text.contains("Ancient"), "{tool} dropped the old note");
+        }
+    }
+
+    /// A bad window should widen to everything, never silently narrow to nothing —
+    /// an empty result the user can't explain is worse than an ignored argument.
+    #[test]
+    fn a_nonsensical_window_is_ignored_rather_than_returning_nothing() {
+        let conn = open();
+        let ancient = seed(&conn, "Ancient budget", "the budget came up back then");
+        set_created_at(&conn, &ancient, NOW - 900 * DAY);
+
+        for window in [json!(0), json!(-3), json!("not a number"), Value::Null] {
+            let args = json!({ "within_days": window });
+            let out = exec(&conn, "", &ToolScope::All, TOOL_LIST, &args);
+            assert!(out.model_text.contains("Ancient"), "window {window:?} should not filter");
+        }
+        // Models routinely emit the number as a string.
+        let out = exec(&conn, "", &ToolScope::All, TOOL_LIST, &json!({ "within_days": "7" }));
+        assert!(!out.model_text.contains("Ancient"), "a numeric string is a real window");
+    }
+
+    #[test]
+    fn a_date_window_cannot_widen_past_the_breadth_clamp() {
+        let conn = open();
+        let anchor = seed(&conn, "Anchor", "anchor content");
+        let other = seed(&conn, "Other", "other content");
+        set_created_at(&conn, &anchor, NOW - 2 * DAY);
+        set_created_at(&conn, &other, NOW - 2 * DAY);
+
+        let args = json!({ "within_days": MAX_WINDOW_DAYS, "client_id": other });
+        let out = exec(&conn, "", &ToolScope::Note(anchor), TOOL_LIST, &args);
+        assert!(out.model_text.contains("Anchor"));
+        assert!(!out.model_text.contains("Other"), "the clamp still wins over any date arg");
+    }
+
+    /// A single-note scope has nothing to narrow, so a window can only take the
+    /// note away — the model would be searching the note on screen and getting
+    /// nothing back.
+    #[test]
+    fn the_date_window_is_ignored_under_note_breadth_however_old_the_anchor_is() {
+        let conn = open();
+        let anchor = seed(&conn, "Anchor", "anchor content");
+        set_created_at(&conn, &anchor, NOW - 900 * DAY);
+
+        let args = json!({ "within_days": 1 });
+        let scope = ToolScope::Note(anchor.clone());
+        assert!(exec(&conn, "", &scope, TOOL_LIST, &args).model_text.contains("Anchor"));
+        assert!(resolve_filter(&scope, &args, NOW).since_ms.is_none());
+        // …but a folder or library scope does honour it.
+        assert_eq!(resolve_filter(&ToolScope::All, &args, NOW).since_ms, Some(NOW - DAY));
+        assert_eq!(
+            resolve_filter(&ToolScope::Folder("f".into()), &args, NOW).since_ms,
+            Some(NOW - DAY)
+        );
+    }
+
+    #[test]
+    fn window_since_resolves_clamps_and_ignores_garbage() {
+        assert_eq!(window_since(&json!({ "within_days": 7 }), NOW), Some(NOW - 7 * DAY));
+        assert_eq!(window_since(&json!({ "within_days": "7" }), NOW), Some(NOW - 7 * DAY));
+        for bad in [json!(0), json!(-1), json!("abc"), json!({}), Value::Null] {
+            assert_eq!(window_since(&json!({ "within_days": bad }), NOW), None, "{bad:?}");
+        }
+        assert_eq!(window_since(&json!({}), NOW), None);
+        // Clamped, not underflowed past the epoch.
+        let since = window_since(&json!({ "within_days": 10_000_000i64 }), NOW).unwrap();
+        assert_eq!(since, NOW - MAX_WINDOW_DAYS * DAY);
     }
 }

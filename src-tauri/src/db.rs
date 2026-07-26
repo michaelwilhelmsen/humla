@@ -1267,7 +1267,9 @@ pub struct ChunkHit {
 }
 
 /// Lightweight Note descriptor for the `list_notes` tool — just what a citation
-/// or a "which note?" decision needs, never the full body/transcript.
+/// or a "which note?" decision needs, never the full body/transcript. `summary`
+/// is the one exception (#81): it lets the model skim candidates without spending
+/// a `get_note` on each, and the tool layer caps how much of it is shown.
 #[derive(Debug, Clone, Serialize)]
 pub struct NoteMeta {
     pub id: String,
@@ -1275,6 +1277,7 @@ pub struct NoteMeta {
     pub created_at: i64,
     pub folder_id: Option<String>,
     pub client_id: Option<String>,
+    pub summary: String,
 }
 
 /// Independent, combinable Note filters for retrieval. Every field is optional
@@ -1286,6 +1289,9 @@ pub struct NoteFilter<'a> {
     pub note_id: Option<&'a str>,
     pub folder_id: Option<&'a str>,
     pub client_id: Option<&'a str>,
+    /// Optional lower bound on note creation time (ms epoch) — backs the retrieval
+    /// tools' relative date window (#81). Narrows only; the breadth clamp still wins.
+    pub since_ms: Option<i64>,
 }
 
 /// Split arbitrary text into ~`target`-char chunks, breaking on blank-line
@@ -1677,14 +1683,60 @@ fn push_note_filters(
         args.push(Value::Text(cl.to_string()));
         sql.push_str(&format!(" AND {t}.client_id = ?{}", args.len()));
     }
+    // Date window on `created_at` (when the meeting happened), not `updated_at` —
+    // "what came up last week" asks about meetings, not about when a note was
+    // last edited.
+    if let Some(since) = filter.since_ms {
+        args.push(Value::Integer(since));
+        sql.push_str(&format!(" AND {t}.created_at >= ?{}", args.len()));
+    }
 }
 
 /// The size of each per-signal candidate pool fused by RRF. Bigger than the
 /// final `limit` so a chunk ranked mid-pack by one signal can still win on the
 /// other.
-const HYBRID_POOL: usize = 20;
+/// Matches the cloud index's candidate pool (`K = 200` in `store.ts`), so the
+/// diversity pass below chooses from a comparably wide field on both sides —
+/// otherwise the same per-note cap yields materially less coverage locally.
+const HYBRID_POOL: usize = 200;
 /// RRF damping constant (standard default).
 const RRF_K: f64 = 60.0;
+/// Max chunks any ONE note may contribute to a result's first pass (#81).
+const PER_NOTE_CAP: usize = 2;
+
+/// Two-pass take over rank-ordered hits: first at most `per_note_cap` per note,
+/// then backfill with the best remaining hits until `limit`.
+///
+/// Chunks are per-section, so a plain `take(limit)` can spend every slot on the
+/// two or three notes that happen to rank best — narrow coverage for a question
+/// spanning the whole library. The cap fixes that; the backfill is what stops it
+/// costing recall when only one note matches (a note-scoped search must still be
+/// able to return several excerpts of its one note).
+fn diversify(ranked: Vec<ChunkHit>, limit: usize, per_note_cap: usize) -> Vec<ChunkHit> {
+    use std::collections::HashMap;
+    let mut out: Vec<ChunkHit> = Vec::with_capacity(limit.min(ranked.len()));
+    let mut held: Vec<ChunkHit> = Vec::new();
+    let mut per_note: HashMap<String, usize> = HashMap::new();
+    for hit in ranked {
+        if out.len() >= limit {
+            return out;
+        }
+        let taken = per_note.entry(hit.note_id.clone()).or_insert(0);
+        if *taken < per_note_cap {
+            *taken += 1;
+            out.push(hit);
+        } else {
+            held.push(hit);
+        }
+    }
+    for hit in held {
+        if out.len() >= limit {
+            break;
+        }
+        out.push(hit);
+    }
+    out
+}
 
 /// Hybrid keyword+semantic search. With `query_vec = Some`, fuses BM25 and
 /// cosine rankings via RRF; with `None` (embedding unavailable), degrades to
@@ -1700,14 +1752,17 @@ pub fn hybrid_search_chunks(
     limit: usize,
 ) -> Result<Vec<ChunkHit>> {
     let keyword = keyword_ranked(conn, query, filter, workspace, HYBRID_POOL)?;
+    // Keyword-only: no query embedding, or nothing embedded yet under this model
+    // (issue #48 graceful degradation).
+    let keyword_only = |kw: Vec<IdentifiedHit>| {
+        Ok(diversify(kw.into_iter().map(|ih| ih.hit).collect(), limit, PER_NOTE_CAP))
+    };
     let Some(qv) = query_vec else {
-        // Keyword-only fallback.
-        return Ok(keyword.into_iter().take(limit).map(|ih| ih.hit).collect());
+        return keyword_only(keyword);
     };
     let semantic = semantic_ranked(conn, qv, model, filter, workspace, HYBRID_POOL)?;
     if semantic.is_empty() {
-        // No vectors yet (e.g. not embedded) → keyword-only.
-        return Ok(keyword.into_iter().take(limit).map(|ih| ih.hit).collect());
+        return keyword_only(keyword);
     }
 
     // Fuse by chunk id; keep a lookup so the winners map back to their hits.
@@ -1716,14 +1771,14 @@ pub fn hybrid_search_chunks(
     let kw_ids: Vec<String> = keyword.into_iter().map(|ih| { hits.insert(ih.chunk_id.clone(), ih.hit); ih.chunk_id }).collect();
     let sem_ids: Vec<String> = semantic.into_iter().map(|ih| { hits.entry(ih.chunk_id.clone()).or_insert(ih.hit); ih.chunk_id }).collect();
     let fused = rrf_fuse(&[kw_ids, sem_ids], RRF_K);
-    Ok(fused
+    let ranked: Vec<ChunkHit> = fused
         .into_iter()
-        .take(limit)
         .filter_map(|(id, score)| hits.remove(&id).map(|mut h| {
             h.rank = score; // fused RRF score (higher = better)
             h
         }))
-        .collect())
+        .collect();
+    Ok(diversify(ranked, limit, PER_NOTE_CAP))
 }
 
 /// List live Notes in a workspace, optionally narrowed by folder and/or client,
@@ -1736,24 +1791,19 @@ pub fn list_notes_filtered(
 ) -> Result<Vec<NoteMeta>> {
     use rusqlite::types::Value;
     let mut sql = String::from(
-        "SELECT id, title, created_at, folder_id, client_id FROM notes \
-         WHERE workspace_id = ?1 AND deleted_at IS NULL",
+        "SELECT n.id, n.title, n.created_at, n.folder_id, n.client_id, n.summary FROM notes n \
+         WHERE n.workspace_id = ?1 AND n.deleted_at IS NULL",
     );
     let mut args: Vec<Value> = vec![Value::Text(workspace.to_string())];
-    if let Some(id) = filter.note_id {
-        args.push(Value::Text(id.to_string()));
-        sql.push_str(&format!(" AND id = ?{}", args.len()));
-    }
-    if let Some(f) = filter.folder_id {
-        args.push(Value::Text(f.to_string()));
-        sql.push_str(&format!(" AND folder_id = ?{}", args.len()));
-    }
-    if let Some(cl) = filter.client_id {
-        args.push(Value::Text(cl.to_string()));
-        sql.push_str(&format!(" AND client_id = ?{}", args.len()));
-    }
+    // Shares the one filter builder with the keyword + semantic queries, so a new
+    // narrowing (like #81's date window) can't reach search but miss listing.
+    push_note_filters(&mut sql, &mut args, filter, "n");
     args.push(Value::Integer(limit as i64));
-    sql.push_str(&format!(" ORDER BY updated_at DESC LIMIT ?{}", args.len()));
+    // Ordered by `created_at`, the same field the date window filters and the tool
+    // layer displays. Ordering by `updated_at` instead let a re-edited old note
+    // outrank a newer meeting, so a capped "last week" listing could drop the very
+    // notes it was asked for.
+    sql.push_str(&format!(" ORDER BY n.created_at DESC LIMIT ?{}", args.len()));
 
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt
@@ -1764,6 +1814,7 @@ pub fn list_notes_filtered(
                 created_at: row.get(2)?,
                 folder_id: row.get(3)?,
                 client_id: row.get(4)?,
+                summary: row.get(5)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -2832,5 +2883,123 @@ mod tests {
         // semantic-only match B would be invisible to keyword search alone.
         assert!(note_ids.contains(&a.id.as_str()), "keyword match present");
         assert!(note_ids.contains(&b.id.as_str()), "semantic-only match surfaced by RRF");
+    }
+
+    // ── #81: hit diversity + date window ────────────────────────────────────
+
+    fn hit(note_id: &str, rank: f64) -> ChunkHit {
+        ChunkHit {
+            note_id: note_id.to_string(),
+            note_title: note_id.to_string(),
+            note_created_at: 0,
+            source: "transcript".into(),
+            text: format!("{note_id}#{rank}"),
+            rank,
+        }
+    }
+
+    fn note_ids_of(hits: &[ChunkHit]) -> Vec<&str> {
+        hits.iter().map(|h| h.note_id.as_str()).collect()
+    }
+
+    #[test]
+    fn diversify_spreads_a_scarce_result_set_across_notes() {
+        // Note A ranks best on four chunks; unbounded it takes every slot and B
+        // and C are never seen.
+        let ranked =
+            vec![hit("a", 9.0), hit("a", 8.0), hit("a", 7.0), hit("a", 6.0), hit("b", 5.0), hit("c", 4.0)];
+        assert_eq!(note_ids_of(&diversify(ranked, 4, 2)), vec!["a", "a", "b", "c"]);
+    }
+
+    #[test]
+    fn diversify_uses_spare_slots_on_the_best_remaining_hits() {
+        // With room for everything, nothing is dropped — the cap reorders
+        // (coverage first), it does not discard.
+        let ranked =
+            vec![hit("a", 9.0), hit("a", 8.0), hit("a", 7.0), hit("a", 6.0), hit("b", 5.0), hit("c", 4.0)];
+        assert_eq!(note_ids_of(&diversify(ranked, 6, 2)), vec!["a", "a", "b", "c", "a", "a"]);
+    }
+
+    /// The backfill is what stops the per-note cap costing recall: a note-scoped
+    /// search must still return several excerpts of its one note.
+    #[test]
+    fn diversify_keeps_full_recall_when_only_one_note_matches() {
+        let ranked = vec![hit("a", 9.0), hit("a", 8.0), hit("a", 7.0)];
+        assert_eq!(diversify(ranked.clone(), 6, 2).len(), 3);
+        assert_eq!(diversify(ranked, 2, 2).len(), 2);
+    }
+
+    #[test]
+    fn diversify_never_exceeds_the_limit() {
+        let ranked: Vec<ChunkHit> =
+            (0..30).map(|i| hit(&format!("n{}", i % 3), 30.0 - f64::from(i))).collect();
+        assert_eq!(diversify(ranked, 8, 2).len(), 8);
+    }
+
+    #[test]
+    fn since_ms_filters_search_and_listing_by_note_creation() {
+        const NOW: i64 = 1_785_024_000_000; // 2026-07-26T00:00:00Z
+        const DAY: i64 = 86_400_000;
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("since.sqlite")).unwrap();
+
+        let mut ids = Vec::new();
+        for (title, age_days) in [("Recent budget", 2), ("Ancient budget", 90)] {
+            let n = create_note(&conn, "en", "meeting", "").unwrap();
+            update_note(
+                &conn,
+                &n.id,
+                &NotePatch {
+                    title: Some(title.into()),
+                    transcript: Some("the budget came up".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE notes SET created_at = ?1 WHERE id = ?2",
+                rusqlite::params![NOW - age_days * DAY, &n.id],
+            )
+            .unwrap();
+            let fresh = get_note(&conn, &n.id).unwrap();
+            reindex_note(&conn, &n.id, &fresh.body, &fresh.transcript, &fresh.summary).unwrap();
+            ids.push(n.id);
+        }
+        let (recent, ancient) = (&ids[0], &ids[1]);
+
+        let unfiltered = NoteFilter::default();
+        let windowed = NoteFilter { since_ms: Some(NOW - 7 * DAY), ..Default::default() };
+
+        let all = hybrid_search_chunks(&conn, "budget", None, "", unfiltered, "", 10).unwrap();
+        assert_eq!(all.len(), 2, "unfiltered sees both");
+        let recent_only = hybrid_search_chunks(&conn, "budget", None, "", windowed, "", 10).unwrap();
+        assert_eq!(note_ids_of(&recent_only), vec![recent.as_str()]);
+
+        // The listing shares the one filter builder, so the window reaches it too.
+        assert_eq!(list_notes_filtered(&conn, unfiltered, "", 10).unwrap().len(), 2);
+        let listed = list_notes_filtered(&conn, windowed, "", 10).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, *recent);
+        assert_ne!(listed[0].id, *ancient);
+    }
+
+    #[test]
+    fn list_notes_filtered_carries_the_summary_for_skimming() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("listsummary.sqlite")).unwrap();
+        let n = create_note(&conn, "en", "meeting", "").unwrap();
+        update_note(
+            &conn,
+            &n.id,
+            &NotePatch {
+                title: Some("Kickoff".into()),
+                summary: Some("Launch slipped two weeks.".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let listed = list_notes_filtered(&conn, NoteFilter::default(), "", 10).unwrap();
+        assert_eq!(listed[0].summary, "Launch slipped two weeks.");
     }
 }
