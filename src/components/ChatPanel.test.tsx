@@ -286,6 +286,93 @@ describe("ChatPanel sessions (#62)", () => {
     expect(controls.current?.activeConversationId).toBe("c1");
   });
 
+  // Paging (#95): `/chat` lists conversations uncapped in the sidebar, so the
+  // panel fetches them a page at a time. It owns the list, so it owns the paging.
+  describe("paging", () => {
+    const page = (from: number, count: number) =>
+      Array.from({ length: count }, (_, i) => ({
+        id: `c${from + i}`,
+        title: `Chat ${from + i}`,
+        breadth: "all" as const,
+        updatedAt: 1000 - (from + i),
+        messageCount: 2,
+      }));
+
+    // The panel's page size, inferred from the first request rather than hardcoded
+    // here — the constant is the panel's business, the tiling is what matters.
+    async function firstPage() {
+      let size = 0;
+      const seen: number[] = [];
+      mockTauri({
+        provider_key_get: () => "sk-test",
+        chat_history: () => history(),
+        chat_list_conversations: (args) => {
+          const { limit, offset } = args as { limit: number; offset: number };
+          size = limit;
+          seen.push(offset);
+          // A full page while rows remain, then a short one: that's how the panel
+          // learns where the end is, with no total count anywhere.
+          if (offset === 0) return page(0, limit);
+          if (offset === limit) return page(limit, 2);
+          return [];
+        },
+      });
+      const controls = renderWithControls();
+      await screen.findByPlaceholderText(/Ask about your notes/);
+      await waitFor(() => expect(controls.current?.conversations.length).toBe(size));
+      return { controls, size, seen };
+    }
+
+    it("appends the next page and then reports the end", async () => {
+      const { controls, size } = await firstPage();
+      expect(controls.current?.hasMore).toBe(true);
+
+      await act(async () => {
+        await controls.current!.loadMore();
+      });
+      await waitFor(() => expect(controls.current?.conversations.length).toBe(size + 2));
+      // A short page means the end; nothing further is requested.
+      expect(controls.current?.hasMore).toBe(false);
+      const before = controls.current!.conversations.length;
+      await act(async () => {
+        await controls.current!.loadMore();
+      });
+      expect(controls.current?.conversations.length).toBe(before);
+    });
+
+    it("asks for each page exactly once for one gesture", async () => {
+      const { controls, seen, size } = await firstPage();
+      // A scroll observer fires repeatedly; a second call while the first is in
+      // flight must not fetch the same window twice.
+      await act(async () => {
+        await Promise.all([controls.current!.loadMore(), controls.current!.loadMore()]);
+      });
+      expect(seen.filter((o) => o === size)).toHaveLength(1);
+    });
+
+    it("does not list a conversation twice when one is bumped between pages", async () => {
+      // A thread that gets a new message moves to page one, shifting the window —
+      // so page two can hand back a row already on screen.
+      mockTauri({
+        provider_key_get: () => "sk-test",
+        chat_history: () => history(),
+        chat_list_conversations: (args) => {
+          const { limit, offset } = args as { limit: number; offset: number };
+          return offset === 0 ? page(0, limit) : [...page(limit - 1, 1), ...page(limit, 1)];
+        },
+      });
+      const controls = renderWithControls();
+      await screen.findByPlaceholderText(/Ask about your notes/);
+      await waitFor(() => expect(controls.current!.conversations.length).toBeGreaterThan(0));
+
+      await act(async () => {
+        await controls.current!.loadMore();
+      });
+      const ids = controls.current!.conversations.map((c) => c.id);
+      expect(new Set(ids).size).toBe(ids.length);
+    });
+  });
+
   it("'+' starts a fresh conversation and switches the pane to it", async () => {
     let created = false;
     mockTauri({

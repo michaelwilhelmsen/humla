@@ -1,34 +1,21 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, Outlet, Route, Routes } from "react-router-dom";
 import { Chat } from "./Chat";
 import { mockTauri } from "../test/tauri";
 import { useCloudStore, DISCONNECTED, type CloudRole } from "../lib/cloud";
 import { useNotesStore } from "../lib/store";
-import type { ConversationMeta, Note } from "../lib/ipc";
+import { useGlobalChatStore } from "../lib/globalChat";
+import type { Note } from "../lib/ipc";
 
-// The `/chat` surface (issue #95). These tests are about what this page owns —
-// the Recents rail, the library prompt set, and the empty-library state. The
-// panel's own behaviour (streaming, citations, activation, a11y) is covered by
-// ChatPanel.test.tsx and arrives here unchanged by construction (#94).
-
-const HOUR = 3_600_000;
-
-function conversation(over: Partial<ConversationMeta> & { id: string }): ConversationMeta {
-  return { title: "Untitled", breadth: "all", updatedAt: 1, messageCount: 2, ...over };
-}
+// The `/chat` page (issue #95). The page owns the shell, the library-wide target
+// and the collapsed-sidebar fallback; the conversation list it publishes is
+// rendered by the sidebar and tested in ChatConversations.test.tsx. Panel
+// behaviour (streaming, citations, activation, a11y) is ChatPanel.test.tsx's.
 
 function seedNotes(count: number) {
   const notes = Array.from({ length: count }, (_, i) => ({ id: `n${i}` }) as unknown as Note);
   useNotesStore.setState({ notes, loaded: true });
-}
-
-function renderChat() {
-  return render(
-    <MemoryRouter>
-      <Chat />
-    </MemoryRouter>,
-  );
 }
 
 function signIntoWorkspace(role: CloudRole = "owner") {
@@ -45,9 +32,24 @@ function signIntoWorkspace(role: CloudRole = "owner") {
   });
 }
 
+// `Chat` reads `sidebarCollapsed` from the Layout's outlet context, so it has to
+// be rendered under a layout route rather than bare.
+function renderChat(sidebarCollapsed = false) {
+  return render(
+    <MemoryRouter initialEntries={["/chat"]}>
+      <Routes>
+        <Route path="/" element={<Outlet context={{ sidebarCollapsed }} />}>
+          <Route path="chat" element={<Chat />} />
+        </Route>
+      </Routes>
+    </MemoryRouter>,
+  );
+}
+
 beforeEach(() => {
   mockTauri();
   useCloudStore.setState({ status: DISCONNECTED, syncStatus: null });
+  useGlobalChatStore.setState({ controls: null });
   // Default: a library with notes, already loaded — the ordinary case.
   seedNotes(3);
 });
@@ -71,89 +73,36 @@ describe("/chat page", () => {
     // No greeting and no display heading — just the page title (#95).
     expect(screen.getByRole("heading", { name: "Chat" })).toBeInTheDocument();
     // An ABSENT note id is what the backend reads as the global scope; an empty
-    // string is rejected (#93), so this assertion is the wire contract.
-    expect(asked).toContainEqual({ noteId: null });
+    // string is rejected (#93), so this assertion is the wire contract. The window
+    // is the first page — the list is uncapped and pages in as it scrolls.
+    expect(asked[0]).toMatchObject({ noteId: null, offset: 0 });
+    expect((asked[0] as { limit: number }).limit).toBeGreaterThan(0);
   });
 
-  it("lists recent conversations most-recent first and marks the active one", async () => {
-    const now = Date.now();
-    mockTauri({
-      provider_key_get: () => "sk-test",
-      chat_history: () => ({ conversationId: "c-mid", messages: [] }),
-      chat_list_conversations: () => [
-        conversation({ id: "c-old", title: "Budget questions", updatedAt: now - 50 * HOUR }),
-        conversation({ id: "c-new", title: "This week", updatedAt: now - 1 * HOUR }),
-        conversation({ id: "c-mid", title: "Client status", updatedAt: now - 5 * HOUR }),
-      ],
-    });
-    renderChat();
-
-    const rows = await waitFor(() => {
-      const found = screen.getAllByRole("listitem");
-      expect(found.length).toBe(3);
-      return found;
-    });
-    expect(rows.map((r) => r.textContent)).toEqual([
-      "This week1h ago",
-      "Client status5h ago",
-      "Budget questions2d ago",
-    ]);
-    // The loaded conversation is marked, and only it.
-    const current = screen.getAllByRole("button", { current: true });
-    expect(current).toHaveLength(1);
-    expect(current[0].textContent).toContain("Client status");
-  });
-
-  it("caps Recents at ten rows", async () => {
-    const now = Date.now();
+  it("publishes its session projection for the sidebar to render", async () => {
     mockTauri({
       provider_key_get: () => "sk-test",
       chat_history: () => ({ conversationId: null, messages: [] }),
-      chat_list_conversations: () =>
-        Array.from({ length: 14 }, (_, i) =>
-          conversation({ id: `c${i}`, title: `Chat ${i}`, updatedAt: now - i * HOUR }),
-        ),
+      chat_list_conversations: () => [],
     });
     renderChat();
 
-    await waitFor(() => expect(screen.getAllByRole("listitem")).toHaveLength(10));
-    // The ten kept are the most recent ten, not the first ten returned.
-    expect(screen.getByText("Chat 0")).toBeInTheDocument();
-    expect(screen.queryByText("Chat 13")).toBeNull();
+    // The list lives in the sidebar, which is not in this tree — the page's job is
+    // to get the projection into the store.
+    await waitFor(() => expect(useGlobalChatStore.getState().controls).not.toBeNull());
+    expect(useGlobalChatStore.getState().controls?.targetKey).toBe("global");
   });
 
-  it("says so when there is no history to browse", async () => {
+  it("clears the projection on unmount, so the sidebar can't outlive the pane", async () => {
     mockTauri({
       provider_key_get: () => "sk-test",
       chat_history: () => ({ conversationId: null, messages: [] }),
-      // A lone untouched conversation isn't history worth listing (#62).
-      chat_list_conversations: () => [conversation({ id: "c1", title: "", messageCount: 0 })],
     });
-    renderChat();
+    const { unmount } = renderChat();
+    await waitFor(() => expect(useGlobalChatStore.getState().controls).not.toBeNull());
 
-    await waitFor(() => expect(screen.getByText("No conversations yet")).toBeInTheDocument());
-    expect(screen.queryByRole("listitem")).toBeNull();
-  });
-
-  it("loads the conversation whose row is clicked", async () => {
-    const requested: unknown[] = [];
-    mockTauri({
-      provider_key_get: () => "sk-test",
-      chat_history: (args) => {
-        requested.push(args);
-        return { conversationId: null, messages: [] };
-      },
-      chat_list_conversations: () => [
-        conversation({ id: "c-a", title: "Alpha", updatedAt: 2 }),
-        conversation({ id: "c-b", title: "Beta", updatedAt: 1 }),
-      ],
-    });
-    renderChat();
-
-    fireEvent.click(await screen.findByText("Beta"));
-    await waitFor(() =>
-      expect(requested).toContainEqual({ noteId: null, conversationId: "c-b" }),
-    );
+    unmount();
+    expect(useGlobalChatStore.getState().controls).toBeNull();
   });
 
   it("offers the library prompt set, not the note-scoped one", async () => {
@@ -170,6 +119,44 @@ describe("/chat page", () => {
     expect(screen.getByText("Client status")).toBeInTheDocument();
     // "What I missed" only makes sense with a note on screen to have missed.
     expect(screen.queryByText("What I missed")).toBeNull();
+  });
+
+  it("shows no scope picker — its only option would be 'All notes'", async () => {
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () => ({ conversationId: null, messages: [] }),
+    });
+    renderChat();
+
+    await screen.findByPlaceholderText(/Ask about your notes/);
+    expect(screen.queryByLabelText("Chat scope")).toBeNull();
+    expect(screen.queryByText("All notes")).toBeNull();
+  });
+});
+
+describe("/chat session chrome placement", () => {
+  // Exactly one home at a time: the sidebar owns the list and the "+" while it's
+  // open; collapsed, it takes them with it, so the popover fallback appears in the
+  // page header instead. Two "new chat" buttons on one screen is a puzzle.
+  it("stays out of the page header while the sidebar is open", async () => {
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () => ({ conversationId: null, messages: [] }),
+    });
+    renderChat(false);
+
+    await screen.findByPlaceholderText(/Ask about your notes/);
+    expect(screen.queryByLabelText("New chat")).toBeNull();
+  });
+
+  it("appears in the page header once the sidebar is collapsed", async () => {
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () => ({ conversationId: null, messages: [] }),
+    });
+    renderChat(true);
+
+    expect(await screen.findByLabelText("New chat")).toBeInTheDocument();
   });
 });
 
@@ -233,19 +220,5 @@ describe("/chat with nothing to retrieve", () => {
     const input = await screen.findByPlaceholderText(/Ask about your notes/);
     expect(input).not.toHaveAttribute("readonly");
     expect(input).not.toHaveAttribute("aria-disabled");
-  });
-});
-
-describe("/chat breadth chrome", () => {
-  it("shows no scope picker — its only option would be 'All notes'", async () => {
-    mockTauri({
-      provider_key_get: () => "sk-test",
-      chat_history: () => ({ conversationId: null, messages: [] }),
-    });
-    renderChat();
-
-    await screen.findByPlaceholderText(/Ask about your notes/);
-    expect(screen.queryByLabelText("Chat scope")).toBeNull();
-    expect(screen.queryByText("All notes")).toBeNull();
   });
 });

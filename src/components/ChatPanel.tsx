@@ -44,6 +44,12 @@ import { cn } from "../lib/cn";
 // its answer, and cites the notes it drew from. A Scope popover controls how
 // broadly it searches (this note / this folder / all notes) as a live filter.
 
+// Conversations fetched per request (issue #95). `/chat` lists them uncapped in
+// the sidebar, so they arrive a page at a time as it scrolls. Sized to overfill
+// a tall sidebar on first paint — the point is to avoid loading hundreds, not to
+// make the common case take two round-trips.
+const PAGE_SIZE = 30;
+
 const Markdown = memo(function Markdown({ source }: { source: string }) {
   return <ReactMarkdown remarkPlugins={[remarkGfm]}>{source}</ReactMarkdown>;
 });
@@ -138,8 +144,17 @@ export type ChatSessionControls = {
   activeConversationId: string | null;
   /** Lone-empty-conversation rule (#62): nothing worth browsing → header hides history. */
   canBrowseHistory: boolean;
+  /** Whether another page of conversations might exist (#95). False once a short
+   *  page has come back, so a list viewer knows when to stop asking. */
+  hasMore: boolean;
+  /** A page fetch is in flight — for a "loading…" line, and so a viewer doesn't
+   *  need its own guard against firing twice. */
+  loadingMore: boolean;
   newChat: () => Promise<void>;
   openConversation: (id: string) => Promise<void>;
+  /** Append the next page. Safe to call repeatedly: it no-ops while a fetch is in
+   *  flight or once the end is known, which a scroll observer relies on. */
+  loadMore: () => Promise<void>;
 };
 
 export function ChatPanel({
@@ -164,6 +179,16 @@ export function ChatPanel({
   // the history popover and the history-visibility rule. Reset to [] on note /
   // workspace switch so the header hides until the fresh list is known.
   const [conversations, setConversations] = useState<ConversationMeta[]>([]);
+  // Paging state for that list (#95). `hasMore` starts true so the first "load
+  // more" is allowed to try; it settles on the first short page.
+  const [hasMoreConversations, setHasMoreConversations] = useState(true);
+  const [loadingMoreConversations, setLoadingMoreConversations] = useState(false);
+  // Refs, not state, for the two values `loadMoreConversations` reads at call
+  // time: a ref can't hand a stale closure the wrong offset, and the in-flight
+  // flag has to be set synchronously to swallow a repeat call in the same tick.
+  const conversationsRef = useRef<ConversationMeta[]>([]);
+  conversationsRef.current = conversations;
+  const loadingMoreRef = useRef(false);
   // The session the panel is on (issue #61). Single-threaded for now: it tracks
   // the note's active/most-recent conversation, captured from the history load
   // and the send result. null until resolved (or when the note has none yet).
@@ -249,20 +274,57 @@ export function ChatPanel({
     });
   }, [anchorNote]);
 
-  // Re-fetch the note's conversation list. Guarded by the switch gen so a slow
-  // list load can't clobber the list after a note/workspace switch. Stable per
-  // note so the callbacks and publish effect below keep stable identities.
+  // Re-fetch the FIRST page of the target's conversation list. Guarded by the
+  // switch gen so a slow list load can't clobber the list after a note/workspace
+  // switch. Stable per note so the callbacks and publish effect below keep stable
+  // identities.
+  //
+  // Always page one: every caller is a "something changed, show me the top of the
+  // list again" moment (initial load, "+", a send that retitled a thread), and the
+  // list is ordered most-recent first, so page one is where the change landed.
   const reloadConversationList = useCallback(
     async (gen: number) => {
       try {
-        const list = await ipc.chatListConversations(noteId);
-        if (gen === switchGenRef.current && Array.isArray(list)) setConversations(list);
+        const list = await ipc.chatListConversations(noteId, { limit: PAGE_SIZE, offset: 0 });
+        if (gen !== switchGenRef.current || !Array.isArray(list)) return;
+        setConversations(list);
+        setHasMoreConversations(list.length === PAGE_SIZE);
       } catch {
         /* keep the prior list */
       }
     },
     [noteId],
   );
+
+  // Append the next page (issue #95). A short page means the end: the backend
+  // returns fewer rows than asked for, and an empty page past the end, so this
+  // converges without needing a total count.
+  //
+  // Guarded three ways — an in-flight fetch, a known end, and the switch gen —
+  // because the sidebar's scroll observer can fire repeatedly for one gesture.
+  const loadMoreConversations = useCallback(async () => {
+    if (loadingMoreRef.current || !hasMoreConversations) return;
+    loadingMoreRef.current = true;
+    const gen = switchGenRef.current;
+    setLoadingMoreConversations(true);
+    try {
+      const offset = conversationsRef.current.length;
+      const next = await ipc.chatListConversations(noteId, { limit: PAGE_SIZE, offset });
+      if (gen !== switchGenRef.current || !Array.isArray(next)) return;
+      // De-dupe by id: a conversation that got bumped to page one between the two
+      // fetches would otherwise appear twice.
+      setConversations((prev) => {
+        const seen = new Set(prev.map((c) => c.id));
+        return [...prev, ...next.filter((c) => !seen.has(c.id))];
+      });
+      setHasMoreConversations(next.length === PAGE_SIZE);
+    } catch {
+      /* keep what we have; the observer will retry on the next scroll */
+    } finally {
+      loadingMoreRef.current = false;
+      setLoadingMoreConversations(false);
+    }
+  }, [noteId, hasMoreConversations]);
 
   // Clear the transient per-turn UI (streaming/activity/errors) and stop
   // accepting stream deltas. Shared by the note-switch load effect and every
@@ -588,8 +650,11 @@ export function ChatPanel({
       conversations,
       activeConversationId: conversationId,
       canBrowseHistory,
+      hasMore: hasMoreConversations,
+      loadingMore: loadingMoreConversations,
       newChat,
       openConversation,
+      loadMore: loadMoreConversations,
     });
   }, [
     onControls,
@@ -598,8 +663,11 @@ export function ChatPanel({
     conversations,
     conversationId,
     messages.length,
+    hasMoreConversations,
+    loadingMoreConversations,
     newChat,
     openConversation,
+    loadMoreConversations,
   ]);
 
   async function send() {

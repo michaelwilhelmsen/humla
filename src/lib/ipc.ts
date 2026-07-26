@@ -416,8 +416,16 @@ export const ipc = {
   // List / create chat sessions for a target (issue #61). Personal reads local
   // SQLite; a workspace reads/creates server-authoritative sessions. There is no
   // delete command — a deliberate v1 decision.
-  chatListConversations: (noteId: string | null) =>
-    invoke<ConversationMeta[]>("chat_list_conversations", { noteId }),
+  // `limit`/`offset` window the list, most-recent first (issue #95): `/chat`
+  // lists conversations uncapped, so it pages them in as the sidebar scrolls.
+  // Omitting `limit` returns everything, which is what the Note header's history
+  // popover has always done.
+  chatListConversations: (noteId: string | null, page?: { limit: number; offset: number }) =>
+    invoke<ConversationMeta[]>("chat_list_conversations", {
+      noteId,
+      limit: page?.limit ?? null,
+      offset: page?.offset ?? null,
+    }),
   chatNewConversation: (noteId: string | null) =>
     invoke<ConversationMeta>("chat_new_conversation", { noteId }),
   // Persist / read the Scope chip's breadth on a conversation (issue #58/#61).
