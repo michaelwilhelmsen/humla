@@ -26,6 +26,7 @@ function publish(over: Partial<ChatSessionControls> = {}) {
     newChat: vi.fn(async () => {}),
     openConversation: vi.fn(async () => {}),
     loadMore: vi.fn(async () => {}),
+    status: null,
     ...over,
   };
   useGlobalChatStore.setState({ controls });

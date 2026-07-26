@@ -244,6 +244,13 @@ select:focus, textarea:focus {
 
 textarea { resize: none; }
 
+/* Scrolls without advertising it. For surfaces that auto-scroll and are read
+   rather than navigated — the chat log, whose bar would otherwise sit on top of
+   the answer's citation chips (#95). Not for lists the user has to explore:
+   there, the bar is the only hint there's more. */
+.nd-scroll-hidden { scrollbar-width: none; -ms-overflow-style: none; }
+.nd-scroll-hidden::-webkit-scrollbar { display: none; }
+
 input::placeholder, textarea::placeholder {
   color: var(--color-text-muted);
 }

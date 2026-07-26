@@ -23,7 +23,7 @@
 
 import { useEffect } from "react";
 import { useOutletContext } from "react-router-dom";
-import { Files, Users } from "lucide-react";
+import { Files, Lock, Sparkles, Users, type LucideIcon } from "lucide-react";
 import { ChatPanel } from "../components/ChatPanel";
 import { ChatHistoryControls } from "../components/ChatHistoryControls";
 import type { LayoutOutletContext } from "../components/Layout";
@@ -36,6 +36,21 @@ import type { ChatTarget } from "../lib/chatTarget";
 // load effect off the target's note id, but a stable object costs nothing and
 // keeps the prop honest.
 const GLOBAL_TARGET: ChatTarget = { kind: "global" };
+
+/** A bordered status pill for the header row.
+ *
+ *  Not `.nd-chip`: that utility is uppercase with wide tracking — a survivor of
+ *  the pre-v0.30 aesthetic — and the current design system is sentence case
+ *  throughout. This is the note meta row's typography in a pill outline, so the
+ *  two kinds of information sit together without shouting. */
+function StatusPill({ icon: Icon, children }: { icon: LucideIcon; children: React.ReactNode }) {
+  return (
+    <span className="inline-flex items-center gap-1.5 rounded-full border border-[var(--color-line-visible)] px-2.5 py-[3px] text-[12px] text-[var(--color-text-muted)] whitespace-nowrap">
+      <Icon size={13} strokeWidth={1.7} className="opacity-75" />
+      {children}
+    </span>
+  );
+}
 
 export function Chat() {
   const { sidebarCollapsed } = useOutletContext<LayoutOutletContext>();
@@ -66,24 +81,48 @@ export function Chat() {
           )}
         </div>
 
-        {/* Meta bar, mirroring the Note view's: the identity of what you're talking
-            to, in the header rather than as a banner inside the pane. In a
-            workspace that's the tenant and — the part that actually matters — that
-            teammates can read this. In Personal it's the size of the library being
-            searched, the same count the sidebar's "All notes" shows, from the same
-            store. Not shown for a workspace, where retrieval runs server-side and
-            the local mirror can lag, so the number would be a claim we can't make.
-            `-ml-2` pulls the first chip's own padding back to the title's edge. */}
-        <div className="-ml-2 flex flex-wrap items-center">
-          {workspaceName ? (
-            <span className="nd-meta">
-              <Users size={14} strokeWidth={1.7} />
-              {workspaceName} · visible to members
+        {/* Meta row, mirroring the Note view's: who you're talking to and where it
+            goes, in the header rather than as a banner inside the pane.
+            `-ml-2` pulls the first item's own padding back to the title's edge.
+            Two kinds of thing, deliberately styled apart — identity reads flat
+            like the note's meta row, status reads as a bordered pill. */}
+        <div className="-ml-2 flex flex-wrap items-center gap-1">
+          {/* Tenant, with the same initial badge the note's meta row uses. */}
+          <span className="nd-meta">
+            <span
+              className="grid place-items-center w-[17px] h-[17px] rounded-[5px] text-[9px] font-semibold"
+              style={{ background: "var(--color-surface-raised)", color: "var(--color-text)" }}
+            >
+              {(workspaceName ?? "Personal").charAt(0).toUpperCase()}
             </span>
-          ) : (
+            {workspaceName ?? "Personal"}
+          </span>
+
+          {/* Who can read this — the highest-stakes fact on the screen, so it gets
+              the pill treatment rather than being tucked into a sentence. */}
+          <StatusPill icon={workspaceName ? Users : Lock}>
+            {workspaceName ? "All members" : "Private"}
+          </StatusPill>
+
+          {/* Personal only, on both counts. The library size is genuinely useful on
+              a surface that searches all of it — but in a workspace retrieval runs
+              server-side and the local mirror can lag, so the number would be a
+              claim we can't make. Likewise the model: a workspace turn runs on the
+              server's model, and this is the local setting (#80), which is why the
+              panel publishes it as null there. */}
+          {!workspaceName && (
             <span className="nd-meta">
               <Files size={14} strokeWidth={1.7} />
               {noteCount === 1 ? "1 note" : `${noteCount} notes`}
+            </span>
+          )}
+          {controls?.status && (
+            <span
+              className="nd-meta"
+              title={`Answering with ${controls.status.model} (${controls.status.provider}) — change it in Settings → Chat`}
+            >
+              <Sparkles size={14} strokeWidth={1.7} />
+              <span className="max-w-[220px] truncate">{controls.status.model}</span>
             </span>
           )}
         </div>

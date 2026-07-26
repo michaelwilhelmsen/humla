@@ -173,6 +173,74 @@ describe("/chat page", () => {
   });
 });
 
+describe("/chat header", () => {
+  it("states the tenant and who can read it, as separate pills", async () => {
+    signIntoWorkspace();
+    mockTauri({ chat_history: () => ({ conversationId: null, messages: [] }) });
+    renderChat();
+
+    // The visibility claim is the highest-stakes fact on the screen, so it's its
+    // own pill rather than a clause in a sentence.
+    expect(await screen.findByText("Acme Team")).toBeInTheDocument();
+    expect(screen.getByText("All members")).toBeInTheDocument();
+    // The old single-line phrasing is gone.
+    expect(screen.queryByText(/visible to members/)).toBeNull();
+  });
+
+  it("says Personal and Private outside a workspace, with the library size", async () => {
+    seedNotes(17);
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () => ({ conversationId: null, messages: [] }),
+    });
+    renderChat();
+
+    expect(await screen.findByText("Personal")).toBeInTheDocument();
+    expect(screen.getByText("Private")).toBeInTheDocument();
+    expect(screen.getByText("17 notes")).toBeInTheDocument();
+  });
+
+  it("names the answering model in the header, not the composer row", async () => {
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () => ({ conversationId: null, messages: [] }),
+      settings_get: (args) => {
+        const key = (args as { key?: string }).key;
+        if (key === "chat_model") return "gpt-5.1";
+        if (key === "onboarding_completed") return "true";
+        return null;
+      },
+    });
+    renderChat();
+
+    expect(await screen.findByText("gpt-5.1")).toBeInTheDocument();
+    // #80 put this chip in the composer row; on the page it moved to the header,
+    // and showing the same fact twice would just be clutter.
+    expect(screen.queryByTestId("chat-model-indicator")).toBeNull();
+  });
+
+  it("claims no library size or model in a workspace", async () => {
+    // Retrieval is server-side there: the local mirror can lag, and the local
+    // chat_model isn't what answers (#80). Both would be claims we can't make.
+    signIntoWorkspace();
+    seedNotes(17);
+    mockTauri({
+      chat_history: () => ({ conversationId: null, messages: [] }),
+      settings_get: (args) => {
+        const key = (args as { key?: string }).key;
+        if (key === "chat_model") return "gpt-5.1";
+        if (key === "onboarding_completed") return "true";
+        return null;
+      },
+    });
+    renderChat();
+
+    await screen.findByText("Acme Team");
+    expect(screen.queryByText("17 notes")).toBeNull();
+    expect(screen.queryByText("gpt-5.1")).toBeNull();
+  });
+});
+
 describe("/chat session chrome placement", () => {
   // Exactly one home at a time: the sidebar owns the list and the "+" while it's
   // open; collapsed, it takes them with it, so the popover fallback appears in the

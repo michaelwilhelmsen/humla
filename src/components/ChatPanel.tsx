@@ -155,6 +155,14 @@ export type ChatSessionControls = {
   /** Append the next page. Safe to call repeatedly: it no-ops while a fetch is in
    *  flight or once the end is known, which a scroll observer relies on. */
   loadMore: () => Promise<void>;
+  /** What the pane is about to answer with (#95), for a host that shows it in its
+   *  own header chrome instead of the composer row — `/chat` does.
+   *
+   *  Published rather than re-derived: `useChatReadiness` polls a local Ollama
+   *  server every 2s, so a second caller would double that probe to show one
+   *  label. Null in a workspace, where the turn runs on the SERVER's model and
+   *  this local setting would name something that isn't answering (#80). */
+  status: { provider: string; model: string } | null;
 };
 
 /** Which host the panel is rendering into (issue #95).
@@ -675,6 +683,7 @@ export function ChatPanel({
       newChat,
       openConversation,
       loadMore: loadMoreConversations,
+      status: inWorkspace || !model ? null : { provider, model },
     });
   }, [
     onControls,
@@ -688,6 +697,9 @@ export function ChatPanel({
     newChat,
     openConversation,
     loadMoreConversations,
+    inWorkspace,
+    provider,
+    model,
   ]);
 
   async function send() {
@@ -847,7 +859,7 @@ export function ChatPanel({
         aria-live="polite"
         aria-busy={bulkLoading}
         aria-label="Chat messages"
-        className={cn("flex-1 min-h-0 overflow-y-auto py-4 flex flex-col gap-3", gutter)}
+        className={cn("nd-scroll-hidden flex-1 min-h-0 overflow-y-auto py-4 flex flex-col gap-3", gutter)}
       >
         {messages.length === 0 && !sending ? (
           <div
@@ -1000,7 +1012,7 @@ export function ChatPanel({
             // box, so the two don't nest into a double border.
             onPage
               ? ""
-              : "border border-transparent transition-colors focus-within:border-[var(--color-text-muted)]",
+              : "border border-[var(--color-line)] transition-colors focus-within:border-[var(--color-text-muted)]",
           )}
         >
           <textarea
@@ -1030,7 +1042,14 @@ export function ChatPanel({
                     : "Ask about your notes…"
             }
             aria-label="Ask about your notes"
-            className="block w-full resize-none max-h-40 bg-transparent text-sm leading-relaxed pl-2 pr-11 py-2 outline-none placeholder:text-[var(--color-text-muted)] read-only:cursor-not-allowed"
+            // `.nd-bare` is the documented opt-out from the global
+            // `select, textarea` surface in globals.css — an UNLAYERED rule, so it
+            // beat every utility here: this textarea has been carrying its own 1px
+            // border, input background and 8px/12px padding all along, which is why
+            // the page variant's composer box read as double-bordered and why the
+            // padding utilities below looked ignored. The wrapper owns the surface
+            // (see the focus-visible comment above); the field itself is bare.
+            className="nd-bare block w-full resize-none max-h-40 text-sm leading-relaxed pl-2 pr-11 py-2 outline-none placeholder:text-[var(--color-text-muted)] read-only:cursor-not-allowed"
           />
           {/* Send morphs into Stop while streaming (#80), so the same spot is
               always the turn's primary control. */}
@@ -1078,8 +1097,11 @@ export function ChatPanel({
                 disabled fails contrast on interactive text (see #65).
                 Personal only: a workspace turn runs on the server's model, and
                 `model` here is the LOCAL chat_model setting, so showing it in a
-                workspace would name a model that isn't answering. */}
-            {!inWorkspace && model && (
+                workspace would name a model that isn't answering.
+                Not on the page, where it's published upward and shown in the
+                header's pill row — the same fact twice on one screen is clutter,
+                and the header is where that surface keeps its identity info. */}
+            {!onPage && !inWorkspace && model && (
               <span
                 data-testid="chat-model-indicator"
                 title={`Answering with ${model} (${provider}) — change it in Settings → Chat`}
