@@ -275,19 +275,36 @@ pub fn max_steps_for(scope: &ToolScope) -> usize {
     }
 }
 
-/// The system prompt with today's date appended.
+/// The system prompt with the turn's context appended: today's date, and who is
+/// asking.
 ///
 /// Every tool result carries absolute note dates ("2026-07-12"), which a model
 /// with no idea what today is cannot reason about — it can neither judge recency
-/// nor sanity-check what a `within_days` window returned. Composed here rather
-/// than baked into [`SYSTEM_PROMPT`] so the mirrored constant stays byte-identical
-/// across the two repos and the assembly stays testable with a fixed clock.
-pub fn system_prompt_with_date(now_ms: i64) -> String {
+/// nor sanity-check what a `within_days` window returned.
+///
+/// The asker is the referent for "I", "me" and "my" (#103). Without it a third of
+/// the questions people actually ask a meeting assistant are unresolvable. The
+/// transcript sentence matters as much as the name: the user's own speech is
+/// labelled `You:` on remote calls and often renamed to their real name after
+/// diarization, so the model needs both spellings tied together or a first-person
+/// question still misses in the very transcript that answers it.
+///
+/// Composed here rather than baked into [`SYSTEM_PROMPT`] so the mirrored constant
+/// stays byte-identical across the two repos and the assembly stays testable with
+/// a fixed clock.
+pub fn system_prompt_with_context(now_ms: i64, asker: Option<&str>) -> String {
     use chrono::{TimeZone, Utc};
-    match Utc.timestamp_millis_opt(now_ms).single() {
-        Some(dt) => format!("{SYSTEM_PROMPT}\n\nToday's date is {}.", dt.format("%Y-%m-%d")),
-        None => SYSTEM_PROMPT.to_string(),
+    let mut out = SYSTEM_PROMPT.to_string();
+    if let Some(dt) = Utc.timestamp_millis_opt(now_ms).single() {
+        out.push_str(&format!("\n\nToday's date is {}.", dt.format("%Y-%m-%d")));
     }
+    if let Some(name) = asker.map(str::trim).filter(|n| !n.is_empty()) {
+        out.push_str(&format!(
+            "\n\nYou are talking to {name}. \"I\", \"me\" and \"my\" mean {name} — including in \
+             transcripts, where their own speech may be labelled \"You:\" or with their name."
+        ));
+    }
+    out
 }
 
 /// Budget for prior turns. Older turns beyond it are dropped (oldest first).
@@ -411,6 +428,9 @@ pub async fn run_chat(
     workspace: &str,
     embedder: Option<&dyn crate::embed::EmbeddingAdapter>,
     user_text: &str,
+    // The asking user's display name, when one is known (see
+    // `system_prompt_with_context`). `None` simply omits the line.
+    asker: Option<&str>,
     mut sink: impl FnMut(ChatEvent) + Send,
 ) -> Result<()> {
     // 1. Read history and build the prospective turn list (existing + the new
@@ -430,7 +450,7 @@ pub async fn run_chat(
     // One clock reading per turn, shared by the prompt's date line and the tools'
     // relative date window, so a turn can't disagree with itself about "now".
     let now_ms = chrono::Utc::now().timestamp_millis();
-    let base = assemble_prompt(&system_prompt_with_date(now_ms), grounding, &turns)?;
+    let base = assemble_prompt(&system_prompt_with_context(now_ms, asker), grounding, &turns)?;
     eprintln!(
         "[chat] provider={} model={} turns={} grounding_chars={}",
         adapter.provider_id(),
@@ -1014,7 +1034,7 @@ mod tests {
         let adapter = FakeChatAdapter::new(["Hello world"]);
         let mut events: Vec<ChatEvent> = Vec::new();
         run_chat(
-            &dbh, &adapter, FAKE_CTX, &conv_id, "GROUNDING", &ToolScope::All, "", None, "What happened?",
+            &dbh, &adapter, FAKE_CTX, &conv_id, "GROUNDING", &ToolScope::All, "", None, "What happened?", None,
             |ev| events.push(ev),
         )
         .await
@@ -1047,7 +1067,7 @@ mod tests {
             let (dbh, _path) = temp_db(&dir);
             conv_id = conv(&dbh, "note-1");
             let adapter = FakeChatAdapter::new(["answer"]);
-            run_chat(&dbh, &adapter, FAKE_CTX, &conv_id, "G", &ToolScope::All, "", None, "hi", |_| {})
+            run_chat(&dbh, &adapter, FAKE_CTX, &conv_id, "G", &ToolScope::All, "", None, "hi", None, |_| {})
                 .await
                 .unwrap();
         }
@@ -1113,7 +1133,7 @@ mod tests {
         let (dbh, _path) = temp_db(&dir);
         let conv_id = conv(&dbh, "n");
         let res = run_chat(
-            &dbh, &FailingAdapter, FAKE_CTX, &conv_id, "G", &ToolScope::All, "", None, "hi", |_| {},
+            &dbh, &FailingAdapter, FAKE_CTX, &conv_id, "G", &ToolScope::All, "", None, "hi", None, |_| {},
         )
         .await;
         assert!(res.is_err());
@@ -1140,7 +1160,7 @@ mod tests {
         ]);
         let mut events: Vec<ChatEvent> = Vec::new();
         run_chat(
-            &dbh, &adapter, FAKE_CTX, &conv_id, "", &ToolScope::All, "", None, "what about budget?",
+            &dbh, &adapter, FAKE_CTX, &conv_id, "", &ToolScope::All, "", None, "what about budget?", None,
             |ev| events.push(ev),
         )
         .await
@@ -1184,7 +1204,7 @@ mod tests {
             &ToolScope::All,
             "",
             None,
-            "stop me",
+            "stop me", None,
             |_| {},
         )
         .await
@@ -1220,7 +1240,8 @@ mod tests {
             "",
             None,
             "search then stop",
-            // The tool finished; stop before the next step is dispatched.
+            None,
+            // The tool finished; stop before the next step is dispatched., None,
             |ev| {
                 if matches!(ev, ChatEvent::ToolActivity { .. }) {
                     flag.cancel();
@@ -1270,7 +1291,8 @@ mod tests {
             "",
             None,
             "narrate, search, then stop",
-            // The tool finished; stop before the next step is dispatched.
+            None,
+            // The tool finished; stop before the next step is dispatched., None,
             |ev| {
                 if matches!(ev, ChatEvent::ToolActivity { .. }) {
                     flag.cancel();
@@ -1315,7 +1337,7 @@ mod tests {
             &ToolScope::All,
             "",
             None,
-            "start answering then stop",
+            "start answering then stop", None,
             |ev| {
                 if matches!(ev, ChatEvent::TextDelta { .. }) {
                     flag.cancel();
@@ -1368,8 +1390,9 @@ mod tests {
             "",
             None,
             "narrate, search, answer, then stop",
+            None,
             // Stop only once the answering step is streaming — cancelling on the
-            // narration would land in the tool phase instead.
+            // narration would land in the tool phase instead., None,
             |ev| {
                 if matches!(&ev, ChatEvent::TextDelta { delta, .. } if delta.starts_with("Half")) {
                     flag.cancel();
@@ -1402,7 +1425,7 @@ mod tests {
             FakeChatAdapter::text_step("I couldn't open that note, but here's what I know."),
         ]);
         let mut events: Vec<ChatEvent> = Vec::new();
-        run_chat(&dbh, &adapter, FAKE_CTX, &conv_id, "", &ToolScope::All, "", None, "open note x", |ev| {
+        run_chat(&dbh, &adapter, FAKE_CTX, &conv_id, "", &ToolScope::All, "", None, "open note x", None, |ev| {
             events.push(ev)
         })
         .await
@@ -1429,7 +1452,7 @@ mod tests {
             .map(|_| FakeChatAdapter::tool_step("c", "search_notes", r#"{"query":"content"}"#))
             .collect();
         let adapter = FakeChatAdapter::scripted(steps);
-        run_chat(&dbh, &adapter, FAKE_CTX, &conv_id, "", &ToolScope::All, "", None, "keep going", |_| {})
+        run_chat(&dbh, &adapter, FAKE_CTX, &conv_id, "", &ToolScope::All, "", None, "keep going", None, |_| {})
             .await
             .unwrap();
 
@@ -1472,7 +1495,7 @@ mod tests {
             &ToolScope::Note(anchor),
             "",
             None,
-            "keep going",
+            "keep going", None,
             |_| {},
         )
         .await
@@ -1484,9 +1507,36 @@ mod tests {
         assert_eq!(tool_parts, MAX_STEPS_NOTE - 1, "note scope is unchanged by the deeper budget");
     }
 
+    /// #103: the asker is the referent for "I"/"me"/"my". Without it a third of
+    /// the questions people actually ask are unresolvable.
+    #[test]
+    fn the_prompt_names_who_is_asking_and_ties_them_to_the_transcript() {
+        let p = system_prompt_with_context(1_785_024_000_000, Some("Michael"));
+        assert!(p.contains("You are talking to Michael."), "{p}");
+        assert!(p.contains("\"I\", \"me\" and \"my\" mean Michael"), "{p}");
+        // The user's own speech is labelled `You:` on remote calls and often
+        // renamed after diarization — without both spellings tied together, a
+        // first-person question still misses in the transcript that answers it.
+        assert!(p.contains("\"You:\""), "{p}");
+        // Context appended to the mirrored constant, never a rewrite of it.
+        assert!(p.starts_with(SYSTEM_PROMPT));
+        assert!(!SYSTEM_PROMPT.contains("You are talking to"));
+        // The date line survives alongside it.
+        assert!(p.contains("Today's date is 2026-07-26."));
+    }
+
+    #[test]
+    fn an_unknown_asker_costs_nothing_but_the_asker_line() {
+        for asker in [None, Some(""), Some("   ")] {
+            let p = system_prompt_with_context(1_785_024_000_000, asker);
+            assert!(!p.contains("You are talking to"), "{asker:?}");
+            assert!(p.contains("Today's date is 2026-07-26."), "{asker:?}");
+        }
+    }
+
     #[test]
     fn the_prompt_tells_the_model_todays_date_without_touching_the_mirrored_constant() {
-        let with_date = system_prompt_with_date(1_785_024_000_000); // 2026-07-26
+        let with_date = system_prompt_with_context(1_785_024_000_000, None); // 2026-07-26
         assert!(with_date.starts_with(SYSTEM_PROMPT));
         assert!(with_date.contains("Today's date is 2026-07-26."));
         // Every tool result carries absolute note dates; without this line the
@@ -1516,7 +1566,7 @@ mod tests {
         };
         let adapter =
             FakeChatAdapter::scripted(vec![preamble, FakeChatAdapter::text_step("The answer.")]);
-        run_chat(&dbh, &adapter, FAKE_CTX, &conv_id, "", &ToolScope::All, "", None, "q", |_| {})
+        run_chat(&dbh, &adapter, FAKE_CTX, &conv_id, "", &ToolScope::All, "", None, "q", None, |_| {})
             .await
             .unwrap();
 
@@ -1559,7 +1609,7 @@ mod tests {
         let mut events: Vec<ChatEvent> = Vec::new();
         run_chat(
             &dbh, &adapter, FAKE_CTX, &conv_id, "", &ToolScope::All, "", Some(&FailingEmbedder),
-            "budget?", |ev| events.push(ev),
+            "budget?", None, |ev| events.push(ev),
         )
         .await
         .unwrap();
@@ -1588,7 +1638,7 @@ mod tests {
         let mut events: Vec<ChatEvent> = Vec::new();
         run_chat(
             &dbh, &adapter, FAKE_CTX, &conv_id, "", &ToolScope::Note(anchor.clone()), "", None,
-            "find it", |ev| events.push(ev),
+            "find it", None, |ev| events.push(ev),
         )
         .await
         .unwrap();

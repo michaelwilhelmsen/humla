@@ -95,6 +95,9 @@ const MS_PER_DAY: i64 = 86_400_000;
 /// The two ends of the relative date window, in tool-argument form.
 const ARG_WITHIN: &str = "within_days";
 const ARG_UNTIL: &str = "until_days";
+/// Restrict to notes the asker created. See the spec comment for why this is a
+/// truthful no-op on the local path.
+const ARG_MINE: &str = "mine_only";
 /// Per-excerpt / per-note text budget in the compact model view.
 const EXCERPT_CHARS: usize = 320;
 const GET_NOTE_CHARS: usize = 6_000;
@@ -115,6 +118,14 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         // ends count back from today, so a window that ENDS in the past is still
         // expressible without either side knowing the calendar (#106).
         ARG_WITHIN: { "type": "integer", "description": "Optional: only notes from the last N days (e.g. 7 for last week)." },
+        // Authorship, not relevance — a flag, not an id the model has to learn.
+        //
+        // On THIS path it is a truthful no-op: the local tools only ever answer a
+        // Personal turn (a workspace turn retrieves server-side), and in Personal
+        // every note is the user's own, so "only mine" is the identity function.
+        // It is still advertised, because the two schemas are pinned equivalent —
+        // and a model that passes it here gets exactly what it asked for.
+        ARG_MINE: { "type": "boolean", "description": "Optional: only notes the person asking created themselves. Use for questions about what I said, promised, or was told." },
         ARG_UNTIL: { "type": "integer", "description": "Optional: exclude notes from the last N days, so the window ends in the past. With within_days it makes a past window: within_days 35 + until_days 7 = the four weeks before last week." },
     });
     vec![
@@ -129,6 +140,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                     "client_id": filters["client_id"],
                     ARG_WITHIN: filters[ARG_WITHIN],
                     ARG_UNTIL: filters[ARG_UNTIL],
+                    ARG_MINE: filters[ARG_MINE],
                 },
                 "required": ["query"],
             }),
@@ -154,6 +166,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                     "client_id": filters["client_id"],
                     ARG_WITHIN: filters[ARG_WITHIN],
                     ARG_UNTIL: filters[ARG_UNTIL],
+                    ARG_MINE: filters[ARG_MINE],
                 },
             }),
         },
@@ -608,6 +621,25 @@ mod tests {
     fn set_summary(conn: &Connection, id: &str, summary: &str) {
         db::update_note(conn, id, &db::NotePatch { summary: Some(summary.into()), ..Default::default() })
             .unwrap();
+    }
+
+    /// #103: the local path only ever answers a PERSONAL turn (a workspace turn
+    /// retrieves server-side), and in Personal every note is the user's own — so
+    /// "only mine" is the identity function here, not an ignored argument. It is
+    /// still advertised, because the two schemas are pinned equivalent.
+    #[test]
+    fn mine_only_is_advertised_and_is_a_truthful_no_op_in_personal() {
+        let conn = open();
+        seed(&conn, "Mine", "the budget came up");
+        for tool in [TOOL_LIST, TOOL_SEARCH] {
+            let out = exec(&conn, "", &ToolScope::All, tool, &json!({ "query": "budget", ARG_MINE: true }));
+            assert!(!out.is_error, "{tool}");
+            assert!(out.model_text.contains("Mine"), "{tool} returned the user's own note");
+        }
+        // Advertised on both filtering tools, as a boolean.
+        for spec in tool_specs().into_iter().filter(|s| s.name != TOOL_GET) {
+            assert_eq!(spec.parameters["properties"][ARG_MINE]["type"], "boolean", "{}", spec.name);
+        }
     }
 
     #[test]
@@ -1101,9 +1133,9 @@ mod pairwise_tests {
     #[test]
     fn the_tool_surface_is_identical_to_the_cloud_schema() {
         let expected = "\
-search_notes(client_id:string, folder_id:string, query:string!, until_days:integer, within_days:integer)
+search_notes(client_id:string, folder_id:string, mine_only:boolean, query:string!, until_days:integer, within_days:integer)
 get_note(note_id:string!)
-list_notes(client_id:string, folder_id:string, until_days:integer, within_days:integer)";
+list_notes(client_id:string, folder_id:string, mine_only:boolean, until_days:integer, within_days:integer)";
         assert_eq!(surface(), expected, "\nupdate humla-cloud/chat-service/src/tools.test.ts in lockstep");
     }
 }

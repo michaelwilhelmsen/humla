@@ -11,6 +11,10 @@ use crate::db::{self, ChatTarget, CHAT_TENANT_PERSONAL};
 use crate::embed::{self, EmbeddingAdapter, OLLAMA_EMBED_MODEL, OPENAI_EMBED_MODEL};
 use crate::openai;
 use crate::AppState;
+
+/// A user-set display name for chat's first-person referent (#103). Empty/unset
+/// falls back to the macOS account name — see [`asker_name`].
+pub(crate) const SETTING_DISPLAY_NAME: &str = "user_display_name";
 use parking_lot::Mutex;
 use rusqlite::Connection;
 use serde::Serialize;
@@ -780,6 +784,46 @@ pub async fn chat_usage(app: AppHandle) -> Result<Option<chat::cloud::UsageDto>,
     Ok(usage_cloud(&state, &workspace).await)
 }
 
+/// The name to call the person asking, or `None` when we genuinely don't know
+/// one. It is the referent for "I"/"me"/"my" in a turn (#103) — without it, a
+/// third of the questions people ask a meeting assistant can't be resolved.
+///
+/// Two sources, in order:
+///
+/// 1. The `user_display_name` setting, when the user has set one.
+/// 2. The macOS account's full name.
+///
+/// The OS name matters because it's the ONLY one the local-only majority has:
+/// Humla has no local account, and a cloud display name exists only once you've
+/// signed in. Falling back to it is what keeps "what did I promise?" answerable
+/// for a user who never signs in to anything. A short login name (`msmith`) is
+/// deliberately not used — as a referent it's worse than nothing.
+///
+/// Never fatal: any failure just omits the line from the prompt.
+pub(crate) fn asker_name(conn: &rusqlite::Connection) -> Option<String> {
+    let configured = crate::db::get_setting(conn, SETTING_DISPLAY_NAME)
+        .ok()
+        .flatten()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+    configured.or_else(os_full_name)
+}
+
+/// The macOS account's full name ("Michael Wilhelmsen"), via `id -F`. `None` if
+/// the command is unavailable, fails, or returns something empty.
+fn os_full_name() -> Option<String> {
+    let out = std::process::Command::new("/usr/bin/id").arg("-F").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
 /// How the workspace's retrieval index looks to search — `ready` / `empty` /
 /// `quarantined` — so the chat pane can tell "your library is empty" apart from
 /// "the index is still building" (issue #102).
@@ -1092,6 +1136,13 @@ pub async fn chat_send(
         think: resolved.think,
         cancel: turn.flag(),
     };
+    // Who is asking, for the prompt's first-person referent (#103). Resolved here
+    // rather than inside run_chat so the prompt's inputs stay explicit and the
+    // loop's tests stay independent of the host machine's account name.
+    let asker = {
+        let conn = state.db.lock();
+        asker_name(&conn)
+    };
     let result = chat::run_chat(
         &state.db,
         adapter.as_ref(),
@@ -1102,6 +1153,7 @@ pub async fn chat_send(
         &workspace,
         Some(&embedder as &dyn EmbeddingAdapter),
         &message,
+        asker.as_deref(),
         sink,
     )
     .await;
