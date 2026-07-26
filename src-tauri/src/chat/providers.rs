@@ -254,6 +254,13 @@ impl FakeChatAdapter {
         }
     }
 
+    /// A tool step that narrates first — a real provider streams prose like
+    /// "Let me search your notes…" alongside its tool call, and that prose has
+    /// already reached the UI by the time the tool runs (issue #98).
+    pub fn narrated_tool_step(text: &str, id: &str, name: &str, arguments: &str) -> ChatStep {
+        ChatStep { text: text.into(), ..Self::tool_step(id, name, arguments) }
+    }
+
     pub fn text_step(text: &str) -> ChatStep {
         ChatStep { text: text.into(), tool_calls: Vec::new() }
     }
@@ -283,6 +290,11 @@ impl ChatAdapter for FakeChatAdapter {
         // offer; on the forced final step (tools dropped) fall back to its text
         // so the loop always terminates with an answer.
         if !step.tool_calls.is_empty() && !tools.is_empty() {
+            // Prose accompanying a tool call streams before the call, same as a
+            // real provider's SSE ordering.
+            if !step.text.is_empty() {
+                on_event(ChatStreamEvent::TextDelta(step.text.clone()));
+            }
             for tc in &step.tool_calls {
                 on_event(ChatStreamEvent::ToolCall(tc.clone()));
             }
