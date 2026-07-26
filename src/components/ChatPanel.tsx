@@ -33,6 +33,7 @@ import { useChatReadiness } from "./provider/useChatReadiness";
 import { SelectablePopover, type PopoverItem } from "./SelectablePopover";
 import { ChatKeyEntry } from "./ChatKeyEntry";
 import { usageTone, liveChatErrorCopy, groundingLikelyTruncated } from "../lib/chatSessions";
+import { targetNoteId, targetKey, targetDefaultScope, type ChatTarget } from "../lib/chatTarget";
 import { NOTE_PROMPTS, opensPromptPicker, type ChatPrompt } from "../lib/chatPrompts";
 import { RECOMMENDED_OLLAMA_MODEL } from "../lib/localModels";
 import { CommandSnippet } from "./CommandSnippet";
@@ -129,9 +130,10 @@ function toolPastLabel(name: string, count: number): string {
 // the sole owner of conversationId/messages; this is a read-only projection plus
 // action callbacks.
 export type ChatSessionControls = {
-  /** The note these controls belong to — lets the header ignore a stale
-   *  projection for one frame after a note switch. */
-  noteId: string;
+  /** The target these controls belong to, as a stable scalar (`targetKey`) — lets
+   *  the header ignore a stale projection for one frame after a switch. A key
+   *  rather than the target object because the comparison must be by value. */
+  targetKey: string;
   conversations: ConversationMeta[];
   activeConversationId: string | null;
   /** Lone-empty-conversation rule (#62): nothing worth browsing → header hides history. */
@@ -141,12 +143,20 @@ export type ChatSessionControls = {
 };
 
 export function ChatPanel({
-  noteId,
+  target,
   onControls,
 }: {
-  noteId: string;
+  target: ChatTarget;
   onControls?: (controls: ChatSessionControls | null) => void;
 }) {
+  // The anchor note id for IPC — null means the whole library (#93). This is also
+  // the pane's dependency identity: it's already a stable scalar and `null` is
+  // exactly "global", so a change in it is exactly a change of target. Depending on
+  // `target` itself would re-run the load effect forever, since the parent rebuilds
+  // the object on most renders.
+  const noteId = targetNoteId(target);
+  // Non-nullable identity for the projection the Note header compares by value.
+  const paneKey = targetKey(target);
   const { loading: readinessLoading, ready, hint, provider, model } = useChatReadiness();
   const [messages, setMessages] = useState<ChatMessageDto[]>([]);
   // This Note's conversations (issue #61/#62), most-recent first from the
@@ -172,7 +182,7 @@ export function ChatPanel({
   const [truncated, setTruncated] = useState(false);
   // Scope chip breadth. Display state only — the backend conversation row is the
   // source of truth (issue #58); this mirrors it and is (re)initialised from it.
-  const [scope, setScope] = useState<ChatScope>("note");
+  const [scope, setScope] = useState<ChatScope>(() => targetDefaultScope(target));
   // Prompt picker visibility (#80). Opened by typing "/" into an empty composer;
   // the picker owns the keys while it's up (it takes focus), so the composer's
   // own key handler doesn't need to know about Escape.
@@ -202,8 +212,11 @@ export function ChatPanel({
   // leak into the conversation the user switched to (#62).
   const switchGenRef = useRef(0);
 
-  // The anchor note's folder drives the "this folder" scope option.
+  // The anchor note's folder drives the "this folder" scope option. A library-wide
+  // pane has no anchor, so no folder option — the store lookup is skipped rather
+  // than searched for a null id.
   const folder = useNotesStore((s) => {
+    if (noteId === null) return null;
     const note = s.notes.find((n) => n.id === noteId);
     const fid = note?.folder_id;
     return fid ? s.folders.find((f) => f.id === fid) ?? null : null;
@@ -211,8 +224,12 @@ export function ChatPanel({
 
   // The anchor note itself, for the pre-emptive truncation hint (#80). Selected
   // as the stored object — a derived `{...}` literal would be a fresh snapshot
-  // on every call and spin useSyncExternalStore into an update loop.
-  const anchorNote = useNotesStore((s) => s.notes.find((n) => n.id === noteId) ?? null);
+  // on every call and spin useSyncExternalStore into an update loop. Null for a
+  // library-wide pane, which injects no note content and so can't overflow the
+  // grounding budget.
+  const anchorNote = useNotesStore((s) =>
+    noteId === null ? null : s.notes.find((n) => n.id === noteId) ?? null,
+  );
   const likelyTruncated = useMemo(() => {
     if (!anchorNote) return false;
     // Body is HTML in the store but plain text in the prompt — measure the text,
@@ -277,7 +294,7 @@ export function ChatPanel({
       if (gen !== switchGenRef.current || !meta) return;
       setConversationId(meta.id);
       setMessages([]);
-      setScope(meta.breadth ?? "note");
+      setScope(meta.breadth ?? targetDefaultScope(target));
       setConversations((prev) => [meta, ...prev.filter((c) => c.id !== meta.id)]);
       void reloadConversationList(gen);
     } catch (e) {
@@ -434,13 +451,15 @@ export function ChatPanel({
         if (!cancelled && gen === switchGenRef.current && b) setScope(b);
       })
       .catch(() => {
-        if (!cancelled && gen === switchGenRef.current) setScope("note");
+        if (!cancelled && gen === switchGenRef.current) setScope(targetDefaultScope(target));
       });
     void reloadConversationList(gen);
     void refreshActivation(gen);
     return () => {
       cancelled = true;
-      void ipc.chatReindexNote(noteId).catch(() => {});
+      // Keep the anchor searchable on the way out. A library-wide pane has no
+      // anchor to reindex — every note is reindexed at its own checkpoints.
+      if (noteId !== null) void ipc.chatReindexNote(noteId).catch(() => {});
     };
   }, [noteId, workspaceId, billingEnabled, reloadConversationList, refreshActivation, resetTransient]);
 
@@ -539,7 +558,7 @@ export function ChatPanel({
       conversations.some((c) => c.messageCount > 0) ||
       messages.length > 0;
     onControls({
-      noteId,
+      targetKey: paneKey,
       conversations,
       activeConversationId: conversationId,
       canBrowseHistory,
@@ -549,7 +568,7 @@ export function ChatPanel({
   }, [
     onControls,
     paneUsable,
-    noteId,
+    paneKey,
     conversations,
     conversationId,
     messages.length,
@@ -871,6 +890,8 @@ export function ChatPanel({
               scope={scope}
               onScope={selectBreadth}
               folderName={folder?.name ?? null}
+              hasAnchor={noteId !== null}
+              fallbackScope={targetDefaultScope(target)}
             />
             {/* Which model is about to answer (#80) — previously invisible
                 without opening Settings. Muted, not disabled: --color-text-
@@ -1059,15 +1080,32 @@ function BreadthPicker({
   scope,
   onScope,
   folderName,
+  hasAnchor,
+  fallbackScope,
 }: {
   scope: ChatScope;
   onScope: (s: ChatScope) => void;
   folderName: string | null;
+  /** False for a library-wide pane (#94), which has no anchor note — so neither
+   *  "This note" nor "Folder: …" is offerable. The backend enforces the same rule
+   *  (`chat::check_anchor`), so offering them would let the chip show a breadth
+   *  the next write is guaranteed to reject. */
+  hasAnchor: boolean;
+  /** Where an unselectable or vanished breadth falls back to. */
+  fallbackScope: ChatScope;
 }) {
   // Per-scope icons so the options read at a glance (#69). Colour inherited.
   const items: PopoverItem[] = [
-    { id: "note", label: "This note", icon: <FileText size={14} strokeWidth={1.7} aria-hidden="true" /> },
-    ...(folderName
+    ...(hasAnchor
+      ? [
+          {
+            id: "note",
+            label: "This note",
+            icon: <FileText size={14} strokeWidth={1.7} aria-hidden="true" />,
+          },
+        ]
+      : []),
+    ...(hasAnchor && folderName
       ? [
           {
             id: "folder",
@@ -1078,17 +1116,19 @@ function BreadthPicker({
       : []),
     { id: "all", label: "All notes", icon: <Files size={14} strokeWidth={1.7} aria-hidden="true" /> },
   ];
-  // If the folder disappears while "folder" is selected, fall back to "note".
-  const activeId = scope === "folder" && !folderName ? "note" : scope;
+  // If the folder disappears while "folder" is selected — or the pane has no
+  // anchor at all — fall back to the pane's own default.
+  const selectable = items.some((i) => i.id === scope);
+  const activeId = selectable ? scope : fallbackScope;
   const active = items.find((i) => i.id === activeId);
-  const label = active?.label ?? "This note";
+  const label = active?.label ?? "All notes";
 
   return (
     <SelectablePopover
       ariaLabel="Chat scope"
       items={items}
       activeId={activeId}
-      onSelect={(id) => onScope((id as ChatScope) ?? "note")}
+      onSelect={(id) => onScope((id as ChatScope) ?? fallbackScope)}
       trigger={
         <span className="inline-flex items-center gap-1 text-xs text-[var(--color-text-muted)] cursor-pointer hover:text-[var(--color-text)] transition-colors">
           {active?.icon}

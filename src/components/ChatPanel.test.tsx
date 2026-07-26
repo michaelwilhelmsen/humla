@@ -109,7 +109,7 @@ function history(messages: ChatMessageDto[] = []) {
 function renderPanel(noteId = "n1") {
   return render(
     <MemoryRouter>
-      <ChatPanel noteId={noteId} />
+      <ChatPanel target={{ kind: "note", noteId }} />
     </MemoryRouter>,
   );
 }
@@ -122,7 +122,7 @@ function renderWithControls(noteId = "n1") {
   render(
     <MemoryRouter>
       <ChatPanel
-        noteId={noteId}
+        target={{ kind: "note", noteId }}
         onControls={(c) => {
           captured.current = c;
         }}
@@ -436,6 +436,117 @@ describe("ChatPanel scope breadth (#58)", () => {
     fireEvent.click(await screen.findByText("All notes"));
     await waitFor(() => expect(setArgs?.breadth).toBe("all"));
     expect(setArgs?.noteId).toBe("n1");
+  });
+});
+
+// #94: the panel is parameterised by a target, so a library-wide pane renders
+// from the same component. No route reaches one yet (#95), so it's exercised
+// here — the refactor's whole claim is that this works without a second
+// implementation.
+describe("ChatPanel with a library-wide target (#94)", () => {
+  function renderGlobal() {
+    return render(
+      <MemoryRouter>
+        <ChatPanel target={{ kind: "global" }} />
+      </MemoryRouter>,
+    );
+  }
+
+  it("sends a null anchor to every chat command, never an empty string", async () => {
+    // `null` is the wire value that means "the whole library"; the backend
+    // REJECTS "" outright (#93), so an empty string here would be a hard error.
+    const seen: Record<string, unknown> = {};
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: (args) => {
+        seen.history = args;
+        return history();
+      },
+      chat_get_breadth: (args) => {
+        seen.breadth = args;
+        return "all";
+      },
+      chat_list_conversations: (args) => {
+        seen.list = args;
+        return [];
+      },
+    });
+    renderGlobal();
+
+    await waitFor(() => expect(seen.history).toBeDefined());
+    for (const [name, args] of Object.entries(seen)) {
+      expect((args as { noteId?: unknown }).noteId, `${name} anchor`).toBeNull();
+    }
+  });
+
+  it("defaults its scope to all notes and offers no anchor-dependent option", async () => {
+    // A library-wide conversation has no anchor to narrow to, so BOTH "This note"
+    // and "Folder: …" are meaningless — and offering either would let the chip
+    // show a breadth the backend's `check_anchor` is guaranteed to reject, so the
+    // chip would end up lying about what the next turn will search. Seeding a note
+    // with a folder proves the options are absent because there's no ANCHOR, not
+    // because no folder exists.
+    seedNoteWithFolder();
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () => history(),
+      // The backend can't be read → the pane must fall back to "all", not "note".
+      chat_get_breadth: () => {
+        throw new Error("unavailable");
+      },
+    });
+    renderGlobal();
+
+    const scopeButton = await screen.findByRole("button", { name: "Chat scope" });
+    await waitFor(() => expect(scopeButton).toHaveTextContent(/all notes/i));
+    fireEvent.click(scopeButton);
+    expect(screen.queryByText(/^Folder:/)).toBeNull();
+    expect(screen.queryByText("This note")).toBeNull();
+    // "All notes" is the only option (it appears twice — the trigger and the row).
+    expect(screen.getAllByText("All notes").length).toBeGreaterThan(0);
+  });
+
+  it("keeps the note pane's own scope options intact", async () => {
+    // The other half of the same rule: an anchored pane still offers everything it
+    // did before. This is the regression the suppression above could cause.
+    seedNoteWithFolder();
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () => history(),
+      chat_get_breadth: () => "note",
+    });
+    renderPanel();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Chat scope" }));
+    // "This note" appears twice (trigger + row); the other two once each.
+    await waitFor(() => expect(screen.getAllByText("This note").length).toBeGreaterThan(0));
+    expect(screen.getByText(/^Folder:/)).toBeInTheDocument();
+    expect(screen.getByText("All notes")).toBeInTheDocument();
+  });
+
+  it("publishes controls under a target key distinct from any note's", async () => {
+    // The header's stale-projection guard compares this key, so a library pane's
+    // projection must never be mistaken for note "global"'s and vice versa.
+    const captured: { current: ChatSessionControls | null } = { current: null };
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () => history(),
+      chat_get_breadth: () => "all",
+      chat_list_conversations: () => [],
+    });
+    render(
+      <MemoryRouter>
+        <ChatPanel
+          target={{ kind: "global" }}
+          onControls={(c) => {
+            captured.current = c;
+          }}
+        />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(captured.current).not.toBeNull());
+    expect(captured.current?.targetKey).toBe("global");
+    expect(captured.current?.targetKey).not.toBe("note:global");
   });
 });
 
