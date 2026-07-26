@@ -1336,7 +1336,24 @@ pub struct NoteMeta {
     pub created_at: i64,
     pub folder_id: Option<String>,
     pub client_id: Option<String>,
+    /// The tagged Client's display name, resolved at query time. Carried because a
+    /// bare `client_id` is unusable to the model: it can only pass an id it has
+    /// seen, and a per-client answer has to name the client in prose (#105).
+    pub client_name: Option<String>,
     pub summary: String,
+}
+
+/// A search's hits *and* how many notes actually matched — two different numbers
+/// the model needs separately (#106). Eight excerpts out of forty matching notes
+/// and eight out of eight look identical otherwise, and absence from a top-k list
+/// reads exactly like absence from the library.
+///
+/// `matched_notes` is exact (see [`count_matching_notes`]); `None` means the query
+/// had no countable predicate, which callers report as unknown, never as zero.
+#[derive(Debug, Clone)]
+pub struct SearchOutcome {
+    pub hits: Vec<ChunkHit>,
+    pub matched_notes: Option<usize>,
 }
 
 /// Independent, combinable Note filters for retrieval. Every field is optional
@@ -1351,6 +1368,10 @@ pub struct NoteFilter<'a> {
     /// Optional lower bound on note creation time (ms epoch) — backs the retrieval
     /// tools' relative date window (#81). Narrows only; the breadth clamp still wins.
     pub since_ms: Option<i64>,
+    /// Optional UPPER bound on note creation time (ms epoch), EXCLUSIVE — the other
+    /// half of a bounded window (#106). Exclusive so successive windows tile without
+    /// double-counting the note that sits exactly on the boundary.
+    pub until_ms: Option<i64>,
 }
 
 /// Split arbitrary text into ~`target`-char chunks, breaking on blank-line
@@ -1749,6 +1770,14 @@ fn push_note_filters(
         args.push(Value::Integer(since));
         sql.push_str(&format!(" AND {t}.created_at >= ?{}", args.len()));
     }
+    // The upper bound is EXCLUSIVE against the lower bound's inclusive `>=`, so
+    // adjacent windows ([a,b) then [b,c)) tile with neither a gap nor a note
+    // counted twice — the property "compare this week with the previous four
+    // weeks" depends on (#106).
+    if let Some(until) = filter.until_ms {
+        args.push(Value::Integer(until));
+        sql.push_str(&format!(" AND {t}.created_at < ?{}", args.len()));
+    }
 }
 
 /// The size of each per-signal candidate pool fused by RRF. Bigger than the
@@ -1809,12 +1838,18 @@ pub fn hybrid_search_chunks(
     filter: NoteFilter<'_>,
     workspace: &str,
     limit: usize,
-) -> Result<Vec<ChunkHit>> {
+) -> Result<SearchOutcome> {
+    // Counted under the SAME filter as the hits, in the same call, so the two
+    // numbers can never describe different question shapes.
+    let matched_notes = count_matching_notes(conn, query, filter, workspace)?;
     let keyword = keyword_ranked(conn, query, filter, workspace, HYBRID_POOL)?;
     // Keyword-only: no query embedding, or nothing embedded yet under this model
     // (issue #48 graceful degradation).
     let keyword_only = |kw: Vec<IdentifiedHit>| {
-        Ok(diversify(kw.into_iter().map(|ih| ih.hit).collect(), limit, PER_NOTE_CAP))
+        Ok(SearchOutcome {
+            hits: diversify(kw.into_iter().map(|ih| ih.hit).collect(), limit, PER_NOTE_CAP),
+            matched_notes,
+        })
     };
     let Some(qv) = query_vec else {
         return keyword_only(keyword);
@@ -1837,7 +1872,39 @@ pub fn hybrid_search_chunks(
             h
         }))
         .collect();
-    Ok(diversify(ranked, limit, PER_NOTE_CAP))
+    Ok(SearchOutcome { hits: diversify(ranked, limit, PER_NOTE_CAP), matched_notes })
+}
+
+/// How many DISTINCT live notes the keyword predicate matches, under the same
+/// filter as the search itself — exactly, with no pool ceiling, so the caller
+/// never has to hedge the number as a floor.
+///
+/// Deliberately the KEYWORD leg only. The semantic leg is a *ranking*, not a
+/// predicate: a KNN query returns its k nearest chunks for any input, so every
+/// note "matches" it and a count over the fused pool would report roughly the
+/// whole library for every question — which is worse than no count at all.
+/// `None` means there is no predicate to count (the query carries no usable FTS
+/// term), which the caller must report as *unknown* rather than as zero.
+fn count_matching_notes(
+    conn: &Connection,
+    query: &str,
+    filter: NoteFilter<'_>,
+    workspace: &str,
+) -> Result<Option<usize>> {
+    let Some(match_expr) = fts_match_query(query) else {
+        return Ok(None);
+    };
+    use rusqlite::types::Value;
+    let mut sql = String::from(
+        "SELECT COUNT(DISTINCT c.note_id) FROM note_chunks_fts f \
+         JOIN note_chunks c ON c.id = f.chunk_id \
+         JOIN notes n ON n.id = c.note_id \
+         WHERE note_chunks_fts MATCH ?1 AND n.workspace_id = ?2 AND n.deleted_at IS NULL",
+    );
+    let mut args: Vec<Value> = vec![Value::Text(match_expr), Value::Text(workspace.to_string())];
+    push_note_filters(&mut sql, &mut args, filter, "n");
+    let count: i64 = conn.query_row(&sql, rusqlite::params_from_iter(args), |row| row.get(0))?;
+    Ok(Some(count.max(0) as usize))
 }
 
 /// List live Notes in a workspace, optionally narrowed by folder and/or client,
@@ -1849,8 +1916,11 @@ pub fn list_notes_filtered(
     limit: usize,
 ) -> Result<Vec<NoteMeta>> {
     use rusqlite::types::Value;
+    // LEFT JOIN, not an inner one: an untagged note (the common case) must still be
+    // listed, and so must a note whose Client row hasn't arrived from sync yet.
     let mut sql = String::from(
-        "SELECT n.id, n.title, n.created_at, n.folder_id, n.client_id, n.summary FROM notes n \
+        "SELECT n.id, n.title, n.created_at, n.folder_id, n.client_id, cl.name, n.summary \
+         FROM notes n LEFT JOIN clients cl ON cl.id = n.client_id \
          WHERE n.workspace_id = ?1 AND n.deleted_at IS NULL",
     );
     let mut args: Vec<Value> = vec![Value::Text(workspace.to_string())];
@@ -1873,7 +1943,8 @@ pub fn list_notes_filtered(
                 created_at: row.get(2)?,
                 folder_id: row.get(3)?,
                 client_id: row.get(4)?,
-                summary: row.get(5)?,
+                client_name: row.get(5)?,
+                summary: row.get(6)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -2738,7 +2809,7 @@ mod tests {
         reindex_note(&conn, &a.id, &na.body, &na.transcript, &na.summary).unwrap();
         reindex_note(&conn, &b.id, &nb.body, &nb.transcript, &nb.summary).unwrap();
 
-        let hits = hybrid_search_chunks(&conn, "budget", None, "", NoteFilter::default(), "", 10).unwrap();
+        let hits = hybrid_search_chunks(&conn, "budget", None, "", NoteFilter::default(), "", 10).unwrap().hits;
         assert_eq!(hits.len(), 1, "only the budget note matches");
         assert_eq!(hits[0].note_id, a.id);
         assert_eq!(hits[0].note_title, "Budget planning");
@@ -2746,12 +2817,12 @@ mod tests {
 
         // Punctuation / operator chars in the query don't blow up FTS5.
         let safe =
-            hybrid_search_chunks(&conn, "budget: \"marketing\" -foo*", None, "", NoteFilter::default(), "", 10).unwrap();
+            hybrid_search_chunks(&conn, "budget: \"marketing\" -foo*", None, "", NoteFilter::default(), "", 10).unwrap().hits;
         assert!(!safe.is_empty(), "sanitised query still matches");
 
         // A gibberish query returns nothing rather than erroring.
-        assert!(hybrid_search_chunks(&conn, "!!!@@@", None, "", NoteFilter::default(), "", 10).unwrap().is_empty());
-        assert!(hybrid_search_chunks(&conn, "zzzzznope", None, "", NoteFilter::default(), "", 10).unwrap().is_empty());
+        assert!(hybrid_search_chunks(&conn, "!!!@@@", None, "", NoteFilter::default(), "", 10).unwrap().hits.is_empty());
+        assert!(hybrid_search_chunks(&conn, "zzzzznope", None, "", NoteFilter::default(), "", 10).unwrap().hits.is_empty());
     }
 
     #[test]
@@ -2769,10 +2840,10 @@ mod tests {
 
         // Old content is no longer findable after an edit; new content is.
         reindex_note(&conn, &n.id, "hello world", "", "").unwrap();
-        assert_eq!(hybrid_search_chunks(&conn, "world", None, "", NoteFilter::default(), "", 10).unwrap().len(), 1);
+        assert_eq!(hybrid_search_chunks(&conn, "world", None, "", NoteFilter::default(), "", 10).unwrap().hits.len(), 1);
         reindex_note(&conn, &n.id, "totally different", "", "").unwrap();
-        assert!(hybrid_search_chunks(&conn, "world", None, "", NoteFilter::default(), "", 10).unwrap().is_empty());
-        assert_eq!(hybrid_search_chunks(&conn, "different", None, "", NoteFilter::default(), "", 10).unwrap().len(), 1);
+        assert!(hybrid_search_chunks(&conn, "world", None, "", NoteFilter::default(), "", 10).unwrap().hits.is_empty());
+        assert_eq!(hybrid_search_chunks(&conn, "different", None, "", NoteFilter::default(), "", 10).unwrap().hits.len(), 1);
     }
 
     #[test]
@@ -2812,14 +2883,14 @@ mod tests {
             NoteFilter { folder_id: Some(&folder.id), client_id: Some(&client.id), ..Default::default() };
         let f_note = NoteFilter { note_id: Some(&outside.id), ..Default::default() };
 
-        assert_eq!(hybrid_search_chunks(&conn, "keyword", None, "", NoteFilter::default(), "", 10).unwrap().len(), 2, "unfiltered sees both");
-        let by_folder = hybrid_search_chunks(&conn, "keyword", None, "", f_folder, "", 10).unwrap();
+        assert_eq!(hybrid_search_chunks(&conn, "keyword", None, "", NoteFilter::default(), "", 10).unwrap().hits.len(), 2, "unfiltered sees both");
+        let by_folder = hybrid_search_chunks(&conn, "keyword", None, "", f_folder, "", 10).unwrap().hits;
         assert_eq!(by_folder.len(), 1);
         assert_eq!(by_folder[0].note_id, inside.id);
         // folder AND client combine (both narrow to the same single note).
-        assert_eq!(hybrid_search_chunks(&conn, "keyword", None, "", f_both, "", 10).unwrap().len(), 1);
+        assert_eq!(hybrid_search_chunks(&conn, "keyword", None, "", f_both, "", 10).unwrap().hits.len(), 1);
         // note_id clamp (the "this Note" breadth) pins search to one note.
-        let by_note = hybrid_search_chunks(&conn, "keyword", None, "", f_note, "", 10).unwrap();
+        let by_note = hybrid_search_chunks(&conn, "keyword", None, "", f_note, "", 10).unwrap().hits;
         assert_eq!(by_note.len(), 1);
         assert_eq!(by_note[0].note_id, outside.id);
 
@@ -2905,7 +2976,7 @@ mod tests {
         reindex_note(&conn, &a.id, &na.body, &na.transcript, &na.summary).unwrap();
 
         // No query vector → keyword-only, still finds the term.
-        let hits = hybrid_search_chunks(&conn, "financial", None, "m", NoteFilter::default(), "", 10).unwrap();
+        let hits = hybrid_search_chunks(&conn, "financial", None, "m", NoteFilter::default(), "", 10).unwrap().hits;
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].note_id, a.id);
     }
@@ -2936,7 +3007,7 @@ mod tests {
         embed(&b.id, &[1.0, 0.0, 0.0]);
 
         let qv = [1.0f32, 0.0, 0.0];
-        let hits = hybrid_search_chunks(&conn, "budget", Some(&qv), "m", NoteFilter::default(), "", 10).unwrap();
+        let hits = hybrid_search_chunks(&conn, "budget", Some(&qv), "m", NoteFilter::default(), "", 10).unwrap().hits;
         let note_ids: Vec<&str> = hits.iter().map(|h| h.note_id.as_str()).collect();
         // Keyword finds A; semantic surfaces B. Hybrid returns BOTH — the
         // semantic-only match B would be invisible to keyword search alone.
@@ -3029,9 +3100,9 @@ mod tests {
         let unfiltered = NoteFilter::default();
         let windowed = NoteFilter { since_ms: Some(NOW - 7 * DAY), ..Default::default() };
 
-        let all = hybrid_search_chunks(&conn, "budget", None, "", unfiltered, "", 10).unwrap();
+        let all = hybrid_search_chunks(&conn, "budget", None, "", unfiltered, "", 10).unwrap().hits;
         assert_eq!(all.len(), 2, "unfiltered sees both");
-        let recent_only = hybrid_search_chunks(&conn, "budget", None, "", windowed, "", 10).unwrap();
+        let recent_only = hybrid_search_chunks(&conn, "budget", None, "", windowed, "", 10).unwrap().hits;
         assert_eq!(note_ids_of(&recent_only), vec![recent.as_str()]);
 
         // The listing shares the one filter builder, so the window reaches it too.

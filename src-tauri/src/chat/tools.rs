@@ -9,6 +9,12 @@
 //! - **Tool errors are content, never panics.** Bad args or an empty result
 //!   return a structured `ToolOutcome { is_error }` the model reads and recovers
 //!   from — the loop never aborts on a tool (parent stories 16).
+//! - **This file is Personal-only, and mirrors `humla-cloud/chat-service/src/
+//!   tools.ts`.** Workspace turns retrieve server-side, so every schema change
+//!   here needs the same change there, verified pairwise. That rule was quietly
+//!   false until #105: `client_id` meant a Client (a group of notes) here and a
+//!   single note's sync key there — same name, same slot, opposite cardinality.
+//!   It now means the same group-of-notes on both paths.
 //! - **The breadth clamp wins.** The Scope popover's breadth (this Note / this
 //!   Folder / all) is enforced server-side via `ToolScope`; the model's own
 //!   filter params can only narrow *within* an "all" scope, never widen past
@@ -86,6 +92,9 @@ const LIST_SUMMARY_CHARS: usize = 180;
 /// epoch on an absurd `within_days`.
 const MAX_WINDOW_DAYS: i64 = 3_650;
 const MS_PER_DAY: i64 = 86_400_000;
+/// The two ends of the relative date window, in tool-argument form.
+const ARG_WITHIN: &str = "within_days";
+const ARG_UNTIL: &str = "until_days";
 /// Per-excerpt / per-note text budget in the compact model view.
 const EXCERPT_CHARS: usize = 320;
 const GET_NOTE_CHARS: usize = 6_000;
@@ -96,11 +105,16 @@ const GET_NOTE_CHARS: usize = 6_000;
 pub fn tool_specs() -> Vec<ToolSpec> {
     let filters = json!({
         "folder_id": { "type": "string", "description": "Optional: restrict to one folder id." },
-        "client_id": { "type": "string", "description": "Optional: restrict to notes tagged with one client id." },
-        // RELATIVE, not an absolute date range: the model would have to know today's
-        // date to build one, and a hallucinated year returns silently-empty results.
-        // "the last N days" needs no date arithmetic from it.
+        // A Client is a GROUP of notes (one customer/account). Ids come from
+        // list_notes rows, which name each note's client — the model can only pass
+        // an id it has seen, so the two have to ship together (#105).
+        "client_id": { "type": "string", "description": "Optional: restrict to notes tagged with one client id, as shown in list_notes rows." },
+        // RELATIVE, not absolute dates: an absolute range needs the model to do date
+        // arithmetic, and a hallucinated year returns silently-empty results. Both
+        // ends count back from today, so a window that ENDS in the past is still
+        // expressible without either side knowing the calendar (#106).
         "within_days": { "type": "integer", "description": "Optional: only notes from the last N days (e.g. 7 for last week)." },
+        "until_days": { "type": "integer", "description": "Optional: exclude notes from the last N days, so the window ends in the past. With within_days it makes a past window: within_days 35 + until_days 7 = the four weeks before last week." },
     });
     vec![
         ToolSpec {
@@ -113,6 +127,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                     "folder_id": filters["folder_id"],
                     "client_id": filters["client_id"],
                     "within_days": filters["within_days"],
+                    "until_days": filters["until_days"],
                 },
                 "required": ["query"],
             }),
@@ -137,6 +152,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                     "folder_id": filters["folder_id"],
                     "client_id": filters["client_id"],
                     "within_days": filters["within_days"],
+                    "until_days": filters["until_days"],
                 },
             }),
         },
@@ -153,7 +169,26 @@ fn str_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
 /// rather than as an error: a bad window should widen to everything, never silently
 /// narrow to nothing.
 fn window_since(args: &Value, now_ms: i64) -> Option<i64> {
-    let raw = args.get("within_days")?;
+    window_edge(args, ARG_WITHIN, now_ms)
+}
+
+/// Resolve the model's `until_days` into an absolute EXCLUSIVE upper bound on note
+/// creation time — the other end of the window, so a range can end in the past
+/// ("the four weeks before last week"), which is what every before/after question
+/// needs (#106).
+///
+/// Same tolerance as the lower bound: a numeric string is accepted, and anything
+/// absent or nonsensical reads as "no upper bound". `0` is nonsense here in the
+/// useful sense — "up to now" is simply no upper bound at all, not an error.
+fn window_until(args: &Value, now_ms: i64) -> Option<i64> {
+    window_edge(args, ARG_UNTIL, now_ms)
+}
+
+/// Shared resolution for both ends of the window: `N days ago` as an absolute ms
+/// epoch, clamped so the arithmetic can't underflow past the epoch, `None` for
+/// anything absent or nonsensical.
+fn window_edge(args: &Value, key: &str, now_ms: i64) -> Option<i64> {
+    let raw = args.get(key)?;
     let days = raw
         .as_i64()
         .or_else(|| raw.as_f64().map(|f| f as i64))
@@ -162,6 +197,32 @@ fn window_since(args: &Value, now_ms: i64) -> Option<i64> {
         return None;
     }
     Some(now_ms - days.min(MAX_WINDOW_DAYS) * MS_PER_DAY)
+}
+
+/// Reject a window that cannot contain anything — `until_days` at or above
+/// `within_days`, i.e. an upper bound at or below the lower one.
+///
+/// This is the one date argument that earns an error rather than being ignored.
+/// The other bad values have a truthful reading ("no filter"); an inverted range
+/// has none. Ignoring it would answer over the whole library, and running it would
+/// return an empty the model reads as "nothing happened then" — both assert
+/// something false, so say what's wrong with the argument instead.
+///
+/// Checked AFTER clamping, so the verdict describes the window that would actually
+/// run rather than the raw numbers.
+fn validate_window(args: &Value, now_ms: i64) -> Result<(), String> {
+    let (Some(since), Some(until)) = (window_since(args, now_ms), window_until(args, now_ms))
+    else {
+        return Ok(());
+    };
+    if until <= since {
+        return Err(format!(
+            "{ARG_UNTIL} must be smaller than {ARG_WITHIN} — both count back from today, so \
+             until_days marks where the window ENDS. For the four weeks before last week: \
+             {ARG_WITHIN} 35, {ARG_UNTIL} 7."
+        ));
+    }
+    Ok(())
 }
 
 /// Resolve the effective `NoteFilter` from the breadth clamp + the model's own
@@ -176,6 +237,7 @@ fn window_since(args: &Value, now_ms: i64) -> Option<i64> {
 /// hits searching the very note on screen.
 fn resolve_filter<'a>(scope: &'a ToolScope, args: &'a Value, now_ms: i64) -> NoteFilter<'a> {
     let since_ms = window_since(args, now_ms);
+    let until_ms = window_until(args, now_ms);
     match scope {
         ToolScope::Note(id) => NoteFilter { note_id: Some(id), ..Default::default() },
         ToolScope::Folder(id) => NoteFilter {
@@ -183,15 +245,25 @@ fn resolve_filter<'a>(scope: &'a ToolScope, args: &'a Value, now_ms: i64) -> Not
             // A client narrowing still composes within the folder breadth.
             client_id: str_arg(args, "client_id"),
             since_ms,
+            until_ms,
             ..Default::default()
         },
         ToolScope::All => NoteFilter {
             folder_id: str_arg(args, "folder_id"),
             client_id: str_arg(args, "client_id"),
             since_ms,
+            until_ms,
             ..Default::default()
         },
     }
+}
+
+/// Whether the date window applies at all under this breadth. Under `Note` breadth
+/// it is dropped entirely (see [`resolve_filter`]), so an inverted window there is
+/// an argument on a filter that doesn't exist — ignored like the rest of it, rather
+/// than erroring on something we were never going to apply.
+fn window_applies(scope: &ToolScope) -> bool {
+    !matches!(scope, ToolScope::Note(_))
 }
 
 fn fmt_date(ms: i64) -> String {
@@ -252,8 +324,13 @@ fn run_search(
     let Some(query) = str_arg(args, "query") else {
         return ToolOutcome::error("search_notes needs a non-empty \"query\" string.");
     };
+    if window_applies(scope) {
+        if let Err(msg) = validate_window(args, now_ms) {
+            return ToolOutcome::error(msg);
+        }
+    }
     let filter = resolve_filter(scope, args, now_ms);
-    let hits = match db::hybrid_search_chunks(
+    let outcome = match db::hybrid_search_chunks(
         conn,
         query,
         query_vec,
@@ -262,16 +339,28 @@ fn run_search(
         workspace,
         SEARCH_LIMIT,
     ) {
-        Ok(h) => h,
+        Ok(o) => o,
         Err(e) => return ToolOutcome::error(format!("search failed: {e}")),
     };
+    let db::SearchOutcome { hits, matched_notes } = outcome;
     if hits.is_empty() {
-        return ToolOutcome::ok(
-            format!("No notes matched \"{query}\". Do not guess — tell the user nothing was found, or try different keywords once."),
-            Vec::new(),
-        );
+        // A counted zero and an unknown zero are different claims. With a real count
+        // the absence is evidence; without one it's only "this query found nothing".
+        let text = match matched_notes {
+            Some(0) => format!(
+                "0 notes match \"{query}\". That is a genuine absence, not a truncated list — say \
+                 plainly that nothing was found (try different wording once if the terms might \
+                 differ). Absence of a mention is NOT evidence about status: it does not mean a \
+                 thing was dropped, resolved or left undone."
+            ),
+            _ => format!(
+                "No notes matched \"{query}\". Do not guess — tell the user nothing was found, or try different keywords once."
+            ),
+        };
+        return ToolOutcome::ok(text, Vec::new());
     }
-    let mut lines = vec![format!("Found {} relevant excerpt(s):", hits.len())];
+    let notes_shown = distinct_notes(&hits);
+    let mut lines = vec![search_header(query, matched_notes, hits.len(), notes_shown)];
     for (i, h) in hits.iter().enumerate() {
         lines.push(format!(
             "{}. \"{}\" ({}, {}): {}",
@@ -295,6 +384,44 @@ fn run_search(
         }
     }
     ToolOutcome::ok(lines.join("\n"), citations)
+}
+
+/// How many distinct notes a hit list draws on — the third number in the header,
+/// and not the same as either of the other two (8 excerpts can come from 4 notes).
+fn distinct_notes(hits: &[db::ChunkHit]) -> usize {
+    let mut ids: Vec<&str> = hits.iter().map(|h| h.note_id.as_str()).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids.len()
+}
+
+/// The line a search result opens with, keeping three numbers apart that the model
+/// otherwise conflates: how many notes MATCHED, how many excerpts it is being shown,
+/// and how many notes those excerpts came from.
+///
+/// Without the first number, top-k is indistinguishable from the whole truth —
+/// "which problems recur across at least three meetings" is uncountable, and a
+/// thing absent from eight excerpts reads exactly like a thing absent from the
+/// library. When the count is unknown (no keyword predicate to count — see
+/// `db::count_matching_notes`) we claim nothing rather than implying zero.
+fn search_header(
+    query: &str,
+    matched: Option<usize>,
+    excerpts: usize,
+    notes_shown: usize,
+) -> String {
+    match matched {
+        Some(m) if m > notes_shown => format!(
+            "{m} note(s) matched \"{query}\". Showing {excerpts} excerpt(s) from the \
+             {notes_shown} most relevant:"
+        ),
+        // Everything that matched is on screen. Saying so is what makes a complete
+        // result legible AS complete, so a count over these notes is safe to state.
+        Some(m) => format!(
+            "{m} note(s) matched \"{query}\" — all {m} are below. Showing {excerpts} excerpt(s):"
+        ),
+        None => format!("Found {excerpts} relevant excerpt(s) from {notes_shown} note(s):"),
+    }
 }
 
 fn run_get(conn: &Connection, workspace: &str, scope: &ToolScope, args: &Value) -> ToolOutcome {
@@ -343,6 +470,24 @@ fn run_get(conn: &Connection, workspace: &str, scope: &ToolScope, args: &Value) 
     ToolOutcome::ok(text, vec![citation])
 }
 
+/// One note's Client, as `[client: Name | id]`, or nothing when untagged.
+///
+/// Both halves earn their place: the NAME is what a per-client answer has to say in
+/// prose, and the ID is the only thing `client_id` accepts. Before this the Client
+/// dimension appeared in no tool result and no prompt, so the filter was a dead
+/// argument — the model could not have learned an id to pass (#105). A tagged note
+/// whose Client row hasn't synced yet falls back to the bare id rather than dropping
+/// the tag.
+fn client_of(n: &db::NoteMeta) -> String {
+    let Some(id) = n.client_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+        return String::new();
+    };
+    match n.client_name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(name) => format!(" [client: {name} | {id}]"),
+        None => format!(" [client: {id}]"),
+    }
+}
+
 /// One note's summary, collapsed to a single line. Summaries are multi-line
 /// markdown; pasted raw they'd break the one-row-per-note shape the model reads.
 fn summary_of(summary: &str) -> String {
@@ -361,6 +506,11 @@ fn run_list(
     args: &Value,
     now_ms: i64,
 ) -> ToolOutcome {
+    if window_applies(scope) {
+        if let Err(msg) = validate_window(args, now_ms) {
+            return ToolOutcome::error(msg);
+        }
+    }
     let filter = resolve_filter(scope, args, now_ms);
     // Fetch one past the cap so a truncated listing can say so rather than reading
     // as complete — a capped listing that looks whole is how a model ends up
@@ -382,11 +532,12 @@ fn run_list(
     for (i, n) in kept.iter().enumerate() {
         let title = if n.title.trim().is_empty() { "(untitled)" } else { n.title.trim() };
         lines.push(format!(
-            "{}. \"{}\" ({}) [id: {}]{}",
+            "{}. \"{}\" ({}) [id: {}]{}{}",
             i + 1,
             title,
             fmt_date(n.created_at),
             n.id,
+            client_of(n),
             summary_of(&n.summary),
         ));
     }
@@ -496,8 +647,11 @@ mod tests {
         let out =
             exec(&conn, "", &ToolScope::All, TOOL_SEARCH, &json!({ "query": "zzznonexistent" }));
         assert!(!out.is_error, "an empty result is a valid answer, not a failure");
-        assert!(out.model_text.to_lowercase().contains("no notes matched"));
-        assert!(out.model_text.contains("Do not guess"));
+        assert!(out.citations.is_empty());
+        // The exact wording is #106's counted-zero text — asserted in
+        // `a_zero_match_search_says_the_absence_is_real`. What matters here is that
+        // an empty result still instructs the model to say so rather than guess.
+        assert!(out.model_text.contains("say plainly that nothing was found"));
     }
 
     #[test]
@@ -656,6 +810,201 @@ mod tests {
             resolve_filter(&ToolScope::Folder("f".into()), &args, NOW).since_ms,
             Some(NOW - DAY)
         );
+    }
+
+    // ── #105: the Client dimension is reachable at all ───────────────────────
+
+    /// `client_id` was a dead argument: the model can only pass an id it has seen,
+    /// and nothing in any tool result or prompt ever named a Client. Listing rows
+    /// carry the name AND the id, so "the latest for each client" can both filter
+    /// and answer in prose.
+    #[test]
+    fn list_notes_names_the_client_and_gives_its_id() {
+        let conn = open();
+        let client = db::create_client(&conn, "Acme", "").unwrap();
+        let tagged = seed(&conn, "Acme kickoff", "we kicked off");
+        seed(&conn, "Internal standup", "we stood up");
+        db::set_note_client(&conn, &tagged, Some(&client.id)).unwrap();
+
+        let out = exec(&conn, "", &ToolScope::All, TOOL_LIST, &json!({}));
+        assert!(out.model_text.contains("client: Acme"), "{}", out.model_text);
+        assert!(out.model_text.contains(&client.id), "the id the filter takes: {}", out.model_text);
+        // An untagged note stays listed and gains no client annotation.
+        let standup = out.model_text.lines().find(|l| l.contains("Internal standup")).unwrap();
+        assert!(!standup.contains("client:"), "{standup}");
+    }
+
+    #[test]
+    fn a_client_filter_narrows_and_an_unknown_client_is_an_honest_empty() {
+        let conn = open();
+        let client = db::create_client(&conn, "Acme", "").unwrap();
+        let tagged = seed(&conn, "Acme kickoff", "the budget came up");
+        seed(&conn, "Internal standup", "the budget came up");
+        db::set_note_client(&conn, &tagged, Some(&client.id)).unwrap();
+
+        for tool in [TOOL_LIST, TOOL_SEARCH] {
+            let args = json!({ "query": "budget", "client_id": client.id });
+            let out = exec(&conn, "", &ToolScope::All, tool, &args);
+            assert!(out.model_text.contains("Acme kickoff"), "{tool}");
+            assert!(!out.model_text.contains("Internal standup"), "{tool} narrowed to the client");
+
+            // An id matching no Client narrows to nothing — never widens to everything.
+            let args = json!({ "query": "budget", "client_id": "no-such-client" });
+            let out = exec(&conn, "", &ToolScope::All, tool, &args);
+            assert!(!out.model_text.contains("Acme kickoff"), "{tool}");
+            assert!(!out.model_text.contains("Internal standup"), "{tool}");
+        }
+    }
+
+    // ── #106: a bounded window, and how many notes actually matched ──────────
+
+    #[test]
+    fn window_until_resolves_clamps_and_ignores_garbage() {
+        assert_eq!(window_until(&json!({ ARG_UNTIL: 7 }), NOW), Some(NOW - 7 * DAY));
+        // Models routinely emit the number as a string.
+        assert_eq!(window_until(&json!({ ARG_UNTIL: "7" }), NOW), Some(NOW - 7 * DAY));
+        // 0 means "up to now", i.e. no upper bound at all — not an error.
+        for bad in [json!(0), json!(-1), json!("abc"), json!({}), Value::Null] {
+            assert_eq!(window_until(&json!({ ARG_UNTIL: bad }), NOW), None, "{bad:?}");
+        }
+        assert_eq!(window_until(&json!({}), NOW), None);
+        assert_eq!(
+            window_until(&json!({ ARG_UNTIL: 10_000_000i64 }), NOW),
+            Some(NOW - MAX_WINDOW_DAYS * DAY),
+            "clamped, not underflowed past the epoch"
+        );
+    }
+
+    #[test]
+    fn a_bounded_window_returns_only_the_notes_inside_it() {
+        let conn = open();
+        let this_week = seed(&conn, "This week budget", "the budget came up again");
+        let last_month = seed(&conn, "Last month budget", "the budget came up then");
+        let ancient = seed(&conn, "Ancient budget", "the budget came up long ago");
+        set_created_at(&conn, &this_week, NOW - 2 * DAY);
+        set_created_at(&conn, &last_month, NOW - 14 * DAY);
+        set_created_at(&conn, &ancient, NOW - 90 * DAY);
+
+        // "the four weeks before last week" — a window that ENDS in the past.
+        let args = json!({ "query": "budget", ARG_WITHIN: 35, ARG_UNTIL: 7 });
+        for tool in [TOOL_LIST, TOOL_SEARCH] {
+            let out = exec(&conn, "", &ToolScope::All, tool, &args);
+            assert!(!out.is_error, "{tool} accepted the bounded window");
+            assert!(out.model_text.contains("Last month"), "{tool} kept the in-window note");
+            assert!(!out.model_text.contains("This week"), "{tool} excluded the newer note");
+            assert!(!out.model_text.contains("Ancient"), "{tool} excluded the older note");
+        }
+    }
+
+    /// The property every before/after question rests on: adjacent windows must
+    /// partition the library, so a note on the boundary is counted exactly once.
+    #[test]
+    fn successive_windows_tile_without_gaps_or_overlap() {
+        let conn = open();
+        let boundary = seed(&conn, "Boundary meeting", "budget");
+        set_created_at(&conn, &boundary, NOW - 7 * DAY);
+
+        let recent = exec(&conn, "", &ToolScope::All, TOOL_LIST, &json!({ ARG_WITHIN: 7 }));
+        let earlier =
+            exec(&conn, "", &ToolScope::All, TOOL_LIST, &json!({ ARG_WITHIN: 35, ARG_UNTIL: 7 }));
+        let in_recent = recent.model_text.contains("Boundary");
+        let in_earlier = earlier.model_text.contains("Boundary");
+        assert!(in_recent ^ in_earlier, "a boundary note belongs to exactly one of two adjacent windows");
+    }
+
+    /// An inverted window can't contain anything. Returning an honest empty would
+    /// read as "nothing happened then"; silently ignoring it would return the whole
+    /// library. Neither is true, so say what's wrong with the argument.
+    #[test]
+    fn an_inverted_window_is_a_clear_error_not_a_silent_answer() {
+        let conn = open();
+        seed(&conn, "Budget", "the budget came up");
+
+        for args in [
+            json!({ "query": "budget", ARG_WITHIN: 7, ARG_UNTIL: 30 }),
+            json!({ "query": "budget", ARG_WITHIN: 7, ARG_UNTIL: 7 }),
+        ] {
+            for tool in [TOOL_LIST, TOOL_SEARCH] {
+                let out = exec(&conn, "", &ToolScope::All, tool, &args);
+                assert!(out.is_error, "{tool} rejected {args:?}");
+                assert!(out.model_text.contains(ARG_UNTIL), "names the offending argument");
+                assert!(
+                    !out.model_text.contains("Budget"),
+                    "an inverted window must not silently return everything"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_window_ending_before_the_library_starts_is_an_honest_empty() {
+        let conn = open();
+        let only = seed(&conn, "Budget", "the budget came up");
+        set_created_at(&conn, &only, NOW - 2 * DAY);
+
+        let args = json!({ "query": "budget", ARG_WITHIN: 3_000, ARG_UNTIL: 400 });
+        let out = exec(&conn, "", &ToolScope::All, TOOL_LIST, &args);
+        assert!(!out.is_error, "an empty window is a valid answer, not a bad argument");
+        assert!(!out.model_text.contains("Budget"));
+        assert!(out.model_text.contains("No notes"));
+    }
+
+    /// Same reasoning as the lower bound: one note is in scope, so a window can only
+    /// take the note on screen away.
+    #[test]
+    fn the_upper_bound_is_ignored_under_note_breadth() {
+        let conn = open();
+        let anchor = seed(&conn, "Anchor", "anchor content");
+        set_created_at(&conn, &anchor, NOW - 2 * DAY);
+
+        let args = json!({ ARG_UNTIL: 30 });
+        let scope = ToolScope::Note(anchor.clone());
+        assert!(resolve_filter(&scope, &args, NOW).until_ms.is_none());
+        assert!(exec(&conn, "", &scope, TOOL_LIST, &args).model_text.contains("Anchor"));
+        // …but a folder or library scope does honour it.
+        assert_eq!(resolve_filter(&ToolScope::All, &args, NOW).until_ms, Some(NOW - 30 * DAY));
+    }
+
+    /// Eight excerpts out of forty matching notes and eight out of eight look
+    /// identical without this, and the model has no way to tell which it got.
+    #[test]
+    fn the_search_header_separates_matched_from_returned() {
+        // More matched than shown — the count is the whole point.
+        let many = search_header("budget", Some(12), 8, 5);
+        assert!(many.contains("12 note(s) matched"), "{many}");
+        assert!(many.contains("8 excerpt(s)"), "{many}");
+        assert!(many.contains('5'), "{many}");
+        // Everything that matched is on screen — say so, so "is this all?" is answered.
+        let all = search_header("budget", Some(3), 4, 3);
+        assert!(all.contains("all 3"), "{all}");
+        // No countable predicate (semantic-only): claim no count rather than "0".
+        let unknown = search_header("budget", None, 8, 5);
+        assert!(!unknown.contains("matched"), "{unknown}");
+        assert!(unknown.contains("8 relevant excerpt(s)"), "{unknown}");
+    }
+
+    #[test]
+    fn search_reports_the_matched_note_count_alongside_the_excerpts() {
+        let conn = open();
+        for i in 0..4 {
+            seed(&conn, &format!("Budget {i}"), "the budget came up again");
+        }
+        let out = exec(&conn, "", &ToolScope::All, TOOL_SEARCH, &json!({ "query": "budget" }));
+        assert!(!out.is_error);
+        assert!(out.model_text.contains("4 note(s) matched"), "{}", out.model_text);
+    }
+
+    /// The misleading case #106 calls out: absence from a top-k list reads exactly
+    /// like absence from the library unless the tool says which one it is.
+    #[test]
+    fn a_zero_match_search_says_the_absence_is_real() {
+        let conn = open();
+        seed(&conn, "Budget", "the budget came up");
+        let out =
+            exec(&conn, "", &ToolScope::All, TOOL_SEARCH, &json!({ "query": "zzznonexistent" }));
+        assert!(!out.is_error);
+        assert!(out.model_text.contains("0 notes match"), "{}", out.model_text);
+        assert!(out.model_text.contains("NOT evidence"), "{}", out.model_text);
     }
 
     #[test]
