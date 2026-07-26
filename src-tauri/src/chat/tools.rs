@@ -70,12 +70,11 @@ pub const TOOL_SEARCH: &str = "search_notes";
 pub const TOOL_GET: &str = "get_note";
 pub const TOOL_LIST: &str = "list_notes";
 
-/// Default and max hits returned per search, keeping tool results small enough to
-/// re-lower every step without blowing the context budget. Raised from 6/12 with
-/// #81's diversity pass: chunks are per-section, so a small budget spent on one
-/// well-matching note gave narrow coverage for a library-wide question.
-const DEFAULT_LIMIT: usize = 8;
-const MAX_LIMIT: usize = 20;
+/// Hits returned per search, keeping tool results small enough to re-lower every
+/// step without blowing the context budget. Raised from 6 with #81's diversity
+/// pass: chunks are per-section, so a small budget spent on one well-matching note
+/// gave narrow coverage for a library-wide question.
+const SEARCH_LIMIT: usize = 8;
 /// Rows per listing, and the per-row summary budget. A listing is the cheap
 /// "skim before opening" move for a library-wide question, and 12 rows can't span
 /// a real library. Worst case is LIST_LIMIT × (row + summary) ≈ 8 KB — deliberately
@@ -148,13 +147,6 @@ fn str_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
     args.get(key).and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty())
 }
 
-fn clamp_limit(args: &Value) -> usize {
-    args.get("limit")
-        .and_then(|v| v.as_u64())
-        .map(|n| (n as usize).clamp(1, MAX_LIMIT))
-        .unwrap_or(DEFAULT_LIMIT)
-}
-
 /// Resolve the model's `within_days` into an absolute lower bound on note creation
 /// time. Accepts a numeric string too — small models routinely emit `"7"`. Returns
 /// `None` for anything absent or nonsensical, which reads as "no date filter"
@@ -175,12 +167,17 @@ fn window_since(args: &Value, now_ms: i64) -> Option<i64> {
 /// Resolve the effective `NoteFilter` from the breadth clamp + the model's own
 /// params. The clamp always wins: within `Note`/`Folder` breadth the model
 /// cannot reach past it; only within `All` do the model's params apply.
-/// A date window narrows WITHIN whatever the clamp allows and is applied to every
-/// breadth — it can never reach past the user's chosen scope, only inside it.
+/// A date window narrows WITHIN whatever the clamp allows — it can never reach
+/// past the user's chosen scope, only inside it.
+///
+/// It is dropped entirely under `Note` breadth. There is exactly one note in
+/// scope, so a window has nothing to narrow and can only take it away: a model
+/// passing `within_days: 7` while the user has an older note open would get zero
+/// hits searching the very note on screen.
 fn resolve_filter<'a>(scope: &'a ToolScope, args: &'a Value, now_ms: i64) -> NoteFilter<'a> {
     let since_ms = window_since(args, now_ms);
     match scope {
-        ToolScope::Note(id) => NoteFilter { note_id: Some(id), since_ms, ..Default::default() },
+        ToolScope::Note(id) => NoteFilter { note_id: Some(id), ..Default::default() },
         ToolScope::Folder(id) => NoteFilter {
             folder_id: Some(id),
             // A client narrowing still composes within the folder breadth.
@@ -263,7 +260,7 @@ fn run_search(
         embed_model,
         filter,
         workspace,
-        clamp_limit(args),
+        SEARCH_LIMIT,
     ) {
         Ok(h) => h,
         Err(e) => return ToolOutcome::error(format!("search failed: {e}")),
@@ -638,6 +635,27 @@ mod tests {
         let out = exec(&conn, "", &ToolScope::Note(anchor), TOOL_LIST, &args);
         assert!(out.model_text.contains("Anchor"));
         assert!(!out.model_text.contains("Other"), "the clamp still wins over any date arg");
+    }
+
+    /// A single-note scope has nothing to narrow, so a window can only take the
+    /// note away — the model would be searching the note on screen and getting
+    /// nothing back.
+    #[test]
+    fn the_date_window_is_ignored_under_note_breadth_however_old_the_anchor_is() {
+        let conn = open();
+        let anchor = seed(&conn, "Anchor", "anchor content");
+        set_created_at(&conn, &anchor, NOW - 900 * DAY);
+
+        let args = json!({ "within_days": 1 });
+        let scope = ToolScope::Note(anchor.clone());
+        assert!(exec(&conn, "", &scope, TOOL_LIST, &args).model_text.contains("Anchor"));
+        assert!(resolve_filter(&scope, &args, NOW).since_ms.is_none());
+        // …but a folder or library scope does honour it.
+        assert_eq!(resolve_filter(&ToolScope::All, &args, NOW).since_ms, Some(NOW - DAY));
+        assert_eq!(
+            resolve_filter(&ToolScope::Folder("f".into()), &args, NOW).since_ms,
+            Some(NOW - DAY)
+        );
     }
 
     #[test]

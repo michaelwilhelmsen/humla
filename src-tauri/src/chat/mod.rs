@@ -195,7 +195,7 @@ pub fn build_grounding(body_text: &str, transcript: &str, summary: &str) -> Grou
 /// Spike #45 found both local candidates loop when a search returns nothing, so
 /// this used to forbid retrying outright. #66 replaced that with *bounded*
 /// exploration — one retry, then concede — because the flat ban also blocked the
-/// single rephrase that recovers recall across NO/EN vocabulary, and `MAX_STEPS`
+/// single rephrase that recovers recall across NO/EN vocabulary, and the step cap
 /// already caps the spin the ban was protecting against.
 ///
 /// Mirrored by the cloud chat service (`chat-service/src/chat.ts`) modulo
@@ -233,13 +233,13 @@ search again.";
 ///
 /// Raising this was deliberately sequenced AFTER #66's bounded search retries, so
 /// the larger budget can't be spent on retry permutations.
-pub const MAX_STEPS: usize = 6;
+pub const MAX_STEPS_NOTE: usize = 6;
 pub const MAX_STEPS_BROAD: usize = 12;
 
-/// The step ceiling for a scope — see [`MAX_STEPS`].
+/// The step ceiling for a scope — see [`MAX_STEPS_NOTE`].
 pub fn max_steps_for(scope: &ToolScope) -> usize {
     match scope {
-        ToolScope::Note(_) => MAX_STEPS,
+        ToolScope::Note(_) => MAX_STEPS_NOTE,
         ToolScope::Folder(_) | ToolScope::All => MAX_STEPS_BROAD,
     }
 }
@@ -357,7 +357,7 @@ pub enum ChatEvent {
 /// grounded prompt, then repeatedly call the provider offering the retrieval
 /// tools. Each step either requests tool calls (executed against the DB, their
 /// results fed back) or answers with text (which ends the loop). The loop
-/// continues iff a step emitted ≥1 tool call, capped at `MAX_STEPS`; on the
+/// continues iff a step emitted ≥1 tool call, capped at `MAX_STEPS_NOTE`; on the
 /// final allowed step tools are dropped and a wrap-up is forced so the model
 /// never gets cut off mid-call. Tool failures are fed back as content, never
 /// aborting the loop.
@@ -1219,7 +1219,7 @@ mod tests {
     #[tokio::test]
     async fn loop_terminates_at_the_step_cap_with_a_text_answer() {
         // Loop-cap: a model that keeps requesting tools is forced to answer on
-        // the final step (tools dropped). It stops after MAX_STEPS with text.
+        // the final step (tools dropped). It stops after MAX_STEPS_NOTE with text.
         let dir = tempfile::tempdir().unwrap();
         let (dbh, _path) = temp_db(&dir);
         seed_note(&dbh, "Anything", "some searchable content here");
@@ -1250,10 +1250,10 @@ mod tests {
     /// grounding, so its ceiling stays where it was.
     #[tokio::test]
     async fn note_scope_keeps_the_old_step_ceiling_while_broad_scopes_get_more() {
-        assert_eq!(max_steps_for(&ToolScope::Note("n".into())), MAX_STEPS);
+        assert_eq!(max_steps_for(&ToolScope::Note("n".into())), MAX_STEPS_NOTE);
         assert_eq!(max_steps_for(&ToolScope::Folder("f".into())), MAX_STEPS_BROAD);
         assert_eq!(max_steps_for(&ToolScope::All), MAX_STEPS_BROAD);
-        assert!(MAX_STEPS_BROAD > MAX_STEPS);
+        assert!(MAX_STEPS_BROAD > MAX_STEPS_NOTE);
 
         let dir = tempfile::tempdir().unwrap();
         let (dbh, _path) = temp_db(&dir);
@@ -1282,7 +1282,7 @@ mod tests {
         let conn = dbh.lock();
         let parts = parse_parts(&db::list_chat_messages(&conn, &conv_id).unwrap()[1].content);
         let tool_parts = parts.iter().filter(|p| matches!(p, Part::Tool { .. })).count();
-        assert_eq!(tool_parts, MAX_STEPS - 1, "note scope is unchanged by the deeper budget");
+        assert_eq!(tool_parts, MAX_STEPS_NOTE - 1, "note scope is unchanged by the deeper budget");
     }
 
     #[test]

@@ -1695,7 +1695,10 @@ fn push_note_filters(
 /// The size of each per-signal candidate pool fused by RRF. Bigger than the
 /// final `limit` so a chunk ranked mid-pack by one signal can still win on the
 /// other.
-const HYBRID_POOL: usize = 60;
+/// Matches the cloud index's candidate pool (`K = 200` in `store.ts`), so the
+/// diversity pass below chooses from a comparably wide field on both sides —
+/// otherwise the same per-note cap yields materially less coverage locally.
+const HYBRID_POOL: usize = 200;
 /// RRF damping constant (standard default).
 const RRF_K: f64 = 60.0;
 /// Max chunks any ONE note may contribute to a result's first pass (#81).
@@ -1749,16 +1752,17 @@ pub fn hybrid_search_chunks(
     limit: usize,
 ) -> Result<Vec<ChunkHit>> {
     let keyword = keyword_ranked(conn, query, filter, workspace, HYBRID_POOL)?;
+    // Keyword-only: no query embedding, or nothing embedded yet under this model
+    // (issue #48 graceful degradation).
+    let keyword_only = |kw: Vec<IdentifiedHit>| {
+        Ok(diversify(kw.into_iter().map(|ih| ih.hit).collect(), limit, PER_NOTE_CAP))
+    };
     let Some(qv) = query_vec else {
-        // Keyword-only fallback.
-        let ranked: Vec<ChunkHit> = keyword.into_iter().map(|ih| ih.hit).collect();
-        return Ok(diversify(ranked, limit, PER_NOTE_CAP));
+        return keyword_only(keyword);
     };
     let semantic = semantic_ranked(conn, qv, model, filter, workspace, HYBRID_POOL)?;
     if semantic.is_empty() {
-        // No vectors yet (e.g. not embedded) → keyword-only.
-        let ranked: Vec<ChunkHit> = keyword.into_iter().map(|ih| ih.hit).collect();
-        return Ok(diversify(ranked, limit, PER_NOTE_CAP));
+        return keyword_only(keyword);
     }
 
     // Fuse by chunk id; keep a lookup so the winners map back to their hits.
@@ -1795,7 +1799,11 @@ pub fn list_notes_filtered(
     // narrowing (like #81's date window) can't reach search but miss listing.
     push_note_filters(&mut sql, &mut args, filter, "n");
     args.push(Value::Integer(limit as i64));
-    sql.push_str(&format!(" ORDER BY n.updated_at DESC LIMIT ?{}", args.len()));
+    // Ordered by `created_at`, the same field the date window filters and the tool
+    // layer displays. Ordering by `updated_at` instead let a re-edited old note
+    // outrank a newer meeting, so a capped "last week" listing could drop the very
+    // notes it was asked for.
+    sql.push_str(&format!(" ORDER BY n.created_at DESC LIMIT ?{}", args.len()));
 
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt
