@@ -438,6 +438,11 @@ export const ipc = {
   // context, and on any unavailable/error/unmetered outcome — a meter never
   // errors the pane, so the caller just hides the display when this is null.
   chatUsage: () => invoke<ChatUsage | null>("chat_usage"),
+  /** How the workspace's retrieval index looks to search, or null when there's no
+   *  information (Personal, an older server, or any failure — the caller keeps its
+   *  local guess). See #102: only the server can tell a backfilling index apart
+   *  from a genuinely empty library. */
+  chatIndexState: () => invoke<ChatIndexState | null>("chat_index_state"),
   // Rebuild a Note's retrieval index — called on Note-view unmount so edits
   // that didn't trigger summarize/diarize still land in search.
   chatReindexNote: (noteId: string) => invoke<void>("chat_reindex_note", { noteId }),
@@ -499,6 +504,11 @@ export type ConversationMeta = {
 export type ChatScope = "note" | "folder" | "all";
 // Workspace turn allowance for the composer meter (issue #69). Only ever present
 // for a metered workspace; personal/unmetered/unavailable resolve to null.
+/** The server's view of a workspace's retrieval index (#102). "empty" covers both
+ *  never-indexed and mid-backfill; "quarantined" is the indexer's deactivation
+ *  grace window. */
+export type ChatIndexState = "ready" | "empty" | "quarantined";
+
 export type ChatUsage = { used: number; cap: number; periodEnd: number };
 
 // Streaming events (the #46 wire contract + #47 tool/citation events).

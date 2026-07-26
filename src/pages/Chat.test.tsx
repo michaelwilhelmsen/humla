@@ -353,6 +353,86 @@ describe("/chat with nothing to retrieve", () => {
     expect(screen.getByLabelText("Ask about your notes")).toHaveAttribute("aria-disabled", "true");
   });
 
+  // ── #102: the server's index_state overrides the local guess ──────────────
+  // Sync state is only a proxy. A workspace pull can be idle — nothing left to
+  // pull — while the server index is still backfilling, and "No notes yet" is
+  // then a false claim about someone's library. Only the server knows.
+
+  it("says notes are still arriving when the server index is backfilling, though sync is idle", async () => {
+    signIntoWorkspace();
+    useNotesStore.setState({ notes: [], loaded: true });
+    useCloudStore.setState({ syncStatus: "idle" });
+    mockTauri({
+      chat_history: () => ({ conversationId: null, messages: [] }),
+      chat_index_state: () => "empty",
+    });
+    renderChat();
+
+    expect(await screen.findByText(/Still syncing your notes/)).toBeInTheDocument();
+    expect(screen.queryByText(/No notes yet\./)).toBeNull();
+  });
+
+  it("treats a quarantined index the same way — withheld is not empty", async () => {
+    signIntoWorkspace();
+    useNotesStore.setState({ notes: [], loaded: true });
+    useCloudStore.setState({ syncStatus: "idle" });
+    mockTauri({
+      chat_history: () => ({ conversationId: null, messages: [] }),
+      chat_index_state: () => "quarantined",
+    });
+    renderChat();
+
+    expect(await screen.findByText(/Still syncing your notes/)).toBeInTheDocument();
+  });
+
+  it("still says there are no notes when the server confirms the index is ready", async () => {
+    // `ready` means an empty result really is empty — the one case where the
+    // claim about the library is true.
+    signIntoWorkspace();
+    useNotesStore.setState({ notes: [], loaded: true });
+    useCloudStore.setState({ syncStatus: "idle" });
+    mockTauri({
+      chat_history: () => ({ conversationId: null, messages: [] }),
+      chat_index_state: () => "ready",
+    });
+    renderChat();
+
+    expect(await screen.findByText(/No notes yet\./)).toBeInTheDocument();
+  });
+
+  it("falls back to sync state when the lookup fails — a hint must never break the pane", async () => {
+    signIntoWorkspace();
+    useNotesStore.setState({ notes: [], loaded: true });
+    useCloudStore.setState({ syncStatus: "syncing" });
+    mockTauri({
+      chat_history: () => ({ conversationId: null, messages: [] }),
+      chat_index_state: () => {
+        throw new Error("route absent on an older server");
+      },
+    });
+    renderChat();
+
+    // The pane renders, and the local proxy still gets the mid-sync copy right.
+    expect(await screen.findByText(/Still syncing your notes/)).toBeInTheDocument();
+  });
+
+  it("asks the server nothing in Personal, where the local store IS the corpus", async () => {
+    let asked = 0;
+    useNotesStore.setState({ notes: [], loaded: true });
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () => ({ conversationId: null, messages: [] }),
+      chat_index_state: () => {
+        asked++;
+        return null;
+      },
+    });
+    renderChat();
+
+    expect(await screen.findByText(/No notes yet\./)).toBeInTheDocument();
+    expect(asked).toBe(0);
+  });
+
   it("leaves the composer open while the first load is still in flight", async () => {
     // notes: [] with loaded: false is "we don't know yet", not "empty" — claiming
     // an empty library here would fire on every launch for one frame.

@@ -240,6 +240,37 @@ pub fn parse_usage(body: &Value) -> Option<UsageDto> {
     Some(UsageDto { used, cap, period_end })
 }
 
+/// How a workspace's retrieval index looks to search, as the server reports it
+/// (issue #102). The client needs this to keep the chat pane honest: an empty
+/// local mirror is not evidence of an empty workspace when the server index is
+/// still backfilling, and "No notes yet" is then a false claim about someone's
+/// library.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IndexState {
+    /// Searchable — an empty result really does mean "nothing matched".
+    Ready,
+    /// Nothing to match yet: never indexed, or still backfilling.
+    Empty,
+    /// Chunks withheld inside the indexer's deactivation grace window.
+    Quarantined,
+}
+
+/// Map a 200 index-state body to the enum, or None when there's nothing usable.
+///
+/// Best-effort like [`parse_usage`]: this only ever *improves* the pane's copy,
+/// so an unknown state (a newer server growing a fourth value) or a malformed
+/// body reads as "no information" and the caller falls back to its local guess.
+/// Never an error — a hint must not be able to break the composer.
+pub fn parse_index_state(body: &Value) -> Option<IndexState> {
+    match body.get("index_state").and_then(|v| v.as_str())? {
+        "ready" => Some(IndexState::Ready),
+        "empty" => Some(IndexState::Empty),
+        "quarantined" => Some(IndexState::Quarantined),
+        _ => None,
+    }
+}
+
 // ── Workspace chat key (BYOK, issue #75) ─────────────────────────────────────
 
 /// Metadata about a workspace's OpenAI key, shown in workspace settings. The
@@ -345,6 +376,25 @@ mod tests {
         // Partial / malformed → None.
         assert_eq!(parse_usage(&json!({ "used_turns": 2 })), None);
         assert_eq!(parse_usage(&json!({})), None);
+    }
+
+    #[test]
+    fn parse_index_state_maps_the_three_states_and_nothing_else() {
+        for (raw, want) in [
+            ("ready", IndexState::Ready),
+            ("empty", IndexState::Empty),
+            ("quarantined", IndexState::Quarantined),
+        ] {
+            assert_eq!(parse_index_state(&json!({ "index_state": raw })), Some(want));
+        }
+        // An unknown state — a newer server growing a fourth value — reads as "no
+        // information" so the pane falls back to its local guess rather than
+        // guessing wrong about a state it doesn't understand.
+        assert_eq!(parse_index_state(&json!({ "index_state": "rebuilding" })), None);
+        // Error shapes and malformed bodies carry no state.
+        assert_eq!(parse_index_state(&json!({ "reason": "not_a_member" })), None);
+        assert_eq!(parse_index_state(&json!({ "index_state": 3 })), None);
+        assert_eq!(parse_index_state(&json!({})), None);
     }
 
     #[test]

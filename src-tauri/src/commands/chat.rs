@@ -780,6 +780,36 @@ pub async fn chat_usage(app: AppHandle) -> Result<Option<chat::cloud::UsageDto>,
     Ok(usage_cloud(&state, &workspace).await)
 }
 
+/// How the workspace's retrieval index looks to search — `ready` / `empty` /
+/// `quarantined` — so the chat pane can tell "your library is empty" apart from
+/// "the index is still building" (issue #102).
+///
+/// Only the server knows the difference: workspace retrieval runs over the
+/// workspace index, and a locally-empty mirror is not evidence of an empty
+/// workspace while that index is backfilling. `None` means "no information" and
+/// the caller keeps its local guess — Personal (where the local store IS the
+/// corpus), an older server without the route, or any failure. Like the turn
+/// meter, this is best-effort: it may improve the pane's copy, never break it.
+#[tauri::command]
+pub async fn chat_index_state(app: AppHandle) -> Result<Option<chat::cloud::IndexState>, String> {
+    let state: State<AppState> = app.state();
+    let workspace = {
+        let conn = state.db.lock();
+        match ChatContext::load(&conn) {
+            ChatContext::Personal => return Ok(None),
+            ChatContext::Workspace(id) => id,
+        }
+    };
+    let body = super::cloud::cloud_get_json(
+        &state,
+        "/api/chat/index-state",
+        &[("workspace_id", workspace.as_str())],
+    )
+    .await
+    .ok();
+    Ok(body.as_ref().and_then(chat::cloud::parse_index_state))
+}
+
 /// GET the usage endpoint, collapsing every non-metered outcome to `None` so the
 /// meter can only ever report or silently hide (issue #69). See [`chat_usage`]
 /// for the full mapping. One-shot 401 re-auth mirrors the other cloud calls.
