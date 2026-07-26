@@ -40,7 +40,7 @@ import { groupTimeline, resolveActivePill, formatSessionCaption } from "../lib/s
 import { RecordingBar } from "../components/RecordingBar";
 import { ChatPanel, type ChatSessionControls } from "../components/ChatPanel";
 import { SelectablePopover } from "../components/SelectablePopover";
-import { conversationTitle, relativeTime } from "../lib/chatSessions";
+import { conversationRows } from "../lib/chatSessions";
 import { targetKey, type ChatTarget } from "../lib/chatTarget";
 import type { LayoutOutletContext } from "../components/Layout";
 import { SkeletonLines } from "../components/Skeleton";
@@ -1370,13 +1370,10 @@ function FolderPicker({
 function ChatHistoryControls({ controls }: { controls: ChatSessionControls }) {
   const { conversations, activeConversationId, canBrowseHistory, newChat, openConversation } =
     controls;
-  const items = [...conversations]
-    .sort((a, b) => b.updatedAt - a.updatedAt)
-    .map((c) => ({
-      id: c.id,
-      label: conversationTitle(c),
-      description: relativeTime(c.updatedAt),
-    }));
+  // Same projection `/chat`'s Recents renders from (#95) — ordering, the
+  // empty-title fallback and the relative date are decided in one place. The
+  // popover takes its own `activeId`, so it ignores each row's `active`.
+  const items = conversationRows(conversations, activeConversationId);
   return (
     <div className="flex items-center gap-0.5">
       <button

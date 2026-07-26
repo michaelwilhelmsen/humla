@@ -41,6 +41,43 @@ export function conversationTitle(meta: { title: string }): string {
   return meta.title.trim() || "New chat";
 }
 
+/** One row of a conversation list, ready to render. */
+export type ConversationRow = {
+  id: string;
+  label: string;
+  description: string;
+  active: boolean;
+};
+
+/**
+ * The rows for a conversation list, most-recent first (issue #95).
+ *
+ * Two surfaces show the same list — the Note header's history popover and
+ * `/chat`'s Recents — and there is no row *component* to share between them
+ * (the popover renders a `{id, label, description}` projection through
+ * `SelectablePopover`; Recents renders its own markup). So the shared thing is
+ * this projection: one place that decides ordering, the empty-title fallback and
+ * the relative date, rather than two lists that drift apart.
+ *
+ * `now` is injectable for deterministic tests, and `active` rides along for
+ * callers that mark the current row themselves — `SelectablePopover` takes its
+ * own `activeId` and simply ignores the extra field.
+ */
+export function conversationRows(
+  conversations: { id: string; title: string; updatedAt: number }[],
+  activeId: string | null,
+  now: number = Date.now(),
+): ConversationRow[] {
+  return [...conversations]
+    .sort((a, b) => b.updatedAt - a.updatedAt)
+    .map((c) => ({
+      id: c.id,
+      label: conversationTitle(c),
+      description: relativeTime(c.updatedAt, now),
+      active: c.id === activeId,
+    }));
+}
+
 // Mirror of the backend's `GROUNDING_CHAR_BUDGET` (`chat/mod.rs`). Kept in sync
 // by hand — it only drives an advisory hint, so a drift makes the warning
 // slightly early or late, never wrong in a way that loses data.

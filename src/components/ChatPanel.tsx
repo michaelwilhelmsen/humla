@@ -34,7 +34,7 @@ import { SelectablePopover, type PopoverItem } from "./SelectablePopover";
 import { ChatKeyEntry } from "./ChatKeyEntry";
 import { usageTone, liveChatErrorCopy, groundingLikelyTruncated } from "../lib/chatSessions";
 import { targetNoteId, targetKey, targetDefaultScope, type ChatTarget } from "../lib/chatTarget";
-import { NOTE_PROMPTS, opensPromptPicker, type ChatPrompt } from "../lib/chatPrompts";
+import { opensPromptPicker, promptsFor, type ChatPrompt } from "../lib/chatPrompts";
 import { RECOMMENDED_OLLAMA_MODEL } from "../lib/localModels";
 import { CommandSnippet } from "./CommandSnippet";
 import { cn } from "../lib/cn";
@@ -230,6 +230,21 @@ export function ChatPanel({
   const anchorNote = useNotesStore((s) =>
     noteId === null ? null : s.notes.find((n) => n.id === noteId) ?? null,
   );
+  // Nothing in the library to retrieve from, so the standing invitation would
+  // invite a question whose only honest answer is "I couldn't find anything" —
+  // and in a metered workspace that costs a turn to discover (#95).
+  //
+  // Three conditions, each load-bearing. A NOTE pane can't be affected: its
+  // anchor is grounding, so there is always something to answer from. In a
+  // WORKSPACE, retrieval runs server-side over the workspace index, so a local
+  // store that looks empty may simply not have synced yet — whether that index is
+  // genuinely empty or still backfilling is `index_state`'s to report, with its
+  // own copy, not this pane's to guess from local rows. And `loaded` separates an
+  // empty library from one whose first load hasn't landed.
+  // (`inWorkspace` isn't in scope until the cloud selectors below, so the flag
+  // itself is derived there.)
+  const libraryEmpty = useNotesStore((s) => s.loaded && s.notes.length === 0);
+
   const likelyTruncated = useMemo(() => {
     if (!anchorNote) return false;
     // Body is HTML in the store but plain text in the prompt — measure the text,
@@ -360,6 +375,8 @@ export function ChatPanel({
   // workspace chat does NOT — it runs on the workspace key, so a member without
   // a personal key still reaches the pane (composer or activation state, #76).
   const paneUsable = inWorkspace || ready;
+  // See `libraryEmpty` above for why all three conditions are needed.
+  const nothingToSearch = target.kind === "global" && !inWorkspace && libraryEmpty;
 
   // Activation gating (#76). Only on the managed server + a workspace. While the
   // key metadata is still loading (undefined) show neither composer nor pane, so
@@ -739,7 +756,9 @@ export function ChatPanel({
           <div className="flex-1 flex flex-col items-center justify-center gap-3 px-6 text-center">
             <MessageCircle size={22} strokeWidth={1.5} className="text-[var(--color-text-disabled)]" />
             <p className="text-sm text-[var(--color-text-muted)]">
-              Ask anything about your notes — it searches, reads, and cites them to answer.
+              {nothingToSearch
+                ? "No notes yet. Record or import a meeting, then ask about it here."
+                : "Ask anything about your notes — it searches, reads, and cites them to answer."}
             </p>
           </div>
         ) : (
@@ -822,7 +841,7 @@ export function ChatPanel({
             fixed-width panel, so this needs no portal or flip logic either. */}
         {promptsOpen && (
           <PromptPicker
-            prompts={NOTE_PROMPTS}
+            prompts={promptsFor(target)}
             onPick={applyPrompt}
             onDismiss={() => {
               setPromptsOpen(false);
@@ -847,10 +866,19 @@ export function ChatPanel({
             onKeyDown={onKeyDown}
             rows={1}
             // Stays enabled while a turn streams so Enter can stop it (#80) —
-            // `send` no-ops on `sending`, so this can't queue a second turn.
-            placeholder={sending ? "Streaming — press Enter to stop" : "Ask about your notes…"}
+            // `send` no-ops on `sending`, so this can't queue a second turn. An
+            // empty library is the one case that does disable it (#95): there is
+            // nothing to retrieve, so every question has the same dead end.
+            disabled={nothingToSearch}
+            placeholder={
+              nothingToSearch
+                ? "Nothing to search yet"
+                : sending
+                  ? "Streaming — press Enter to stop"
+                  : "Ask about your notes…"
+            }
             aria-label="Ask about your notes"
-            className="block w-full resize-none max-h-40 bg-transparent text-sm leading-relaxed pl-2 pr-11 py-2 outline-none placeholder:text-[var(--color-text-muted)]"
+            className="block w-full resize-none max-h-40 bg-transparent text-sm leading-relaxed pl-2 pr-11 py-2 outline-none placeholder:text-[var(--color-text-muted)] disabled:cursor-not-allowed"
           />
           {/* Send morphs into Stop while streaming (#80), so the same spot is
               always the turn's primary control. */}

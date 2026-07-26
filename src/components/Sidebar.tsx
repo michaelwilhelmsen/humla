@@ -7,6 +7,7 @@ import {
   Folder as FolderIcon,
   FolderPlus,
   Home as HomeIcon,
+  MessageCircle,
   Plus,
   Search,
   Settings as SettingsIcon,
@@ -208,6 +209,14 @@ export function Sidebar({ onCollapse }: { onCollapse: () => void }) {
             label="All notes"
             active={location.pathname === "/all-notes"}
             count={notes.length}
+          />
+          {/* Chat sits directly under "All notes" — both are library-level
+              destinations, so they belong on the same tier (#95). */}
+          <NavItem
+            to="/chat"
+            icon={MessageCircle}
+            label="Chat"
+            active={location.pathname === "/chat"}
           />
           <button
             type="button"
