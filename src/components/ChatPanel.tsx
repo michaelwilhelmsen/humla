@@ -24,7 +24,8 @@ import {
   type ChatCitation,
   type ChatMessageDto,
   type ChatScope,
-  type ChatUsage,
+  type ChatIndexState,
+  ChatUsage,
   type ConversationMeta,
 } from "../lib/ipc";
 import { useNotesStore } from "../lib/store";
@@ -252,6 +253,10 @@ export function ChatPanel({
   // in a managed workspace, to avoid flashing the composer before we know), then
   // a `ChatKeyMeta` or `null`. Feeds the activation-pane decision.
   const [keyMeta, setKeyMeta] = useState<ChatKeyMeta | null | undefined>(null);
+  // The server's view of the workspace retrieval index (#102). null = no
+  // information (Personal, an older server, or a failed lookup) → the empty-state
+  // copy falls back to the local sync proxy.
+  const [indexState, setIndexState] = useState<ChatIndexState | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
   // The composer is auto-focused exactly once per mount, on the first transition
@@ -465,16 +470,25 @@ export function ChatPanel({
   // A NOTE pane never reaches either: its anchor note IS grounding, so there is
   // always something to answer from.
   //
-  // `syncing` splits them. A workspace pulls its notes down after a switch, so a
-  // local mirror that looks empty mid-pull isn't evidence of an empty workspace —
-  // that gets the still-arriving copy rather than a claim about the library. This
-  // is a client-side stand-in for the server's `index_state`, which reports
-  // "empty" (backfilling) vs "quarantined" vs "ready" authoritatively but isn't
-  // wired to the client yet; until it is, sync state is the honest local proxy.
+  // Two things split them, and in a workspace the server's word wins (#102).
+  //
+  // `syncing` is the local proxy: a workspace pulls its notes down after a
+  // switch, so a mirror that looks empty mid-pull isn't evidence of an empty
+  // workspace. But it's only a proxy — the pull can be idle, with nothing left to
+  // pull, while the SERVER index is still backfilling. Workspace retrieval runs
+  // over that index, so `indexState` is the authoritative answer: "empty"
+  // (never indexed / backfilling) and "quarantined" (withheld in the indexer's
+  // deactivation grace window) both mean "not yet", where only "ready" makes an
+  // empty result a true statement about the library.
+  //
+  // null covers Personal (where the local store IS the retrieval corpus, so the
+  // local check is already authoritative), an older server without the route, and
+  // any failure — all of which fall back to the sync proxy rather than blocking.
   const syncing = useCloudStore((s) => s.syncStatus) === "syncing";
+  const indexNotReady = indexState === "empty" || indexState === "quarantined";
   const globalPane = target.kind === "global";
-  const nothingToSearch = globalPane && libraryEmpty && !syncing;
-  const notesStillArriving = globalPane && libraryEmpty && syncing;
+  const nothingToSearch = globalPane && libraryEmpty && !syncing && !indexNotReady;
+  const notesStillArriving = globalPane && libraryEmpty && (syncing || indexNotReady);
   const composerHeld = nothingToSearch || notesStillArriving;
   // Does the composer's control row have anything in it? The breadth picker needs
   // an anchor to offer a second option (#95), the model chip is panel-only and
@@ -502,21 +516,27 @@ export function ChatPanel({
       if (!workspaceId) {
         setUsage(null);
         setKeyMeta(null);
+        setIndexState(null);
         return;
       }
       try {
-        const [u, m] = await Promise.all([
+        const [u, m, ix] = await Promise.all([
           ipc.chatUsage(),
           billingEnabled ? cloudApi.chatKeyMeta(workspaceId) : Promise.resolve(null),
+          // Settled separately: this one is a HINT. A rejection here must not
+          // take the usage meter and activation decision down with it.
+          ipc.chatIndexState().catch(() => null),
         ]);
         if (gen === switchGenRef.current) {
           setUsage(u);
           setKeyMeta(m);
+          setIndexState(ix);
         }
       } catch {
         if (gen === switchGenRef.current) {
           setUsage(null);
           setKeyMeta(null);
+          setIndexState(null);
         }
       }
     },
