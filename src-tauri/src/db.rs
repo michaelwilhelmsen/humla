@@ -297,6 +297,13 @@ pub fn open(path: &Path) -> Result<Connection> {
         "ALTER TABLE conversations ADD COLUMN breadth TEXT NOT NULL DEFAULT 'note'",
         [],
     );
+    // A pinned authorship filter (#103). Empty = off, which is the only safe
+    // back-fill: an existing conversation was answered unfiltered, so it must keep
+    // answering unfiltered.
+    let _ = conn.execute(
+        "ALTER TABLE conversations ADD COLUMN owner_filter TEXT NOT NULL DEFAULT ''",
+        [],
+    );
     // Chat sessions (issue #61). Two idempotent steps:
     //   1. Drop the old UNIQUE index that pinned one conversation per
     //      (tenant, scope, scope_id) — sessions need many per scope now. IF
@@ -1006,6 +1013,15 @@ pub struct Conversation {
     /// single source of truth for the Scope chip; a live filter on retrieval
     /// within the conversation, not a conversation-identity dimension.
     pub breadth: String,
+    /// A pinned authorship filter (#103): the user id whose notes this
+    /// conversation retrieves from, or empty for no filter.
+    ///
+    /// A user id rather than a flag, because a workspace's conversation list is
+    /// visible to every member — a boolean "only mine" would mean different notes
+    /// to different readers of the same thread. Storing the person keeps one
+    /// meaning per conversation, and lets the chip name them ("Created by Anna")
+    /// instead of implying "you".
+    pub owner_filter: String,
     /// Session title (issue #61). NULL until the first user message sets it
     /// (personal scope) or the migration back-fills it; the session list falls
     /// back to a derived date label when it's still absent.
@@ -1035,14 +1051,15 @@ fn map_conversation(row: &rusqlite::Row) -> rusqlite::Result<Conversation> {
         tenant: row.get(3)?,
         remote_id: row.get(4)?,
         breadth: row.get(5)?,
-        title: row.get(6)?,
-        created_at: row.get(7)?,
-        updated_at: row.get(8)?,
+        owner_filter: row.get(6)?,
+        title: row.get(7)?,
+        created_at: row.get(8)?,
+        updated_at: row.get(9)?,
     })
 }
 
 const CONVERSATION_COLS: &str =
-    "id, scope, scope_id, tenant, remote_id, breadth, title, created_at, updated_at";
+    "id, scope, scope_id, tenant, remote_id, breadth, owner_filter, title, created_at, updated_at";
 
 /// The most-recently-updated conversation ("active session") for a scope, or
 /// None (issue #61). This replaces the old get-or-create: opening the Chat tab
@@ -1236,6 +1253,21 @@ pub fn set_conversation_breadth(conn: &Connection, id: &str, breadth: &str) -> R
     conn.execute(
         "UPDATE conversations SET breadth = ?1 WHERE id = ?2",
         params![breadth, id],
+    )?;
+    Ok(())
+}
+
+/// Pin (or clear) the conversation's authorship filter (#103). `None` clears.
+/// Stored as the user id whose notes the conversation retrieves — see
+/// [`Conversation::owner_filter`] for why it isn't a boolean.
+pub fn set_conversation_owner_filter(
+    conn: &Connection,
+    id: &str,
+    owner: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE conversations SET owner_filter = ?1, updated_at = ?2 WHERE id = ?3",
+        params![owner.unwrap_or(""), now_ms(), id],
     )?;
     Ok(())
 }

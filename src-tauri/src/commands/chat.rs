@@ -476,6 +476,9 @@ pub struct ConversationMeta {
     id: String,
     title: String,
     breadth: String,
+    /// The pinned authorship filter's user id, or "" for none (#103). The chip
+    /// resolves it to a name against the workspace roster.
+    owner_filter: String,
     updated_at: i64,
     message_count: i64,
 }
@@ -516,6 +519,7 @@ fn conversation_meta(
         id: c.id.clone(),
         title: resolved_title(c),
         breadth: c.breadth.clone(),
+        owner_filter: c.owner_filter.clone(),
         updated_at: c.updated_at,
         message_count,
     })
@@ -720,6 +724,41 @@ pub fn chat_set_breadth(
     let conversation =
         resolve_or_create(&conn, ctx.tenant(), &target, conversation_id.as_deref())?;
     db::set_conversation_breadth(&conn, &conversation.id, &breadth).map_err(|e| e.to_string())
+}
+
+/// Pin (or clear) the conversation's authorship filter (#103) — the user whose
+/// notes it retrieves from.
+///
+/// A user id, not a flag, because a workspace's conversation list is visible to
+/// every member: a boolean would mean different notes to different readers of the
+/// same thread. Storing the person keeps one meaning per conversation.
+///
+/// `owner` is `None` to clear. The UI only ever offers the caller's own id, and
+/// only when the filter is off or already pinned to them — but that gate is not
+/// enforced here, matching `chat_set_breadth`, which likewise lets any member
+/// change a shared conversation's retrieval settings.
+#[tauri::command]
+pub fn chat_set_owner_filter(
+    app: AppHandle,
+    note_id: Option<String>,
+    conversation_id: Option<String>,
+    owner: Option<String>,
+) -> Result<(), String> {
+    let target = ChatTarget::from_note_id(note_id)?;
+    let owner = owner.map(|o| o.trim().to_string()).filter(|o| !o.is_empty());
+    let state: State<AppState> = app.state();
+    let conn = state.db.lock();
+    let ctx = ChatContext::load(&conn);
+    if matches!(ctx, ChatContext::Personal) && owner.is_some() {
+        // In Personal every note is the user's own, so a filter could only ever be
+        // the identity function or a mistake. The control isn't rendered there;
+        // reject rather than store a pin nothing would honour.
+        return Err("Filtering by author needs a workspace — in Personal every note is yours.".into());
+    }
+    let conversation =
+        resolve_or_create(&conn, ctx.tenant(), &target, conversation_id.as_deref())?;
+    db::set_conversation_owner_filter(&conn, &conversation.id, owner.as_deref())
+        .map_err(|e| e.to_string())
 }
 
 /// Read the persisted breadth for a conversation so the Scope chip initialises
@@ -1024,6 +1063,9 @@ pub async fn chat_send(
     note_id: Option<String>,
     conversation_id: Option<String>,
     message: String,
+    // See `chat_send_cloud` — display name for a pinned authorship filter.
+    // Ignored on the Personal path, which never pins one.
+    owner_name: Option<String>,
 ) -> Result<ChatSendResult, String> {
     let target = ChatTarget::from_note_id(note_id)?;
     let state: State<AppState> = app.state();
@@ -1035,7 +1077,7 @@ pub async fn chat_send(
         ChatContext::load(&conn).workspace().is_some()
     };
     if in_workspace {
-        return chat_send_cloud(app, target, conversation_id, message).await;
+        return chat_send_cloud(app, target, conversation_id, message, owner_name).await;
     }
 
     // Keychain read out of band — not inside the DB lock. Chat reuses the
@@ -1072,6 +1114,10 @@ pub async fn chat_send(
         // self-healed against the Note's current folder.
         let breadth =
             effective_breadth(&conn, &conversation.id, &conversation.breadth, note.as_ref())?;
+        // The pinned authorship filter (#103), read from the same row as breadth
+        // and binding the same way: it's the user's stated intent, so it applies
+        // whatever the model asks for.
+        let owner_filter = conversation.owner_filter.clone();
         let tool_scope = resolve_scope(&breadth, note.as_ref())?;
         (grounding, resolved, conversation.id, tool_scope, workspace)
     };
@@ -1197,9 +1243,14 @@ async fn chat_send_cloud(
     target: ChatTarget,
     conversation_id: Option<String>,
     message: String,
+    // Display name for a pinned authorship filter, resolved by the caller from
+    // the workspace roster. Prompt text only — the id on the conversation row is
+    // what actually filters — so it is passed per turn rather than cached in a
+    // column that a rename would leave stale.
+    owner_name: Option<String>,
 ) -> Result<ChatSendResult, String> {
     let state: State<AppState> = app.state();
-    let (workspace, folder_id, title, conversation, breadth) = {
+    let (workspace, folder_id, title, conversation, breadth, owner_filter) = {
         let conn = state.db.lock();
         let ctx = ChatContext::load(&conn);
         let Some(workspace) = ctx.workspace() else {
@@ -1214,6 +1265,10 @@ async fn chat_send_cloud(
         // against the Note's folder, exactly like the Personal path (issue #58).
         let breadth =
             effective_breadth(&conn, &conversation.id, &conversation.breadth, note.as_ref())?;
+        // The pinned authorship filter (#103), read from the same row as breadth
+        // and binding the same way: it's the user's stated intent, so it applies
+        // whatever the model asks for.
+        let owner_filter = conversation.owner_filter.clone();
         (
             workspace.to_string(),
             note.as_ref().and_then(|n| n.folder_id.clone()),
@@ -1222,6 +1277,7 @@ async fn chat_send_cloud(
             note.as_ref().map(|n| n.title.clone()).unwrap_or_default(),
             conversation,
             breadth,
+            owner_filter,
         )
     };
 
@@ -1233,6 +1289,10 @@ async fn chat_send_cloud(
         &breadth,
         target.note_id(),
         folder_id.as_deref(),
+        // The name is display-only, resolved by the caller from the workspace
+        // roster; the id is what the server filters on.
+        (!owner_filter.trim().is_empty())
+            .then(|| (owner_filter.as_str(), owner_name.as_deref().unwrap_or(""))),
     )?;
 
     // Stream the turn, retrying once after a 401 (a stale cached token → forget
@@ -1556,10 +1616,24 @@ fn ensure_workspace_handle(
     target: &ChatTarget,
     remote_id: &str,
     breadth: &str,
+    owner_filter: &str,
 ) -> Result<db::Conversation, String> {
     if let Some(c) = db::get_conversation_by_remote_id(conn, workspace, remote_id)
         .map_err(|e| e.to_string())?
     {
+        // The server's copy wins on load, the same way breadth does. Without this
+        // a pin set on another device would render on the chip but not reach the
+        // next turn, which reads the LOCAL row — the filter would silently stop
+        // applying (#103).
+        if c.owner_filter != owner_filter {
+            db::set_conversation_owner_filter(
+                conn,
+                &c.id,
+                Some(owner_filter).filter(|o| !o.is_empty()),
+            )
+            .map_err(|e| e.to_string())?;
+            return Ok(db::Conversation { owner_filter: owner_filter.to_string(), ..c });
+        }
         return Ok(c);
     }
     let breadth = chat::validate_breadth(breadth).unwrap_or_else(|_| chat::default_breadth(target));
@@ -1567,6 +1641,11 @@ fn ensure_workspace_handle(
         db::create_conversation(conn, workspace, target.scope(), target.scope_id(), breadth)
             .map_err(|e| e.to_string())?;
     db::set_conversation_remote_id(conn, &handle.id, remote_id).map_err(|e| e.to_string())?;
+    if !owner_filter.is_empty() {
+        db::set_conversation_owner_filter(conn, &handle.id, Some(owner_filter))
+            .map_err(|e| e.to_string())?;
+        return Ok(db::Conversation { owner_filter: owner_filter.to_string(), ..handle });
+    }
     Ok(handle)
 }
 
@@ -1595,14 +1674,16 @@ fn cloud_conversation_meta(
         .ok_or("Team chat returned a conversation without an id")?;
     let breadth =
         item.get("breadth").and_then(|v| v.as_str()).unwrap_or_else(|| chat::default_breadth(target));
+    let owner_filter = item.get("owner_filter").and_then(|v| v.as_str()).unwrap_or_default();
     let handle = {
         let conn = state.db.lock();
-        ensure_workspace_handle(&conn, workspace, target, remote_id, breadth)?
+        ensure_workspace_handle(&conn, workspace, target, remote_id, breadth, owner_filter)?
     };
     Ok(ConversationMeta {
         id: handle.id,
         title: item.get("title").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
         breadth: breadth.to_string(),
+        owner_filter: owner_filter.to_string(),
         updated_at: pb_timestamp_ms(item.get("updated")),
         message_count: item.get("message_count").and_then(|v| v.as_i64()).unwrap_or(0),
     })
@@ -1720,7 +1801,15 @@ async fn list_conversations_cloud(
             .await
             .map(|r| r.len() as i64)
             .unwrap_or(0);
-        metas.push(ConversationMeta { id, title, breadth, updated_at, message_count });
+        // A legacy handle predates the pin, so it has none.
+        metas.push(ConversationMeta {
+            id,
+            title,
+            breadth,
+            owner_filter: String::new(),
+            updated_at,
+            message_count,
+        });
     }
 
     // Server list is already -updated; re-sort so merged legacy entries land in
@@ -1752,6 +1841,7 @@ async fn legacy_workspace_sessions(
         title: resolved_title(&handle),
         id: handle.id,
         breadth: handle.breadth,
+        owner_filter: handle.owner_filter,
         updated_at: handle.updated_at,
         message_count,
     }])
@@ -2150,6 +2240,7 @@ mod tests {
                 tenant: "wsA".to_string(),
                 remote_id: remote.map(String::from),
                 breadth: "note".to_string(),
+                owner_filter: String::new(),
                 title: None,
                 created_at: 0,
                 updated_at: 0,
@@ -2215,6 +2306,7 @@ mod tests {
             Some("roundtrip test"),
             "all",
             Some("roundtrip-anchor"),
+            None,
             None,
         )
         .expect("all-breadth request builds");

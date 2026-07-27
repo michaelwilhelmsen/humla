@@ -34,6 +34,10 @@ pub fn build_cloud_request(
     breadth: &str,
     note_id: Option<&str>,
     folder_id: Option<&str>,
+    // A pinned authorship filter (#103): `(user_id, display_name)`. The id is
+    // what the server filters on; the name only reaches the prompt, so the model
+    // can say whose notes it was restricted to. Absent = no filter.
+    owner: Option<(&str, &str)>,
 ) -> Result<Value, String> {
     // Reject an unknown breadth through the shared validator — one owner of the
     // vocabulary and its error, no duplicated match/message here.
@@ -59,11 +63,24 @@ pub fn build_cloud_request(
         }
         v
     };
+    // The pin rides the scope, beside the breadth clamp it behaves like: both are
+    // the user's stated intent, and both bind regardless of what the model asks
+    // for. The display name travels separately from the id it names — one is a
+    // filter input, the other is only ever prompt text.
+    let with_owner = |mut v: Value| {
+        if let Some((id, name)) = owner.filter(|(id, _)| !id.trim().is_empty()) {
+            v["owner"] = json!(id);
+            if !name.trim().is_empty() {
+                v["owner_name"] = json!(name);
+            }
+        }
+        v
+    };
     let scope = match breadth {
-        "note" => with_anchor(json!({ "breadth": "note" })),
-        "all" => with_anchor(json!({ "breadth": "all" })),
+        "note" => with_owner(with_anchor(json!({ "breadth": "note" }))),
+        "all" => with_owner(with_anchor(json!({ "breadth": "all" }))),
         "folder" => match folder_id.filter(|f| !f.is_empty()) {
-            Some(f) => with_anchor(json!({ "breadth": "folder", "folder_id": f })),
+            Some(f) => with_owner(with_anchor(json!({ "breadth": "folder", "folder_id": f }))),
             None => {
                 return Err(
                     "\"Folder\" scope needs a folder, but this note isn't in one.".into()
@@ -444,7 +461,7 @@ mod tests {
 
     #[test]
     fn request_defaults_to_note_breadth_with_grounding_anchor() {
-        let b = build_cloud_request(None, "ws1", "hi", None, "note", Some("n1"), None).unwrap();
+        let b = build_cloud_request(None, "ws1", "hi", None, "note", Some("n1"), None, None).unwrap();
         assert_eq!(b["workspace_id"], "ws1");
         assert_eq!(b["message"], "hi");
         assert_eq!(b["scope"], json!({ "breadth": "note", "note_id": "n1" }));
@@ -458,7 +475,7 @@ mod tests {
     /// the key has to be absent.
     #[test]
     fn a_library_wide_request_sends_no_anchor_at_all() {
-        let b = build_cloud_request(None, "ws1", "hi", None, "all", None, None).unwrap();
+        let b = build_cloud_request(None, "ws1", "hi", None, "all", None, None, None).unwrap();
         assert_eq!(b["scope"], json!({ "breadth": "all" }));
         assert!(
             b["scope"].get("note_id").is_none(),
@@ -467,7 +484,7 @@ mod tests {
         // An EMPTY anchor is a caller bug, not "absent" — the same strictness
         // `ChatTarget::from_note_id` applies at the IPC boundary, so `""` can't
         // mean "a note" at one layer and "the library" at another.
-        let err = build_cloud_request(None, "ws1", "hi", None, "all", Some(""), None).unwrap_err();
+        let err = build_cloud_request(None, "ws1", "hi", None, "all", Some(""), None, None).unwrap_err();
         assert!(err.contains("empty note id"), "got: {err}");
     }
 
@@ -476,26 +493,26 @@ mod tests {
     #[test]
     fn a_request_without_an_anchor_must_be_all_breadth() {
         for breadth in ["note", "folder"] {
-            let err = build_cloud_request(None, "ws1", "hi", None, breadth, None, Some("f1"))
+            let err = build_cloud_request(None, "ws1", "hi", None, breadth, None, Some("f1"), None)
                 .unwrap_err();
             assert!(err.contains("needs an anchor note"), "{breadth}: {err}");
         }
         // With an anchor, both still build as before.
-        assert!(build_cloud_request(None, "ws1", "hi", None, "note", Some("n1"), None).is_ok());
+        assert!(build_cloud_request(None, "ws1", "hi", None, "note", Some("n1"), None, None).is_ok());
         assert!(
-            build_cloud_request(None, "ws1", "hi", None, "folder", Some("n1"), Some("f1")).is_ok()
+            build_cloud_request(None, "ws1", "hi", None, "folder", Some("n1"), Some("f1"), None).is_ok()
         );
     }
 
     #[test]
     fn request_carries_remote_id_and_title_when_present() {
         let b =
-            build_cloud_request(Some("srv123"), "ws1", "hi", Some("Kickoff"), "note", Some("n1"), None)
+            build_cloud_request(Some("srv123"), "ws1", "hi", Some("Kickoff"), "note", Some("n1"), None, None)
                 .unwrap();
         assert_eq!(b["conversation_id"], "srv123");
         assert_eq!(b["title"], "Kickoff");
         // Empty strings are dropped, not sent.
-        let b2 = build_cloud_request(Some(""), "ws1", "hi", Some(""), "note", Some("n1"), None).unwrap();
+        let b2 = build_cloud_request(Some(""), "ws1", "hi", Some(""), "note", Some("n1"), None, None).unwrap();
         assert!(b2.get("conversation_id").is_none());
         assert!(b2.get("title").is_none());
     }
@@ -503,7 +520,7 @@ mod tests {
     #[test]
     fn request_folder_breadth_carries_the_folder_id() {
         let with =
-            build_cloud_request(None, "ws1", "hi", None, "folder", Some("n1"), Some("f1")).unwrap();
+            build_cloud_request(None, "ws1", "hi", None, "folder", Some("n1"), Some("f1"), None).unwrap();
         assert_eq!(with["scope"], json!({ "breadth": "folder", "note_id": "n1", "folder_id": "f1" }));
     }
 
@@ -512,20 +529,20 @@ mod tests {
         // Issue #58: no silent degradation. The desktop heals the folder-less
         // case to "note" upstream, so this strict guard shouldn't fire — but if
         // it's reached it errors loudly rather than quietly narrowing to note.
-        let err = build_cloud_request(None, "ws1", "hi", None, "folder", Some("n1"), None).unwrap_err();
+        let err = build_cloud_request(None, "ws1", "hi", None, "folder", Some("n1"), None, None).unwrap_err();
         assert!(err.to_lowercase().contains("folder"), "names the missing folder: {err}");
     }
 
     #[test]
     fn request_unrecognized_breadth_is_an_error() {
         // Issue #58: the former `_ => {}` fall-through silently clamped to note.
-        let err = build_cloud_request(None, "ws1", "hi", None, "everything", Some("n1"), None).unwrap_err();
+        let err = build_cloud_request(None, "ws1", "hi", None, "everything", Some("n1"), None, None).unwrap_err();
         assert!(err.contains("everything"), "the offending value is surfaced: {err}");
     }
 
     #[test]
     fn request_all_breadth_keeps_the_grounding_anchor() {
-        let b = build_cloud_request(None, "ws1", "hi", None, "all", Some("n1"), None).unwrap();
+        let b = build_cloud_request(None, "ws1", "hi", None, "all", Some("n1"), None, None).unwrap();
         assert_eq!(b["scope"], json!({ "breadth": "all", "note_id": "n1" }));
     }
 
