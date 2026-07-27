@@ -366,6 +366,7 @@ where
             commands::chat_set_breadth,
             commands::chat_set_owner_filter,
             commands::chat_get_breadth,
+            commands::chat_get_owner_filter,
             commands::chat_usage,
             commands::chat_index_state,
             commands::chat_key_meta,

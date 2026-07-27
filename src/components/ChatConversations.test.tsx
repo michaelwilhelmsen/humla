@@ -12,7 +12,7 @@ import type { ConversationMeta } from "../lib/ipc";
 const HOUR = 3_600_000;
 
 function conversation(over: Partial<ConversationMeta> & { id: string }): ConversationMeta {
-  return { title: "Untitled", breadth: "all", updatedAt: 1, messageCount: 2, ...over };
+  return { title: "Untitled", breadth: "all", ownerFilter: "", updatedAt: 1, messageCount: 2, ...over };
 }
 
 function publish(over: Partial<ChatSessionControls> = {}) {

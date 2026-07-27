@@ -2283,6 +2283,39 @@ mod tests {
         assert_eq!(reloaded.breadth, "all", "breadth survives a re-open (idempotent migration)");
     }
 
+    /// The authorship pin (#103) defaults to off, round-trips, clears, and — the
+    /// part that matters — survives a re-open. An existing conversation must
+    /// back-fill to "" rather than to anything that would narrow retrieval:
+    /// its scrollback was written over the whole workspace.
+    #[test]
+    fn conversation_owner_filter_defaults_off_and_persists_idempotently() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("owner.sqlite");
+        let reload = |conn: &Connection| {
+            latest_conversation(conn, CHAT_TENANT_PERSONAL, CHAT_SCOPE_NOTE, "note1")
+                .unwrap()
+                .unwrap()
+        };
+        {
+            let conn = open(&path).unwrap();
+            let conv =
+                create_conversation(&conn, CHAT_TENANT_PERSONAL, CHAT_SCOPE_NOTE, "note1", "note")
+                    .unwrap();
+            assert_eq!(conv.owner_filter, "", "a new conversation is unpinned");
+            set_conversation_owner_filter(&conn, &conv.id, Some("u-anna")).unwrap();
+            assert_eq!(reload(&conn).owner_filter, "u-anna", "the pin round-trips");
+            set_conversation_owner_filter(&conn, &conv.id, None).unwrap();
+            assert_eq!(reload(&conn).owner_filter, "", "None clears the pin");
+            set_conversation_owner_filter(&conn, &conv.id, Some("u-anna")).unwrap();
+        }
+        let conn = open(&path).unwrap();
+        assert_eq!(
+            reload(&conn).owner_filter,
+            "u-anna",
+            "the pin survives a re-open (idempotent migration)"
+        );
+    }
+
     /// Migration idempotency + first-session preservation (issue #61). Seeds a
     /// pre-#61 DB — the old UNIQUE `idx_conversations_scope`, no `title` column,
     /// a conversation with a user message and an empty one — then runs `open()`

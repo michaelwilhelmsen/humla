@@ -793,6 +793,28 @@ pub fn chat_get_breadth(
     effective_breadth(&conn, &conversation.id, &conversation.breadth, note.as_ref())
 }
 
+/// Read the persisted authorship pin (#103) so the chip initialises from the
+/// backend in one round trip, exactly as the Scope chip does. `""` = off.
+///
+/// No session yet → off, WITHOUT creating a row: unlike breadth there is no
+/// default to inherit, since a pin is only ever something the user set.
+#[tauri::command]
+pub fn chat_get_owner_filter(
+    app: AppHandle,
+    note_id: Option<String>,
+    conversation_id: Option<String>,
+) -> Result<String, String> {
+    let target = ChatTarget::from_note_id(note_id)?;
+    let state: State<AppState> = app.state();
+    let conn = state.db.lock();
+    let ctx = ChatContext::load(&conn);
+    Ok(
+        resolve_existing(&conn, ctx.tenant(), &target, conversation_id.as_deref())?
+            .map(|c| c.owner_filter)
+            .unwrap_or_default(),
+    )
+}
+
 /// Workspace turn-allowance for the composer meter (issue #69). Personal chat is
 /// unmetered by design → `None` with no HTTP. In a workspace, GET the chat
 /// service's usage endpoint (same base/token/one-shot-401-retry as the other

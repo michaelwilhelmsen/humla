@@ -1346,3 +1346,167 @@ describe("ChatPanel stop (#80)", () => {
     await act(async () => release());
   });
 });
+
+// The conversation's pinned authorship filter (#103) — "Created by me" beside the
+// breadth picker. Breadth says WHAT is in reach; this says WHOSE.
+describe("ChatPanel authorship pin", () => {
+  const PIN = { name: /Created by/ };
+
+  // Signed into a workspace WITHOUT billing (so the BYOK activation pane doesn't
+  // gate the composer), as a user with an id — the chip resolves the pin against
+  // that id directly, not against a display name.
+  function signInAs(id = "u-me", name = "Michael") {
+    const ws = { id: "ws1", name: "Acme Team", role: "owner" as const, plan_status: "active" as const };
+    useCloudStore.setState({
+      status: {
+        ...DISCONNECTED,
+        configured: true,
+        logged_in: true,
+        base_url: "https://sync.humla.team",
+        user: { id, name, email: `${id}@acme.com` },
+        current_workspace: ws,
+        workspaces: [ws],
+      },
+      members: {
+        [id]: { id, name, email: `${id}@acme.com`, role: "owner" },
+        "u-anna": { id: "u-anna", name: "Anna", email: "anna@acme.com", role: "member" },
+      },
+    });
+  }
+
+  function renderGlobal() {
+    return render(
+      <MemoryRouter>
+        <ChatPanel target={{ kind: "global" }} />
+      </MemoryRouter>,
+    );
+  }
+
+  it("is absent in Personal, where every note is already yours", async () => {
+    mockTauri({ provider_key_get: () => "sk-test", chat_history: () => history(), chat_get_breadth: () => "all" });
+    renderGlobal();
+    await screen.findByPlaceholderText(/Ask about your notes/);
+    expect(screen.queryByRole("button", PIN)).toBeNull();
+  });
+
+  // Presence tracks the SCOPE, not the note. Under `note` breadth the filter is
+  // either a no-op (your own note) or empties the pane's own anchor (a
+  // teammate's) — the same reason the date window is dropped there.
+  it("is absent under note breadth, and appears once the scope widens", async () => {
+    signInAs();
+    seedNoteWithFolder();
+    mockTauri({ provider_key_get: () => "sk-test", chat_history: () => history(), chat_get_breadth: () => "note" });
+    renderPanel();
+
+    await screen.findByPlaceholderText(/Ask about your notes/);
+    expect(screen.queryByRole("button", PIN)).toBeNull();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Chat scope" }));
+    fireEvent.click(await screen.findByText("All notes"));
+    await waitFor(() => expect(screen.getByRole("button", PIN)).toBeInTheDocument());
+  });
+
+  it("pins to the signed-in user's id, not to their name", async () => {
+    signInAs("u-me");
+    const writes: unknown[] = [];
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () => history(),
+      chat_get_breadth: () => "all",
+      chat_set_owner_filter: (a) => {
+        writes.push(a);
+        return null;
+      },
+    });
+    renderGlobal();
+
+    fireEvent.click(await screen.findByRole("button", PIN));
+    await waitFor(() => expect(writes).toHaveLength(1));
+    expect(writes[0]).toMatchObject({ owner: "u-me" });
+    expect(screen.getByRole("button", PIN)).toHaveAttribute("aria-pressed", "true");
+  });
+
+  it("clears the pin by sending null, not an empty string", async () => {
+    signInAs("u-me");
+    const writes: { owner?: string | null }[] = [];
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () => history(),
+      chat_get_breadth: () => "all",
+      chat_get_owner_filter: () => "u-me",
+      chat_set_owner_filter: (a) => {
+        writes.push(a as { owner?: string | null });
+        return null;
+      },
+    });
+    renderGlobal();
+
+    await waitFor(() => expect(screen.getByRole("button", PIN)).toHaveAttribute("aria-pressed", "true"));
+    fireEvent.click(screen.getByRole("button", PIN));
+    await waitFor(() => expect(writes).toHaveLength(1));
+    expect(writes[0]!.owner).toBeNull();
+  });
+
+  // Anna's way out of a thread pinned to Michael is her own thread — the
+  // alternative is her quietly rewriting what his scrollback means.
+  it("names someone else's pin and refuses to let you change it", async () => {
+    signInAs("u-me");
+    const writes: unknown[] = [];
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () => history(),
+      chat_get_breadth: () => "all",
+      chat_get_owner_filter: () => "u-anna",
+      chat_set_owner_filter: (a) => {
+        writes.push(a);
+        return null;
+      },
+    });
+    renderGlobal();
+
+    const chip = await screen.findByRole("button", { name: /Created by Anna/ });
+    expect(chip).toBeDisabled();
+    fireEvent.click(chip);
+    expect(writes).toHaveLength(0);
+  });
+
+  // The id filters; the name is only the model's disclosure wording. An
+  // unresolvable person must not read as "me" — that would misattribute a
+  // teammate's filter to whoever is looking at the thread.
+  it("stays neutral about a pin it cannot resolve, and still shows it as on", async () => {
+    signInAs("u-me");
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () => history(),
+      chat_get_breadth: () => "all",
+      chat_get_owner_filter: () => "u-departed",
+    });
+    renderGlobal();
+
+    const chip = await screen.findByRole("button", { name: /Created by someone else/ });
+    expect(chip).toHaveAttribute("aria-pressed", "true");
+    expect(chip).toBeDisabled();
+  });
+
+  it("sends the pinned person's name with the turn, for the model's disclosure", async () => {
+    signInAs("u-me");
+    const sends: { ownerName?: string | null }[] = [];
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () => history(),
+      chat_get_breadth: () => "all",
+      chat_get_owner_filter: () => "u-anna",
+      chat_send: (a) => {
+        sends.push(a as { ownerName?: string | null });
+        return { conversationId: "c1", truncated: false };
+      },
+    });
+    renderGlobal();
+
+    const input = await screen.findByPlaceholderText(/Ask about your notes/);
+    fireEvent.change(input, { target: { value: "what did we decide?" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    await waitFor(() => expect(sends).toHaveLength(1));
+    expect(sends[0]!.ownerName).toBe("Anna");
+  });
+});

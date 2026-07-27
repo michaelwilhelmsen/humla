@@ -546,6 +546,43 @@ mod tests {
         assert_eq!(b["scope"], json!({ "breadth": "all", "note_id": "n1" }));
     }
 
+    /// The authorship pin (#103) rides the scope under every breadth — it says
+    /// WHOSE notes are in reach, which composes with WHAT is, rather than being a
+    /// fourth breadth.
+    #[test]
+    fn request_carries_the_authorship_pin_under_every_breadth() {
+        let owner = Some(("u-anna", "Anna"));
+        let note = build_cloud_request(None, "ws1", "hi", None, "note", Some("n1"), None, owner).unwrap();
+        assert_eq!(note["scope"], json!({ "breadth": "note", "note_id": "n1", "owner": "u-anna", "owner_name": "Anna" }));
+        let all = build_cloud_request(None, "ws1", "hi", None, "all", None, None, owner).unwrap();
+        assert_eq!(all["scope"], json!({ "breadth": "all", "owner": "u-anna", "owner_name": "Anna" }));
+        let folder =
+            build_cloud_request(None, "ws1", "hi", None, "folder", Some("n1"), Some("f1"), owner).unwrap();
+        assert_eq!(
+            folder["scope"],
+            json!({ "breadth": "folder", "note_id": "n1", "folder_id": "f1", "owner": "u-anna", "owner_name": "Anna" }),
+        );
+    }
+
+    /// The ID filters; the NAME is only the prompt's disclosure wording. So an
+    /// unresolvable person (a removed member, a roster that hasn't loaded) must
+    /// still pin — losing the name, never the filter.
+    #[test]
+    fn a_pin_without_a_resolvable_name_still_filters() {
+        let b = build_cloud_request(None, "ws1", "hi", None, "all", None, None, Some(("u-anna", ""))).unwrap();
+        assert_eq!(b["scope"], json!({ "breadth": "all", "owner": "u-anna" }));
+    }
+
+    /// The inverse: a name with no id behind it is not a pin. Sending `owner_name`
+    /// alone would make the server disclose a filter that isn't running.
+    #[test]
+    fn a_blank_owner_id_is_no_pin_at_all() {
+        for owner in [Some(("", "Anna")), Some(("   ", "Anna")), None] {
+            let b = build_cloud_request(None, "ws1", "hi", None, "all", None, None, owner).unwrap();
+            assert_eq!(b["scope"], json!({ "breadth": "all" }), "{owner:?}");
+        }
+    }
+
     #[test]
     fn parses_sse_event_and_data() {
         let (ev, data) = parse_sse_frame("event: text_delta\ndata: {\"delta\":\"hi\"}").unwrap();
