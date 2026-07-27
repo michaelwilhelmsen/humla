@@ -1438,6 +1438,11 @@ function PromptPicker({
   );
 }
 
+// The composer control row's shared resting look: quiet, sentence-case, muted.
+// Both controls in the row wear it, so neither can drift into shouting past the
+// other; each adds its own interaction and active states.
+const QUIET_CONTROL = "inline-flex items-center gap-1 text-xs text-[var(--color-text-muted)] transition-colors";
+
 // Retrieval-breadth picker for the composer (#63). A quiet, sentence-case
 // labelled dropdown — not a chip, not bordered — that always shows the current
 // breadth on the trigger (fixing the old bug where the active value only
@@ -1505,7 +1510,7 @@ function BreadthPicker({
       activeId={activeId}
       onSelect={(id) => onScope((id as ChatScope) ?? fallbackScope)}
       trigger={
-        <span className="inline-flex items-center gap-1 text-xs text-[var(--color-text-muted)] cursor-pointer hover:text-[var(--color-text)] transition-colors">
+        <span className={cn(QUIET_CONTROL, "cursor-pointer hover:text-[var(--color-text)]")}>
           {active?.icon}
           {label}
           <ChevronDown size={12} strokeWidth={2} aria-hidden="true" className="shrink-0" />
@@ -1567,10 +1572,9 @@ function AuthorPin({
       aria-pressed={pinned}
       title={title}
       className={cn(
-        "inline-flex shrink-0 items-center gap-1 rounded-full text-xs transition-colors",
-        pinned
-          ? "bg-[var(--color-accent-soft)] px-2 py-0.5 text-[var(--color-accent-text)]"
-          : "text-[var(--color-text-muted)]",
+        QUIET_CONTROL,
+        "shrink-0 rounded-full",
+        pinned && "bg-[var(--color-accent-soft)] px-2 py-0.5 text-[var(--color-accent-text)]",
         editable ? "cursor-pointer hover:text-[var(--color-text)]" : "cursor-default",
       )}
     >

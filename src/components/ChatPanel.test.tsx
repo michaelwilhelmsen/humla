@@ -1363,7 +1363,7 @@ describe("ChatPanel authorship pin", () => {
         configured: true,
         logged_in: true,
         base_url: "https://sync.humla.team",
-        user: { id, name, email: `${id}@acme.com` },
+        user: { id, name, email: `${id}@acme.com`, verified: true },
         current_workspace: ws,
         workspaces: [ws],
       },

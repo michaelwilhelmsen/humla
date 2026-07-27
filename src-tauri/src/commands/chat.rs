@@ -1136,10 +1136,11 @@ pub async fn chat_send(
         // self-healed against the Note's current folder.
         let breadth =
             effective_breadth(&conn, &conversation.id, &conversation.breadth, note.as_ref())?;
-        // The pinned authorship filter (#103), read from the same row as breadth
-        // and binding the same way: it's the user's stated intent, so it applies
-        // whatever the model asks for.
-        let owner_filter = conversation.owner_filter.clone();
+        // No authorship pin is read here: `chat_set_owner_filter` refuses one in
+        // Personal, where every note is the user's own, so the column is always
+        // empty on this path. The workspace turn (`chat_send_cloud`) is where the
+        // pin is read and sent. Keep this in step with that rejection — a pin that
+        // could be stored but not applied is the silent-no-op shape (#103).
         let tool_scope = resolve_scope(&breadth, note.as_ref())?;
         (grounding, resolved, conversation.id, tool_scope, workspace)
     };
@@ -1638,24 +1639,24 @@ fn ensure_workspace_handle(
     target: &ChatTarget,
     remote_id: &str,
     breadth: &str,
-    owner_filter: &str,
+    owner_filter: Option<&str>,
 ) -> Result<db::Conversation, String> {
+    // An EXISTING handle is returned untouched — the local row is the source of
+    // truth for both breadth and the pin, and this reconciliation runs on every
+    // list refresh. Letting the server win here would resurrect a pin the user
+    // just cleared: clear it, don't send a turn (so the persist never mirrors the
+    // clear upward), reopen the pane, and the stale server value writes itself
+    // back over the local "". The filter would start applying again with nobody
+    // having touched it — the silent-no-op shape this whole area keeps producing.
+    //
+    // The cost is that a pin set on another device reaches only a device that has
+    // not opened this thread yet (which adopts it below, at handle creation).
+    // That is the same guarantee breadth has always had, and the failure it trades
+    // for — a pin that doesn't propagate — is visible on the chip, where a pin
+    // that undoes itself is not.
     if let Some(c) = db::get_conversation_by_remote_id(conn, workspace, remote_id)
         .map_err(|e| e.to_string())?
     {
-        // The server's copy wins on load, the same way breadth does. Without this
-        // a pin set on another device would render on the chip but not reach the
-        // next turn, which reads the LOCAL row — the filter would silently stop
-        // applying (#103).
-        if c.owner_filter != owner_filter {
-            db::set_conversation_owner_filter(
-                conn,
-                &c.id,
-                Some(owner_filter).filter(|o| !o.is_empty()),
-            )
-            .map_err(|e| e.to_string())?;
-            return Ok(db::Conversation { owner_filter: owner_filter.to_string(), ..c });
-        }
         return Ok(c);
     }
     let breadth = chat::validate_breadth(breadth).unwrap_or_else(|_| chat::default_breadth(target));
@@ -1663,10 +1664,11 @@ fn ensure_workspace_handle(
         db::create_conversation(conn, workspace, target.scope(), target.scope_id(), breadth)
             .map_err(|e| e.to_string())?;
     db::set_conversation_remote_id(conn, &handle.id, remote_id).map_err(|e| e.to_string())?;
-    if !owner_filter.is_empty() {
-        db::set_conversation_owner_filter(conn, &handle.id, Some(owner_filter))
+    let pin = owner_filter.unwrap_or_default();
+    if !pin.is_empty() {
+        db::set_conversation_owner_filter(conn, &handle.id, Some(pin))
             .map_err(|e| e.to_string())?;
-        return Ok(db::Conversation { owner_filter: owner_filter.to_string(), ..handle });
+        return Ok(db::Conversation { owner_filter: pin.to_string(), ..handle });
     }
     Ok(handle)
 }
@@ -1696,7 +1698,11 @@ fn cloud_conversation_meta(
         .ok_or("Team chat returned a conversation without an id")?;
     let breadth =
         item.get("breadth").and_then(|v| v.as_str()).unwrap_or_else(|| chat::default_breadth(target));
-    let owner_filter = item.get("owner_filter").and_then(|v| v.as_str()).unwrap_or_default();
+    // `None` is a server that doesn't know the field (pre-#39, or self-hosted and
+    // not yet updated) — NOT the same as "off", and the distinction matters at
+    // handle creation, where absent must not stamp an empty pin over an inherited
+    // one.
+    let owner_filter = item.get("owner_filter").and_then(|v| v.as_str());
     let handle = {
         let conn = state.db.lock();
         ensure_workspace_handle(&conn, workspace, target, remote_id, breadth, owner_filter)?
@@ -1705,7 +1711,10 @@ fn cloud_conversation_meta(
         id: handle.id,
         title: item.get("title").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
         breadth: breadth.to_string(),
-        owner_filter: owner_filter.to_string(),
+        // The HANDLE's pin, not the server item's: the local row is what the next
+        // turn reads, so reporting the server's would let the chip show a filter
+        // the turn isn't applying.
+        owner_filter: handle.owner_filter,
         updated_at: pb_timestamp_ms(item.get("updated")),
         message_count: item.get("message_count").and_then(|v| v.as_i64()).unwrap_or(0),
     })
