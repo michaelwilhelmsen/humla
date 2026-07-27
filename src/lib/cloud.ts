@@ -212,6 +212,25 @@ export function useOwnerName(ownerId: string | undefined | null): string | null 
   return rosterLoaded ? "Former member" : null;
 }
 
+/**
+ * Resolve a workspace member id to their display name — plainly, with none of
+ * `useOwnerName`'s attribution logic. That one collapses "it's you" and "can't
+ * resolve them" to the same `null`, which is right for a "created by" byline
+ * (both render nothing) and wrong everywhere the two must be told apart: the
+ * authorship chip labels a self-pin "Created by me" and an unresolvable one
+ * neutrally, and the chat turn sends the name for the model's disclosure line
+ * whether or not the pinned person is the caller (#103).
+ */
+export function useMemberName(id: string | undefined | null): string | null {
+  const member = useCloudStore((s) => (id ? s.members[id] : undefined));
+  const myName = useCloudStore((s) => (id && s.status.user?.id === id ? s.status.user : null));
+  if (!id) return null;
+  if (member) return member.name || member.email || null;
+  // The roster excludes the caller on some servers, so fall back to their own
+  // account before giving up — a self-pin must not read as a stranger.
+  return myName ? myName.name || myName.email || null : null;
+}
+
 export function roleLabel(role: CloudRole): string {
   return role.charAt(0).toUpperCase() + role.slice(1);
 }

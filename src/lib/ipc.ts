@@ -405,8 +405,17 @@ export const ipc = {
   // library** (#93). The backend reads an absent note id as the global scope and
   // REJECTS an empty string, so null is the only correct way to say "no anchor" —
   // never "".
-  chatSend: (noteId: string | null, conversationId: string | null, message: string) =>
-    invoke<ChatSendResult>("chat_send", { noteId, conversationId, message }),
+  //
+  // `ownerName` is a DISPLAY NAME for the pinned author (#103), used only in the
+  // prompt's disclosure line — the pinned *id* lives on the conversation row and
+  // is what actually filters. Sent from the roster the client already holds so
+  // the turn costs no extra lookup; null when there's no pin or no name for it.
+  chatSend: (
+    noteId: string | null,
+    conversationId: string | null,
+    message: string,
+    ownerName: string | null = null,
+  ) => invoke<ChatSendResult>("chat_send", { noteId, conversationId, message, ownerName }),
   // Stop the turn streaming in a pane (issue #80). A no-op when nothing is in
   // flight, so a stray click can't error. Any text that already streamed is kept;
   // a stop before the first token leaves only the user's message.
@@ -434,6 +443,13 @@ export const ipc = {
     invoke<void>("chat_set_breadth", { noteId, conversationId, breadth }),
   chatGetBreadth: (noteId: string | null, conversationId: string | null = null) =>
     invoke<ChatScope>("chat_get_breadth", { noteId, conversationId }),
+  // Persist / read the conversation's pinned authorship filter (#103) — a user
+  // id, or null/"" for off. Workspace-only: the backend rejects a pin in
+  // Personal, where every note is the user's own already.
+  chatSetOwnerFilter: (noteId: string | null, conversationId: string | null, owner: string | null) =>
+    invoke<void>("chat_set_owner_filter", { noteId, conversationId, owner }),
+  chatGetOwnerFilter: (noteId: string | null, conversationId: string | null = null) =>
+    invoke<string>("chat_get_owner_filter", { noteId, conversationId }),
   // Workspace turn allowance for the composer meter (issue #69). null in personal
   // context, and on any unavailable/error/unmetered outcome — a meter never
   // errors the pane, so the caller just hides the display when this is null.
@@ -496,6 +512,10 @@ export type ConversationMeta = {
   id: string;
   title: string;
   breadth: ChatScope;
+  /** The pinned authorship filter's user id, or "" for off (#103). A user id
+   *  rather than a flag because a workspace's conversation list is shared: a
+   *  boolean would mean different notes to different readers of one thread. */
+  ownerFilter: string;
   updatedAt: number;
   messageCount: number;
 };

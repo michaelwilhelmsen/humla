@@ -14,6 +14,7 @@ import {
   MessageCircle,
   Settings2,
   Square,
+  UserRound,
 } from "lucide-react";
 import {
   ipc,
@@ -29,7 +30,7 @@ import {
   type ConversationMeta,
 } from "../lib/ipc";
 import { useNotesStore } from "../lib/store";
-import { cloudApi, formatSeatPrice, useCloudStore, type ChatAddon, type ChatKeyMeta } from "../lib/cloud";
+import { cloudApi, formatSeatPrice, useCloudStore, useMemberName, type ChatAddon, type ChatKeyMeta } from "../lib/cloud";
 import { useChatReadiness } from "./provider/useChatReadiness";
 import { SelectablePopover, type PopoverItem } from "./SelectablePopover";
 import { ChatKeyEntry } from "./ChatKeyEntry";
@@ -237,6 +238,11 @@ export function ChatPanel({
   // Scope chip breadth. Display state only — the backend conversation row is the
   // source of truth (issue #58); this mirrors it and is (re)initialised from it.
   const [scope, setScope] = useState<ChatScope>(() => targetDefaultScope(target));
+  // The conversation's pinned authorship filter (#103): a user id, or "" for off.
+  // Display state only, mirroring the backend row exactly as `scope` does. A user
+  // id and not a flag because a workspace's conversation list is shared — a
+  // boolean would mean different notes to each reader of the same thread.
+  const [ownerFilter, setOwnerFilter] = useState("");
   // Prompt picker visibility (#80). Opened by typing "/" into an empty composer;
   // the picker owns the keys while it's up (it takes focus), so the composer's
   // own key handler doesn't need to know about Escape.
@@ -396,6 +402,7 @@ export function ChatPanel({
       setConversationId(meta.id);
       setMessages([]);
       setScope(meta.breadth ?? targetDefaultScope(target));
+      setOwnerFilter(meta.ownerFilter ?? "");
       setConversations((prev) => [meta, ...prev.filter((c) => c.id !== meta.id)]);
       void reloadConversationList(gen);
     } catch (e) {
@@ -415,14 +422,16 @@ export function ChatPanel({
       const gen = beginSwitch();
       setConversationId(id);
       try {
-        const [h, b] = await Promise.all([
+        const [h, b, o] = await Promise.all([
           ipc.chatHistory(noteId, id),
           ipc.chatGetBreadth(noteId, id),
+          ipc.chatGetOwnerFilter(noteId, id).catch(() => ""),
         ]);
         if (gen !== switchGenRef.current) return;
         setMessages(h?.messages ?? []);
         if (h?.conversationId) setConversationId(h.conversationId);
         if (b) setScope(b);
+        setOwnerFilter(o ?? "");
       } catch {
         if (gen === switchGenRef.current) setMessages([]);
       } finally {
@@ -454,6 +463,10 @@ export function ChatPanel({
   const members = useCloudStore((s) => s.members);
   const addon = useCloudStore((s) => s.status.chat_addon ?? null);
   const inWorkspace = !!workspaceId;
+  // The signed-in user's own id — compared against the pin DIRECTLY rather than
+  // via `useOwnerName`, which returns null both for "that's you" and for "can't
+  // resolve them". The chip has to tell those two apart (#103).
+  const myUserId = useCloudStore((s) => s.status.user?.id ?? null);
   const isOwner = wsRole === "owner";
   const ownerMember = Object.values(members).find((m) => m.role === "owner");
   const ownerName = ownerMember ? ownerMember.name || ownerMember.email : "the workspace owner";
@@ -495,8 +508,29 @@ export function ChatPanel({
   // Personal-only (#80), the truncation hint needs an anchor note, and the turn
   // meter needs a metered workspace (#69). On `/chat` in Personal that's nothing
   // at all — so don't render the row and leave a gap where content isn't.
+  // The authorship pin (#103), shown as a toggle in the same control row.
+  //
+  // HIDDEN IN PERSONAL — every note is the user's own there, so the control could
+  // only ever be the identity function — and HIDDEN UNDER `note` BREADTH, where
+  // it is either a no-op (your own note) or empties the pane's own anchor (a
+  // teammate's). That is the same reason the date window is dropped under `note`.
+  // Presence tracks the SCOPE, not the note: conditioning on who owns the anchor
+  // would only change the no-op case, while making the chip flicker between notes
+  // for a reason nothing on screen explains.
+  const showAuthorPin = inWorkspace && scope !== "note";
+  // Editable iff the filter is off, or pinned to you. Anna's way out of a thread
+  // pinned to Michael is her own thread — the alternative is her quietly rewriting
+  // what his scrollback means. (The backend does NOT enforce this, matching
+  // `chat_set_breadth`; making this the one chat setting with a server-side
+  // authorization rule wasn't worth it.)
+  const authorPinIsMine = ownerFilter !== "" && ownerFilter === myUserId;
+  const authorPinEditable = ownerFilter === "" ? myUserId !== null : authorPinIsMine;
+  // The pinned person's display name — for the chip's label and for the model's
+  // disclosure line. Null when unresolvable (a removed member, or a roster that
+  // hasn't loaded); the pin still filters, it just loses its wording.
+  const pinnedAuthorName = useMemberName(ownerFilter || null);
   const showComposerControls =
-    noteId !== null || (!onPage && !inWorkspace && !!model) || !!usage;
+    noteId !== null || (!onPage && !inWorkspace && !!model) || !!usage || showAuthorPin;
 
   // Activation gating (#76). Only on the managed server + a workspace. While the
   // key metadata is still loading (undefined) show neither composer nor pane, so
@@ -596,6 +630,17 @@ export function ChatPanel({
       .catch(() => {
         if (!cancelled && gen === switchGenRef.current) setScope(targetDefaultScope(target));
       });
+    // Same for the authorship pin (#103). Off is the safe fallback: a chip that
+    // wrongly reads "off" under-promises, where one that wrongly reads "on" would
+    // claim a narrowing the turn isn't doing.
+    ipc
+      .chatGetOwnerFilter(noteId)
+      .then((o) => {
+        if (!cancelled && gen === switchGenRef.current) setOwnerFilter(o ?? "");
+      })
+      .catch(() => {
+        if (!cancelled && gen === switchGenRef.current) setOwnerFilter("");
+      });
     void reloadConversationList(gen);
     void refreshActivation(gen);
     return () => {
@@ -611,6 +656,18 @@ export function ChatPanel({
   function selectBreadth(next: ChatScope) {
     setScope(next);
     void ipc.chatSetBreadth(noteId, conversationId, next).catch((e) => setError(String(e)));
+  }
+
+  // Pin the conversation to the caller's own notes, or clear the pin (#103).
+  // Optimistic like the breadth write, and only ever offers MY id — the chip is
+  // inert when someone else's pin is in force (see `authorPinEditable`).
+  function toggleOwnerFilter() {
+    const next = ownerFilter === "" ? (myUserId ?? "") : "";
+    if (next === "" && ownerFilter === "") return;
+    setOwnerFilter(next);
+    void ipc
+      .chatSetOwnerFilter(noteId, conversationId, next === "" ? null : next)
+      .catch((e) => setError(String(e)));
   }
 
   // Owner activated chat from the pane (#76): the entry reports fresh metadata →
@@ -774,7 +831,10 @@ export function ChatPanel({
     try {
       // Send to the resolved session (null lazily creates the note's first one),
       // capturing the id the backend landed on so the reload targets it (#61).
-      const result = await ipc.chatSend(noteId, conversationId, text);
+      // The pinned author's NAME rides the turn for the prompt's disclosure line
+      // only — the id lives on the conversation row and is what filters, so an
+      // unresolvable name costs wording and nothing else (#103).
+      const result = await ipc.chatSend(noteId, conversationId, text, pinnedAuthorName);
       if (gen !== switchGenRef.current) return;
       setConversationId(result.conversationId);
       const h = await ipc.chatHistory(noteId, result.conversationId);
@@ -1153,6 +1213,15 @@ export function ChatPanel({
               hasAnchor={noteId !== null}
               fallbackScope={targetDefaultScope(target)}
             />
+            {showAuthorPin && (
+              <AuthorPin
+                pinned={ownerFilter !== ""}
+                isMine={authorPinIsMine}
+                name={pinnedAuthorName}
+                editable={authorPinEditable}
+                onToggle={toggleOwnerFilter}
+              />
+            )}
             {/* Which model is about to answer (#80) — previously invisible
                 without opening Settings. Muted, not disabled: --color-text-
                 disabled fails contrast on interactive text (see #65).
@@ -1369,6 +1438,11 @@ function PromptPicker({
   );
 }
 
+// The composer control row's shared resting look: quiet, sentence-case, muted.
+// Both controls in the row wear it, so neither can drift into shouting past the
+// other; each adds its own interaction and active states.
+const QUIET_CONTROL = "inline-flex items-center gap-1 text-xs text-[var(--color-text-muted)] transition-colors";
+
 // Retrieval-breadth picker for the composer (#63). A quiet, sentence-case
 // labelled dropdown — not a chip, not bordered — that always shows the current
 // breadth on the trigger (fixing the old bug where the active value only
@@ -1436,13 +1510,77 @@ function BreadthPicker({
       activeId={activeId}
       onSelect={(id) => onScope((id as ChatScope) ?? fallbackScope)}
       trigger={
-        <span className="inline-flex items-center gap-1 text-xs text-[var(--color-text-muted)] cursor-pointer hover:text-[var(--color-text)] transition-colors">
+        <span className={cn(QUIET_CONTROL, "cursor-pointer hover:text-[var(--color-text)]")}>
           {active?.icon}
           {label}
           <ChevronDown size={12} strokeWidth={2} aria-hidden="true" className="shrink-0" />
         </span>
       }
     />
+  );
+}
+
+// The conversation's authorship filter (#103), beside the breadth picker: breadth
+// says WHAT is in reach, this says WHOSE.
+//
+// "Created by me", not "My notes". `notes.owner` is who RECORDED a note, not who
+// attended — so if a colleague records a meeting you were both in, this excludes
+// it. In a shared workspace most people read "my notes" as "meetings I was in",
+// and would get confidently wrong answers to exactly the questions this control
+// exists for ("what did I commit to?"). Naming authorship keeps the false negative
+// visible instead of silent. Attendance is #104 and is not attempted here.
+//
+// Styled to the row rather than as an `.nd-chip`: that utility is uppercase and
+// letter-spaced, which would shout beside the quiet sentence-case breadth trigger
+// and the muted model indicator. Off is muted text; ON is a filled accent-soft
+// pill, because an active filter narrowing every answer must be impossible to
+// miss — the same reason the turn discloses it to the model.
+function AuthorPin({
+  pinned,
+  isMine,
+  name,
+  editable,
+  onToggle,
+}: {
+  pinned: boolean;
+  /** Pinned to the signed-in user. Resolved against their id, not their name. */
+  isMine: boolean;
+  /** The pinned person's display name, or null when it can't be resolved. */
+  name: string | null;
+  editable: boolean;
+  onToggle: () => void;
+}) {
+  // Someone else's pin reads by name; an unresolvable one stays neutral rather
+  // than guessing "me", which would misattribute a teammate's filter to the
+  // reader. Off and pinned-to-me share a label, told apart by the fill — that is
+  // what makes it read as one toggle rather than two states of a sentence.
+  const label = !pinned || isMine ? "Created by me" : name ? `Created by ${name}` : "Created by someone else";
+  const title = pinned
+    ? editable
+      ? "Only notes you recorded are searched. Meetings someone else recorded are excluded, even ones you attended."
+      : `This conversation is pinned to notes recorded by ${name ?? "another member"}. Start your own conversation to search differently.`
+    : "Search only the notes you recorded yourself.";
+  return (
+    <button
+      type="button"
+      data-testid="chat-author-pin"
+      onClick={editable ? onToggle : undefined}
+      // Inert, not hidden: the pin is changing every answer in the thread, so the
+      // reader has to be able to see it — they just can't rewrite what someone
+      // else's scrollback meant.
+      disabled={!editable}
+      aria-pressed={pinned}
+      title={title}
+      className={cn(
+        QUIET_CONTROL,
+        "shrink-0 rounded-full",
+        pinned && "bg-[var(--color-accent-soft)] px-2 py-0.5 text-[var(--color-accent-text)]",
+        editable ? "cursor-pointer hover:text-[var(--color-text)]" : "cursor-default",
+      )}
+    >
+      <UserRound size={13} strokeWidth={1.7} aria-hidden="true" />
+      {label}
+    </button>
   );
 }
 

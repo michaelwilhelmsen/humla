@@ -36,6 +36,8 @@ export function mockTauri(handlers: Record<string, Handler> = {}) {
         return "idle";
       case "chat_get_breadth":
         return "note";
+      case "chat_get_owner_filter":
+        return "";
       case "permissions_status":
         return { microphone: "granted", screen: "granted" };
       case "cloud_status":
