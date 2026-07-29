@@ -332,6 +332,12 @@ pub enum Reach<'a> {
 /// The disclosure sentence for a narrowed reach, or `None` when there is nothing
 /// honest to say.
 ///
+/// **Mirrored by `reachDisclosure` in `humla-cloud/chat-service/src/chat.ts`** —
+/// workspace turns retrieve server-side, so a change here that isn't made there
+/// leaves the gap open in exactly the tenant where folders are most used. The
+/// wording differs in one respect on purpose: this path says "your notes", the
+/// workspace path says the workspace's, matching each prompt's own framing.
+///
 /// Breadth clamps every search and listing the turn makes, and until #113 the model
 /// was never told — so under `folder` it could search, find nothing, and report
 /// "there's no mention of that anywhere in your notes" when what it established was
@@ -343,9 +349,13 @@ pub enum Reach<'a> {
 /// stays silent on a blank name rather than emitting "restricted to the folder ''",
 /// which is worse than nothing — the model can't tell a bug from a real narrowing.
 ///
-/// Kept terse on purpose. A small model re-litigates long constraint blocks, and
-/// this sits next to #103's authorship-pin paragraph; two walls of "you cannot see
-/// everything" would drown each other out.
+/// Kept terse on purpose: a small model re-litigates long constraint blocks (the
+/// minimal-prompt finding from the presets).
+///
+/// Note that on THIS path it stands alone — #103's authorship-pin paragraph is
+/// workspace-only and disclosed server-side, so the two never appear together in a
+/// Personal prompt. They do in `chat-service`, which is why the folder variant there
+/// is trimmed rather than repeating the pin's closing sentence.
 fn reach_disclosure(reach: Reach<'_>) -> Option<String> {
     match reach {
         Reach::Note(title) => {
@@ -1004,11 +1014,14 @@ mod tests {
         assert!(note.contains("Kickoff with K2"));
         assert!(note.contains("cannot widen"));
 
-        // The disclosures compose with #103's authorship pin without either being
-        // swallowed — a pane can be narrowed on both axes at once.
+        // The reach line coexists with the asker line without either being swallowed.
+        // NOT a test of composing with the authorship pin: that pin is workspace-only
+        // and disclosed server-side, so it never appears in a Personal prompt at all.
+        // The composition test that matters lives in chat-service's suite, where both
+        // paragraphs really do land together.
         let both = system_prompt_with_context(NOW, Some("Michael"), Some(Reach::Folder("K2 pilot")));
-        assert!(both.contains("K2 pilot"));
-        assert!(both.contains("Michael"));
+        assert!(both.contains("K2 pilot"), "the reach survives alongside the asker line");
+        assert!(both.contains("You are talking to Michael"), "and the asker line survives it");
     }
 
     /// A blank or whitespace name must NOT produce a disclosure, because the
