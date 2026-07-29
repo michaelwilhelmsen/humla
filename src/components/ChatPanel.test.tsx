@@ -132,6 +132,23 @@ function renderWithControls(noteId = "n1") {
   return captured;
 }
 
+/** The same, on the library-wide target — which since #120 opens on a draft
+ *  rather than resuming, so its behaviour has to be asserted separately. */
+function renderGlobalWithControls() {
+  const captured: { current: ChatSessionControls | null } = { current: null };
+  render(
+    <MemoryRouter>
+      <ChatPanel
+        target={{ kind: "global" }}
+        onControls={(c) => {
+          captured.current = c;
+        }}
+      />
+    </MemoryRouter>,
+  );
+  return captured;
+}
+
 beforeEach(() => {
   mockTauri();
   // Default: signed out, so Personal is the only tenant unless a test opts in.
@@ -451,6 +468,194 @@ describe("ChatPanel sessions (#62)", () => {
           "Older thread",
         ),
       );
+    });
+  });
+
+  // Opening on a draft (#120). The backend decides what a bare `chat_history`
+  // resolves to; what the PANE owns is persisting nothing until the first turn —
+  // so these assert on IPC that must NOT happen, which is the whole point.
+  describe("a library-wide pane opens on a draft (#120)", () => {
+    const aFinishedThread = {
+      provider_key_get: () => "sk-test",
+      // What the backend now returns for a bare library-wide request: no
+      // conversation, even though one exists in the list below.
+      chat_history: () => ({ conversationId: null, messages: [] }),
+      chat_get_breadth: () => "all",
+      chat_list_conversations: () => [
+        { id: "c-old", title: "Last week's question", breadth: "all", updatedAt: 5, messageCount: 6 },
+      ],
+    };
+
+    it("shows no conversation, so the prompt cards stand where a thread would", async () => {
+      mockTauri(aFinishedThread);
+      const controls = renderGlobalWithControls();
+      await screen.findByPlaceholderText(/Ask about your notes/);
+      await waitFor(() => expect(controls.current).not.toBeNull());
+
+      expect(controls.current?.activeConversationId).toBeNull();
+      // The past thread is still reachable — drafting hides nothing from the list.
+      await waitFor(() => expect(controls.current?.conversations).toHaveLength(1));
+    });
+
+    it("'+' costs no IPC and creates no row", async () => {
+      // A drafting pane is already the empty state "+" would produce, so creating
+      // anything would only leave a row behind if the user changed their mind.
+      let created = 0;
+      mockTauri({
+        ...aFinishedThread,
+        chat_new_conversation: () => {
+          created += 1;
+          return { id: "c-new", title: "", breadth: "all", updatedAt: 9, messageCount: 0 };
+        },
+      });
+      const controls = renderGlobalWithControls();
+      await screen.findByPlaceholderText(/Ask about your notes/);
+      await waitFor(() => expect(controls.current).not.toBeNull());
+
+      await act(async () => {
+        await controls.current!.newChat();
+      });
+
+      expect(created).toBe(0);
+      expect(controls.current?.activeConversationId).toBeNull();
+    });
+
+    it("does not persist a breadth or pin chosen before the first turn", async () => {
+      // The trap this replaces: writing them lazily created a row the list hid but
+      // the next send resolved to, so the chip could read "off" while the stored
+      // row narrowed the turn anyway (#103).
+      let breadthWrites = 0;
+      let pinWrites = 0;
+      mockTauri({
+        ...aFinishedThread,
+        chat_set_breadth: () => {
+          breadthWrites += 1;
+          return null;
+        },
+        chat_set_owner_filter: () => {
+          pinWrites += 1;
+          return null;
+        },
+      });
+      renderGlobalWithControls();
+      await screen.findByPlaceholderText(/Ask about your notes/);
+
+      expect(breadthWrites).toBe(0);
+      expect(pinWrites).toBe(0);
+    });
+
+    it("carries the draft's breadth into the turn that creates the conversation", async () => {
+      let sent: Record<string, unknown> | null = null;
+      mockTauri({
+        ...aFinishedThread,
+        chat_send: (args) => {
+          sent = args as Record<string, unknown>;
+          return { conversationId: "c-fresh", truncated: false };
+        },
+      });
+      renderGlobalWithControls();
+      const input = await screen.findByPlaceholderText(/Ask about your notes/);
+
+      fireEvent.change(input, { target: { value: "what did we decide?" } });
+      fireEvent.keyDown(input, { key: "Enter" });
+
+      await waitFor(() => expect(sent).not.toBeNull());
+      // No conversation to append to, so the settings ride along...
+      expect(sent!.conversationId).toBeNull();
+      expect(sent!.draftBreadth).toBe("all");
+      // ...and an absent pin is null, not "" — "" would read as a pin on nobody.
+      expect(sent!.draftOwnerFilter).toBeNull();
+    });
+
+    it("stops sending draft settings once a conversation exists", async () => {
+      // With a row open it is the source of truth for both, so re-sending them
+      // could only introduce a disagreement.
+      const sends: Record<string, unknown>[] = [];
+      mockTauri({
+        ...aFinishedThread,
+        chat_send: (args) => {
+          sends.push(args as Record<string, unknown>);
+          return { conversationId: "c-fresh", truncated: false };
+        },
+      });
+      renderGlobalWithControls();
+      const input = await screen.findByPlaceholderText(/Ask about your notes/);
+
+      fireEvent.change(input, { target: { value: "first" } });
+      fireEvent.keyDown(input, { key: "Enter" });
+      await waitFor(() => expect(sends).toHaveLength(1));
+
+      fireEvent.change(input, { target: { value: "second" } });
+      fireEvent.keyDown(input, { key: "Enter" });
+      await waitFor(() => expect(sends).toHaveLength(2));
+
+      expect(sends[1].conversationId).toBe("c-fresh");
+      expect(sends[1].draftBreadth).toBeNull();
+    });
+
+    it("keeps the question, and the thread, when a draft's first turn fails", async () => {
+      // The backend persists the user message and then rolls back only the
+      // assistant placeholder, so a failed first turn leaves a real conversation we
+      // were never told the id of. Refetching with `null` resolves to nothing on a
+      // drafting target, which would blank the question while a one-sided row
+      // appeared in the sidebar — and a retry would open a second thread.
+      const rows = [
+        { id: "c-created", title: "why did the build break", breadth: "all", updatedAt: 20, messageCount: 1 },
+      ];
+      mockTauri({
+        provider_key_get: () => "sk-test",
+        chat_history: (args) => {
+          const { conversationId } = args as { conversationId: string | null };
+          // Mirrors the new backend: a bare library-wide request resolves to nothing.
+          if (!conversationId) return { conversationId: null, messages: [] };
+          return { conversationId, messages: [userMsg("why did the build break")] };
+        },
+        chat_get_breadth: () => "all",
+        chat_list_conversations: () => [...rows],
+        chat_send: () => {
+          throw new Error("The model is unavailable.");
+        },
+      });
+      const controls = renderGlobalWithControls();
+      const input = await screen.findByPlaceholderText(/Ask about your notes/);
+
+      fireEvent.change(input, { target: { value: "why did the build break" } });
+      fireEvent.keyDown(input, { key: "Enter" });
+
+      expect(await screen.findByText(/The model is unavailable/)).toBeInTheDocument();
+      // The question survives...
+      expect(await screen.findByText("why did the build break")).toBeInTheDocument();
+      // ...and the pane has adopted the conversation the failed turn created, so a
+      // retry continues it.
+      await waitFor(() => expect(controls.current?.activeConversationId).toBe("c-created"));
+    });
+
+    it("a NOTE's pane still resumes its thread and still creates on '+'", async () => {
+      // The deliberate divergence: a note is an anchor, so returning to it
+      // continues the same line of thinking. Asserted so it stays a decision.
+      let created = 0;
+      mockTauri({
+        provider_key_get: () => "sk-test",
+        chat_history: () => ({
+          conversationId: "c1",
+          messages: [userMsg("Old question?"), assistantMsg("Old answer.")],
+        }),
+        chat_list_conversations: () => [
+          { id: "c1", title: "First", breadth: "note", updatedAt: 5, messageCount: 2 },
+        ],
+        chat_new_conversation: () => {
+          created += 1;
+          return { id: "c2", title: "", breadth: "note", updatedAt: 9, messageCount: 0 };
+        },
+      });
+      const controls = renderWithControls();
+      await waitFor(() => expect(controls.current?.activeConversationId).toBe("c1"));
+      expect(await screen.findByText("Old answer.")).toBeInTheDocument();
+
+      await act(async () => {
+        await controls.current!.newChat();
+      });
+      expect(created).toBe(1);
     });
   });
 
@@ -1574,32 +1779,49 @@ describe("ChatPanel authorship pin", () => {
     await waitFor(() => expect(screen.getByRole("button", PIN)).toBeInTheDocument());
   });
 
+  // Pinned on a DRAFT (the library-wide default since #120): nothing is written
+  // through, because there is no conversation to write to — the chip holds the pin
+  // and the first turn carries it in. The #103 guarantee is unchanged, it just
+  // binds one step later; `chat_send` carrying `draftOwnerFilter` is asserted in
+  // the draft suite, and Rust covers the row being created with it.
   it("pins to the signed-in user's id, not to their name", async () => {
     signInAs("u-me");
-    const writes: unknown[] = [];
+    const sends: Record<string, unknown>[] = [];
     mockTauri({
       provider_key_get: () => "sk-test",
       chat_history: () => history(),
       chat_get_breadth: () => "all",
-      chat_set_owner_filter: (a) => {
-        writes.push(a);
-        return null;
+      chat_send: (a) => {
+        sends.push(a as Record<string, unknown>);
+        return { conversationId: "c-fresh", truncated: false };
       },
     });
     renderGlobal();
 
     fireEvent.click(await screen.findByRole("button", PIN));
-    await waitFor(() => expect(writes).toHaveLength(1));
-    expect(writes[0]).toMatchObject({ owner: "u-me" });
-    expect(screen.getByRole("button", PIN)).toHaveAttribute("aria-pressed", "true");
+    await waitFor(() =>
+      expect(screen.getByRole("button", PIN)).toHaveAttribute("aria-pressed", "true"),
+    );
+
+    const input = screen.getByPlaceholderText(/Ask about your notes/);
+    fireEvent.change(input, { target: { value: "what did we agree?" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    await waitFor(() => expect(sends).toHaveLength(1));
+    // The ID, never the display name — a name is prompt wording only.
+    expect(sends[0].draftOwnerFilter).toBe("u-me");
   });
 
+  // Clearing a pin on an OPEN conversation still writes through as null — an
+  // existing row is the source of truth, so the clear has to reach it. (The
+  // drafting case has no row and is covered above.) `history` returns a message so
+  // the pane resolves a conversation, which is what makes this the write path.
   it("clears the pin by sending null, not an empty string", async () => {
     signInAs("u-me");
     const writes: { owner?: string | null }[] = [];
     mockTauri({
       provider_key_get: () => "sk-test",
-      chat_history: () => history(),
+      chat_history: () => history([userMsg("earlier question")]),
       chat_get_breadth: () => "all",
       chat_get_owner_filter: () => "u-me",
       chat_set_owner_filter: (a) => {

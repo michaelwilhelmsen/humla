@@ -410,12 +410,28 @@ export const ipc = {
   // prompt's disclosure line — the pinned *id* lives on the conversation row and
   // is what actually filters. Sent from the roster the client already holds so
   // the turn costs no extra lookup; null when there's no pin or no name for it.
+  //
+  // `draft` carries a library-wide pane's breadth + authorship pin when no
+  // conversation exists yet (#120). A drafting pane deliberately persists nothing
+  // until its first turn, so these are the only way settings chosen beforehand
+  // reach the row this turn creates — and they are read ONLY on creation, since an
+  // existing conversation is already the source of truth for both. Omit them
+  // whenever `conversationId` is non-null.
   chatSend: (
     noteId: string | null,
     conversationId: string | null,
     message: string,
     ownerName: string | null = null,
-  ) => invoke<ChatSendResult>("chat_send", { noteId, conversationId, message, ownerName }),
+    draft: { breadth: ChatScope | null; ownerFilter: string | null } | null = null,
+  ) =>
+    invoke<ChatSendResult>("chat_send", {
+      noteId,
+      conversationId,
+      message,
+      ownerName,
+      draftBreadth: draft?.breadth ?? null,
+      draftOwnerFilter: draft?.ownerFilter ?? null,
+    }),
   // Stop the turn streaming in a pane (issue #80). A no-op when nothing is in
   // flight, so a stray click can't error. Any text that already streamed is kept;
   // a stop before the first token leaves only the user's message.

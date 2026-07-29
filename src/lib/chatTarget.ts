@@ -39,3 +39,20 @@ export function targetKey(target: ChatTarget): string {
 export function targetDefaultScope(target: ChatTarget): ChatScope {
   return target.kind === "global" ? "all" : "note";
 }
+
+/** Whether opening this target's pane RESUMES its most-recent conversation, or
+ *  starts an unsaved draft (#120).
+ *
+ *  Mirrors `commands::chat::resumes_on_open` on the Rust side, and the mirroring
+ *  matters more than usual: the backend decides what a bare request resolves to,
+ *  while the frontend decides whether "+" and a settings change persist anything.
+ *  If the two disagree, the pane either shows a draft the next send files into an
+ *  old thread, or creates rows the pane will never open again. Change both.
+ *
+ *  A library-wide pane drafts — `/chat` is a front door, and asking something new
+ *  is what it is for. A Note's pane resumes, deliberately: a note is an anchor,
+ *  and coming back to continue the same line of thinking is a plausible default
+ *  there in a way it isn't library-wide. */
+export function targetResumesOnOpen(target: ChatTarget): boolean {
+  return target.kind === "note";
+}
