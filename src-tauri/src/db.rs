@@ -1484,6 +1484,12 @@ pub struct NoteMeta {
     /// seen, and a per-client answer has to name the client in prose (#105).
     pub client_name: Option<String>,
     pub summary: String,
+    /// Who spoke in this note, from the derived `notes.speakers` column (#104).
+    /// Carried for the same reason as `client_name`: `NoteMeta` deliberately
+    /// excludes the transcript, so without this a listing row cannot name a single
+    /// speaker — and the model can then only pass a `speaker` filter for a name it
+    /// has actually seen, rather than one it guessed (#105's lesson).
+    pub speakers: Vec<String>,
 }
 
 /// A search's hits *and* how many notes actually matched — two different numbers
@@ -1515,6 +1521,15 @@ pub struct NoteFilter<'a> {
     /// half of a bounded window (#106). Exclusive so successive windows tile without
     /// double-counting the note that sits exactly on the boundary.
     pub until_ms: Option<i64>,
+    /// Optional speaker label (#104). Matched EXACTLY against the wrapped derived
+    /// column, so `Michael` never reaches `Michael Berg` — substring matching would
+    /// merge two people into one confident wrong answer.
+    ///
+    /// Applied at both levels: notes where they spoke (listings, counts) and, in
+    /// chunk search, the passages they spoke in. So a hit means *"they spoke here"*,
+    /// not *"they said this"* — right for "what did Hege commit to", wrong for
+    /// counting who talked most.
+    pub speaker: Option<&'a str>,
 }
 
 /// The maximum length of a speaker label, in chars. Mirrors the `{1,40}` bound in
@@ -2028,7 +2043,14 @@ fn keyword_ranked(
          {KEYWORD_FROM_WHERE}"
     );
     let mut args: Vec<Value> = vec![Value::Text(match_expr), Value::Text(workspace.to_string())];
-    push_note_filters(&mut sql, &mut args, filter, "n");
+    // Speaker is applied to the CHUNK, not the note (#104): an excerpt should come
+    // back only if the speaker spoke in that passage. Note-level would return every
+    // excerpt from any meeting they attended, including passages where someone else
+    // was talking — which is what "in their own words" must not mean.
+    push_note_filters(&mut sql, &mut args, NoteFilter { speaker: None, ..filter }, "n");
+    if let Some(speaker) = filter.speaker {
+        push_speaker_clause(&mut sql, &mut args, speaker, "c");
+    }
     args.push(Value::Integer(limit as i64));
     sql.push_str(&format!(" ORDER BY rank LIMIT ?{}", args.len()));
     let mut stmt = conn.prepare(&sql)?;
@@ -2070,7 +2092,12 @@ fn semantic_ranked(
          WHERE n.workspace_id = ?2 AND n.deleted_at IS NULL",
     );
     let mut args: Vec<Value> = vec![Value::Text(model.to_string()), Value::Text(workspace.to_string())];
-    push_note_filters(&mut sql, &mut args, filter, "n");
+    // Chunk-level, matching the keyword leg — the two must narrow identically or a
+    // fused result would contain semantic hits the keyword filter would have refused.
+    push_note_filters(&mut sql, &mut args, NoteFilter { speaker: None, ..filter }, "n");
+    if let Some(speaker) = filter.speaker {
+        push_speaker_clause(&mut sql, &mut args, speaker, "c");
+    }
     let mut stmt = conn.prepare(&sql)?;
     let mut scored: Vec<(f32, IdentifiedHit)> = stmt
         .query_map(rusqlite::params_from_iter(args), |row| {
@@ -2136,6 +2163,73 @@ fn push_note_filters(
         args.push(Value::Integer(until));
         sql.push_str(&format!(" AND {t}.created_at < ?{}", args.len()));
     }
+    if let Some(speaker) = filter.speaker {
+        push_speaker_clause(sql, args, speaker, t);
+    }
+}
+
+/// Narrow to rows whose derived `speakers` column contains `speaker` as a WHOLE
+/// label, against either alias — `n` for notes ("they spoke in this meeting"), `c`
+/// for chunks ("they spoke in this passage").
+///
+/// The wrapping is what makes it exact: the needle is built as `%|Label|%`, and
+/// since [`encode_speakers`] wraps every stored label in the same delimiters,
+/// `|Michael|` cannot occur inside `|Michael Berg|`.
+///
+/// Case folding is SQLite `LIKE`'s, which is ASCII-only — so `hege`/`Hege` match
+/// but a label differing only in the case of a non-ASCII character (`Ærlig`/`ærlig`)
+/// would not. Accepted: labels reach this filter having been read off a listing
+/// row, so they arrive spelled as stored, and the alternative is a second
+/// lowercased mirror column purely for folding.
+fn push_speaker_clause(
+    sql: &mut String,
+    args: &mut Vec<rusqlite::types::Value>,
+    speaker: &str,
+    t: &str,
+) {
+    use rusqlite::types::Value;
+    // Neutralise LIKE's own wildcards so a name containing % or _ can't widen the
+    // match, via an explicit ESCAPE clause.
+    let escaped = speaker
+        .trim()
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+        .replace('|', " ");
+    args.push(Value::Text(format!("%|{escaped}|%")));
+    sql.push_str(&format!(" AND {t}.speakers LIKE ?{} ESCAPE '\\'", args.len()));
+}
+
+/// The distinct speakers present in a scope, so an unmatched `speaker` argument can
+/// be answered with the names that DO exist rather than an empty result (#106: a
+/// model handed a bare zero reports absence; one handed the real options
+/// self-corrects). Ordered for a stable, readable list.
+pub fn speakers_in_scope(
+    conn: &Connection,
+    filter: NoteFilter<'_>,
+    workspace_id: &str,
+) -> Result<Vec<String>> {
+    let mut sql = String::from(
+        "SELECT speakers FROM notes n WHERE n.workspace_id = ?1 AND n.deleted_at IS NULL \
+         AND n.speakers != ''",
+    );
+    let mut args: Vec<rusqlite::types::Value> =
+        vec![rusqlite::types::Value::Text(workspace_id.to_string())];
+    // The speaker field itself is dropped: we are asking what else is there.
+    push_note_filters(&mut sql, &mut args, NoteFilter { speaker: None, ..filter }, "n");
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(args), |r| r.get::<_, String>(0))?;
+    let mut out: Vec<String> = Vec::new();
+    for encoded in rows {
+        for s in decode_speakers(&encoded?) {
+            if !out.iter().any(|seen| seen == &s) {
+                out.push(s);
+            }
+        }
+    }
+    out.sort_unstable();
+    Ok(out)
 }
 
 /// The size of each per-signal candidate pool fused by RRF. Bigger than the
@@ -2255,7 +2349,13 @@ fn count_matching_notes(
     use rusqlite::types::Value;
     let mut sql = format!("SELECT COUNT(DISTINCT c.note_id) {KEYWORD_FROM_WHERE}");
     let mut args: Vec<Value> = vec![Value::Text(match_expr), Value::Text(workspace.to_string())];
-    push_note_filters(&mut sql, &mut args, filter, "n");
+    // Chunk-level, exactly as the keyword hit query narrows — the count and the hits
+    // must measure the same predicate, or the header states a number that does not
+    // describe what is on screen (#106).
+    push_note_filters(&mut sql, &mut args, NoteFilter { speaker: None, ..filter }, "n");
+    if let Some(speaker) = filter.speaker {
+        push_speaker_clause(&mut sql, &mut args, speaker, "c");
+    }
     let count: i64 = conn.query_row(&sql, rusqlite::params_from_iter(args), |row| row.get(0))?;
     Ok(Some(count.max(0) as usize))
 }
@@ -2272,7 +2372,8 @@ pub fn list_notes_filtered(
     // LEFT JOIN, not an inner one: an untagged note (the common case) must still be
     // listed, and so must a note whose Client row hasn't arrived from sync yet.
     let mut sql = String::from(
-        "SELECT n.id, n.title, n.created_at, n.folder_id, n.client_id, cl.name, n.summary \
+        "SELECT n.id, n.title, n.created_at, n.folder_id, n.client_id, cl.name, n.summary, \
+                n.speakers \
          FROM notes n LEFT JOIN clients cl ON cl.id = n.client_id \
          WHERE n.workspace_id = ?1 AND n.deleted_at IS NULL",
     );
@@ -2298,6 +2399,7 @@ pub fn list_notes_filtered(
                 client_id: row.get(4)?,
                 client_name: row.get(5)?,
                 summary: row.get(6)?,
+                speakers: decode_speakers(&row.get::<_, String>(7)?),
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -3489,6 +3591,170 @@ mod tests {
             )
             .unwrap();
         assert!(remaining > 0, "soft delete keeps the index so restore is lossless");
+    }
+
+    /// Seeds two notes whose speakers deliberately overlap by prefix — the case
+    /// that decides whether the filter is exact or quietly merges two people.
+    fn seed_speaker_notes(conn: &Connection) -> (String, String) {
+        let a = create_note(conn, "en", "meeting", "").unwrap().id;
+        update_note(
+            conn,
+            &a,
+            &NotePatch { title: Some("K2 kickoff".into()), ..Default::default() },
+        )
+        .unwrap();
+        reindex_note(
+            conn,
+            &a,
+            "",
+            "Michael: we should scope the pilot\nHege: not without the security review",
+            "",
+        )
+        .unwrap();
+
+        let b = create_note(conn, "en", "meeting", "").unwrap().id;
+        update_note(
+            conn,
+            &b,
+            &NotePatch { title: Some("Berg sync".into()), ..Default::default() },
+        )
+        .unwrap();
+        reindex_note(conn, &b, "", "Michael Berg: the pilot looks fine to me", "").unwrap();
+        (a, b)
+    }
+
+    #[test]
+    fn the_speaker_filter_is_exact_and_never_merges_two_people() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("t.sqlite")).unwrap();
+        let (a, b) = seed_speaker_notes(&conn);
+
+        // "Michael" must not reach "Michael Berg" — the wrong answer here is a
+        // confident one, which is the whole reason matching is exact (#104).
+        let only_michael = NoteFilter { speaker: Some("Michael"), ..Default::default() };
+        let notes = list_notes_filtered(&conn, only_michael, "", 50).unwrap();
+        let ids: Vec<&str> = notes.iter().map(|n| n.id.as_str()).collect();
+        assert!(ids.contains(&a.as_str()), "Michael spoke in the kickoff");
+        assert!(!ids.contains(&b.as_str()), "Michael must NOT match Michael Berg");
+
+        // And the longer label finds only its own note.
+        let berg = NoteFilter { speaker: Some("Michael Berg"), ..Default::default() };
+        let berg_ids: Vec<String> =
+            list_notes_filtered(&conn, berg, "", 50).unwrap().into_iter().map(|n| n.id).collect();
+        assert_eq!(berg_ids, vec![b.clone()]);
+
+        // Case-insensitive, so a model echoing a name in different case still hits.
+        let lower = NoteFilter { speaker: Some("hege"), ..Default::default() };
+        assert_eq!(list_notes_filtered(&conn, lower, "", 50).unwrap().len(), 1, "case folded");
+
+        // A name nobody has is an honest empty, not a widened search.
+        let absent = NoteFilter { speaker: Some("Nobody"), ..Default::default() };
+        assert!(list_notes_filtered(&conn, absent, "", 50).unwrap().is_empty());
+    }
+
+    #[test]
+    fn listing_rows_carry_who_spoke_so_the_model_can_only_name_real_speakers() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("t.sqlite")).unwrap();
+        let (a, _) = seed_speaker_notes(&conn);
+
+        let notes = list_notes_filtered(&conn, NoteFilter::default(), "", 50).unwrap();
+        let kickoff = notes.iter().find(|n| n.id == a).unwrap();
+        assert_eq!(
+            kickoff.speakers,
+            vec!["Michael".to_string(), "Hege".to_string()],
+            "a listing row names its speakers, since NoteMeta excludes the transcript"
+        );
+    }
+
+    /// The filter is CHUNK-level, and that has a precise meaning worth pinning
+    /// because it is easy to over-read: a hit means *"they spoke in this passage"*,
+    /// NOT *"they said this"*. A chunk holds several turns, so a chunk attributed to
+    /// Hege can still contain Michael's words — which is exactly why labels stay
+    /// inline in the text, so the model reads who said what rather than trusting the
+    /// filter to have separated it. Right for "what did Hege commit to", wrong for
+    /// counting who talked most (#104's own Risks note).
+    #[test]
+    fn the_speaker_filter_narrows_to_passages_not_to_sentences() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("t.sqlite")).unwrap();
+        let id = create_note(&conn, "en", "meeting", "").unwrap().id;
+
+        // One turn long enough to fill chunks on its own, so Michael's speech and
+        // Hege's land in DIFFERENT chunks and chunk-level narrowing is observable.
+        let long_michael = format!("Michael: {} pilot", "padding words ".repeat(400));
+        let transcript = format!("{long_michael}\nHege: not without the security review");
+        reindex_note(&conn, &id, "", &transcript, "").unwrap();
+
+        let chunk_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM note_chunks WHERE note_id = ?1 AND source = 'transcript'",
+                params![&id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(chunk_count > 1, "precondition: the turns must not share a chunk");
+
+        // "pilot" sits in Michael's speech. Filtering to Hege finds nothing, because
+        // the passage she spoke in doesn't contain it.
+        let hege = NoteFilter { speaker: Some("Hege"), ..Default::default() };
+        let hits = hybrid_search_chunks(&conn, "pilot", None, "", hege, "", 10).unwrap().hits;
+        assert!(hits.is_empty(), "Hege's passages do not mention the pilot: {hits:?}");
+
+        // Same query, no filter: found. So the emptiness above is the filter working
+        // rather than the query failing.
+        let unfiltered =
+            hybrid_search_chunks(&conn, "pilot", None, "", NoteFilter::default(), "", 10)
+                .unwrap()
+                .hits;
+        assert!(!unfiltered.is_empty(), "the query itself is sound");
+
+        // And filtering to Michael does find it.
+        let michael = NoteFilter { speaker: Some("Michael"), ..Default::default() };
+        let his = hybrid_search_chunks(&conn, "pilot", None, "", michael, "", 10).unwrap().hits;
+        assert!(!his.is_empty(), "Michael did say it");
+    }
+
+    /// The other half of the same boundary, stated as a fact rather than a hope: a
+    /// chunk returned for one speaker may carry another's words. If this ever starts
+    /// failing, the filter has silently become sentence-level and the header/citation
+    /// copy that says "passages" needs revisiting.
+    #[test]
+    fn a_chunk_attributed_to_one_speaker_may_still_contain_anothers_words() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("t.sqlite")).unwrap();
+        let id = create_note(&conn, "en", "meeting", "").unwrap().id;
+        reindex_note(
+            &conn,
+            &id,
+            "",
+            "Michael: we should scope the pilot\nHege: not without the security review",
+            "",
+        )
+        .unwrap();
+
+        let hege = NoteFilter { speaker: Some("Hege"), ..Default::default() };
+        let hits = hybrid_search_chunks(&conn, "pilot", None, "", hege, "", 10).unwrap().hits;
+        assert_eq!(hits.len(), 1, "short turns share a chunk, and Hege spoke in it");
+        assert!(
+            hits[0].text.contains("Michael: we should scope the pilot"),
+            "the excerpt carries Michael's label inline, so the model can attribute it"
+        );
+    }
+
+    #[test]
+    fn an_unmatched_speaker_can_be_answered_with_the_names_that_do_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("t.sqlite")).unwrap();
+        seed_speaker_notes(&conn);
+
+        // #106's doctrine: a miss that reports the available names lets the model
+        // self-correct, where a bare empty result invites it to report absence.
+        let present = speakers_in_scope(&conn, NoteFilter::default(), "").unwrap();
+        assert!(present.contains(&"Michael".to_string()));
+        assert!(present.contains(&"Hege".to_string()));
+        assert!(present.contains(&"Michael Berg".to_string()));
+        assert_eq!(present.len(), 3, "distinct, no repeats: {present:?}");
     }
 
     #[test]
