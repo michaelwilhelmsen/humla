@@ -21,12 +21,42 @@ function SyncIndicator({ status }: { status: SyncStatus }) {
   );
 }
 
+const PILL_CLS =
+  "shrink-0 px-1 text-[9px] uppercase tracking-[0.08em] rounded border border-[var(--color-line)] text-[var(--color-text-muted)]";
+
 function RolePill({ role }: { role: CloudRole }) {
+  return <span className={PILL_CLS}>{roleLabel(role)}</span>;
+}
+
+// The only ambient hint that team workspaces exist. It occupies the trigger
+// row's pill slot, which is dead space on Personal — and it disappears for good
+// once there's a workspace, because the slot becomes the RolePill. So there's no
+// dismiss state to persist and nothing to nag: having a team removes the hint.
+// Deliberately says nothing about price or the trial (that lives in Settings →
+// Account, next to the button that actually starts one) and avoids "upgrade" —
+// Personal is a choice, not a lesser tier.
+function AddTeamPill() {
+  const navigate = useNavigate();
   return (
     <span
-      className="shrink-0 px-1 text-[9px] uppercase tracking-[0.08em] rounded border border-[var(--color-line)] text-[var(--color-text-muted)]"
+      role="button"
+      tabIndex={0}
+      title="Sync notes across your team"
+      onClick={(e) => {
+        // The trigger button wraps this, so its onClick would toggle the
+        // dropdown right back open behind the navigation.
+        e.stopPropagation();
+        navigate("/settings?tab=account");
+      }}
+      onKeyDown={(e) => {
+        if (e.key !== "Enter" && e.key !== " ") return;
+        e.stopPropagation();
+        e.preventDefault();
+        navigate("/settings?tab=account");
+      }}
+      className={`${PILL_CLS} cursor-pointer hover:text-[var(--color-text)] hover:border-[var(--color-text-muted)] transition-colors`}
     >
-      {roleLabel(role)}
+      Add team
     </span>
   );
 }
@@ -109,7 +139,7 @@ export function WorkspaceSwitcher() {
         </span>
         <span className="flex-1 min-w-0 text-left truncate">{label}</span>
         {current && syncStatus && <SyncIndicator status={syncStatus} />}
-        {current && <RolePill role={current.role} />}
+        {current ? <RolePill role={current.role} /> : <AddTeamPill />}
         <ChevronsUpDown size={14} strokeWidth={1.5} className="shrink-0 text-[var(--color-text-muted)]" />
       </button>
 

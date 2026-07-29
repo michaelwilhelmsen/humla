@@ -657,7 +657,7 @@ function TrialStage({ ws, ctx }: { ws: CloudWorkspace; ctx: StepContext }) {
       // otherwise start a new Checkout (trial or fresh subscription).
       const url = pastDue
         ? await cloudApi.billingPortal(ws.id)
-        : await cloudApi.billingCheckout(ws.id);
+        : await cloudApi.billingCheckout(ws.id, "onboarding");
       await openExternal(url);
       setCheckout("waiting");
     } catch (e) {

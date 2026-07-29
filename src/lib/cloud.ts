@@ -106,9 +106,13 @@ export const cloudApi = {
     invoke<void>("cloud_remove_member", { workspaceId, userId }),
   setMemberRole: (workspaceId: string, userId: string, role: CloudRole) =>
     invoke<void>("cloud_set_member_role", { workspaceId, userId, role }),
-  /** Start/resume Stripe Checkout for a workspace; returns a hosted URL to open. */
-  billingCheckout: (workspaceId: string) =>
-    invoke<string>("cloud_billing_checkout", { workspaceId }),
+  /** Start/resume Stripe Checkout for a workspace; returns a hosted URL to open.
+   *  `source` records which surface sent the user here (onboarding vs. the
+   *  Organization pane vs. a hint) — Stripe only ever sees the checkout session,
+   *  so without this a trial start can't be attributed. Rides on the
+   *  subscription metadata; must match /^[a-z0-9_]{1,40}$/ (server-validated). */
+  billingCheckout: (workspaceId: string, source?: string) =>
+    invoke<string>("cloud_billing_checkout", { workspaceId, source }),
   /** Open the Stripe Customer Portal for a subscribed workspace; returns a URL. */
   billingPortal: (workspaceId: string) =>
     invoke<string>("cloud_billing_portal", { workspaceId }),

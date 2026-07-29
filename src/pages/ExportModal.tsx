@@ -1,7 +1,10 @@
 import { useMemo, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { save } from "@tauri-apps/plugin-dialog";
+import { X } from "lucide-react";
 import { ipc, type ExportFormat, type Note } from "../lib/ipc";
 import { useRecordingStore } from "../lib/store";
+import { useCloudStore } from "../lib/cloud";
 import { Modal } from "./settings/components/Modal";
 import { Segmented } from "./settings/components/Segmented";
 import { Toggle } from "./settings/components/Toggle";
@@ -60,6 +63,54 @@ function Check({
       <span>{label}</span>
       {hint && <span className="text-[var(--color-text-muted)] text-xs">{hint}</span>}
     </label>
+  );
+}
+
+// Contextual team hint. Manually exporting a note to hand it to someone is the
+// one moment where a team workspace is the literal answer to what the user is
+// doing, so this is the only place the pitch appears outside Settings. Shown
+// only on Personal (someone already in a workspace doesn't need telling), and
+// dismissed for good on the first ×. Sits below the action row so it can never
+// compete with Export, and says nothing about price — the trial lives next to
+// the button that starts one.
+const HINT_KEY = "humla.teamHint.exportDismissed";
+
+function TeamHint({ onLeave }: { onLeave: () => void }) {
+  const navigate = useNavigate();
+  const inWorkspace = useCloudStore((s) => s.status.current_workspace !== null);
+  const [dismissed, setDismissed] = useState(
+    () => localStorage.getItem(HINT_KEY) === "1",
+  );
+
+  if (inWorkspace || dismissed) return null;
+
+  return (
+    <div className="flex items-start gap-2 pt-3 border-t border-[var(--color-line)]">
+      <p className="flex-1 nd-meta">
+        Exporting to share it? A team workspace syncs notes to teammates
+        automatically.{" "}
+        <button
+          onClick={() => {
+            onLeave();
+            navigate("/settings?tab=account");
+          }}
+          className="underline text-[var(--color-accent-text)] hover:no-underline"
+        >
+          Learn more
+        </button>
+      </p>
+      <button
+        onClick={() => {
+          localStorage.setItem(HINT_KEY, "1");
+          setDismissed(true);
+        }}
+        title="Don't show this again"
+        aria-label="Dismiss team workspace hint"
+        className="shrink-0 text-[var(--color-text-muted)] hover:text-[var(--color-text)] transition-colors"
+      >
+        <X size={13} strokeWidth={1.5} />
+      </button>
+    </div>
   );
 }
 
@@ -181,6 +232,8 @@ export function ExportModal({
             {busy ? "Exporting…" : "Export…"}
           </Btn>
         </div>
+
+        <TeamHint onLeave={onClose} />
       </div>
     </Modal>
   );

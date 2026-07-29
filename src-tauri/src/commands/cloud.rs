@@ -745,16 +745,25 @@ pub async fn cloud_status(state: State<'_, AppState>) -> Result<CloudStatus, Str
 /// Start (or resume) a Stripe Checkout for a workspace's team subscription.
 /// Returns a hosted Checkout URL the client opens in the browser. Owner-only +
 /// billing-config checks happen server-side in the billing hook.
+///
+/// `source` is the surface that sent the user to checkout (e.g. "onboarding",
+/// "settings_organization"). It rides onto the Stripe subscription metadata so a
+/// trial start can be attributed — Stripe itself only sees the checkout session.
+/// Optional: older clients omit it and the server treats it as absent.
 #[tauri::command]
-pub async fn cloud_billing_checkout(state: State<'_, AppState>, workspace_id: String) -> Result<String, String> {
+pub async fn cloud_billing_checkout(
+    state: State<'_, AppState>,
+    workspace_id: String,
+    source: Option<String>,
+) -> Result<String, String> {
     let (base, session) = ensure_session(&state).await?;
-    let val = authed_post(
-        &base,
-        &session.token,
-        "/api/humla/billing/checkout",
-        serde_json::json!({ "workspace_id": workspace_id }),
-    )
-    .await?;
+    let mut body = serde_json::json!({ "workspace_id": workspace_id });
+    // Only send a non-empty source; the server rejects anything outside
+    // /^[a-z0-9_]{1,40}$/ rather than forwarding junk into Stripe metadata.
+    if let Some(s) = source.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        body["source"] = serde_json::Value::String(s.to_string());
+    }
+    let val = authed_post(&base, &session.token, "/api/humla/billing/checkout", body).await?;
     val.get("url")
         .and_then(|v| v.as_str())
         .map(String::from)
