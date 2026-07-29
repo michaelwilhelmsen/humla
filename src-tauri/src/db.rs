@@ -280,6 +280,20 @@ pub fn open(path: &Path) -> Result<Connection> {
     // instead of dropping the row so it's recoverable; remote tombstones land
     // here too. Note lists filter `deleted_at IS NULL`.
     let _ = conn.execute("ALTER TABLE notes ADD COLUMN deleted_at INTEGER", []);
+    // Speaker-aware retrieval (issue #104). Two derived columns, both written only
+    // by `reindex_note` from the transcript text, both delimiter-wrapped by
+    // `encode_speakers`: `notes.speakers` backs a note-level filter and lets
+    // listing rows name who spoke (NoteMeta deliberately excludes the transcript),
+    // `note_chunks.speakers` backs the chunk-level one.
+    //
+    // Local-only and NOT synced, deliberately: the server derives its own from the
+    // transcript it already holds, so no new PB field exists and no structured list
+    // of named third parties enters the shared collection (ADR-0002). They are a
+    // cache, not a record — rebuildable from the text at any time, and destroyed
+    // with the note that produced them.
+    let _ = conn.execute("ALTER TABLE notes ADD COLUMN speakers TEXT NOT NULL DEFAULT ''", []);
+    let _ =
+        conn.execute("ALTER TABLE note_chunks ADD COLUMN speakers TEXT NOT NULL DEFAULT ''", []);
     // Workspace (Teams) chat (issue #50). A workspace conversation is
     // server-authoritative: the local row is just a (tenant, scope, scope_id)
     // handle whose `remote_id` maps to the humla-cloud conversation record id.
@@ -815,6 +829,21 @@ pub fn restore_note(conn: &Connection, id: &str) -> Result<()> {
 /// Permanently delete a note (hard DELETE) — removes the local row for good.
 /// The server copy is already tombstoned from the soft-delete.
 pub fn purge_note(conn: &Connection, id: &str) -> Result<()> {
+    // Take the derived index with it (issue #121). Purge is the point of no return,
+    // and until this landed the note's chunk + FTS rows survived as orphans: never
+    // reachable by search (the hit query inner-joins live notes) but still holding
+    // the transcript text, speaker names included, after the user performed the one
+    // action the UI presents as permanent.
+    //
+    // ADR-0002 makes this a rule rather than tidiness: "delete the note" is the
+    // answer to erasing a person, which only holds if derived person data is
+    // destroyed rather than hidden. The cloud indexer already did this on a
+    // tombstone; this is local catching up.
+    //
+    // `chunk_embeddings` is deliberately left alone — keyed `(text_hash, model)`
+    // with no note linkage, so it is shared by any notes with identical text and
+    // cannot be deleted per note. It stores a vector, not text, so it holds no name.
+    remove_note_chunks(conn, id)?;
     conn.execute("DELETE FROM notes WHERE id = ?1", params![id])?;
     Ok(())
 }
@@ -1518,6 +1547,39 @@ pub struct NoteChunk {
     pub speakers: Vec<String>,
 }
 
+/// Wrap a chunk's speakers for storage as `|Michael|Hege|`, or `""` for none.
+///
+/// Delimiter-wrapped rather than a join, so an exact-label match is a single
+/// `LIKE '%|Michael|%'` that cannot also match `Michael Berg` — substring matching
+/// would merge two people into one confident wrong answer (#104). The cost is that
+/// the column can't be substring-indexed, which is why #116's autocomplete wants
+/// its own derived table rather than querying this one.
+///
+/// A `|` inside a label would break the encoding, so it is normalised to a space
+/// **in this derived column only** — the transcript text is never rewritten.
+pub fn encode_speakers(speakers: &[String]) -> String {
+    if speakers.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("|");
+    for s in speakers {
+        out.push_str(&s.replace('|', " "));
+        out.push('|');
+    }
+    out
+}
+
+/// Read back what [`encode_speakers`] wrote. Tolerates `""` and a bare unwrapped
+/// value, so a hand-edited or half-migrated row can't panic a search.
+pub fn decode_speakers(encoded: &str) -> Vec<String> {
+    encoded
+        .split('|')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 /// Split a transcript into speaker turns, one per line.
 ///
 /// **This is one of three copies of the same parse** — the others are
@@ -1722,20 +1784,37 @@ pub fn reindex_note(
     remove_note_chunks(conn, note_id)?;
     let now = now_ms();
     let chunks = note_chunk_texts(body_text, transcript, summary);
+    // The note-level set is the union of what the chunks carry, in first-encounter
+    // order — derived from the same parse, so the two columns cannot disagree.
+    let mut note_speakers: Vec<String> = Vec::new();
+    for chunk in &chunks {
+        for s in &chunk.speakers {
+            if !note_speakers.iter().any(|seen| seen == s) {
+                note_speakers.push(s.clone());
+            }
+        }
+    }
     for (seq, chunk) in chunks.iter().enumerate() {
-        let NoteChunk { source, text, .. } = chunk;
+        let NoteChunk { source, text, speakers } = chunk;
         let chunk_id = uuid::Uuid::new_v4().to_string();
         let hash = text_hash(text);
         conn.execute(
-            "INSERT INTO note_chunks (id, note_id, seq, source, text, text_hash, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![chunk_id, note_id, seq as i64, source, text, hash, now],
+            "INSERT INTO note_chunks (id, note_id, seq, source, text, text_hash, created_at, speakers)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![chunk_id, note_id, seq as i64, source, text, hash, now, encode_speakers(speakers)],
         )?;
         conn.execute(
             "INSERT INTO note_chunks_fts (text, chunk_id, note_id) VALUES (?1, ?2, ?3)",
             params![text, chunk_id, note_id],
         )?;
     }
+    // Deliberately does NOT touch `updated_at`. Reindex runs on every settled
+    // content change, so bumping it would mark the note dirty over derived data and
+    // hand the sync worker an endless stream of no-op pushes.
+    conn.execute(
+        "UPDATE notes SET speakers = ?1 WHERE id = ?2",
+        params![encode_speakers(&note_speakers), note_id],
+    )?;
     Ok(chunks.len())
 }
 
@@ -3351,6 +3430,153 @@ mod tests {
         for c in chunks.iter().filter(|c| c.source != "transcript") {
             assert!(c.speakers.is_empty(), "{} must claim no speakers", c.source);
         }
+    }
+
+    /// Issue #121, which ADR-0002 turns from untidiness into a rule: derived person
+    /// data must be destroyed with its source, not merely hidden from queries, or
+    /// "delete the note" is not an honest answer to erasing someone.
+    #[test]
+    fn purging_a_note_takes_its_derived_chunks_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("t.sqlite")).unwrap();
+        let doomed = create_note(&conn, "en", "meeting", "").unwrap().id;
+        let keeper = create_note(&conn, "en", "meeting", "").unwrap().id;
+        reindex_note(&conn, &doomed, "", "Hege: something private", "").unwrap();
+        reindex_note(&conn, &keeper, "", "Michael: something else", "").unwrap();
+
+        let count = |note_id: &str| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM note_chunks WHERE note_id = ?1",
+                params![note_id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let fts_count = |note_id: &str| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM note_chunks_fts WHERE note_id = ?1",
+                params![note_id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert!(count(&doomed) > 0 && fts_count(&doomed) > 0, "indexed to begin with");
+
+        purge_note(&conn, &doomed).unwrap();
+
+        assert_eq!(count(&doomed), 0, "purge must clear the chunk rows, not orphan them");
+        assert_eq!(fts_count(&doomed), 0, "and the FTS rows with them");
+        assert!(count(&keeper) > 0, "another note's chunks are untouched");
+    }
+
+    /// Soft delete is the opposite case and must NOT clear anything — a Trash
+    /// restore has to bring the note back searchable, and the `deleted_at IS NULL`
+    /// join already keeps it out of results meanwhile.
+    #[test]
+    fn soft_deleting_a_note_keeps_its_chunks_for_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("t.sqlite")).unwrap();
+        let id = create_note(&conn, "en", "meeting", "").unwrap().id;
+        reindex_note(&conn, &id, "", "Hege: still here", "").unwrap();
+
+        delete_note(&conn, &id).unwrap();
+
+        let remaining: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM note_chunks WHERE note_id = ?1",
+                params![&id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(remaining > 0, "soft delete keeps the index so restore is lossless");
+    }
+
+    #[test]
+    fn speakers_encoding_isolates_one_label_from_another() {
+        assert_eq!(encode_speakers(&[]), "", "no speakers is empty, not a bare delimiter");
+        assert_eq!(encode_speakers(&["Michael".into()]), "|Michael|");
+        assert_eq!(encode_speakers(&["Michael".into(), "Hege".into()]), "|Michael|Hege|");
+
+        // The property the whole filter rests on: a wrapped exact label cannot be a
+        // substring of a DIFFERENT wrapped label, so "Michael" never matches
+        // "Michael Berg" and two people stay two people (#104).
+        let berg = encode_speakers(&["Michael Berg".into()]);
+        assert!(!berg.contains("|Michael|"), "{berg} must not contain the shorter label");
+        assert!(encode_speakers(&["Michael".into()]).contains("|Michael|"));
+
+        // A `|` in a label would forge a boundary, so it is normalised away here.
+        let odd = encode_speakers(&["A|B".into()]);
+        assert_eq!(decode_speakers(&odd), vec!["A B".to_string()], "pipe normalised to a space");
+
+        assert!(decode_speakers("").is_empty());
+        assert_eq!(decode_speakers("|Michael|Hege|"), vec!["Michael".to_string(), "Hege".to_string()]);
+        assert_eq!(decode_speakers("Michael"), vec!["Michael".to_string()], "tolerates unwrapped");
+    }
+
+    #[test]
+    fn reindex_note_records_speakers_on_chunks_and_on_the_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("t.sqlite")).unwrap();
+        let id = create_note(&conn, "en", "meeting", "").unwrap().id;
+        let transcript = "Michael: shall we start\nHege: yes\nMichael: good";
+
+        reindex_note(&conn, &id, "some body", transcript, "a summary").unwrap();
+
+        // Note level: the union of everyone who spoke, first-encounter order.
+        let note_speakers: String = conn
+            .query_row("SELECT speakers FROM notes WHERE id = ?1", params![&id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(decode_speakers(&note_speakers), vec!["Michael".to_string(), "Hege".to_string()]);
+
+        // Chunk level: only the transcript chunk claims speakers.
+        let mut stmt = conn
+            .prepare("SELECT source, speakers FROM note_chunks WHERE note_id = ?1 ORDER BY seq")
+            .unwrap();
+        let rows: Vec<(String, String)> = stmt
+            .query_map(params![&id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        for (source, speakers) in &rows {
+            if source == "transcript" {
+                assert!(!speakers.is_empty(), "a transcript chunk must be attributed");
+            } else {
+                assert!(speakers.is_empty(), "{source} must claim no speakers");
+            }
+        }
+    }
+
+    #[test]
+    fn reindex_note_is_the_only_writer_so_a_rename_cannot_drift() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("t.sqlite")).unwrap();
+        let id = create_note(&conn, "en", "meeting", "").unwrap().id;
+
+        reindex_note(&conn, &id, "", "Speaker 1: hello", "").unwrap();
+        let before: String = conn
+            .query_row("SELECT speakers FROM notes WHERE id = ?1", params![&id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(decode_speakers(&before), vec!["Speaker 1".to_string()]);
+
+        // The user renames the speaker, which rewrites the transcript text. The
+        // derived columns follow on the next reindex — they cannot disagree with
+        // what the user reads, because the text is their only source.
+        reindex_note(&conn, &id, "", "Hege Tronshaugen: hello", "").unwrap();
+        let after: String = conn
+            .query_row("SELECT speakers FROM notes WHERE id = ?1", params![&id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(decode_speakers(&after), vec!["Hege Tronshaugen".to_string()]);
+
+        // Reindexing must NOT mark the note dirty: it runs on every content settle,
+        // and bumping updated_at would re-sync the note forever over derived data.
+        let touched: i64 = conn
+            .query_row("SELECT updated_at FROM notes WHERE id = ?1", params![&id], |r| r.get(0))
+            .unwrap();
+        reindex_note(&conn, &id, "", "Hege Tronshaugen: hello", "").unwrap();
+        let after_reindex: i64 = conn
+            .query_row("SELECT updated_at FROM notes WHERE id = ?1", params![&id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(touched, after_reindex, "reindex must not bump updated_at");
     }
 
     #[test]
