@@ -473,7 +473,7 @@ pub async fn run_chat(
     let specs = tool_specs();
     let result = agentic_loop(
         db, adapter, ctx, scope, workspace, &specs, base, &assistant_id, &answer_block, embedder,
-        now_ms, &mut sink,
+        now_ms, asker, &mut sink,
     )
     .await;
 
@@ -540,6 +540,9 @@ async fn agentic_loop(
     answer_block: &str,
     embedder: Option<&dyn crate::embed::EmbeddingAdapter>,
     now_ms: i64,
+    // Forwarded to the tools so the asker's name and the `You:` sentinel count as
+    // the same person when filtering by speaker (#104).
+    asker: Option<&str>,
     sink: &mut (impl FnMut(ChatEvent) + Send),
 ) -> Result<LoopOut> {
     let mut working = base;
@@ -659,7 +662,7 @@ async fn agentic_loop(
 
             let outcome = {
                 let conn = db.lock();
-                execute_tool(&conn, workspace, scope, &call.name, &args, query_vec.as_deref(), embed_model, now_ms)
+                execute_tool(&conn, workspace, scope, &call.name, &args, query_vec.as_deref(), embed_model, now_ms, asker)
             };
             sink(ChatEvent::ToolActivity {
                 message_id: assistant_id.to_string(),

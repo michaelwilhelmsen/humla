@@ -1466,6 +1466,11 @@ pub struct ChunkHit {
     pub source: String,
     pub text: String,
     pub rank: f64,
+    /// Position of this chunk within its Note. Carried so a grouped result can put a
+    /// note's excerpts back into READING order (#104's seventh decision): ranked
+    /// order scrambles them, which garbles any "what was decided" narrative the
+    /// model tries to reconstruct from several excerpts of one meeting.
+    pub seq: i64,
 }
 
 /// Lightweight Note descriptor for the `list_notes` tool — just what a citation
@@ -1503,6 +1508,15 @@ pub struct NoteMeta {
 pub struct SearchOutcome {
     pub hits: Vec<ChunkHit>,
     pub matched_notes: Option<usize>,
+    /// How many candidate excerpts each note contributed BEFORE the per-note
+    /// diversity cap trimmed them, keyed by note id (#104).
+    ///
+    /// Needed so a grouped result can say "2 of 7" honestly and name the cap as the
+    /// reason — without it, showing 2 of a note's excerpts reads as "the other 5
+    /// didn't match" when the diversity cap is the real limiter. Measures the same
+    /// fused candidate set the hits are drawn from, so the two numbers describe one
+    /// set rather than two (#106's counting trap).
+    pub per_note_matched: std::collections::HashMap<String, usize>,
 }
 
 /// Independent, combinable Note filters for retrieval. Every field is optional
@@ -1530,6 +1544,17 @@ pub struct NoteFilter<'a> {
     /// not *"they said this"* — right for "what did Hege commit to", wrong for
     /// counting who talked most.
     pub speaker: Option<&'a str>,
+    /// A SECOND label that counts as the same person as `speaker` (#104).
+    ///
+    /// Exists for the `You:` sentinel. Mic chunks on remote calls are labelled with
+    /// the literal "You", so the app user's own speech is stored under two different
+    /// labels across a library: "You" wherever the diarizer wrote it, and their real
+    /// name wherever they renamed it. Filtering for one and silently missing the other
+    /// is a wrong answer that looks complete, so a filter may name both.
+    ///
+    /// Ignored unless `speaker` is set. The transcript text is never rewritten — this
+    /// is the query-side half of resolving the sentinel.
+    pub speaker_alias: Option<&'a str>,
 }
 
 /// The maximum length of a speaker label, in chars. Mirrors the `{1,40}` bound in
@@ -2076,7 +2101,8 @@ fn keyword_ranked(
     };
     use rusqlite::types::Value;
     let mut sql = format!(
-        "SELECT c.id, n.id, n.title, n.created_at, c.source, c.text, bm25(note_chunks_fts) AS rank \
+        "SELECT c.id, n.id, n.title, n.created_at, c.source, c.text, bm25(note_chunks_fts) AS rank, \
+                c.seq \
          {KEYWORD_FROM_WHERE}"
     );
     let mut args: Vec<Value> = vec![Value::Text(match_expr), Value::Text(workspace.to_string())];
@@ -2095,6 +2121,7 @@ fn keyword_ranked(
                     source: row.get(4)?,
                     text: row.get(5)?,
                     rank: row.get(6)?,
+                    seq: row.get(7)?,
                 },
             })
         })?
@@ -2115,7 +2142,7 @@ fn semantic_ranked(
 ) -> Result<Vec<IdentifiedHit>> {
     use rusqlite::types::Value;
     let mut sql = String::from(
-        "SELECT c.id, n.id, n.title, n.created_at, c.source, c.text, e.vector \
+        "SELECT c.id, n.id, n.title, n.created_at, c.source, c.text, e.vector, c.seq \
          FROM note_chunks c \
          JOIN chunk_embeddings e ON e.text_hash = c.text_hash AND e.model = ?1 \
          JOIN notes n ON n.id = c.note_id \
@@ -2139,6 +2166,7 @@ fn semantic_ranked(
                         source: row.get(4)?,
                         text: row.get(5)?,
                         rank: 0.0,
+                        seq: row.get(7)?,
                     },
                 },
             ))
@@ -2189,7 +2217,7 @@ fn push_note_filters(
         sql.push_str(&format!(" AND {t}.created_at < ?{}", args.len()));
     }
     if let Some(speaker) = filter.speaker {
-        push_speaker_clause(sql, args, speaker, t);
+        push_speaker_clause(sql, args, speaker, filter.speaker_alias, t);
     }
 }
 
@@ -2206,9 +2234,9 @@ fn push_chunk_filters(
     args: &mut Vec<rusqlite::types::Value>,
     filter: NoteFilter<'_>,
 ) {
-    push_note_filters(sql, args, NoteFilter { speaker: None, ..filter }, "n");
+    push_note_filters(sql, args, NoteFilter { speaker: None, speaker_alias: None, ..filter }, "n");
     if let Some(speaker) = filter.speaker {
-        push_speaker_clause(sql, args, speaker, "c");
+        push_speaker_clause(sql, args, speaker, filter.speaker_alias, "c");
     }
 }
 
@@ -2229,19 +2257,32 @@ fn push_speaker_clause(
     sql: &mut String,
     args: &mut Vec<rusqlite::types::Value>,
     speaker: &str,
+    alias: Option<&str>,
     t: &str,
 ) {
     use rusqlite::types::Value;
     // Neutralise LIKE's own wildcards so a name containing % or _ can't widen the
     // match, via an explicit ESCAPE clause.
-    let escaped = speaker
-        .trim()
-        .replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_")
-        .replace('|', " ");
-    args.push(Value::Text(format!("%|{escaped}|%")));
-    sql.push_str(&format!(" AND {t}.speakers LIKE ?{} ESCAPE '\\'", args.len()));
+    let mut clauses: Vec<String> = Vec::new();
+    for label in [Some(speaker), alias].into_iter().flatten() {
+        let escaped = label
+            .trim()
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_")
+            .replace('|', " ");
+        if escaped.is_empty() {
+            continue;
+        }
+        args.push(Value::Text(format!("%|{escaped}|%")));
+        clauses.push(format!("{t}.speakers LIKE ?{} ESCAPE '\\'", args.len()));
+    }
+    if clauses.is_empty() {
+        return;
+    }
+    // Parenthesised: an unbracketed OR would let the second label escape every
+    // preceding AND and match notes the breadth clamp had already excluded.
+    sql.push_str(&format!(" AND ({})", clauses.join(" OR ")));
 }
 
 /// The distinct speakers present in a scope, so an unmatched `speaker` argument can
@@ -2260,7 +2301,7 @@ pub fn speakers_in_scope(
     let mut args: Vec<rusqlite::types::Value> =
         vec![rusqlite::types::Value::Text(workspace_id.to_string())];
     // The speaker field itself is dropped: we are asking what else is there.
-    push_note_filters(&mut sql, &mut args, NoteFilter { speaker: None, ..filter }, "n");
+    push_note_filters(&mut sql, &mut args, NoteFilter { speaker: None, speaker_alias: None, ..filter }, "n");
 
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(rusqlite::params_from_iter(args), |r| r.get::<_, String>(0))?;
@@ -2294,14 +2335,24 @@ const PER_NOTE_CAP: usize = 2;
 /// spanning the whole library. The cap fixes that; the backfill is what stops it
 /// costing recall when only one note matches (a note-scoped search must still be
 /// able to return several excerpts of its one note).
-fn diversify(ranked: Vec<ChunkHit>, limit: usize, per_note_cap: usize) -> Vec<ChunkHit> {
+fn diversify(
+    ranked: Vec<ChunkHit>,
+    limit: usize,
+    per_note_cap: usize,
+) -> (Vec<ChunkHit>, std::collections::HashMap<String, usize>) {
     use std::collections::HashMap;
+    // Counted over the WHOLE ranked candidate set, before any capping or the early
+    // return below, so it stays an honest denominator for "showing N of M".
+    let mut matched: HashMap<String, usize> = HashMap::new();
+    for hit in &ranked {
+        *matched.entry(hit.note_id.clone()).or_insert(0) += 1;
+    }
     let mut out: Vec<ChunkHit> = Vec::with_capacity(limit.min(ranked.len()));
     let mut held: Vec<ChunkHit> = Vec::new();
     let mut per_note: HashMap<String, usize> = HashMap::new();
     for hit in ranked {
         if out.len() >= limit {
-            return out;
+            return (out, matched);
         }
         let taken = per_note.entry(hit.note_id.clone()).or_insert(0);
         if *taken < per_note_cap {
@@ -2317,7 +2368,7 @@ fn diversify(ranked: Vec<ChunkHit>, limit: usize, per_note_cap: usize) -> Vec<Ch
         }
         out.push(hit);
     }
-    out
+    (out, matched)
 }
 
 /// Hybrid keyword+semantic search. With `query_vec = Some`, fuses BM25 and
@@ -2340,10 +2391,9 @@ pub fn hybrid_search_chunks(
     // Keyword-only: no query embedding, or nothing embedded yet under this model
     // (issue #48 graceful degradation).
     let keyword_only = |kw: Vec<IdentifiedHit>| {
-        Ok(SearchOutcome {
-            hits: diversify(kw.into_iter().map(|ih| ih.hit).collect(), limit, PER_NOTE_CAP),
-            matched_notes,
-        })
+        let (hits, per_note_matched) =
+            diversify(kw.into_iter().map(|ih| ih.hit).collect(), limit, PER_NOTE_CAP);
+        Ok(SearchOutcome { hits, matched_notes, per_note_matched })
     };
     let Some(qv) = query_vec else {
         return keyword_only(keyword);
@@ -2366,7 +2416,8 @@ pub fn hybrid_search_chunks(
             h
         }))
         .collect();
-    Ok(SearchOutcome { hits: diversify(ranked, limit, PER_NOTE_CAP), matched_notes })
+    let (hits, per_note_matched) = diversify(ranked, limit, PER_NOTE_CAP);
+    Ok(SearchOutcome { hits, matched_notes, per_note_matched })
 }
 
 /// How many DISTINCT live notes the keyword predicate matches, under the same
@@ -4168,7 +4219,18 @@ mod tests {
             source: "transcript".into(),
             text: format!("{note_id}#{rank}"),
             rank,
+            seq: 0,
         }
+    }
+
+    /// The selection half of [`diversify`], for the tests that predate it also
+    /// reporting per-note candidate counts.
+    fn diversify_hits(
+        ranked: Vec<ChunkHit>,
+        limit: usize,
+        per_note_cap: usize,
+    ) -> Vec<ChunkHit> {
+        diversify(ranked, limit, per_note_cap).0
     }
 
     fn note_ids_of(hits: &[ChunkHit]) -> Vec<&str> {
@@ -4181,7 +4243,7 @@ mod tests {
         // and C are never seen.
         let ranked =
             vec![hit("a", 9.0), hit("a", 8.0), hit("a", 7.0), hit("a", 6.0), hit("b", 5.0), hit("c", 4.0)];
-        assert_eq!(note_ids_of(&diversify(ranked, 4, 2)), vec!["a", "a", "b", "c"]);
+        assert_eq!(note_ids_of(&diversify_hits(ranked, 4, 2)), vec!["a", "a", "b", "c"]);
     }
 
     #[test]
@@ -4190,7 +4252,7 @@ mod tests {
         // (coverage first), it does not discard.
         let ranked =
             vec![hit("a", 9.0), hit("a", 8.0), hit("a", 7.0), hit("a", 6.0), hit("b", 5.0), hit("c", 4.0)];
-        assert_eq!(note_ids_of(&diversify(ranked, 6, 2)), vec!["a", "a", "b", "c", "a", "a"]);
+        assert_eq!(note_ids_of(&diversify_hits(ranked, 6, 2)), vec!["a", "a", "b", "c", "a", "a"]);
     }
 
     /// The backfill is what stops the per-note cap costing recall: a note-scoped
@@ -4198,15 +4260,15 @@ mod tests {
     #[test]
     fn diversify_keeps_full_recall_when_only_one_note_matches() {
         let ranked = vec![hit("a", 9.0), hit("a", 8.0), hit("a", 7.0)];
-        assert_eq!(diversify(ranked.clone(), 6, 2).len(), 3);
-        assert_eq!(diversify(ranked, 2, 2).len(), 2);
+        assert_eq!(diversify_hits(ranked.clone(), 6, 2).len(), 3);
+        assert_eq!(diversify_hits(ranked, 2, 2).len(), 2);
     }
 
     #[test]
     fn diversify_never_exceeds_the_limit() {
         let ranked: Vec<ChunkHit> =
             (0..30).map(|i| hit(&format!("n{}", i % 3), 30.0 - f64::from(i))).collect();
-        assert_eq!(diversify(ranked, 8, 2).len(), 8);
+        assert_eq!(diversify_hits(ranked, 8, 2).len(), 8);
     }
 
     #[test]
