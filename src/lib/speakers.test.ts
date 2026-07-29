@@ -44,6 +44,37 @@ describe("extractSpeakerLabels", () => {
   it("trims whitespace between the label and the colon", () => {
     expect(extractSpeakerLabels("Alice : hi")).toEqual(["Alice"]);
   });
+
+  // ── Pinned parity with the Rust parse (issue #104) ────────────────────────
+  //
+  // The same label rule now exists three times: here, in `db::parse_speaker_turns`
+  // (which decides how transcripts are chunked and which speakers each chunk is
+  // attributed to), and in humla-cloud's indexer. They MUST agree — a one-sided
+  // change means a chunk is attributed to someone the UI never shows as a speaker,
+  // or vice versa. #105's `client_id` drift passed every test on both sides, so the
+  // mitigation is the same one used for the tool schemas: pin the identical case
+  // table in each suite.
+  //
+  // The mirror of this block is `db::tests::parse_speaker_turns_mirrors_the_frontend_label_rule`.
+  // Change one, change both, or the pair stops meaning anything.
+  const PINNED_LABEL_CASES: Array<[input: string, expected: string | null]> = [
+    ["Michael: hello", "Michael"],
+    ["  Michael: hello", "Michael"],
+    ["Alice : hi", "Alice"],
+    ["Hege Tronshaugen: ja", "Hege Tronshaugen"],
+    ["Speaker 1: hi", "Speaker 1"],
+    ["You: hi", "You"],
+    ["12:30 standup", null],
+    ["see https://example.com now", null],
+    ["Michael:hello", null],
+    ["no colon at all", null],
+    [`${"x".repeat(41)}: over the bound`, null],
+    [`${"x".repeat(40)}: at the bound`, "x".repeat(40)],
+  ];
+
+  it.each(PINNED_LABEL_CASES)("pinned: %j → %j", (input, expected) => {
+    expect(extractSpeakerLabels(input)).toEqual(expected === null ? [] : [expected]);
+  });
 });
 
 describe("renameSpeakerInTranscript", () => {

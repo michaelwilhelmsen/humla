@@ -1488,6 +1488,163 @@ pub struct NoteFilter<'a> {
     pub until_ms: Option<i64>,
 }
 
+/// The maximum length of a speaker label, in chars. Mirrors the `{1,40}` bound in
+/// the frontend's `extractSpeakerLabels` regex — see [`parse_speaker_turns`].
+const SPEAKER_LABEL_MAX_CHARS: usize = 40;
+
+/// One line of a transcript, split into its speaker label (if it has one) and the
+/// full original text of the line.
+///
+/// `text` is verbatim and INCLUDES the label, because labels stay inline: a chunk
+/// built from these turns self-describes to the model with no rewriting, and stays
+/// a faithful slice of what the user reads (issue #104).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Turn {
+    /// The asserted speaker, or `None` for a line with no label — an import, or a
+    /// live transcript before the post-stop diarize pass adds labels.
+    pub speaker: Option<String>,
+    pub text: String,
+}
+
+/// A chunk of one Note source, with the speakers it contains.
+///
+/// `speakers` is derived from the text and only ever populated for the transcript
+/// source; it is empty for body and summary, which have no turn structure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoteChunk {
+    pub source: &'static str,
+    pub text: String,
+    /// Distinct speakers in this chunk, in first-encounter order.
+    pub speakers: Vec<String>,
+}
+
+/// Split a transcript into speaker turns, one per line.
+///
+/// **This is one of three copies of the same parse** — the others are
+/// `extractSpeakerLabels` in `src/lib/speakers.ts` (frontend) and the indexer's
+/// parse in `humla-cloud/chat-service`. They must agree, so the rule is pinned
+/// here verbatim and asserted by [`tests::parse_speaker_turns_mirrors_the_frontend_label_rule`]:
+///
+/// > a label is up to 40 non-colon chars at the start of the line (after leading
+/// > whitespace), followed by a colon and then whitespace.
+///
+/// The trailing-whitespace requirement is what stops `12:30 standup` and
+/// `https://example.com` being read as speakers.
+pub fn parse_speaker_turns(transcript: &str) -> Vec<Turn> {
+    transcript
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| Turn { speaker: speaker_label(line), text: line.to_string() })
+        .collect()
+}
+
+/// The speaker label of one line, or `None`. See [`parse_speaker_turns`] for the
+/// rule this pins.
+fn speaker_label(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    // Take up to the bound in chars (not bytes — a Norwegian name is not ASCII).
+    let mut label = String::new();
+    let mut chars = trimmed.chars();
+    loop {
+        match chars.next() {
+            // A colon closes the candidate label; it must be followed by whitespace.
+            Some(':') => {
+                return match chars.next() {
+                    Some(next) if next.is_whitespace() => {
+                        let label = label.trim();
+                        (!label.is_empty()).then(|| label.to_string())
+                    }
+                    _ => None,
+                };
+            }
+            Some(c) if label.chars().count() < SPEAKER_LABEL_MAX_CHARS => label.push(c),
+            // Ran past the bound, or ran out of line, without finding a colon.
+            _ => return None,
+        }
+    }
+}
+
+/// Pack whole turns into ~`target`-char chunks, so a chunk boundary never lands
+/// mid-turn and every chunk carries the labels of the speech inside it (#104).
+///
+/// A turn longer than `target` is hard-split, and its continuations are prefixed
+/// `Name (continued): ` so a mid-turn chunk still says who is speaking. That
+/// prefix is the one place a chunk's text is not verbatim, and it pushes a
+/// continuation slightly past `target` — acceptable, since `target` is a soft
+/// budget well inside the model's window.
+pub fn pack_turns(turns: &[Turn], target: usize) -> Vec<NoteChunk> {
+    let target = target.max(1);
+    let mut out: Vec<NoteChunk> = Vec::new();
+    let mut lines: Vec<&str> = Vec::new();
+    let mut speakers: Vec<String> = Vec::new();
+    let mut len = 0usize;
+
+    for turn in turns {
+        let turn_len = turn.text.chars().count();
+
+        // An overlong turn cannot share a chunk with anything: close what's open,
+        // then hard-split it on its own.
+        if turn_len > target {
+            if !lines.is_empty() {
+                out.push(transcript_chunk(&lines, std::mem::take(&mut speakers)));
+                lines.clear();
+                len = 0;
+            }
+            out.extend(split_long_turn(turn, target));
+            continue;
+        }
+
+        // `+ 1` for the newline this turn would be joined on.
+        if !lines.is_empty() && len + 1 + turn_len > target {
+            out.push(transcript_chunk(&lines, std::mem::take(&mut speakers)));
+            lines.clear();
+            len = 0;
+        }
+
+        if !lines.is_empty() {
+            len += 1;
+        }
+        len += turn_len;
+        lines.push(&turn.text);
+        if let Some(s) = &turn.speaker {
+            if !speakers.iter().any(|seen| seen == s) {
+                speakers.push(s.clone());
+            }
+        }
+    }
+    if !lines.is_empty() {
+        out.push(transcript_chunk(&lines, speakers));
+    }
+    out
+}
+
+/// Assemble one transcript chunk, rejoining turns on the single newline they were
+/// separated by so the text stays a verbatim slice of the transcript.
+fn transcript_chunk(lines: &[&str], speakers: Vec<String>) -> NoteChunk {
+    NoteChunk { source: "transcript", text: lines.join("\n"), speakers }
+}
+
+/// Hard-split one over-budget turn, naming the speaker on every continuation so a
+/// mid-turn chunk is still attributable. The first piece needs no prefix — it
+/// already opens with the real label.
+fn split_long_turn(turn: &Turn, target: usize) -> Vec<NoteChunk> {
+    let speakers: Vec<String> = turn.speaker.clone().map(|s| vec![s]).unwrap_or_default();
+    let prefix = turn.speaker.as_ref().map(|s| format!("{s} (continued): "));
+    let chars: Vec<char> = turn.text.chars().collect();
+    chars
+        .chunks(target)
+        .enumerate()
+        .map(|(i, window)| {
+            let body: String = window.iter().collect();
+            let text = match (i, prefix.as_deref()) {
+                (0, _) | (_, None) => body,
+                (_, Some(p)) => format!("{p}{body}"),
+            };
+            NoteChunk { source: "transcript", text, speakers: speakers.clone() }
+        })
+        .collect()
+}
+
 /// Split arbitrary text into ~`target`-char chunks, breaking on blank-line
 /// paragraph boundaries where possible and hard-splitting any single paragraph
 /// longer than `target`. Blank/whitespace input yields no chunks.
@@ -1532,20 +1689,21 @@ pub fn split_into_chunks(text: &str, target: usize) -> Vec<String> {
 /// Produce the (source, text) chunk list for a Note. `body_text` must already be
 /// plain text (HTML stripped by the caller). Sources are chunked independently
 /// so a chunk never straddles e.g. transcript and summary.
-pub fn note_chunk_texts(
-    body_text: &str,
-    transcript: &str,
-    summary: &str,
-) -> Vec<(&'static str, String)> {
-    let mut out: Vec<(&'static str, String)> = Vec::new();
-    for (source, text) in [
-        ("body", body_text),
-        ("transcript", transcript),
-        ("summary", summary),
-    ] {
-        for chunk in split_into_chunks(text, CHUNK_TARGET_CHARS) {
-            out.push((source, chunk));
-        }
+/// The transcript takes a different path from body and summary, and that asymmetry
+/// is the point (#104): its turns are separated by SINGLE newlines, which the
+/// blank-line paragraph splitter cannot see — so a transcript arrived as one
+/// "paragraph", blew past the target, and fell through to arbitrary char slicing
+/// that cut mid-word and stranded each speaker's label in a previous chunk. Prose
+/// really does have blank lines, so it keeps the splitter that suits it, and claims
+/// no speakers: `Note: buy milk` typed in a body is not a person who spoke.
+pub fn note_chunk_texts(body_text: &str, transcript: &str, summary: &str) -> Vec<NoteChunk> {
+    let mut out: Vec<NoteChunk> = Vec::new();
+    for chunk in split_into_chunks(body_text, CHUNK_TARGET_CHARS) {
+        out.push(NoteChunk { source: "body", text: chunk, speakers: Vec::new() });
+    }
+    out.extend(pack_turns(&parse_speaker_turns(transcript), CHUNK_TARGET_CHARS));
+    for chunk in split_into_chunks(summary, CHUNK_TARGET_CHARS) {
+        out.push(NoteChunk { source: "summary", text: chunk, speakers: Vec::new() });
     }
     out
 }
@@ -1564,7 +1722,8 @@ pub fn reindex_note(
     remove_note_chunks(conn, note_id)?;
     let now = now_ms();
     let chunks = note_chunk_texts(body_text, transcript, summary);
-    for (seq, (source, text)) in chunks.iter().enumerate() {
+    for (seq, chunk) in chunks.iter().enumerate() {
+        let NoteChunk { source, text, .. } = chunk;
         let chunk_id = uuid::Uuid::new_v4().to_string();
         let hash = text_hash(text);
         conn.execute(
@@ -3051,15 +3210,158 @@ mod tests {
         assert_eq!(merged[0], "one\n\ntwo");
     }
 
+    // ── Speaker-aware chunking (issue #104) ──────────────────────────────────
+
+    /// Pinned parity with the frontend parse (issue #104).
+    ///
+    /// The same label rule now exists three times: here, in `extractSpeakerLabels`
+    /// (`src/lib/speakers.ts`, which decides the rename UI's chip strip), and in
+    /// humla-cloud's indexer. They MUST agree — a one-sided change means a chunk is
+    /// attributed to someone the UI never shows as a speaker, or vice versa. #105's
+    /// `client_id` drift passed every test on both sides, so the mitigation is the
+    /// one used for the tool schemas: pin the identical case table in each suite.
+    ///
+    /// The mirror of this table is `PINNED_LABEL_CASES` in `src/lib/speakers.test.ts`.
+    /// Change one, change both, or the pair stops meaning anything.
+    #[test]
+    fn parse_speaker_turns_mirrors_the_frontend_label_rule() {
+        let over_bound = format!("{}: over the bound", "x".repeat(41));
+        let at_bound = format!("{}: at the bound", "x".repeat(40));
+        let forty = "x".repeat(40);
+        let pinned_label_cases: &[(&str, Option<&str>)] = &[
+            ("Michael: hello", Some("Michael")),
+            ("  Michael: hello", Some("Michael")),
+            ("Alice : hi", Some("Alice")),
+            ("Hege Tronshaugen: ja", Some("Hege Tronshaugen")),
+            ("Speaker 1: hi", Some("Speaker 1")),
+            ("You: hi", Some("You")),
+            ("12:30 standup", None),
+            ("see https://example.com now", None),
+            ("Michael:hello", None),
+            ("no colon at all", None),
+            (over_bound.as_str(), None),
+            (at_bound.as_str(), Some(forty.as_str())),
+        ];
+
+        for (input, expected) in pinned_label_cases {
+            let got = parse_speaker_turns(input).into_iter().next().and_then(|t| t.speaker);
+            assert_eq!(
+                got.as_deref(),
+                *expected,
+                "pinned label case {input:?} disagrees with the frontend"
+            );
+        }
+
+        // Blank lines are dropped, and text is verbatim including the label.
+        let turns = parse_speaker_turns("Michael: one\n\n   \nHege: two");
+        assert_eq!(turns.len(), 2, "blank lines contribute no turns");
+        assert_eq!(turns[0].text, "Michael: one", "text keeps the label inline");
+    }
+
+    #[test]
+    fn pack_turns_keeps_whole_turns_together_and_records_their_speakers() {
+        let turns = parse_speaker_turns("Michael: aaaa\nHege: bbbb\nMichael: cccc");
+
+        // Tight budget: each turn is its own chunk, and carries its own speaker.
+        let tight = pack_turns(&turns, 14);
+        assert_eq!(tight.len(), 3, "a boundary never lands mid-turn");
+        assert_eq!(tight[0].text, "Michael: aaaa");
+        assert_eq!(tight[0].speakers, vec!["Michael".to_string()]);
+        assert_eq!(tight[1].speakers, vec!["Hege".to_string()]);
+
+        // Generous budget: all three pack into one chunk joined by the original
+        // single newline, with distinct speakers in first-encounter order.
+        let merged = pack_turns(&turns, 1000);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "Michael: aaaa\nHege: bbbb\nMichael: cccc");
+        assert_eq!(
+            merged[0].speakers,
+            vec!["Michael".to_string(), "Hege".to_string()],
+            "distinct, first-encounter order, not repeated"
+        );
+
+        assert!(pack_turns(&[], 100).is_empty(), "no turns, no chunks");
+    }
+
+    #[test]
+    fn pack_turns_hard_splits_an_overlong_turn_and_says_who_is_still_speaking() {
+        // One turn far past the budget — the case that today falls through to
+        // arbitrary char slicing with the label stranded in the first piece.
+        let long = format!("Hege: {}", "x".repeat(120));
+        let turns = parse_speaker_turns(&long);
+        let chunks = pack_turns(&turns, 50);
+
+        assert!(chunks.len() > 1, "an overlong turn is split, not emitted whole");
+        assert!(chunks[0].text.starts_with("Hege: "), "the first piece keeps the real label");
+        for (i, c) in chunks.iter().enumerate().skip(1) {
+            assert!(
+                c.text.starts_with("Hege (continued): "),
+                "piece {i} must still name the speaker, got {:?}",
+                c.text
+            );
+        }
+        for c in &chunks {
+            assert_eq!(c.speakers, vec!["Hege".to_string()], "every piece is attributed");
+        }
+
+        // Reassembling the pieces recovers the original speech exactly — the
+        // prefix is additive, never a rewrite of the user's words.
+        let rejoined: String = chunks
+            .iter()
+            .map(|c| c.text.trim_start_matches("Hege (continued): ").to_string())
+            .collect();
+        assert_eq!(rejoined, long, "no speech is lost or altered by splitting");
+    }
+
+    #[test]
+    fn pack_turns_handles_a_transcript_with_no_labels_at_all() {
+        // An import, or a live transcript before the post-stop diarize pass. This
+        // is strictly better than today's behaviour: unlabelled transcripts are
+        // one blank-line-free "paragraph", so they hard-split mid-word.
+        let turns = parse_speaker_turns("first line here\nsecond line here\nthird line here");
+        let chunks = pack_turns(&turns, 32);
+
+        assert!(chunks.len() > 1, "packs by line even with nothing to attribute");
+        for c in &chunks {
+            assert!(c.speakers.is_empty(), "nothing to attribute, so no speakers claimed");
+        }
+        let rejoined = chunks.iter().map(|c| c.text.as_str()).collect::<Vec<_>>().join("\n");
+        assert_eq!(rejoined, "first line here\nsecond line here\nthird line here");
+    }
+
+    #[test]
+    fn note_chunk_texts_packs_the_transcript_by_turn_but_leaves_prose_alone() {
+        // The transcript's turns are separated by SINGLE newlines, which is exactly
+        // what the paragraph splitter cannot see — hence the separate path.
+        let transcript = "Michael: alpha\nHege: beta";
+        let chunks = note_chunk_texts("body one\n\nbody two", transcript, "summary text");
+
+        let transcript_chunks: Vec<&NoteChunk> =
+            chunks.iter().filter(|c| c.source == "transcript").collect();
+        assert_eq!(transcript_chunks.len(), 1);
+        assert_eq!(
+            transcript_chunks[0].speakers,
+            vec!["Michael".to_string(), "Hege".to_string()],
+            "transcript chunks carry speakers"
+        );
+
+        // Body and summary keep the paragraph splitter and claim no speakers —
+        // a line in a typed note that happens to read "Note: buy milk" is not a
+        // person who spoke.
+        for c in chunks.iter().filter(|c| c.source != "transcript") {
+            assert!(c.speakers.is_empty(), "{} must claim no speakers", c.source);
+        }
+    }
+
     #[test]
     fn note_chunk_texts_tags_each_source() {
         let chunks = note_chunk_texts("body words", "transcript words", "summary words");
-        let sources: Vec<&str> = chunks.iter().map(|(s, _)| *s).collect();
+        let sources: Vec<&str> = chunks.iter().map(|c| c.source).collect();
         assert_eq!(sources, vec!["body", "transcript", "summary"]);
         // Blank sources contribute nothing.
         let sparse = note_chunk_texts("only body", "", "");
         assert_eq!(sparse.len(), 1);
-        assert_eq!(sparse[0].0, "body");
+        assert_eq!(sparse[0].source, "body");
     }
 
     #[test]
