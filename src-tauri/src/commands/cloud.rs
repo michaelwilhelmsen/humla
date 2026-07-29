@@ -405,6 +405,7 @@ impl CloudReqError {
 enum Request<'a> {
     Get(&'a [(&'a str, &'a str)]),
     Post(&'a serde_json::Value),
+    Patch(&'a serde_json::Value),
     Delete(&'a [(&'a str, &'a str)]),
 }
 
@@ -436,6 +437,16 @@ pub(crate) async fn cloud_delete_json(
     request_json(state, path, Request::Delete(query)).await
 }
 
+/// PATCH a direct cloud endpoint as JSON — a partial update of one record
+/// (issue #109's conversation rename is the first).
+pub(crate) async fn cloud_patch_json(
+    state: &State<'_, AppState>,
+    path: &str,
+    body: &serde_json::Value,
+) -> Result<serde_json::Value, CloudReqError> {
+    request_json(state, path, Request::Patch(body)).await
+}
+
 /// The shared skeleton: session → bearer → send → one-shot 401 re-auth → JSON.
 /// A malformed body is `Value::Null` rather than an error, matching the call
 /// sites' own `unwrap_or_default` (their parsers already treat a missing field
@@ -452,6 +463,7 @@ async fn request_json(
         let req = match request {
             Request::Get(q) => http().get(url).query(q),
             Request::Post(b) => http().post(url).json(b),
+            Request::Patch(b) => http().patch(url).json(b),
             Request::Delete(q) => http().delete(url).query(q),
         };
         let resp = req

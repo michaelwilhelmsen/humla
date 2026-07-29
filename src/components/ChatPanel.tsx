@@ -34,7 +34,12 @@ import { cloudApi, formatSeatPrice, useCloudStore, useMemberName, type ChatAddon
 import { useChatReadiness } from "./provider/useChatReadiness";
 import { SelectablePopover, type PopoverItem } from "./SelectablePopover";
 import { ChatKeyEntry } from "./ChatKeyEntry";
-import { usageTone, liveChatErrorCopy, groundingLikelyTruncated } from "../lib/chatSessions";
+import {
+  usageTone,
+  liveChatErrorCopy,
+  groundingLikelyTruncated,
+  conversationTitle,
+} from "../lib/chatSessions";
 import { targetNoteId, targetKey, targetDefaultScope, type ChatTarget } from "../lib/chatTarget";
 import { opensPromptPicker, promptsFor, type ChatPrompt } from "../lib/chatPrompts";
 import { RECOMMENDED_OLLAMA_MODEL } from "../lib/localModels";
@@ -154,6 +159,13 @@ export type ChatSessionControls = {
   loadingMore: boolean;
   newChat: () => Promise<void>;
   openConversation: (id: string) => Promise<void>;
+  /** Delete a conversation and its messages (#109). Hard — the caller confirms
+   *  first. Deleting the OPEN conversation lands the pane on a fresh chat rather
+   *  than a dead id. */
+  deleteConversation: (id: string) => Promise<void>;
+  /** Rename a conversation (#109). Optimistic; a rejected rename puts the old
+   *  title back. An empty/unchanged title is a no-op. */
+  renameConversation: (id: string, title: string) => Promise<void>;
   /** Append the next page. Safe to call repeatedly: it no-ops while a fetch is in
    *  flight or once the end is known, which a scroll observer relies on. */
   loadMore: () => Promise<void>;
@@ -414,6 +426,64 @@ export function ChatPanel({
       inputRef.current?.focus();
     }
   }, [noteId, beginSwitch, reloadConversationList]);
+
+  // Delete a conversation (issue #109). Hard: there is no Trash for chat, which
+  // is why the callers confirm first.
+  //
+  // Server-then-local ordering lives in the command; what this owns is the pane's
+  // state afterwards. Deleting the OPEN conversation can't just drop the row — the
+  // pane would keep rendering messages belonging to an id that no longer exists,
+  // and the next send would resurrect it — so it starts a fresh chat. Deleting any
+  // other row leaves the open one alone, which is the common case from the sidebar.
+  const deleteConversation = useCallback(
+    async (id: string) => {
+      const wasOpen = id === conversationId;
+      try {
+        await ipc.chatDeleteConversation(noteId, id);
+      } catch (e) {
+        // Surface it and keep the row: a failed delete that removed the row anyway
+        // would read as success and leave the list disagreeing with the backend.
+        setError(String(e));
+        return;
+      }
+      setConversations((prev) => prev.filter((c) => c.id !== id));
+      if (wasOpen) await newChat();
+    },
+    [noteId, conversationId, newChat],
+  );
+
+  // Rename a conversation (issue #109) — the user's override of the model-derived
+  // title. Optimistic, like the breadth and owner-filter writes: the row updates
+  // immediately and a failure puts the old title back, because a rename that
+  // silently didn't take is worse than one that visibly bounces.
+  const renameConversation = useCallback(
+    async (id: string, title: string) => {
+      const next = title.trim();
+      if (!next) return;
+      const previous = conversationsRef.current.find((c) => c.id === id);
+      if (previous?.title === next) return;
+      // Accepting the placeholder is not a rename. Both editors seed their input
+      // from the row's DISPLAYED label, which for a still-untitled thread is the
+      // "New chat" fallback — so opening the editor and clicking away would store
+      // that fallback as a real title, and a real title is exactly what stops the
+      // first turn from naming the thread. Compare against the fallback, not just
+      // the stored value, or the placeholder becomes permanent.
+      if (previous && !previous.title.trim() && next === conversationTitle(previous)) return;
+      setConversations((prev) => prev.map((c) => (c.id === id ? { ...c, title: next } : c)));
+      try {
+        const updated = await ipc.chatRenameConversation(noteId, id, next);
+        // Adopt the server's row wholesale — it carries the applied title (which
+        // may be capped) and the bumped `updatedAt` the list orders by.
+        if (updated) setConversations((prev) => prev.map((c) => (c.id === id ? updated : c)));
+      } catch (e) {
+        setError(String(e));
+        if (previous) {
+          setConversations((prev) => prev.map((c) => (c.id === id ? previous : c)));
+        }
+      }
+    },
+    [noteId],
+  );
 
   // Load a conversation chosen from the history popover: its messages and its
   // own stored breadth (so the Scope chip tracks the loaded conversation, #62).
@@ -783,6 +853,8 @@ export function ChatPanel({
       loadingMore: loadingMoreConversations,
       newChat,
       openConversation,
+      deleteConversation,
+      renameConversation,
       loadMore: loadMoreConversations,
       status: inWorkspace || !model ? null : { provider, model },
     });
@@ -797,6 +869,8 @@ export function ChatPanel({
     loadingMoreConversations,
     newChat,
     openConversation,
+    deleteConversation,
+    renameConversation,
     loadMoreConversations,
     inWorkspace,
     provider,
