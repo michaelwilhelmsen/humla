@@ -151,6 +151,57 @@ pub async fn embed_backfill(app: AppHandle) {
     eprintln!("[chat] embedding backfill complete");
 }
 
+/// Rebuild the retrieval index for the WHOLE library (issue #104).
+///
+/// The only way to repair an existing library after a chunking-shape change. The
+/// startup backfill is keyed on sentinels for never-indexed notes, so it cannot see
+/// a note whose chunks are present but built the old way — and without this, an
+/// archive would stay hard-split until each note happened to be opened, which is
+/// precisely the wrong outcome: old meetings are what a "briefing on X" query needs.
+///
+/// Deliberately user-triggered rather than automatic. Re-chunking changes every
+/// chunk's `text_hash`, so the embedding cache misses and the library re-embeds on
+/// the user's own API key — cents, but not to be spent unasked.
+///
+/// Returns the number of notes rebuilt. Embedding is kicked off afterwards and
+/// reuses `embed_backfill`, which already finds exactly the chunks missing vectors
+/// under the current model, so the two stay one mechanism rather than two.
+///
+/// `async` + `spawn_blocking` is load-bearing, not decoration: Tauri runs a
+/// synchronous command on the main thread, so walking a whole library there would
+/// freeze the webview for the duration — the "Rebuilding…" state could never even
+/// paint, which is the one piece of UI that makes a slow, key-spending action
+/// tolerable. Same shape as the local-Whisper path for the same reason.
+#[tauri::command]
+pub async fn chat_rebuild_index(app: AppHandle) -> Result<usize, String> {
+    // Clone the Arc out and drop the `State` borrow before any await: a
+    // `parking_lot` guard held across one would make this future non-Send, and all
+    // the locking below happens inside the blocking closure regardless.
+    let db = {
+        let state: State<AppState> = app.state();
+        state.db.clone()
+    };
+    let rebuilt = tauri::async_runtime::spawn_blocking(move || {
+        let ids = {
+            let conn = db.lock();
+            db::live_note_ids(&conn).map_err(super::err)?
+        };
+        // One lock acquisition per note, not one around the loop: a large library
+        // would otherwise hold the connection long enough to stall every other
+        // command that needs the database.
+        for id in &ids {
+            let conn = db.lock();
+            reindex_note_content(&conn, id);
+        }
+        Ok::<usize, String>(ids.len())
+    })
+    .await
+    .map_err(|e| format!("rebuild task failed: {e}"))??;
+    eprintln!("[chat] rebuilt retrieval chunks for {rebuilt} note(s)");
+    tauri::async_runtime::spawn(embed_backfill(app));
+    Ok(rebuilt)
+}
+
 /// Rebuild a Note's retrieval index on demand — the frontend calls this when
 /// the Note view unmounts, so edits made without triggering summarize/diarize
 /// still land in search. Re-chunks synchronously, then embeds off the request

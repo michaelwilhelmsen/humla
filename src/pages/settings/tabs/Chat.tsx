@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { open as openExternal } from "@tauri-apps/plugin-shell";
 import { Row, Section } from "../components/Section";
 import { Select } from "../components/Select";
@@ -13,6 +14,8 @@ import {
   isEmbeddingModel,
   isModelInstalled,
 } from "../../../lib/localModels";
+import { useDeveloperMode } from "../../../lib/useDeveloperMode";
+import { ipc } from "../../../lib/ipc";
 import type { SettingsHook } from "../useSettings";
 
 // AI Chat provider setting (issue #44). A dedicated provider choice, separate
@@ -27,6 +30,7 @@ export function ChatTab({ s, update }: Pick<SettingsHook, "s" | "update">) {
   // when chat isn't on Ollama.
   const key = useProviderKey("openai");
   const { reachable, installed } = useOllamaProbe(s.local_llm_base_url, { enabled: isOllama });
+  const devMode = useDeveloperMode();
 
   // Readiness — reflect exactly what's missing before chat can run.
   let ready = false;
@@ -147,6 +151,58 @@ export function ChatTab({ s, update }: Pick<SettingsHook, "s" | "update">) {
           <p className="text-xs text-[var(--color-text-muted)] mt-1">{hint}</p>
         )}
       </Row>
+
+      {devMode && <RebuildIndexRow />}
     </Section>
+  );
+}
+
+// Rebuild the whole library's retrieval index (issue #104).
+//
+// Behind developer mode because it's a repair tool, not a setting: the only reason
+// to reach for it is that the chunking changed under an existing library, which the
+// lazy startup backfill can't detect. The cost is disclosed rather than hidden — it
+// re-embeds, which spends the configured key — because an action that quietly costs
+// money is worse than a slow one.
+type RebuildState =
+  | { kind: "idle" }
+  | { kind: "running" }
+  | { kind: "done"; count: number }
+  | { kind: "error"; message: string };
+
+function RebuildIndexRow() {
+  const [state, setState] = useState<RebuildState>({ kind: "idle" });
+
+  async function rebuild() {
+    setState({ kind: "running" });
+    try {
+      setState({ kind: "done", count: await ipc.chatRebuildIndex() });
+    } catch (e) {
+      setState({ kind: "error", message: String(e) });
+    }
+  }
+
+  return (
+    <Row label="Search index">
+      <button
+        className="nd-btn"
+        onClick={() => void rebuild()}
+        disabled={state.kind === "running"}
+      >
+        {state.kind === "running" ? "Rebuilding…" : "Rebuild search index"}
+      </button>
+      <p className="text-xs text-[var(--color-text-muted)] mt-1">
+        Re-chunks every note so older meetings get speaker-aware search. Re-embeds as it goes,
+        which uses your configured key — a few cents for a large library.
+      </p>
+      {state.kind === "done" && (
+        <p className="text-xs text-[var(--color-success)] mt-1">
+          Rebuilt {state.count} note{state.count === 1 ? "" : "s"} ✓
+        </p>
+      )}
+      {state.kind === "error" && (
+        <p className="text-xs text-[var(--color-danger)] mt-1">{state.message}</p>
+      )}
+    </Row>
   );
 }

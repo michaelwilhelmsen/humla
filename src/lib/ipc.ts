@@ -489,6 +489,9 @@ export const ipc = {
   // Rebuild a Note's retrieval index — called on Note-view unmount so edits
   // that didn't trigger summarize/diarize still land in search.
   chatReindexNote: (noteId: string) => invoke<void>("chat_reindex_note", { noteId }),
+  /** Rebuild the retrieval index for every live note; resolves with how many (#104).
+   *  Slow and re-embeds, so it is user-triggered — see `chat_rebuild_index`. */
+  chatRebuildIndex: () => invoke<number>("chat_rebuild_index"),
 
   permissionsStatus: () => invoke<PermissionsStatus>("permissions_status"),
   permissionsRequest: (kind: PermissionKind) => invoke<PermissionsStatus>("permissions_request", { kind }),

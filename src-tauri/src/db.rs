@@ -280,6 +280,20 @@ pub fn open(path: &Path) -> Result<Connection> {
     // instead of dropping the row so it's recoverable; remote tombstones land
     // here too. Note lists filter `deleted_at IS NULL`.
     let _ = conn.execute("ALTER TABLE notes ADD COLUMN deleted_at INTEGER", []);
+    // Speaker-aware retrieval (issue #104). Two derived columns, both written only
+    // by `reindex_note` from the transcript text, both delimiter-wrapped by
+    // `encode_speakers`: `notes.speakers` backs a note-level filter and lets
+    // listing rows name who spoke (NoteMeta deliberately excludes the transcript),
+    // `note_chunks.speakers` backs the chunk-level one.
+    //
+    // Local-only and NOT synced, deliberately: the server derives its own from the
+    // transcript it already holds, so no new PB field exists and no structured list
+    // of named third parties enters the shared collection (ADR-0002). They are a
+    // cache, not a record — rebuildable from the text at any time, and destroyed
+    // with the note that produced them.
+    let _ = conn.execute("ALTER TABLE notes ADD COLUMN speakers TEXT NOT NULL DEFAULT ''", []);
+    let _ =
+        conn.execute("ALTER TABLE note_chunks ADD COLUMN speakers TEXT NOT NULL DEFAULT ''", []);
     // Workspace (Teams) chat (issue #50). A workspace conversation is
     // server-authoritative: the local row is just a (tenant, scope, scope_id)
     // handle whose `remote_id` maps to the humla-cloud conversation record id.
@@ -815,6 +829,21 @@ pub fn restore_note(conn: &Connection, id: &str) -> Result<()> {
 /// Permanently delete a note (hard DELETE) — removes the local row for good.
 /// The server copy is already tombstoned from the soft-delete.
 pub fn purge_note(conn: &Connection, id: &str) -> Result<()> {
+    // Take the derived index with it (issue #121). Purge is the point of no return,
+    // and until this landed the note's chunk + FTS rows survived as orphans: never
+    // reachable by search (the hit query inner-joins live notes) but still holding
+    // the transcript text, speaker names included, after the user performed the one
+    // action the UI presents as permanent.
+    //
+    // ADR-0002 makes this a rule rather than tidiness: "delete the note" is the
+    // answer to erasing a person, which only holds if derived person data is
+    // destroyed rather than hidden. The cloud indexer already did this on a
+    // tombstone; this is local catching up.
+    //
+    // `chunk_embeddings` is deliberately left alone — keyed `(text_hash, model)`
+    // with no note linkage, so it is shared by any notes with identical text and
+    // cannot be deleted per note. It stores a vector, not text, so it holds no name.
+    remove_note_chunks(conn, id)?;
     conn.execute("DELETE FROM notes WHERE id = ?1", params![id])?;
     Ok(())
 }
@@ -1437,6 +1466,11 @@ pub struct ChunkHit {
     pub source: String,
     pub text: String,
     pub rank: f64,
+    /// Position of this chunk within its Note. Carried so a grouped result can put a
+    /// note's excerpts back into READING order (#104's seventh decision): ranked
+    /// order scrambles them, which garbles any "what was decided" narrative the
+    /// model tries to reconstruct from several excerpts of one meeting.
+    pub seq: i64,
 }
 
 /// Lightweight Note descriptor for the `list_notes` tool — just what a citation
@@ -1455,6 +1489,12 @@ pub struct NoteMeta {
     /// seen, and a per-client answer has to name the client in prose (#105).
     pub client_name: Option<String>,
     pub summary: String,
+    /// Who spoke in this note, from the derived `notes.speakers` column (#104).
+    /// Carried for the same reason as `client_name`: `NoteMeta` deliberately
+    /// excludes the transcript, so without this a listing row cannot name a single
+    /// speaker — and the model can then only pass a `speaker` filter for a name it
+    /// has actually seen, rather than one it guessed (#105's lesson).
+    pub speakers: Vec<String>,
 }
 
 /// A search's hits *and* how many notes actually matched — two different numbers
@@ -1468,6 +1508,15 @@ pub struct NoteMeta {
 pub struct SearchOutcome {
     pub hits: Vec<ChunkHit>,
     pub matched_notes: Option<usize>,
+    /// How many candidate excerpts each note contributed BEFORE the per-note
+    /// diversity cap trimmed them, keyed by note id (#104).
+    ///
+    /// Needed so a grouped result can say "2 of 7" honestly and name the cap as the
+    /// reason — without it, showing 2 of a note's excerpts reads as "the other 5
+    /// didn't match" when the diversity cap is the real limiter. Measures the same
+    /// fused candidate set the hits are drawn from, so the two numbers describe one
+    /// set rather than two (#106's counting trap).
+    pub per_note_matched: std::collections::HashMap<String, usize>,
 }
 
 /// Independent, combinable Note filters for retrieval. Every field is optional
@@ -1486,6 +1535,232 @@ pub struct NoteFilter<'a> {
     /// half of a bounded window (#106). Exclusive so successive windows tile without
     /// double-counting the note that sits exactly on the boundary.
     pub until_ms: Option<i64>,
+    /// Optional speaker label (#104). Matched EXACTLY against the wrapped derived
+    /// column, so `Michael` never reaches `Michael Berg` — substring matching would
+    /// merge two people into one confident wrong answer.
+    ///
+    /// Applied at both levels: notes where they spoke (listings, counts) and, in
+    /// chunk search, the passages they spoke in. So a hit means *"they spoke here"*,
+    /// not *"they said this"* — right for "what did Hege commit to", wrong for
+    /// counting who talked most.
+    pub speaker: Option<&'a str>,
+    /// A SECOND label that counts as the same person as `speaker` (#104).
+    ///
+    /// Exists for the `You:` sentinel. Mic chunks on remote calls are labelled with
+    /// the literal "You", so the app user's own speech is stored under two different
+    /// labels across a library: "You" wherever the diarizer wrote it, and their real
+    /// name wherever they renamed it. Filtering for one and silently missing the other
+    /// is a wrong answer that looks complete, so a filter may name both.
+    ///
+    /// Ignored unless `speaker` is set. The transcript text is never rewritten — this
+    /// is the query-side half of resolving the sentinel.
+    pub speaker_alias: Option<&'a str>,
+}
+
+/// The maximum length of a speaker label, in chars. Mirrors the `{1,40}` bound in
+/// the frontend's `extractSpeakerLabels` regex — see [`parse_speaker_turns`].
+const SPEAKER_LABEL_MAX_CHARS: usize = 40;
+
+/// One line of a transcript, split into its speaker label (if it has one) and the
+/// full original text of the line.
+///
+/// `text` is verbatim and INCLUDES the label, because labels stay inline: a chunk
+/// built from these turns self-describes to the model with no rewriting, and stays
+/// a faithful slice of what the user reads (issue #104).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Turn {
+    /// The asserted speaker, or `None` for a line with no label — an import, or a
+    /// live transcript before the post-stop diarize pass adds labels.
+    pub speaker: Option<String>,
+    pub text: String,
+}
+
+/// A chunk of one Note source, with the speakers it contains.
+///
+/// `speakers` is derived from the text and only ever populated for the transcript
+/// source; it is empty for body and summary, which have no turn structure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoteChunk {
+    pub source: &'static str,
+    pub text: String,
+    /// Distinct speakers in this chunk, in first-encounter order.
+    pub speakers: Vec<String>,
+}
+
+/// Append `value` unless it is already present, preserving first-encounter order.
+///
+/// Speaker lists are short (a handful per note) and their ORDER is meaningful — the
+/// first voice is usually whoever opened the meeting — so a linear scan over a `Vec`
+/// beats a `HashSet` plus a second pass to recover ordering. Used wherever speakers
+/// are accumulated, so "distinct, in first-encounter order" is defined once.
+fn push_distinct(out: &mut Vec<String>, value: &str) {
+    if !out.iter().any(|seen| seen == value) {
+        out.push(value.to_string());
+    }
+}
+
+/// Wrap a chunk's speakers for storage as `|Michael|Hege|`, or `""` for none.
+///
+/// Delimiter-wrapped rather than a join, so an exact-label match is a single
+/// `LIKE '%|Michael|%'` that cannot also match `Michael Berg` — substring matching
+/// would merge two people into one confident wrong answer (#104). The cost is that
+/// the column can't be substring-indexed, which is why #116's autocomplete wants
+/// its own derived table rather than querying this one.
+///
+/// A `|` inside a label would break the encoding, so it is normalised to a space
+/// **in this derived column only** — the transcript text is never rewritten.
+pub fn encode_speakers(speakers: &[String]) -> String {
+    if speakers.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("|");
+    for s in speakers {
+        out.push_str(&s.replace('|', " "));
+        out.push('|');
+    }
+    out
+}
+
+/// Read back what [`encode_speakers`] wrote. Tolerates `""` and a bare unwrapped
+/// value, so a hand-edited or half-migrated row can't panic a search.
+pub fn decode_speakers(encoded: &str) -> Vec<String> {
+    encoded
+        .split('|')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Split a transcript into speaker turns, one per line.
+///
+/// **This is one of three copies of the same parse** — the others are
+/// `extractSpeakerLabels` in `src/lib/speakers.ts` (frontend) and the indexer's
+/// parse in `humla-cloud/chat-service`. They must agree, so the rule is pinned
+/// here verbatim and asserted by [`tests::parse_speaker_turns_mirrors_the_frontend_label_rule`]:
+///
+/// > a label is up to 40 non-colon chars at the start of the line (after leading
+/// > whitespace), followed by a colon and then whitespace.
+///
+/// The trailing-whitespace requirement is what stops `12:30 standup` and
+/// `https://example.com` being read as speakers.
+pub fn parse_speaker_turns(transcript: &str) -> Vec<Turn> {
+    transcript
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| Turn { speaker: speaker_label(line), text: line.to_string() })
+        .collect()
+}
+
+/// The speaker label of one line, or `None`. See [`parse_speaker_turns`] for the
+/// rule this pins.
+fn speaker_label(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    // Take up to the bound in chars (not bytes — a Norwegian name is not ASCII).
+    let mut label = String::new();
+    let mut chars = trimmed.chars();
+    loop {
+        match chars.next() {
+            // A colon closes the candidate label; it must be followed by whitespace.
+            Some(':') => {
+                return match chars.next() {
+                    Some(next) if next.is_whitespace() => {
+                        let label = label.trim();
+                        (!label.is_empty()).then(|| label.to_string())
+                    }
+                    _ => None,
+                };
+            }
+            Some(c) if label.chars().count() < SPEAKER_LABEL_MAX_CHARS => label.push(c),
+            // Ran past the bound, or ran out of line, without finding a colon.
+            _ => return None,
+        }
+    }
+}
+
+/// Pack whole turns into ~`target`-char chunks, so a chunk boundary never lands
+/// mid-turn and every chunk carries the labels of the speech inside it (#104).
+///
+/// A turn longer than `target` is hard-split, and its continuations are prefixed
+/// `Name (continued): ` so a mid-turn chunk still says who is speaking. That
+/// prefix is the one place a chunk's text is not verbatim, and it pushes a
+/// continuation slightly past `target` — acceptable, since `target` is a soft
+/// budget well inside the model's window.
+pub fn pack_turns(turns: &[Turn], target: usize) -> Vec<NoteChunk> {
+    let target = target.max(1);
+    let mut out: Vec<NoteChunk> = Vec::new();
+    let mut lines: Vec<&str> = Vec::new();
+    let mut speakers: Vec<String> = Vec::new();
+    let mut len = 0usize;
+
+    for turn in turns {
+        let turn_len = turn.text.chars().count();
+
+        // An overlong turn cannot share a chunk with anything: close what's open,
+        // then hard-split it on its own.
+        if turn_len > target {
+            if !lines.is_empty() {
+                out.push(transcript_chunk(&lines, std::mem::take(&mut speakers)));
+                lines.clear();
+                len = 0;
+            }
+            out.extend(split_long_turn(turn, target));
+            continue;
+        }
+
+        // `+ 1` for the newline this turn would be joined on.
+        if !lines.is_empty() && len + 1 + turn_len > target {
+            out.push(transcript_chunk(&lines, std::mem::take(&mut speakers)));
+            lines.clear();
+            len = 0;
+        }
+
+        if !lines.is_empty() {
+            len += 1;
+        }
+        len += turn_len;
+        lines.push(&turn.text);
+        if let Some(s) = &turn.speaker {
+            push_distinct(&mut speakers, s);
+        }
+    }
+    if !lines.is_empty() {
+        out.push(transcript_chunk(&lines, speakers));
+    }
+    out
+}
+
+/// Assemble one transcript chunk, rejoining turns on the single newline they were
+/// separated by.
+///
+/// The text is the transcript's own words, unaltered, but not a byte-for-byte slice:
+/// `parse_speaker_turns` drops blank lines (they carry no speech, and the paragraph
+/// splitter dropped them too), so a transcript containing them — an import, or
+/// pasted text — rejoins without them. Speech is never changed; only empty lines go.
+/// The other, louder departure is the `(continued)` prefix in [`split_long_turn`].
+fn transcript_chunk(lines: &[&str], speakers: Vec<String>) -> NoteChunk {
+    NoteChunk { source: "transcript", text: lines.join("\n"), speakers }
+}
+
+/// Hard-split one over-budget turn, naming the speaker on every continuation so a
+/// mid-turn chunk is still attributable. The first piece needs no prefix — it
+/// already opens with the real label.
+fn split_long_turn(turn: &Turn, target: usize) -> Vec<NoteChunk> {
+    let speakers: Vec<String> = turn.speaker.clone().map(|s| vec![s]).unwrap_or_default();
+    let prefix = turn.speaker.as_ref().map(|s| format!("{s} (continued): "));
+    let chars: Vec<char> = turn.text.chars().collect();
+    chars
+        .chunks(target)
+        .enumerate()
+        .map(|(i, window)| {
+            let body: String = window.iter().collect();
+            let text = match (i, prefix.as_deref()) {
+                (0, _) | (_, None) => body,
+                (_, Some(p)) => format!("{p}{body}"),
+            };
+            NoteChunk { source: "transcript", text, speakers: speakers.clone() }
+        })
+        .collect()
 }
 
 /// Split arbitrary text into ~`target`-char chunks, breaking on blank-line
@@ -1532,20 +1807,21 @@ pub fn split_into_chunks(text: &str, target: usize) -> Vec<String> {
 /// Produce the (source, text) chunk list for a Note. `body_text` must already be
 /// plain text (HTML stripped by the caller). Sources are chunked independently
 /// so a chunk never straddles e.g. transcript and summary.
-pub fn note_chunk_texts(
-    body_text: &str,
-    transcript: &str,
-    summary: &str,
-) -> Vec<(&'static str, String)> {
-    let mut out: Vec<(&'static str, String)> = Vec::new();
-    for (source, text) in [
-        ("body", body_text),
-        ("transcript", transcript),
-        ("summary", summary),
-    ] {
-        for chunk in split_into_chunks(text, CHUNK_TARGET_CHARS) {
-            out.push((source, chunk));
-        }
+/// The transcript takes a different path from body and summary, and that asymmetry
+/// is the point (#104): its turns are separated by SINGLE newlines, which the
+/// blank-line paragraph splitter cannot see — so a transcript arrived as one
+/// "paragraph", blew past the target, and fell through to arbitrary char slicing
+/// that cut mid-word and stranded each speaker's label in a previous chunk. Prose
+/// really does have blank lines, so it keeps the splitter that suits it, and claims
+/// no speakers: `Note: buy milk` typed in a body is not a person who spoke.
+pub fn note_chunk_texts(body_text: &str, transcript: &str, summary: &str) -> Vec<NoteChunk> {
+    let mut out: Vec<NoteChunk> = Vec::new();
+    for chunk in split_into_chunks(body_text, CHUNK_TARGET_CHARS) {
+        out.push(NoteChunk { source: "body", text: chunk, speakers: Vec::new() });
+    }
+    out.extend(pack_turns(&parse_speaker_turns(transcript), CHUNK_TARGET_CHARS));
+    for chunk in split_into_chunks(summary, CHUNK_TARGET_CHARS) {
+        out.push(NoteChunk { source: "summary", text: chunk, speakers: Vec::new() });
     }
     out
 }
@@ -1564,19 +1840,35 @@ pub fn reindex_note(
     remove_note_chunks(conn, note_id)?;
     let now = now_ms();
     let chunks = note_chunk_texts(body_text, transcript, summary);
-    for (seq, (source, text)) in chunks.iter().enumerate() {
+    // The note-level set is the union of what the chunks carry, in first-encounter
+    // order — derived from the same parse, so the two columns cannot disagree.
+    let mut note_speakers: Vec<String> = Vec::new();
+    for chunk in &chunks {
+        for s in &chunk.speakers {
+            push_distinct(&mut note_speakers, s);
+        }
+    }
+    for (seq, chunk) in chunks.iter().enumerate() {
+        let NoteChunk { source, text, speakers } = chunk;
         let chunk_id = uuid::Uuid::new_v4().to_string();
         let hash = text_hash(text);
         conn.execute(
-            "INSERT INTO note_chunks (id, note_id, seq, source, text, text_hash, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![chunk_id, note_id, seq as i64, source, text, hash, now],
+            "INSERT INTO note_chunks (id, note_id, seq, source, text, text_hash, created_at, speakers)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![chunk_id, note_id, seq as i64, source, text, hash, now, encode_speakers(speakers)],
         )?;
         conn.execute(
             "INSERT INTO note_chunks_fts (text, chunk_id, note_id) VALUES (?1, ?2, ?3)",
             params![text, chunk_id, note_id],
         )?;
     }
+    // Deliberately does NOT touch `updated_at`. Reindex runs on every settled
+    // content change, so bumping it would mark the note dirty over derived data and
+    // hand the sync worker an endless stream of no-op pushes.
+    conn.execute(
+        "UPDATE notes SET speakers = ?1 WHERE id = ?2",
+        params![encode_speakers(&note_speakers), note_id],
+    )?;
     Ok(chunks.len())
 }
 
@@ -1599,6 +1891,29 @@ pub fn remove_note_chunks(conn: &Connection, note_id: &str) -> Result<()> {
     conn.execute("DELETE FROM note_chunks WHERE note_id = ?1", params![note_id])?;
     conn.execute("DELETE FROM note_chunks_fts WHERE note_id = ?1", params![note_id])?;
     Ok(())
+}
+
+/// Every live note's id, oldest first — the work-list for the user-triggered
+/// "rebuild search index" action (#104).
+///
+/// Distinct from [`note_ids_needing_reindex`], which is a *lazy* startup backfill
+/// keyed on sentinels for notes that were never indexed. A chunking-shape change
+/// invalidates notes that look perfectly indexed, and there is no sentinel for
+/// "chunked before turn-packing" — so repairing an existing library means walking
+/// all of them. Deliberately NOT wired into startup: re-chunking changes every
+/// chunk's `text_hash`, which misses the embedding cache and re-embeds the whole
+/// library on the user's own API key. Cheap in absolute terms (cents), but not
+/// something to spend unasked, so the user asks for it.
+///
+/// Oldest first because old meetings are exactly what a "briefing on X" query
+/// needs, and they are the ones that would otherwise never be re-opened.
+pub fn live_note_ids(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt =
+        conn.prepare("SELECT id FROM notes WHERE deleted_at IS NULL ORDER BY created_at ASC")?;
+    let ids = stmt
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(ids)
 }
 
 /// Ids of live notes needing a (re)index — the startup-backfill work-list.
@@ -1786,11 +2101,12 @@ fn keyword_ranked(
     };
     use rusqlite::types::Value;
     let mut sql = format!(
-        "SELECT c.id, n.id, n.title, n.created_at, c.source, c.text, bm25(note_chunks_fts) AS rank \
+        "SELECT c.id, n.id, n.title, n.created_at, c.source, c.text, bm25(note_chunks_fts) AS rank, \
+                c.seq \
          {KEYWORD_FROM_WHERE}"
     );
     let mut args: Vec<Value> = vec![Value::Text(match_expr), Value::Text(workspace.to_string())];
-    push_note_filters(&mut sql, &mut args, filter, "n");
+    push_chunk_filters(&mut sql, &mut args, filter);
     args.push(Value::Integer(limit as i64));
     sql.push_str(&format!(" ORDER BY rank LIMIT ?{}", args.len()));
     let mut stmt = conn.prepare(&sql)?;
@@ -1805,6 +2121,7 @@ fn keyword_ranked(
                     source: row.get(4)?,
                     text: row.get(5)?,
                     rank: row.get(6)?,
+                    seq: row.get(7)?,
                 },
             })
         })?
@@ -1825,14 +2142,14 @@ fn semantic_ranked(
 ) -> Result<Vec<IdentifiedHit>> {
     use rusqlite::types::Value;
     let mut sql = String::from(
-        "SELECT c.id, n.id, n.title, n.created_at, c.source, c.text, e.vector \
+        "SELECT c.id, n.id, n.title, n.created_at, c.source, c.text, e.vector, c.seq \
          FROM note_chunks c \
          JOIN chunk_embeddings e ON e.text_hash = c.text_hash AND e.model = ?1 \
          JOIN notes n ON n.id = c.note_id \
          WHERE n.workspace_id = ?2 AND n.deleted_at IS NULL",
     );
     let mut args: Vec<Value> = vec![Value::Text(model.to_string()), Value::Text(workspace.to_string())];
-    push_note_filters(&mut sql, &mut args, filter, "n");
+    push_chunk_filters(&mut sql, &mut args, filter);
     let mut stmt = conn.prepare(&sql)?;
     let mut scored: Vec<(f32, IdentifiedHit)> = stmt
         .query_map(rusqlite::params_from_iter(args), |row| {
@@ -1849,6 +2166,7 @@ fn semantic_ranked(
                         source: row.get(4)?,
                         text: row.get(5)?,
                         rank: 0.0,
+                        seq: row.get(7)?,
                     },
                 },
             ))
@@ -1898,6 +2216,103 @@ fn push_note_filters(
         args.push(Value::Integer(until));
         sql.push_str(&format!(" AND {t}.created_at < ?{}", args.len()));
     }
+    if let Some(speaker) = filter.speaker {
+        push_speaker_clause(sql, args, speaker, filter.speaker_alias, t);
+    }
+}
+
+/// The filter set for a query that selects CHUNKS (`c`) joined to notes (`n`).
+///
+/// Every note-level narrowing applies as usual, but `speaker` moves to the chunk:
+/// an excerpt should come back only if that speaker spoke in that passage, where
+/// note-level would return every excerpt from any meeting they attended. All three
+/// chunk queries — keyword hits, semantic candidates and the match count — must
+/// narrow identically, or the count describes a different set from the hits (#106),
+/// so they share this one call rather than three copies of the same two steps.
+fn push_chunk_filters(
+    sql: &mut String,
+    args: &mut Vec<rusqlite::types::Value>,
+    filter: NoteFilter<'_>,
+) {
+    push_note_filters(sql, args, NoteFilter { speaker: None, speaker_alias: None, ..filter }, "n");
+    if let Some(speaker) = filter.speaker {
+        push_speaker_clause(sql, args, speaker, filter.speaker_alias, "c");
+    }
+}
+
+/// Narrow to rows whose derived `speakers` column contains `speaker` as a WHOLE
+/// label, against either alias — `n` for notes ("they spoke in this meeting"), `c`
+/// for chunks ("they spoke in this passage").
+///
+/// The wrapping is what makes it exact: the needle is built as `%|Label|%`, and
+/// since [`encode_speakers`] wraps every stored label in the same delimiters,
+/// `|Michael|` cannot occur inside `|Michael Berg|`.
+///
+/// Case folding is SQLite `LIKE`'s, which is ASCII-only — so `hege`/`Hege` match
+/// but a label differing only in the case of a non-ASCII character (`Ærlig`/`ærlig`)
+/// would not. Accepted: labels reach this filter having been read off a listing
+/// row, so they arrive spelled as stored, and the alternative is a second
+/// lowercased mirror column purely for folding.
+fn push_speaker_clause(
+    sql: &mut String,
+    args: &mut Vec<rusqlite::types::Value>,
+    speaker: &str,
+    alias: Option<&str>,
+    t: &str,
+) {
+    use rusqlite::types::Value;
+    // Neutralise LIKE's own wildcards so a name containing % or _ can't widen the
+    // match, via an explicit ESCAPE clause.
+    let mut clauses: Vec<String> = Vec::new();
+    for label in [Some(speaker), alias].into_iter().flatten() {
+        let escaped = label
+            .trim()
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_")
+            .replace('|', " ");
+        if escaped.is_empty() {
+            continue;
+        }
+        args.push(Value::Text(format!("%|{escaped}|%")));
+        clauses.push(format!("{t}.speakers LIKE ?{} ESCAPE '\\'", args.len()));
+    }
+    if clauses.is_empty() {
+        return;
+    }
+    // Parenthesised: an unbracketed OR would let the second label escape every
+    // preceding AND and match notes the breadth clamp had already excluded.
+    sql.push_str(&format!(" AND ({})", clauses.join(" OR ")));
+}
+
+/// The distinct speakers present in a scope, so an unmatched `speaker` argument can
+/// be answered with the names that DO exist rather than an empty result (#106: a
+/// model handed a bare zero reports absence; one handed the real options
+/// self-corrects). Ordered for a stable, readable list.
+pub fn speakers_in_scope(
+    conn: &Connection,
+    filter: NoteFilter<'_>,
+    workspace_id: &str,
+) -> Result<Vec<String>> {
+    let mut sql = String::from(
+        "SELECT speakers FROM notes n WHERE n.workspace_id = ?1 AND n.deleted_at IS NULL \
+         AND n.speakers != ''",
+    );
+    let mut args: Vec<rusqlite::types::Value> =
+        vec![rusqlite::types::Value::Text(workspace_id.to_string())];
+    // The speaker field itself is dropped: we are asking what else is there.
+    push_note_filters(&mut sql, &mut args, NoteFilter { speaker: None, speaker_alias: None, ..filter }, "n");
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(args), |r| r.get::<_, String>(0))?;
+    let mut out: Vec<String> = Vec::new();
+    for encoded in rows {
+        for s in decode_speakers(&encoded?) {
+            push_distinct(&mut out, &s);
+        }
+    }
+    out.sort_unstable();
+    Ok(out)
 }
 
 /// The size of each per-signal candidate pool fused by RRF. Bigger than the
@@ -1920,14 +2335,24 @@ const PER_NOTE_CAP: usize = 2;
 /// spanning the whole library. The cap fixes that; the backfill is what stops it
 /// costing recall when only one note matches (a note-scoped search must still be
 /// able to return several excerpts of its one note).
-fn diversify(ranked: Vec<ChunkHit>, limit: usize, per_note_cap: usize) -> Vec<ChunkHit> {
+fn diversify(
+    ranked: Vec<ChunkHit>,
+    limit: usize,
+    per_note_cap: usize,
+) -> (Vec<ChunkHit>, std::collections::HashMap<String, usize>) {
     use std::collections::HashMap;
+    // Counted over the WHOLE ranked candidate set, before any capping or the early
+    // return below, so it stays an honest denominator for "showing N of M".
+    let mut matched: HashMap<String, usize> = HashMap::new();
+    for hit in &ranked {
+        *matched.entry(hit.note_id.clone()).or_insert(0) += 1;
+    }
     let mut out: Vec<ChunkHit> = Vec::with_capacity(limit.min(ranked.len()));
     let mut held: Vec<ChunkHit> = Vec::new();
     let mut per_note: HashMap<String, usize> = HashMap::new();
     for hit in ranked {
         if out.len() >= limit {
-            return out;
+            return (out, matched);
         }
         let taken = per_note.entry(hit.note_id.clone()).or_insert(0);
         if *taken < per_note_cap {
@@ -1943,7 +2368,7 @@ fn diversify(ranked: Vec<ChunkHit>, limit: usize, per_note_cap: usize) -> Vec<Ch
         }
         out.push(hit);
     }
-    out
+    (out, matched)
 }
 
 /// Hybrid keyword+semantic search. With `query_vec = Some`, fuses BM25 and
@@ -1966,10 +2391,9 @@ pub fn hybrid_search_chunks(
     // Keyword-only: no query embedding, or nothing embedded yet under this model
     // (issue #48 graceful degradation).
     let keyword_only = |kw: Vec<IdentifiedHit>| {
-        Ok(SearchOutcome {
-            hits: diversify(kw.into_iter().map(|ih| ih.hit).collect(), limit, PER_NOTE_CAP),
-            matched_notes,
-        })
+        let (hits, per_note_matched) =
+            diversify(kw.into_iter().map(|ih| ih.hit).collect(), limit, PER_NOTE_CAP);
+        Ok(SearchOutcome { hits, matched_notes, per_note_matched })
     };
     let Some(qv) = query_vec else {
         return keyword_only(keyword);
@@ -1992,7 +2416,8 @@ pub fn hybrid_search_chunks(
             h
         }))
         .collect();
-    Ok(SearchOutcome { hits: diversify(ranked, limit, PER_NOTE_CAP), matched_notes })
+    let (hits, per_note_matched) = diversify(ranked, limit, PER_NOTE_CAP);
+    Ok(SearchOutcome { hits, matched_notes, per_note_matched })
 }
 
 /// How many DISTINCT live notes the keyword predicate matches, under the same
@@ -2017,7 +2442,7 @@ fn count_matching_notes(
     use rusqlite::types::Value;
     let mut sql = format!("SELECT COUNT(DISTINCT c.note_id) {KEYWORD_FROM_WHERE}");
     let mut args: Vec<Value> = vec![Value::Text(match_expr), Value::Text(workspace.to_string())];
-    push_note_filters(&mut sql, &mut args, filter, "n");
+    push_chunk_filters(&mut sql, &mut args, filter);
     let count: i64 = conn.query_row(&sql, rusqlite::params_from_iter(args), |row| row.get(0))?;
     Ok(Some(count.max(0) as usize))
 }
@@ -2034,7 +2459,8 @@ pub fn list_notes_filtered(
     // LEFT JOIN, not an inner one: an untagged note (the common case) must still be
     // listed, and so must a note whose Client row hasn't arrived from sync yet.
     let mut sql = String::from(
-        "SELECT n.id, n.title, n.created_at, n.folder_id, n.client_id, cl.name, n.summary \
+        "SELECT n.id, n.title, n.created_at, n.folder_id, n.client_id, cl.name, n.summary, \
+                n.speakers \
          FROM notes n LEFT JOIN clients cl ON cl.id = n.client_id \
          WHERE n.workspace_id = ?1 AND n.deleted_at IS NULL",
     );
@@ -2060,6 +2486,7 @@ pub fn list_notes_filtered(
                 client_id: row.get(4)?,
                 client_name: row.get(5)?,
                 summary: row.get(6)?,
+                speakers: decode_speakers(&row.get::<_, String>(7)?),
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -3051,15 +3478,496 @@ mod tests {
         assert_eq!(merged[0], "one\n\ntwo");
     }
 
+    // ── Speaker-aware chunking (issue #104) ──────────────────────────────────
+
+    /// Pinned parity with the frontend parse (issue #104).
+    ///
+    /// The same label rule now exists three times: here, in `extractSpeakerLabels`
+    /// (`src/lib/speakers.ts`, which decides the rename UI's chip strip), and in
+    /// humla-cloud's indexer. They MUST agree — a one-sided change means a chunk is
+    /// attributed to someone the UI never shows as a speaker, or vice versa. #105's
+    /// `client_id` drift passed every test on both sides, so the mitigation is the
+    /// one used for the tool schemas: pin the identical case table in each suite.
+    ///
+    /// The mirror of this table is `PINNED_LABEL_CASES` in `src/lib/speakers.test.ts`.
+    /// Change one, change both, or the pair stops meaning anything.
+    #[test]
+    fn parse_speaker_turns_mirrors_the_frontend_label_rule() {
+        let over_bound = format!("{}: over the bound", "x".repeat(41));
+        let at_bound = format!("{}: at the bound", "x".repeat(40));
+        let forty = "x".repeat(40);
+        let pinned_label_cases: &[(&str, Option<&str>)] = &[
+            ("Michael: hello", Some("Michael")),
+            ("  Michael: hello", Some("Michael")),
+            ("Alice : hi", Some("Alice")),
+            ("Hege Tronshaugen: ja", Some("Hege Tronshaugen")),
+            ("Speaker 1: hi", Some("Speaker 1")),
+            ("You: hi", Some("You")),
+            ("12:30 standup", None),
+            ("see https://example.com now", None),
+            ("Michael:hello", None),
+            ("no colon at all", None),
+            (over_bound.as_str(), None),
+            (at_bound.as_str(), Some(forty.as_str())),
+        ];
+
+        for (input, expected) in pinned_label_cases {
+            let got = parse_speaker_turns(input).into_iter().next().and_then(|t| t.speaker);
+            assert_eq!(
+                got.as_deref(),
+                *expected,
+                "pinned label case {input:?} disagrees with the frontend"
+            );
+        }
+
+        // Blank lines are dropped, and text is verbatim including the label.
+        let turns = parse_speaker_turns("Michael: one\n\n   \nHege: two");
+        assert_eq!(turns.len(), 2, "blank lines contribute no turns");
+        assert_eq!(turns[0].text, "Michael: one", "text keeps the label inline");
+    }
+
+    #[test]
+    fn pack_turns_keeps_whole_turns_together_and_records_their_speakers() {
+        let turns = parse_speaker_turns("Michael: aaaa\nHege: bbbb\nMichael: cccc");
+
+        // Tight budget: each turn is its own chunk, and carries its own speaker.
+        let tight = pack_turns(&turns, 14);
+        assert_eq!(tight.len(), 3, "a boundary never lands mid-turn");
+        assert_eq!(tight[0].text, "Michael: aaaa");
+        assert_eq!(tight[0].speakers, vec!["Michael".to_string()]);
+        assert_eq!(tight[1].speakers, vec!["Hege".to_string()]);
+
+        // Generous budget: all three pack into one chunk joined by the original
+        // single newline, with distinct speakers in first-encounter order.
+        let merged = pack_turns(&turns, 1000);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "Michael: aaaa\nHege: bbbb\nMichael: cccc");
+        assert_eq!(
+            merged[0].speakers,
+            vec!["Michael".to_string(), "Hege".to_string()],
+            "distinct, first-encounter order, not repeated"
+        );
+
+        assert!(pack_turns(&[], 100).is_empty(), "no turns, no chunks");
+    }
+
+    #[test]
+    fn pack_turns_hard_splits_an_overlong_turn_and_says_who_is_still_speaking() {
+        // One turn far past the budget — the case that today falls through to
+        // arbitrary char slicing with the label stranded in the first piece.
+        let long = format!("Hege: {}", "x".repeat(120));
+        let turns = parse_speaker_turns(&long);
+        let chunks = pack_turns(&turns, 50);
+
+        assert!(chunks.len() > 1, "an overlong turn is split, not emitted whole");
+        assert!(chunks[0].text.starts_with("Hege: "), "the first piece keeps the real label");
+        for (i, c) in chunks.iter().enumerate().skip(1) {
+            assert!(
+                c.text.starts_with("Hege (continued): "),
+                "piece {i} must still name the speaker, got {:?}",
+                c.text
+            );
+        }
+        for c in &chunks {
+            assert_eq!(c.speakers, vec!["Hege".to_string()], "every piece is attributed");
+        }
+
+        // Reassembling the pieces recovers the original speech exactly — the
+        // prefix is additive, never a rewrite of the user's words.
+        let rejoined: String = chunks
+            .iter()
+            .map(|c| c.text.trim_start_matches("Hege (continued): ").to_string())
+            .collect();
+        assert_eq!(rejoined, long, "no speech is lost or altered by splitting");
+    }
+
+    #[test]
+    fn pack_turns_handles_a_transcript_with_no_labels_at_all() {
+        // An import, or a live transcript before the post-stop diarize pass. This
+        // is strictly better than today's behaviour: unlabelled transcripts are
+        // one blank-line-free "paragraph", so they hard-split mid-word.
+        let turns = parse_speaker_turns("first line here\nsecond line here\nthird line here");
+        let chunks = pack_turns(&turns, 32);
+
+        assert!(chunks.len() > 1, "packs by line even with nothing to attribute");
+        for c in &chunks {
+            assert!(c.speakers.is_empty(), "nothing to attribute, so no speakers claimed");
+        }
+        let rejoined = chunks.iter().map(|c| c.text.as_str()).collect::<Vec<_>>().join("\n");
+        assert_eq!(rejoined, "first line here\nsecond line here\nthird line here");
+    }
+
+    #[test]
+    fn note_chunk_texts_packs_the_transcript_by_turn_but_leaves_prose_alone() {
+        // The transcript's turns are separated by SINGLE newlines, which is exactly
+        // what the paragraph splitter cannot see — hence the separate path.
+        let transcript = "Michael: alpha\nHege: beta";
+        let chunks = note_chunk_texts("body one\n\nbody two", transcript, "summary text");
+
+        let transcript_chunks: Vec<&NoteChunk> =
+            chunks.iter().filter(|c| c.source == "transcript").collect();
+        assert_eq!(transcript_chunks.len(), 1);
+        assert_eq!(
+            transcript_chunks[0].speakers,
+            vec!["Michael".to_string(), "Hege".to_string()],
+            "transcript chunks carry speakers"
+        );
+
+        // Body and summary keep the paragraph splitter and claim no speakers —
+        // a line in a typed note that happens to read "Note: buy milk" is not a
+        // person who spoke.
+        for c in chunks.iter().filter(|c| c.source != "transcript") {
+            assert!(c.speakers.is_empty(), "{} must claim no speakers", c.source);
+        }
+    }
+
+    #[test]
+    fn live_note_ids_covers_every_live_note_and_no_trashed_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("t.sqlite")).unwrap();
+        let keep_a = create_note(&conn, "en", "meeting", "").unwrap().id;
+        let keep_b = create_note(&conn, "en", "meeting", "").unwrap().id;
+        let trashed = create_note(&conn, "en", "meeting", "").unwrap().id;
+        delete_note(&conn, &trashed).unwrap();
+
+        let ids = live_note_ids(&conn).unwrap();
+        assert!(ids.contains(&keep_a) && ids.contains(&keep_b));
+        assert!(!ids.contains(&trashed), "a trashed note is not reindexed");
+
+        // Unlike the lazy startup backfill, this includes notes that ALREADY have
+        // chunks — a chunking-shape change invalidates rows that look fine, and
+        // there is no sentinel for "chunked before turn-packing".
+        reindex_note(&conn, &keep_a, "", "Michael: hi", "").unwrap();
+        assert!(
+            live_note_ids(&conn).unwrap().contains(&keep_a),
+            "an already-indexed note still needs rebuilding"
+        );
+        assert!(
+            !note_ids_needing_reindex(&conn).unwrap().contains(&keep_a),
+            "...which is exactly what the lazy work-list does NOT cover"
+        );
+    }
+
+    /// Issue #121, which ADR-0002 turns from untidiness into a rule: derived person
+    /// data must be destroyed with its source, not merely hidden from queries, or
+    /// "delete the note" is not an honest answer to erasing someone.
+    #[test]
+    fn purging_a_note_takes_its_derived_chunks_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("t.sqlite")).unwrap();
+        let doomed = create_note(&conn, "en", "meeting", "").unwrap().id;
+        let keeper = create_note(&conn, "en", "meeting", "").unwrap().id;
+        reindex_note(&conn, &doomed, "", "Hege: something private", "").unwrap();
+        reindex_note(&conn, &keeper, "", "Michael: something else", "").unwrap();
+
+        let count = |note_id: &str| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM note_chunks WHERE note_id = ?1",
+                params![note_id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let fts_count = |note_id: &str| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM note_chunks_fts WHERE note_id = ?1",
+                params![note_id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert!(count(&doomed) > 0 && fts_count(&doomed) > 0, "indexed to begin with");
+
+        purge_note(&conn, &doomed).unwrap();
+
+        assert_eq!(count(&doomed), 0, "purge must clear the chunk rows, not orphan them");
+        assert_eq!(fts_count(&doomed), 0, "and the FTS rows with them");
+        assert!(count(&keeper) > 0, "another note's chunks are untouched");
+    }
+
+    /// Soft delete is the opposite case and must NOT clear anything — a Trash
+    /// restore has to bring the note back searchable, and the `deleted_at IS NULL`
+    /// join already keeps it out of results meanwhile.
+    #[test]
+    fn soft_deleting_a_note_keeps_its_chunks_for_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("t.sqlite")).unwrap();
+        let id = create_note(&conn, "en", "meeting", "").unwrap().id;
+        reindex_note(&conn, &id, "", "Hege: still here", "").unwrap();
+
+        delete_note(&conn, &id).unwrap();
+
+        let remaining: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM note_chunks WHERE note_id = ?1",
+                params![&id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(remaining > 0, "soft delete keeps the index so restore is lossless");
+    }
+
+    /// Seeds two notes whose speakers deliberately overlap by prefix — the case
+    /// that decides whether the filter is exact or quietly merges two people.
+    fn seed_speaker_notes(conn: &Connection) -> (String, String) {
+        let a = create_note(conn, "en", "meeting", "").unwrap().id;
+        update_note(
+            conn,
+            &a,
+            &NotePatch { title: Some("K2 kickoff".into()), ..Default::default() },
+        )
+        .unwrap();
+        reindex_note(
+            conn,
+            &a,
+            "",
+            "Michael: we should scope the pilot\nHege: not without the security review",
+            "",
+        )
+        .unwrap();
+
+        let b = create_note(conn, "en", "meeting", "").unwrap().id;
+        update_note(
+            conn,
+            &b,
+            &NotePatch { title: Some("Berg sync".into()), ..Default::default() },
+        )
+        .unwrap();
+        reindex_note(conn, &b, "", "Michael Berg: the pilot looks fine to me", "").unwrap();
+        (a, b)
+    }
+
+    #[test]
+    fn the_speaker_filter_is_exact_and_never_merges_two_people() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("t.sqlite")).unwrap();
+        let (a, b) = seed_speaker_notes(&conn);
+
+        // "Michael" must not reach "Michael Berg" — the wrong answer here is a
+        // confident one, which is the whole reason matching is exact (#104).
+        let only_michael = NoteFilter { speaker: Some("Michael"), ..Default::default() };
+        let notes = list_notes_filtered(&conn, only_michael, "", 50).unwrap();
+        let ids: Vec<&str> = notes.iter().map(|n| n.id.as_str()).collect();
+        assert!(ids.contains(&a.as_str()), "Michael spoke in the kickoff");
+        assert!(!ids.contains(&b.as_str()), "Michael must NOT match Michael Berg");
+
+        // And the longer label finds only its own note.
+        let berg = NoteFilter { speaker: Some("Michael Berg"), ..Default::default() };
+        let berg_ids: Vec<String> =
+            list_notes_filtered(&conn, berg, "", 50).unwrap().into_iter().map(|n| n.id).collect();
+        assert_eq!(berg_ids, vec![b.clone()]);
+
+        // Case-insensitive, so a model echoing a name in different case still hits.
+        let lower = NoteFilter { speaker: Some("hege"), ..Default::default() };
+        assert_eq!(list_notes_filtered(&conn, lower, "", 50).unwrap().len(), 1, "case folded");
+
+        // A name nobody has is an honest empty, not a widened search.
+        let absent = NoteFilter { speaker: Some("Nobody"), ..Default::default() };
+        assert!(list_notes_filtered(&conn, absent, "", 50).unwrap().is_empty());
+    }
+
+    #[test]
+    fn listing_rows_carry_who_spoke_so_the_model_can_only_name_real_speakers() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("t.sqlite")).unwrap();
+        let (a, _) = seed_speaker_notes(&conn);
+
+        let notes = list_notes_filtered(&conn, NoteFilter::default(), "", 50).unwrap();
+        let kickoff = notes.iter().find(|n| n.id == a).unwrap();
+        assert_eq!(
+            kickoff.speakers,
+            vec!["Michael".to_string(), "Hege".to_string()],
+            "a listing row names its speakers, since NoteMeta excludes the transcript"
+        );
+    }
+
+    /// The filter is CHUNK-level, and that has a precise meaning worth pinning
+    /// because it is easy to over-read: a hit means *"they spoke in this passage"*,
+    /// NOT *"they said this"*. A chunk holds several turns, so a chunk attributed to
+    /// Hege can still contain Michael's words — which is exactly why labels stay
+    /// inline in the text, so the model reads who said what rather than trusting the
+    /// filter to have separated it. Right for "what did Hege commit to", wrong for
+    /// counting who talked most (#104's own Risks note).
+    #[test]
+    fn the_speaker_filter_narrows_to_passages_not_to_sentences() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("t.sqlite")).unwrap();
+        let id = create_note(&conn, "en", "meeting", "").unwrap().id;
+
+        // One turn long enough to fill chunks on its own, so Michael's speech and
+        // Hege's land in DIFFERENT chunks and chunk-level narrowing is observable.
+        let long_michael = format!("Michael: {} pilot", "padding words ".repeat(400));
+        let transcript = format!("{long_michael}\nHege: not without the security review");
+        reindex_note(&conn, &id, "", &transcript, "").unwrap();
+
+        let chunk_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM note_chunks WHERE note_id = ?1 AND source = 'transcript'",
+                params![&id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(chunk_count > 1, "precondition: the turns must not share a chunk");
+
+        // "pilot" sits in Michael's speech. Filtering to Hege finds nothing, because
+        // the passage she spoke in doesn't contain it.
+        let hege = NoteFilter { speaker: Some("Hege"), ..Default::default() };
+        let hits = hybrid_search_chunks(&conn, "pilot", None, "", hege, "", 10).unwrap().hits;
+        assert!(hits.is_empty(), "Hege's passages do not mention the pilot: {hits:?}");
+
+        // Same query, no filter: found. So the emptiness above is the filter working
+        // rather than the query failing.
+        let unfiltered =
+            hybrid_search_chunks(&conn, "pilot", None, "", NoteFilter::default(), "", 10)
+                .unwrap()
+                .hits;
+        assert!(!unfiltered.is_empty(), "the query itself is sound");
+
+        // And filtering to Michael does find it.
+        let michael = NoteFilter { speaker: Some("Michael"), ..Default::default() };
+        let his = hybrid_search_chunks(&conn, "pilot", None, "", michael, "", 10).unwrap().hits;
+        assert!(!his.is_empty(), "Michael did say it");
+    }
+
+    /// The other half of the same boundary, stated as a fact rather than a hope: a
+    /// chunk returned for one speaker may carry another's words. If this ever starts
+    /// failing, the filter has silently become sentence-level and the header/citation
+    /// copy that says "passages" needs revisiting.
+    #[test]
+    fn a_chunk_attributed_to_one_speaker_may_still_contain_anothers_words() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("t.sqlite")).unwrap();
+        let id = create_note(&conn, "en", "meeting", "").unwrap().id;
+        reindex_note(
+            &conn,
+            &id,
+            "",
+            "Michael: we should scope the pilot\nHege: not without the security review",
+            "",
+        )
+        .unwrap();
+
+        let hege = NoteFilter { speaker: Some("Hege"), ..Default::default() };
+        let hits = hybrid_search_chunks(&conn, "pilot", None, "", hege, "", 10).unwrap().hits;
+        assert_eq!(hits.len(), 1, "short turns share a chunk, and Hege spoke in it");
+        assert!(
+            hits[0].text.contains("Michael: we should scope the pilot"),
+            "the excerpt carries Michael's label inline, so the model can attribute it"
+        );
+    }
+
+    #[test]
+    fn an_unmatched_speaker_can_be_answered_with_the_names_that_do_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("t.sqlite")).unwrap();
+        seed_speaker_notes(&conn);
+
+        // #106's doctrine: a miss that reports the available names lets the model
+        // self-correct, where a bare empty result invites it to report absence.
+        let present = speakers_in_scope(&conn, NoteFilter::default(), "").unwrap();
+        assert!(present.contains(&"Michael".to_string()));
+        assert!(present.contains(&"Hege".to_string()));
+        assert!(present.contains(&"Michael Berg".to_string()));
+        assert_eq!(present.len(), 3, "distinct, no repeats: {present:?}");
+    }
+
+    #[test]
+    fn speakers_encoding_isolates_one_label_from_another() {
+        assert_eq!(encode_speakers(&[]), "", "no speakers is empty, not a bare delimiter");
+        assert_eq!(encode_speakers(&["Michael".into()]), "|Michael|");
+        assert_eq!(encode_speakers(&["Michael".into(), "Hege".into()]), "|Michael|Hege|");
+
+        // The property the whole filter rests on: a wrapped exact label cannot be a
+        // substring of a DIFFERENT wrapped label, so "Michael" never matches
+        // "Michael Berg" and two people stay two people (#104).
+        let berg = encode_speakers(&["Michael Berg".into()]);
+        assert!(!berg.contains("|Michael|"), "{berg} must not contain the shorter label");
+        assert!(encode_speakers(&["Michael".into()]).contains("|Michael|"));
+
+        // A `|` in a label would forge a boundary, so it is normalised away here.
+        let odd = encode_speakers(&["A|B".into()]);
+        assert_eq!(decode_speakers(&odd), vec!["A B".to_string()], "pipe normalised to a space");
+
+        assert!(decode_speakers("").is_empty());
+        assert_eq!(decode_speakers("|Michael|Hege|"), vec!["Michael".to_string(), "Hege".to_string()]);
+        assert_eq!(decode_speakers("Michael"), vec!["Michael".to_string()], "tolerates unwrapped");
+    }
+
+    #[test]
+    fn reindex_note_records_speakers_on_chunks_and_on_the_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("t.sqlite")).unwrap();
+        let id = create_note(&conn, "en", "meeting", "").unwrap().id;
+        let transcript = "Michael: shall we start\nHege: yes\nMichael: good";
+
+        reindex_note(&conn, &id, "some body", transcript, "a summary").unwrap();
+
+        // Note level: the union of everyone who spoke, first-encounter order.
+        let note_speakers: String = conn
+            .query_row("SELECT speakers FROM notes WHERE id = ?1", params![&id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(decode_speakers(&note_speakers), vec!["Michael".to_string(), "Hege".to_string()]);
+
+        // Chunk level: only the transcript chunk claims speakers.
+        let mut stmt = conn
+            .prepare("SELECT source, speakers FROM note_chunks WHERE note_id = ?1 ORDER BY seq")
+            .unwrap();
+        let rows: Vec<(String, String)> = stmt
+            .query_map(params![&id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        for (source, speakers) in &rows {
+            if source == "transcript" {
+                assert!(!speakers.is_empty(), "a transcript chunk must be attributed");
+            } else {
+                assert!(speakers.is_empty(), "{source} must claim no speakers");
+            }
+        }
+    }
+
+    #[test]
+    fn reindex_note_is_the_only_writer_so_a_rename_cannot_drift() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("t.sqlite")).unwrap();
+        let id = create_note(&conn, "en", "meeting", "").unwrap().id;
+
+        reindex_note(&conn, &id, "", "Speaker 1: hello", "").unwrap();
+        let before: String = conn
+            .query_row("SELECT speakers FROM notes WHERE id = ?1", params![&id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(decode_speakers(&before), vec!["Speaker 1".to_string()]);
+
+        // The user renames the speaker, which rewrites the transcript text. The
+        // derived columns follow on the next reindex — they cannot disagree with
+        // what the user reads, because the text is their only source.
+        reindex_note(&conn, &id, "", "Hege Tronshaugen: hello", "").unwrap();
+        let after: String = conn
+            .query_row("SELECT speakers FROM notes WHERE id = ?1", params![&id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(decode_speakers(&after), vec!["Hege Tronshaugen".to_string()]);
+
+        // Reindexing must NOT mark the note dirty: it runs on every content settle,
+        // and bumping updated_at would re-sync the note forever over derived data.
+        let touched: i64 = conn
+            .query_row("SELECT updated_at FROM notes WHERE id = ?1", params![&id], |r| r.get(0))
+            .unwrap();
+        reindex_note(&conn, &id, "", "Hege Tronshaugen: hello", "").unwrap();
+        let after_reindex: i64 = conn
+            .query_row("SELECT updated_at FROM notes WHERE id = ?1", params![&id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(touched, after_reindex, "reindex must not bump updated_at");
+    }
+
     #[test]
     fn note_chunk_texts_tags_each_source() {
         let chunks = note_chunk_texts("body words", "transcript words", "summary words");
-        let sources: Vec<&str> = chunks.iter().map(|(s, _)| *s).collect();
+        let sources: Vec<&str> = chunks.iter().map(|c| c.source).collect();
         assert_eq!(sources, vec!["body", "transcript", "summary"]);
         // Blank sources contribute nothing.
         let sparse = note_chunk_texts("only body", "", "");
         assert_eq!(sparse.len(), 1);
-        assert_eq!(sparse[0].0, "body");
+        assert_eq!(sparse[0].source, "body");
     }
 
     #[test]
@@ -3311,7 +4219,18 @@ mod tests {
             source: "transcript".into(),
             text: format!("{note_id}#{rank}"),
             rank,
+            seq: 0,
         }
+    }
+
+    /// The selection half of [`diversify`], for the tests that predate it also
+    /// reporting per-note candidate counts.
+    fn diversify_hits(
+        ranked: Vec<ChunkHit>,
+        limit: usize,
+        per_note_cap: usize,
+    ) -> Vec<ChunkHit> {
+        diversify(ranked, limit, per_note_cap).0
     }
 
     fn note_ids_of(hits: &[ChunkHit]) -> Vec<&str> {
@@ -3324,7 +4243,7 @@ mod tests {
         // and C are never seen.
         let ranked =
             vec![hit("a", 9.0), hit("a", 8.0), hit("a", 7.0), hit("a", 6.0), hit("b", 5.0), hit("c", 4.0)];
-        assert_eq!(note_ids_of(&diversify(ranked, 4, 2)), vec!["a", "a", "b", "c"]);
+        assert_eq!(note_ids_of(&diversify_hits(ranked, 4, 2)), vec!["a", "a", "b", "c"]);
     }
 
     #[test]
@@ -3333,7 +4252,7 @@ mod tests {
         // (coverage first), it does not discard.
         let ranked =
             vec![hit("a", 9.0), hit("a", 8.0), hit("a", 7.0), hit("a", 6.0), hit("b", 5.0), hit("c", 4.0)];
-        assert_eq!(note_ids_of(&diversify(ranked, 6, 2)), vec!["a", "a", "b", "c", "a", "a"]);
+        assert_eq!(note_ids_of(&diversify_hits(ranked, 6, 2)), vec!["a", "a", "b", "c", "a", "a"]);
     }
 
     /// The backfill is what stops the per-note cap costing recall: a note-scoped
@@ -3341,15 +4260,15 @@ mod tests {
     #[test]
     fn diversify_keeps_full_recall_when_only_one_note_matches() {
         let ranked = vec![hit("a", 9.0), hit("a", 8.0), hit("a", 7.0)];
-        assert_eq!(diversify(ranked.clone(), 6, 2).len(), 3);
-        assert_eq!(diversify(ranked, 2, 2).len(), 2);
+        assert_eq!(diversify_hits(ranked.clone(), 6, 2).len(), 3);
+        assert_eq!(diversify_hits(ranked, 2, 2).len(), 2);
     }
 
     #[test]
     fn diversify_never_exceeds_the_limit() {
         let ranked: Vec<ChunkHit> =
             (0..30).map(|i| hit(&format!("n{}", i % 3), 30.0 - f64::from(i))).collect();
-        assert_eq!(diversify(ranked, 8, 2).len(), 8);
+        assert_eq!(diversify_hits(ranked, 8, 2).len(), 8);
     }
 
     #[test]
