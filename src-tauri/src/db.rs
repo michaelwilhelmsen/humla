@@ -294,17 +294,25 @@ pub fn open(path: &Path) -> Result<Connection> {
     let _ = conn.execute("ALTER TABLE notes ADD COLUMN speakers TEXT NOT NULL DEFAULT ''", []);
     let _ =
         conn.execute("ALTER TABLE note_chunks ADD COLUMN speakers TEXT NOT NULL DEFAULT ''", []);
-    // Which chunker produced this row (issue #122). The DEFAULT is deliberately 1,
-    // not the current version: every row that already exists was written by the
-    // pre-#104 blank-line chunker, so the default IS the correct historical answer and
-    // the migration needs no backfill pass.
+    // Which chunker produced this row (issue #122). This is the sentinel #104 lacked:
+    // it could not tell an old-shaped chunk from a current one, which is why the repair
+    // had to be a blunt "rebuild everything" with no way to say whether it was needed.
+    // Staleness is now detectable per note — for this change and the next one, which is
+    // the part that pays twice.
     //
-    // This is the sentinel #104 lacked. It could not tell an old-shaped chunk from a
-    // current one, which is why the repair had to be a blunt "rebuild everything" with
-    // no way to say whether it was needed. Now staleness is exactly detectable — for
-    // this change and for the next one, which is the part that pays twice.
+    // DEFAULT 1 is right for almost every existing row and KNOWINGLY WRONG for a few.
+    // Rows written before #104 really are version 1, the overwhelming majority. But
+    // v0.40.0 shipped #104's chunker, so an install that ran it wrote v2-shaped rows
+    // into a table with no version column — and those now read as 1, i.e. stale.
+    //
+    // Not cleanly fixable: `speakers` landed in the same change, so an empty `speakers`
+    // cannot distinguish "pre-#104" from "#104 with nobody labelled". The consequence is
+    // bounded and self-correcting — the count over-reports for one release window, and a
+    // rebuild re-embeds those notes once, needlessly but harmlessly. Accepted rather
+    // than papered over, because the alternative is a migration heuristic that would be
+    // wrong in a way nobody could later audit.
     let _ = conn.execute(
-        &format!("ALTER TABLE note_chunks ADD COLUMN chunker_version INTEGER NOT NULL DEFAULT 1"),
+        "ALTER TABLE note_chunks ADD COLUMN chunker_version INTEGER NOT NULL DEFAULT 1",
         [],
     );
     // Workspace (Teams) chat (issue #50). A workspace conversation is

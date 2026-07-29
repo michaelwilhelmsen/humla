@@ -180,16 +180,21 @@ function RebuildIndexRow() {
   // doesn't flash a "needs rebuilding" claim it hasn't verified.
   const [stale, setStale] = useState<number | null>(null);
 
+  // Re-read on mount and after a rebuild FINISHES — keyed on `state.kind` rather than
+  // the whole state object, which would also refetch on the transition into "running"
+  // and spend an IPC call on a count that cannot have changed yet.
   useEffect(() => {
     let live = true;
     ipc
       .chatStaleNoteCount()
       .then((n) => live && setStale(n))
+      // A failed count renders as quiet, never as "0 notes are stale" (a claim we have
+      // not verified) or as a rebuild prompt (an action on unknown state).
       .catch(() => live && setStale(0));
     return () => {
       live = false;
     };
-  }, [state]);
+  }, [state.kind]);
 
   async function rebuild() {
     setState({ kind: "running" });
