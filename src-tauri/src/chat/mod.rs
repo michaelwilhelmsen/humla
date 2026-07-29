@@ -1105,7 +1105,7 @@ mod tests {
             db::latest_conversation(&conn, CHAT_TENANT_PERSONAL, CHAT_SCOPE_NOTE, "note-1").unwrap().unwrap();
         assert_eq!(latest.id, a.id, "the just-updated session is the active one");
         assert_eq!(
-            db::list_conversations(&conn, CHAT_TENANT_PERSONAL, CHAT_SCOPE_NOTE, "note-1", None).unwrap().len(),
+            db::list_conversations(&conn, CHAT_TENANT_PERSONAL, CHAT_SCOPE_NOTE, "note-1", None, db::ListFilter::All).unwrap().len(),
             2
         );
     }

@@ -40,7 +40,13 @@ import {
   groundingLikelyTruncated,
   conversationTitle,
 } from "../lib/chatSessions";
-import { targetNoteId, targetKey, targetDefaultScope, type ChatTarget } from "../lib/chatTarget";
+import {
+  targetNoteId,
+  targetKey,
+  targetDefaultScope,
+  targetResumesOnOpen,
+  type ChatTarget,
+} from "../lib/chatTarget";
 import { opensPromptPicker, promptsFor, type ChatPrompt } from "../lib/chatPrompts";
 import { RECOMMENDED_OLLAMA_MODEL } from "../lib/localModels";
 import { CommandSnippet } from "./CommandSnippet";
@@ -408,6 +414,18 @@ export function ChatPanel({
   // empty message list and its inherited breadth reflected in the Scope chip.
   const newChat = useCallback(async () => {
     const gen = beginSwitch();
+    // A drafting target creates nothing (#120): "+" is a local reset to the same
+    // empty state the pane already opens in, so it costs no IPC and leaves no row
+    // behind if the user changes their mind. Breadth inherits from what's on
+    // screen — the chip doesn't move, which matches the old inherit-on-create.
+    if (!targetResumesOnOpen(target)) {
+      setConversationId(null);
+      setMessages([]);
+      setInput("");
+      setBulkLoading(false);
+      inputRef.current?.focus();
+      return;
+    }
     try {
       const meta = await ipc.chatNewConversation(noteId);
       if (gen !== switchGenRef.current || !meta) return;
@@ -723,8 +741,19 @@ export function ChatPanel({
 
   // Persist a breadth change to the conversation (issue #58): update the chip
   // optimistically, then write it through so the next turn reads the new value.
+  //
+  // On a DRAFTING target with no conversation open the chip is the whole record
+  // (#120) — the write is skipped rather than lazily creating a row to hold it,
+  // and `send` carries the value in instead. That lazy row is what used to be
+  // hidden from the list yet still resolved to by the next send, so the pane could
+  // show one setting while the stored row applied another.
+  //
+  // A Note with no session still writes through, which lazily creates it: that
+  // pane RESUMES, so a breadth chosen before the first turn has to be stored
+  // somewhere it will be found again. Mirrors `resolve_for_write` in Rust.
   function selectBreadth(next: ChatScope) {
     setScope(next);
+    if (!conversationId && !targetResumesOnOpen(target)) return;
     void ipc.chatSetBreadth(noteId, conversationId, next).catch((e) => setError(String(e)));
   }
 
@@ -735,6 +764,10 @@ export function ChatPanel({
     const next = ownerFilter === "" ? (myUserId ?? "") : "";
     if (next === "" && ownerFilter === "") return;
     setOwnerFilter(next);
+    // Same as breadth: nothing to write to on a draft, and the pin especially must
+    // not be stored somewhere the chip can't see (#120/#103). A Note still writes
+    // through and lazily creates, as it did before.
+    if (!conversationId && !targetResumesOnOpen(target)) return;
     void ipc
       .chatSetOwnerFilter(noteId, conversationId, next === "" ? null : next)
       .catch((e) => setError(String(e)));
@@ -908,7 +941,18 @@ export function ChatPanel({
       // The pinned author's NAME rides the turn for the prompt's disclosure line
       // only — the id lives on the conversation row and is what filters, so an
       // unresolvable name costs wording and nothing else (#103).
-      const result = await ipc.chatSend(noteId, conversationId, text, pinnedAuthorName);
+      // A drafting pane has persisted nothing, so its chips are the only record of
+      // the breadth and pin the user chose — they ride along and are applied to the
+      // row this turn creates (#120). With a conversation already open they're
+      // omitted: the row is the source of truth and re-sending them could only
+      // disagree with it.
+      const result = await ipc.chatSend(
+        noteId,
+        conversationId,
+        text,
+        pinnedAuthorName,
+        conversationId ? null : { breadth: scope, ownerFilter: ownerFilter || null },
+      );
       if (gen !== switchGenRef.current) return;
       setConversationId(result.conversationId);
       const h = await ipc.chatHistory(noteId, result.conversationId);

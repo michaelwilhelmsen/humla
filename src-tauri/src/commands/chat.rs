@@ -579,21 +579,131 @@ fn resolve_existing(
         .map_err(|e| e.to_string())
 }
 
-/// Resolve the active session, lazily creating the target's FIRST session when
-/// none exists (breadth defaults to the target's own). Used by send + set-breadth
-/// so the first turn / first breadth write materialises the session on demand.
+/// Whether opening this target's pane RESUMES its most-recent conversation, or
+/// starts an unsaved draft (issue #120).
+///
+/// A library-wide pane drafts. `/chat` is a front door, and asking a new question
+/// is overwhelmingly what it is for — reopening a finished thread there hid the
+/// prompt cards, named the bar after an old question, and made "ask something"
+/// take a second deliberate action. Returning to a specific past thread is the
+/// rarer, more intentional act, and the sidebar list already exists for it.
+///
+/// A Note's pane resumes, deliberately diverging: a note is an anchor, and coming
+/// back to it to continue the same line of thinking is a plausible default in a
+/// way it isn't on a library-wide route. Recorded here, in one predicate, so the
+/// divergence stays a decision rather than becoming an accident — every caller
+/// that cares reads it from this function.
+fn resumes_on_open(target: &ChatTarget) -> bool {
+    match target {
+        ChatTarget::Note(_) => true,
+        ChatTarget::Global => false,
+    }
+}
+
+/// The conversation-list filter implied by the resume rule (issue #120).
+///
+/// A target that drafts can never return to an empty thread, so an empty row in
+/// its list is residue — from an older client, or a breadth chosen then abandoned
+/// — and hiding it is right. A target that resumes has the opposite relationship
+/// to the same row: it IS the draft being resumed, so hiding it would hide what
+/// the pane is showing.
+fn list_filter_for(target: &ChatTarget) -> db::ListFilter {
+    if resumes_on_open(target) {
+        db::ListFilter::All
+    } else {
+        db::ListFilter::WithMessages
+    }
+}
+
+/// Resolve the session a READ command targets, honouring the resume rule (#120).
+///
+/// Shared by `chat_history`, `chat_get_breadth` and `chat_get_owner_filter` so all
+/// three agree about what a bare request means. An explicit id always wins — a
+/// thread picked from the sidebar must open — but a bare request on a drafting
+/// target resolves to nothing rather than to whatever was newest.
+fn resolve_for_read(
+    conn: &rusqlite::Connection,
+    tenant: &str,
+    target: &ChatTarget,
+    explicit: Option<&str>,
+) -> Result<Option<db::Conversation>, String> {
+    if explicit.is_none() && !resumes_on_open(target) {
+        return Ok(None);
+    }
+    resolve_existing(conn, tenant, target, explicit)
+}
+
+/// Resolve the session a SETTINGS write targets, or `None` when there is nothing
+/// to write to yet (issue #120).
+///
+/// A Note still lazily creates its first session, which is what #61 wanted: that
+/// pane resumes, so a breadth chosen before the first turn has to be stored
+/// somewhere it will be found again. A drafting target returns `None` instead —
+/// the pane holds the value, and `DraftSettings` carries it into the turn that
+/// makes the row.
+fn resolve_for_write(
+    conn: &rusqlite::Connection,
+    tenant: &str,
+    target: &ChatTarget,
+    explicit: Option<&str>,
+) -> Result<Option<db::Conversation>, String> {
+    if explicit.is_none() && !resumes_on_open(target) {
+        return Ok(None);
+    }
+    Ok(Some(resolve_or_create(conn, tenant, target, explicit, DraftSettings::default())?))
+}
+
+/// What a draft had chosen before it had a row to store it on (issue #120).
+///
+/// A library-wide pane holds its breadth and authorship pin locally until the
+/// first turn, so those values arrive with the send that materialises the row.
+/// This replaces the old lazy-create (#61, #103): a row that existed only to hold
+/// a pre-turn setting was invisible in the list yet still resolved to by the next
+/// send, so the pane could show "no pin" while the stored row narrowed the turn
+/// anyway — exactly the lie #103 set out to prevent. Now the row appears once,
+/// already carrying what the chips showed.
+#[derive(Debug, Default, Clone)]
+pub struct DraftSettings {
+    pub breadth: Option<String>,
+    pub owner_filter: Option<String>,
+}
+
+/// Resolve the active session, creating one when none applies.
+///
+/// Creation happens either because the target has no session yet, or — on a
+/// drafting target with no explicit id — because a bare send always starts its own
+/// conversation. That second case is load-bearing: resolving a draft's first turn
+/// to "most recent" would file the message into a thread the user believed they
+/// had left, which is worse than any list bug.
 fn resolve_or_create(
     conn: &rusqlite::Connection,
     tenant: &str,
     target: &ChatTarget,
     explicit: Option<&str>,
+    draft: DraftSettings,
 ) -> Result<db::Conversation, String> {
-    if let Some(c) = resolve_existing(conn, tenant, target, explicit)? {
-        return Ok(c);
+    if explicit.is_some() || resumes_on_open(target) {
+        if let Some(c) = resolve_existing(conn, tenant, target, explicit)? {
+            return Ok(c);
+        }
     }
-    let breadth = inherited_breadth(conn, tenant, target);
-    db::create_conversation(conn, tenant, target.scope(), target.scope_id(), &breadth)
-        .map_err(|e| e.to_string())
+    // A draft's own choice wins over inheritance; absent one, "+"-style
+    // inheritance is unchanged.
+    let breadth = draft.breadth.unwrap_or_else(|| inherited_breadth(conn, tenant, target));
+    let conv = db::create_conversation(conn, tenant, target.scope(), target.scope_id(), &breadth)
+        .map_err(|e| e.to_string())?;
+    match draft.owner_filter.as_deref() {
+        // Written as a second statement rather than a wider INSERT: the pin is
+        // rare, and `create_conversation` is on every path that makes a row.
+        Some(owner) if !owner.is_empty() => {
+            db::set_conversation_owner_filter(conn, &conv.id, Some(owner))
+                .map_err(|e| e.to_string())?;
+            db::get_conversation_by_id(conn, &conv.id)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "conversation vanished after insert".to_string())
+        }
+        _ => Ok(conv),
+    }
 }
 
 /// Resolve the "new session" for a target in the personal scope (issue #61),
@@ -649,6 +759,7 @@ pub async fn chat_list_conversations(
                 target.scope(),
                 target.scope_id(),
                 page,
+                list_filter_for(&target),
             )
             .map_err(|e| e.to_string())?;
             convs.iter().map(|c| conversation_meta(&conn, c)).collect()
@@ -849,8 +960,14 @@ pub fn chat_set_breadth(
     let state: State<AppState> = app.state();
     let conn = state.db.lock();
     let ctx = ChatContext::load(&conn);
-    let conversation =
-        resolve_or_create(&conn, ctx.tenant(), &target, conversation_id.as_deref())?;
+    // A draft has nowhere to store this yet, and must not grow a row to hold it
+    // (#120): the pane keeps the value and the first turn carries it in via
+    // `DraftSettings`. Writing here would create a row the list hides but the next
+    // send resolves to — the stale-setting trap this replaced.
+    let Some(conversation) = resolve_for_write(&conn, ctx.tenant(), &target, conversation_id.as_deref())?
+    else {
+        return Ok(());
+    };
     db::set_conversation_breadth(&conn, &conversation.id, &breadth).map_err(|e| e.to_string())
 }
 
@@ -883,8 +1000,13 @@ pub fn chat_set_owner_filter(
         // reject rather than store a pin nothing would honour.
         return Err("Filtering by author needs a workspace — in Personal every note is yours.".into());
     }
-    let conversation =
-        resolve_or_create(&conn, ctx.tenant(), &target, conversation_id.as_deref())?;
+    // Same as breadth: a draft carries its pin in the pane until the first turn
+    // creates the row (#120). Especially important here — an invisible row holding
+    // a pin is what let the chip read "off" while the turn narrowed anyway.
+    let Some(conversation) = resolve_for_write(&conn, ctx.tenant(), &target, conversation_id.as_deref())?
+    else {
+        return Ok(());
+    };
     db::set_conversation_owner_filter(&conn, &conversation.id, owner.as_deref())
         .map_err(|e| e.to_string())
 }
@@ -908,7 +1030,7 @@ pub fn chat_get_breadth(
     let conn = state.db.lock();
     let ctx = ChatContext::load(&conn);
     let Some(conversation) =
-        resolve_existing(&conn, ctx.tenant(), &target, conversation_id.as_deref())?
+        resolve_for_read(&conn, ctx.tenant(), &target, conversation_id.as_deref())?
     else {
         // No session yet → report the target's own default WITHOUT creating a row,
         // which is also what `inherited_breadth` would return here (its
@@ -937,7 +1059,7 @@ pub fn chat_get_owner_filter(
     let conn = state.db.lock();
     let ctx = ChatContext::load(&conn);
     Ok(
-        resolve_existing(&conn, ctx.tenant(), &target, conversation_id.as_deref())?
+        resolve_for_read(&conn, ctx.tenant(), &target, conversation_id.as_deref())?
             .map(|c| c.owner_filter)
             .unwrap_or_default(),
     )
@@ -1216,7 +1338,14 @@ pub async fn chat_send(
     // See `chat_send_cloud` — display name for a pinned authorship filter.
     // Ignored on the Personal path, which never pins one.
     owner_name: Option<String>,
+    // A drafting pane's breadth / authorship pin, chosen before any row existed
+    // (#120). Only read when this turn CREATES the conversation; an existing row
+    // is already the source of truth for both.
+    draft_breadth: Option<String>,
+    draft_owner_filter: Option<String>,
 ) -> Result<ChatSendResult, String> {
+    let draft =
+        DraftSettings { breadth: draft_breadth, owner_filter: draft_owner_filter };
     let target = ChatTarget::from_note_id(note_id)?;
     let state: State<AppState> = app.state();
     // Chat is pinned to the loaded context (issue #58): a loaded workspace →
@@ -1227,7 +1356,7 @@ pub async fn chat_send(
         ChatContext::load(&conn).workspace().is_some()
     };
     if in_workspace {
-        return chat_send_cloud(app, target, conversation_id, message, owner_name).await;
+        return chat_send_cloud(app, target, conversation_id, message, owner_name, draft).await;
     }
 
     // Keychain read out of band — not inside the DB lock. Chat reuses the
@@ -1245,7 +1374,7 @@ pub async fn chat_send(
         // active/most-recent one, lazily creating the target's first session on
         // the first send. Breadth is a persisted live filter within it.
         let conversation =
-            resolve_or_create(&conn, CHAT_TENANT_PERSONAL, &target, conversation_id.as_deref())?;
+            resolve_or_create(&conn, CHAT_TENANT_PERSONAL, &target, conversation_id.as_deref(), draft)?;
         // Set the personal session's title once, from its first user message
         // (issue #61). Guarded on an empty title so later turns never rewrite it.
         if resolved_title_is_unset(&conversation) {
@@ -1399,6 +1528,7 @@ async fn chat_send_cloud(
     // what actually filters — so it is passed per turn rather than cached in a
     // column that a rename would leave stale.
     owner_name: Option<String>,
+    draft: DraftSettings,
 ) -> Result<ChatSendResult, String> {
     let state: State<AppState> = app.state();
     let (workspace, folder_id, title, conversation, breadth, owner_filter) = {
@@ -1411,7 +1541,8 @@ async fn chat_send_cloud(
         // Resolve the target workspace-handle session (issue #61): an explicit
         // id, else the active/most-recent handle, lazily creating one (remote_id
         // filled from the server's response below) on the first turn.
-        let conversation = resolve_or_create(&conn, workspace, &target, conversation_id.as_deref())?;
+        let conversation =
+            resolve_or_create(&conn, workspace, &target, conversation_id.as_deref(), draft)?;
         // Breadth is read from the (workspace) conversation row and self-healed
         // against the Note's folder, exactly like the Personal path (issue #58).
         let breadth =
@@ -1652,7 +1783,7 @@ pub async fn chat_history(
         // conversations). No handle → nothing persisted yet, so empty + None.
         let handle = {
             let conn = state.db.lock();
-            resolve_existing(&conn, workspace, &target, conversation_id.as_deref())?
+            resolve_for_read(&conn, workspace, &target, conversation_id.as_deref())?
         };
         let Some(handle) = handle else {
             return Ok(ChatHistoryResult { conversation_id: None, messages: Vec::new() });
@@ -1669,7 +1800,7 @@ pub async fn chat_history(
 
     let conn = state.db.lock();
     let Some(conversation) =
-        resolve_existing(&conn, CHAT_TENANT_PERSONAL, &target, conversation_id.as_deref())?
+        resolve_for_read(&conn, CHAT_TENANT_PERSONAL, &target, conversation_id.as_deref())?
     else {
         return Ok(ChatHistoryResult { conversation_id: None, messages: Vec::new() });
     };
@@ -1925,9 +2056,20 @@ async fn list_conversations_cloud(
     let items = val.get("conversations").and_then(|c| c.as_array()).cloned().unwrap_or_default();
     let mut metas: Vec<ConversationMeta> = Vec::with_capacity(items.len());
     let mut server_remote_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let hide_empty = list_filter_for(target) == db::ListFilter::WithMessages;
     for item in &items {
         if let Some(rid) = item.get("id").and_then(|v| v.as_str()) {
             server_remote_ids.insert(rid.to_string());
+        }
+        // A drafting target can never reopen an empty thread, so an empty row can
+        // only be residue — from an older client, or a thread abandoned before its
+        // first turn. Emptiness is read from the SERVER's count, deliberately: a
+        // workspace's messages live in PocketBase and are never written to the local
+        // table, so the local count reads 0 for every workspace thread and would
+        // hide the entire list. Still recorded in `server_remote_ids` above, so a
+        // hidden row doesn't get resurrected by the legacy union below.
+        if hide_empty && item.get("message_count").and_then(|v| v.as_i64()).unwrap_or(0) == 0 {
+            continue;
         }
         metas.push(cloud_conversation_meta(state, workspace, target, item)?);
     }
@@ -1938,7 +2080,14 @@ async fn list_conversations_cloud(
     let legacy: Vec<(String, String, String, i64, String)> = {
         let conn = state.db.lock();
         let local_handles =
-            db::list_conversations(&conn, workspace, target.scope(), target.scope_id(), None)
+            db::list_conversations(
+                &conn,
+                workspace,
+                target.scope(),
+                target.scope_id(),
+                None,
+                list_filter_for(target),
+            )
                 .map_err(|e| e.to_string())?;
         unlisted_legacy_handles(&server_remote_ids, &local_handles)
             .into_iter()
@@ -2219,7 +2368,7 @@ mod tests {
         let n1 = new_personal_conversation(&conn, &note_target).unwrap();
         assert_ne!(n1.id, g1.id);
         let listed = |t: &ChatTarget| {
-            db::list_conversations(&conn, CHAT_TENANT_PERSONAL, t.scope(), t.scope_id(), None)
+            db::list_conversations(&conn, CHAT_TENANT_PERSONAL, t.scope(), t.scope_id(), None, db::ListFilter::All)
                 .unwrap()
                 .into_iter()
                 .map(|c| c.id)
@@ -2345,7 +2494,7 @@ mod tests {
         let again = new_personal_conversation(&conn, &ChatTarget::Note("n1".into())).unwrap();
         assert_eq!(again.id, first.id, "an empty most-recent session is reused, not duplicated");
         assert_eq!(
-            db::list_conversations(&conn, CHAT_TENANT_PERSONAL, CHAT_SCOPE_NOTE, "n1", None).unwrap().len(),
+            db::list_conversations(&conn, CHAT_TENANT_PERSONAL, CHAT_SCOPE_NOTE, "n1", None, db::ListFilter::All).unwrap().len(),
             1,
             "no empty duplicate session was created"
         );
@@ -2365,6 +2514,134 @@ mod tests {
         assert_eq!(inherited_breadth(&conn, "wsA", &ChatTarget::Note("n1".into())), "all", "inherits the workspace session's breadth");
         // A different tenant's breadth doesn't leak across.
         assert_eq!(inherited_breadth(&conn, CHAT_TENANT_PERSONAL, &ChatTarget::Note("n1".into())), "note");
+    }
+
+    #[test]
+    /// A library-wide pane opens on an unsaved draft, a Note's pane resumes that
+    /// Note's most-recent thread (#120, the divergence chosen deliberately).
+    ///
+    /// `resolve_for_read` is what the three no-id read commands share, so this one
+    /// test covers history, breadth and the authorship pin at once.
+    #[test]
+    fn a_library_wide_pane_opens_on_a_draft_while_a_note_resumes_its_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = db::open(&dir.path().join("draft.sqlite")).unwrap();
+
+        let global = ChatTarget::Global;
+        let note = ChatTarget::Note("n1".into());
+        let g = db::create_conversation(
+            &conn,
+            CHAT_TENANT_PERSONAL,
+            global.scope(),
+            global.scope_id(),
+            "all",
+        )
+        .unwrap();
+        db::insert_chat_message(&conn, &g.id, "user", "[]").unwrap();
+        let n = db::create_conversation(
+            &conn,
+            CHAT_TENANT_PERSONAL,
+            note.scope(),
+            note.scope_id(),
+            "note",
+        )
+        .unwrap();
+        db::insert_chat_message(&conn, &n.id, "user", "[]").unwrap();
+
+        // No id + library-wide → nothing resolved, so the pane starts empty even
+        // though a finished thread exists. This is the bug #120 was filed for.
+        assert!(
+            resolve_for_read(&conn, CHAT_TENANT_PERSONAL, &global, None).unwrap().is_none(),
+            "a library-wide pane must not reopen the last thread"
+        );
+        // No id + a Note → still resumes, unchanged.
+        assert_eq!(
+            resolve_for_read(&conn, CHAT_TENANT_PERSONAL, &note, None).unwrap().map(|c| c.id),
+            Some(n.id),
+            "a Note's pane continues its own thread"
+        );
+        // An EXPLICIT id is honoured for both — picking a thread from the sidebar
+        // must still open it, or the list would be unusable.
+        assert_eq!(
+            resolve_for_read(&conn, CHAT_TENANT_PERSONAL, &global, Some(&g.id))
+                .unwrap()
+                .map(|c| c.id),
+            Some(g.id.clone()),
+            "an explicitly chosen library-wide thread still opens"
+        );
+    }
+
+    /// A library-wide draft's first turn starts a NEW conversation instead of
+    /// appending to the last one (#120).
+    ///
+    /// The sharpest failure this prevents: with the pane showing an empty draft, a
+    /// send that resolved to "most recent" would file the message into a finished
+    /// thread the user believed they had left.
+    #[test]
+    fn a_library_wide_first_turn_never_appends_to_the_previous_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = db::open(&dir.path().join("draftsend.sqlite")).unwrap();
+        let global = ChatTarget::Global;
+
+        let previous = db::create_conversation(
+            &conn,
+            CHAT_TENANT_PERSONAL,
+            global.scope(),
+            global.scope_id(),
+            "all",
+        )
+        .unwrap();
+        db::insert_chat_message(&conn, &previous.id, "user", "[]").unwrap();
+
+        let fresh =
+            resolve_or_create(&conn, CHAT_TENANT_PERSONAL, &global, None, DraftSettings::default())
+                .unwrap();
+        assert_ne!(fresh.id, previous.id, "a draft's turn opens its own conversation");
+
+        // A Note's bare send still continues its thread — the resume rule is the
+        // one thing deciding both, so they can't drift apart.
+        let note = ChatTarget::Note("n1".into());
+        let existing =
+            db::create_conversation(&conn, CHAT_TENANT_PERSONAL, note.scope(), note.scope_id(), "note")
+                .unwrap();
+        db::insert_chat_message(&conn, &existing.id, "user", "[]").unwrap();
+        let resolved =
+            resolve_or_create(&conn, CHAT_TENANT_PERSONAL, &note, None, DraftSettings::default())
+                .unwrap();
+        assert_eq!(resolved.id, existing.id, "a Note's bare send continues its thread");
+    }
+
+    /// Settings chosen on a draft — before any row exists — are applied to the
+    /// conversation its first turn creates (#120, preserving #61 and #103).
+    ///
+    /// This is what replaces the old lazy-create: the row appears once, already
+    /// carrying what the chips showed, so there is never a moment where a stored
+    /// row and the visible chip disagree.
+    #[test]
+    fn a_drafts_breadth_and_pin_reach_the_conversation_its_turn_creates() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = db::open(&dir.path().join("draftsettings.sqlite")).unwrap();
+        let global = ChatTarget::Global;
+
+        let created = resolve_or_create(
+            &conn,
+            "wsA",
+            &global,
+            None,
+            DraftSettings { breadth: Some("all".into()), owner_filter: Some("u7".into()) },
+        )
+        .unwrap();
+        assert_eq!(created.breadth, "all");
+        assert_eq!(
+            created.owner_filter, "u7",
+            "a pin set before the first turn binds that turn — the #103 guarantee"
+        );
+
+        // Absent settings fall back to inheritance, so "+" keeps behaving as it did.
+        let plain =
+            resolve_or_create(&conn, "wsB", &global, None, DraftSettings::default()).unwrap();
+        assert_eq!(plain.breadth, "all");
+        assert_eq!(plain.owner_filter, "", "no pin unless one was chosen");
     }
 
     #[test]

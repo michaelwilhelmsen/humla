@@ -1097,19 +1097,44 @@ pub struct Page {
     pub offset: i64,
 }
 
+/// Which conversations a listing should include (issue #120).
+///
+/// `WithMessages` hides threads that hold nothing. It exists because a
+/// library-wide pane now opens on an unsaved draft, so an empty row on `/chat`
+/// can only be residue — one left by an older client, or by a breadth chosen and
+/// then abandoned — never something the user can return to. In a Note the
+/// opposite is true (an empty thread is exactly the draft the tab resumes), which
+/// is why this is a parameter and not the default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListFilter {
+    All,
+    WithMessages,
+}
+
 pub fn list_conversations(
     conn: &Connection,
     tenant: &str,
     scope: &str,
     scope_id: &str,
     page: Option<Page>,
+    filter: ListFilter,
 ) -> Result<Vec<Conversation>> {
     // SQLite reads a negative LIMIT as "no limit", so an absent page needs no
     // second query shape — one prepared statement serves both callers.
     let (limit, offset) = page.map_or((-1, 0), |p| (p.limit, p.offset));
+    // Filtered in SQL, deliberately, not by the caller after the fact: the sidebar
+    // reads a short page as the end of the list, so dropping rows from an
+    // already-windowed page would let one hidden draft masquerade as the end and
+    // truncate everything below it.
+    let having = match filter {
+        ListFilter::All => "",
+        ListFilter::WithMessages => {
+            " AND EXISTS (SELECT 1 FROM messages WHERE messages.conversation_id = conversations.id)"
+        }
+    };
     let mut stmt = conn.prepare_cached(&format!(
         "SELECT {CONVERSATION_COLS} FROM conversations
-         WHERE tenant = ?1 AND scope = ?2 AND scope_id = ?3
+         WHERE tenant = ?1 AND scope = ?2 AND scope_id = ?3{having}
          ORDER BY updated_at DESC, created_at DESC, id DESC
          LIMIT ?4 OFFSET ?5",
     ))?;
@@ -2292,6 +2317,76 @@ mod tests {
         assert!(personal_reload.remote_id.is_none());
     }
 
+    /// `ListFilter::WithMessages` hides conversations that hold no messages, and
+    /// the paging stays honest while it does (#120).
+    ///
+    /// The paging half is the part worth a test: `/chat`'s sidebar treats a short
+    /// page as "you have reached the end", so filtering AFTER the window would let
+    /// one hidden draft in a full page look like the end of the list and silently
+    /// truncate everything below it. Filtering in SQL is what keeps a page full.
+    #[test]
+    fn empty_conversations_can_be_excluded_without_breaking_paging() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("emptyfilter.sqlite")).unwrap();
+
+        // Six global conversations, every other one left empty, stamped so the
+        // intended order is unambiguous.
+        let mut with_messages = Vec::new();
+        for i in 0..6 {
+            let c = create_conversation(
+                &conn,
+                CHAT_TENANT_PERSONAL,
+                CHAT_SCOPE_GLOBAL,
+                CHAT_GLOBAL_SCOPE_ID,
+                "all",
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE conversations SET updated_at = ?1 WHERE id = ?2",
+                params![1_000 + i, c.id],
+            )
+            .unwrap();
+            if i % 2 == 0 {
+                insert_chat_message(&conn, &c.id, "user", "[]").unwrap();
+                with_messages.push(c.id);
+            }
+        }
+        with_messages.reverse(); // most-recently-updated first
+
+        let all = list_conversations(
+            &conn,
+            CHAT_TENANT_PERSONAL,
+            CHAT_SCOPE_GLOBAL,
+            CHAT_GLOBAL_SCOPE_ID,
+            None,
+            ListFilter::All,
+        )
+        .unwrap();
+        assert_eq!(all.len(), 6, "unfiltered still sees every conversation");
+
+        let non_empty = |page: Option<Page>| {
+            list_conversations(
+                &conn,
+                CHAT_TENANT_PERSONAL,
+                CHAT_SCOPE_GLOBAL,
+                CHAT_GLOBAL_SCOPE_ID,
+                page,
+                ListFilter::WithMessages,
+            )
+            .unwrap()
+            .into_iter()
+            .map(|c| c.id)
+            .collect::<Vec<_>>()
+        };
+
+        assert_eq!(non_empty(None), with_messages, "empties are hidden, order preserved");
+        // Paging tiles the FILTERED list: a full page means more may follow, and
+        // the pages concatenate to exactly the filtered set with no gaps.
+        assert_eq!(non_empty(Some(Page { limit: 2, offset: 0 })), with_messages[0..2]);
+        assert_eq!(non_empty(Some(Page { limit: 2, offset: 2 })), with_messages[2..3]);
+        assert!(non_empty(Some(Page { limit: 2, offset: 3 })).is_empty(), "past the end");
+    }
+
     /// Deleting a conversation takes its messages with it and leaves its
     /// neighbours — including the same Note's OTHER tenant — untouched (#109).
     #[test]
@@ -2495,7 +2590,7 @@ mod tests {
         // The existing thread is preserved as the note's single (first) session.
         let latest = latest_conversation(&conn, "personal", "note", "n1").unwrap().unwrap();
         assert_eq!(latest.id, "conv1");
-        assert_eq!(list_conversations(&conn, "personal", "note", "n1", None).unwrap().len(), 1);
+        assert_eq!(list_conversations(&conn, "personal", "note", "n1", None, ListFilter::All).unwrap().len(), 1);
         // The empty conversation gets the date fallback (created_at = epoch 0).
         let conv2 = get_conversation_by_id(&conn, "conv2").unwrap().unwrap();
         assert_eq!(conv2.title.as_deref(), Some("Chat 1970-01-01"));
@@ -3361,6 +3456,7 @@ mod tests {
                 CHAT_SCOPE_GLOBAL,
                 CHAT_GLOBAL_SCOPE_ID,
                 Some(Page { limit, offset }),
+                ListFilter::All,
             )
             .unwrap()
             .into_iter()
@@ -3375,7 +3471,7 @@ mod tests {
         assert!(page(4, 8).is_empty());
         // And no page at all still means everything.
         assert_eq!(
-            list_conversations(&conn, CHAT_TENANT_PERSONAL, CHAT_SCOPE_GLOBAL, CHAT_GLOBAL_SCOPE_ID, None)
+            list_conversations(&conn, CHAT_TENANT_PERSONAL, CHAT_SCOPE_GLOBAL, CHAT_GLOBAL_SCOPE_ID, None, ListFilter::All)
                 .unwrap()
                 .len(),
             6,
@@ -3402,7 +3498,7 @@ mod tests {
         assert_ne!(note_conv.id, global_conv.id);
 
         let listed = |t: &ChatTarget| {
-            list_conversations(&conn, CHAT_TENANT_PERSONAL, t.scope(), t.scope_id(), None)
+            list_conversations(&conn, CHAT_TENANT_PERSONAL, t.scope(), t.scope_id(), None, ListFilter::All)
                 .unwrap()
                 .into_iter()
                 .map(|c| c.id)
@@ -3416,7 +3512,7 @@ mod tests {
             create_conversation(&conn, "wsA", global.scope(), global.scope_id(), "all").unwrap();
         assert_eq!(listed(&global), vec![global_conv.id.clone()], "personal is unaffected");
         assert_eq!(
-            list_conversations(&conn, "wsA", global.scope(), global.scope_id(), None).unwrap().len(),
+            list_conversations(&conn, "wsA", global.scope(), global.scope_id(), None, ListFilter::All).unwrap().len(),
             1
         );
         assert_eq!(
