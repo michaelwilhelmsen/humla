@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { open as openExternal } from "@tauri-apps/plugin-shell";
 import { Row, Section } from "../components/Section";
 import { Select } from "../components/Select";
@@ -14,7 +14,6 @@ import {
   isEmbeddingModel,
   isModelInstalled,
 } from "../../../lib/localModels";
-import { useDeveloperMode } from "../../../lib/useDeveloperMode";
 import { ipc } from "../../../lib/ipc";
 import type { SettingsHook } from "../useSettings";
 
@@ -30,7 +29,6 @@ export function ChatTab({ s, update }: Pick<SettingsHook, "s" | "update">) {
   // when chat isn't on Ollama.
   const key = useProviderKey("openai");
   const { reachable, installed } = useOllamaProbe(s.local_llm_base_url, { enabled: isOllama });
-  const devMode = useDeveloperMode();
 
   // Readiness — reflect exactly what's missing before chat can run.
   let ready = false;
@@ -152,26 +150,58 @@ export function ChatTab({ s, update }: Pick<SettingsHook, "s" | "update">) {
         )}
       </Row>
 
-      {devMode && <RebuildIndexRow />}
+      <RebuildIndexRow />
     </Section>
   );
 }
 
-// Rebuild the whole library's retrieval index (issue #104).
+// Rebuild the whole library's retrieval index (issues #104, #122).
 //
-// Behind developer mode because it's a repair tool, not a setting: the only reason
-// to reach for it is that the chunking changed under an existing library, which the
-// lazy startup backfill can't detect. The cost is disclosed rather than hidden — it
-// re-embeds, which spends the configured key — because an action that quietly costs
-// money is worse than a slow one.
+// NOT behind developer mode (#122). Hiding it meant a user whose library predates a
+// chunking change had worse chat retrieval over their own notes than over a shared
+// workspace's — the server rebuilds its index on deploy, the client never did — with
+// nothing on screen to explain the gap or fix it.
+//
+// It stays quiet when there is nothing to repair. `chat_stale_note_count` reports how
+// many notes still hold chunks from an older chunker, so this renders as a plain
+// status line on a current library and as an actionable prompt only when it isn't.
+// That is what makes it safe to show by default: a permanently visible "rebuild"
+// button trains people to either ignore it or press it pointlessly, and pressing it
+// pointlessly spends their embedding key.
 type RebuildState =
   | { kind: "idle" }
   | { kind: "running" }
   | { kind: "done"; count: number }
   | { kind: "error"; message: string };
 
+/** How many notes a rebuild would repair. `"loading"` on first read and `"unknown"`
+ *  when the count could not be read — deliberately NOT collapsed into `0`, because
+ *  `0` renders "Up to date ✓", which is a stronger claim than the one we'd be
+ *  avoiding. Not knowing and knowing-it's-fine are different facts. */
+type StaleCount = { kind: "loading" } | { kind: "unknown" } | { kind: "known"; count: number };
+
+/** Plural suffix, so the row's copy doesn't repeat the same ternary four times. */
+const s = (n: number) => (n === 1 ? "" : "s");
+
 function RebuildIndexRow() {
   const [state, setState] = useState<RebuildState>({ kind: "idle" });
+  const [stale, setStale] = useState<StaleCount>({ kind: "loading" });
+
+  // Re-read on mount and once a rebuild has FINISHED — `state.kind` changes on the way
+  // into "running" too, so `done` is filtered explicitly rather than relying on the
+  // dependency to do it: an extra count during the rebuild would contend with its
+  // per-note locking for a number that cannot have settled yet.
+  const settled = state.kind === "done";
+  useEffect(() => {
+    let live = true;
+    ipc
+      .chatStaleNoteCount()
+      .then((n) => live && setStale({ kind: "known", count: n }))
+      .catch(() => live && setStale({ kind: "unknown" }));
+    return () => {
+      live = false;
+    };
+  }, [settled]);
 
   async function rebuild() {
     setState({ kind: "running" });
@@ -182,22 +212,49 @@ function RebuildIndexRow() {
     }
   }
 
+  const running = state.kind === "running";
+
   return (
-    <Row label="Search index">
-      <button
-        className="nd-btn"
-        onClick={() => void rebuild()}
-        disabled={state.kind === "running"}
-      >
-        {state.kind === "running" ? "Rebuilding…" : "Rebuild search index"}
-      </button>
-      <p className="text-xs text-[var(--color-text-muted)] mt-1">
-        Re-chunks every note so older meetings get speaker-aware search. Re-embeds as it goes,
-        which uses your configured key — a few cents for a large library.
-      </p>
+    <Row label="Chat search index">
+      {stale.kind === "loading" && (
+        <span className="text-xs text-[var(--color-text-muted)]">Checking…</span>
+      )}
+      {/* Couldn't read the count: say so rather than claiming either state. Offering
+          the rebuild here would be an action on unknown state; claiming "up to date"
+          would be the unverified assertion this whole row exists to avoid. */}
+      {stale.kind === "unknown" && (
+        <span className="text-xs text-[var(--color-text-muted)]">
+          Couldn't check the index.
+        </span>
+      )}
+      {stale.kind === "known" && stale.count === 0 && (
+        <span className="text-xs text-[var(--color-success)]">Up to date ✓</span>
+      )}
+      {stale.kind === "known" && stale.count > 0 && (
+        <>
+          {/* `--color-warning-text` (not `--color-warning`) — the readable variant, per
+              globals.css: raw warning gold doesn't clear AAA as body text. */}
+          <p className="text-xs text-[var(--color-warning-text)]">
+            {stale.count} recording{s(stale.count)} {stale.count === 1 ? "was" : "were"} indexed
+            before the latest improvements — chat can't tell who spoke in{" "}
+            {stale.count === 1 ? "it" : "them"}, and its excerpts may cut mid-sentence.
+          </p>
+          <button className="nd-btn mt-2" onClick={() => void rebuild()} disabled={running}>
+            {running ? "Rebuilding…" : "Rebuild now"}
+          </button>
+          <p className="text-xs text-[var(--color-text-muted)] mt-1">
+            Re-reads your whole library and re-embeds anything that changed, which uses your
+            configured key — a few cents at most. Only affects what chat can find; your notes
+            aren't changed.
+          </p>
+        </>
+      )}
       {state.kind === "done" && (
         <p className="text-xs text-[var(--color-success)] mt-1">
-          Rebuilt {state.count} note{state.count === 1 ? "" : "s"} ✓
+          {/* Deliberately not "Rebuilt {count} of {stale}" — the rebuild walks the whole
+              library, so this number is larger than the stale count it was offered for,
+              and pairing them would read as a discrepancy. */}
+          Index rebuilt across {state.count} note{s(state.count)} ✓
         </p>
       )}
       {state.kind === "error" && (

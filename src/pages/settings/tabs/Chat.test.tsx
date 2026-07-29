@@ -120,3 +120,68 @@ describe("ChatTab readiness", () => {
     expect(update).not.toHaveBeenCalledWith("chat_model", "embeddinggemma:latest");
   });
 });
+
+// Issue #122: the rebuild action came out from behind developer mode, which is only
+// safe because it stays QUIET when there is nothing to repair. A permanently visible
+// "rebuild" button trains people to ignore it or to press it pointlessly — and
+// pressing it pointlessly spends their embedding key.
+describe("ChatTab rebuild-index row", () => {
+  it("is visible without developer mode, and silent on a current library", async () => {
+    mockTauri({ chat_stale_note_count: () => 0 });
+    render(<ChatTab s={settings()} update={async () => {}} />);
+
+    // Present at all — the #122 fix is that this no longer requires developer mode.
+    expect(await screen.findByText(/Up to date/)).toBeTruthy();
+    // …and offers no action, because there is nothing to do.
+    expect(screen.queryByRole("button", { name: /Rebuild/i })).toBeNull();
+  });
+
+  it("says how many notes are stale and offers the fix when some are", async () => {
+    mockTauri({ chat_stale_note_count: () => 7 });
+    render(<ChatTab s={settings()} update={async () => {}} />);
+
+    // The count is the point: a bare button gives no way to judge whether the slow,
+    // key-spending action is worth taking.
+    expect(await screen.findByText(/7 recordings were indexed before the latest improvements/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: /Rebuild now/i })).toBeTruthy();
+    // The cost is disclosed rather than buried.
+    expect(screen.getByText(/uses your configured key/)).toBeTruthy();
+    // And it says what it does NOT touch, since "rebuild" sounds destructive.
+    expect(screen.getByText(/your notes aren't changed/)).toBeTruthy();
+  });
+
+  it("reports how many notes it rebuilt", async () => {
+    // The rebuild walks the WHOLE library, so its number is larger than the stale
+    // count it was offered for. The copy must not pair them as though they should match.
+    mockTauri({ chat_stale_note_count: () => 3, chat_rebuild_index: () => 41 });
+    render(<ChatTab s={settings()} update={async () => {}} />);
+    fireEvent.click(await screen.findByRole("button", { name: /Rebuild now/i }));
+    await waitFor(() => expect(screen.getByText(/Index rebuilt across 41 notes/)).toBeTruthy());
+  });
+
+  it("says it couldn't check rather than claiming either state", async () => {
+    // This test previously asserted "Up to date ✓" on a failed count — which is a
+    // STRONGER unverified claim than the "0 notes are stale" it was trying to avoid.
+    // Not knowing and knowing-it's-fine are different facts, and the row now says which.
+    mockTauri({
+      chat_stale_note_count: () => {
+        throw new Error("nope");
+      },
+    });
+    render(<ChatTab s={settings()} update={async () => {}} />);
+    await waitFor(() => expect(screen.getByText(/Couldn't check the index/)).toBeTruthy());
+    expect(screen.queryByText(/Up to date/)).toBeNull();
+    // And no action is offered on unknown state.
+    expect(screen.queryByRole("button", { name: /Rebuild/i })).toBeNull();
+  });
+
+  it("never calls a typed-notes-only library stale", async () => {
+    // #104 moved transcript boundaries only, so a note with no recording can't be
+    // stale on account of it. Asserted here as well as in db.rs because this row is
+    // where a user would see the wrong claim.
+    mockTauri({ chat_stale_note_count: () => 0 });
+    render(<ChatTab s={settings()} update={async () => {}} />);
+    expect(await screen.findByText(/Up to date/)).toBeTruthy();
+    expect(screen.queryByText(/indexed before the latest improvements/)).toBeNull();
+  });
+});

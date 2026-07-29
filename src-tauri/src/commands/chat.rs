@@ -151,6 +151,19 @@ pub async fn embed_backfill(app: AppHandle) {
     eprintln!("[chat] embedding backfill complete");
 }
 
+/// How many notes a rebuild would repair (#122), so the UI can offer the action only
+/// when it does something — and say what it will do.
+///
+/// A blind "rebuild search index" button is a bad bargain: it is slow, it spends the
+/// user's embedding key, and it gives no way to tell whether any of that was needed.
+/// With a count, the row can stay quiet on a current library and state the work on a
+/// stale one.
+#[tauri::command]
+pub fn chat_stale_note_count(state: State<AppState>) -> Result<usize, String> {
+    let conn = state.db.lock();
+    db::notes_with_stale_chunks(&conn).map_err(super::err)
+}
+
 /// Rebuild the retrieval index for the WHOLE library (issue #104).
 ///
 /// The only way to repair an existing library after a chunking-shape change. The
