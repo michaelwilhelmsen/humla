@@ -492,6 +492,8 @@ export const ipc = {
   /** Rebuild the retrieval index for every live note; resolves with how many (#104).
    *  Slow and re-embeds, so it is user-triggered — see `chat_rebuild_index`. */
   chatRebuildIndex: () => invoke<number>("chat_rebuild_index"),
+  /** How many notes a rebuild would repair — 0 when the index is current (#122). */
+  chatStaleNoteCount: () => invoke<number>("chat_stale_note_count"),
 
   permissionsStatus: () => invoke<PermissionsStatus>("permissions_status"),
   permissionsRequest: (kind: PermissionKind) => invoke<PermissionsStatus>("permissions_request", { kind }),

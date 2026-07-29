@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { open as openExternal } from "@tauri-apps/plugin-shell";
 import { Row, Section } from "../components/Section";
 import { Select } from "../components/Select";
@@ -14,7 +14,6 @@ import {
   isEmbeddingModel,
   isModelInstalled,
 } from "../../../lib/localModels";
-import { useDeveloperMode } from "../../../lib/useDeveloperMode";
 import { ipc } from "../../../lib/ipc";
 import type { SettingsHook } from "../useSettings";
 
@@ -30,7 +29,6 @@ export function ChatTab({ s, update }: Pick<SettingsHook, "s" | "update">) {
   // when chat isn't on Ollama.
   const key = useProviderKey("openai");
   const { reachable, installed } = useOllamaProbe(s.local_llm_base_url, { enabled: isOllama });
-  const devMode = useDeveloperMode();
 
   // Readiness — reflect exactly what's missing before chat can run.
   let ready = false;
@@ -152,18 +150,24 @@ export function ChatTab({ s, update }: Pick<SettingsHook, "s" | "update">) {
         )}
       </Row>
 
-      {devMode && <RebuildIndexRow />}
+      <RebuildIndexRow />
     </Section>
   );
 }
 
-// Rebuild the whole library's retrieval index (issue #104).
+// Rebuild the whole library's retrieval index (issues #104, #122).
 //
-// Behind developer mode because it's a repair tool, not a setting: the only reason
-// to reach for it is that the chunking changed under an existing library, which the
-// lazy startup backfill can't detect. The cost is disclosed rather than hidden — it
-// re-embeds, which spends the configured key — because an action that quietly costs
-// money is worse than a slow one.
+// NOT behind developer mode (#122). Hiding it meant a user whose library predates a
+// chunking change had worse chat retrieval over their own notes than over a shared
+// workspace's — the server rebuilds its index on deploy, the client never did — with
+// nothing on screen to explain the gap or fix it.
+//
+// It stays quiet when there is nothing to repair. `chat_stale_note_count` reports how
+// many notes still hold chunks from an older chunker, so this renders as a plain
+// status line on a current library and as an actionable prompt only when it isn't.
+// That is what makes it safe to show by default: a permanently visible "rebuild"
+// button trains people to either ignore it or press it pointlessly, and pressing it
+// pointlessly spends their embedding key.
 type RebuildState =
   | { kind: "idle" }
   | { kind: "running" }
@@ -172,6 +176,20 @@ type RebuildState =
 
 function RebuildIndexRow() {
   const [state, setState] = useState<RebuildState>({ kind: "idle" });
+  // How many notes a rebuild would actually repair. `null` while loading, so the row
+  // doesn't flash a "needs rebuilding" claim it hasn't verified.
+  const [stale, setStale] = useState<number | null>(null);
+
+  useEffect(() => {
+    let live = true;
+    ipc
+      .chatStaleNoteCount()
+      .then((n) => live && setStale(n))
+      .catch(() => live && setStale(0));
+    return () => {
+      live = false;
+    };
+  }, [state]);
 
   async function rebuild() {
     setState({ kind: "running" });
@@ -182,19 +200,31 @@ function RebuildIndexRow() {
     }
   }
 
+  const running = state.kind === "running";
+  const needsWork = stale !== null && stale > 0;
+
   return (
-    <Row label="Search index">
-      <button
-        className="nd-btn"
-        onClick={() => void rebuild()}
-        disabled={state.kind === "running"}
-      >
-        {state.kind === "running" ? "Rebuilding…" : "Rebuild search index"}
-      </button>
-      <p className="text-xs text-[var(--color-text-muted)] mt-1">
-        Re-chunks every note so older meetings get speaker-aware search. Re-embeds as it goes,
-        which uses your configured key — a few cents for a large library.
-      </p>
+    <Row label="Chat search index">
+      {stale === null ? (
+        <span className="text-xs text-[var(--color-text-muted)]">Checking…</span>
+      ) : needsWork ? (
+        <>
+          <p className="text-xs text-[var(--color-warning)]">
+            {stale} note{stale === 1 ? "" : "s"} indexed before the latest improvements — chat
+            can't tell who spoke in {stale === 1 ? "it" : "them"}, and its excerpts from{" "}
+            {stale === 1 ? "it" : "them"} may cut mid-sentence.
+          </p>
+          <button className="nd-btn mt-2" onClick={() => void rebuild()} disabled={running}>
+            {running ? "Rebuilding…" : "Rebuild now"}
+          </button>
+          <p className="text-xs text-[var(--color-text-muted)] mt-1">
+            Re-reads every note and re-embeds as it goes, which uses your configured key — a few
+            cents for a large library. Only affects what chat can find; your notes aren't changed.
+          </p>
+        </>
+      ) : (
+        <span className="text-xs text-[var(--color-success)]">Up to date ✓</span>
+      )}
       {state.kind === "done" && (
         <p className="text-xs text-[var(--color-success)] mt-1">
           Rebuilt {state.count} note{state.count === 1 ? "" : "s"} ✓

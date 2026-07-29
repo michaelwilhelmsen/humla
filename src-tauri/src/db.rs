@@ -294,6 +294,19 @@ pub fn open(path: &Path) -> Result<Connection> {
     let _ = conn.execute("ALTER TABLE notes ADD COLUMN speakers TEXT NOT NULL DEFAULT ''", []);
     let _ =
         conn.execute("ALTER TABLE note_chunks ADD COLUMN speakers TEXT NOT NULL DEFAULT ''", []);
+    // Which chunker produced this row (issue #122). The DEFAULT is deliberately 1,
+    // not the current version: every row that already exists was written by the
+    // pre-#104 blank-line chunker, so the default IS the correct historical answer and
+    // the migration needs no backfill pass.
+    //
+    // This is the sentinel #104 lacked. It could not tell an old-shaped chunk from a
+    // current one, which is why the repair had to be a blunt "rebuild everything" with
+    // no way to say whether it was needed. Now staleness is exactly detectable — for
+    // this change and for the next one, which is the part that pays twice.
+    let _ = conn.execute(
+        &format!("ALTER TABLE note_chunks ADD COLUMN chunker_version INTEGER NOT NULL DEFAULT 1"),
+        [],
+    );
     // Workspace (Teams) chat (issue #50). A workspace conversation is
     // server-authoritative: the local row is just a (tenant, scope, scope_id)
     // handle whose `remote_id` maps to the humla-cloud conversation record id.
@@ -1470,6 +1483,17 @@ pub fn list_chat_messages(conn: &Connection, conversation_id: &str) -> Result<Ve
 /// paragraph boundaries; a paragraph longer than this is hard-split.
 pub const CHUNK_TARGET_CHARS: usize = 3000;
 
+/// The chunker's shape version, stamped onto every row `reindex_note` writes (#122).
+///
+/// **Bump this whenever the chunk SHAPE changes** — boundaries, framing, or what a
+/// chunk's text contains. Rows written by an older chunker then become detectable, so
+/// the app can say how many notes a rebuild would fix instead of offering a blind
+/// action. Do NOT bump it for a change that leaves boundaries identical.
+///
+/// 1 = the original blank-line paragraph splitter, which was wrong for transcripts.
+/// 2 = #104's turn-packed transcripts (prose still paragraph-split).
+pub const CHUNKER_VERSION: i64 = 2;
+
 /// A keyword-search hit: the matched chunk plus enough of the parent Note to
 /// build a citation chip (title + date). `rank` is the raw bm25 score (lower =
 /// better); callers order by it and otherwise treat it as opaque.
@@ -1868,9 +1892,19 @@ pub fn reindex_note(
         let chunk_id = uuid::Uuid::new_v4().to_string();
         let hash = text_hash(text);
         conn.execute(
-            "INSERT INTO note_chunks (id, note_id, seq, source, text, text_hash, created_at, speakers)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![chunk_id, note_id, seq as i64, source, text, hash, now, encode_speakers(speakers)],
+            "INSERT INTO note_chunks (id, note_id, seq, source, text, text_hash, created_at, speakers, chunker_version)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                chunk_id,
+                note_id,
+                seq as i64,
+                source,
+                text,
+                hash,
+                now,
+                encode_speakers(speakers),
+                CHUNKER_VERSION,
+            ],
         )?;
         conn.execute(
             "INSERT INTO note_chunks_fts (text, chunk_id, note_id) VALUES (?1, ?2, ?3)",
@@ -1906,6 +1940,27 @@ pub fn remove_note_chunks(conn: &Connection, note_id: &str) -> Result<()> {
     conn.execute("DELETE FROM note_chunks WHERE note_id = ?1", params![note_id])?;
     conn.execute("DELETE FROM note_chunks_fts WHERE note_id = ?1", params![note_id])?;
     Ok(())
+}
+
+/// How many LIVE notes hold chunks from an older chunker (#122) — i.e. how many a
+/// rebuild would actually repair.
+///
+/// Counts notes rather than chunks, because that is the unit the user thinks in and
+/// the unit the rebuild walks. Live only, for the same reason: the rebuild skips
+/// trashed notes, so counting them would advertise work the button never does and
+/// leave a hint that can never be cleared.
+///
+/// `0` means the index is current, which is what lets the UI stay quiet instead of
+/// showing a repair prompt to someone with nothing to repair.
+pub fn notes_with_stale_chunks(conn: &Connection) -> Result<usize> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(DISTINCT c.note_id) FROM note_chunks c \
+         JOIN notes n ON n.id = c.note_id \
+         WHERE n.deleted_at IS NULL AND c.chunker_version < ?1",
+        params![CHUNKER_VERSION],
+        |r| r.get(0),
+    )?;
+    Ok(n.max(0) as usize)
 }
 
 /// Every live note's id, oldest first — the work-list for the user-triggered
@@ -3634,6 +3689,54 @@ mod tests {
         for c in chunks.iter().filter(|c| c.source != "transcript") {
             assert!(c.speakers.is_empty(), "{} must claim no speakers", c.source);
         }
+    }
+
+    /// Issue #122. #104 changed the chunk SHAPE, and nothing could tell an
+    /// old-shaped chunk from a current one — which is why the repair was a blunt
+    /// "rebuild everything" button with no way to say whether it was needed. Stamping
+    /// the version per chunk makes staleness exactly detectable, for this change and
+    /// for the next one.
+    #[test]
+    fn stale_chunks_are_detectable_so_the_rebuild_can_say_what_it_will_fix() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("t.sqlite")).unwrap();
+        let a = create_note(&conn, "en", "meeting", "").unwrap().id;
+        let b = create_note(&conn, "en", "meeting", "").unwrap().id;
+        reindex_note(&conn, &a, "", "Michael: hello", "").unwrap();
+        reindex_note(&conn, &b, "", "Hege: hi", "").unwrap();
+
+        // Freshly indexed by the current chunker: nothing to repair.
+        assert_eq!(notes_with_stale_chunks(&conn).unwrap(), 0);
+
+        // Simulate a library indexed before #104 — which is exactly what the ALTER
+        // TABLE default produces for rows that already existed.
+        conn.execute("UPDATE note_chunks SET chunker_version = 1 WHERE note_id = ?1", params![&a])
+            .unwrap();
+        assert_eq!(notes_with_stale_chunks(&conn).unwrap(), 1, "counts NOTES, not chunks");
+
+        // Reindexing that note repairs it, with no action needed on the other.
+        reindex_note(&conn, &a, "", "Michael: hello", "").unwrap();
+        assert_eq!(notes_with_stale_chunks(&conn).unwrap(), 0);
+    }
+
+    /// A trashed note must not be counted: the rebuild walks live notes only, so
+    /// counting it would advertise work the button never does and leave a hint that
+    /// can never be cleared.
+    #[test]
+    fn a_trashed_note_is_not_counted_as_needing_a_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("t.sqlite")).unwrap();
+        let id = create_note(&conn, "en", "meeting", "").unwrap().id;
+        reindex_note(&conn, &id, "", "Michael: hello", "").unwrap();
+        conn.execute("UPDATE note_chunks SET chunker_version = 1", []).unwrap();
+        assert_eq!(notes_with_stale_chunks(&conn).unwrap(), 1);
+
+        delete_note(&conn, &id).unwrap();
+        assert_eq!(
+            notes_with_stale_chunks(&conn).unwrap(),
+            0,
+            "the rebuild only walks live notes, so only live notes may be counted"
+        );
     }
 
     #[test]

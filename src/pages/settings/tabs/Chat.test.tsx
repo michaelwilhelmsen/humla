@@ -120,3 +120,53 @@ describe("ChatTab readiness", () => {
     expect(update).not.toHaveBeenCalledWith("chat_model", "embeddinggemma:latest");
   });
 });
+
+// Issue #122: the rebuild action came out from behind developer mode, which is only
+// safe because it stays QUIET when there is nothing to repair. A permanently visible
+// "rebuild" button trains people to ignore it or to press it pointlessly — and
+// pressing it pointlessly spends their embedding key.
+describe("ChatTab rebuild-index row", () => {
+  it("is visible without developer mode, and silent on a current library", async () => {
+    mockTauri({ chat_stale_note_count: () => 0 });
+    render(<ChatTab s={settings()} update={async () => {}} />);
+
+    // Present at all — the #122 fix is that this no longer requires developer mode.
+    expect(await screen.findByText(/Up to date/)).toBeTruthy();
+    // …and offers no action, because there is nothing to do.
+    expect(screen.queryByRole("button", { name: /Rebuild/i })).toBeNull();
+  });
+
+  it("says how many notes are stale and offers the fix when some are", async () => {
+    mockTauri({ chat_stale_note_count: () => 7 });
+    render(<ChatTab s={settings()} update={async () => {}} />);
+
+    // The count is the point: a bare button gives no way to judge whether the slow,
+    // key-spending action is worth taking.
+    expect(await screen.findByText(/7 notes indexed before the latest improvements/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: /Rebuild now/i })).toBeTruthy();
+    // The cost is disclosed rather than buried.
+    expect(screen.getByText(/uses your configured key/)).toBeTruthy();
+    // And it says what it does NOT touch, since "rebuild" sounds destructive.
+    expect(screen.getByText(/your notes aren't changed/)).toBeTruthy();
+  });
+
+  it("reports how many notes it rebuilt", async () => {
+    mockTauri({ chat_stale_note_count: () => 3, chat_rebuild_index: () => 3 });
+    render(<ChatTab s={settings()} update={async () => {}} />);
+    fireEvent.click(await screen.findByRole("button", { name: /Rebuild now/i }));
+    await waitFor(() => expect(screen.getByText(/Rebuilt 3 notes/)).toBeTruthy());
+  });
+
+  it("stays quiet rather than guessing when the count can't be read", async () => {
+    // A failed count must not render "0 notes are stale" (a claim) or a rebuild
+    // prompt (an action on unknown state).
+    mockTauri({
+      chat_stale_note_count: () => {
+        throw new Error("nope");
+      },
+    });
+    render(<ChatTab s={settings()} update={async () => {}} />);
+    await waitFor(() => expect(screen.getByText(/Up to date/)).toBeTruthy());
+    expect(screen.queryByRole("button", { name: /Rebuild/i })).toBeNull();
+  });
+});
