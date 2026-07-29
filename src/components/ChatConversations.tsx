@@ -231,7 +231,10 @@ function ConversationListRow({
         aria-current={row.active ? "true" : undefined}
         title={row.label}
         className={cn(
-          "no-drag w-full flex flex-col gap-0.5 px-2.5 py-1.5 rounded-[var(--radius)] text-left transition-colors",
+          // `select-none`: a right-click in a webview places a selection before the
+          // menu opens, so the row's title was left highlighted behind the menu.
+          // The row is a control, not prose — there is nothing here worth selecting.
+          "no-drag select-none w-full flex flex-col gap-0.5 px-2.5 py-1.5 rounded-[var(--radius)] text-left transition-colors",
           row.active
             ? "bg-[var(--color-sidebar-active)] text-[var(--color-text)] font-medium shadow-[0_1px_2px_rgba(0,0,0,0.05)]"
             : "text-[var(--color-text-muted)] hover:bg-[var(--color-pill-hover)] hover:text-[var(--color-text)]",
