@@ -11,11 +11,25 @@
 // The history button hides for a lone empty conversation; the panel decides that
 // via `canBrowseHistory`. All state lives in ChatPanel — this renders the
 // projection it publishes and nothing else.
+//
+// Rename and delete ride here too (issue #109), and this popover is not a
+// nice-to-have copy of the sidebar's: on a Note route the sidebar shows folders
+// and notes, so this is the ONLY surface a note-scoped conversation can be
+// reached from. Without these, every thread anchored to a note would stay
+// undeletable.
+//
+// `SelectablePopover` already carries per-row rename/delete affordances (built
+// for the Client picker), so rename wires straight through. Delete does NOT:
+// the popover fires `onDelete` immediately, which is acceptable for a Client and
+// not for a thread whose messages can't be recovered. So delete opens the same
+// confirm the sidebar uses, and only then calls through.
 
+import { useState } from "react";
 import { History, Plus } from "lucide-react";
 import { SelectablePopover } from "./SelectablePopover";
+import { Modal } from "../pages/settings/components/Modal";
 import type { ChatSessionControls } from "./ChatPanel";
-import { conversationRows } from "../lib/chatSessions";
+import { conversationRows, type ConversationRow } from "../lib/chatSessions";
 
 export function ChatHistoryControls({
   controls,
@@ -29,8 +43,17 @@ export function ChatHistoryControls({
    *  twice. The Note header has no list, so it keeps the default. */
   showHistory?: boolean;
 }) {
-  const { conversations, activeConversationId, canBrowseHistory, newChat, openConversation } =
-    controls;
+  const {
+    conversations,
+    activeConversationId,
+    canBrowseHistory,
+    newChat,
+    openConversation,
+    deleteConversation,
+    renameConversation,
+  } = controls;
+  const [pendingDelete, setPendingDelete] = useState<ConversationRow | null>(null);
+  const [deleting, setDeleting] = useState(false);
   // Same projection the `/chat` sidebar list renders from (#95) — ordering, the
   // empty-title fallback and the relative date are decided in one place. The
   // popover takes its own `activeId`, so it ignores each row's `active`.
@@ -39,6 +62,18 @@ export function ChatHistoryControls({
   // poor place to scroll for more. It shows the pages already loaded, which for a
   // note is everything and for `/chat` is at least the most recent 30.
   const items = conversationRows(conversations, activeConversationId);
+
+  async function confirmDelete() {
+    if (!pendingDelete) return;
+    setDeleting(true);
+    try {
+      await deleteConversation(pendingDelete.id);
+    } finally {
+      setDeleting(false);
+      setPendingDelete(null);
+    }
+  }
+
   return (
     <div className="flex items-center gap-0.5">
       <button
@@ -59,6 +94,13 @@ export function ChatHistoryControls({
           onSelect={(id) => {
             if (id) void openConversation(id);
           }}
+          onRename={(id, name) => renameConversation(id, name)}
+          onDelete={(id) => {
+            // Gate, don't destroy: hand the row to the confirm below rather than
+            // deleting on the click, which is what the popover would do by default.
+            const row = items.find((i) => i.id === id);
+            if (row) setPendingDelete(row);
+          }}
           trigger={
             <span className="nd-btn-icon" title="Chat history">
               <History size={16} strokeWidth={1.7} aria-hidden="true" />
@@ -66,6 +108,33 @@ export function ChatHistoryControls({
           }
         />
       )}
+
+      {/* Same copy and same stakes as the sidebar's confirm — there is no Trash for
+          chat, so the dialog is the only thing between a click and losing a thread. */}
+      <Modal
+        open={pendingDelete !== null}
+        onClose={() => {
+          if (!deleting) setPendingDelete(null);
+        }}
+        title="Delete conversation"
+      >
+        <p className="text-[14px] text-[var(--color-text)]">
+          Delete “{pendingDelete?.label}”? Its messages go with it, and this can’t be undone.
+        </p>
+        <div className="flex justify-end gap-2 mt-5">
+          <button className="nd-btn" onClick={() => setPendingDelete(null)} disabled={deleting}>
+            Cancel
+          </button>
+          <button
+            className="nd-btn"
+            style={{ color: "var(--color-danger)" }}
+            onClick={() => void confirmDelete()}
+            disabled={deleting}
+          >
+            Delete
+          </button>
+        </div>
+      </Modal>
     </div>
   );
 }

@@ -462,8 +462,19 @@ impl ChatContext {
 
 // ── Chat sessions (issue #61) ───────────────────────────────────────────────
 // Multiple conversations ("sessions") per Note. The active session is the most-
-// recently-updated one; an explicit command creates a fresh one. There is no
-// deletion command — a deliberate v1 decision.
+// recently-updated one; an explicit command creates a fresh one. Sessions can be
+// deleted and renamed since #109 (`chat_delete_conversation` /
+// `chat_rename_conversation`).
+
+/// The longest title we store on a rename (issue #109).
+///
+/// Pinned to the cap in `chat_sessions.pb.js`'s create + rename routes: if this
+/// were larger, a workspace rename would silently come back shortened, and the
+/// local row and the server record would disagree about the thread's name. Much
+/// longer than [`chat::TITLE_MAX_CHARS`] (40) on purpose — that bounds what we
+/// *derive* from a first message, where this bounds what a user may deliberately
+/// type.
+const TITLE_MAX_STORED_CHARS: usize = 300;
 
 /// One row in the session list. `id` is always the LOCAL conversation id (for a
 /// workspace session that's the handle row, its `remote_id` mapping to the
@@ -695,6 +706,123 @@ pub async fn chat_new_conversation(
         }
         Some(ws) => new_conversation_cloud(&state, ws, &target).await,
     }
+}
+
+/// Delete a conversation and its messages (issue #109).
+///
+/// The id is explicit and required — there is no "delete the active one" fallback.
+/// Every other command here resolves an absent id to the most-recent session,
+/// which is a helpful default for reading and an unacceptable one for destroying:
+/// a caller that forgot to pass an id would silently take out whatever thread
+/// happened to be newest.
+///
+/// **Both sides or neither.** A workspace conversation is server-authoritative,
+/// but the local handle is what `list_conversations_cloud`'s pre-#19 union falls
+/// back to — so dropping only the remote record leaves a handle that the very
+/// next list puts back on screen. The remote delete therefore goes FIRST and its
+/// failure aborts: a local row with a live server record is a stale cache the
+/// next list corrects, where a deleted server record with a surviving handle is a
+/// row that reappears with no way to remove it.
+#[tauri::command]
+pub async fn chat_delete_conversation(
+    app: AppHandle,
+    note_id: Option<String>,
+    conversation_id: String,
+) -> Result<(), String> {
+    let target = ChatTarget::from_note_id(note_id)?;
+    let state: State<AppState> = app.state();
+    let ctx = {
+        let conn = state.db.lock();
+        ChatContext::load(&conn)
+    };
+
+    // Resolve within the caller's tenant + target first, so a stray id can't
+    // reach another note's or another tenant's thread.
+    let conv = {
+        let conn = state.db.lock();
+        resolve_existing(&conn, ctx.tenant(), &target, Some(&conversation_id))?
+    };
+    let Some(conv) = conv else {
+        // Nothing local to remove. Idempotent by intent: the UI drops the row
+        // optimistically, so a retry after a partial failure must still succeed.
+        return Ok(());
+    };
+
+    // No remote id → the thread never reached the server (created, never sent to).
+    // The local handle is the whole of it, so dropping it below is complete.
+    if let (Some(workspace), Some(remote_id)) = (ctx.workspace(), conv.remote_id.as_deref()) {
+        let workspace = workspace.to_string();
+        super::cloud::cloud_delete_json(
+            &state,
+            &format!("/api/humla/chat/conversations/{remote_id}"),
+            &[("workspace_id", workspace.as_str())],
+        )
+        .await
+        .map_err(|e| e.message(chat::cloud::cloud_chat_error_message))?;
+    }
+
+    let conn = state.db.lock();
+    db::delete_conversation(&conn, &conv.id).map_err(|e| e.to_string())
+}
+
+/// Rename a conversation (issue #109) — the user's override of the title derived
+/// from the first turn.
+///
+/// Remote first, for the same reason as the delete above: a local title the
+/// server never accepted would be silently reverted the next time the workspace
+/// list is read, and a rename that looks applied but isn't is worse than one that
+/// reports failure. Rejects an all-whitespace title, because an empty title is
+/// how both sides spell "never titled" — storing one would re-arm the send path's
+/// derivation and let the next turn overwrite the user's choice.
+#[tauri::command]
+pub async fn chat_rename_conversation(
+    app: AppHandle,
+    note_id: Option<String>,
+    conversation_id: String,
+    title: String,
+) -> Result<ConversationMeta, String> {
+    let target = ChatTarget::from_note_id(note_id)?;
+    let state: State<AppState> = app.state();
+    let ctx = {
+        let conn = state.db.lock();
+        ChatContext::load(&conn)
+    };
+
+    let trimmed = title.trim();
+    if trimmed.is_empty() {
+        return Err("A conversation needs a name.".into());
+    }
+    // Same cap the server applies, so a title written here can't be silently
+    // truncated to a different value there. Sliced on a char boundary.
+    let capped: String = trimmed.chars().take(TITLE_MAX_STORED_CHARS).collect();
+
+    let conv = {
+        let conn = state.db.lock();
+        resolve_existing(&conn, ctx.tenant(), &target, Some(&conversation_id))?
+    };
+    let Some(conv) = conv else {
+        return Err("That conversation no longer exists.".into());
+    };
+
+    // No remote id yet: the local title rides up with the first turn's persist,
+    // which carries the conversation's title alongside its messages.
+    if let (Some(workspace), Some(remote_id)) = (ctx.workspace(), conv.remote_id.as_deref()) {
+        let body = serde_json::json!({ "workspace_id": workspace, "title": capped });
+        super::cloud::cloud_patch_json(
+            &state,
+            &format!("/api/humla/chat/conversations/{remote_id}"),
+            &body,
+        )
+        .await
+        .map_err(|e| e.message(chat::cloud::cloud_chat_error_message))?;
+    }
+
+    let conn = state.db.lock();
+    db::rename_conversation(&conn, &conv.id, &capped).map_err(|e| e.to_string())?;
+    let updated = db::get_conversation_by_id(&conn, &conv.id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "That conversation no longer exists.".to_string())?;
+    conversation_meta(&conn, &updated)
 }
 
 /// Persist the Scope chip's breadth on a conversation (issue #58) — the single

@@ -363,6 +363,8 @@ where
             commands::chat_history,
             commands::chat_list_conversations,
             commands::chat_new_conversation,
+            commands::chat_delete_conversation,
+            commands::chat_rename_conversation,
             commands::chat_set_breadth,
             commands::chat_set_owner_filter,
             commands::chat_get_breadth,

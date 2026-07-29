@@ -25,6 +25,8 @@ function publish(over: Partial<ChatSessionControls> = {}) {
     loadingMore: false,
     newChat: vi.fn(async () => {}),
     openConversation: vi.fn(async () => {}),
+    deleteConversation: vi.fn(async () => {}),
+    renameConversation: vi.fn(async () => {}),
     loadMore: vi.fn(async () => {}),
     status: null,
     ...over,
@@ -146,6 +148,131 @@ describe("ChatConversations", () => {
 
     fireEvent.click(screen.getByText("Alpha"));
     expect(controls.openConversation).toHaveBeenCalledWith("c-a");
+  });
+
+  // Rename + delete from the row's right-click menu (issue #109), mirroring the
+  // sidebar's folder rows. Deleting is unrecoverable, so the confirm is part of
+  // the contract, not decoration.
+  describe("the row menu", () => {
+    function openRowMenu(label: string) {
+      fireEvent.contextMenu(screen.getByText(label));
+    }
+
+    it("opens on right-click with Rename and Delete", () => {
+      publish({ conversations: [conversation({ id: "c-a", title: "Alpha" })] });
+      render(<ChatConversations />);
+
+      // Nothing until asked for — the row is a plain button at rest.
+      expect(screen.queryByRole("menuitem", { name: "Rename" })).toBeNull();
+      openRowMenu("Alpha");
+      expect(screen.getByRole("menuitem", { name: "Rename" })).toBeInTheDocument();
+      expect(screen.getByRole("menuitem", { name: "Delete" })).toBeInTheDocument();
+    });
+
+    it("renames a conversation on Enter", () => {
+      const controls = publish({ conversations: [conversation({ id: "c-a", title: "Alpha" })] });
+      render(<ChatConversations />);
+
+      openRowMenu("Alpha");
+      fireEvent.click(screen.getByRole("menuitem", { name: "Rename" }));
+      const input = screen.getByLabelText("Conversation name");
+      fireEvent.change(input, { target: { value: "Q3 pricing" } });
+      fireEvent.keyDown(input, { key: "Enter" });
+
+      expect(controls.renameConversation).toHaveBeenCalledWith("c-a", "Q3 pricing");
+      // The editor closes, so the row is a row again.
+      expect(screen.queryByLabelText("Conversation name")).toBeNull();
+    });
+
+    it("abandons a rename on Escape without writing", () => {
+      const controls = publish({ conversations: [conversation({ id: "c-a", title: "Alpha" })] });
+      render(<ChatConversations />);
+
+      openRowMenu("Alpha");
+      fireEvent.click(screen.getByRole("menuitem", { name: "Rename" }));
+      const input = screen.getByLabelText("Conversation name");
+      fireEvent.change(input, { target: { value: "typed then abandoned" } });
+      fireEvent.keyDown(input, { key: "Escape" });
+
+      expect(controls.renameConversation).not.toHaveBeenCalled();
+      expect(screen.getByText("Alpha")).toBeInTheDocument();
+    });
+
+    it("treats an emptied or unchanged name as a cancel, not a write", () => {
+      // The backend rejects an empty title — it's how "never titled" is spelled —
+      // so sending one would raise an error for what is plainly an abandon.
+      const controls = publish({ conversations: [conversation({ id: "c-a", title: "Alpha" })] });
+      render(<ChatConversations />);
+
+      openRowMenu("Alpha");
+      fireEvent.click(screen.getByRole("menuitem", { name: "Rename" }));
+      const input = screen.getByLabelText("Conversation name");
+      fireEvent.change(input, { target: { value: "   " } });
+      fireEvent.blur(input);
+      expect(controls.renameConversation).not.toHaveBeenCalled();
+
+      openRowMenu("Alpha");
+      fireEvent.click(screen.getByRole("menuitem", { name: "Rename" }));
+      fireEvent.blur(screen.getByLabelText("Conversation name"));
+      expect(controls.renameConversation).not.toHaveBeenCalled();
+    });
+
+    it("confirms before deleting, and names the thread it is about to destroy", () => {
+      const controls = publish({ conversations: [conversation({ id: "c-a", title: "Alpha" })] });
+      render(<ChatConversations />);
+
+      openRowMenu("Alpha");
+      fireEvent.click(screen.getByRole("menuitem", { name: "Delete" }));
+
+      // Nothing has happened yet: the confirm is a real gate, not a toast.
+      expect(controls.deleteConversation).not.toHaveBeenCalled();
+      expect(screen.getByText(/Delete “Alpha”\?/)).toBeInTheDocument();
+      expect(screen.getByText(/can’t be undone/)).toBeInTheDocument();
+    });
+
+    it("deletes once the confirm is accepted", async () => {
+      const controls = publish({ conversations: [conversation({ id: "c-a", title: "Alpha" })] });
+      render(<ChatConversations />);
+
+      openRowMenu("Alpha");
+      fireEvent.click(screen.getByRole("menuitem", { name: "Delete" }));
+      fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+
+      await waitFor(() => expect(controls.deleteConversation).toHaveBeenCalledWith("c-a"));
+    });
+
+    it("destroys nothing when the confirm is dismissed", () => {
+      const controls = publish({ conversations: [conversation({ id: "c-a", title: "Alpha" })] });
+      render(<ChatConversations />);
+
+      openRowMenu("Alpha");
+      fireEvent.click(screen.getByRole("menuitem", { name: "Delete" }));
+      fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+      expect(controls.deleteConversation).not.toHaveBeenCalled();
+      expect(screen.queryByText(/Delete “Alpha”\?/)).toBeNull();
+      expect(screen.getByText("Alpha")).toBeInTheDocument();
+    });
+
+    it("deletes the row that was right-clicked, not the active one", () => {
+      // The row menu acts on what the pointer is on. Conflating the two would let a
+      // right-click on an old thread destroy the one being read.
+      const controls = publish({
+        activeConversationId: "c-open",
+        conversations: [
+          conversation({ id: "c-open", title: "Open thread", updatedAt: 2 }),
+          conversation({ id: "c-other", title: "Older thread", updatedAt: 1 }),
+        ],
+      });
+      render(<ChatConversations />);
+
+      openRowMenu("Older thread");
+      fireEvent.click(screen.getByRole("menuitem", { name: "Delete" }));
+      expect(screen.getByText(/Delete “Older thread”\?/)).toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+
+      expect(controls.deleteConversation).toHaveBeenCalledWith("c-other");
+    });
   });
 
   describe("paging", () => {

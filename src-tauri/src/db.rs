@@ -1188,6 +1188,47 @@ pub fn set_conversation_title(conn: &Connection, id: &str, title: &str) -> Resul
     Ok(())
 }
 
+/// Delete a conversation and its messages (issue #109).
+///
+/// A HARD delete, unlike [`delete_note`]'s `deleted_at` tombstone, and the
+/// asymmetry is deliberate. A note tombstone exists to serve two things this
+/// table doesn't have: a Trash the user can restore from, and last-write-wins
+/// reconciliation against a synced copy. Conversations are never touched by the
+/// sync worker — a Personal conversation exists nowhere else, and a workspace
+/// one is server-authoritative with this row acting only as a handle — so a
+/// tombstone here would buy nothing and leave rows the list has to filter
+/// forever. The confirm step in the UI is what stands in for the missing undo.
+///
+/// Messages go first so a failure can't strand them: the orphan check is
+/// `conversation_id`, and a message whose conversation is gone would never be
+/// read or cleaned up again. Deleting a row that doesn't exist is a no-op, which
+/// keeps the command idempotent under a double-click or a retry.
+pub fn delete_conversation(conn: &Connection, id: &str) -> Result<()> {
+    conn.execute("DELETE FROM messages WHERE conversation_id = ?1", params![id])?;
+    conn.execute("DELETE FROM conversations WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
+/// Rename a conversation (issue #109) — the user's override of the title
+/// `derive_title` guessed from the first turn.
+///
+/// Bumps `updated_at`, which needs saying because it has a visible cost: the
+/// lists order by it, so a rename moves the row to the top. That's the right
+/// trade — `updated_at` is what the workspace read-through and the recency
+/// ordering both key off, and a rename that left it stale would let a later
+/// reconcile treat the server's copy as newer and overwrite the new title.
+///
+/// No `title_locked` column is needed to protect this from a later turn: the
+/// send path only titles a conversation when `resolved_title_is_unset` (see
+/// `commands/chat.rs`), so a non-empty title is already never rewritten.
+pub fn rename_conversation(conn: &Connection, id: &str, title: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE conversations SET title = ?1, updated_at = ?2 WHERE id = ?3",
+        params![title, now_ms(), id],
+    )?;
+    Ok(())
+}
+
 /// Back-fill titles for conversations that predate the `title` column (issue
 /// #61). For each NULL-title row, derive a title from its oldest user message
 /// (whitespace-collapsed, char-boundary-truncated) or a date fallback when the
@@ -2249,6 +2290,74 @@ mod tests {
         // The personal conversation is untouched by the workspace one's remote id.
         let personal_reload = latest_conversation(&conn, CHAT_TENANT_PERSONAL, CHAT_SCOPE_NOTE, "note1").unwrap().unwrap();
         assert!(personal_reload.remote_id.is_none());
+    }
+
+    /// Deleting a conversation takes its messages with it and leaves its
+    /// neighbours — including the same Note's OTHER tenant — untouched (#109).
+    #[test]
+    fn delete_conversation_removes_messages_and_only_that_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("conv.sqlite")).unwrap();
+
+        let doomed =
+            create_conversation(&conn, CHAT_TENANT_PERSONAL, CHAT_SCOPE_NOTE, "note1", "note")
+                .unwrap();
+        let keep =
+            create_conversation(&conn, CHAT_TENANT_PERSONAL, CHAT_SCOPE_NOTE, "note1", "note")
+                .unwrap();
+        // Same Note, other tenant: a workspace handle must survive a Personal delete.
+        let other_tenant =
+            create_conversation(&conn, "wsA", CHAT_SCOPE_NOTE, "note1", "note").unwrap();
+        for c in [&doomed, &keep, &other_tenant] {
+            insert_chat_message(&conn, &c.id, "user", "[]").unwrap();
+        }
+
+        delete_conversation(&conn, &doomed.id).unwrap();
+
+        assert!(get_conversation_by_id(&conn, &doomed.id).unwrap().is_none());
+        assert_eq!(
+            conversation_message_count(&conn, &doomed.id).unwrap(),
+            0,
+            "messages go with the conversation — an orphan would never be read or cleaned up"
+        );
+        assert!(get_conversation_by_id(&conn, &keep.id).unwrap().is_some());
+        assert_eq!(conversation_message_count(&conn, &keep.id).unwrap(), 1);
+        assert!(get_conversation_by_id(&conn, &other_tenant.id).unwrap().is_some());
+        assert_eq!(conversation_message_count(&conn, &other_tenant.id).unwrap(), 1);
+
+        // Idempotent: a double-click or a retry must not error.
+        delete_conversation(&conn, &doomed.id).unwrap();
+    }
+
+    /// A rename persists, bumps `updated_at` so the row sorts as freshly touched,
+    /// and is not overwritten by the send path's title derivation (#109). That
+    /// last part is the acceptance criterion, and it holds because the send path
+    /// only titles a conversation whose title is unset.
+    #[test]
+    fn rename_conversation_persists_and_survives_title_derivation() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("conv.sqlite")).unwrap();
+
+        let conv =
+            create_conversation(&conn, CHAT_TENANT_PERSONAL, CHAT_SCOPE_NOTE, "note1", "note")
+                .unwrap();
+        assert!(conv.title.is_none(), "a fresh conversation is untitled");
+        let created_updated_at = conv.updated_at;
+
+        rename_conversation(&conn, &conv.id, "Q3 pricing").unwrap();
+        let renamed = get_conversation_by_id(&conn, &conv.id).unwrap().unwrap();
+        assert_eq!(renamed.title.as_deref(), Some("Q3 pricing"));
+        assert!(
+            renamed.updated_at >= created_updated_at,
+            "a rename touches the row, so recency ordering reflects it"
+        );
+
+        // The send path's guard: a titled conversation is never re-titled, so the
+        // user's override outlives the next turn.
+        assert!(
+            renamed.title.as_deref().is_some_and(|t| !t.trim().is_empty()),
+            "non-empty title → resolved_title_is_unset() is false → derive_title never runs"
+        );
     }
 
     /// A conversation defaults to "note" breadth and the stored value survives a

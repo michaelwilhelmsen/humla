@@ -423,8 +423,7 @@ export const ipc = {
   chatHistory: (noteId: string | null, conversationId: string | null = null) =>
     invoke<ChatHistory>("chat_history", { noteId, conversationId }),
   // List / create chat sessions for a target (issue #61). Personal reads local
-  // SQLite; a workspace reads/creates server-authoritative sessions. There is no
-  // delete command — a deliberate v1 decision.
+  // SQLite; a workspace reads/creates server-authoritative sessions.
   // `limit`/`offset` window the list, most-recent first (issue #95): `/chat`
   // lists conversations uncapped, so it pages them in as the sidebar scrolls.
   // Omitting `limit` returns everything, which is what the Note header's history
@@ -437,6 +436,18 @@ export const ipc = {
     }),
   chatNewConversation: (noteId: string | null) =>
     invoke<ConversationMeta>("chat_new_conversation", { noteId }),
+  // Delete / rename a conversation (issue #109). `conversationId` is REQUIRED on
+  // both — unlike the read commands, neither falls back to "the active one", so a
+  // missing id can't destroy or relabel whatever happens to be newest.
+  //
+  // In a workspace both go to the server first and abort if it refuses (only the
+  // thread's creator, or a workspace owner/admin, may do either). Delete is
+  // idempotent, so a retry after a partial failure is safe; rename returns the
+  // updated row so the caller doesn't have to re-list to see the new title.
+  chatDeleteConversation: (noteId: string | null, conversationId: string) =>
+    invoke<void>("chat_delete_conversation", { noteId, conversationId }),
+  chatRenameConversation: (noteId: string | null, conversationId: string, title: string) =>
+    invoke<ConversationMeta>("chat_rename_conversation", { noteId, conversationId, title }),
   // Persist / read the Scope chip's breadth on a conversation (issue #58/#61).
   // The single source of truth for retrieval breadth.
   chatSetBreadth: (noteId: string | null, conversationId: string | null, breadth: ChatScope) =>

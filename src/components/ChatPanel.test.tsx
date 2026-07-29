@@ -286,6 +286,174 @@ describe("ChatPanel sessions (#62)", () => {
     expect(controls.current?.activeConversationId).toBe("c1");
   });
 
+  // Delete + rename (#109). The panel owns the list, so it owns what happens to
+  // the pane afterwards — which is the part a UI test can't see.
+  describe("delete + rename (#109)", () => {
+    const twoConversations = {
+      provider_key_get: () => "sk-test",
+      chat_history: () => ({ conversationId: "c1", messages: [] }),
+      chat_list_conversations: () => [
+        { id: "c1", title: "Open thread", breadth: "note", updatedAt: 20, messageCount: 2 },
+        { id: "c2", title: "Older thread", breadth: "note", updatedAt: 10, messageCount: 4 },
+      ],
+    };
+
+    it("drops a deleted row from the list", async () => {
+      const deleted: string[] = [];
+      mockTauri({
+        ...twoConversations,
+        chat_delete_conversation: (args) => {
+          const { conversationId } = args as { conversationId: string };
+          deleted.push(conversationId);
+          return null;
+        },
+      });
+      const controls = renderWithControls();
+      await waitFor(() => expect(controls.current?.conversations).toHaveLength(2));
+
+      await controls.current!.deleteConversation("c2");
+
+      expect(deleted).toEqual(["c2"]);
+      await waitFor(() => expect(controls.current?.conversations).toHaveLength(1));
+      expect(controls.current?.conversations[0].id).toBe("c1");
+      // The open conversation is untouched — deleting another row is not a switch.
+      expect(controls.current?.activeConversationId).toBe("c1");
+    });
+
+    it("lands on a fresh chat when the OPEN conversation is deleted", async () => {
+      // The acceptance criterion: never leave the pane pointing at a dead id, or
+      // the next send would resurrect it.
+      //
+      // The backing list is STATEFUL here, because `newChat` re-lists from the
+      // backend — a fake that kept returning the deleted row would assert that we
+      // tolerate a list contradicting the delete, which is the opposite of the
+      // guarantee. This shape also proves the row doesn't come back on the reload.
+      const rows = [
+        { id: "c1", title: "Open thread", breadth: "note", updatedAt: 20, messageCount: 2 },
+        { id: "c2", title: "Older thread", breadth: "note", updatedAt: 10, messageCount: 4 },
+      ];
+      mockTauri({
+        provider_key_get: () => "sk-test",
+        chat_history: () => ({ conversationId: "c1", messages: [] }),
+        chat_list_conversations: () => [...rows],
+        chat_delete_conversation: (args) => {
+          const { conversationId } = args as { conversationId: string };
+          const i = rows.findIndex((r) => r.id === conversationId);
+          if (i >= 0) rows.splice(i, 1);
+          return null;
+        },
+        chat_new_conversation: () => {
+          const fresh = {
+            id: "c-fresh",
+            title: "",
+            breadth: "note",
+            updatedAt: 30,
+            messageCount: 0,
+          };
+          rows.unshift(fresh);
+          return fresh;
+        },
+      });
+      const controls = renderWithControls();
+      await waitFor(() => expect(controls.current?.activeConversationId).toBe("c1"));
+
+      await controls.current!.deleteConversation("c1");
+
+      await waitFor(() => expect(controls.current?.activeConversationId).toBe("c-fresh"));
+      expect(controls.current?.conversations.some((c) => c.id === "c1")).toBe(false);
+    });
+
+    it("keeps the row when the backend refuses the delete", async () => {
+      // A failed delete that removed the row anyway would read as success and leave
+      // the list disagreeing with the backend.
+      mockTauri({
+        ...twoConversations,
+        chat_delete_conversation: () => {
+          throw new Error("Only the conversation's creator can delete it.");
+        },
+      });
+      const controls = renderWithControls();
+      await waitFor(() => expect(controls.current?.conversations).toHaveLength(2));
+
+      await controls.current!.deleteConversation("c2");
+
+      expect(controls.current?.conversations).toHaveLength(2);
+      expect(await screen.findByText(/creator can delete/)).toBeInTheDocument();
+    });
+
+    it("renames optimistically and adopts the row the backend returns", async () => {
+      mockTauri({
+        ...twoConversations,
+        chat_rename_conversation: (args) => ({
+          id: "c2",
+          title: (args as { title: string }).title,
+          breadth: "note",
+          updatedAt: 99,
+          messageCount: 4,
+        }),
+      });
+      const controls = renderWithControls();
+      await waitFor(() => expect(controls.current?.conversations).toHaveLength(2));
+
+      await controls.current!.renameConversation("c2", "Q3 pricing");
+
+      await waitFor(() => {
+        const row = controls.current?.conversations.find((c) => c.id === "c2");
+        expect(row?.title).toBe("Q3 pricing");
+        // The bumped timestamp comes back with it, so ordering tracks the rename.
+        expect(row?.updatedAt).toBe(99);
+      });
+    });
+
+    it("does not store the placeholder label as a real title", async () => {
+      // Both editors seed from the row's DISPLAYED label, so an untitled thread
+      // offers "New chat". Accepting that unchanged must not write it: a stored
+      // title is what stops the first turn from naming the thread, so this would
+      // make the placeholder permanent.
+      let renames = 0;
+      mockTauri({
+        provider_key_get: () => "sk-test",
+        chat_history: () => ({ conversationId: "c1", messages: [] }),
+        chat_list_conversations: () => [
+          { id: "c1", title: "", breadth: "note", updatedAt: 20, messageCount: 0 },
+          { id: "c2", title: "Older thread", breadth: "note", updatedAt: 10, messageCount: 4 },
+        ],
+        chat_rename_conversation: () => {
+          renames += 1;
+          return null;
+        },
+      });
+      const controls = renderWithControls();
+      await waitFor(() => expect(controls.current?.conversations).toHaveLength(2));
+
+      await controls.current!.renameConversation("c1", "New chat");
+      expect(renames).toBe(0);
+
+      // A genuine name still goes through.
+      await controls.current!.renameConversation("c1", "Kickoff questions");
+      expect(renames).toBe(1);
+    });
+
+    it("puts the old title back when a rename is refused", async () => {
+      mockTauri({
+        ...twoConversations,
+        chat_rename_conversation: () => {
+          throw new Error("A conversation needs a name.");
+        },
+      });
+      const controls = renderWithControls();
+      await waitFor(() => expect(controls.current?.conversations).toHaveLength(2));
+
+      await controls.current!.renameConversation("c2", "doomed rename");
+
+      await waitFor(() =>
+        expect(controls.current?.conversations.find((c) => c.id === "c2")?.title).toBe(
+          "Older thread",
+        ),
+      );
+    });
+  });
+
   // Paging (#95): `/chat` lists conversations uncapped in the sidebar, so the
   // panel fetches them a page at a time. It owns the list, so it owns the paging.
   describe("paging", () => {

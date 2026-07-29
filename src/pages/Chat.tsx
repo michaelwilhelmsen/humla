@@ -25,11 +25,13 @@
 // pretends to. Also absent: a scope picker (its only option would be "All notes";
 // narrowing stays a tool argument the model chooses, per #81).
 
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { useOutletContext } from "react-router-dom";
-import { Lock, Sparkles, Users, type LucideIcon } from "lucide-react";
+import { Lock, MoreHorizontal, Sparkles, Users, type LucideIcon } from "lucide-react";
 import { ChatPanel } from "../components/ChatPanel";
 import { ChatHistoryControls } from "../components/ChatHistoryControls";
+import { ContextMenu, ContextMenuItem } from "../components/ContextMenu";
+import { Modal } from "./settings/components/Modal";
 import type { LayoutOutletContext } from "../components/Layout";
 import { useGlobalChatStore } from "../lib/globalChat";
 import { useCloudStore } from "../lib/cloud";
@@ -61,6 +63,9 @@ export function Chat() {
   const controls = useGlobalChatStore((s) => s.controls);
   const setControls = useGlobalChatStore((s) => s.setControls);
   const workspaceName = useCloudStore((s) => s.status.current_workspace?.name ?? null);
+  const [menuPos, setMenuPos] = useState<{ x: number; y: number } | null>(null);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [deleting, setDeleting] = useState(false);
 
   // Clear on the way out, or the sidebar would keep rendering a list belonging to
   // a pane that no longer exists. (`ChatPanel` publishes `null` when chat isn't
@@ -73,6 +78,29 @@ export function Chat() {
   const active =
     controls?.conversations.find((c) => c.id === controls.activeConversationId) ?? null;
   const barTitle = active?.title.trim() || "Chat";
+
+  // The ⋯ menu only has something to offer once a conversation exists to act on —
+  // an empty new chat has nothing to delete, and offering a disabled item would be
+  // noise. Same reasoning the Note toolbar uses to gate Export on `note`.
+  const canActOnConversation = controls !== null && active !== null;
+
+  async function deleteActive() {
+    if (!controls || !active) return;
+    setDeleting(true);
+    try {
+      await controls.deleteConversation(active.id);
+    } finally {
+      setDeleting(false);
+      setConfirmDelete(false);
+    }
+  }
+
+  function openMenu(e: React.MouseEvent<HTMLButtonElement>) {
+    // Anchored under the button, like the Note toolbar's ⋯ — a bar action opens
+    // beneath itself, where a row's menu opens at the pointer.
+    const rect = e.currentTarget.getBoundingClientRect();
+    setMenuPos({ x: rect.right - 160, y: rect.bottom + 4 });
+  }
 
   return (
     <div className="h-full flex flex-col overflow-hidden">
@@ -129,7 +157,56 @@ export function Chat() {
             is open it IS the history, and the popover would be a second copy of
             it; collapsed, the popover is the only way back to a past thread. */}
         {controls && <ChatHistoryControls controls={controls} showHistory={sidebarCollapsed} />}
+
+        {/* Delete lives here as well as on the sidebar row, mirroring the Note
+            view: the row's menu is for acting on a thread you're pointing at, and
+            this is for acting on the one you're reading. Without it, deleting the
+            open conversation would mean hunting for its row. */}
+        {canActOnConversation && (
+          <button onClick={openMenu} className="no-drag nd-btn-icon" title="More" aria-label="More">
+            <MoreHorizontal size={16} strokeWidth={1.7} />
+          </button>
+        )}
+        {menuPos && (
+          <ContextMenu x={menuPos.x} y={menuPos.y} onClose={() => setMenuPos(null)}>
+            <ContextMenuItem
+              onClick={() => {
+                setMenuPos(null);
+                setConfirmDelete(true);
+              }}
+              danger
+            >
+              Delete conversation
+            </ContextMenuItem>
+          </ContextMenu>
+        )}
       </div>
+
+      {/* Same confirm as the sidebar's, for the same reason: no Trash, no undo. */}
+      <Modal
+        open={confirmDelete}
+        onClose={() => {
+          if (!deleting) setConfirmDelete(false);
+        }}
+        title="Delete conversation"
+      >
+        <p className="text-[14px] text-[var(--color-text)]">
+          Delete “{barTitle}”? Its messages go with it, and this can’t be undone.
+        </p>
+        <div className="flex justify-end gap-2 mt-5">
+          <button className="nd-btn" onClick={() => setConfirmDelete(false)} disabled={deleting}>
+            Cancel
+          </button>
+          <button
+            className="nd-btn"
+            style={{ color: "var(--color-danger)" }}
+            onClick={() => void deleteActive()}
+            disabled={deleting}
+          >
+            Delete
+          </button>
+        </div>
+      </Modal>
 
       {/* Just the conversation: the log fills the height (so a new chat's prompt
           cards sit centred in it) and the composer is seated at the bottom. */}
