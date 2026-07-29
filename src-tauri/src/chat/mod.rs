@@ -292,7 +292,11 @@ pub fn max_steps_for(scope: &ToolScope) -> usize {
 /// Composed here rather than baked into [`SYSTEM_PROMPT`] so the mirrored constant
 /// stays byte-identical across the two repos and the assembly stays testable with
 /// a fixed clock.
-pub fn system_prompt_with_context(now_ms: i64, asker: Option<&str>) -> String {
+pub fn system_prompt_with_context(
+    now_ms: i64,
+    asker: Option<&str>,
+    reach: Option<Reach<'_>>,
+) -> String {
     use chrono::{TimeZone, Utc};
     let mut out = SYSTEM_PROMPT.to_string();
     if let Some(dt) = Utc.timestamp_millis_opt(now_ms).single() {
@@ -304,7 +308,64 @@ pub fn system_prompt_with_context(now_ms: i64, asker: Option<&str>) -> String {
              transcripts, where their own speech may be labelled \"You:\" or with their name."
         ));
     }
+    if let Some(line) = reach.and_then(reach_disclosure) {
+        out.push('\n');
+        out.push('\n');
+        out.push_str(&line);
+    }
     out
+}
+
+/// What this conversation can retrieve from, for disclosure only (issue #113).
+///
+/// `None` at the call site means the whole library, which is deliberately SILENT:
+/// announcing "you can see everything" on every broad turn is noise, and the
+/// silence is what makes the disclosure meaningful when it does appear.
+#[derive(Debug, Clone, Copy)]
+pub enum Reach<'a> {
+    /// One note, by title — the pane's anchor under `note` breadth.
+    Note(&'a str),
+    /// One folder, by name.
+    Folder(&'a str),
+}
+
+/// The disclosure sentence for a narrowed reach, or `None` when there is nothing
+/// honest to say.
+///
+/// Breadth clamps every search and listing the turn makes, and until #113 the model
+/// was never told — so under `folder` it could search, find nothing, and report
+/// "there's no mention of that anywhere in your notes" when what it established was
+/// "not in this folder". Same failure as #106's counted zero, one level up, and
+/// worse in one respect: breadth is the *user's* narrowing, so the model cannot
+/// infer it from the tool results either.
+///
+/// Two things it does NOT do. It doesn't fire library-wide (see [`Reach`]). And it
+/// stays silent on a blank name rather than emitting "restricted to the folder ''",
+/// which is worse than nothing — the model can't tell a bug from a real narrowing.
+///
+/// Kept terse on purpose. A small model re-litigates long constraint blocks, and
+/// this sits next to #103's authorship-pin paragraph; two walls of "you cannot see
+/// everything" would drown each other out.
+fn reach_disclosure(reach: Reach<'_>) -> Option<String> {
+    match reach {
+        Reach::Note(title) => {
+            let title = title.trim();
+            (!title.is_empty()).then(|| format!(
+                "This conversation is about ONE note: \"{title}\". Every search and listing you run \
+                 is confined to it and you cannot widen it — so an empty result means \"not in this \
+                 note\", never \"not anywhere\"."
+            ))
+        }
+        Reach::Folder(name) => {
+            let name = name.trim();
+            (!name.is_empty()).then(|| format!(
+                "The user has restricted this conversation to the folder \"{name}\". Every search \
+                 and listing you run is confined to it and you cannot widen it — so an empty result \
+                 means \"not in this folder\", never \"not anywhere in your notes\". Say which when \
+                 it matters."
+            ))
+        }
+    }
 }
 
 /// Budget for prior turns. Older turns beyond it are dropped (oldest first).
@@ -450,7 +511,25 @@ pub async fn run_chat(
     // One clock reading per turn, shared by the prompt's date line and the tools'
     // relative date window, so a turn can't disagree with itself about "now".
     let now_ms = chrono::Utc::now().timestamp_millis();
-    let base = assemble_prompt(&system_prompt_with_context(now_ms, asker), grounding, &turns)?;
+    // What this conversation can retrieve from, resolved to a NAME for disclosure
+    // (#113). `ToolScope` carries ids; the prompt has to say "the folder \"K2 pilot\"",
+    // not an id the user never sees. Scoped so no lock is held across an await, and
+    // a missing row degrades to no disclosure rather than to a blank name.
+    let (anchor_title, anchor_folder) = {
+        let conn = db.lock();
+        match scope {
+            ToolScope::Note(id) => (db::get_note(&conn, id).ok().map(|n| n.title), None),
+            ToolScope::Folder(id) => (None, db::folder_name(&conn, id).ok().flatten()),
+            ToolScope::All => (None, None),
+        }
+    };
+    let reach = match scope {
+        ToolScope::Note(_) => anchor_title.as_deref().map(Reach::Note),
+        ToolScope::Folder(_) => anchor_folder.as_deref().map(Reach::Folder),
+        ToolScope::All => None,
+    };
+    let base =
+        assemble_prompt(&system_prompt_with_context(now_ms, asker, reach), grounding, &turns)?;
     eprintln!(
         "[chat] provider={} model={} turns={} grounding_chars={}",
         adapter.provider_id(),
@@ -885,6 +964,67 @@ mod tests {
             prompt.contains("couldn't find it"),
             "a genuine miss must still be reported plainly"
         );
+    }
+
+    /// A fixed clock for the prompt-assembly tests, so a date line can be asserted
+    /// without depending on the wall clock.
+    const NOW: i64 = 1_785_024_000_000;
+
+    /// Issue #113. Breadth clamps every retrieval the turn makes and the model was
+    /// never told, so under `folder` it could search, find nothing, and answer
+    /// "there's no mention of that anywhere in your notes" — when what it
+    /// established was "not in this folder". Same failure class as #106's counted
+    /// zero, one level up, and worse: breadth is the USER's narrowing, so the model
+    /// cannot infer it from the results either.
+    #[test]
+    fn the_prompt_discloses_a_narrowed_reach_and_stays_silent_on_a_whole_one() {
+        // Library-wide: SILENT. Not an oversight — saying "you can see everything"
+        // on every broad turn is noise, and it is the silence that makes the
+        // disclosure meaningful when it does appear.
+        // Asserted against the disclosure's own phrases, not a common word like
+        // "only" — that would break the moment SYSTEM_PROMPT happened to use it.
+        let all = system_prompt_with_context(NOW, None, None);
+        assert!(!all.contains("cannot widen"), "a whole-library turn discloses nothing:\n{all}");
+        assert!(!all.contains("confined to"));
+
+        // Folder: named, stated as unliftable, and told what an empty result means.
+        let folder = system_prompt_with_context(NOW, None, Some(Reach::Folder("K2 pilot")));
+        assert!(folder.contains("K2 pilot"), "the folder must be NAMED, not just implied");
+        assert!(folder.contains("cannot widen"), "the clamp is stated, not offered");
+        assert!(
+            folder.to_lowercase().contains("not in this folder"),
+            "an empty result must be given its honest meaning:\n{folder}"
+        );
+
+        // Note: one sentence, naming it. The grounding block already says
+        // "reference material about the current note", but that is not the same
+        // claim — a note-anchored pane can have breadth `all`, so grounding tells
+        // the model a note EXISTS, never that it is the only one searchable.
+        let note = system_prompt_with_context(NOW, None, Some(Reach::Note("Kickoff with K2")));
+        assert!(note.contains("Kickoff with K2"));
+        assert!(note.contains("cannot widen"));
+
+        // The disclosures compose with #103's authorship pin without either being
+        // swallowed — a pane can be narrowed on both axes at once.
+        let both = system_prompt_with_context(NOW, Some("Michael"), Some(Reach::Folder("K2 pilot")));
+        assert!(both.contains("K2 pilot"));
+        assert!(both.contains("Michael"));
+    }
+
+    /// A blank or whitespace name must NOT produce a disclosure, because the
+    /// sentence would read "restricted to the folder ''" — worse than silence, and
+    /// the model cannot tell it is a bug rather than a real narrowing.
+    #[test]
+    fn a_reach_with_no_usable_name_discloses_nothing() {
+        for name in ["", "   "] {
+            let folder = system_prompt_with_context(NOW, None, Some(Reach::Folder(name)));
+            assert!(
+                !folder.contains("cannot widen"),
+                "a nameless folder reach must stay silent, got:\n{folder}"
+            );
+            let note = system_prompt_with_context(NOW, None, Some(Reach::Note(name)));
+            assert!(!note.contains("cannot widen"), "same for a nameless note reach");
+        }
     }
 
     #[test]
@@ -1514,7 +1654,7 @@ mod tests {
     /// the questions people actually ask are unresolvable.
     #[test]
     fn the_prompt_names_who_is_asking_and_ties_them_to_the_transcript() {
-        let p = system_prompt_with_context(1_785_024_000_000, Some("Michael"));
+        let p = system_prompt_with_context(1_785_024_000_000, Some("Michael"), None);
         assert!(p.contains("You are talking to Michael."), "{p}");
         assert!(p.contains("\"I\", \"me\" and \"my\" mean Michael"), "{p}");
         // The user's own speech is labelled `You:` on remote calls and often
@@ -1531,7 +1671,7 @@ mod tests {
     #[test]
     fn an_unknown_asker_costs_nothing_but_the_asker_line() {
         for asker in [None, Some(""), Some("   ")] {
-            let p = system_prompt_with_context(1_785_024_000_000, asker);
+            let p = system_prompt_with_context(1_785_024_000_000, asker, None);
             assert!(!p.contains("You are talking to"), "{asker:?}");
             assert!(p.contains("Today's date is 2026-07-26."), "{asker:?}");
         }
@@ -1539,7 +1679,7 @@ mod tests {
 
     #[test]
     fn the_prompt_tells_the_model_todays_date_without_touching_the_mirrored_constant() {
-        let with_date = system_prompt_with_context(1_785_024_000_000, None); // 2026-07-26
+        let with_date = system_prompt_with_context(1_785_024_000_000, None, None); // 2026-07-26
         assert!(with_date.starts_with(SYSTEM_PROMPT));
         assert!(with_date.contains("Today's date is 2026-07-26."));
         // Every tool result carries absolute note dates; without this line the

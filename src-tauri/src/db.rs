@@ -459,6 +459,21 @@ pub fn create_folder(conn: &Connection, name: &str, workspace: &str) -> Result<F
     .map_err(Into::into)
 }
 
+/// One folder's display name, or `None` when the id matches nothing.
+///
+/// Added for #113's breadth disclosure: the chat prompt has to NAME the folder it is
+/// confined to, and `ToolScope::Folder` carries only the id. `Ok(None)` for a missing
+/// row rather than an error, because a stale scope id must degrade to saying nothing
+/// — never to failing the turn.
+pub fn folder_name(conn: &Connection, id: &str) -> Result<Option<String>> {
+    let found = conn
+        .query_row("SELECT name FROM folders WHERE id = ?1", params![id], |r| {
+            r.get::<_, String>(0)
+        })
+        .optional()?;
+    Ok(found)
+}
+
 pub fn rename_folder(conn: &Connection, id: &str, name: &str) -> Result<()> {
     let now = now_ms();
     conn.execute(
