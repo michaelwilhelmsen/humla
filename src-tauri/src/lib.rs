@@ -376,6 +376,7 @@ where
             commands::chat_key_set_from_keychain,
             commands::chat_key_delete,
             commands::chat_reindex_note,
+            commands::chat_rebuild_index,
             commands::permissions_status,
             commands::permissions_request,
             commands::permissions_open_settings,

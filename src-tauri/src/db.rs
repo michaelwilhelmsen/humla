@@ -1854,6 +1854,29 @@ pub fn remove_note_chunks(conn: &Connection, note_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Every live note's id, oldest first — the work-list for the user-triggered
+/// "rebuild search index" action (#104).
+///
+/// Distinct from [`note_ids_needing_reindex`], which is a *lazy* startup backfill
+/// keyed on sentinels for notes that were never indexed. A chunking-shape change
+/// invalidates notes that look perfectly indexed, and there is no sentinel for
+/// "chunked before turn-packing" — so repairing an existing library means walking
+/// all of them. Deliberately NOT wired into startup: re-chunking changes every
+/// chunk's `text_hash`, which misses the embedding cache and re-embeds the whole
+/// library on the user's own API key. Cheap in absolute terms (cents), but not
+/// something to spend unasked, so the user asks for it.
+///
+/// Oldest first because old meetings are exactly what a "briefing on X" query
+/// needs, and they are the ones that would otherwise never be re-opened.
+pub fn live_note_ids(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt =
+        conn.prepare("SELECT id FROM notes WHERE deleted_at IS NULL ORDER BY created_at ASC")?;
+    let ids = stmt
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(ids)
+}
+
 /// Ids of live notes needing a (re)index — the startup-backfill work-list.
 /// Covers notes with no chunks (pre-#47) AND notes whose chunks predate the
 /// #48 `text_hash` column (so re-chunking backfills the embedding key). Cheap
@@ -3532,6 +3555,33 @@ mod tests {
         for c in chunks.iter().filter(|c| c.source != "transcript") {
             assert!(c.speakers.is_empty(), "{} must claim no speakers", c.source);
         }
+    }
+
+    #[test]
+    fn live_note_ids_covers_every_live_note_and_no_trashed_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("t.sqlite")).unwrap();
+        let keep_a = create_note(&conn, "en", "meeting", "").unwrap().id;
+        let keep_b = create_note(&conn, "en", "meeting", "").unwrap().id;
+        let trashed = create_note(&conn, "en", "meeting", "").unwrap().id;
+        delete_note(&conn, &trashed).unwrap();
+
+        let ids = live_note_ids(&conn).unwrap();
+        assert!(ids.contains(&keep_a) && ids.contains(&keep_b));
+        assert!(!ids.contains(&trashed), "a trashed note is not reindexed");
+
+        // Unlike the lazy startup backfill, this includes notes that ALREADY have
+        // chunks — a chunking-shape change invalidates rows that look fine, and
+        // there is no sentinel for "chunked before turn-packing".
+        reindex_note(&conn, &keep_a, "", "Michael: hi", "").unwrap();
+        assert!(
+            live_note_ids(&conn).unwrap().contains(&keep_a),
+            "an already-indexed note still needs rebuilding"
+        );
+        assert!(
+            !note_ids_needing_reindex(&conn).unwrap().contains(&keep_a),
+            "...which is exactly what the lazy work-list does NOT cover"
+        );
     }
 
     /// Issue #121, which ADR-0002 turns from untidiness into a rule: derived person

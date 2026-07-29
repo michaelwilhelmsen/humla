@@ -151,6 +151,39 @@ pub async fn embed_backfill(app: AppHandle) {
     eprintln!("[chat] embedding backfill complete");
 }
 
+/// Rebuild the retrieval index for the WHOLE library (issue #104).
+///
+/// The only way to repair an existing library after a chunking-shape change. The
+/// startup backfill is keyed on sentinels for never-indexed notes, so it cannot see
+/// a note whose chunks are present but built the old way — and without this, an
+/// archive would stay hard-split until each note happened to be opened, which is
+/// precisely the wrong outcome: old meetings are what a "briefing on X" query needs.
+///
+/// Deliberately user-triggered rather than automatic. Re-chunking changes every
+/// chunk's `text_hash`, so the embedding cache misses and the library re-embeds on
+/// the user's own API key — cents, but not to be spent unasked.
+///
+/// Returns the number of notes rebuilt. Embedding is kicked off afterwards and
+/// reuses `embed_backfill`, which already finds exactly the chunks missing vectors
+/// under the current model, so the two stay one mechanism rather than two.
+#[tauri::command]
+pub fn chat_rebuild_index(app: AppHandle) -> Result<usize, String> {
+    let state: State<AppState> = app.state();
+    let ids = {
+        let conn = state.db.lock();
+        db::live_note_ids(&conn).map_err(super::err)?
+    };
+    // One lock acquisition per note, not one for the whole loop: a large library
+    // would otherwise hold the connection long enough to stall every other command.
+    for id in &ids {
+        let conn = state.db.lock();
+        reindex_note_content(&conn, id);
+    }
+    eprintln!("[chat] rebuilt retrieval chunks for {} note(s)", ids.len());
+    tauri::async_runtime::spawn(embed_backfill(app.clone()));
+    Ok(ids.len())
+}
+
 /// Rebuild a Note's retrieval index on demand — the frontend calls this when
 /// the Note view unmounts, so edits made without triggering summarize/diarize
 /// still land in search. Re-chunks synchronously, then embeds off the request
