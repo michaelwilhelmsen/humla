@@ -1628,7 +1628,7 @@ async fn chat_send_cloud(
     draft: DraftSettings,
 ) -> Result<ChatSendResult, String> {
     let state: State<AppState> = app.state();
-    let (workspace, folder_id, title, conversation, breadth, owner_filter) = {
+    let (workspace, folder_id, title, conversation, breadth, owner_filter, folder_display) = {
         let conn = state.db.lock();
         let ctx = ChatContext::load(&conn);
         let Some(workspace) = ctx.workspace() else {
@@ -1648,6 +1648,14 @@ async fn chat_send_cloud(
         // and binding the same way: it's the user's stated intent, so it applies
         // whatever the model asks for.
         let owner_filter = conversation.owner_filter.clone();
+        // The folder's display NAME for #113's breadth disclosure — the server has to
+        // say `the folder "K2 pilot"`, and the scope carries only an id the user has
+        // never seen. Resolved here beside the folder id it names; `None` degrades to
+        // no disclosure rather than to an empty quoted string.
+        let folder_display = note
+            .as_ref()
+            .and_then(|n| n.folder_id.clone())
+            .and_then(|id| db::folder_name(&conn, &id).ok().flatten());
         (
             workspace.to_string(),
             note.as_ref().and_then(|n| n.folder_id.clone()),
@@ -1657,6 +1665,7 @@ async fn chat_send_cloud(
             conversation,
             breadth,
             owner_filter,
+            folder_display,
         )
     };
 
@@ -1672,6 +1681,11 @@ async fn chat_send_cloud(
         // roster; the id is what the server filters on.
         (!owner_filter.trim().is_empty())
             .then(|| (owner_filter.as_str(), owner_name.as_deref().unwrap_or(""))),
+        // Display names for #113's disclosure. `title` IS the anchor note's title
+        // here (the server derives a conversation title from it), so it doubles as
+        // the note-breadth name rather than being resolved twice.
+        Some(title.as_str()).filter(|t| !t.trim().is_empty()),
+        folder_display.as_deref(),
     )?;
 
     // Stream the turn, retrying once after a 401 (a stale cached token → forget
@@ -2865,6 +2879,8 @@ mod tests {
             Some("roundtrip test"),
             "all",
             Some("roundtrip-anchor"),
+            None,
+            None,
             None,
             None,
         )
