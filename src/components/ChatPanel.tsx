@@ -973,8 +973,29 @@ export function ChatPanel({
       // on the live pane and the error copy shows instead.)
       void refreshActivation(gen);
       try {
-        const h = await ipc.chatHistory(noteId, conversationId);
-        if (gen === switchGenRef.current) setMessages(h.messages);
+        // A first turn sent from a draft may have CREATED the conversation before
+        // failing: the backend persists the user message, then drops only the
+        // assistant placeholder (`run_chat`'s rollback). We never received its id,
+        // because the throw beat the assignment above — so recover it from the list
+        // rather than refetching with `null`, which on a drafting target resolves to
+        // nothing and would blank the question the user just typed while a one-sided
+        // row appeared in the sidebar. Adopting it also means a retry continues that
+        // thread instead of starting a second one.
+        let recovered = conversationId;
+        if (!recovered) {
+          const list = await ipc.chatListConversations(noteId, { limit: 1, offset: 0 });
+          recovered = list?.[0]?.id ?? null;
+        }
+        // Still nothing persisted (the send failed before creating anything) → keep
+        // the optimistic view, which is the only place the message now exists.
+        if (recovered) {
+          const h = await ipc.chatHistory(noteId, recovered);
+          if (gen === switchGenRef.current) {
+            setConversationId(recovered);
+            setMessages(h.messages);
+          }
+          void reloadConversationList(gen);
+        }
       } catch {
         /* keep the optimistic view */
       }

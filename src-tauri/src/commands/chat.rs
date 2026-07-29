@@ -668,6 +668,43 @@ pub struct DraftSettings {
     pub owner_filter: Option<String>,
 }
 
+/// Check a draft's pending settings against the same rules their dedicated
+/// setters enforce (issue #120).
+///
+/// `chat_set_breadth` rejects a value outside the vocabulary and a non-`all`
+/// breadth on a library-wide target; `chat_set_owner_filter` rejects a pin in
+/// Personal, where every note is the caller's own already. `DraftSettings` writes
+/// the same two columns, so it answers to the same rules — a chip that can't
+/// produce an illegal value today is not a reason for the command to accept one.
+fn validated_draft(
+    state: &State<'_, AppState>,
+    target: &ChatTarget,
+    breadth: Option<String>,
+    owner_filter: Option<String>,
+) -> Result<DraftSettings, String> {
+    if let Some(b) = breadth.as_deref() {
+        chat::validate_breadth(b)?;
+        if matches!(target, ChatTarget::Global) && b != "all" {
+            return Err("A library-wide chat always searches all notes.".into());
+        }
+    }
+    // An empty string is "no pin", not a pin on nobody — normalise it away rather
+    // than storing it, so the created row reads the same as one that never had one.
+    let owner_filter = owner_filter.filter(|o| !o.trim().is_empty());
+    if owner_filter.is_some() {
+        let personal = {
+            let conn = state.db.lock();
+            matches!(ChatContext::load(&conn), ChatContext::Personal)
+        };
+        if personal {
+            return Err(
+                "Filtering by author needs a workspace — in Personal every note is yours.".into()
+            );
+        }
+    }
+    Ok(DraftSettings { breadth, owner_filter })
+}
+
 /// Resolve the active session, creating one when none applies.
 ///
 /// Creation happens either because the target has no session yet, or — on a
@@ -692,7 +729,12 @@ fn resolve_or_create(
     let breadth = draft.breadth.unwrap_or_else(|| inherited_breadth(conn, tenant, target));
     let conv = db::create_conversation(conn, tenant, target.scope(), target.scope_id(), &breadth)
         .map_err(|e| e.to_string())?;
-    match draft.owner_filter.as_deref() {
+    match draft.owner_filter.as_deref().map(str::trim) {
+        // Blank is "no pin", checked here as well as in `validated_draft`: this is
+        // the layer that writes, and it shouldn't depend on a validator having run
+        // first. A stored "   " would be a pin on nobody — a third state retrieval
+        // would then need an opinion about.
+        //
         // Written as a second statement rather than a wider INSERT: the pin is
         // rare, and `create_conversation` is on every path that makes a row.
         Some(owner) if !owner.is_empty() => {
@@ -1344,10 +1386,14 @@ pub async fn chat_send(
     draft_breadth: Option<String>,
     draft_owner_filter: Option<String>,
 ) -> Result<ChatSendResult, String> {
-    let draft =
-        DraftSettings { breadth: draft_breadth, owner_filter: draft_owner_filter };
     let target = ChatTarget::from_note_id(note_id)?;
     let state: State<AppState> = app.state();
+    // Validated on the way in, to the same standard as `chat_set_breadth` and
+    // `chat_set_owner_filter`. These two fields reach the same columns those
+    // commands guard, so accepting them unchecked here would be a second, unguarded
+    // door onto the same state — and the frontend enforcing it is not the same as
+    // the backend enforcing it.
+    let draft = validated_draft(&state, &target, draft_breadth, draft_owner_filter)?;
     // Chat is pinned to the loaded context (issue #58): a loaded workspace →
     // the Teams (cloud) path; Personal (no workspace) → the on-device path
     // below. There is no user-chosen tenant — it follows the sidebar workspace.
@@ -2086,7 +2132,14 @@ async fn list_conversations_cloud(
                 target.scope(),
                 target.scope_id(),
                 None,
-                list_filter_for(target),
+                // NOT `list_filter_for` — deliberately. This reads LOCAL handles for
+                // a workspace, and a workspace's messages live in PocketBase and are
+                // never written to the local table, so a `WithMessages` filter here
+                // matches nothing and would drop every server-omitted handle from
+                // the union. The empty-thread filter for a workspace is applied
+                // above, off the SERVER's `message_count`, which is the only count
+                // that means anything for these rows.
+                db::ListFilter::All,
             )
                 .map_err(|e| e.to_string())?;
         unlisted_legacy_handles(&server_remote_ids, &local_handles)
@@ -2516,7 +2569,6 @@ mod tests {
         assert_eq!(inherited_breadth(&conn, CHAT_TENANT_PERSONAL, &ChatTarget::Note("n1".into())), "note");
     }
 
-    #[test]
     /// A library-wide pane opens on an unsaved draft, a Note's pane resumes that
     /// Note's most-recent thread (#120, the divergence chosen deliberately).
     ///
@@ -2609,6 +2661,26 @@ mod tests {
             resolve_or_create(&conn, CHAT_TENANT_PERSONAL, &note, None, DraftSettings::default())
                 .unwrap();
         assert_eq!(resolved.id, existing.id, "a Note's bare send continues its thread");
+    }
+
+    /// An empty pin string is normalised to "no pin" rather than stored (#120).
+    ///
+    /// The wire carries `""` for "off" in places, and a row storing `""` must read
+    /// identically to one that never had a pin — otherwise "pinned to nobody"
+    /// becomes a state that retrieval has to have an opinion about.
+    #[test]
+    fn a_drafts_blank_pin_is_no_pin_at_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = db::open(&dir.path().join("blankpin.sqlite")).unwrap();
+        let created = resolve_or_create(
+            &conn,
+            "wsA",
+            &ChatTarget::Global,
+            None,
+            DraftSettings { breadth: None, owner_filter: Some("   ".into()) },
+        )
+        .unwrap();
+        assert_eq!(created.owner_filter, "", "whitespace is not a pin");
     }
 
     /// Settings chosen on a draft — before any row exists — are applied to the

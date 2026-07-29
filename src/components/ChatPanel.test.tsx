@@ -593,6 +593,43 @@ describe("ChatPanel sessions (#62)", () => {
       expect(sends[1].draftBreadth).toBeNull();
     });
 
+    it("keeps the question, and the thread, when a draft's first turn fails", async () => {
+      // The backend persists the user message and then rolls back only the
+      // assistant placeholder, so a failed first turn leaves a real conversation we
+      // were never told the id of. Refetching with `null` resolves to nothing on a
+      // drafting target, which would blank the question while a one-sided row
+      // appeared in the sidebar — and a retry would open a second thread.
+      const rows = [
+        { id: "c-created", title: "why did the build break", breadth: "all", updatedAt: 20, messageCount: 1 },
+      ];
+      mockTauri({
+        provider_key_get: () => "sk-test",
+        chat_history: (args) => {
+          const { conversationId } = args as { conversationId: string | null };
+          // Mirrors the new backend: a bare library-wide request resolves to nothing.
+          if (!conversationId) return { conversationId: null, messages: [] };
+          return { conversationId, messages: [userMsg("why did the build break")] };
+        },
+        chat_get_breadth: () => "all",
+        chat_list_conversations: () => [...rows],
+        chat_send: () => {
+          throw new Error("The model is unavailable.");
+        },
+      });
+      const controls = renderGlobalWithControls();
+      const input = await screen.findByPlaceholderText(/Ask about your notes/);
+
+      fireEvent.change(input, { target: { value: "why did the build break" } });
+      fireEvent.keyDown(input, { key: "Enter" });
+
+      expect(await screen.findByText(/The model is unavailable/)).toBeInTheDocument();
+      // The question survives...
+      expect(await screen.findByText("why did the build break")).toBeInTheDocument();
+      // ...and the pane has adopted the conversation the failed turn created, so a
+      // retry continues it.
+      await waitFor(() => expect(controls.current?.activeConversationId).toBe("c-created"));
+    });
+
     it("a NOTE's pane still resumes its thread and still creates on '+'", async () => {
       // The deliberate divergence: a note is an anchor, so returning to it
       // continues the same line of thinking. Asserted so it stays a decision.
