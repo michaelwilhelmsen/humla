@@ -142,7 +142,7 @@ describe("ChatTab rebuild-index row", () => {
 
     // The count is the point: a bare button gives no way to judge whether the slow,
     // key-spending action is worth taking.
-    expect(await screen.findByText(/7 notes indexed before the latest improvements/)).toBeTruthy();
+    expect(await screen.findByText(/7 recordings were indexed before the latest improvements/)).toBeTruthy();
     expect(screen.getByRole("button", { name: /Rebuild now/i })).toBeTruthy();
     // The cost is disclosed rather than buried.
     expect(screen.getByText(/uses your configured key/)).toBeTruthy();
@@ -151,22 +151,37 @@ describe("ChatTab rebuild-index row", () => {
   });
 
   it("reports how many notes it rebuilt", async () => {
-    mockTauri({ chat_stale_note_count: () => 3, chat_rebuild_index: () => 3 });
+    // The rebuild walks the WHOLE library, so its number is larger than the stale
+    // count it was offered for. The copy must not pair them as though they should match.
+    mockTauri({ chat_stale_note_count: () => 3, chat_rebuild_index: () => 41 });
     render(<ChatTab s={settings()} update={async () => {}} />);
     fireEvent.click(await screen.findByRole("button", { name: /Rebuild now/i }));
-    await waitFor(() => expect(screen.getByText(/Rebuilt 3 notes/)).toBeTruthy());
+    await waitFor(() => expect(screen.getByText(/Index rebuilt across 41 notes/)).toBeTruthy());
   });
 
-  it("stays quiet rather than guessing when the count can't be read", async () => {
-    // A failed count must not render "0 notes are stale" (a claim) or a rebuild
-    // prompt (an action on unknown state).
+  it("says it couldn't check rather than claiming either state", async () => {
+    // This test previously asserted "Up to date ✓" on a failed count — which is a
+    // STRONGER unverified claim than the "0 notes are stale" it was trying to avoid.
+    // Not knowing and knowing-it's-fine are different facts, and the row now says which.
     mockTauri({
       chat_stale_note_count: () => {
         throw new Error("nope");
       },
     });
     render(<ChatTab s={settings()} update={async () => {}} />);
-    await waitFor(() => expect(screen.getByText(/Up to date/)).toBeTruthy());
+    await waitFor(() => expect(screen.getByText(/Couldn't check the index/)).toBeTruthy());
+    expect(screen.queryByText(/Up to date/)).toBeNull();
+    // And no action is offered on unknown state.
     expect(screen.queryByRole("button", { name: /Rebuild/i })).toBeNull();
+  });
+
+  it("never calls a typed-notes-only library stale", async () => {
+    // #104 moved transcript boundaries only, so a note with no recording can't be
+    // stale on account of it. Asserted here as well as in db.rs because this row is
+    // where a user would see the wrong claim.
+    mockTauri({ chat_stale_note_count: () => 0 });
+    render(<ChatTab s={settings()} update={async () => {}} />);
+    expect(await screen.findByText(/Up to date/)).toBeTruthy();
+    expect(screen.queryByText(/indexed before the latest improvements/)).toBeNull();
   });
 });

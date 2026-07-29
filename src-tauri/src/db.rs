@@ -300,19 +300,28 @@ pub fn open(path: &Path) -> Result<Connection> {
     // Staleness is now detectable per note — for this change and the next one, which is
     // the part that pays twice.
     //
-    // DEFAULT 1 is right for almost every existing row and KNOWINGLY WRONG for a few.
-    // Rows written before #104 really are version 1, the overwhelming majority. But
-    // v0.40.0 shipped #104's chunker, so an install that ran it wrote v2-shaped rows
-    // into a table with no version column — and those now read as 1, i.e. stale.
-    //
-    // Not cleanly fixable: `speakers` landed in the same change, so an empty `speakers`
-    // cannot distinguish "pre-#104" from "#104 with nobody labelled". The consequence is
-    // bounded and self-correcting — the count over-reports for one release window, and a
-    // rebuild re-embeds those notes once, needlessly but harmlessly. Accepted rather
-    // than papered over, because the alternative is a migration heuristic that would be
-    // wrong in a way nobody could later audit.
+    // DEFAULT 1 is right for rows written before #104 — the overwhelming majority —
+    // and wrong for one window: v0.40.0 shipped #104's chunker, so an install that ran
+    // it wrote v2-shaped rows into a table with no version column, and those default
+    // to 1.
     let _ = conn.execute(
         "ALTER TABLE note_chunks ADD COLUMN chunker_version INTEGER NOT NULL DEFAULT 1",
+        [],
+    );
+    // Reclaim the rows we can prove are v2. A non-empty `speakers` is a ONE-WAY
+    // signal: that column arrived in the same commit as turn-packing, defaulted to
+    // '', and is only ever written by `reindex_note` — so anything holding a speaker
+    // was written by the v2 chunker and nothing else could have put it there. Safe to
+    // assert, and auditable later from the column alone.
+    //
+    // It does not catch everything: a v2 chunk of an UNLABELLED transcript also has
+    // empty `speakers`, so those stay marked 1 and are over-reported once. That
+    // residue is bounded (one release window), self-correcting (a rebuild stamps them
+    // v2), and cheap — re-chunking produces byte-identical text, so the embedding
+    // cache hits by `text_hash` and no API spend follows. Guarded on `< 2` so it is a
+    // no-op on every subsequent open rather than a write on each launch.
+    let _ = conn.execute(
+        "UPDATE note_chunks SET chunker_version = 2 WHERE speakers != '' AND chunker_version < 2",
         [],
     );
     // Workspace (Teams) chat (issue #50). A workspace conversation is
@@ -1877,6 +1886,12 @@ pub fn note_chunk_texts(body_text: &str, transcript: &str, summary: &str) -> Vec
 /// clears the Note's existing chunks first, so calling it on every
 /// content-settled checkpoint keeps the index fresh without duplication.
 /// Returns the number of chunks indexed.
+///
+/// **If you change where chunks BREAK — here, in [`note_chunk_texts`],
+/// [`split_into_chunks`] or [`pack_turns`] — bump [`CHUNKER_VERSION`]**, or every
+/// already-indexed note keeps its old shape with nothing able to tell (#122). If the
+/// change moves PROSE boundaries, widen [`notes_with_stale_chunks`] too: it currently
+/// only counts transcript chunks, because #104 only moved transcript boundaries.
 pub fn reindex_note(
     conn: &Connection,
     note_id: &str,
@@ -1962,9 +1977,22 @@ pub fn remove_note_chunks(conn: &Connection, note_id: &str) -> Result<()> {
 /// showing a repair prompt to someone with nothing to repair.
 pub fn notes_with_stale_chunks(conn: &Connection) -> Result<usize> {
     let n: i64 = conn.query_row(
+        // `source = 'transcript'` is load-bearing, not an optimisation. #104 changed
+        // the TRANSCRIPT chunker only — prose still goes through the untouched
+        // paragraph splitter — so a body or summary chunk sitting at version 1 is
+        // perfectly current and must not be counted. Without this filter a user who
+        // only ever types notes and never records is told "N notes indexed before the
+        // latest improvements — chat can't tell who spoke in them", which is nonsense
+        // for a typed note, and a rebuild would re-chunk them to byte-identical text.
+        //
+        // It also honours this module's own rule that `CHUNKER_VERSION` must not be
+        // bumped for a change that leaves boundaries identical: prose boundaries did
+        // not change, so prose cannot be stale on account of this bump. A future
+        // change that DOES move prose boundaries has to widen this predicate — which
+        // is the moment to split the version per source rather than guess.
         "SELECT COUNT(DISTINCT c.note_id) FROM note_chunks c \
          JOIN notes n ON n.id = c.note_id \
-         WHERE n.deleted_at IS NULL AND c.chunker_version < ?1",
+         WHERE n.deleted_at IS NULL AND c.source = 'transcript' AND c.chunker_version < ?1",
         params![CHUNKER_VERSION],
         |r| r.get(0),
     )?;
@@ -3725,6 +3753,61 @@ mod tests {
         // Reindexing that note repairs it, with no action needed on the other.
         reindex_note(&conn, &a, "", "Michael: hello", "").unwrap();
         assert_eq!(notes_with_stale_chunks(&conn).unwrap(), 0);
+    }
+
+    /// #104 moved TRANSCRIPT boundaries only — prose kept the untouched paragraph
+    /// splitter. So a body/summary chunk at version 1 is current, and counting it would
+    /// tell someone who only types notes that "chat can't tell who spoke in them",
+    /// which is nonsense for a typed note, and send them to re-chunk text that would
+    /// come back byte-identical.
+    #[test]
+    fn prose_chunks_are_never_stale_because_their_boundaries_did_not_move() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("t.sqlite")).unwrap();
+        let typed = create_note(&conn, "en", "meeting", "").unwrap().id;
+        // A typed note with no recording: body + summary chunks, no transcript.
+        reindex_note(&conn, &typed, "some typed thoughts", "", "a summary").unwrap();
+        conn.execute("UPDATE note_chunks SET chunker_version = 1", []).unwrap();
+
+        assert_eq!(
+            notes_with_stale_chunks(&conn).unwrap(),
+            0,
+            "a note with no transcript can never need a re-chunk for #104"
+        );
+
+        // A note that DOES have a transcript is still caught.
+        let recorded = create_note(&conn, "en", "meeting", "").unwrap().id;
+        reindex_note(&conn, &recorded, "", "Michael: hello", "").unwrap();
+        conn.execute("UPDATE note_chunks SET chunker_version = 1", []).unwrap();
+        assert_eq!(notes_with_stale_chunks(&conn).unwrap(), 1);
+    }
+
+    /// The v0.40.0 window: that release shipped #104's chunker, so an install that ran
+    /// it wrote v2-shaped rows into a table with no version column. Rows holding a
+    /// speaker are provably v2 — only `reindex_note` writes that column, and it arrived
+    /// in the same commit — so the migration reclaims them instead of over-reporting.
+    #[test]
+    fn rows_that_prove_they_are_current_are_reclaimed_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.sqlite");
+        let id = {
+            let conn = open(&path).unwrap();
+            let id = create_note(&conn, "en", "meeting", "").unwrap().id;
+            reindex_note(&conn, &id, "", "Michael: hello\nHege: hi", "").unwrap();
+            // Simulate the v0.40.0 state: v2-shaped rows, but no version recorded.
+            conn.execute("UPDATE note_chunks SET chunker_version = 1", []).unwrap();
+            assert_eq!(notes_with_stale_chunks(&conn).unwrap(), 1, "stale before reopening");
+            id
+        };
+
+        // Reopening runs the migration, which reclaims what it can prove.
+        let conn = open(&path).unwrap();
+        assert_eq!(
+            notes_with_stale_chunks(&conn).unwrap(),
+            0,
+            "a chunk holding a speaker could only have been written by the v2 chunker"
+        );
+        let _ = id;
     }
 
     /// A trashed note must not be counted: the rebuild walks live notes only, so

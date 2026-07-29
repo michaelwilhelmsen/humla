@@ -174,27 +174,34 @@ type RebuildState =
   | { kind: "done"; count: number }
   | { kind: "error"; message: string };
 
+/** How many notes a rebuild would repair. `"loading"` on first read and `"unknown"`
+ *  when the count could not be read — deliberately NOT collapsed into `0`, because
+ *  `0` renders "Up to date ✓", which is a stronger claim than the one we'd be
+ *  avoiding. Not knowing and knowing-it's-fine are different facts. */
+type StaleCount = { kind: "loading" } | { kind: "unknown" } | { kind: "known"; count: number };
+
+/** Plural suffix, so the row's copy doesn't repeat the same ternary four times. */
+const s = (n: number) => (n === 1 ? "" : "s");
+
 function RebuildIndexRow() {
   const [state, setState] = useState<RebuildState>({ kind: "idle" });
-  // How many notes a rebuild would actually repair. `null` while loading, so the row
-  // doesn't flash a "needs rebuilding" claim it hasn't verified.
-  const [stale, setStale] = useState<number | null>(null);
+  const [stale, setStale] = useState<StaleCount>({ kind: "loading" });
 
-  // Re-read on mount and after a rebuild FINISHES — keyed on `state.kind` rather than
-  // the whole state object, which would also refetch on the transition into "running"
-  // and spend an IPC call on a count that cannot have changed yet.
+  // Re-read on mount and once a rebuild has FINISHED — `state.kind` changes on the way
+  // into "running" too, so `done` is filtered explicitly rather than relying on the
+  // dependency to do it: an extra count during the rebuild would contend with its
+  // per-note locking for a number that cannot have settled yet.
+  const settled = state.kind === "done";
   useEffect(() => {
     let live = true;
     ipc
       .chatStaleNoteCount()
-      .then((n) => live && setStale(n))
-      // A failed count renders as quiet, never as "0 notes are stale" (a claim we have
-      // not verified) or as a rebuild prompt (an action on unknown state).
-      .catch(() => live && setStale(0));
+      .then((n) => live && setStale({ kind: "known", count: n }))
+      .catch(() => live && setStale({ kind: "unknown" }));
     return () => {
       live = false;
     };
-  }, [state.kind]);
+  }, [settled]);
 
   async function rebuild() {
     setState({ kind: "running" });
@@ -206,33 +213,48 @@ function RebuildIndexRow() {
   }
 
   const running = state.kind === "running";
-  const needsWork = stale !== null && stale > 0;
 
   return (
     <Row label="Chat search index">
-      {stale === null ? (
+      {stale.kind === "loading" && (
         <span className="text-xs text-[var(--color-text-muted)]">Checking…</span>
-      ) : needsWork ? (
+      )}
+      {/* Couldn't read the count: say so rather than claiming either state. Offering
+          the rebuild here would be an action on unknown state; claiming "up to date"
+          would be the unverified assertion this whole row exists to avoid. */}
+      {stale.kind === "unknown" && (
+        <span className="text-xs text-[var(--color-text-muted)]">
+          Couldn't check the index.
+        </span>
+      )}
+      {stale.kind === "known" && stale.count === 0 && (
+        <span className="text-xs text-[var(--color-success)]">Up to date ✓</span>
+      )}
+      {stale.kind === "known" && stale.count > 0 && (
         <>
-          <p className="text-xs text-[var(--color-warning)]">
-            {stale} note{stale === 1 ? "" : "s"} indexed before the latest improvements — chat
-            can't tell who spoke in {stale === 1 ? "it" : "them"}, and its excerpts from{" "}
-            {stale === 1 ? "it" : "them"} may cut mid-sentence.
+          {/* `--color-warning-text` (not `--color-warning`) — the readable variant, per
+              globals.css: raw warning gold doesn't clear AAA as body text. */}
+          <p className="text-xs text-[var(--color-warning-text)]">
+            {stale.count} recording{s(stale.count)} {stale.count === 1 ? "was" : "were"} indexed
+            before the latest improvements — chat can't tell who spoke in{" "}
+            {stale.count === 1 ? "it" : "them"}, and its excerpts may cut mid-sentence.
           </p>
           <button className="nd-btn mt-2" onClick={() => void rebuild()} disabled={running}>
             {running ? "Rebuilding…" : "Rebuild now"}
           </button>
           <p className="text-xs text-[var(--color-text-muted)] mt-1">
-            Re-reads every note and re-embeds as it goes, which uses your configured key — a few
-            cents for a large library. Only affects what chat can find; your notes aren't changed.
+            Re-reads your whole library and re-embeds anything that changed, which uses your
+            configured key — a few cents at most. Only affects what chat can find; your notes
+            aren't changed.
           </p>
         </>
-      ) : (
-        <span className="text-xs text-[var(--color-success)]">Up to date ✓</span>
       )}
       {state.kind === "done" && (
         <p className="text-xs text-[var(--color-success)] mt-1">
-          Rebuilt {state.count} note{state.count === 1 ? "" : "s"} ✓
+          {/* Deliberately not "Rebuilt {count} of {stale}" — the rebuild walks the whole
+              library, so this number is larger than the stale count it was offered for,
+              and pairing them would read as a discrepancy. */}
+          Index rebuilt across {state.count} note{s(state.count)} ✓
         </p>
       )}
       {state.kind === "error" && (
