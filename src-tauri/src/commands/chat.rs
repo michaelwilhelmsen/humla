@@ -166,22 +166,40 @@ pub async fn embed_backfill(app: AppHandle) {
 /// Returns the number of notes rebuilt. Embedding is kicked off afterwards and
 /// reuses `embed_backfill`, which already finds exactly the chunks missing vectors
 /// under the current model, so the two stay one mechanism rather than two.
+///
+/// `async` + `spawn_blocking` is load-bearing, not decoration: Tauri runs a
+/// synchronous command on the main thread, so walking a whole library there would
+/// freeze the webview for the duration — the "Rebuilding…" state could never even
+/// paint, which is the one piece of UI that makes a slow, key-spending action
+/// tolerable. Same shape as the local-Whisper path for the same reason.
 #[tauri::command]
-pub fn chat_rebuild_index(app: AppHandle) -> Result<usize, String> {
-    let state: State<AppState> = app.state();
-    let ids = {
-        let conn = state.db.lock();
-        db::live_note_ids(&conn).map_err(super::err)?
+pub async fn chat_rebuild_index(app: AppHandle) -> Result<usize, String> {
+    // Clone the Arc out and drop the `State` borrow before any await: a
+    // `parking_lot` guard held across one would make this future non-Send, and all
+    // the locking below happens inside the blocking closure regardless.
+    let db = {
+        let state: State<AppState> = app.state();
+        state.db.clone()
     };
-    // One lock acquisition per note, not one for the whole loop: a large library
-    // would otherwise hold the connection long enough to stall every other command.
-    for id in &ids {
-        let conn = state.db.lock();
-        reindex_note_content(&conn, id);
-    }
-    eprintln!("[chat] rebuilt retrieval chunks for {} note(s)", ids.len());
-    tauri::async_runtime::spawn(embed_backfill(app.clone()));
-    Ok(ids.len())
+    let rebuilt = tauri::async_runtime::spawn_blocking(move || {
+        let ids = {
+            let conn = db.lock();
+            db::live_note_ids(&conn).map_err(super::err)?
+        };
+        // One lock acquisition per note, not one around the loop: a large library
+        // would otherwise hold the connection long enough to stall every other
+        // command that needs the database.
+        for id in &ids {
+            let conn = db.lock();
+            reindex_note_content(&conn, id);
+        }
+        Ok::<usize, String>(ids.len())
+    })
+    .await
+    .map_err(|e| format!("rebuild task failed: {e}"))??;
+    eprintln!("[chat] rebuilt retrieval chunks for {rebuilt} note(s)");
+    tauri::async_runtime::spawn(embed_backfill(app));
+    Ok(rebuilt)
 }
 
 /// Rebuild a Note's retrieval index on demand — the frontend calls this when

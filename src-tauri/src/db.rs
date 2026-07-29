@@ -1562,6 +1562,18 @@ pub struct NoteChunk {
     pub speakers: Vec<String>,
 }
 
+/// Append `value` unless it is already present, preserving first-encounter order.
+///
+/// Speaker lists are short (a handful per note) and their ORDER is meaningful — the
+/// first voice is usually whoever opened the meeting — so a linear scan over a `Vec`
+/// beats a `HashSet` plus a second pass to recover ordering. Used wherever speakers
+/// are accumulated, so "distinct, in first-encounter order" is defined once.
+fn push_distinct(out: &mut Vec<String>, value: &str) {
+    if !out.iter().any(|seen| seen == value) {
+        out.push(value.to_string());
+    }
+}
+
 /// Wrap a chunk's speakers for storage as `|Michael|Hege|`, or `""` for none.
 ///
 /// Delimiter-wrapped rather than a join, so an exact-label match is a single
@@ -1684,9 +1696,7 @@ pub fn pack_turns(turns: &[Turn], target: usize) -> Vec<NoteChunk> {
         len += turn_len;
         lines.push(&turn.text);
         if let Some(s) = &turn.speaker {
-            if !speakers.iter().any(|seen| seen == s) {
-                speakers.push(s.clone());
-            }
+            push_distinct(&mut speakers, s);
         }
     }
     if !lines.is_empty() {
@@ -1696,7 +1706,13 @@ pub fn pack_turns(turns: &[Turn], target: usize) -> Vec<NoteChunk> {
 }
 
 /// Assemble one transcript chunk, rejoining turns on the single newline they were
-/// separated by so the text stays a verbatim slice of the transcript.
+/// separated by.
+///
+/// The text is the transcript's own words, unaltered, but not a byte-for-byte slice:
+/// `parse_speaker_turns` drops blank lines (they carry no speech, and the paragraph
+/// splitter dropped them too), so a transcript containing them — an import, or
+/// pasted text — rejoins without them. Speech is never changed; only empty lines go.
+/// The other, louder departure is the `(continued)` prefix in [`split_long_turn`].
 fn transcript_chunk(lines: &[&str], speakers: Vec<String>) -> NoteChunk {
     NoteChunk { source: "transcript", text: lines.join("\n"), speakers }
 }
@@ -1804,9 +1820,7 @@ pub fn reindex_note(
     let mut note_speakers: Vec<String> = Vec::new();
     for chunk in &chunks {
         for s in &chunk.speakers {
-            if !note_speakers.iter().any(|seen| seen == s) {
-                note_speakers.push(s.clone());
-            }
+            push_distinct(&mut note_speakers, s);
         }
     }
     for (seq, chunk) in chunks.iter().enumerate() {
@@ -2066,14 +2080,7 @@ fn keyword_ranked(
          {KEYWORD_FROM_WHERE}"
     );
     let mut args: Vec<Value> = vec![Value::Text(match_expr), Value::Text(workspace.to_string())];
-    // Speaker is applied to the CHUNK, not the note (#104): an excerpt should come
-    // back only if the speaker spoke in that passage. Note-level would return every
-    // excerpt from any meeting they attended, including passages where someone else
-    // was talking — which is what "in their own words" must not mean.
-    push_note_filters(&mut sql, &mut args, NoteFilter { speaker: None, ..filter }, "n");
-    if let Some(speaker) = filter.speaker {
-        push_speaker_clause(&mut sql, &mut args, speaker, "c");
-    }
+    push_chunk_filters(&mut sql, &mut args, filter);
     args.push(Value::Integer(limit as i64));
     sql.push_str(&format!(" ORDER BY rank LIMIT ?{}", args.len()));
     let mut stmt = conn.prepare(&sql)?;
@@ -2115,12 +2122,7 @@ fn semantic_ranked(
          WHERE n.workspace_id = ?2 AND n.deleted_at IS NULL",
     );
     let mut args: Vec<Value> = vec![Value::Text(model.to_string()), Value::Text(workspace.to_string())];
-    // Chunk-level, matching the keyword leg — the two must narrow identically or a
-    // fused result would contain semantic hits the keyword filter would have refused.
-    push_note_filters(&mut sql, &mut args, NoteFilter { speaker: None, ..filter }, "n");
-    if let Some(speaker) = filter.speaker {
-        push_speaker_clause(&mut sql, &mut args, speaker, "c");
-    }
+    push_chunk_filters(&mut sql, &mut args, filter);
     let mut stmt = conn.prepare(&sql)?;
     let mut scored: Vec<(f32, IdentifiedHit)> = stmt
         .query_map(rusqlite::params_from_iter(args), |row| {
@@ -2191,6 +2193,25 @@ fn push_note_filters(
     }
 }
 
+/// The filter set for a query that selects CHUNKS (`c`) joined to notes (`n`).
+///
+/// Every note-level narrowing applies as usual, but `speaker` moves to the chunk:
+/// an excerpt should come back only if that speaker spoke in that passage, where
+/// note-level would return every excerpt from any meeting they attended. All three
+/// chunk queries — keyword hits, semantic candidates and the match count — must
+/// narrow identically, or the count describes a different set from the hits (#106),
+/// so they share this one call rather than three copies of the same two steps.
+fn push_chunk_filters(
+    sql: &mut String,
+    args: &mut Vec<rusqlite::types::Value>,
+    filter: NoteFilter<'_>,
+) {
+    push_note_filters(sql, args, NoteFilter { speaker: None, ..filter }, "n");
+    if let Some(speaker) = filter.speaker {
+        push_speaker_clause(sql, args, speaker, "c");
+    }
+}
+
 /// Narrow to rows whose derived `speakers` column contains `speaker` as a WHOLE
 /// label, against either alias — `n` for notes ("they spoke in this meeting"), `c`
 /// for chunks ("they spoke in this passage").
@@ -2246,9 +2267,7 @@ pub fn speakers_in_scope(
     let mut out: Vec<String> = Vec::new();
     for encoded in rows {
         for s in decode_speakers(&encoded?) {
-            if !out.iter().any(|seen| seen == &s) {
-                out.push(s);
-            }
+            push_distinct(&mut out, &s);
         }
     }
     out.sort_unstable();
@@ -2372,13 +2391,7 @@ fn count_matching_notes(
     use rusqlite::types::Value;
     let mut sql = format!("SELECT COUNT(DISTINCT c.note_id) {KEYWORD_FROM_WHERE}");
     let mut args: Vec<Value> = vec![Value::Text(match_expr), Value::Text(workspace.to_string())];
-    // Chunk-level, exactly as the keyword hit query narrows — the count and the hits
-    // must measure the same predicate, or the header states a number that does not
-    // describe what is on screen (#106).
-    push_note_filters(&mut sql, &mut args, NoteFilter { speaker: None, ..filter }, "n");
-    if let Some(speaker) = filter.speaker {
-        push_speaker_clause(&mut sql, &mut args, speaker, "c");
-    }
+    push_chunk_filters(&mut sql, &mut args, filter);
     let count: i64 = conn.query_row(&sql, rusqlite::params_from_iter(args), |row| row.get(0))?;
     Ok(Some(count.max(0) as usize))
 }

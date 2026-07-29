@@ -164,37 +164,44 @@ export function ChatTab({ s, update }: Pick<SettingsHook, "s" | "update">) {
 // lazy startup backfill can't detect. The cost is disclosed rather than hidden — it
 // re-embeds, which spends the configured key — because an action that quietly costs
 // money is worse than a slow one.
+type RebuildState =
+  | { kind: "idle" }
+  | { kind: "running" }
+  | { kind: "done"; count: number }
+  | { kind: "error"; message: string };
+
 function RebuildIndexRow() {
-  const [state, setState] = useState<"idle" | "running" | { done: number } | { error: string }>(
-    "idle",
-  );
-  const running = state === "running";
+  const [state, setState] = useState<RebuildState>({ kind: "idle" });
 
   async function rebuild() {
-    setState("running");
+    setState({ kind: "running" });
     try {
-      setState({ done: await ipc.chatRebuildIndex() });
+      setState({ kind: "done", count: await ipc.chatRebuildIndex() });
     } catch (e) {
-      setState({ error: String(e) });
+      setState({ kind: "error", message: String(e) });
     }
   }
 
   return (
     <Row label="Search index">
-      <button className="nd-btn" onClick={() => void rebuild()} disabled={running}>
-        {running ? "Rebuilding…" : "Rebuild search index"}
+      <button
+        className="nd-btn"
+        onClick={() => void rebuild()}
+        disabled={state.kind === "running"}
+      >
+        {state.kind === "running" ? "Rebuilding…" : "Rebuild search index"}
       </button>
       <p className="text-xs text-[var(--color-text-muted)] mt-1">
         Re-chunks every note so older meetings get speaker-aware search. Re-embeds as it goes,
         which uses your configured key — a few cents for a large library.
       </p>
-      {typeof state === "object" && "done" in state && (
+      {state.kind === "done" && (
         <p className="text-xs text-[var(--color-success)] mt-1">
-          Rebuilt {state.done} note{state.done === 1 ? "" : "s"} ✓
+          Rebuilt {state.count} note{state.count === 1 ? "" : "s"} ✓
         </p>
       )}
-      {typeof state === "object" && "error" in state && (
-        <p className="text-xs text-[var(--color-danger)] mt-1">{state.error}</p>
+      {state.kind === "error" && (
+        <p className="text-xs text-[var(--color-danger)] mt-1">{state.message}</p>
       )}
     </Row>
   );
