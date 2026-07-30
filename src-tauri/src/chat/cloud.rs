@@ -69,18 +69,25 @@ pub fn build_cloud_request(
     // Reject an unknown breadth through the shared validator — one owner of the
     // vocabulary and its error, no duplicated match/message here.
     super::validate_breadth(breadth)?;
-    // A library-wide turn (#93) sends NO `note_id` at all: the server 400s a
-    // malformed `note_id` under *every* breadth including "all", so a sentinel or
-    // an empty string would be rejected rather than ignored (humla-cloud#26).
-    // An EMPTY anchor is a caller bug, not "absent" — `ChatTarget::from_note_id`
+    // A note-less turn (#93, #110) sends NO `note_id` at all: the server 400s a
+    // malformed `note_id` under *every* breadth, so a sentinel or an empty string
+    // would be rejected rather than ignored (humla-cloud#26).
+    // An EMPTY anchor is a caller bug, not "absent" — `ChatTarget::from_ids`
     // rejects it at the IPC boundary and this is the matching strictness, so the
     // same value can't mean two things at two layers.
     if note_id.is_some_and(|s| s.trim().is_empty()) {
         return Err("An empty note id is not a valid chat anchor.".into());
     }
     let anchor = note_id;
-    // The anchor-less rule lives in `chat::check_anchor` — one owner, one message.
-    super::check_anchor(breadth, anchor.is_some())?;
+    // The needs-its-own-id rule lives in `chat::check_anchor` — one owner, one
+    // message. A folder turn is satisfied by its `folder_id` alone (humla-cloud#110
+    // dropped the server's note requirement for it), which is what lets a folder
+    // conversation exist with no anchor note behind it at all.
+    super::check_anchor(
+        breadth,
+        anchor.is_some(),
+        folder_id.is_some_and(|f| !f.trim().is_empty()),
+    )?;
     // When present, `note_id` stays in every scope so the server can ground on the
     // anchor Note regardless of breadth (under "all" the server ignores it by
     // design).
@@ -547,11 +554,20 @@ mod tests {
     /// A note-less create must be breadth "all" — a note-less "folder" is a 400
     /// server-side, so catch it here as our bug rather than as a failed turn.
     #[test]
-    fn a_request_without_an_anchor_must_be_all_breadth() {
-        for breadth in ["note", "folder"] {
-            let err = req(CloudScope { breadth, folder_id: Some("f1"), ..Default::default() }).unwrap_err();
-            assert!(err.contains("needs an anchor note"), "{breadth}: {err}");
-        }
+    fn a_request_without_an_anchor_must_carry_the_id_its_breadth_clamps_on() {
+        // `note` breadth still needs its note — nothing else will do.
+        let err = req(CloudScope { breadth: "note", folder_id: Some("f1"), ..Default::default() })
+            .unwrap_err();
+        assert!(err.contains("needs an anchor note"), "got: {err}");
+        // `folder` breadth needs its FOLDER, and that is now enough on its own
+        // (#110) — the server dropped the note requirement for exactly this case,
+        // which is what lets a folder conversation exist with no note behind it.
+        assert!(req(CloudScope { breadth: "folder", folder_id: Some("f1"), ..Default::default() })
+            .is_ok());
+        // …and a folder breadth with no folder at all is still refused, since an
+        // absent id must never widen the turn into the library.
+        let no_folder = req(CloudScope { breadth: "folder", ..Default::default() }).unwrap_err();
+        assert!(no_folder.contains("needs a folder"), "got: {no_folder}");
         // With an anchor, both still build as before.
         assert!(req(note_scope("n1")).is_ok());
         assert!(req(CloudScope {
@@ -561,6 +577,25 @@ mod tests {
             ..Default::default()
         })
         .is_ok());
+    }
+
+    /// The wire shape a folder conversation actually sends (#110): a folder id and
+    /// no `note_id` key at all. Absent rather than empty, for the same reason the
+    /// library-wide case is — the server 400s a malformed anchor under every breadth.
+    #[test]
+    fn a_folder_conversation_sends_its_folder_and_no_anchor() {
+        let body = req(CloudScope {
+            breadth: "folder",
+            folder_id: Some("f1"),
+            folder_name: Some("K2 pilot"),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(body["scope"]["breadth"], "folder");
+        assert_eq!(body["scope"]["folder_id"], "f1");
+        assert!(body["scope"].get("note_id").is_none());
+        // The display name still rides along for the server's disclosure line (#113).
+        assert_eq!(body["scope"]["folder_name"], "K2 pilot");
     }
 
     #[test]

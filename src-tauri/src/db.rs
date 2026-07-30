@@ -516,6 +516,15 @@ pub fn rename_folder(conn: &Connection, id: &str, name: &str) -> Result<()> {
 /// Delete a folder. Its notes fall back to root (`folder_id = NULL`) rather
 /// than being deleted; their `updated_at` is bumped so a sync layer re-pushes
 /// them. Returns the ids of the reparented notes so the caller can notify sync.
+///
+/// Its folder-scoped CONVERSATIONS (#110) go with it, messages first — the same
+/// ordering and the same hard-delete rationale as [`delete_conversation`]. They
+/// don't reparent the way notes do, and the asymmetry is the point: a note has
+/// content of its own that outlives the folder it sat in, while a folder thread's
+/// entire reach *was* that folder. A surviving one would clamp to nothing,
+/// belong to no list, and be reachable from no surface — a live row that only
+/// ever reads as a bug. Scoped by `(scope, scope_id)` rather than `scope_id`
+/// alone, so a note whose id happened to match a folder's is never caught in it.
 pub fn delete_folder(conn: &Connection, id: &str) -> Result<Vec<String>> {
     let now = now_ms();
     let reparented: Vec<String> = {
@@ -528,6 +537,15 @@ pub fn delete_folder(conn: &Connection, id: &str) -> Result<Vec<String>> {
     conn.execute(
         "UPDATE notes SET folder_id = NULL, updated_at = ?2 WHERE folder_id = ?1",
         params![id, now],
+    )?;
+    conn.execute(
+        "DELETE FROM messages WHERE conversation_id IN
+           (SELECT id FROM conversations WHERE scope = ?1 AND scope_id = ?2)",
+        params![CHAT_SCOPE_FOLDER, id],
+    )?;
+    conn.execute(
+        "DELETE FROM conversations WHERE scope = ?1 AND scope_id = ?2",
+        params![CHAT_SCOPE_FOLDER, id],
     )?;
     conn.execute("DELETE FROM folders WHERE id = ?1", params![id])?;
     Ok(reparented)
@@ -1019,10 +1037,14 @@ fn map_summary_prompt(row: &rusqlite::Row) -> rusqlite::Result<SummaryPrompt> {
 // note in `open()` for the storage-shape rationale (opencode v2 model).
 
 /// General chat scope — the string stored in `conversations.scope`, chosen in
-/// one place so later scopes (folder/client) add variants without touching call
-/// sites. `global` arrived with #93; folder and client are still unbuilt.
+/// one place so later scopes add variants without touching call sites. `global`
+/// arrived with #93, `folder` with #110; client scope is still unbuilt.
 pub const CHAT_SCOPE_NOTE: &str = "note";
 pub const CHAT_SCOPE_GLOBAL: &str = "global";
+/// A conversation confined to one folder (#110). `scope_id` holds the folder's
+/// id, exactly as a note thread's holds the note's — which is why the column
+/// needed no change: `(tenant, scope, scope_id)` anticipated this.
+pub const CHAT_SCOPE_FOLDER: &str = "folder";
 /// `scope_id` for the one global conversation set per tenant. A fixed sentinel
 /// rather than an empty string: the composite key is `(tenant, scope, scope_id)`,
 /// and an empty id already reads as "absent" in too many places to also mean
@@ -1032,54 +1054,87 @@ pub const CHAT_GLOBAL_SCOPE_ID: &str = "__global__";
 /// Only Personal is used in this slice; workspace tenants arrive with Teams.
 pub const CHAT_TENANT_PERSONAL: &str = "personal";
 
-/// What a chat conversation is *about*: one Note, or the whole library.
+/// What a chat conversation is *about*: one Note, one folder, or the whole library.
 ///
 /// This is the single place `(scope, scope_id)` is derived, so a caller can no
 /// longer accidentally pair a global scope with a note's id. Constructed from the
-/// IPC boundary via [`ChatTarget::from_note_id`], where **absent** means global
-/// and **empty** is an error — the distinction that keeps `""` from quietly
-/// becoming "everything" (the same trap humla-cloud#26 avoided server-side).
+/// IPC boundary via [`ChatTarget::from_ids`], where **absent** means global and
+/// **empty** is an error — the distinction that keeps `""` from quietly becoming
+/// "everything" (the same trap humla-cloud#26 avoided server-side).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChatTarget {
     Note(String),
+    /// Confined to one folder (#110). The folder is the thread's own anchor —
+    /// there is no note behind it, which is why [`Self::note_id`] returning None
+    /// can no longer be read as "library-wide".
+    Folder(String),
     Global,
 }
 
 impl ChatTarget {
-    /// Parse the optional note id an IPC command received.
+    /// Parse the optional note id an IPC command received. Shorthand for
+    /// [`Self::from_ids`] on the surfaces that can only ever name a note.
     pub fn from_note_id(note_id: Option<String>) -> Result<Self, String> {
-        match note_id {
-            None => Ok(Self::Global),
-            Some(id) if id.trim().is_empty() => Err(
-                "A chat target needs a note id, or none at all for the whole library — \
-                 an empty id is neither."
-                    .into(),
-            ),
-            Some(id) => Ok(Self::Note(id)),
+        Self::from_ids(note_id, None)
+    }
+
+    /// Parse the optional ids an IPC command received. The two are ALTERNATIVES,
+    /// not composable — a thread is about a note or about a folder — so sending
+    /// both is a caller bug rather than something to silently pick between.
+    pub fn from_ids(note_id: Option<String>, folder_id: Option<String>) -> Result<Self, String> {
+        match (note_id, folder_id) {
+            (Some(_), Some(_)) => Err("A chat target is a note or a folder, not both.".into()),
+            (None, None) => Ok(Self::Global),
+            // Empty is an error under BOTH, and for the same reason: degrading it
+            // to "absent" would land on Global, the widest scope there is.
+            (Some(id), None) if id.trim().is_empty() => Err(Self::empty_id_error()),
+            (None, Some(id)) if id.trim().is_empty() => Err(Self::empty_id_error()),
+            (Some(id), None) => Ok(Self::Note(id)),
+            (None, Some(id)) => Ok(Self::Folder(id)),
         }
+    }
+
+    fn empty_id_error() -> String {
+        "A chat target needs a note or folder id, or none at all for the whole library — \
+         an empty id is neither."
+            .into()
     }
 
     pub fn scope(&self) -> &'static str {
         match self {
             Self::Note(_) => CHAT_SCOPE_NOTE,
+            Self::Folder(_) => CHAT_SCOPE_FOLDER,
             Self::Global => CHAT_SCOPE_GLOBAL,
         }
     }
 
     pub fn scope_id(&self) -> &str {
         match self {
-            Self::Note(id) => id,
+            Self::Note(id) | Self::Folder(id) => id,
             Self::Global => CHAT_GLOBAL_SCOPE_ID,
         }
     }
 
-    /// The anchor note id, or None for a global target. Callers that genuinely
-    /// need a note (grounding, folder breadth) go through this and handle None
-    /// rather than reaching for `scope_id`.
+    /// The anchor note id, or None for a folder or global target. Callers that
+    /// genuinely need a note (grounding) go through this and handle None rather
+    /// than reaching for `scope_id`.
+    ///
+    /// None does NOT mean "library-wide" — a folder target has no note either.
+    /// Anything branching on reach must look at the variant, or at
+    /// [`Self::folder_id`] beside this.
     pub fn note_id(&self) -> Option<&str> {
         match self {
             Self::Note(id) => Some(id),
-            Self::Global => None,
+            Self::Folder(_) | Self::Global => None,
+        }
+    }
+
+    /// The folder this thread is confined to, or None (#110). This is the id the
+    /// `folder` breadth clamps on when there is no anchor note to read it from.
+    pub fn folder_id(&self) -> Option<&str> {
+        match self {
+            Self::Folder(id) => Some(id),
+            Self::Note(_) | Self::Global => None,
         }
     }
 }
@@ -4672,9 +4727,29 @@ mod tests {
         let note = ChatTarget::Note("n1".into());
         assert_eq!((note.scope(), note.scope_id()), (CHAT_SCOPE_NOTE, "n1"));
         assert_eq!((ChatTarget::Global.scope(), ChatTarget::Global.scope_id()), (CHAT_SCOPE_GLOBAL, CHAT_GLOBAL_SCOPE_ID));
+        // #110: a folder target's id IS its scope_id — the column already carried
+        // a note id for note threads, which is what made this cheap.
+        let folder = ChatTarget::Folder("f1".into());
+        assert_eq!((folder.scope(), folder.scope_id()), (CHAT_SCOPE_FOLDER, "f1"));
         // A global target has no anchor; callers needing one must handle None.
         assert_eq!(note.note_id(), Some("n1"));
         assert_eq!(ChatTarget::Global.note_id(), None);
+        // …and neither has a folder target. `note_id()` returning None must not be
+        // read as "library-wide" — that conflation is the one hazard #110 adds.
+        assert_eq!(folder.note_id(), None);
+        assert_eq!(folder.folder_id(), Some("f1"));
+        assert_eq!(note.folder_id(), None);
+        assert_eq!(ChatTarget::Global.folder_id(), None);
+    }
+
+    /// The three scope strings must stay distinct: they are the `scope` half of
+    /// the `(tenant, scope, scope_id)` key, so a collision would merge two
+    /// populations' conversation lists.
+    #[test]
+    fn the_chat_scopes_are_distinct() {
+        let all = [CHAT_SCOPE_NOTE, CHAT_SCOPE_FOLDER, CHAT_SCOPE_GLOBAL];
+        let unique: std::collections::BTreeSet<_> = all.iter().collect();
+        assert_eq!(unique.len(), all.len());
     }
 
     /// Absent means global; EMPTY is an error. Letting `""` mean global is the
@@ -4689,6 +4764,76 @@ mod tests {
         );
         for empty in ["", "   ", "\t"] {
             let err = ChatTarget::from_note_id(Some(empty.into())).unwrap_err();
+            assert!(err.contains("empty id"), "got: {err}");
+        }
+    }
+
+    /// #110's last acceptance criterion: deleting a folder must leave its
+    /// conversations in a DEFINED state, not pointing at a dead id. They go with
+    /// it — a folder thread's whole reach was that folder, so a surviving one
+    /// would clamp to nothing and be reachable from no surface. Notes reparent
+    /// instead because a note has content of its own; a conversation about a
+    /// folder that no longer exists does not.
+    #[test]
+    fn deleting_a_folder_takes_its_conversations_and_their_messages_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("folderchat.sqlite")).unwrap();
+        let f1 = create_folder(&conn, "Pilot", "").unwrap();
+        let f2 = create_folder(&conn, "Other", "").unwrap();
+        let doomed =
+            create_conversation(&conn, CHAT_TENANT_PERSONAL, CHAT_SCOPE_FOLDER, &f1.id, "folder")
+                .unwrap();
+        let neighbour =
+            create_conversation(&conn, CHAT_TENANT_PERSONAL, CHAT_SCOPE_FOLDER, &f2.id, "folder")
+                .unwrap();
+        let global = create_conversation(
+            &conn,
+            CHAT_TENANT_PERSONAL,
+            CHAT_SCOPE_GLOBAL,
+            CHAT_GLOBAL_SCOPE_ID,
+            "all",
+        )
+        .unwrap();
+        insert_chat_message(&conn, &doomed.id, "user", "[]").unwrap();
+
+        delete_folder(&conn, &f1.id).unwrap();
+
+        assert!(get_conversation_by_id(&conn, &doomed.id).unwrap().is_none());
+        // Its messages go too — the same ordering `delete_conversation` uses, so
+        // a failure can't strand rows nothing would ever read or clean up.
+        let orphans: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE conversation_id = ?1",
+                params![doomed.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(orphans, 0);
+        // Only THAT folder's threads: scope_id is namespaced by scope, so a note
+        // whose id collides with a folder's would not be caught in the blast.
+        assert!(get_conversation_by_id(&conn, &neighbour.id).unwrap().is_some());
+        assert!(get_conversation_by_id(&conn, &global.id).unwrap().is_some());
+    }
+
+    /// #110's constructor. The two ids are ALTERNATIVES: a thread is about a note
+    /// or about a folder, never both, and an empty id is an error under either —
+    /// same reasoning as above, since `""` degrading to "absent" would land on
+    /// Global, the widest scope there is.
+    #[test]
+    fn a_target_is_built_from_a_note_id_or_a_folder_id_but_never_both() {
+        assert_eq!(ChatTarget::from_ids(None, None).unwrap(), ChatTarget::Global);
+        assert_eq!(
+            ChatTarget::from_ids(Some("n1".into()), None).unwrap(),
+            ChatTarget::Note("n1".into())
+        );
+        assert_eq!(
+            ChatTarget::from_ids(None, Some("f1".into())).unwrap(),
+            ChatTarget::Folder("f1".into())
+        );
+        let both = ChatTarget::from_ids(Some("n1".into()), Some("f1".into())).unwrap_err();
+        assert!(both.contains("not both"), "got: {both}");
+        for empty in ["", "   ", "\t"] {
+            let err = ChatTarget::from_ids(None, Some(empty.into())).unwrap_err();
             assert!(err.contains("empty id"), "got: {err}");
         }
     }

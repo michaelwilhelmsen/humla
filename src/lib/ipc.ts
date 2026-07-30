@@ -1,6 +1,14 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { SpeakerLabelStat } from "./speakerSuggest";
+import { targetFolderId, targetNoteId, type ChatTarget } from "./chatTarget";
+
+/** The `(noteId, folderId)` pair every chat command sends, derived in ONE place
+ *  so no call site can pair a folder id with a note scope. `chatTarget.ts` imports
+ *  only a type from here, so this direction of the cycle carries no runtime edge. */
+function targetIds(target: ChatTarget): { noteId: string | null; folderId: string | null } {
+  return { noteId: targetNoteId(target), folderId: targetFolderId(target) };
+}
 
 export type Note = {
   id: string;
@@ -416,10 +424,12 @@ export const ipc = {
   // conversation server-side — `chatSetBreadth` writes it, `chatGetBreadth` reads
   // it back to initialise the Scope chip. `chatSend` carries no scope: it reads
   // the persisted breadth, so the UI can never diverge from it.
-  // Every chat command takes `noteId: string | null`, where **null means the whole
-  // library** (#93). The backend reads an absent note id as the global scope and
-  // REJECTS an empty string, so null is the only correct way to say "no anchor" —
-  // never "".
+  // Every chat command takes a `ChatTarget` and sends it as the `noteId` /
+  // `folderId` pair the backend's `ChatTarget::from_ids` parses (#93, #110). The
+  // union crosses the boundary rather than a bare nullable id because a null note
+  // id no longer identifies a scope on its own: both a folder pane and the
+  // library-wide pane have none. An ABSENT id is what selects a note-less scope
+  // and an EMPTY string is rejected, so these must be null and never "".
   //
   // `ownerName` is a DISPLAY NAME for the pinned author (#103), used only in the
   // prompt's disclosure line — the pinned *id* lives on the conversation row and
@@ -433,14 +443,14 @@ export const ipc = {
   // existing conversation is already the source of truth for both. Omit them
   // whenever `conversationId` is non-null.
   chatSend: (
-    noteId: string | null,
+    target: ChatTarget,
     conversationId: string | null,
     message: string,
     ownerName: string | null = null,
     draft: { breadth: ChatScope | null; ownerFilter: string | null } | null = null,
   ) =>
     invoke<ChatSendResult>("chat_send", {
-      noteId,
+      ...targetIds(target),
       conversationId,
       message,
       ownerName,
@@ -450,23 +460,23 @@ export const ipc = {
   // Stop the turn streaming in a pane (issue #80). A no-op when nothing is in
   // flight, so a stray click can't error. Any text that already streamed is kept;
   // a stop before the first token leaves only the user's message.
-  chatCancel: (noteId: string | null) => invoke<void>("chat_cancel", { noteId }),
-  chatHistory: (noteId: string | null, conversationId: string | null = null) =>
-    invoke<ChatHistory>("chat_history", { noteId, conversationId }),
+  chatCancel: (target: ChatTarget) => invoke<void>("chat_cancel", targetIds(target)),
+  chatHistory: (target: ChatTarget, conversationId: string | null = null) =>
+    invoke<ChatHistory>("chat_history", { ...targetIds(target), conversationId }),
   // List / create chat sessions for a target (issue #61). Personal reads local
   // SQLite; a workspace reads/creates server-authoritative sessions.
   // `limit`/`offset` window the list, most-recent first (issue #95): `/chat`
   // lists conversations uncapped, so it pages them in as the sidebar scrolls.
   // Omitting `limit` returns everything, which is what the Note header's history
   // popover has always done.
-  chatListConversations: (noteId: string | null, page?: { limit: number; offset: number }) =>
+  chatListConversations: (target: ChatTarget, page?: { limit: number; offset: number }) =>
     invoke<ConversationMeta[]>("chat_list_conversations", {
-      noteId,
+      ...targetIds(target),
       limit: page?.limit ?? null,
       offset: page?.offset ?? null,
     }),
-  chatNewConversation: (noteId: string | null) =>
-    invoke<ConversationMeta>("chat_new_conversation", { noteId }),
+  chatNewConversation: (target: ChatTarget) =>
+    invoke<ConversationMeta>("chat_new_conversation", targetIds(target)),
   // Delete / rename a conversation (issue #109). `conversationId` is REQUIRED on
   // both — unlike the read commands, neither falls back to "the active one", so a
   // missing id can't destroy or relabel whatever happens to be newest.
@@ -475,23 +485,23 @@ export const ipc = {
   // thread's creator, or a workspace owner/admin, may do either). Delete is
   // idempotent, so a retry after a partial failure is safe; rename returns the
   // updated row so the caller doesn't have to re-list to see the new title.
-  chatDeleteConversation: (noteId: string | null, conversationId: string) =>
-    invoke<void>("chat_delete_conversation", { noteId, conversationId }),
-  chatRenameConversation: (noteId: string | null, conversationId: string, title: string) =>
-    invoke<ConversationMeta>("chat_rename_conversation", { noteId, conversationId, title }),
+  chatDeleteConversation: (target: ChatTarget, conversationId: string) =>
+    invoke<void>("chat_delete_conversation", { ...targetIds(target), conversationId }),
+  chatRenameConversation: (target: ChatTarget, conversationId: string, title: string) =>
+    invoke<ConversationMeta>("chat_rename_conversation", { ...targetIds(target), conversationId, title }),
   // Persist / read the Scope chip's breadth on a conversation (issue #58/#61).
   // The single source of truth for retrieval breadth.
-  chatSetBreadth: (noteId: string | null, conversationId: string | null, breadth: ChatScope) =>
-    invoke<void>("chat_set_breadth", { noteId, conversationId, breadth }),
-  chatGetBreadth: (noteId: string | null, conversationId: string | null = null) =>
-    invoke<ChatScope>("chat_get_breadth", { noteId, conversationId }),
+  chatSetBreadth: (target: ChatTarget, conversationId: string | null, breadth: ChatScope) =>
+    invoke<void>("chat_set_breadth", { ...targetIds(target), conversationId, breadth }),
+  chatGetBreadth: (target: ChatTarget, conversationId: string | null = null) =>
+    invoke<ChatScope>("chat_get_breadth", { ...targetIds(target), conversationId }),
   // Persist / read the conversation's pinned authorship filter (#103) — a user
   // id, or null/"" for off. Workspace-only: the backend rejects a pin in
   // Personal, where every note is the user's own already.
-  chatSetOwnerFilter: (noteId: string | null, conversationId: string | null, owner: string | null) =>
-    invoke<void>("chat_set_owner_filter", { noteId, conversationId, owner }),
-  chatGetOwnerFilter: (noteId: string | null, conversationId: string | null = null) =>
-    invoke<string>("chat_get_owner_filter", { noteId, conversationId }),
+  chatSetOwnerFilter: (target: ChatTarget, conversationId: string | null, owner: string | null) =>
+    invoke<void>("chat_set_owner_filter", { ...targetIds(target), conversationId, owner }),
+  chatGetOwnerFilter: (target: ChatTarget, conversationId: string | null = null) =>
+    invoke<string>("chat_get_owner_filter", { ...targetIds(target), conversationId }),
   // Workspace turn allowance for the composer meter (issue #69). null in personal
   // context, and on any unavailable/error/unmetered outcome — a meter never
   // errors the pane, so the caller just hides the display when this is null.

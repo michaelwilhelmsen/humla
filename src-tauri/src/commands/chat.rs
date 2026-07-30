@@ -257,36 +257,47 @@ fn heal_and_read_breadth(
     Ok(breadth.to_string())
 }
 
-/// The library-wide counterpart: a global conversation is all-notes-only in v1
-/// (#82), so "note" and "folder" are meaningless — it has no anchor to mean them
-/// by. Heal rather than error, matching the folder-heal above: a corrupt row must
-/// not be able to break the user's chat.
+/// The note-less counterpart: a conversation with no anchor note holds exactly
+/// one breadth — `all` for a library-wide thread (#82), `folder` for a
+/// folder-scoped one (#110) — because it has no anchor to mean any other by.
+/// Heal rather than error, matching the folder-heal above: a corrupt row must not
+/// be able to break the user's chat.
 ///
 /// A separate function rather than an `Option<&Note>` arm on the one above,
 /// because `None` there would hide a whole policy branch behind a nullable
-/// parameter — a reader couldn't tell "library-wide" from "note not loaded".
-fn heal_and_read_global_breadth(
+/// parameter — a reader couldn't tell "note-less" from "note not loaded".
+fn heal_and_read_pinned_breadth(
     conn: &rusqlite::Connection,
     conversation_id: &str,
     stored: &str,
+    pinned: &'static str,
 ) -> Result<String, String> {
-    if chat::validate_breadth(stored)? != "all" {
-        db::set_conversation_breadth(conn, conversation_id, "all").map_err(|e| e.to_string())?;
+    if chat::validate_breadth(stored)? != pinned {
+        db::set_conversation_breadth(conn, conversation_id, pinned).map_err(|e| e.to_string())?;
     }
-    Ok("all".into())
+    Ok(pinned.into())
 }
 
-/// Effective breadth for whichever target a turn is on — the one place the two
-/// heal policies are chosen between.
+/// Effective breadth for whichever target a turn is on — the one place the heal
+/// policies are chosen between.
+///
+/// A folder target pins to `folder` rather than being allowed to widen: the clamp
+/// is what "chat about this folder" means, and it matches how a note-scoped thread
+/// can't be widened past its own note either. A user who wants the library has
+/// `/chat` one click away.
 fn effective_breadth(
     conn: &rusqlite::Connection,
     conversation_id: &str,
     stored: &str,
+    target: &ChatTarget,
     note: Option<&db::Note>,
 ) -> Result<String, String> {
-    match note {
-        Some(note) => heal_and_read_breadth(conn, conversation_id, stored, note),
-        None => heal_and_read_global_breadth(conn, conversation_id, stored),
+    match (target, note) {
+        (ChatTarget::Folder(_), _) => {
+            heal_and_read_pinned_breadth(conn, conversation_id, stored, "folder")
+        }
+        (_, Some(note)) => heal_and_read_breadth(conn, conversation_id, stored, note),
+        (_, None) => heal_and_read_pinned_breadth(conn, conversation_id, stored, "all"),
     }
 }
 
@@ -319,20 +330,36 @@ fn turn_grounding(note: Option<&db::Note>) -> (chat::Grounding, Option<String>) 
 }
 
 /// Resolve an (already-effective) breadth into a server-enforced `ToolScope`.
-/// "folder" resolves to the anchor Note's folder. Unrecognised breadths and a
-/// folder breadth without a folder are loud errors (issue #58) rather than a
-/// silent clamp to Note — in practice `heal_and_read_breadth` heals the
-/// folder-less case upstream, so those arms are belt-and-suspenders.
 ///
-/// `note` is `None` for a library-wide turn (#93), which resolves straight to
-/// `All` without reaching for an anchor — the retrieval tools carry it alone.
-fn resolve_scope(breadth: &str, note: Option<&db::Note>) -> Result<ToolScope, String> {
+/// "folder" resolves to the conversation's OWN folder when it has one (#110),
+/// falling back to the anchor Note's folder — the only source there was before,
+/// back when a folder breadth could only be reached from a note that sat in one.
+/// The thread's own folder wins because it is the identity the user chose; the
+/// note's is merely where the note happens to live.
+///
+/// Unrecognised breadths and a folder breadth with no folder from either source
+/// are loud errors (issue #58) rather than a silent clamp to Note — in practice
+/// `heal_and_read_breadth` heals the folder-less case upstream, so those arms are
+/// belt-and-suspenders.
+///
+/// `note` is `None` for a note-less turn (#93, #110), which resolves without
+/// reaching for an anchor — the retrieval tools carry it alone.
+fn resolve_scope(
+    breadth: &str,
+    note: Option<&db::Note>,
+    target_folder: Option<&str>,
+) -> Result<ToolScope, String> {
     match chat::validate_breadth(breadth)? {
         "all" => Ok(ToolScope::All),
-        "folder" => match note.and_then(|n| n.folder_id.as_deref()) {
-            Some(folder_id) if !folder_id.is_empty() => Ok(ToolScope::Folder(folder_id.to_string())),
-            _ => Err("This note isn't in a folder, so \"Folder\" scope isn't available.".into()),
-        },
+        "folder" => {
+            let folder = target_folder
+                .or_else(|| note.and_then(|n| n.folder_id.as_deref()))
+                .filter(|f| !f.is_empty());
+            match folder {
+                Some(folder_id) => Ok(ToolScope::Folder(folder_id.to_string())),
+                None => Err("This note isn't in a folder, so \"Folder\" scope isn't available.".into()),
+            }
+        }
         // A "note" breadth with no note can only be a corrupt global row.
         // `heal_and_read_global_breadth` rewrites those to "all" before a turn ever
         // reaches here, so this is unreachable in practice — and it errors rather
@@ -634,6 +661,9 @@ fn resolve_existing(
         if c.tenant != tenant || c.scope != target.scope() || c.scope_id != target.scope_id() {
             return Err(match target {
                 ChatTarget::Note(_) => "That chat session doesn't belong to this note.".into(),
+                ChatTarget::Folder(_) => {
+                    "That chat session doesn't belong to this folder.".to_string()
+                }
                 ChatTarget::Global => "That chat session isn't a library-wide one.".to_string(),
             });
         }
@@ -652,15 +682,20 @@ fn resolve_existing(
 /// take a second deliberate action. Returning to a specific past thread is the
 /// rarer, more intentional act, and the sidebar list already exists for it.
 ///
+/// A folder pane drafts for the same reason (#110): it is a route you navigate to
+/// in order to ask something, not an object you were already reading. The folder
+/// narrows *what is in reach*, which is not the same as being an anchor — there is
+/// no folder text to continue a line of thinking about.
+///
 /// A Note's pane resumes, deliberately diverging: a note is an anchor, and coming
 /// back to it to continue the same line of thinking is a plausible default in a
-/// way it isn't on a library-wide route. Recorded here, in one predicate, so the
-/// divergence stays a decision rather than becoming an accident — every caller
-/// that cares reads it from this function.
+/// way it isn't on a route. Recorded here, in one predicate, so the divergence
+/// stays a decision rather than becoming an accident — every caller that cares
+/// reads it from this function.
 fn resumes_on_open(target: &ChatTarget) -> bool {
     match target {
         ChatTarget::Note(_) => true,
-        ChatTarget::Global => false,
+        ChatTarget::Folder(_) | ChatTarget::Global => false,
     }
 }
 
@@ -732,6 +767,36 @@ pub struct DraftSettings {
     pub owner_filter: Option<String>,
 }
 
+/// The one breadth a note-less target may hold, if it is pinned to one.
+///
+/// A library-wide thread is `all` and a folder thread is `folder`: with no anchor
+/// note, the target's identity IS its reach, so there is nothing for a picker to
+/// offer. (A Note is the exception — it can widen to its folder or the library,
+/// which is what the breadth picker is for.) Returns `None` when the target has a
+/// real choice to make.
+fn pinned_breadth(target: &ChatTarget) -> Option<&'static str> {
+    match target {
+        ChatTarget::Note(_) => None,
+        ChatTarget::Folder(_) => Some("folder"),
+        ChatTarget::Global => Some("all"),
+    }
+}
+
+/// Reject a breadth a pinned target may not hold. One owner for the rule, since
+/// both `chat_set_breadth` and `validated_draft` write the same column and would
+/// otherwise be free to disagree about it.
+fn check_pinned_breadth(target: &ChatTarget, breadth: &str) -> Result<(), String> {
+    match pinned_breadth(target) {
+        Some(pinned) if breadth != pinned => Err(match target {
+            ChatTarget::Folder(_) => {
+                "A folder chat always searches that folder.".to_string()
+            }
+            _ => "A library-wide chat always searches all notes.".to_string(),
+        }),
+        _ => Ok(()),
+    }
+}
+
 /// Check a draft's pending settings against the same rules their dedicated
 /// setters enforce (issue #120).
 ///
@@ -748,9 +813,7 @@ fn validated_draft(
 ) -> Result<DraftSettings, String> {
     if let Some(b) = breadth.as_deref() {
         chat::validate_breadth(b)?;
-        if matches!(target, ChatTarget::Global) && b != "all" {
-            return Err("A library-wide chat always searches all notes.".into());
-        }
+        check_pinned_breadth(target, b)?;
     }
     // An empty string is "no pin", not a pin on nobody — normalise it away rather
     // than storing it, so the created row reads the same as one that never had one.
@@ -846,10 +909,11 @@ fn new_personal_conversation(
 pub async fn chat_list_conversations(
     app: AppHandle,
     note_id: Option<String>,
+    folder_id: Option<String>,
     limit: Option<u32>,
     offset: Option<u32>,
 ) -> Result<Vec<ConversationMeta>, String> {
-    let target = ChatTarget::from_note_id(note_id)?;
+    let target = ChatTarget::from_ids(note_id, folder_id)?;
     let page = conversation_page(limit, offset);
     let state: State<AppState> = app.state();
     let ctx = {
@@ -908,8 +972,9 @@ fn apply_page<T>(all: Vec<T>, page: Option<db::Page>) -> Vec<T> {
 pub async fn chat_new_conversation(
     app: AppHandle,
     note_id: Option<String>,
+    folder_id: Option<String>,
 ) -> Result<ConversationMeta, String> {
-    let target = ChatTarget::from_note_id(note_id)?;
+    let target = ChatTarget::from_ids(note_id, folder_id)?;
     let state: State<AppState> = app.state();
     let ctx = {
         let conn = state.db.lock();
@@ -944,9 +1009,10 @@ pub async fn chat_new_conversation(
 pub async fn chat_delete_conversation(
     app: AppHandle,
     note_id: Option<String>,
+    folder_id: Option<String>,
     conversation_id: String,
 ) -> Result<(), String> {
-    let target = ChatTarget::from_note_id(note_id)?;
+    let target = ChatTarget::from_ids(note_id, folder_id)?;
     let state: State<AppState> = app.state();
     let ctx = {
         let conn = state.db.lock();
@@ -995,10 +1061,11 @@ pub async fn chat_delete_conversation(
 pub async fn chat_rename_conversation(
     app: AppHandle,
     note_id: Option<String>,
+    folder_id: Option<String>,
     conversation_id: String,
     title: String,
 ) -> Result<ConversationMeta, String> {
-    let target = ChatTarget::from_note_id(note_id)?;
+    let target = ChatTarget::from_ids(note_id, folder_id)?;
     let state: State<AppState> = app.state();
     let ctx = {
         let conn = state.db.lock();
@@ -1052,17 +1119,16 @@ pub async fn chat_rename_conversation(
 pub fn chat_set_breadth(
     app: AppHandle,
     note_id: Option<String>,
+    folder_id: Option<String>,
     conversation_id: Option<String>,
     breadth: String,
 ) -> Result<(), String> {
     chat::validate_breadth(&breadth)?;
-    let target = ChatTarget::from_note_id(note_id)?;
-    if matches!(target, ChatTarget::Global) && breadth != "all" {
-        // #82 fixed the library surface at all-notes-only for v1, so there is no
-        // picker to send this — reject rather than store a breadth that
-        // `heal_and_read_breadth` would immediately undo.
-        return Err("A library-wide chat always searches all notes.".into());
-    }
+    let target = ChatTarget::from_ids(note_id, folder_id)?;
+    // A note-less target's identity IS its reach, so it holds exactly one breadth
+    // and no picker can send another (#82, #110). Reject rather than store a value
+    // `effective_breadth` would immediately undo.
+    check_pinned_breadth(&target, &breadth)?;
     let state: State<AppState> = app.state();
     let conn = state.db.lock();
     let ctx = ChatContext::load(&conn);
@@ -1092,10 +1158,11 @@ pub fn chat_set_breadth(
 pub fn chat_set_owner_filter(
     app: AppHandle,
     note_id: Option<String>,
+    folder_id: Option<String>,
     conversation_id: Option<String>,
     owner: Option<String>,
 ) -> Result<(), String> {
-    let target = ChatTarget::from_note_id(note_id)?;
+    let target = ChatTarget::from_ids(note_id, folder_id)?;
     let owner = owner.map(|o| o.trim().to_string()).filter(|o| !o.is_empty());
     let state: State<AppState> = app.state();
     let conn = state.db.lock();
@@ -1129,9 +1196,10 @@ pub fn chat_set_owner_filter(
 pub fn chat_get_breadth(
     app: AppHandle,
     note_id: Option<String>,
+    folder_id: Option<String>,
     conversation_id: Option<String>,
 ) -> Result<String, String> {
-    let target = ChatTarget::from_note_id(note_id)?;
+    let target = ChatTarget::from_ids(note_id, folder_id)?;
     let state: State<AppState> = app.state();
     let conn = state.db.lock();
     let ctx = ChatContext::load(&conn);
@@ -1144,9 +1212,9 @@ pub fn chat_get_breadth(
         // established there's no session).
         return Ok(chat::default_breadth(&target).into());
     };
-    // A library-wide conversation has no anchor to heal against.
+    // A note-less conversation has no anchor to heal against.
     let note = anchor_note(&conn, &target)?;
-    effective_breadth(&conn, &conversation.id, &conversation.breadth, note.as_ref())
+    effective_breadth(&conn, &conversation.id, &conversation.breadth, &target, note.as_ref())
 }
 
 /// Read the persisted authorship pin (#103) so the chip initialises from the
@@ -1158,9 +1226,10 @@ pub fn chat_get_breadth(
 pub fn chat_get_owner_filter(
     app: AppHandle,
     note_id: Option<String>,
+    folder_id: Option<String>,
     conversation_id: Option<String>,
 ) -> Result<String, String> {
-    let target = ChatTarget::from_note_id(note_id)?;
+    let target = ChatTarget::from_ids(note_id, folder_id)?;
     let state: State<AppState> = app.state();
     let conn = state.db.lock();
     let ctx = ChatContext::load(&conn);
@@ -1460,11 +1529,16 @@ impl Drop for TurnCancel {
 /// dropped, but the server finishes generating and the tokens are really spent,
 /// so a metered turn still counts. A server-side cancel is the follow-up.
 #[tauri::command]
-pub fn chat_cancel(app: AppHandle, note_id: Option<String>) -> Result<(), String> {
+pub fn chat_cancel(
+    app: AppHandle,
+    note_id: Option<String>,
+    folder_id: Option<String>,
+) -> Result<(), String> {
     let state: State<AppState> = app.state();
-    // Panes are keyed by `scope_id`, which is the note id for a note pane and the
-    // global sentinel for the library pane — so the two can't stop each other.
-    let target = ChatTarget::from_note_id(note_id)?;
+    // Panes are keyed by `scope_id` — the note id for a note pane, the folder id
+    // for a folder pane, the global sentinel for the library one — so no pane can
+    // stop another's turn.
+    let target = ChatTarget::from_ids(note_id, folder_id)?;
     if let Some(flag) = state.chat_cancels.lock().get(target.scope_id()) {
         flag.cancel();
     }
@@ -1475,6 +1549,7 @@ pub fn chat_cancel(app: AppHandle, note_id: Option<String>) -> Result<(), String
 pub async fn chat_send(
     app: AppHandle,
     note_id: Option<String>,
+    folder_id: Option<String>,
     conversation_id: Option<String>,
     message: String,
     // See `chat_send_cloud` — display name for a pinned authorship filter.
@@ -1486,7 +1561,7 @@ pub async fn chat_send(
     draft_breadth: Option<String>,
     draft_owner_filter: Option<String>,
 ) -> Result<ChatSendResult, String> {
-    let target = ChatTarget::from_note_id(note_id)?;
+    let target = ChatTarget::from_ids(note_id, folder_id)?;
     let state: State<AppState> = app.state();
     // Validated on the way in, to the same standard as `chat_set_breadth` and
     // `chat_set_owner_filter`. These two fields reach the same columns those
@@ -1538,13 +1613,13 @@ pub async fn chat_send(
         // Breadth is read from the conversation row (single source of truth),
         // self-healed against the Note's current folder.
         let breadth =
-            effective_breadth(&conn, &conversation.id, &conversation.breadth, note.as_ref())?;
+            effective_breadth(&conn, &conversation.id, &conversation.breadth, &target, note.as_ref())?;
         // No authorship pin is read here: `chat_set_owner_filter` refuses one in
         // Personal, where every note is the user's own, so the column is always
         // empty on this path. The workspace turn (`chat_send_cloud`) is where the
         // pin is read and sent. Keep this in step with that rejection — a pin that
         // could be stored but not applied is the silent-no-op shape (#103).
-        let tool_scope = resolve_scope(&breadth, note.as_ref())?;
+        let tool_scope = resolve_scope(&breadth, note.as_ref(), target.folder_id())?;
         (grounding, resolved, conversation.id, tool_scope, workspace)
     };
 
@@ -1692,7 +1767,7 @@ async fn chat_send_cloud(
         // Breadth is read from the (workspace) conversation row and self-healed
         // against the Note's folder, exactly like the Personal path (issue #58).
         let breadth =
-            effective_breadth(&conn, &conversation.id, &conversation.breadth, note.as_ref())?;
+            effective_breadth(&conn, &conversation.id, &conversation.breadth, &target, note.as_ref())?;
         // The pinned authorship filter (#103), read from the same row as breadth
         // and binding the same way: it's the user's stated intent, so it applies
         // whatever the model asks for.
@@ -1701,13 +1776,21 @@ async fn chat_send_cloud(
         // say `the folder "K2 pilot"`, and the scope carries only an id the user has
         // never seen. Resolved here beside the folder id it names; `None` degrades to
         // no disclosure rather than to an empty quoted string.
-        let folder_display = note
-            .as_ref()
-            .and_then(|n| n.folder_id.clone())
-            .and_then(|id| db::folder_name(&conn, &id).ok().flatten());
+        //
+        // The folder comes from the TARGET first (#110) and only then from the
+        // anchor note — the same precedence `resolve_scope` uses locally, and for
+        // the same reason: a folder thread's own folder is the identity the user
+        // chose, while a note's is merely where the note happens to live.
+        let folder_id = target
+            .folder_id()
+            .map(str::to_string)
+            .or_else(|| note.as_ref().and_then(|n| n.folder_id.clone()));
+        let folder_display = folder_id
+            .as_deref()
+            .and_then(|id| db::folder_name(&conn, id).ok().flatten());
         (
             workspace.to_string(),
-            note.as_ref().and_then(|n| n.folder_id.clone()),
+            folder_id,
             // The server derives a global conversation's title from the first
             // message, the same as Personal; there's no note title to send.
             note.as_ref().map(|n| n.title.clone()).unwrap_or_default(),
@@ -1928,9 +2011,10 @@ pub struct ChatMessageDto {
 pub async fn chat_history(
     app: AppHandle,
     note_id: Option<String>,
+    folder_id: Option<String>,
     conversation_id: Option<String>,
 ) -> Result<ChatHistoryResult, String> {
-    let target = ChatTarget::from_note_id(note_id)?;
+    let target = ChatTarget::from_ids(note_id, folder_id)?;
     let state: State<AppState> = app.state();
     // Chat follows the loaded context (issue #58): a loaded workspace reads its
     // server-authoritative conversation; Personal reads the local table.
@@ -2164,10 +2248,12 @@ fn unlisted_legacy_handles<'a>(
 /// handle, then UNIONS in local handles the server omitted (pre-#19 threads not
 /// yet adopted — their message count is read through). Most-recently-updated
 /// first.
-/// Query params for the conversations route. `note_id` is optional (humla-cloud#26)
-/// and its ABSENCE is what selects the library-wide list — the server keys that off
-/// its own `scope` field, so the param must be omitted rather than sent as a
-/// sentinel it would reject as malformed.
+/// Query params for the conversations route. Both ids are optional and select
+/// which of the server's three disjoint populations is addressed (humla-cloud#26,
+/// #110): `note_id` → that Note's threads, `folder_id` → that folder's, NEITHER →
+/// the library-wide ones. The server keys the note-less lists off its own `scope`
+/// field, so an absent id must be omitted rather than sent as a sentinel it would
+/// reject as malformed.
 fn conversation_route_params<'a>(
     workspace: &'a str,
     target: &'a ChatTarget,
@@ -2176,20 +2262,33 @@ fn conversation_route_params<'a>(
     if let Some(id) = target.note_id() {
         params.push(("note_id", id));
     }
+    if let Some(id) = target.folder_id() {
+        params.push(("folder_id", id));
+    }
     params
 }
 
 /// Body for creating a conversation server-side. Same rule as the params above,
-/// plus the anchor-less-must-be-`all` check in its one owner.
+/// plus the each-breadth-carries-its-own-id check in its one owner.
 fn new_conversation_body(
     workspace: &str,
     target: &ChatTarget,
     breadth: &str,
 ) -> Result<serde_json::Value, String> {
-    chat::check_anchor(breadth, target.note_id().is_some())?;
+    chat::check_anchor(
+        breadth,
+        target.note_id().is_some(),
+        // A folder breadth may also be a NOTE thread widened to its folder, whose
+        // folder the server reads from the note. Only a folder target must supply
+        // the id itself — which is exactly what it does.
+        target.folder_id().is_some() || target.note_id().is_some(),
+    )?;
     let mut body = serde_json::json!({ "workspace_id": workspace, "breadth": breadth });
     if let Some(id) = target.note_id() {
         body["note_id"] = serde_json::json!(id);
+    }
+    if let Some(id) = target.folder_id() {
+        body["folder_id"] = serde_json::json!(id);
     }
     Ok(body)
 }
@@ -2391,16 +2490,16 @@ mod tests {
         let with_folder = note_in_folder(&conn, Some(&folder.id));
         let no_folder = note_in_folder(&conn, None);
 
-        assert!(matches!(resolve_scope("all", Some(&no_folder)).unwrap(), ToolScope::All));
-        assert!(matches!(resolve_scope("note", Some(&no_folder)).unwrap(), ToolScope::Note(_)));
-        match resolve_scope("folder", Some(&with_folder)).unwrap() {
+        assert!(matches!(resolve_scope("all", Some(&no_folder), None).unwrap(), ToolScope::All));
+        assert!(matches!(resolve_scope("note", Some(&no_folder), None).unwrap(), ToolScope::Note(_)));
+        match resolve_scope("folder", Some(&with_folder), None).unwrap() {
             ToolScope::Folder(id) => assert_eq!(id, folder.id),
             other => panic!("expected Folder scope, got {other:?}"),
         }
         // Unknown breadth is loud (issue #58) — the old `_ => Note` clamp is gone.
-        assert!(resolve_scope("everything", Some(&no_folder)).is_err());
+        assert!(resolve_scope("everything", Some(&no_folder), None).is_err());
         // Folder breadth on a folder-less note errors rather than clamping.
-        assert!(resolve_scope("folder", Some(&no_folder)).is_err());
+        assert!(resolve_scope("folder", Some(&no_folder), None).is_err());
     }
 
     // ── #93: library-wide (global) scope ────────────────────────────────────
@@ -2409,16 +2508,16 @@ mod tests {
     /// retrieval tools carry it alone (#82: no fallback note is substituted).
     #[test]
     fn resolve_scope_resolves_a_library_wide_turn_without_a_note() {
-        assert!(matches!(resolve_scope("all", None).unwrap(), ToolScope::All));
+        assert!(matches!(resolve_scope("all", None, None).unwrap(), ToolScope::All));
         // Every anchor-requiring breadth is LOUD without an anchor rather than
         // widening to the whole library — a corrupt global row must not silently
         // search everything. `heal_and_read_global_breadth` rewrites such rows to
         // "all" before a turn gets here, so these arms are belt-and-suspenders.
         for breadth in ["note", "folder"] {
-            assert!(resolve_scope(breadth, None).is_err(), "{breadth} should not widen silently");
+            assert!(resolve_scope(breadth, None, None).is_err(), "{breadth} should not widen silently");
         }
         // Garbage is still loud.
-        assert!(resolve_scope("everything", None).is_err());
+        assert!(resolve_scope("everything", None, None).is_err());
     }
 
     /// #93's proof is Rust tests, so the two cloud shapes are asserted directly
@@ -2446,15 +2545,84 @@ mod tests {
         let global_body = new_conversation_body("ws1", &global, "all").unwrap();
         assert!(global_body.get("note_id").is_none());
         assert_eq!(global_body["breadth"], "all");
-        // A note-less create MUST be breadth "all" — a note-less "folder" is a 400
-        // server-side, so it's caught here as our bug instead.
-        for breadth in ["note", "folder"] {
-            assert!(
-                new_conversation_body("ws1", &global, breadth)
-                    .unwrap_err()
-                    .contains("needs an anchor note"),
-                "{breadth} without an anchor should be rejected"
-            );
+        // A library-wide create MUST be breadth "all": it carries neither id, so
+        // any narrowing breadth would have nothing to clamp on — a 400 server-side,
+        // caught here as our bug instead.
+        assert!(new_conversation_body("ws1", &global, "note")
+            .unwrap_err()
+            .contains("needs an anchor note"));
+        assert!(new_conversation_body("ws1", &global, "folder")
+            .unwrap_err()
+            .contains("needs a folder"));
+    }
+
+    /// #110's wire shape, and the third of the server's disjoint populations: a
+    /// folder target addresses its own list with `folder_id` and no `note_id`.
+    #[test]
+    fn the_cloud_conversation_routes_address_a_folder_by_its_own_id() {
+        let folder = ChatTarget::Folder("f1".into());
+        assert_eq!(
+            conversation_route_params("ws1", &folder),
+            vec![("workspace_id", "ws1"), ("folder_id", "f1")]
+        );
+        // The anchor param is absent, not empty — the two ids are alternatives, and
+        // sending both is a 400 server-side.
+        assert!(!conversation_route_params("ws1", &folder)
+            .iter()
+            .any(|(k, _)| *k == "note_id"));
+
+        let body = new_conversation_body("ws1", &folder, "folder").unwrap();
+        assert_eq!(body["folder_id"], "f1");
+        assert_eq!(body["breadth"], "folder");
+        assert!(body.get("note_id").is_none());
+        // A folder target has no note, so `note` breadth has nothing to clamp on.
+        assert!(new_conversation_body("ws1", &folder, "note")
+            .unwrap_err()
+            .contains("needs an anchor note"));
+    }
+
+    /// The clamp is the point of the surface (#110), so it is pinned rather than
+    /// defaulted: neither the breadth setter nor a draft may widen a folder thread
+    /// to the library. Consistent with a note-scoped thread, which can't be widened
+    /// past its own note either — `/chat` is where a library-wide question goes.
+    #[test]
+    fn a_folder_thread_is_pinned_to_folder_breadth() {
+        let folder = ChatTarget::Folder("f1".into());
+        assert_eq!(pinned_breadth(&folder), Some("folder"));
+        assert_eq!(pinned_breadth(&ChatTarget::Global), Some("all"));
+        // A Note is the one target with a real choice — that's what the picker is for.
+        assert_eq!(pinned_breadth(&ChatTarget::Note("n1".into())), None);
+
+        assert!(check_pinned_breadth(&folder, "folder").is_ok());
+        for widened in ["all", "note"] {
+            let err = check_pinned_breadth(&folder, widened).unwrap_err();
+            assert!(err.contains("always searches that folder"), "{widened}: {err}");
+        }
+        for b in ["note", "folder", "all"] {
+            assert!(check_pinned_breadth(&ChatTarget::Note("n1".into()), b).is_ok());
+        }
+    }
+
+    /// A folder thread resolves its clamp from its OWN folder — it has no anchor
+    /// note to borrow one from, which is the whole reason the scope value exists.
+    #[test]
+    fn resolve_scope_clamps_a_folder_thread_to_its_own_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = db::open(&dir.path().join("folderscope.sqlite")).unwrap();
+        let folder = db::create_folder(&conn, "Team", "").unwrap();
+
+        match resolve_scope("folder", None, Some(&folder.id)).unwrap() {
+            ToolScope::Folder(id) => assert_eq!(id, folder.id),
+            other => panic!("expected Folder scope, got {other:?}"),
+        }
+        // The thread's own folder WINS over the anchor note's — a note pane widened
+        // to its folder passes None here, so the two never actually compete, but the
+        // precedence has to be stated somewhere and this is it.
+        let elsewhere = db::create_folder(&conn, "Elsewhere", "").unwrap();
+        let note = note_in_folder(&conn, Some(&elsewhere.id));
+        match resolve_scope("folder", Some(&note), Some(&folder.id)).unwrap() {
+            ToolScope::Folder(id) => assert_eq!(id, folder.id),
+            other => panic!("expected the target's folder, got {other:?}"),
         }
     }
 
@@ -2499,18 +2667,18 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(heal_and_read_global_breadth(&conn, &conv.id, "all").unwrap(), "all");
+        assert_eq!(heal_and_read_pinned_breadth(&conn, &conv.id, "all", "all").unwrap(), "all");
         // A row that somehow stored a note/folder breadth has no anchor to mean it
         // by. Heal rather than error: a corrupt row must not break the user's chat.
         for stored in ["note", "folder"] {
             db::set_conversation_breadth(&conn, &conv.id, stored).unwrap();
-            assert_eq!(heal_and_read_global_breadth(&conn, &conv.id, stored).unwrap(), "all");
+            assert_eq!(heal_and_read_pinned_breadth(&conn, &conv.id, stored, "all").unwrap(), "all");
             // The heal is persisted, so the chip and the request never diverge.
             let reloaded = db::get_conversation_by_id(&conn, &conv.id).unwrap().unwrap();
             assert_eq!(reloaded.breadth, "all");
         }
         // Garbage is still loud, exactly as for a note conversation.
-        assert!(heal_and_read_global_breadth(&conn, &conv.id, "bogus").is_err());
+        assert!(heal_and_read_pinned_breadth(&conn, &conv.id, "bogus", "all").is_err());
     }
 
     #[test]

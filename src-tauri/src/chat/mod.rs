@@ -43,9 +43,10 @@ pub fn validate_breadth(breadth: &str) -> Result<&str, String> {
     }
 }
 
-/// The breadth a target's first-ever conversation starts at. A library-wide
-/// conversation has no anchor to narrow to, so it is always `all` (#82 fixed v1 at
-/// all-notes-only); a Note's defaults to itself.
+/// The breadth a target's first-ever conversation starts at — each surface
+/// starting at its own reach. A library-wide conversation has no anchor to narrow
+/// to, so it is always `all`; a Note's defaults to itself; a folder's to that
+/// folder (#110), which is also the only breadth it may hold.
 ///
 /// Lives here rather than on `ChatTarget` so the breadth vocabulary and its
 /// defaults stay in the module that owns `validate_breadth` — `db` shouldn't mint
@@ -53,24 +54,36 @@ pub fn validate_breadth(breadth: &str) -> Result<&str, String> {
 pub fn default_breadth(target: &crate::db::ChatTarget) -> &'static str {
     match target {
         crate::db::ChatTarget::Note(_) => "note",
+        crate::db::ChatTarget::Folder(_) => "folder",
         crate::db::ChatTarget::Global => "all",
     }
 }
 
-/// Whether a breadth can run without an anchor note, in ONE place (#93).
+/// Whether a breadth has the id it needs to clamp on, in ONE place (#93, #110).
 ///
-/// Two server rules make this exact (humla-cloud#26): a note-less create must be
-/// breadth `all`, and a malformed `note_id` is a 400 under *every* breadth — so an
-/// anchor-less `note`/`folder` turn is our bug and must be caught before it
-/// becomes a failed request. Both request builders and the local resolver funnel
-/// through here so the message exists once, matching the discipline
-/// `validate_breadth` already sets.
-pub fn check_anchor(breadth: &str, has_anchor: bool) -> Result<(), String> {
-    if has_anchor || validate_breadth(breadth)? == "all" {
+/// Each narrowing breadth requires its OWN id — `note` a note, `folder` a folder —
+/// and `all` requires none. Until #110 a folder breadth was always *derived* from
+/// an anchor note's folder, so "has an anchor" was a good enough proxy for both;
+/// now that a folder can be a thread's own anchor, the two are asked separately.
+///
+/// The server rules this mirrors (humla-cloud#26, #110): a note-less create must
+/// be breadth `all` or `folder`, an absent id may never widen a turn, and a
+/// malformed id is a 400 under *every* breadth. So a breadth missing its id is
+/// our bug and must be caught before it becomes a failed request. Both request
+/// builders and the local resolver funnel through here so the message exists
+/// once, matching the discipline `validate_breadth` already sets.
+pub fn check_anchor(breadth: &str, has_note: bool, has_folder: bool) -> Result<(), String> {
+    let needed = match validate_breadth(breadth)? {
+        "note" => ("an anchor note", has_note),
+        "folder" => ("a folder", has_folder),
+        _ => return Ok(()),
+    };
+    if needed.1 {
         return Ok(());
     }
     Err(format!(
-        "chat breadth {breadth:?} needs an anchor note; only \"all\" can run without one"
+        "chat breadth {breadth:?} needs {}; only \"all\" can run without one",
+        needed.0
     ))
 }
 
@@ -888,31 +901,40 @@ mod tests {
     /// local resolver). This is its single owner, so the contract is asserted here
     /// rather than three times over.
     #[test]
-    fn check_anchor_allows_only_all_to_run_without_a_note() {
-        // With an anchor, every breadth is fine.
+    fn check_anchor_requires_each_breadth_to_carry_its_own_id() {
+        // With both ids in hand, every breadth is fine.
         for b in ["note", "folder", "all"] {
-            assert!(check_anchor(b, true).is_ok(), "{b} with an anchor");
+            assert!(check_anchor(b, true, true).is_ok(), "{b} with both ids");
         }
-        // Without one, only "all" — a note-less create of any other breadth is a
-        // 400 server-side (humla-cloud#26), so it's caught as our bug first.
-        assert!(check_anchor("all", false).is_ok());
-        for b in ["note", "folder"] {
-            let err = check_anchor(b, false).unwrap_err();
-            assert!(err.contains("needs an anchor note"), "{b}: {err}");
-        }
+        // `all` needs neither — the note-less, library-wide case (humla-cloud#26).
+        assert!(check_anchor("all", false, false).is_ok());
+        // Each narrowing breadth needs ITS OWN id, and is satisfied by nothing else.
+        // #110 is exactly this distinction: before it, a folder breadth borrowed the
+        // anchor note's folder, so a note alone looked like enough for both.
+        assert!(check_anchor("note", true, false).is_ok());
+        assert!(check_anchor("folder", false, true).is_ok());
+        let no_note = check_anchor("note", false, true).unwrap_err();
+        assert!(no_note.contains("needs an anchor note"), "got: {no_note}");
+        let no_folder = check_anchor("folder", true, false).unwrap_err();
+        assert!(no_folder.contains("needs a folder"), "got: {no_folder}");
         // Garbage still funnels through validate_breadth's message, not a second one.
-        let err = check_anchor("everything", false).unwrap_err();
+        let err = check_anchor("everything", false, false).unwrap_err();
         assert!(err.contains("Unrecognized chat scope"), "got: {err}");
     }
 
     #[test]
-    fn a_library_wide_conversation_defaults_to_all_and_a_notes_to_note() {
+    fn every_target_defaults_to_its_own_reach() {
         use crate::db::ChatTarget;
         assert_eq!(default_breadth(&ChatTarget::Global), "all");
         assert_eq!(default_breadth(&ChatTarget::Note("n1".into())), "note");
-        // Both defaults must be values `validate_breadth` accepts — the reason this
+        assert_eq!(default_breadth(&ChatTarget::Folder("f1".into())), "folder");
+        // Every default must be a value `validate_breadth` accepts — the reason this
         // lives here rather than on `ChatTarget` in `db`.
-        for t in [ChatTarget::Global, ChatTarget::Note("n1".into())] {
+        for t in [
+            ChatTarget::Global,
+            ChatTarget::Note("n1".into()),
+            ChatTarget::Folder("f1".into()),
+        ] {
             assert!(validate_breadth(default_breadth(&t)).is_ok());
         }
     }

@@ -42,8 +42,11 @@ import {
 } from "../lib/chatSessions";
 import {
   targetNoteId,
+  targetFolderId,
+  targetFromKey,
   targetKey,
   targetDefaultScope,
+  targetPinsScope,
   targetResumesOnOpen,
   type ChatTarget,
 } from "../lib/chatTarget";
@@ -201,7 +204,7 @@ export type ChatSessionControls = {
 export type ChatPanelVariant = "panel" | "page";
 
 export function ChatPanel({
-  target,
+  target: targetProp,
   onControls,
   variant = "panel",
 }: {
@@ -212,14 +215,17 @@ export function ChatPanel({
   const onPage = variant === "page";
   // The page supplies its own gutter, so the panel's own padding would double it.
   const gutter = onPage ? "" : "px-4";
-  // The anchor note id for IPC — null means the whole library (#93). This is also
-  // the pane's dependency identity: it's already a stable scalar and `null` is
-  // exactly "global", so a change in it is exactly a change of target. Depending on
-  // `target` itself would re-run the load effect forever, since the parent rebuilds
-  // the object on most renders.
+  // The pane's identity, and the only thing anything below depends on.
+  const paneKey = targetKey(targetProp);
+  // The target, re-derived from its key so its IDENTITY is the key. The parent
+  // rebuilds the prop object on most renders, so depending on THAT would re-run
+  // the load effect forever — and depending on the key while calling IPC with the
+  // prop is the same thing with the reasoning hidden in eight lint suppressions.
+  // `targetFromKey` is the exact inverse of `targetKey`, round-trip tested.
+  const target = useMemo(() => targetFromKey(paneKey), [paneKey]);
+  // The ANCHOR, not the pane: null for a folder pane as well as a library-wide
+  // one (#110), so nothing may read it alone to mean "the whole library".
   const noteId = targetNoteId(target);
-  // Non-nullable identity for the projection the Note header compares by value.
-  const paneKey = targetKey(target);
   const { loading: readinessLoading, ready, hint, provider, model } = useChatReadiness();
   const [messages, setMessages] = useState<ChatMessageDto[]>([]);
   // This Note's conversations (issue #61/#62), most-recent first from the
@@ -294,10 +300,13 @@ export function ChatPanel({
   // leak into the conversation the user switched to (#62).
   const switchGenRef = useRef(0);
 
-  // The anchor note's folder drives the "this folder" scope option. A library-wide
-  // pane has no anchor, so no folder option — the store lookup is skipped rather
-  // than searched for a null id.
+  // The folder the pane is scoped to, for the breadth picker's label and the
+  // "this folder" option. A FOLDER pane names it directly (#110); a note pane
+  // reaches it through the anchor's `folder_id`; a library-wide pane has neither,
+  // so the store lookup is skipped rather than searched for a null id.
+  const folderId = targetFolderId(target);
   const folder = useNotesStore((s) => {
+    if (folderId !== null) return s.folders.find((f) => f.id === folderId) ?? null;
     if (noteId === null) return null;
     const note = s.notes.find((n) => n.id === noteId);
     const fid = note?.folder_id;
@@ -342,7 +351,7 @@ export function ChatPanel({
   const reloadConversationList = useCallback(
     async (gen: number) => {
       try {
-        const list = await ipc.chatListConversations(noteId, { limit: PAGE_SIZE, offset: 0 });
+        const list = await ipc.chatListConversations(target, { limit: PAGE_SIZE, offset: 0 });
         if (gen !== switchGenRef.current || !Array.isArray(list)) return;
         setConversations(list);
         setHasMoreConversations(list.length === PAGE_SIZE);
@@ -350,7 +359,7 @@ export function ChatPanel({
         /* keep the prior list */
       }
     },
-    [noteId],
+    [target],
   );
 
   // Append the next page (issue #95). A short page means the end: the backend
@@ -366,7 +375,7 @@ export function ChatPanel({
     setLoadingMoreConversations(true);
     try {
       const offset = conversationsRef.current.length;
-      const next = await ipc.chatListConversations(noteId, { limit: PAGE_SIZE, offset });
+      const next = await ipc.chatListConversations(target, { limit: PAGE_SIZE, offset });
       if (gen !== switchGenRef.current || !Array.isArray(next)) return;
       // De-dupe by id: a conversation that got bumped to page one between the two
       // fetches would otherwise appear twice.
@@ -381,7 +390,7 @@ export function ChatPanel({
       loadingMoreRef.current = false;
       setLoadingMoreConversations(false);
     }
-  }, [noteId, hasMoreConversations]);
+  }, [target, hasMoreConversations]);
 
   // Clear the transient per-turn UI (streaming/activity/errors) and stop
   // accepting stream deltas. Shared by the note-switch load effect and every
@@ -427,7 +436,7 @@ export function ChatPanel({
       return;
     }
     try {
-      const meta = await ipc.chatNewConversation(noteId);
+      const meta = await ipc.chatNewConversation(target);
       if (gen !== switchGenRef.current || !meta) return;
       setConversationId(meta.id);
       setMessages([]);
@@ -443,7 +452,7 @@ export function ChatPanel({
       // dropped into the void (#64).
       inputRef.current?.focus();
     }
-  }, [noteId, beginSwitch, reloadConversationList]);
+  }, [target, beginSwitch, reloadConversationList]);
 
   // Delete a conversation (issue #109). Hard: there is no Trash for chat, which
   // is why the callers confirm first.
@@ -457,7 +466,7 @@ export function ChatPanel({
     async (id: string) => {
       const wasOpen = id === conversationId;
       try {
-        await ipc.chatDeleteConversation(noteId, id);
+        await ipc.chatDeleteConversation(target, id);
       } catch (e) {
         // Surface it and keep the row: a failed delete that removed the row anyway
         // would read as success and leave the list disagreeing with the backend.
@@ -467,7 +476,7 @@ export function ChatPanel({
       setConversations((prev) => prev.filter((c) => c.id !== id));
       if (wasOpen) await newChat();
     },
-    [noteId, conversationId, newChat],
+    [target, conversationId, newChat],
   );
 
   // Rename a conversation (issue #109) — the user's override of the model-derived
@@ -489,7 +498,7 @@ export function ChatPanel({
       if (previous && !previous.title.trim() && next === conversationTitle(previous)) return;
       setConversations((prev) => prev.map((c) => (c.id === id ? { ...c, title: next } : c)));
       try {
-        const updated = await ipc.chatRenameConversation(noteId, id, next);
+        const updated = await ipc.chatRenameConversation(target, id, next);
         // Adopt the server's row wholesale — it carries the applied title (which
         // may be capped) and the bumped `updatedAt` the list orders by.
         if (updated) setConversations((prev) => prev.map((c) => (c.id === id ? updated : c)));
@@ -500,7 +509,7 @@ export function ChatPanel({
         }
       }
     },
-    [noteId],
+    [target],
   );
 
   // Load a conversation chosen from the history popover: its messages and its
@@ -511,9 +520,9 @@ export function ChatPanel({
       setConversationId(id);
       try {
         const [h, b, o] = await Promise.all([
-          ipc.chatHistory(noteId, id),
-          ipc.chatGetBreadth(noteId, id),
-          ipc.chatGetOwnerFilter(noteId, id).catch(() => ""),
+          ipc.chatHistory(target, id),
+          ipc.chatGetBreadth(target, id),
+          ipc.chatGetOwnerFilter(target, id).catch(() => ""),
         ]);
         if (gen !== switchGenRef.current) return;
         setMessages(h?.messages ?? []);
@@ -528,7 +537,7 @@ export function ChatPanel({
         inputRef.current?.focus();
       }
     },
-    [noteId, beginSwitch],
+    [target, beginSwitch],
   );
 
   // Chat is pinned to the loaded context (issue #58). The chat follows the
@@ -618,7 +627,12 @@ export function ChatPanel({
   // hasn't loaded); the pin still filters, it just loses its wording.
   const pinnedAuthorName = useMemberName(ownerFilter || null);
   const showComposerControls =
-    noteId !== null || (!onPage && !inWorkspace && !!model) || !!usage || showAuthorPin;
+    noteId !== null ||
+    // A folder pane has no anchor but does have a reach worth stating (#110).
+    folderId !== null ||
+    (!onPage && !inWorkspace && !!model) ||
+    !!usage ||
+    showAuthorPin;
 
   // Activation gating (#76). Only on the managed server + a workspace. While the
   // key metadata is still loading (undefined) show neither composer nor pane, so
@@ -694,7 +708,7 @@ export function ChatPanel({
     // moves on every switch; `cancelled` alone doesn't (beginSwitch never flips
     // it), so we need both.
     ipc
-      .chatHistory(noteId)
+      .chatHistory(target)
       .then((h) => {
         if (!cancelled && gen === switchGenRef.current) {
           setMessages(h.messages);
@@ -711,7 +725,7 @@ export function ChatPanel({
     // Initialise the chip from the backend's persisted breadth in one round
     // trip; fall back to "note" if it can't be read.
     ipc
-      .chatGetBreadth(noteId)
+      .chatGetBreadth(target)
       .then((b) => {
         if (!cancelled && gen === switchGenRef.current && b) setScope(b);
       })
@@ -722,7 +736,7 @@ export function ChatPanel({
     // wrongly reads "off" under-promises, where one that wrongly reads "on" would
     // claim a narrowing the turn isn't doing.
     ipc
-      .chatGetOwnerFilter(noteId)
+      .chatGetOwnerFilter(target)
       .then((o) => {
         if (!cancelled && gen === switchGenRef.current) setOwnerFilter(o ?? "");
       })
@@ -733,11 +747,12 @@ export function ChatPanel({
     void refreshActivation(gen);
     return () => {
       cancelled = true;
-      // Keep the anchor searchable on the way out. A library-wide pane has no
-      // anchor to reindex — every note is reindexed at its own checkpoints.
+      // Keep the anchor searchable on the way out. A note-less pane (library-wide
+      // or folder) has no anchor to reindex — every note is reindexed at its own
+      // checkpoints anyway.
       if (noteId !== null) void ipc.chatReindexNote(noteId).catch(() => {});
     };
-  }, [noteId, workspaceId, billingEnabled, reloadConversationList, refreshActivation, resetTransient]);
+  }, [target, workspaceId, billingEnabled, reloadConversationList, refreshActivation, resetTransient]);
 
   // Persist a breadth change to the conversation (issue #58): update the chip
   // optimistically, then write it through so the next turn reads the new value.
@@ -754,7 +769,7 @@ export function ChatPanel({
   function selectBreadth(next: ChatScope) {
     setScope(next);
     if (!conversationId && !targetResumesOnOpen(target)) return;
-    void ipc.chatSetBreadth(noteId, conversationId, next).catch((e) => setError(String(e)));
+    void ipc.chatSetBreadth(target, conversationId, next).catch((e) => setError(String(e)));
   }
 
   // Pin the conversation to the caller's own notes, or clear the pin (#103).
@@ -769,7 +784,7 @@ export function ChatPanel({
     // through and lazily creates, as it did before.
     if (!conversationId && !targetResumesOnOpen(target)) return;
     void ipc
-      .chatSetOwnerFilter(noteId, conversationId, next === "" ? null : next)
+      .chatSetOwnerFilter(target, conversationId, next === "" ? null : next)
       .catch((e) => setError(String(e)));
   }
 
@@ -894,7 +909,7 @@ export function ChatPanel({
   }, [
     onControls,
     paneUsable,
-    paneKey,
+    target,
     conversations,
     conversationId,
     messages.length,
@@ -946,8 +961,7 @@ export function ChatPanel({
       // row this turn creates (#120). With a conversation already open they're
       // omitted: the row is the source of truth and re-sending them could only
       // disagree with it.
-      const result = await ipc.chatSend(
-        noteId,
+      const result = await ipc.chatSend(target,
         conversationId,
         text,
         pinnedAuthorName,
@@ -955,7 +969,7 @@ export function ChatPanel({
       );
       if (gen !== switchGenRef.current) return;
       setConversationId(result.conversationId);
-      const h = await ipc.chatHistory(noteId, result.conversationId);
+      const h = await ipc.chatHistory(target, result.conversationId);
       if (gen !== switchGenRef.current) return;
       setMessages(h.messages);
       setTruncated(result.truncated);
@@ -983,13 +997,13 @@ export function ChatPanel({
         // thread instead of starting a second one.
         let recovered = conversationId;
         if (!recovered) {
-          const list = await ipc.chatListConversations(noteId, { limit: 1, offset: 0 });
+          const list = await ipc.chatListConversations(target, { limit: 1, offset: 0 });
           recovered = list?.[0]?.id ?? null;
         }
         // Still nothing persisted (the send failed before creating anything) → keep
         // the optimistic view, which is the only place the message now exists.
         if (recovered) {
-          const h = await ipc.chatHistory(noteId, recovered);
+          const h = await ipc.chatHistory(target, recovered);
           if (gen === switchGenRef.current) {
             setConversationId(recovered);
             setMessages(h.messages);
@@ -1013,8 +1027,8 @@ export function ChatPanel({
   // nothing is in flight, and `sending` is cleared by the send's own completion
   // path — the backend still finishes the turn by persisting whatever streamed.
   const cancel = useCallback(() => {
-    void ipc.chatCancel(noteId).catch(() => {});
-  }, [noteId]);
+    void ipc.chatCancel(target).catch(() => {});
+  }, [target]);
 
   function onKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
     // "/" on an empty composer opens the prompt picker; mid-sentence it stays a
@@ -1350,6 +1364,7 @@ export function ChatPanel({
               onScope={selectBreadth}
               folderName={folder?.name ?? null}
               hasAnchor={noteId !== null}
+              pinned={targetPinsScope(target)}
               fallbackScope={targetDefaultScope(target)}
             />
             {showAuthorPin && (
@@ -1593,16 +1608,22 @@ function BreadthPicker({
   onScope,
   folderName,
   hasAnchor,
+  pinned,
   fallbackScope,
 }: {
   scope: ChatScope;
   onScope: (s: ChatScope) => void;
   folderName: string | null;
-  /** False for a library-wide pane (#94), which has no anchor note — so neither
-   *  "This note" nor "Folder: …" is offerable. The backend enforces the same rule
-   *  (`chat::check_anchor`), so offering them would let the chip show a breadth
-   *  the next write is guaranteed to reject. */
+  /** False for a note-less pane (#94, #110), which has no anchor note — so
+   *  "This note" isn't offerable. The backend enforces the same rule
+   *  (`chat::check_anchor`), so offering it would let the chip show a breadth the
+   *  next write is guaranteed to reject. */
   hasAnchor: boolean;
+  /** True when the target holds exactly ONE breadth and there is nothing to pick
+   *  (#110) — mirrors `targetPinsScope`. A folder pane still renders, as a static
+   *  label: the clamp is the whole reason the surface exists, so it has to be
+   *  visible even though it isn't a choice. */
+  pinned: boolean;
   /** Where an unselectable or vanished breadth falls back to. */
   fallbackScope: ChatScope;
 }) {
@@ -1617,7 +1638,7 @@ function BreadthPicker({
           },
         ]
       : []),
-    ...(hasAnchor && folderName
+    ...(folderName
       ? [
           {
             id: "folder",
@@ -1628,6 +1649,20 @@ function BreadthPicker({
       : []),
     { id: "all", label: "All notes", icon: <Files size={14} strokeWidth={1.7} aria-hidden="true" /> },
   ];
+  // A pinned pane states its reach instead of offering it (#110). Without this a
+  // folder pane would fall into the "one option is not a choice" case below and
+  // render nothing at all — leaving the user's clamp invisible on the one surface
+  // whose entire point is that it clamps.
+  if (pinned) {
+    const active = items.find((i) => i.id === scope);
+    if (!active || scope === "all") return null;
+    return (
+      <span className={cn(QUIET_CONTROL, "cursor-default")} aria-label="Chat scope">
+        {active.icon}
+        {active.label}
+      </span>
+    );
+  }
   // One option is not a choice: a picker whose only entry is "All notes" is noise,
   // so a library-wide pane shows no breadth chrome at all (#95). Narrowing is
   // still available there — as a tool argument the model chooses (#81), not as a
