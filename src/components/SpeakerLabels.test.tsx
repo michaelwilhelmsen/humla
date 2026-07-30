@@ -85,15 +85,28 @@ describe("SpeakerLabels merge flow", () => {
     expect(merged).toContain("Speaker 2:");
   });
 
-  it("moves focus onto the first menu item when the menu opens", async () => {
+  it("moves focus onto the first menu item when opened from the keyboard", async () => {
+    const user = userEvent.setup();
+    render(<SpeakerLabels transcript={THREE_SPEAKERS} onRename={vi.fn()} />);
+
+    screen.getByRole("button", { name: /merge speaker 1 into another/i }).focus();
+    await user.keyboard("{Enter}");
+
+    const items = screen.getAllByRole("menuitem");
+    expect(items[0]).toHaveFocus();
+  });
+
+  it("keeps focus inside the menu when opened with the mouse", async () => {
     const user = userEvent.setup();
     render(<SpeakerLabels transcript={THREE_SPEAKERS} onRename={vi.fn()} />);
 
     await user.click(
       screen.getByRole("button", { name: /merge speaker 1 into another/i }),
     );
-    const items = screen.getAllByRole("menuitem");
-    expect(items[0]).toHaveFocus();
+
+    // A pointer open highlights nothing (no focus-ring flash for mouse users),
+    // but focus lands on the menu itself so the arrow keys still reach the rows.
+    expect(screen.getByRole("menu")).toHaveFocus();
   });
 
   it("roves focus with ArrowDown/ArrowUp (wrapping)", async () => {
@@ -104,6 +117,7 @@ describe("SpeakerLabels merge flow", () => {
       screen.getByRole("button", { name: /merge speaker 1 into another/i }),
     );
     const items = screen.getAllByRole("menuitem"); // Speaker 2, Speaker 3
+    await user.keyboard("{ArrowDown}");
     expect(items[0]).toHaveFocus();
     await user.keyboard("{ArrowDown}");
     expect(items[1]).toHaveFocus();

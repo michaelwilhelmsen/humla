@@ -1,17 +1,24 @@
-import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
-import { createPortal } from "react-dom";
-import { Check, Pencil, Trash2, Plus } from "lucide-react";
+import { useEffect, useState, type ReactNode } from "react";
+import { Pencil, Trash2, Plus } from "lucide-react";
+import {
+  Menu,
+  MenuContent,
+  MenuItem,
+  MenuRadioGroup,
+  MenuRadioItem,
+  MenuTrigger,
+} from "./ui/Menu";
 
 // A single reusable selectable-popover primitive (issue #43): a quiet trigger
 // that opens a menu of options with a checkmark on the active one. Optionally
 // editable — pass onCreate/onRename/onDelete to get an inline "new" row plus
 // per-row rename/delete affordances (the Client picker). Leave those off for a
-// plain checkmark menu (intended for reuse by the chat Scope popover, #47).
+// plain checkmark menu (the chat Scope popover, #47).
 //
-// Portal/positioning/dismiss mechanics mirror settings' Select.tsx: the menu
-// is `position: fixed` off a one-time measurement of the trigger, flips above
-// when there's no room below, and closes on outside-click / Escape / scroll.
-// No new UI dependency.
+// Since #114 this is a thin composition over the shared `Menu` primitive:
+// Radix owns the portal, collision-aware placement, dismissal, focus return and
+// — new here — arrow-key roving and typeahead over the rows. The public shape is
+// unchanged, so ChatPanel / ChatHistoryControls / Note are untouched.
 
 export type PopoverItem = {
   id: string;
@@ -40,12 +47,15 @@ type Props = {
   ariaLabel?: string;
   /**
    * Horizontal anchor. "start" (default) pins the menu's left edge to the
-   * trigger's left edge (existing behavior). "end" pins its right edge to the
-   * trigger's right edge, so a right-aligned trigger opens leftward instead of
-   * overflowing the viewport (#62).
+   * trigger's left edge. "end" pins its right edge to the trigger's right edge,
+   * so a right-aligned trigger opens leftward instead of overflowing (#62).
    */
   align?: "start" | "end";
 };
+
+// Radix radio values are strings, so the "none" row needs a sentinel that no
+// real item id can collide with.
+const NONE = "__none__";
 
 export function SelectablePopover({
   trigger,
@@ -65,18 +75,6 @@ export function SelectablePopover({
   const [editingId, setEditingId] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
   const [draft, setDraft] = useState("");
-  const rootRef = useRef<HTMLDivElement>(null);
-  const popoverRef = useRef<HTMLDivElement>(null);
-  const triggerRef = useRef<HTMLButtonElement>(null);
-  const [pos, setPos] = useState<{
-    top?: number;
-    bottom?: number;
-    // Exactly one of left/right is set, per `align`.
-    left?: number;
-    right?: number;
-    minWidth: number;
-    maxHeight: number;
-  } | null>(null);
 
   // Reset transient edit state whenever the menu closes.
   useEffect(() => {
@@ -86,77 +84,6 @@ export function SelectablePopover({
       setDraft("");
     }
   }, [open]);
-
-  useLayoutEffect(() => {
-    if (!open) {
-      setPos(null);
-      return;
-    }
-    const trigger = rootRef.current;
-    if (!trigger) return;
-    const rect = trigger.getBoundingClientRect();
-    const gap = 4;
-    const edgeMargin = 8;
-    const preferredMax = 280;
-    const spaceBelow = window.innerHeight - rect.bottom - gap - edgeMargin;
-    const spaceAbove = rect.top - gap - edgeMargin;
-    // Anchor the left edge to the trigger's left ("start") or the right edge to
-    // the trigger's right ("end") so a right-aligned trigger opens leftward.
-    const anchor =
-      align === "end" ? { right: window.innerWidth - rect.right } : { left: rect.left };
-    const minWidth = Math.max(rect.width, 200);
-    if (spaceBelow >= Math.min(preferredMax, 150) || spaceBelow >= spaceAbove) {
-      setPos({ ...anchor, top: rect.bottom + gap, minWidth, maxHeight: Math.max(120, Math.min(preferredMax, spaceBelow)) });
-    } else {
-      setPos({ ...anchor, bottom: window.innerHeight - rect.top + gap, minWidth, maxHeight: Math.max(120, Math.min(preferredMax, spaceAbove)) });
-    }
-  }, [open, align]);
-
-  useEffect(() => {
-    if (!open) return;
-    const onDown = (e: MouseEvent) => {
-      const target = e.target as Node;
-      if (rootRef.current?.contains(target) || popoverRef.current?.contains(target)) return;
-      setOpen(false);
-    };
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        e.stopPropagation();
-        // Escape cancels an in-progress edit first, then closes the menu.
-        if (editingId || creating) {
-          setEditingId(null);
-          setCreating(false);
-          setDraft("");
-        } else {
-          closeAndRestore();
-        }
-      }
-    };
-    const onScroll = (e: Event) => {
-      if (popoverRef.current?.contains(e.target as Node)) return;
-      setOpen(false);
-    };
-    document.addEventListener("mousedown", onDown);
-    document.addEventListener("keydown", onKey, true);
-    document.addEventListener("scroll", onScroll, true);
-    window.addEventListener("resize", onScroll);
-    return () => {
-      document.removeEventListener("mousedown", onDown);
-      document.removeEventListener("keydown", onKey, true);
-      document.removeEventListener("scroll", onScroll, true);
-      window.removeEventListener("resize", onScroll);
-    };
-  }, [open, editingId, creating]);
-
-  // Close and return focus to the trigger. Used only for deliberate,
-  // keyboard-reachable closes (item select, Escape) so keyboard users don't drop
-  // to <body> when the menu unmounts (#64). Incidental closes — click-away and
-  // scroll — use plain setOpen(false) so they don't yank focus from a mouse user
-  // who clicked elsewhere.
-  const closeAndRestore = () => {
-    setOpen(false);
-    triggerRef.current?.focus();
-  };
 
   const editable = !!(onCreate || onRename || onDelete);
 
@@ -180,192 +107,150 @@ export function SelectablePopover({
     setDraft("");
   }
 
-  const rowBase =
-    "flex w-full items-center gap-2 px-2.5 py-1.5 rounded-md text-sm text-left transition-colors";
+  // Typed keys must not reach the menu, which would read them as typeahead and
+  // move focus off the input mid-word.
+  const inputClass = "w-full px-2.5 py-1.5 rounded-md text-sm bg-[var(--color-pill-hover)] outline-none";
 
   return (
-    <div ref={rootRef} className="relative inline-flex">
-      <button
-        ref={triggerRef}
-        type="button"
-        aria-haspopup="menu"
-        aria-expanded={open}
-        aria-label={ariaLabel}
-        onClick={() => setOpen((o) => !o)}
-        className="inline-flex items-center"
-      >
+    <Menu open={open} onOpenChange={setOpen}>
+      <MenuTrigger aria-label={ariaLabel} className="inline-flex items-center">
         {trigger}
-      </button>
-      {open &&
-        pos &&
-        createPortal(
-          <div
-            ref={popoverRef}
-            role="menu"
-            style={{
-              position: "fixed",
-              top: pos.top,
-              bottom: pos.bottom,
-              left: pos.left,
-              right: pos.right,
-              minWidth: pos.minWidth,
-              maxHeight: pos.maxHeight,
-            }}
-            className="z-50 w-max max-w-[320px] overflow-y-auto rounded-lg border border-[var(--color-line-visible)] bg-[var(--color-canvas)] shadow-lg p-1"
-          >
-            {noneLabel && (
-              <button
-                type="button"
-                role="menuitemradio"
-                aria-checked={activeId === null}
-                onClick={() => {
-                  onSelect(null);
-                  closeAndRestore();
-                }}
-                className={
-                  rowBase +
-                  " justify-between " +
-                  (activeId === null
-                    ? "text-[var(--color-text)]"
-                    : "text-[var(--color-text-muted)] hover:text-[var(--color-text)]") +
-                  " hover:bg-[var(--color-pill-hover)]"
-                }
-              >
-                <span className="truncate">{noneLabel}</span>
-                {activeId === null && (
-                  <Check size={14} strokeWidth={2} className="shrink-0 text-[var(--color-accent-text)]" aria-hidden />
-                )}
-              </button>
-            )}
+      </MenuTrigger>
+      <MenuContent
+        align={align}
+        className="min-w-[max(var(--radix-dropdown-menu-trigger-width),12.5rem)]"
+        // An in-progress rename/create owns Escape: it cancels the edit and
+        // leaves the menu open, matching the pre-Radix behaviour.
+        onEscapeKeyDown={(e) => {
+          if (!editingId && !creating) return;
+          e.preventDefault();
+          setEditingId(null);
+          setCreating(false);
+          setDraft("");
+        }}
+      >
+        <MenuRadioGroup
+          value={activeId ?? NONE}
+          onValueChange={(value) => onSelect(value === NONE ? null : value)}
+        >
+          {noneLabel && (
+            <MenuRadioItem value={NONE}>
+              <span className="truncate">{noneLabel}</span>
+            </MenuRadioItem>
+          )}
 
-            {items.map((item) => {
-              if (editingId === item.id) {
-                return (
-                  <input
-                    key={item.id}
-                    autoFocus
-                    value={draft}
-                    onChange={(e) => setDraft(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") void commitRename(item.id);
-                    }}
-                    onBlur={() => void commitRename(item.id)}
-                    aria-label="Rename"
-                    className="w-full px-2.5 py-1.5 rounded-md text-sm bg-[var(--color-pill-hover)] outline-none"
-                  />
-                );
-              }
-              const selected = item.id === activeId;
+          {items.map((item) => {
+            if (editingId === item.id) {
               return (
-                <div key={item.id} className="group flex items-center">
-                  <button
-                    type="button"
-                    role="menuitemradio"
-                    aria-checked={selected}
-                    onClick={() => {
-                      onSelect(item.id);
-                      closeAndRestore();
-                    }}
-                    className={
-                      rowBase +
-                      " flex-1 min-w-0 " +
-                      (selected
-                        ? "text-[var(--color-text)]"
-                        : "text-[var(--color-text-muted)] hover:text-[var(--color-text)]") +
-                      " hover:bg-[var(--color-pill-hover)]"
-                    }
-                  >
-                    <Check
-                      size={14}
-                      strokeWidth={2}
-                      aria-hidden
-                      className={"shrink-0 " + (selected ? "text-[var(--color-accent-text)]" : "opacity-0")}
-                    />
-                    {item.icon && (
-                      <span className="shrink-0 inline-flex" aria-hidden="true">
-                        {item.icon}
-                      </span>
-                    )}
-                    <span className="flex min-w-0 flex-col">
-                      <span className="truncate">{item.label}</span>
-                      {item.description && (
-                        <span className="truncate text-xs text-[var(--color-text-muted)]">
-                          {item.description}
-                        </span>
-                      )}
-                    </span>
-                  </button>
-                  {editable && (
-                    <span className="flex items-center opacity-0 group-hover:opacity-100 transition-opacity pr-1">
-                      {onRename && (
-                        <button
-                          type="button"
-                          title="Rename"
-                          aria-label={`Rename ${item.label}`}
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            setEditingId(item.id);
-                            setDraft(item.label);
-                          }}
-                          className="p-1 rounded text-[var(--color-text-muted)] hover:text-[var(--color-text)] hover:bg-[var(--color-pill-hover)]"
-                        >
-                          <Pencil size={13} strokeWidth={1.8} />
-                        </button>
-                      )}
-                      {onDelete && (
-                        <button
-                          type="button"
-                          title="Delete"
-                          aria-label={`Delete ${item.label}`}
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            void onDelete(item.id);
-                          }}
-                          className="p-1 rounded text-[var(--color-text-muted)] hover:text-[var(--color-accent-text)] hover:bg-[var(--color-pill-hover)]"
-                        >
-                          <Trash2 size={13} strokeWidth={1.8} />
-                        </button>
-                      )}
-                    </span>
-                  )}
-                </div>
-              );
-            })}
-
-            {onCreate &&
-              (creating ? (
                 <input
+                  key={item.id}
                   autoFocus
                   value={draft}
                   onChange={(e) => setDraft(e.target.value)}
                   onKeyDown={(e) => {
-                    if (e.key === "Enter") void commitCreate();
+                    e.stopPropagation();
+                    if (e.key === "Enter") void commitRename(item.id);
                   }}
-                  onBlur={() => void commitCreate()}
-                  placeholder={createPlaceholder}
-                  aria-label={createPlaceholder}
-                  className="w-full px-2.5 py-1.5 rounded-md text-sm bg-[var(--color-pill-hover)] outline-none mt-0.5"
+                  onBlur={() => void commitRename(item.id)}
+                  aria-label="Rename"
+                  className={inputClass}
                 />
-              ) : (
-                <button
-                  type="button"
-                  role="menuitem"
-                  onClick={() => {
-                    setCreating(true);
-                    setDraft("");
-                  }}
-                  className={
-                    rowBase +
-                    " mt-0.5 border-t border-[var(--color-line)] rounded-none pt-2 text-[var(--color-text-muted)] hover:text-[var(--color-text)] hover:bg-[var(--color-pill-hover)]"
-                  }
-                >
-                  <Plus size={14} strokeWidth={1.8} className="shrink-0" />
-                  <span className="truncate">{createLabel}</span>
-                </button>
-              ))}
-          </div>,
-          document.body,
-        )}
-    </div>
+              );
+            }
+            return (
+              <div key={item.id} className="group flex items-center">
+                <MenuRadioItem value={item.id} className="flex-1 min-w-0">
+                  {item.icon && (
+                    <span className="shrink-0 inline-flex" aria-hidden="true">
+                      {item.icon}
+                    </span>
+                  )}
+                  <span className="flex min-w-0 flex-col">
+                    <span className="truncate">{item.label}</span>
+                    {item.description && (
+                      <span className="truncate text-xs text-[var(--color-text-muted)]">
+                        {item.description}
+                      </span>
+                    )}
+                  </span>
+                </MenuRadioItem>
+                {/*
+                  Hover-revealed and mouse-only: a Radix menu swallows Tab (the
+                  ARIA menu model exits the menu on Tab), so nothing inside a row
+                  but the row itself is keyboard-reachable. That matches what
+                  shipped before — these buttons only sat in the tab order by
+                  accident of the portal being last in <body> — but it is a real
+                  gap, and the honest fix is a per-row submenu rather than
+                  anything this refactor should smuggle in.
+                */}
+                {editable && (
+                  <span className="flex items-center opacity-0 group-hover:opacity-100 transition-opacity pr-1">
+                    {onRename && (
+                      <button
+                        type="button"
+                        title="Rename"
+                        aria-label={`Rename ${item.label}`}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setEditingId(item.id);
+                          setDraft(item.label);
+                        }}
+                        className="p-1 rounded text-[var(--color-text-muted)] hover:text-[var(--color-text)] hover:bg-[var(--color-pill-hover)]"
+                      >
+                        <Pencil size={13} strokeWidth={1.8} />
+                      </button>
+                    )}
+                    {onDelete && (
+                      <button
+                        type="button"
+                        title="Delete"
+                        aria-label={`Delete ${item.label}`}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          void onDelete(item.id);
+                        }}
+                        className="p-1 rounded text-[var(--color-text-muted)] hover:text-[var(--color-accent-text)] hover:bg-[var(--color-pill-hover)]"
+                      >
+                        <Trash2 size={13} strokeWidth={1.8} />
+                      </button>
+                    )}
+                  </span>
+                )}
+              </div>
+            );
+          })}
+        </MenuRadioGroup>
+
+        {onCreate &&
+          (creating ? (
+            <input
+              autoFocus
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              onKeyDown={(e) => {
+                e.stopPropagation();
+                if (e.key === "Enter") void commitCreate();
+              }}
+              onBlur={() => void commitCreate()}
+              placeholder={createPlaceholder}
+              aria-label={createPlaceholder}
+              className={inputClass + " mt-0.5"}
+            />
+          ) : (
+            <MenuItem
+              className="mt-0.5 border-t border-[var(--color-line)] rounded-none pt-2"
+              // Swap the row for its input rather than closing the menu.
+              onSelect={(e) => {
+                e.preventDefault();
+                setCreating(true);
+                setDraft("");
+              }}
+            >
+              <Plus size={14} strokeWidth={1.8} className="shrink-0" />
+              <span className="truncate">{createLabel}</span>
+            </MenuItem>
+          ))}
+      </MenuContent>
+    </Menu>
   );
 }

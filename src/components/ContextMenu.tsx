@@ -1,10 +1,14 @@
 import { useEffect, useRef } from "react";
-import { createPortal } from "react-dom";
-import { cn } from "../lib/cn";
+import { Menu, MenuContent, MenuItem, MenuTrigger } from "./ui/Menu";
 
-// Small floating menu anchored at viewport (x, y). Closes on any click,
-// right-click outside, Escape, or scroll. Items render via the children
-// prop — pass <ContextMenuItem /> rows.
+// Small floating menu anchored at viewport (x, y) — the right-click menu for
+// sidebar folders, chat conversations and note rows.
+//
+// The public shape (x/y/onClose plus <ContextMenuItem> children) is unchanged;
+// underneath it is now the shared `Menu` primitive (#114), which brings the
+// arrow-key roving, typeahead and real collision detection this copy never had.
+// Radix anchors content to a trigger rather than to raw coordinates, so the
+// trigger here is a zero-size element pinned at the pointer.
 export function ContextMenu({
   x,
   y,
@@ -16,53 +20,47 @@ export function ContextMenu({
   onClose: () => void;
   children: React.ReactNode;
 }) {
-  const ref = useRef<HTMLDivElement | null>(null);
-
+  // Radix moves focus into the menu on open and hands it back to the trigger on
+  // close — but our trigger is virtual and unmounts with the menu, so focus
+  // would land on <body>. Remember what had focus when the menu opened (the
+  // right-clicked row) and put it back there instead.
+  const restoreRef = useRef<Element | null>(null);
   useEffect(() => {
-    function onDown(e: MouseEvent) {
-      if (ref.current && ref.current.contains(e.target as Node)) return;
-      onClose();
-    }
-    function onKey(e: KeyboardEvent) {
-      if (e.key === "Escape") onClose();
-    }
-    function onScroll() {
-      onClose();
-    }
-    // Use mousedown + keydown + scroll so the menu dismisses on the
-    // first interaction outside it (including the right-click that
-    // would open a new menu).
-    document.addEventListener("mousedown", onDown);
-    document.addEventListener("contextmenu", onDown);
-    document.addEventListener("keydown", onKey);
+    restoreRef.current = document.activeElement;
+  }, []);
+
+  // Close on scroll. Radix keeps content glued to its anchor, but ours is
+  // pinned to raw viewport coordinates — scrolling the list underneath would
+  // leave the menu hovering over a different row than the one it acts on.
+  useEffect(() => {
+    const onScroll = () => onClose();
     document.addEventListener("scroll", onScroll, true);
-    return () => {
-      document.removeEventListener("mousedown", onDown);
-      document.removeEventListener("contextmenu", onDown);
-      document.removeEventListener("keydown", onKey);
-      document.removeEventListener("scroll", onScroll, true);
-    };
+    return () => document.removeEventListener("scroll", onScroll, true);
   }, [onClose]);
 
-  // Keep the menu inside the viewport — if too close to the right or
-  // bottom edge, anchor from the opposite side.
-  const vw = typeof window !== "undefined" ? window.innerWidth : 1200;
-  const vh = typeof window !== "undefined" ? window.innerHeight : 800;
-  const w = 200; // approximate width — used only for edge nudging
-  const h = 100; // approximate height
-  const left = x + w > vw ? Math.max(8, vw - w - 8) : x;
-  const top = y + h > vh ? Math.max(8, vh - h - 8) : y;
-
-  return createPortal(
-    <div
-      ref={ref}
-      role="menu"
-      className="fixed z-50 min-w-[160px] p-1 rounded-md border border-[var(--color-line-visible)] bg-[var(--color-surface)] shadow-lg"
-      style={{ top, left }}
+  return (
+    <Menu
+      open
+      onOpenChange={(open) => {
+        if (!open) onClose();
+      }}
     >
-      {children}
-    </div>,
-    document.body,
+      <MenuTrigger asChild>
+        <span aria-hidden style={{ position: "fixed", left: x, top: y, width: 0, height: 0 }} />
+      </MenuTrigger>
+      <MenuContent
+        sideOffset={0}
+        maxHeight={320}
+        className="bg-[var(--color-surface)] rounded-md"
+        onCloseAutoFocus={(e) => {
+          e.preventDefault();
+          const node = restoreRef.current;
+          if (node instanceof HTMLElement && document.body.contains(node)) node.focus();
+        }}
+      >
+        {children}
+      </MenuContent>
+    </Menu>
   );
 }
 
@@ -76,18 +74,8 @@ export function ContextMenuItem({
   danger?: boolean;
 }) {
   return (
-    <button
-      type="button"
-      role="menuitem"
-      onClick={onClick}
-      className={cn(
-        "w-full text-left px-3 py-1.5 text-sm rounded-sm transition-colors",
-        danger
-          ? "text-[var(--color-danger)] hover:bg-[var(--color-pill-hover)]"
-          : "text-[var(--color-text)] hover:bg-[var(--color-pill-hover)]",
-      )}
-    >
+    <MenuItem danger={danger} onSelect={onClick} className="px-3 rounded-sm">
       {children}
-    </button>
+    </MenuItem>
   );
 }

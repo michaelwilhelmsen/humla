@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { ChatTab } from "./Chat";
 import { mockTauri } from "../../../test/tauri";
 import { DEFAULTS, type EditableKey } from "../types";
@@ -13,20 +14,20 @@ beforeEach(() => {
 });
 
 describe("ChatTab provider setting", () => {
-  it("offers exactly OpenAI and Ollama — never Groq/Deepgram", () => {
+  it("offers exactly OpenAI and Ollama — never Groq/Deepgram", async () => {
     render(<ChatTab s={settings({ chat_provider: "openai" })} update={async () => {}} />);
-    fireEvent.click(screen.getByRole("button", { name: /Cloud \(OpenAI\)/ }));
+    await userEvent.click(screen.getByRole("combobox", { name: /Cloud \(OpenAI\)/ }));
     const options = screen.getAllByRole("option").map((o) => o.textContent);
     expect(options).toEqual(["Cloud (OpenAI)", "Local (Ollama)"]);
     expect(screen.queryByRole("option", { name: /Groq/i })).toBeNull();
     expect(screen.queryByRole("option", { name: /Deepgram/i })).toBeNull();
   });
 
-  it("persists the provider choice via update", () => {
+  it("persists the provider choice via update", async () => {
     const update = vi.fn();
     render(<ChatTab s={settings({ chat_provider: "openai" })} update={update} />);
-    fireEvent.click(screen.getByRole("button", { name: /Cloud \(OpenAI\)/ }));
-    fireEvent.click(screen.getByRole("option", { name: "Local (Ollama)" }));
+    await userEvent.click(screen.getByRole("combobox", { name: /Cloud \(OpenAI\)/ }));
+    await userEvent.click(screen.getByRole("option", { name: "Local (Ollama)" }));
     expect(update).toHaveBeenCalledWith("chat_provider", "ollama");
   });
 });

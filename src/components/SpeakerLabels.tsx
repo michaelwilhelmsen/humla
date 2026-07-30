@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Merge } from "lucide-react";
 import { extractSpeakerLabels } from "../lib/speakers";
+import { Menu, MenuContent, MenuItem, MenuLabel, MenuTrigger } from "./ui/Menu";
 
 // Speaker chip strip shown above the transcript. Each unique speaker label
 // renders as a colour-coded pill; clicking a pill renames it inline, and a
@@ -80,12 +81,8 @@ function SpeakerChip({
   readOnly?: boolean;
 }) {
   const [editing, setEditing] = useState(false);
-  const [merging, setMerging] = useState(false);
   const [draft, setDraft] = useState(label);
   const inputRef = useRef<HTMLInputElement | null>(null);
-  const wrapRef = useRef<HTMLSpanElement | null>(null);
-  const menuRef = useRef<HTMLDivElement | null>(null);
-  const mergeBtnRef = useRef<HTMLButtonElement | null>(null);
 
   // Snap the draft back to the canonical label whenever the underlying
   // label changes (e.g. diarize replaced the transcript and our label
@@ -97,61 +94,6 @@ function SpeakerChip({
   useEffect(() => {
     if (editing) inputRef.current?.select();
   }, [editing]);
-
-  // Dismiss the merge menu on outside click — the Tauri webview blocks
-  // window.confirm, so the inline menu itself is the confirmation: picking a
-  // target IS the commit, and there's no destructive default. (Escape, arrow
-  // roving and focus-return are handled by the menu's own keydown below, per
-  // the ARIA menu keyboard model.)
-  useEffect(() => {
-    if (!merging) return;
-    function onDown(e: MouseEvent) {
-      if (wrapRef.current && wrapRef.current.contains(e.target as Node)) return;
-      setMerging(false);
-    }
-    document.addEventListener("mousedown", onDown);
-    return () => document.removeEventListener("mousedown", onDown);
-  }, [merging]);
-
-  // On open, move focus onto the first menu item (menu keyboard model). We keep
-  // role="menu"/menuitem, so we owe the caller focus-in, arrow roving,
-  // Home/End, and Escape-closes-returning-focus — implemented here + below.
-  useEffect(() => {
-    if (!merging) return;
-    const items = menuRef.current?.querySelectorAll<HTMLElement>('[role="menuitem"]');
-    items?.[0]?.focus();
-  }, [merging]);
-
-  function onMenuKeyDown(e: ReactKeyboardEvent<HTMLDivElement>) {
-    const items = Array.from(
-      menuRef.current?.querySelectorAll<HTMLElement>('[role="menuitem"]') ?? [],
-    );
-    if (items.length === 0) return;
-    const idx = items.indexOf(document.activeElement as HTMLElement);
-    switch (e.key) {
-      case "Escape":
-        e.preventDefault();
-        setMerging(false);
-        mergeBtnRef.current?.focus(); // return focus to the trigger
-        break;
-      case "ArrowDown":
-        e.preventDefault();
-        items[(idx + 1 + items.length) % items.length].focus();
-        break;
-      case "ArrowUp":
-        e.preventDefault();
-        items[(idx - 1 + items.length) % items.length].focus();
-        break;
-      case "Home":
-        e.preventDefault();
-        items[0].focus();
-        break;
-      case "End":
-        e.preventDefault();
-        items[items.length - 1].focus();
-        break;
-    }
-  }
 
   function commit() {
     setEditing(false);
@@ -201,7 +143,7 @@ function SpeakerChip({
   }
 
   return (
-    <span ref={wrapRef} className="relative inline-flex items-center gap-1">
+    <span className="inline-flex items-center gap-1">
       <button
         type="button"
         onClick={() => setEditing(true)}
@@ -212,49 +154,37 @@ function SpeakerChip({
         {label}
       </button>
       {otherLabels.length > 0 && (
-        <button
-          ref={mergeBtnRef}
-          type="button"
-          aria-label={`Merge ${label} into another speaker`}
-          aria-haspopup="menu"
-          aria-expanded={merging}
-          title="Merge this speaker into another"
-          onClick={() => setMerging((v) => !v)}
-          className="inline-flex items-center justify-center rounded-full p-1 text-[color:var(--color-text-muted)] hover:text-[color:var(--color-text)] hover:bg-[color:var(--color-pill-hover)] transition-colors"
-        >
-          <Merge size={13} strokeWidth={1.75} />
-        </button>
-      )}
-      {merging && otherLabels.length > 0 && (
-        <div
-          ref={menuRef}
-          role="menu"
-          aria-label={`Merge ${label} into`}
-          onKeyDown={onMenuKeyDown}
-          className="absolute left-0 top-full z-20 mt-1 min-w-[10rem] rounded-lg border border-[color:var(--color-line-visible)] bg-[color:var(--color-surface)] p-1 shadow-lg"
-        >
-          <div className="nd-label px-2 py-1">Merge into</div>
-          {otherLabels.map((target) => (
-            <button
-              key={target}
-              type="button"
-              role="menuitem"
-              aria-label={`Merge ${label} into ${target}`}
-              onClick={() => {
-                setMerging(false);
-                onMerge(target);
-              }}
-              className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left font-[family-name:var(--font-mono)] text-[11px] tracking-[0.04em] text-[color:var(--color-text)] hover:bg-[color:var(--color-pill-hover)]"
-            >
-              <span
-                className="inline-block h-2 w-2 shrink-0 rounded-full"
-                style={{ background: colors.get(target) ?? SPEAKER_COLORS[0] }}
-                aria-hidden
-              />
-              {target}
-            </button>
-          ))}
-        </div>
+        // The inline menu itself is the confirmation — the Tauri webview blocks
+        // window.confirm, so picking a target IS the commit and there's no
+        // destructive default (#23). Focus-in, arrow roving, Escape-returns-
+        // focus and dismissal all come from the shared `Menu` now (#114).
+        <Menu>
+          <MenuTrigger
+            aria-label={`Merge ${label} into another speaker`}
+            title="Merge this speaker into another"
+            className="inline-flex items-center justify-center rounded-full p-1 text-[color:var(--color-text-muted)] hover:text-[color:var(--color-text)] hover:bg-[color:var(--color-pill-hover)] transition-colors"
+          >
+            <Merge size={13} strokeWidth={1.75} />
+          </MenuTrigger>
+          <MenuContent aria-label={`Merge ${label} into`} className="bg-[var(--color-surface)]">
+            <MenuLabel>Merge into</MenuLabel>
+            {otherLabels.map((target) => (
+              <MenuItem
+                key={target}
+                aria-label={`Merge ${label} into ${target}`}
+                onSelect={() => onMerge(target)}
+                className="px-2 text-[11px] tracking-[0.04em] text-[color:var(--color-text)]"
+              >
+                <span
+                  className="inline-block h-2 w-2 shrink-0 rounded-full"
+                  style={{ background: colors.get(target) ?? SPEAKER_COLORS[0] }}
+                  aria-hidden
+                />
+                {target}
+              </MenuItem>
+            ))}
+          </MenuContent>
+        </Menu>
       )}
     </span>
   );

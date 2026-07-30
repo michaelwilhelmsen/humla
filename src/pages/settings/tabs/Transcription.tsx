@@ -5,7 +5,7 @@ import { LocalModelManager } from "../components/LocalModelManager";
 import { PerLanguageOverrides } from "../components/PerLanguageOverrides";
 import { ProviderConfigForm } from "../components/ProviderConfigForm";
 import { Row, Section } from "../components/Section";
-import { Select } from "../components/Select";
+import { Select } from "../../../components/ui/Select";
 import { ProviderKeyCard, type KeyProvider } from "../../../components/provider/ProviderKeyCard";
 import { LANGUAGES, languageOptionLabel } from "../../../lib/languages";
 import { inputClass } from "../types";

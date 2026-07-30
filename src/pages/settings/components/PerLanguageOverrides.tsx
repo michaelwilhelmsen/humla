@@ -2,7 +2,7 @@ import { useState } from "react";
 import { LANGUAGES, languageOptionLabel } from "../../../lib/languages";
 import type { ProviderConfig, TranscribeConfig } from "../../../lib/ipc";
 import { ProviderConfigForm } from "./ProviderConfigForm";
-import { Select } from "./Select";
+import { Select } from "../../../components/ui/Select";
 import type { LocalState } from "../types";
 
 // Section that lists existing per-language overrides and offers a + Add

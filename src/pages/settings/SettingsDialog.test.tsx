@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { screen, within } from "@testing-library/react";
+import { fireEvent, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { renderApp, openSettingsFromSidebar } from "../../test/app";
 
@@ -117,7 +117,7 @@ describe("settings dialog", () => {
     const dialog = await screen.findByRole("dialog", { name: /settings/i });
 
     // Open the Language select's listbox.
-    const trigger = await within(dialog).findByRole("button", {
+    const trigger = await within(dialog).findByRole("combobox", {
       name: /norwegian/i,
     });
     await userEvent.click(trigger);
@@ -159,15 +159,17 @@ describe("settings dialog", () => {
     renderApp("/settings?tab=transcription");
     const dialog = await screen.findByRole("dialog", { name: /settings/i });
 
-    const trigger = await within(dialog).findByRole("button", {
+    const trigger = await within(dialog).findByRole("combobox", {
       name: /norwegian/i,
     });
     await userEvent.click(trigger);
     expect(within(dialog).getByRole("listbox")).toBeInTheDocument();
 
-    await userEvent.click(screen.getByTestId("settings-backdrop"));
+    // The open listbox is modal, so the backdrop underneath is inert — the
+    // pointerdown lands on the select's dismiss layer and never reaches it.
+    fireEvent.pointerDown(screen.getByTestId("settings-backdrop"));
 
-    // First backdrop click only dismisses the popover.
+    // First backdrop press only dismisses the popover.
     expect(within(dialog).queryByRole("listbox")).not.toBeInTheDocument();
     expect(
       screen.getByRole("dialog", { name: /settings/i }),
@@ -287,7 +289,7 @@ describe("settings dialog", () => {
 
     // Relocated from General (#15): the language sits with the engine that
     // consumes it.
-    const trigger = await within(dialog).findByRole("button", {
+    const trigger = await within(dialog).findByRole("combobox", {
       name: /norwegian/i,
     });
     await userEvent.click(trigger);
@@ -341,7 +343,7 @@ describe("settings dialog", () => {
     expect(within(dialog).getByText("Model")).toBeInTheDocument();
     // The selected provider shows in the picker trigger.
     expect(
-      within(dialog).getByRole("button", { name: /openai/i }),
+      within(dialog).getByRole("combobox", { name: /openai/i }),
     ).toBeInTheDocument();
   });
 
@@ -444,12 +446,12 @@ describe("settings dialog", () => {
     ).toBeInTheDocument();
     // Default preset moved here from General.
     expect(
-      within(dialog).getByRole("button", { name: /meeting/i }),
+      within(dialog).getByRole("combobox", { name: /meeting/i }),
     ).toBeInTheDocument();
 
     await userEvent.click(within(dialog).getByRole("tab", { name: "General" }));
     expect(
-      within(dialog).queryByRole("button", { name: /meeting/i }),
+      within(dialog).queryByRole("combobox", { name: /meeting/i }),
     ).not.toBeInTheDocument();
   });
 
@@ -479,7 +481,7 @@ describe("settings dialog", () => {
     ).toBeInTheDocument();
 
     await userEvent.click(
-      within(dialog).getByRole("button", { name: /choose a model|qwen3/i }),
+      within(dialog).getByRole("combobox", { name: /choose a model|qwen3/i }),
     );
     await userEvent.click(
       within(dialog).getByRole("option", { name: "qwen3:8b" }),

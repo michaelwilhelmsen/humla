@@ -1,6 +1,6 @@
 import { open as openExternal } from "@tauri-apps/plugin-shell";
 import { Row, Section } from "../components/Section";
-import { Select } from "../components/Select";
+import { Select } from "../../../components/ui/Select";
 import { Toggle } from "../components/Toggle";
 import { SummaryPromptsManager } from "../components/SummaryPromptsManager";
 import { OllamaConnect } from "../../../components/provider/OllamaConnect";

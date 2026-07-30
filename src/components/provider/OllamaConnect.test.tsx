@@ -33,7 +33,7 @@ describe("OllamaConnect", () => {
     expect(await screen.findByText(/connected/i)).toBeInTheDocument();
 
     await userEvent.click(
-      screen.getByRole("button", { name: /choose a model|qwen3/i }),
+      screen.getByRole("combobox", { name: /choose a model|qwen3/i }),
     );
     const listbox = screen.getByRole("listbox");
     await userEvent.click(

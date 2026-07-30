@@ -22,6 +22,27 @@ afterEach(() => {
   mockIPC(async () => null);
 });
 
+// Radix primitives (#114) lean on browser APIs jsdom doesn't implement:
+// Floating UI measures the anchor with a ResizeObserver, menus/selects call
+// scrollIntoView when roving focus, and Select's trigger uses pointer capture
+// to distinguish a click from a drag. Absent, every popover test throws before
+// it can assert anything.
+if (!("ResizeObserver" in window)) {
+  (window as unknown as Record<string, unknown>).ResizeObserver = class {
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  };
+}
+if (!Element.prototype.scrollIntoView) {
+  Element.prototype.scrollIntoView = () => {};
+}
+if (!Element.prototype.hasPointerCapture) {
+  Element.prototype.hasPointerCapture = () => false;
+  Element.prototype.setPointerCapture = () => {};
+  Element.prototype.releasePointerCapture = () => {};
+}
+
 // jsdom lacks matchMedia; theme/palette boot and CSS hooks touch it.
 if (!window.matchMedia) {
   window.matchMedia = (query: string) =>
