@@ -58,6 +58,11 @@ import { SUMMARY_PRESETS, presetLabel } from "../lib/presets";
 import { LANGUAGES, languageOptionLabel } from "../lib/languages";
 import { useDeveloperMode } from "../lib/useDeveloperMode";
 import { useSpeakerSuggestions } from "../lib/useSpeakerSuggestions";
+import {
+  notesWithSpeaker,
+  renameOutcomeMessage,
+  renameSpeakerAcrossNotes,
+} from "../lib/crossNoteRename";
 import { cn } from "../lib/cn";
 
 // Memoized Markdown renderer. ReactMarkdown's parse step is O(N) over
@@ -87,6 +92,11 @@ export function Note() {
   const refreshNotes = useNotesStore((s) => s.refresh);
   const folders = useNotesStore((s) => s.folders);
   const note = useNotesStore((s) => s.notes.find((n) => n.id === id));
+  // Every note in the active workspace. `notes_list` includes each one's full
+  // transcript, so the cross-note rename (#116 part 2) needs no extra query to
+  // find or count the notes it will rewrite.
+  const allNotes = useNotesStore((s) => s.notes);
+  const replaceTranscript = useNotesStore((s) => s.replaceTranscript);
   const [draft, setDraft] = useState<TNote | null>(null);
   // Version history panel + a nonce so restoring re-seeds the body editor
   // (initialBody is memoised on the note id, which doesn't change on restore).
@@ -537,6 +547,31 @@ export function Note() {
     !!draft && draft.transcript.trim().length > 0 && !readOnly,
   );
 
+  // How many OTHER notes carry each of this note's speaker labels (#116 part 2),
+  // which is what gates the "rename everywhere" choice and puts the number on
+  // its button. Counted from transcript text rather than `notes.speakers`: that
+  // column is only written by `reindex_note` and can be stale, so the button
+  // could otherwise promise a number it doesn't deliver.
+  // Every note, with the open one's live draft substituted for the store's copy.
+  // `patch` debounces, so the store can lag the transcript on screen by up to a
+  // few hundred ms — sweeping off the stale copy would revert edits the user can
+  // still see, and count off a transcript that isn't the one being renamed.
+  const notesForSweep = useMemo(
+    () => (draft ? allNotes.map((n) => (n.id === draft.id ? draft : n)) : allNotes),
+    [allNotes, draft],
+  );
+
+  const otherNotesWithLabel = useMemo(() => {
+    if (!draft) return {};
+    const others = notesForSweep.filter((n) => n.id !== draft.id);
+    return Object.fromEntries(
+      extractSpeakerLabels(draft.transcript).map((label) => [
+        label,
+        notesWithSpeaker(others, label).length,
+      ]),
+    );
+  }, [notesForSweep, draft]);
+
   if (!draft) return null;
 
   // Who may move this note to another workspace: its creator, or a workspace
@@ -980,6 +1015,37 @@ export function Note() {
                         transcript={draft.transcript}
                         readOnly={readOnly}
                         suggestions={speakerSuggestions}
+                        otherNotesWithLabel={otherNotesWithLabel}
+                        onRenameEverywhere={(oldLabel, newLabel) => {
+                          if (readOnlyRef.current) return;
+                          // This note included, through the same per-note path a
+                          // single rename takes — one rewrite implementation, and
+                          // `notes_update` pings the sync observer correctly.
+                          // Undo comes free: `db::update_note` snapshots a
+                          // revision on every transcript change.
+                          void renameSpeakerAcrossNotes({
+                            notes: notesForSweep,
+                            oldLabel,
+                            newLabel,
+                            onRewritten: (noteId, transcript) => {
+                              replaceTranscript(noteId, transcript);
+                              // The open note's own draft, so the pills and the
+                              // transcript view flip with everything else.
+                              if (noteId === draft.id) {
+                                setDraft((d) => (d ? { ...d, transcript } : d));
+                                setTimeline((tl) =>
+                                  tl.map((e) =>
+                                    e.label === oldLabel ? { ...e, label: newLabel } : e,
+                                  ),
+                                );
+                              }
+                            },
+                          }).then((outcome) => {
+                            useRecordingStore
+                              .getState()
+                              .pushFlash(renameOutcomeMessage(outcome));
+                          });
+                        }}
                         onRename={(oldLabel, newLabel) => {
                           if (readOnlyRef.current) return;
                           patch("transcript", renameSpeakerInTranscript(draft.transcript, oldLabel, newLabel));

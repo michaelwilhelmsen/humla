@@ -319,6 +319,12 @@ export const ipc = {
   // which member management needs to fail loudly.
   speakerLabelStats: () => invoke<SpeakerLabelStat[]>("speaker_label_stats"),
   speakerRoster: () => invoke<string[]>("cloud_speaker_roster"),
+  // The name to prefill when renaming the literal `You:` label (#116 part 2):
+  // `user_display_name` → workspace account name → macOS full name. The cloud
+  // name is passed in because the store already holds it, so the prefill never
+  // waits on the network.
+  speakerDefaultName: (cloudName: string | null) =>
+    invoke<string | null>("speaker_default_name", { cloudName }),
   noteTimeline: (noteId: string) =>
     invoke<TimelineEntry[]>("note_timeline", { noteId }),
   noteTimelineRename: (noteId: string, oldLabel: string, newLabel: string) =>

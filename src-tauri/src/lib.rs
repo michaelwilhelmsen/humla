@@ -272,6 +272,7 @@ where
         .invoke_handler(tauri::generate_handler![
             commands::notes_list,
             commands::speaker_label_stats,
+            commands::speaker_default_name,
             commands::notes_get,
             commands::notes_create,
             commands::notes_update,

@@ -37,6 +37,8 @@ export function speakerColorMap(labels: string[]): Map<string, string> {
 export function SpeakerLabels({
   transcript,
   onRename,
+  onRenameEverywhere,
+  otherNotesWithLabel,
   readOnly,
   suggestions,
 }: {
@@ -44,6 +46,13 @@ export function SpeakerLabels({
   // Both rename and merge report through here. For a merge, `newLabel` is
   // an already-existing label from the strip.
   onRename: (oldLabel: string, newLabel: string) => void;
+  /**
+   * Rename this speaker in every note that names them (#116 part 2), this one
+   * included. Offered only for labels `otherNotesWithLabel` reports elsewhere.
+   */
+  onRenameEverywhere?: (oldLabel: string, newLabel: string) => void;
+  /** Per label: how many OTHER notes carry it. Absent → no sweep is offered. */
+  otherNotesWithLabel?: Record<string, number>;
   readOnly?: boolean;
   /** Omitted → the rename input is plain free text, exactly as before. */
   suggestions?: SpeakerSuggestionSource;
@@ -64,6 +73,10 @@ export function SpeakerLabels({
           otherLabels={labels.filter((l) => l !== label)}
           colors={colors}
           onRename={(next) => onRename(label, next)}
+          onRenameEverywhere={
+            onRenameEverywhere ? (next) => onRenameEverywhere(label, next) : undefined
+          }
+          otherNoteCount={otherNotesWithLabel?.[label] ?? 0}
           onMerge={(target) => onRename(label, target)}
           readOnly={readOnly}
           suggestions={suggestions}
@@ -80,6 +93,8 @@ function SpeakerChip({
   otherLabels,
   colors,
   onRename,
+  onRenameEverywhere,
+  otherNoteCount,
   onMerge,
   readOnly,
   suggestions,
@@ -90,6 +105,9 @@ function SpeakerChip({
   otherLabels: string[];
   colors: Map<string, string>;
   onRename: (next: string) => void;
+  onRenameEverywhere?: (next: string) => void;
+  /** How many OTHER notes carry this label. 0 → nothing to choose between. */
+  otherNoteCount: number;
   onMerge: (target: string) => void;
   readOnly?: boolean;
   suggestions?: SpeakerSuggestionSource;
@@ -97,12 +115,16 @@ function SpeakerChip({
 }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(label);
+  // The name is chosen but the scope isn't yet (#116 part 2). Holding it here
+  // rather than in a modal is what makes the choice itself the commit.
+  const [pendingName, setPendingName] = useState<string | null>(null);
 
   // Snap the draft back to the canonical label whenever the underlying
   // label changes (e.g. diarize replaced the transcript and our label
   // was re-derived).
   useEffect(() => {
     setDraft(label);
+    setPendingName(null);
   }, [label]);
 
   const ranked = useMemo(
@@ -147,6 +169,8 @@ function SpeakerChip({
   // never a deliberate second person.
   const preselect = caseVariantTarget(draft, ranked) ?? undefined;
 
+  const canSweep = !!onRenameEverywhere && otherNoteCount > 0;
+
   function commit(next: string) {
     setEditing(false);
     const trimmed = next.trim();
@@ -154,7 +178,18 @@ function SpeakerChip({
       setDraft(label);
       return;
     }
+    // With other notes carrying this label, the scope is a real question and the
+    // answer is the commit. With none, asking would be a pointless extra click.
+    if (canSweep) {
+      setPendingName(trimmed);
+      return;
+    }
     onRename(trimmed);
+  }
+
+  function cancelScope() {
+    setPendingName(null);
+    setDraft(label);
   }
 
   // Read-only (viewer): a static, non-interactive pill — no click-to-rename,
@@ -164,6 +199,52 @@ function SpeakerChip({
       <span className="nd-speaker-pill" style={{ background: color }}>
         {label}
       </span>
+    );
+  }
+
+  if (pendingName !== null) {
+    // The name is chosen; the scope is the remaining question. Two choices, no
+    // modal and no destructive default — picking one IS the commit, the same
+    // reasoning the merge menu uses (#23). A modal with per-note checkboxes was
+    // rejected as turning a data cleanup into a per-note editing session.
+    //
+    // A `Menu` rather than a `Popover`: this is a list of choices, so Radix's
+    // arrow-key roving and `menuitem` semantics come free (CLAUDE.md). The pill
+    // itself is the trigger, so the menu anchors where the rename happened.
+    return (
+      <Menu open onOpenChange={(next) => !next && cancelScope()}>
+        <MenuTrigger asChild>
+          <button type="button" className="nd-speaker-pill" style={{ background: color }}>
+            {pendingName}
+          </button>
+        </MenuTrigger>
+        <MenuContent
+          aria-label={`Rename ${label} to ${pendingName}`}
+          className="bg-[var(--color-surface)]"
+        >
+          <MenuLabel>
+            {label} → {pendingName}
+          </MenuLabel>
+          <MenuItem
+            onSelect={() => {
+              setPendingName(null);
+              onRename(pendingName);
+            }}
+          >
+            Rename here only
+          </MenuItem>
+          <MenuItem
+            onSelect={() => {
+              setPendingName(null);
+              onRenameEverywhere?.(pendingName);
+            }}
+          >
+            {/* This note plus the others, because that is what the sweep
+                actually rewrites. */}
+            Rename in all {otherNoteCount + 1} notes
+          </MenuItem>
+        </MenuContent>
+      </Menu>
     );
   }
 
