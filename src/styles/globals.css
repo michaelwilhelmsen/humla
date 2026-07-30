@@ -416,18 +416,6 @@ input::placeholder, textarea::placeholder {
 .nd-meta.is-interactive:hover { background: var(--color-pill-hover); color: var(--color-text); }
 .nd-meta > svg { opacity: 0.72; flex-shrink: 0; }
 
-/* Panel control chip — the bordered surface-2 pill used as a Menu trigger by
-   the Summary (preset/provider) and Transcript (language/speakers) tabs. */
-.nd-ctl {
-  display: inline-flex; align-items: center; gap: 6px;
-  font-size: 12px; font-weight: 500; color: var(--color-text);
-  padding: 5px 9px; border: 1px solid var(--color-line-visible);
-  border-radius: 8px; background: var(--color-surface-2);
-  cursor: pointer; white-space: nowrap; transition: border-color 120ms;
-}
-.nd-ctl:hover { border-color: var(--color-text-muted); }
-.nd-ctl > svg { opacity: 0.72; flex-shrink: 0; }
-
 /* No <select> rules live here any more: every picker in the app goes through
    the Radix-backed Popover / Menu / Select primitives (#114), so the chrome
    resets and the hand-drawn caret that used to fight WebKit are gone with the

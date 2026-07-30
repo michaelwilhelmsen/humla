@@ -1252,6 +1252,12 @@ function PanelEmpty({ icon, text }: { icon: React.ReactNode; text: string }) {
 // would do — WKWebView ignores `field-sizing: content`), and the choices come
 // from the shared Menu (#114) rather than a system popup. Rows carry a
 // checkmark on the active one, matching every other picker in the app.
+//
+// The trigger wears `nd-meta is-interactive` — the same quiet, borderless chip
+// as the note meta bar's folder / client / workspace pickers. These were the
+// app's only bordered picker chips (`.nd-ctl`, now deleted), which made two
+// panels' worth of pickers read as a different kind of control from every other
+// picker in the app.
 export type CtlOption = {
   value: string;
   label: string;
@@ -1278,7 +1284,7 @@ function CtlSelect({
 }) {
   return (
     <Menu>
-      <MenuTrigger className="nd-ctl" title={title} aria-label={title ?? label}>
+      <MenuTrigger className="nd-meta is-interactive" title={title} aria-label={title ?? label}>
         {icon}
         {extra}
         <span className="truncate" style={{ maxWidth: 160 }}>{label}</span>
