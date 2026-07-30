@@ -33,6 +33,7 @@ import { useDownloadStore, useNotesStore, useRecordingStore } from "../lib/store
 import { computeSetupStatus } from "../lib/setupStatus";
 import { useOwnerName, useCloudStore } from "../lib/cloud";
 import { extractSpeakerLabels, renameSpeakerInTranscript } from "../lib/speakers";
+import { shouldAdoptRemoteBody } from "../lib/noteSync";
 import { SpeakerLabels, speakerColorMap } from "../components/SpeakerLabels";
 import { RecordingSessions } from "../components/RecordingSessions";
 import { groupTimeline, resolveActivePill, formatSessionCaption } from "../lib/sessions";
@@ -403,12 +404,35 @@ export function Note() {
 
   // Auto-grow the title textarea so long titles wrap onto a second line
   // instead of horizontally clipping at the right edge of the page.
-  useEffect(() => {
+  const fitTitle = useCallback(() => {
     const el = titleRef.current;
     if (!el) return;
     el.style.height = "auto";
     el.style.height = el.scrollHeight + "px";
-  }, [draft?.title]);
+  }, []);
+  useEffect(fitTitle, [fitTitle, draft?.title]);
+
+  // Wrapping depends on the column's width, not only on the text, and the column
+  // widens when the context panel closes or is dragged. Watching React state
+  // won't do: the effect would run at commit, before the 300ms max-width
+  // transition has moved, and re-bake the pre-transition height — which is how a
+  // title that no longer wraps kept its two-line height and left a gap above the
+  // meta bar. Observe the textarea itself so we refit on every frame of the
+  // transition and every drag tick. The height writes are idempotent, so this
+  // settles after one extra callback rather than looping.
+  useEffect(() => {
+    const el = titleRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    let lastWidth = -1;
+    const ro = new ResizeObserver(() => {
+      const w = el.clientWidth;
+      if (w === lastWidth) return;
+      lastWidth = w;
+      fitTitle();
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [fitTitle, draft?.id]);
 
   // Always pull summary updates from the store. Pull transcript updates only
   // while a recording or diarization is in flight — otherwise our debounced
@@ -423,10 +447,18 @@ export function Note() {
       if (!d) return d;
       const nextSummary = note.summary;
       const nextTranscript = allowTranscriptSync ? note.transcript : d.transcript;
-      if (d.summary === nextSummary && d.transcript === nextTranscript) return d;
-      return { ...d, summary: nextSummary, transcript: nextTranscript };
+      // A cloud pull can land the body *after* we read the row — see
+      // shouldAdoptRemoteBody for why adopting is gated on an empty draft with
+      // nothing queued for save.
+      const nextBody = shouldAdoptRemoteBody(d.body, note.body, "body" in pendingChanges.current)
+        ? note.body
+        : d.body;
+      if (d.summary === nextSummary && d.transcript === nextTranscript && d.body === nextBody) {
+        return d;
+      }
+      return { ...d, summary: nextSummary, transcript: nextTranscript, body: nextBody };
     });
-  }, [note?.transcript, note?.summary, allowTranscriptSync]);
+  }, [note?.transcript, note?.summary, note?.body, allowTranscriptSync]);
 
   // Re-fetch the playback bundle whenever the note id or recording
   // phase changes. The post-stop diarize step writes the bundle, so
@@ -535,8 +567,12 @@ export function Note() {
       .split(/\n{2,}/)
       .map((para) => `<p>${escapeHtml(para).replace(/\n/g, "<br />")}</p>`)
       .join("");
+    // Keyed on the body value, not just the id: a late-arriving cloud body has to
+    // reach the editor. Cursor-safe because `patch` stores the editor's own HTML,
+    // so on a keystroke this recomputes to exactly what the editor already holds
+    // and NoteEditor's equality guard makes the re-sync a no-op.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [draft?.id, restoreNonce]);
+  }, [draft?.id, draft?.body, restoreNonce]);
 
   const dateChip = useMemo(() => (draft ? formatDateChip(draft.created_at) : "Today"), [draft]);
 
