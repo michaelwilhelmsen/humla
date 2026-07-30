@@ -11,6 +11,7 @@ import { ipc } from "../../../lib/ipc";
 import { LANGUAGES, languageOptionLabel } from "../../../lib/languages";
 import type { StepContext } from "../types";
 import { StepShell } from "../StepShell";
+import { Select } from "../../../components/ui/Select";
 
 // Same default as Settings → General (`DEFAULTS.language`). Kept inline rather
 // than imported from the Settings types module to avoid coupling onboarding to
@@ -61,21 +62,16 @@ export function LanguageStep({ ctx }: { ctx: StepContext }) {
       title="What language are your meetings mostly in?"
       subtitle="This helps Humla pick the right transcription model. You can override it per note later."
     >
-      <label className="w-full max-w-xs">
-        <span className="sr-only">Meeting language</span>
-        <select
+      <div className="w-full max-w-xs">
+        <Select
+          ariaLabel="Meeting language"
           value={value ?? DEFAULT_LANGUAGE}
           disabled={value === null}
-          onChange={(e) => change(e.target.value)}
-          className="w-full px-3 py-2.5 rounded-md text-sm bg-[var(--color-input-bg)] border border-[var(--color-line)] focus:border-[var(--color-text-muted)]"
-        >
-          {LANGUAGES.map((l) => (
-            <option key={l.value} value={l.value}>
-              {languageOptionLabel(l)}
-            </option>
-          ))}
-        </select>
-      </label>
+          onChange={change}
+          options={LANGUAGES.map((l) => ({ value: l.value, label: languageOptionLabel(l) }))}
+          className="w-full max-w-none justify-between px-3 py-2.5 bg-[var(--color-input-bg)] border-[var(--color-line)] hover:bg-[var(--color-input-bg)] focus:border-[var(--color-text-muted)]"
+        />
+      </div>
 
       <div className="mt-8">
         <button

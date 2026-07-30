@@ -44,6 +44,7 @@ import { useDownloadStore } from "../../../lib/store";
 import { useProviderKey } from "../../../components/provider/useProviderKey";
 import type { StepContext } from "../types";
 import { StepShell } from "../StepShell";
+import { Select } from "../../../components/ui/Select";
 
 // ---- Model routing (mirrors design/ONBOARDING.md § 4) ---------------------
 // Norwegian meetings get the National Library's NB Whisper; everything else
@@ -437,20 +438,13 @@ export function TranscriptionStep({ ctx }: { ctx: StepContext }) {
           {/* Provider dropdown + key field, revealed on selection. */}
           {selection === "cloud" && (
             <div className="mt-4 flex flex-col gap-3">
-              <label className="block">
-                <span className="sr-only">Provider</span>
-                <select
-                  value={cloudProvider}
-                  onChange={(e) => changeCloudProvider(e.target.value as CloudProvider)}
-                  className="w-full px-3 py-2 rounded-md text-sm bg-[var(--color-input-bg)] border border-[var(--color-line)] focus:border-[var(--color-text-muted)]"
-                >
-                  {CLOUD_PROVIDERS.map((p) => (
-                    <option key={p.value} value={p.value}>
-                      {p.label}
-                    </option>
-                  ))}
-                </select>
-              </label>
+              <Select
+                ariaLabel="Provider"
+                value={cloudProvider}
+                onChange={(v) => changeCloudProvider(v as CloudProvider)}
+                options={CLOUD_PROVIDERS.map((p) => ({ value: p.value, label: p.label }))}
+                className="w-full max-w-none justify-between px-3 py-2 bg-[var(--color-input-bg)] border-[var(--color-line)] hover:bg-[var(--color-input-bg)] focus:border-[var(--color-text-muted)]"
+              />
 
               <div className="flex gap-2">
                 <input

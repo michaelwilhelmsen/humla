@@ -19,6 +19,10 @@ import { floatingSurface, rowClass, rowHighlightClass } from "./surface";
 // portal at the nearest `[role="dialog"]` ancestor when there is one — that
 // clears the panel's clip while staying inside `within(dialog)` queries in
 // tests and inside the dialog for assistive tech. Falls back to <body>.
+//
+// `className` overrides the trigger's chrome for callers that need a different
+// shape (onboarding's full-width form fields); the listbox is always the shared
+// floating surface.
 
 // Radix reserves the empty string: `Select.Root value=""` means "nothing
 // chosen", and an `Item` with an empty value throws outright. Several callers
@@ -34,6 +38,10 @@ export function Select({
   onChange,
   options,
   id,
+  ariaLabel,
+  className,
+  disabled,
+  placeholder,
 }: {
   value: string;
   onChange: (v: string) => void;
@@ -41,6 +49,13 @@ export function Select({
   // Optional id placed on the trigger (a labelable element) so an external
   // <label htmlFor> can name this control.
   id?: string;
+  /** Names the control where there's no visible <label> to point at it. */
+  ariaLabel?: string;
+  /** Overrides trigger chrome — e.g. a full-width form field in onboarding. */
+  className?: string;
+  disabled?: boolean;
+  /** Shown when `value` matches no option (and none is the empty string). */
+  placeholder?: string;
 }) {
   const triggerRef = useRef<HTMLButtonElement>(null);
   // Resolved when the listbox opens rather than in a ref callback, which would
@@ -62,11 +77,15 @@ export function Select({
         // be nameless where the caller doesn't wrap it in a <label htmlFor>.
         // Fall back to the current value — the same name the old plain <button>
         // derived from its text — and stay out of the way when there IS a label.
-        aria-label={id ? undefined : (current?.label ?? value)}
+        aria-label={ariaLabel ?? (id ? undefined : (current?.label ?? value))}
         ref={triggerRef}
-        className="inline-flex items-center gap-1.5 max-w-[260px] px-2.5 py-1.5 rounded-md text-sm border border-[var(--color-line-visible)] bg-[var(--color-surface)] hover:bg-[var(--color-pill-hover)] transition-colors"
+        disabled={disabled}
+        className={cn(
+          "inline-flex items-center gap-1.5 max-w-[260px] px-2.5 py-1.5 rounded-md text-sm border border-[var(--color-line-visible)] bg-[var(--color-surface)] hover:bg-[var(--color-pill-hover)] transition-colors disabled:opacity-50",
+          className,
+        )}
       >
-        <span className="truncate">{current?.label ?? value}</span>
+        <span className="truncate">{current?.label ?? placeholder ?? value}</span>
         <RadixSelect.Icon asChild>
           <ChevronDown
             size={13}

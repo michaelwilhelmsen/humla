@@ -1,9 +1,11 @@
 import { useEffect, useState } from "react";
+import { ChevronDown } from "lucide-react";
 import { ipc, type SummaryPrompt } from "../../../lib/ipc";
 import { SUMMARY_PRESETS, presetLabel, presetPromptForLang } from "../../../lib/presets";
 import { inputClass } from "../types";
 import { Btn } from "./Btn";
 import { Modal } from "./Modal";
+import { Menu, MenuContent, MenuItem, MenuTrigger } from "../../../components/ui/Menu";
 
 // Two-section UI: built-in presets are read-only previews; user-defined
 // prompts live in their own list with create / edit / delete via a
@@ -237,24 +239,27 @@ function PromptEditor({
         <label className="text-xs uppercase tracking-wide text-[var(--color-text-muted)]">
           Content
         </label>
-        <select
-          onChange={(e) => {
-            if (e.target.value) onSeed(e.target.value);
-            e.currentTarget.value = "";
-          }}
-          className={inputClass + " w-auto py-1 text-xs"}
-          defaultValue=""
-          aria-label="Seed content from preset"
-        >
-          <option value="" disabled>
+        {/*
+          A list of actions, not a value picker — seeding fires once and the
+          control keeps showing its own label — so it's a Menu rather than the
+          Select primitive (#114).
+        */}
+        <Menu>
+          <MenuTrigger
+            aria-label="Seed content from preset"
+            className={inputClass + " inline-flex items-center gap-1.5 w-auto py-1 text-xs"}
+          >
             Seed from preset…
-          </option>
-          {SUMMARY_PRESETS.map((p) => (
-            <option key={p.value} value={p.value}>
-              {presetLabel(p)}
-            </option>
-          ))}
-        </select>
+            <ChevronDown size={12} strokeWidth={2} className="text-[var(--color-text-muted)]" aria-hidden />
+          </MenuTrigger>
+          <MenuContent aria-label="Seed content from preset">
+            {SUMMARY_PRESETS.map((p) => (
+              <MenuItem key={p.value} onSelect={() => onSeed(p.value)}>
+                {presetLabel(p)}
+              </MenuItem>
+            ))}
+          </MenuContent>
+        </Menu>
         <textarea
           value={value.content}
           onChange={(e) => onChange({ ...value, content: e.target.value })}
