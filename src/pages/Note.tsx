@@ -57,6 +57,7 @@ import { ExportModal } from "./ExportModal";
 import { SUMMARY_PRESETS, presetLabel } from "../lib/presets";
 import { LANGUAGES, languageOptionLabel } from "../lib/languages";
 import { useDeveloperMode } from "../lib/useDeveloperMode";
+import { useSpeakerSuggestions } from "../lib/useSpeakerSuggestions";
 import { cn } from "../lib/cn";
 
 // Memoized Markdown renderer. ReactMarkdown's parse step is O(N) over
@@ -529,6 +530,13 @@ export function Note() {
 
   const dateChip = useMemo(() => (draft ? formatDateChip(draft.created_at) : "Today"), [draft]);
 
+  // Suggestion source for the speaker-rename picker (#116), fetched once there is
+  // a transcript to label. Must stay ABOVE the `!draft` return below: a hook
+  // after an early return changes the hook count as soon as a note loads.
+  const speakerSuggestions = useSpeakerSuggestions(
+    !!draft && draft.transcript.trim().length > 0 && !readOnly,
+  );
+
   if (!draft) return null;
 
   // Who may move this note to another workspace: its creator, or a workspace
@@ -971,6 +979,7 @@ export function Note() {
                       <SpeakerLabels
                         transcript={draft.transcript}
                         readOnly={readOnly}
+                        suggestions={speakerSuggestions}
                         onRename={(oldLabel, newLabel) => {
                           if (readOnlyRef.current) return;
                           patch("transcript", renameSpeakerInTranscript(draft.transcript, oldLabel, newLabel));
@@ -1840,7 +1849,7 @@ const TranscriptView = memo(function TranscriptView({
             } else {
               content = (
                 <div className="whitespace-pre-wrap">
-                  {`${line.lead}${line.label}: ${line.rest}` || " "}
+                  {`${line.lead}${line.label}: ${line.rest}`}
                 </div>
               );
             }

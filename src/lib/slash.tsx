@@ -1,3 +1,7 @@
+/* eslint-disable @typescript-eslint/no-explicit-any --
+   The three suggestion callbacks below take Tiptap's `SuggestionProps`, which is
+   generic over the editor and not exported in a usable shape; typing them by hand
+   restates the plugin's internals and drifts on every Tiptap bump. */
 import { Extension, ReactRenderer, type Editor, type Range } from "@tiptap/react";
 import Suggestion from "@tiptap/suggestion";
 import tippy, { type Instance as TippyInstance } from "tippy.js";

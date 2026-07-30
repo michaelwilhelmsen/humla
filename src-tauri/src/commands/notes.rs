@@ -16,6 +16,18 @@ pub fn notes_list(state: State<AppState>) -> Result<Vec<Note>, String> {
     db::list_notes(&conn, &workspace).map_err(err)
 }
 
+/// Every distinct speaker label in the active workspace, with usage counters —
+/// the suggestion source for the rename picker (#116 part 1).
+///
+/// Fetched once when the speaker strip mounts; the picker then filters and ranks
+/// in TS per keystroke, so there is no IPC per keystroke.
+#[tauri::command]
+pub fn speaker_label_stats(state: State<AppState>) -> Result<Vec<db::SpeakerLabelStat>, String> {
+    let conn = state.db.lock();
+    let workspace = super::cloud::active_workspace(&conn);
+    db::speaker_label_stats(&conn, &workspace).map_err(err)
+}
+
 #[tauri::command]
 pub fn notes_get(state: State<AppState>, id: String) -> Result<Note, String> {
     let conn = state.db.lock();

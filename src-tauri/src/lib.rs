@@ -271,6 +271,7 @@ where
         })
         .invoke_handler(tauri::generate_handler![
             commands::notes_list,
+            commands::speaker_label_stats,
             commands::notes_get,
             commands::notes_create,
             commands::notes_update,
@@ -307,6 +308,7 @@ where
             commands::cloud_leave_workspace,
             commands::cloud_transfer_workspace,
             commands::cloud_workspace_members,
+            commands::cloud_speaker_roster,
             commands::cloud_pending_note_ids,
             commands::cloud_upload_note_audio,
             commands::cloud_download_note_audio,
