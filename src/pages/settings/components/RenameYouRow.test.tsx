@@ -24,6 +24,12 @@ function seed(notes: ReturnType<typeof makeNote>[]) {
 beforeEach(() => {
   mockTauri({ speaker_default_name: () => "Michael Wilhelmsen" });
   seed([]);
+  // Signed out, Personal, no workspace — the state each test opts out of
+  // explicitly. Without the reset, cloud identity leaks between tests and the
+  // owner-scoping assertions pass or fail on run order.
+  useCloudStore.setState({
+    status: { ...useCloudStore.getState().status, user: null, current_workspace: null },
+  });
 });
 
 describe("RenameYouRow gating", () => {
@@ -217,5 +223,56 @@ describe("RenameYouRow permissions", () => {
     useCloudStore.setState({
       status: { ...useCloudStore.getState().status, current_workspace: null },
     });
+  });
+});
+
+describe("RenameYouRow scope", () => {
+  // "You" means whoever held the mic, so it only resolves to this user inside
+  // their own recordings. In a teammate's recording it is THEM — rewriting it
+  // shipped Michael's name into Kurt's meeting.
+  function signedInAs(id: string) {
+    useCloudStore.setState({
+      status: {
+        ...useCloudStore.getState().status,
+        user: { id, email: "me@example.com", name: "Michael", verified: true },
+      },
+    });
+  }
+
+  it("counts only the notes I recorded", async () => {
+    signedInAs("u_me");
+    seed([
+      makeNote({ id: "mine", owner: "u_me", transcript: "You: hi" }),
+      makeNote({ id: "kurts", owner: "u_kurt", transcript: "You: hei" }),
+    ]);
+    render(<RenameYouRow />);
+    expect(await screen.findByRole("button", { name: /in 1 note$/ })).toBeTruthy();
+  });
+
+  it("never rewrites a teammate's recording", async () => {
+    const updated: string[] = [];
+    mockTauri({
+      speaker_default_name: () => "Michael Wilhelmsen",
+      notes_update: (args) => {
+        updated.push((args as { id: string }).id);
+        return undefined;
+      },
+    });
+    signedInAs("u_me");
+    seed([
+      makeNote({ id: "mine", owner: "u_me", transcript: "You: hi" }),
+      makeNote({ id: "kurts", owner: "u_kurt", transcript: "You: hei" }),
+    ]);
+    render(<RenameYouRow />);
+
+    await userEvent.click(await screen.findByRole("button", { name: /^Rename You/ }));
+    await waitFor(() => expect(updated).toEqual(["mine"]));
+  });
+
+  it("is absent when only teammates' notes say You", async () => {
+    signedInAs("u_me");
+    seed([makeNote({ id: "kurts", owner: "u_kurt", transcript: "You: hei" })]);
+    const { container } = render(<RenameYouRow />);
+    await waitFor(() => expect(container).toBeEmptyDOMElement());
   });
 });

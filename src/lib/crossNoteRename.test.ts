@@ -3,6 +3,8 @@ import {
   notesWithSpeaker,
   renameOutcomeMessage,
   renameSpeakerAcrossNotes,
+  isPerRecordingLabel,
+  notesIRecorded,
 } from "./crossNoteRename";
 import { makeNote } from "../test/fixtures";
 
@@ -219,5 +221,48 @@ describe("renameOutcomeMessage", () => {
     expect(renameOutcomeMessage({ renamed: [], failed: ["a", "b"] })).toBe(
       "Renamed in 0 of 2 — 2 failed",
     );
+  });
+});
+
+describe("isPerRecordingLabel", () => {
+  it("treats the placeholders as per-recording, because they are", () => {
+    // "You" means whoever held the mic, and "Speaker 1" is whoever the diarizer
+    // clustered first — both name a DIFFERENT person in every recording. Renaming
+    // them across notes writes false attribution into someone else's meeting.
+    expect(isPerRecordingLabel("You")).toBe(true);
+    expect(isPerRecordingLabel("Speaker 1")).toBe(true);
+    expect(isPerRecordingLabel("Speaker 12")).toBe(true);
+  });
+
+  it("treats a real name as meaning the same person everywhere", () => {
+    // Which is what makes a name safe to converge across notes at all.
+    expect(isPerRecordingLabel("Hege Tronshaugen")).toBe(false);
+    expect(isPerRecordingLabel("Kurt Skoland")).toBe(false);
+  });
+});
+
+describe("notesIRecorded", () => {
+  it("keeps only notes I own", () => {
+    const notes = [
+      makeNote({ id: "mine", owner: "u_me" }),
+      makeNote({ id: "kurts", owner: "u_kurt" }),
+    ];
+    expect(notesIRecorded(notes, "u_me").map((n) => n.id)).toEqual(["mine"]);
+  });
+
+  it("counts an unowned note as mine — local and Personal notes have no owner", () => {
+    const notes = [makeNote({ id: "local", owner: "" })];
+    expect(notesIRecorded(notes, "u_me").map((n) => n.id)).toEqual(["local"]);
+  });
+
+  it("is every note when signed out, where there are no other authors", () => {
+    const notes = [makeNote({ id: "a", owner: "" }), makeNote({ id: "b", owner: "" })];
+    expect(notesIRecorded(notes, undefined)).toHaveLength(2);
+  });
+
+  it("never claims a teammate's note when signed out but notes carry owners", () => {
+    // A stale store from a previous session must not widen the sweep.
+    const notes = [makeNote({ id: "kurts", owner: "u_kurt" })];
+    expect(notesIRecorded(notes, undefined)).toEqual([]);
   });
 });

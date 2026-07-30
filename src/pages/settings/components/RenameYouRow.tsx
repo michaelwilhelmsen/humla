@@ -5,6 +5,7 @@ import { useNotesStore } from "../../../lib/store";
 import { useCloudStore } from "../../../lib/cloud";
 import { s as plural } from "./format";
 import {
+  notesIRecorded,
   notesWithSpeaker,
   renameOutcomeMessage,
   renameSpeakerAcrossNotes,
@@ -49,6 +50,7 @@ export function RenameYouRow() {
   // pill optimistically and then fail every write (#116: "viewer gets none of
   // this").
   const isViewer = useCloudStore((s) => s.status.current_workspace?.role === "viewer");
+  const myUserId = useCloudStore((s) => s.status.user?.id);
   const [name, setName] = useState<string | null>(null);
   const [state, setState] = useState<
     | { kind: "idle" }
@@ -60,7 +62,15 @@ export function RenameYouRow() {
 
   // Counted from transcript text, so the number on the button cannot be a lie —
   // `notes.speakers` is only written by `reindex_note` and can be stale.
-  const affected = useMemo(() => notesWithSpeaker(notes, YOU_LABEL), [notes]);
+  //
+  // **Scoped to notes I recorded**, which is the whole basis for touching `You`
+  // at all: it means "whoever held the mic", so it only resolves to me inside my
+  // own recordings. In a teammate's recording `You` is *them*, and rewriting it
+  // to my name writes false attribution into their meeting.
+  const affected = useMemo(
+    () => notesWithSpeaker(notesIRecorded(notes, myUserId), YOU_LABEL),
+    [notes, myUserId],
+  );
 
   // `user_display_name` → workspace account name → macOS full name. Resolved in
   // Rust so the chain lives in one place; the cloud half is passed in because

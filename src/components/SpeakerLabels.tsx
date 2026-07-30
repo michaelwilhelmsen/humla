@@ -8,6 +8,7 @@ import {
   suggestSpeakerLabels,
   type SpeakerSuggestionSource,
 } from "../lib/speakerSuggest";
+import { isPerRecordingLabel } from "../lib/crossNoteRename";
 
 // Speaker chip strip shown above the transcript. Each unique speaker label
 // renders as a colour-coded pill; clicking a pill renames it inline, and a
@@ -169,7 +170,11 @@ function SpeakerChip({
   // never a deliberate second person.
   const preselect = caseVariantTarget(draft, ranked) ?? undefined;
 
-  const canSweep = !!onRenameEverywhere && otherNoteCount > 0;
+  // A sweep is only ever offered for a real name. `Speaker 1` and `You` mean a
+  // DIFFERENT person in every recording, so renaming them across notes writes
+  // false attribution — in a workspace, into a teammate's meeting.
+  const canSweep =
+    !!onRenameEverywhere && otherNoteCount > 0 && !isPerRecordingLabel(label);
 
   function commit(next: string) {
     setEditing(false);
