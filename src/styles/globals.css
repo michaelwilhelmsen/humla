@@ -416,6 +416,15 @@ input::placeholder, textarea::placeholder {
 .nd-meta.is-interactive:hover { background: var(--color-pill-hover); color: var(--color-text); }
 .nd-meta > svg { opacity: 0.72; flex-shrink: 0; }
 
+/* Filled variant, for a chip that has to hold its own on a card rather than
+   sit under a line of metadata. A transparent chip needs surrounding text to
+   read as inset — in a left-aligned row of nothing else (the Summary and
+   Transcript panel pickers) it just looks like indented prose until you hover
+   it. `surface-2` is the recessed-chip step below the panel's own `surface`,
+   in both themes; hover lifts to `surface-raised`. */
+.nd-meta.is-filled { background: var(--color-surface-2); }
+.nd-meta.is-filled:hover { background: var(--color-surface-raised); color: var(--color-text); }
+
 /* No <select> rules live here any more: every picker in the app goes through
    the Radix-backed Popover / Menu / Select primitives (#114), so the chrome
    resets and the hand-drawn caret that used to fight WebKit are gone with the
