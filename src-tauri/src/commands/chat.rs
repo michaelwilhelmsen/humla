@@ -1687,18 +1687,20 @@ async fn chat_send_cloud(
         &workspace,
         &message,
         Some(&title),
-        &breadth,
-        target.note_id(),
-        folder_id.as_deref(),
-        // The name is display-only, resolved by the caller from the workspace
-        // roster; the id is what the server filters on.
-        (!owner_filter.trim().is_empty())
-            .then(|| (owner_filter.as_str(), owner_name.as_deref().unwrap_or(""))),
-        // Display names for #113's disclosure. `title` IS the anchor note's title
-        // here (the server derives a conversation title from it), so it doubles as
-        // the note-breadth name rather than being resolved twice.
-        Some(title.as_str()).filter(|t| !t.trim().is_empty()),
-        folder_display.as_deref(),
+        chat::cloud::CloudScope {
+            breadth: &breadth,
+            note_id: target.note_id(),
+            folder_id: folder_id.as_deref(),
+            // The name is display-only, resolved by the caller from the workspace
+            // roster; the id is what the server filters on.
+            owner: (!owner_filter.trim().is_empty())
+                .then(|| (owner_filter.as_str(), owner_name.as_deref().unwrap_or(""))),
+            // Display names for #113's disclosure. `title` IS the anchor note's title
+            // here (the server derives a conversation title from it), so it doubles as
+            // the note-breadth name rather than being resolved twice.
+            note_title: Some(title.as_str()).filter(|t| !t.trim().is_empty()),
+            folder_name: folder_display.as_deref(),
+        },
     )?;
 
     // Stream the turn, retrying once after a 401 (a stale cached token → forget
@@ -2890,12 +2892,11 @@ mod tests {
             &ws,
             "In one sentence, what is this workspace about?",
             Some("roundtrip test"),
-            "all",
-            Some("roundtrip-anchor"),
-            None,
-            None,
-            None,
-            None,
+            chat::cloud::CloudScope {
+                breadth: "all",
+                note_id: Some("roundtrip-anchor"),
+                ..Default::default()
+            },
         )
         .expect("all-breadth request builds");
         let resp = client

@@ -13,6 +13,38 @@
 use serde::Serialize;
 use serde_json::{json, Value};
 
+/// Everything that defines what a workspace turn can REACH, in one named
+/// argument (issue #123) — the list grows every time a conversation-level filter
+/// lands, and as positional params a transposed pair would compile, pass, and
+/// silently send the wrong field.
+///
+/// The id/name split runs through the whole struct: `note_id` / `folder_id` /
+/// `owner.0` are FILTER INPUTS the server acts on; `note_title` / `folder_name`
+/// / `owner.1` are prompt text only, so the server can disclose what the turn is
+/// confined to. Losing a name loses the disclosure, never the filter.
+///
+/// `Default` exists for the `..Default::default()` shorthand, so its `breadth` is
+/// `""` — deliberately NOT a member of the vocabulary. There is no sane default
+/// reach, and a blank one fails loudly at `validate_breadth` rather than quietly
+/// standing in for "note".
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CloudScope<'a> {
+    /// Breadth verbatim — validated, never clamped (issue #58).
+    pub breadth: &'a str,
+    /// The anchor note. Always sent inside `scope` for grounding when present.
+    pub note_id: Option<&'a str>,
+    /// Rides only when the breadth is folder.
+    pub folder_id: Option<&'a str>,
+    /// A pinned authorship filter (#103): `(user_id, display_name)`. The id is
+    /// what the server filters on; the name only reaches the prompt, so the model
+    /// can say whose notes it was restricted to. Absent = no filter.
+    pub owner: Option<(&'a str, &'a str)>,
+    /// The anchor note's title — display name for breadth "note" (#113).
+    pub note_title: Option<&'a str>,
+    /// The folder's name — display name for breadth "folder" (#113).
+    pub folder_name: Option<&'a str>,
+}
+
 /// Build the JSON body for `POST /api/chat`. `remote_conversation_id` is the
 /// server's conversation record id (None/empty on the first turn → the server
 /// creates one and returns it). The anchor `note_id` is always sent inside
@@ -31,21 +63,9 @@ pub fn build_cloud_request(
     workspace_id: &str,
     message: &str,
     title: Option<&str>,
-    breadth: &str,
-    note_id: Option<&str>,
-    folder_id: Option<&str>,
-    // A pinned authorship filter (#103): `(user_id, display_name)`. The id is
-    // what the server filters on; the name only reaches the prompt, so the model
-    // can say whose notes it was restricted to. Absent = no filter.
-    owner: Option<(&str, &str)>,
-    // Display names for the ACTIVE BREADTH (#113): the anchor note's title and the
-    // folder's name. Prompt text only — never filter inputs, exactly like
-    // `owner`'s second element. The server needs them to disclose what the turn is
-    // confined to, and naming an id the user has never seen would be worse than
-    // silence. Absent just loses the disclosure.
-    note_title: Option<&str>,
-    folder_name: Option<&str>,
+    scope: CloudScope<'_>,
 ) -> Result<Value, String> {
+    let CloudScope { breadth, note_id, folder_id, owner, note_title, folder_name } = scope;
     // Reject an unknown breadth through the shared validator — one owner of the
     // vocabulary and its error, no duplicated match/message here.
     super::validate_breadth(breadth)?;
@@ -97,7 +117,7 @@ pub fn build_cloud_request(
         }
         v
     };
-    let scope = match breadth {
+    let scope_json = match breadth {
         "note" => with_reach_name(with_owner(with_anchor(json!({ "breadth": "note" })))),
         "all" => with_owner(with_anchor(json!({ "breadth": "all" }))),
         "folder" => match folder_id.filter(|f| !f.is_empty()) {
@@ -123,7 +143,7 @@ pub fn build_cloud_request(
     let mut body = json!({
         "workspace_id": workspace_id,
         "message": message,
-        "scope": scope,
+        "scope": scope_json,
     });
     if let Some(id) = remote_conversation_id.filter(|s| !s.is_empty()) {
         body["conversation_id"] = json!(id);
@@ -482,9 +502,22 @@ mod tests {
         assert!(!chat_key_error_message("weird", "   ").is_empty());
     }
 
+    /// A first-turn request where only the SCOPE is under test — every case below
+    /// but the remote-id/title one shares this prefix, so the scope is all that
+    /// varies at the call site.
+    fn req(scope: CloudScope<'_>) -> Result<Value, String> {
+        build_cloud_request(None, "ws1", "hi", None, scope)
+    }
+
+    /// The commonest scope in these tests: a note-breadth turn anchored on `id`,
+    /// no folder, no pin, no display names.
+    fn note_scope(id: &str) -> CloudScope<'_> {
+        CloudScope { breadth: "note", note_id: Some(id), ..CloudScope::default() }
+    }
+
     #[test]
     fn request_defaults_to_note_breadth_with_grounding_anchor() {
-        let b = build_cloud_request(None, "ws1", "hi", None, "note", Some("n1"), None, None, None, None).unwrap();
+        let b = req(note_scope("n1")).unwrap();
         assert_eq!(b["workspace_id"], "ws1");
         assert_eq!(b["message"], "hi");
         assert_eq!(b["scope"], json!({ "breadth": "note", "note_id": "n1" }));
@@ -498,7 +531,7 @@ mod tests {
     /// the key has to be absent.
     #[test]
     fn a_library_wide_request_sends_no_anchor_at_all() {
-        let b = build_cloud_request(None, "ws1", "hi", None, "all", None, None, None, None, None).unwrap();
+        let b = req(CloudScope { breadth: "all", ..Default::default() }).unwrap();
         assert_eq!(b["scope"], json!({ "breadth": "all" }));
         assert!(
             b["scope"].get("note_id").is_none(),
@@ -507,7 +540,7 @@ mod tests {
         // An EMPTY anchor is a caller bug, not "absent" — the same strictness
         // `ChatTarget::from_note_id` applies at the IPC boundary, so `""` can't
         // mean "a note" at one layer and "the library" at another.
-        let err = build_cloud_request(None, "ws1", "hi", None, "all", Some(""), None, None, None, None).unwrap_err();
+        let err = req(CloudScope { breadth: "all", note_id: Some(""), ..Default::default() }).unwrap_err();
         assert!(err.contains("empty note id"), "got: {err}");
     }
 
@@ -516,34 +549,40 @@ mod tests {
     #[test]
     fn a_request_without_an_anchor_must_be_all_breadth() {
         for breadth in ["note", "folder"] {
-            let err = build_cloud_request(None, "ws1", "hi", None, breadth, None, Some("f1"), None, None, None)
-                .unwrap_err();
+            let err = req(CloudScope { breadth, folder_id: Some("f1"), ..Default::default() }).unwrap_err();
             assert!(err.contains("needs an anchor note"), "{breadth}: {err}");
         }
         // With an anchor, both still build as before.
-        assert!(build_cloud_request(None, "ws1", "hi", None, "note", Some("n1"), None, None, None, None).is_ok());
-        assert!(
-            build_cloud_request(None, "ws1", "hi", None, "folder", Some("n1"), Some("f1"), None, None, None).is_ok()
-        );
+        assert!(req(note_scope("n1")).is_ok());
+        assert!(req(CloudScope {
+            breadth: "folder",
+            note_id: Some("n1"),
+            folder_id: Some("f1"),
+            ..Default::default()
+        })
+        .is_ok());
     }
 
     #[test]
     fn request_carries_remote_id_and_title_when_present() {
-        let b =
-            build_cloud_request(Some("srv123"), "ws1", "hi", Some("Kickoff"), "note", Some("n1"), None, None, None, None)
-                .unwrap();
+        let b = build_cloud_request(Some("srv123"), "ws1", "hi", Some("Kickoff"), note_scope("n1")).unwrap();
         assert_eq!(b["conversation_id"], "srv123");
         assert_eq!(b["title"], "Kickoff");
         // Empty strings are dropped, not sent.
-        let b2 = build_cloud_request(Some(""), "ws1", "hi", Some(""), "note", Some("n1"), None, None, None, None).unwrap();
+        let b2 = build_cloud_request(Some(""), "ws1", "hi", Some(""), note_scope("n1")).unwrap();
         assert!(b2.get("conversation_id").is_none());
         assert!(b2.get("title").is_none());
     }
 
     #[test]
     fn request_folder_breadth_carries_the_folder_id() {
-        let with =
-            build_cloud_request(None, "ws1", "hi", None, "folder", Some("n1"), Some("f1"), None, None, None).unwrap();
+        let with = req(CloudScope {
+            breadth: "folder",
+            note_id: Some("n1"),
+            folder_id: Some("f1"),
+            ..Default::default()
+        })
+        .unwrap();
         assert_eq!(with["scope"], json!({ "breadth": "folder", "note_id": "n1", "folder_id": "f1" }));
     }
 
@@ -552,20 +591,20 @@ mod tests {
         // Issue #58: no silent degradation. The desktop heals the folder-less
         // case to "note" upstream, so this strict guard shouldn't fire — but if
         // it's reached it errors loudly rather than quietly narrowing to note.
-        let err = build_cloud_request(None, "ws1", "hi", None, "folder", Some("n1"), None, None, None, None).unwrap_err();
+        let err = req(CloudScope { breadth: "folder", note_id: Some("n1"), ..Default::default() }).unwrap_err();
         assert!(err.to_lowercase().contains("folder"), "names the missing folder: {err}");
     }
 
     #[test]
     fn request_unrecognized_breadth_is_an_error() {
         // Issue #58: the former `_ => {}` fall-through silently clamped to note.
-        let err = build_cloud_request(None, "ws1", "hi", None, "everything", Some("n1"), None, None, None, None).unwrap_err();
+        let err = req(CloudScope { breadth: "everything", note_id: Some("n1"), ..Default::default() }).unwrap_err();
         assert!(err.contains("everything"), "the offending value is surfaced: {err}");
     }
 
     #[test]
     fn request_all_breadth_keeps_the_grounding_anchor() {
-        let b = build_cloud_request(None, "ws1", "hi", None, "all", Some("n1"), None, None, None, None).unwrap();
+        let b = req(CloudScope { breadth: "all", note_id: Some("n1"), ..Default::default() }).unwrap();
         assert_eq!(b["scope"], json!({ "breadth": "all", "note_id": "n1" }));
     }
 
@@ -574,16 +613,17 @@ mod tests {
     /// `owner`/`owner_name` already makes.
     #[test]
     fn request_sends_only_the_display_name_its_breadth_actually_uses() {
-        let note = build_cloud_request(
-            None, "ws1", "hi", None, "note", Some("n1"), None, None, Some("Kickoff"), Some("K2 pilot"),
-        )
-        .unwrap();
+        // Both names are supplied every time; only the one the breadth uses is sent.
+        let both_names = CloudScope {
+            note_id: Some("n1"),
+            note_title: Some("Kickoff"),
+            folder_name: Some("K2 pilot"),
+            ..Default::default()
+        };
+        let note = req(CloudScope { breadth: "note", ..both_names }).unwrap();
         assert_eq!(note["scope"], json!({ "breadth": "note", "note_id": "n1", "note_title": "Kickoff" }));
 
-        let folder = build_cloud_request(
-            None, "ws1", "hi", None, "folder", Some("n1"), Some("f1"), None, Some("Kickoff"), Some("K2 pilot"),
-        )
-        .unwrap();
+        let folder = req(CloudScope { breadth: "folder", folder_id: Some("f1"), ..both_names }).unwrap();
         assert_eq!(
             folder["scope"],
             json!({ "breadth": "folder", "note_id": "n1", "folder_id": "f1", "folder_name": "K2 pilot" })
@@ -593,17 +633,18 @@ mod tests {
         // conversation, so sending its title would invite the server to announce a
         // one-note confinement on a library-wide turn — a filter that isn't running,
         // which is the same lie as hiding one that is.
-        let all = build_cloud_request(
-            None, "ws1", "hi", None, "all", Some("n1"), None, None, Some("Kickoff"), Some("K2 pilot"),
-        )
-        .unwrap();
+        let all = req(CloudScope { breadth: "all", ..both_names }).unwrap();
         assert_eq!(all["scope"], json!({ "breadth": "all", "note_id": "n1" }));
 
         // A blank name is omitted rather than sent empty: the server would otherwise
         // have to decide whether `""` means "no narrowing" or "a folder with no name".
-        let blank = build_cloud_request(
-            None, "ws1", "hi", None, "folder", Some("n1"), Some("f1"), None, None, Some("   "),
-        )
+        let blank = req(CloudScope {
+            breadth: "folder",
+            note_id: Some("n1"),
+            folder_id: Some("f1"),
+            folder_name: Some("   "),
+            ..Default::default()
+        })
         .unwrap();
         assert_eq!(blank["scope"], json!({ "breadth": "folder", "note_id": "n1", "folder_id": "f1" }));
     }
@@ -613,13 +654,13 @@ mod tests {
     /// fourth breadth.
     #[test]
     fn request_carries_the_authorship_pin_under_every_breadth() {
-        let owner = Some(("u-anna", "Anna"));
-        let note = build_cloud_request(None, "ws1", "hi", None, "note", Some("n1"), None, owner, None, None).unwrap();
+        let pinned = CloudScope { owner: Some(("u-anna", "Anna")), ..Default::default() };
+        let note = req(CloudScope { breadth: "note", note_id: Some("n1"), ..pinned }).unwrap();
         assert_eq!(note["scope"], json!({ "breadth": "note", "note_id": "n1", "owner": "u-anna", "owner_name": "Anna" }));
-        let all = build_cloud_request(None, "ws1", "hi", None, "all", None, None, owner, None, None).unwrap();
+        let all = req(CloudScope { breadth: "all", ..pinned }).unwrap();
         assert_eq!(all["scope"], json!({ "breadth": "all", "owner": "u-anna", "owner_name": "Anna" }));
         let folder =
-            build_cloud_request(None, "ws1", "hi", None, "folder", Some("n1"), Some("f1"), owner, None, None).unwrap();
+            req(CloudScope { breadth: "folder", note_id: Some("n1"), folder_id: Some("f1"), ..pinned }).unwrap();
         assert_eq!(
             folder["scope"],
             json!({ "breadth": "folder", "note_id": "n1", "folder_id": "f1", "owner": "u-anna", "owner_name": "Anna" }),
@@ -631,7 +672,7 @@ mod tests {
     /// still pin — losing the name, never the filter.
     #[test]
     fn a_pin_without_a_resolvable_name_still_filters() {
-        let b = build_cloud_request(None, "ws1", "hi", None, "all", None, None, Some(("u-anna", "")), None, None).unwrap();
+        let b = req(CloudScope { breadth: "all", owner: Some(("u-anna", "")), ..Default::default() }).unwrap();
         assert_eq!(b["scope"], json!({ "breadth": "all", "owner": "u-anna" }));
     }
 
@@ -640,7 +681,7 @@ mod tests {
     #[test]
     fn a_blank_owner_id_is_no_pin_at_all() {
         for owner in [Some(("", "Anna")), Some(("   ", "Anna")), None] {
-            let b = build_cloud_request(None, "ws1", "hi", None, "all", None, None, owner, None, None).unwrap();
+            let b = req(CloudScope { breadth: "all", owner, ..Default::default() }).unwrap();
             assert_eq!(b["scope"], json!({ "breadth": "all" }), "{owner:?}");
         }
     }
