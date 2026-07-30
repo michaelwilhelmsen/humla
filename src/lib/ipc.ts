@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import type { SpeakerLabelStat } from "./speakerSuggest";
 
 export type Note = {
   id: string;
@@ -310,6 +311,14 @@ export const ipc = {
   // banner + disabled Record button so teammates don't record the same note.
   noteRecordingStatus: (noteId: string) =>
     invoke<RecordingLockStatus | null>("cloud_note_recording_status", { noteId }),
+  // The rename picker's two suggestion halves (#116): every distinct speaker
+  // label in the active workspace with usage counters, and the workspace member
+  // names. Fetched once per strip mount; ranking and filtering happen in TS
+  // (`lib/speakerSuggest.ts`). `speakerRoster` is best-effort by design and
+  // serves a cached roster when offline — unlike `cloudApi.workspaceMembers`,
+  // which member management needs to fail loudly.
+  speakerLabelStats: () => invoke<SpeakerLabelStat[]>("speaker_label_stats"),
+  speakerRoster: () => invoke<string[]>("cloud_speaker_roster"),
   noteTimeline: (noteId: string) =>
     invoke<TimelineEntry[]>("note_timeline", { noteId }),
   noteTimelineRename: (noteId: string, oldLabel: string, newLabel: string) =>

@@ -205,6 +205,128 @@ describe("SpeakerLabels rename still works", () => {
   });
 });
 
+describe("SpeakerLabels rename picker", () => {
+  // The picker is the cross-note identity strategy (#116 part 1): with no alias
+  // table (ADR-0002) the rename IS the join key, so these tests are about
+  // convergence on one spelling, not about convenience.
+  const SUGGESTIONS = {
+    stats: [
+      { label: "Hege Tronshaugen", note_count: 4, last_used_at: 1_767_000_000 },
+      { label: "Åse Berg", note_count: 1, last_used_at: 1_766_000_000 },
+    ],
+    roster: ["Anna Lie"],
+  };
+
+  it("suggests a name you have used in another note", async () => {
+    const user = userEvent.setup();
+    render(
+      <SpeakerLabels transcript={TWO_SPEAKERS} onRename={vi.fn()} suggestions={SUGGESTIONS} />,
+    );
+    await user.click(screen.getByRole("button", { name: /^Speaker 1$/ }));
+    await user.clear(screen.getByRole("combobox"));
+    await user.type(screen.getByRole("combobox"), "tron");
+
+    // Word-start match: a surname is how you'd actually reach a full name.
+    expect(screen.getByRole("option", { name: /Hege Tronshaugen/ })).toBeTruthy();
+  });
+
+  it("commits the suggestion picked with the arrow keys", async () => {
+    const user = userEvent.setup();
+    const onRename = vi.fn();
+    render(
+      <SpeakerLabels transcript={TWO_SPEAKERS} onRename={onRename} suggestions={SUGGESTIONS} />,
+    );
+    await user.click(screen.getByRole("button", { name: /^Speaker 1$/ }));
+    await user.clear(screen.getByRole("combobox"));
+    await user.type(screen.getByRole("combobox"), "tron");
+    await user.keyboard("{ArrowDown}{Enter}");
+
+    expect(onRename).toHaveBeenCalledWith("Speaker 1", "Hege Tronshaugen");
+  });
+
+  it("still commits free text, so a new person is no harder than an existing one", async () => {
+    const user = userEvent.setup();
+    const onRename = vi.fn();
+    render(
+      <SpeakerLabels transcript={TWO_SPEAKERS} onRename={onRename} suggestions={SUGGESTIONS} />,
+    );
+    await user.click(screen.getByRole("button", { name: /^Speaker 1$/ }));
+    await user.clear(screen.getByRole("combobox"));
+    // A prefix of an existing suggestion, committed literally.
+    await user.type(screen.getByRole("combobox"), "Hege");
+    await user.keyboard("{Enter}");
+
+    expect(onRename).toHaveBeenCalledWith("Speaker 1", "Hege");
+  });
+
+  it("preselects the existing spelling when the typed text is a case variant", async () => {
+    const user = userEvent.setup();
+    const onRename = vi.fn();
+    render(
+      <SpeakerLabels transcript={TWO_SPEAKERS} onRename={onRename} suggestions={SUGGESTIONS} />,
+    );
+    await user.click(screen.getByRole("button", { name: /^Speaker 1$/ }));
+    await user.clear(screen.getByRole("combobox"));
+    await user.type(screen.getByRole("combobox"), "ase berg");
+    await user.keyboard("{Enter}");
+
+    // "ase berg" is never a deliberate second person — in a Norwegian-market
+    // product this split is the specific risk the picker exists to prevent.
+    expect(onRename).toHaveBeenCalledWith("Speaker 1", "Åse Berg");
+  });
+
+  it("tags a label already on this note as a merge", async () => {
+    const user = userEvent.setup();
+    render(
+      <SpeakerLabels
+        transcript={"Michael: hi\nHege Tronshaugen: hello"}
+        onRename={vi.fn()}
+        suggestions={SUGGESTIONS}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: /^Michael$/ }));
+    await user.clear(screen.getByRole("combobox"));
+    await user.type(screen.getByRole("combobox"), "hege");
+
+    // Shown rather than hidden: typing the name in full merges anyway, so
+    // hiding the row would only remove the warning.
+    expect(screen.getByRole("option", { name: /Hege Tronshaugen/ }).textContent).toMatch(/merge/i);
+  });
+
+  it("never suggests a placeholder label", async () => {
+    const user = userEvent.setup();
+    render(
+      <SpeakerLabels
+        transcript={TWO_SPEAKERS}
+        onRename={vi.fn()}
+        suggestions={{
+          stats: [
+            { label: "Speaker 2", note_count: 9, last_used_at: 1_767_000_000 },
+            { label: "You", note_count: 9, last_used_at: 1_767_000_000 },
+          ],
+          roster: [],
+        }}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: /^Speaker 1$/ }));
+    // Converging on a placeholder is the opposite of the point.
+    expect(screen.queryByRole("listbox")).toBeNull();
+  });
+
+  it("renames with no picker at all when there is nothing to suggest", async () => {
+    const user = userEvent.setup();
+    const onRename = vi.fn();
+    render(<SpeakerLabels transcript={TWO_SPEAKERS} onRename={onRename} />);
+
+    await user.click(screen.getByRole("button", { name: /^Speaker 1$/ }));
+    await user.clear(screen.getByRole("combobox"));
+    await user.type(screen.getByRole("combobox"), "Michael");
+    await user.keyboard("{Enter}");
+
+    expect(onRename).toHaveBeenCalledWith("Speaker 1", "Michael");
+  });
+});
+
 describe("SpeakerLabels read-only", () => {
   it("renders static pills with no rename or merge affordance", () => {
     render(<SpeakerLabels transcript={TWO_SPEAKERS} onRename={vi.fn()} readOnly />);

@@ -921,6 +921,17 @@ pub fn delete_setting(conn: &Connection, key: &str) -> Result<()> {
     Ok(())
 }
 
+/// Delete every setting whose key starts with `prefix` — for the per-entity
+/// families of rows (`roster_cache:<workspace_id>`) that have to be dropped
+/// wholesale when the thing they belong to ends.
+pub fn delete_settings_with_prefix(conn: &Connection, prefix: &str) -> Result<()> {
+    let mut stmt = conn.prepare_cached("DELETE FROM settings WHERE key GLOB ?1")?;
+    // GLOB, not LIKE: `_` is a single-char wildcard in LIKE, and these keys
+    // contain underscores.
+    stmt.execute(params![format!("{prefix}*")])?;
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SummaryPrompt {
     pub id: String,
@@ -2389,6 +2400,67 @@ fn push_speaker_clause(
     // Parenthesised: an unbracketed OR would let the second label escape every
     // preceding AND and match notes the breadth clamp had already excluded.
     sql.push_str(&format!(" AND ({})", clauses.join(" OR ")));
+}
+
+/// One distinct speaker label in a workspace, with the counters the rename
+/// picker ranks on (#116 part 1).
+#[derive(Serialize, Debug, Clone, PartialEq)]
+pub struct SpeakerLabelStat {
+    pub label: String,
+    /// Live notes carrying this label.
+    pub note_count: u32,
+    /// `MAX(notes.updated_at)` over those notes. #108 means there is no meeting
+    /// date to use, so "last touched" is the only recency signal available.
+    pub last_used_at: i64,
+}
+
+/// Every distinct speaker label in the active workspace, with usage counters —
+/// the suggestion source for the rename picker (#116 part 1).
+///
+/// Read from `notes.speakers`, deliberately: that column is what the `speaker`
+/// filter matches and what a listing row displays, so deriving suggestions from
+/// anything else is how the picker ends up offering a name the filter then
+/// misses (the trap the cloud half hit during #40).
+///
+/// A plain scan, with no `speaker_labels` table behind it. `notes.speakers` is
+/// delimiter-wrapped and so can't be indexed by substring anyway, and at a few
+/// thousand notes the scan is instant — the derived table is the optimization to
+/// add when it stops being, not a prerequisite. Trashed notes are excluded, so a
+/// label whose only source is in the Trash stops being suggested.
+///
+/// Ranking, prefix matching and case/diacritic folding all happen client-side
+/// (`src/lib/speakerSuggest.ts`): SQLite `LIKE` folds ASCII only, so `Åse` and
+/// `åse` would stay two keys here, and one fetch per strip mount beats one IPC
+/// call per keystroke.
+pub fn speaker_label_stats(conn: &Connection, workspace_id: &str) -> Result<Vec<SpeakerLabelStat>> {
+    let mut stmt = conn.prepare(
+        "SELECT speakers, updated_at FROM notes \
+         WHERE workspace_id = ?1 AND deleted_at IS NULL AND speakers != ''",
+    )?;
+    let rows = stmt.query_map(params![workspace_id], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+    })?;
+
+    // Keyed on the exact label: matching is exact everywhere else (#104), so
+    // "Michael" and "Michael Berg" stay two entries here too.
+    let mut acc: std::collections::HashMap<String, (u32, i64)> = std::collections::HashMap::new();
+    for row in rows {
+        let (encoded, updated_at) = row?;
+        for label in decode_speakers(&encoded) {
+            let entry = acc.entry(label).or_insert((0, 0));
+            entry.0 += 1;
+            entry.1 = entry.1.max(updated_at);
+        }
+    }
+
+    let mut out: Vec<SpeakerLabelStat> = acc
+        .into_iter()
+        .map(|(label, (note_count, last_used_at))| SpeakerLabelStat { label, note_count, last_used_at })
+        .collect();
+    // Stable order so the payload doesn't churn between fetches; the real
+    // ranking is the caller's.
+    out.sort_unstable_by(|a, b| a.label.cmp(&b.label));
+    Ok(out)
 }
 
 /// The distinct speakers present in a scope, so an unmatched `speaker` argument can
@@ -4063,6 +4135,72 @@ mod tests {
             hits[0].text.contains("Michael: we should scope the pilot"),
             "the excerpt carries Michael's label inline, so the model can attribute it"
         );
+    }
+
+    #[test]
+    fn deleting_settings_by_prefix_takes_the_family_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("t.sqlite")).unwrap();
+        set_setting(&conn, "roster_cache:ws_a", "[]").unwrap();
+        set_setting(&conn, "roster_cache:ws_b", "[]").unwrap();
+        set_setting(&conn, "language", "nb").unwrap();
+
+        delete_settings_with_prefix(&conn, "roster_cache:").unwrap();
+
+        assert!(get_setting(&conn, "roster_cache:ws_a").unwrap().is_none());
+        assert!(get_setting(&conn, "roster_cache:ws_b").unwrap().is_none());
+        assert_eq!(get_setting(&conn, "language").unwrap().as_deref(), Some("nb"));
+    }
+
+    #[test]
+    fn deleting_settings_by_prefix_does_not_treat_underscores_as_wildcards() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("t.sqlite")).unwrap();
+        // The trap GLOB avoids: under LIKE, `_` matches any single character, so
+        // a prefix containing one would reach unrelated keys.
+        set_setting(&conn, "local_llm_model", "gemma").unwrap();
+        set_setting(&conn, "localxllm_model", "other").unwrap();
+
+        delete_settings_with_prefix(&conn, "local_llm").unwrap();
+
+        assert!(get_setting(&conn, "local_llm_model").unwrap().is_none());
+        assert_eq!(get_setting(&conn, "localxllm_model").unwrap().as_deref(), Some("other"));
+    }
+
+    #[test]
+    fn speaker_label_stats_counts_notes_per_label_and_ignores_the_trash() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("t.sqlite")).unwrap();
+        let (a, _b) = seed_speaker_notes(&conn);
+
+        let stats = speaker_label_stats(&conn, "").unwrap();
+        let count = |label: &str| stats.iter().find(|s| s.label == label).map(|s| s.note_count);
+        assert_eq!(count("Michael"), Some(1));
+        assert_eq!(count("Hege"), Some(1));
+        // Exact, like the filter it must agree with: "Michael" is not "Michael Berg".
+        assert_eq!(count("Michael Berg"), Some(1));
+        assert!(stats.iter().all(|s| s.last_used_at > 0), "recency comes from notes.updated_at");
+
+        // A trashed note's labels stop being suggested — the picker must not
+        // offer a name whose only source is in the Trash.
+        delete_note(&conn, &a).unwrap();
+        let after = speaker_label_stats(&conn, "").unwrap();
+        assert!(
+            after.iter().all(|s| s.label != "Hege"),
+            "Hege only spoke in the trashed note: {after:?}"
+        );
+    }
+
+    #[test]
+    fn speaker_label_stats_scopes_to_one_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("t.sqlite")).unwrap();
+        seed_speaker_notes(&conn);
+
+        // Personal ("") and a workspace are separate corpora, so a suggestion
+        // can't leak a colleague's label into a Personal note.
+        assert!(speaker_label_stats(&conn, "ws_other").unwrap().is_empty());
+        assert!(!speaker_label_stats(&conn, "").unwrap().is_empty());
     }
 
     #[test]

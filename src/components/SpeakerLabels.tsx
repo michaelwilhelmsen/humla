@@ -1,7 +1,13 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { Merge } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+import { Merge, User } from "lucide-react";
 import { extractSpeakerLabels } from "../lib/speakers";
 import { Menu, MenuContent, MenuItem, MenuLabel, MenuTrigger } from "./ui/Menu";
+import { Combobox, type ComboboxOption } from "./ui/Combobox";
+import {
+  caseVariantTarget,
+  suggestSpeakerLabels,
+  type SpeakerSuggestionSource,
+} from "../lib/speakerSuggest";
 
 // Speaker chip strip shown above the transcript. Each unique speaker label
 // renders as a colour-coded pill; clicking a pill renames it inline, and a
@@ -32,12 +38,15 @@ export function SpeakerLabels({
   transcript,
   onRename,
   readOnly,
+  suggestions,
 }: {
   transcript: string;
   // Both rename and merge report through here. For a merge, `newLabel` is
   // an already-existing label from the strip.
   onRename: (oldLabel: string, newLabel: string) => void;
   readOnly?: boolean;
+  /** Omitted → the rename input is plain free text, exactly as before. */
+  suggestions?: SpeakerSuggestionSource;
 }) {
   const labels = useMemo(() => extractSpeakerLabels(transcript), [transcript]);
   const colors = useMemo(() => speakerColorMap(labels), [labels]);
@@ -57,6 +66,8 @@ export function SpeakerLabels({
           onRename={(next) => onRename(label, next)}
           onMerge={(target) => onRename(label, target)}
           readOnly={readOnly}
+          suggestions={suggestions}
+          inNoteLabels={labels}
         />
       ))}
     </div>
@@ -71,6 +82,8 @@ function SpeakerChip({
   onRename,
   onMerge,
   readOnly,
+  suggestions,
+  inNoteLabels,
 }: {
   label: string;
   color: string;
@@ -79,10 +92,11 @@ function SpeakerChip({
   onRename: (next: string) => void;
   onMerge: (target: string) => void;
   readOnly?: boolean;
+  suggestions?: SpeakerSuggestionSource;
+  inNoteLabels: string[];
 }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(label);
-  const inputRef = useRef<HTMLInputElement | null>(null);
 
   // Snap the draft back to the canonical label whenever the underlying
   // label changes (e.g. diarize replaced the transcript and our label
@@ -91,13 +105,51 @@ function SpeakerChip({
     setDraft(label);
   }, [label]);
 
-  useEffect(() => {
-    if (editing) inputRef.current?.select();
-  }, [editing]);
+  const ranked = useMemo(
+    () =>
+      suggestions
+        ? suggestSpeakerLabels({
+            query: draft,
+            stats: suggestions.stats,
+            roster: suggestions.roster,
+            inNoteLabels,
+            renaming: label,
+          })
+        : [],
+    [suggestions, draft, inNoteLabels, label],
+  );
 
-  function commit() {
+  const options: ComboboxOption[] = ranked.map((s) => ({
+    value: s.label,
+    label: s.label,
+    // The distinction is carried by form, not metadata — no note counts or
+    // dates. Every row reads "@Name", so anything left in the input WITHOUT an
+    // "@" is visibly a new label. That is the whole cue.
+    content: (
+      <>
+        {s.kind === "member" && (
+          // A member you've never labelled, marked so it doesn't read as a name
+          // you already chose.
+          <User size={12} strokeWidth={1.75} aria-hidden className="opacity-60" />
+        )}
+        <span>@{s.label}</span>
+        {s.inNote && (
+          // Picking this has a different consequence: it folds two pills into
+          // one. Shown, not hidden — typing the name in full merges anyway.
+          <span className="ml-auto text-[11px] opacity-60">Merge</span>
+        )}
+      </>
+    ),
+  }));
+
+  // Enter normally commits exactly what was typed. The one exception is a pure
+  // case/diacritic variant of a name that already exists — "åse" beside "Åse" is
+  // never a deliberate second person.
+  const preselect = caseVariantTarget(draft, ranked) ?? undefined;
+
+  function commit(next: string) {
     setEditing(false);
-    const trimmed = draft.trim();
+    const trimmed = next.trim();
     if (!trimmed || trimmed === label) {
       setDraft(label);
       return;
@@ -116,26 +168,26 @@ function SpeakerChip({
   }
 
   if (editing) {
-    // size= sets the visible character width; with monospace font this
-    // makes the input width track the typed text. Floor at 3 so the
-    // pill never collapses to nothing while the user is mid-edit.
+    // The input replaces the pill in place, with the suggestion list anchored
+    // below it (#116) — no new trigger, and free text keeps working by default
+    // rather than by exception.
+    //
+    // size= sets the visible character width, so the input width tracks the
+    // typed text. Floor at 3 so the pill never collapses to nothing mid-edit.
     return (
-      <input
-        ref={inputRef}
+      <Combobox
         value={draft}
-        onChange={(e) => setDraft(e.target.value)}
-        onBlur={commit}
-        size={Math.max(draft.length, 3)}
-        onKeyDown={(e) => {
-          if (e.key === "Enter") {
-            e.preventDefault();
-            commit();
-          } else if (e.key === "Escape") {
-            e.preventDefault();
-            setDraft(label);
-            setEditing(false);
-          }
+        onValueChange={setDraft}
+        options={options}
+        preselect={preselect}
+        onCommit={commit}
+        onCancel={() => {
+          setDraft(label);
+          setEditing(false);
         }}
+        aria-label={`Rename ${label}`}
+        listLabel="Speaker names you have used"
+        size={Math.max(draft.length, 3)}
         className="nd-speaker-pill cursor-text outline-none"
         style={{ background: color }}
       />

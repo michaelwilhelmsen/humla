@@ -19,7 +19,7 @@
 use super::err;
 use crate::db;
 use crate::AppState;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::sync::{LazyLock, Mutex};
 use tauri::{Manager, State};
 
@@ -104,12 +104,54 @@ pub struct ChatAddon {
     pub currency: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct CloudMember {
     pub id: String,
     pub email: String,
     pub name: String,
     pub role: String,
+}
+
+/// Settings key holding the cached roster for one workspace (#116 part 1).
+fn roster_cache_key(workspace_id: &str) -> String {
+    format!("roster_cache:{workspace_id}")
+}
+
+/// Persist the roster so the rename picker can suggest a colleague offline.
+///
+/// This deviates from ADR-0002's "roster inputs are recomputed rather than
+/// stored", and the ADR carries the carve-out that permits it: the cache mirrors
+/// a store the workspace already holds, whose members consented to being named,
+/// and it is deleted on leave-workspace, delete-workspace and logout — so it
+/// still cannot outlive its source. It holds no user-asserted claim about who a
+/// speaker is, which is the line ADR-0002 actually draws.
+///
+/// Best-effort: a cache write must never fail the fetch that produced it.
+fn write_roster_cache(state: &State<'_, AppState>, workspace_id: &str, members: &[CloudMember]) {
+    if let Ok(json) = serde_json::to_string(members) {
+        let conn = state.db.lock();
+        let _ = db::set_setting(&conn, &roster_cache_key(workspace_id), &json);
+    }
+}
+
+fn read_roster_cache(state: &State<'_, AppState>, workspace_id: &str) -> Option<Vec<CloudMember>> {
+    let conn = state.db.lock();
+    let json = db::get_setting(&conn, &roster_cache_key(workspace_id)).ok().flatten()?;
+    serde_json::from_str(&json).ok()
+}
+
+/// Drop one workspace's cached roster — it dies with the membership that
+/// justified holding it.
+fn clear_roster_cache(state: &State<'_, AppState>, workspace_id: &str) {
+    let conn = state.db.lock();
+    let _ = db::delete_setting(&conn, &roster_cache_key(workspace_id));
+}
+
+/// Drop every cached roster. Signing out ends the consent basis for all of them
+/// at once, so none may survive it.
+fn clear_all_roster_caches(state: &State<'_, AppState>) {
+    let conn = state.db.lock();
+    let _ = db::delete_settings_with_prefix(&conn, "roster_cache:");
 }
 
 fn http() -> reqwest::Client {
@@ -914,6 +956,7 @@ pub async fn cloud_request_password_reset(
 #[tauri::command]
 pub fn cloud_logout(state: State<'_, AppState>) -> Result<(), String> {
     clear_creds();
+    clear_all_roster_caches(&state); // no cached names survive sign-out (#116 / ADR-0002)
     *SESSION.lock().unwrap() = None;
     state.sync.config_changed(); // creds gone → stop the sync worker
     Ok(())
@@ -959,12 +1002,57 @@ pub fn cloud_select_workspace(state: State<'_, AppState>, id: String) -> Result<
     Ok(())
 }
 
+/// The workspace roster, with each member's role resolved.
+///
+/// Fails loudly, and the member-management screen depends on that: an expired
+/// session or a revoked membership must not be presented as a roster, or a
+/// role change gets decided against names that no longer exist. Only the
+/// suggestion source (`cloud_speaker_roster`) is allowed to fall back to cache.
 #[tauri::command]
 pub async fn cloud_workspace_members(
     state: State<'_, AppState>,
     workspace_id: String,
 ) -> Result<Vec<CloudMember>, String> {
-    let (base, session) = ensure_session(&state).await?;
+    let roster = fetch_workspace_members(&state, &workspace_id).await?;
+    // Refreshed on every successful fetch — which is workspace select and every
+    // Organization load, the two points the roster can have changed.
+    write_roster_cache(&state, &workspace_id, &roster);
+    Ok(roster)
+}
+
+/// Member display names for the speaker-rename picker (#116 part 1).
+///
+/// Best-effort by definition: a suggestion source may be stale or empty, but it
+/// may never be an error, because losing it must not break a rename that still
+/// accepts free text. Serves the cache when the fetch fails — a cold launch
+/// while offline is exactly when you're labelling a recording you just made,
+/// which is why fetch-only was rejected.
+#[tauri::command]
+pub async fn cloud_speaker_roster(state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    let workspace = {
+        let conn = state.db.lock();
+        active_workspace(&conn)
+    };
+    if workspace.is_empty() {
+        return Ok(Vec::new()); // Personal has no members, which is correct, not a failure.
+    }
+    let roster = match fetch_workspace_members(&state, &workspace).await {
+        Ok(roster) => {
+            write_roster_cache(&state, &workspace, &roster);
+            roster
+        }
+        Err(_) => read_roster_cache(&state, &workspace).unwrap_or_default(),
+    };
+    // Emails are deliberately not a fallback: a speaker label is what a
+    // transcript line reads as, and "a@b.com:" is not a name.
+    Ok(roster.into_iter().map(|m| m.name).filter(|n| !n.trim().is_empty()).collect())
+}
+
+async fn fetch_workspace_members(
+    state: &State<'_, AppState>,
+    workspace_id: &str,
+) -> Result<Vec<CloudMember>, String> {
+    let (base, session) = ensure_session(state).await?;
     let path = format!("/api/collections/workspaces/records/{workspace_id}");
     let val = authed_get(&base, &session.token, &path, &[("expand", "members")]).await?;
 
@@ -978,7 +1066,7 @@ pub async fn cloud_workspace_members(
         .cloned()
         .unwrap_or_default();
 
-    Ok(members
+    let roster: Vec<CloudMember> = members
         .iter()
         .map(|m| {
             let id = m.get("id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
@@ -998,7 +1086,8 @@ pub async fn cloud_workspace_members(
                 id,
             }
         })
-        .collect())
+        .collect();
+    Ok(roster)
 }
 
 /// Fetch the workspace's current `members` + `admins` + `viewers` id arrays.
@@ -1186,6 +1275,7 @@ pub async fn cloud_delete_workspace(
     let (base, session) = ensure_session(&state).await?;
     let path = format!("/api/collections/workspaces/records/{workspace_id}");
     authed_delete(&base, &session.token, &path).await?;
+    clear_roster_cache(&state, &workspace_id); // the cache dies with the workspace (#116)
     if read_workspace_id(&state).as_deref() == Some(workspace_id.as_str()) {
         {
             let conn = state.db.lock();
@@ -1215,6 +1305,7 @@ pub async fn cloud_leave_workspace(
         .await
         .map_err(|e| e.to_string())?;
     pb_json(resp).await?; // surfaces the hook's message (e.g. owner-can't-leave)
+    clear_roster_cache(&state, &workspace_id); // the cache dies with the membership (#116)
     if read_workspace_id(&state).as_deref() == Some(workspace_id.as_str()) {
         {
             let conn = state.db.lock();

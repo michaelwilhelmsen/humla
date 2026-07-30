@@ -57,6 +57,7 @@ import { ExportModal } from "./ExportModal";
 import { SUMMARY_PRESETS, presetLabel } from "../lib/presets";
 import { LANGUAGES, languageOptionLabel } from "../lib/languages";
 import { useDeveloperMode } from "../lib/useDeveloperMode";
+import { useSpeakerSuggestions } from "../lib/useSpeakerSuggestions";
 import { cn } from "../lib/cn";
 
 // Memoized Markdown renderer. ReactMarkdown's parse step is O(N) over
@@ -546,6 +547,9 @@ export function Note() {
 
   const hasSummary = draft.summary.trim().length > 0;
   const hasTranscript = draft.transcript.trim().length > 0;
+  // Suggestion source for the speaker-rename picker (#116). One fetch, only once
+  // there is a transcript to label.
+  const speakerSuggestions = useSpeakerSuggestions(hasTranscript && !readOnly);
   // Live-feed alignment: while a recording is in flight, pin the
   // collapsed transcript card to its bottom so newly transcribed
   // chunks stay visible. After stop / on a saved note the user is
@@ -971,6 +975,7 @@ export function Note() {
                       <SpeakerLabels
                         transcript={draft.transcript}
                         readOnly={readOnly}
+                        suggestions={speakerSuggestions}
                         onRename={(oldLabel, newLabel) => {
                           if (readOnlyRef.current) return;
                           patch("transcript", renameSpeakerInTranscript(draft.transcript, oldLabel, newLabel));
