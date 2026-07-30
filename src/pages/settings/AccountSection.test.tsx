@@ -326,7 +326,7 @@ describe("Account section", () => {
     const dialog = await screen.findByRole("dialog", { name: /settings/i });
 
     // Ola's role select (owner rows render a static pill instead).
-    const trigger = await within(dialog).findByRole("button", {
+    const trigger = await within(dialog).findByRole("combobox", {
       name: /^member$/i,
     });
     await userEvent.click(trigger);

@@ -1,5 +1,5 @@
 import { useEffect, useRef } from "react";
-import { Select } from "../../pages/settings/components/Select";
+import { Select } from "../ui/Select";
 import { completionModels } from "../../lib/localModels";
 import { useOllamaProbe } from "./useOllamaProbe";
 

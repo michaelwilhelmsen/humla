@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import { AllNotes } from "./AllNotes";
 import { LocationProbe } from "../test/app";
@@ -330,8 +331,10 @@ describe("AllNotes bulk move", () => {
     fireEvent.click(screen.getByRole("link", { name: /Alpha/ }), { metaKey: true });
     fireEvent.click(screen.getByRole("link", { name: /Beta/ }), { metaKey: true });
 
-    fireEvent.click(screen.getByRole("button", { name: /Move to folder/ }));
-    fireEvent.click(screen.getByRole("button", { name: "Work" }));
+    // The picker is the shared Menu now (#114): rows are menu items, and the
+    // trigger opens on pointerdown, so drive it through userEvent.
+    await userEvent.click(screen.getByRole("button", { name: /Move to folder/ }));
+    await userEvent.click(screen.getByRole("menuitem", { name: "Work" }));
 
     await waitFor(() => expect(moveSpy).toHaveBeenCalledTimes(2));
     expect(moveSpy).toHaveBeenCalledWith({ id: "n1", folderId: "f1" });
@@ -355,11 +358,10 @@ describe("AllNotes bulk move", () => {
     fireEvent.click(screen.getByRole("link", { name: /Alpha/ }), { metaKey: true });
     fireEvent.click(screen.getByRole("link", { name: /Beta/ }), { metaKey: true });
 
-    fireEvent.click(screen.getByRole("button", { name: /Move to folder/ }));
-    // "No folder" also names a filter chip up top; the popover entry is the
-    // last one in DOM order.
-    const noFolderButtons = screen.getAllByRole("button", { name: "No folder" });
-    fireEvent.click(noFolderButtons[noFolderButtons.length - 1]);
+    await userEvent.click(screen.getByRole("button", { name: /Move to folder/ }));
+    // "No folder" also names a filter chip up top, but that one is a button —
+    // the picker entry is the only menu item with that name.
+    await userEvent.click(screen.getByRole("menuitem", { name: "No folder" }));
 
     await waitFor(() => expect(moveSpy).toHaveBeenCalledTimes(2));
     expect(moveSpy).toHaveBeenCalledWith({ id: "n1", folderId: null });

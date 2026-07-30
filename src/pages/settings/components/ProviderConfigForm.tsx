@@ -9,7 +9,7 @@ import {
   type Provider,
 } from "../types";
 import { Row } from "./Section";
-import { Select } from "./Select";
+import { Select } from "../../../components/ui/Select";
 import { Toggle } from "./Toggle";
 
 type LocalModelSummary = {

@@ -1,5 +1,5 @@
 import { Link, useNavigate, useOutletContext, useParams } from "react-router-dom";
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { useVirtualizer } from "@tanstack/react-virtual";
@@ -39,6 +39,14 @@ import { groupTimeline, resolveActivePill, formatSessionCaption } from "../lib/s
 import { RecordingBar } from "../components/RecordingBar";
 import { ChatPanel, type ChatSessionControls } from "../components/ChatPanel";
 import { SelectablePopover } from "../components/SelectablePopover";
+import {
+  Menu,
+  MenuContent,
+  MenuRadioGroup,
+  MenuRadioItem,
+  MenuSeparator,
+  MenuTrigger,
+} from "../components/ui/Menu";
 import { ChatHistoryControls } from "../components/ChatHistoryControls";
 import { targetKey, type ChatTarget } from "../lib/chatTarget";
 import type { LayoutOutletContext } from "../components/Layout";
@@ -630,27 +638,27 @@ export function Note() {
             </span>
           )}
           {cloudLoggedIn ? (
-            <span className="nd-meta is-interactive relative">
-              <span
-                className="grid place-items-center w-[17px] h-[17px] rounded-[5px] text-[9px] font-semibold"
-                style={{ background: "var(--color-surface-raised)", color: "var(--color-text)" }}
-              >
-                {wsInitial}
-              </span>
-              <WorkspacePicker
-                value={draft.workspace_id}
-                disabled={readOnly || !canMoveWorkspace}
-                onChange={async (workspaceId) => {
-                  if (!draft || readOnly || !canMoveWorkspace || workspaceId === draft.workspace_id) return;
-                  const next = { ...draft, workspace_id: workspaceId };
-                  setDraft(next);
-                  await ipc.setNoteWorkspace(draft.id, workspaceId);
-                  // Moving out of the active workspace removes it from that
-                  // list — refetch so the sidebar reflects the move.
-                  await refreshNotes();
-                }}
-              />
-            </span>
+            <WorkspacePicker
+              value={draft.workspace_id}
+              disabled={readOnly || !canMoveWorkspace}
+              badge={
+                <span
+                  className="grid place-items-center w-[17px] h-[17px] rounded-[5px] text-[9px] font-semibold"
+                  style={{ background: "var(--color-surface-raised)", color: "var(--color-text)" }}
+                >
+                  {wsInitial}
+                </span>
+              }
+              onChange={async (workspaceId) => {
+                if (!draft || readOnly || !canMoveWorkspace || workspaceId === draft.workspace_id) return;
+                const next = { ...draft, workspace_id: workspaceId };
+                setDraft(next);
+                await ipc.setNoteWorkspace(draft.id, workspaceId);
+                // Moving out of the active workspace removes it from that
+                // list — refetch so the sidebar reflects the move.
+                await refreshNotes();
+              }}
+            />
           ) : (
             draft.workspace_id && (
               <span className="nd-meta">
@@ -668,19 +676,16 @@ export function Note() {
             <Calendar size={14} strokeWidth={1.7} />
             {dateChip}
           </span>
-          <span className="nd-meta is-interactive relative">
-            <Folder size={14} strokeWidth={1.6} />
-            <FolderPicker
-              value={draft.folder_id}
-              onChange={async (folderId) => {
-                if (!draft || readOnly) return;
-                const next = { ...draft, folder_id: folderId };
-                setDraft(next);
-                await ipc.moveNote(draft.id, folderId);
-                upsert(next);
-              }}
-            />
-          </span>
+          <FolderPicker
+            value={draft.folder_id}
+            onChange={async (folderId) => {
+              if (!draft || readOnly) return;
+              const next = { ...draft, folder_id: folderId };
+              setDraft(next);
+              await ipc.moveNote(draft.id, folderId);
+              upsert(next);
+            }}
+          />
           <ClientPicker
             value={draft.client_id ?? null}
             onChange={async (clientId) => {
@@ -1242,10 +1247,25 @@ function PanelEmpty({ icon, text }: { icon: React.ReactNode; text: string }) {
   );
 }
 
-// A chip-friendly <select> that sizes to the SELECTED option, not the widest
-// one. WKWebView ignores `field-sizing: content` on <select>, so we render the
-// current label as visible text (which sizes the chip) and overlay a
-// transparent native <select> across the whole chip for interaction.
+// A chip-shaped picker for the Summary and Transcript panels: the trigger sizes
+// to the SELECTED option (not the widest one, which is what a native <select>
+// would do — WKWebView ignores `field-sizing: content`), and the choices come
+// from the shared Menu (#114) rather than a system popup. Rows carry a
+// checkmark on the active one, matching every other picker in the app.
+//
+// The trigger wears `nd-meta`, the same chip as the note meta bar's folder /
+// client / workspace pickers — these were the app's only bordered picker chips
+// (`.nd-ctl`, now deleted), which made two panels' worth of pickers read as a
+// different kind of control from every other picker in the app. It takes the
+// `is-filled` variant because this row is left-aligned with no metadata beside
+// it: a transparent chip there reads as indented prose rather than a control.
+export type CtlOption = {
+  value: string;
+  label: string;
+  /** Draws a divider above this row (e.g. built-in presets vs. your own). */
+  separatorBefore?: boolean;
+};
+
 function CtlSelect({
   icon,
   extra,
@@ -1253,7 +1273,7 @@ function CtlSelect({
   value,
   onChange,
   title,
-  children,
+  options,
 }: {
   icon: React.ReactNode;
   extra?: React.ReactNode;
@@ -1261,23 +1281,29 @@ function CtlSelect({
   value: string;
   onChange: (v: string) => void;
   title?: string;
-  children: React.ReactNode;
+  options: CtlOption[];
 }) {
   return (
-    <span className="nd-ctl relative" title={title}>
-      {icon}
-      {extra}
-      <span className="truncate" style={{ maxWidth: 160 }}>{label}</span>
-      <ChevronDown size={12} strokeWidth={2} />
-      <select
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        aria-label={title ?? label}
-        className="absolute inset-0 h-full w-full cursor-pointer opacity-0"
-      >
-        {children}
-      </select>
-    </span>
+    <Menu>
+      <MenuTrigger className="nd-meta is-interactive is-filled" title={title} aria-label={title ?? label}>
+        {icon}
+        {extra}
+        <span className="truncate" style={{ maxWidth: 160 }}>{label}</span>
+        <ChevronDown size={12} strokeWidth={2} />
+      </MenuTrigger>
+      <MenuContent aria-label={title ?? label}>
+        <MenuRadioGroup value={value} onValueChange={onChange}>
+          {options.map((o) => (
+            <Fragment key={o.value}>
+              {o.separatorBefore && <MenuSeparator />}
+              <MenuRadioItem value={o.value}>
+                <span className="truncate">{o.label}</span>
+              </MenuRadioItem>
+            </Fragment>
+          ))}
+        </MenuRadioGroup>
+      </MenuContent>
+    </Menu>
   );
 }
 
@@ -1290,72 +1316,32 @@ function FolderPicker({
 }) {
   const folders = useNotesStore((s) => s.folders);
   const upsertFolder = useNotesStore((s) => s.upsertFolder);
-  const [creating, setCreating] = useState(false);
-  const [name, setName] = useState("");
+  const label = (value ? folders.find((f) => f.id === value)?.name : null) ?? "No folder";
 
-  async function handleChange(raw: string) {
-    if (raw === "__new__") {
-      setCreating(true);
-      setName("");
-      return;
-    }
-    onChange(raw === "__root__" ? null : raw);
-  }
-
-  async function commit() {
-    const trimmed = name.trim();
-    if (!trimmed) {
-      setCreating(false);
-      setName("");
-      return;
-    }
-    try {
-      const folder = await ipc.createFolder(trimmed);
-      upsertFolder(folder);
-      onChange(folder.id);
-    } finally {
-      setCreating(false);
-      setName("");
-    }
-  }
-
-  if (creating) {
-    return (
-      <input
-        autoFocus
-        value={name}
-        onChange={(e) => setName(e.target.value)}
-        onKeyDown={(e) => {
-          if (e.key === "Enter") commit();
-          else if (e.key === "Escape") { setCreating(false); setName(""); }
-        }}
-        onBlur={commit}
-        placeholder="Folder name"
-        className="bg-transparent outline-none w-40"
-      />
-    );
-  }
-
+  // Same shape as the Client picker below — a none row, the list, and inline
+  // creation — so it's the same primitive (#114). It owns the whole chip so the
+  // trigger's hit area matches the old full-chip transparent <select> overlay.
   return (
-    <>
-      <span className="truncate" style={{ maxWidth: 150 }}>
-        {(value ? folders.find((f) => f.id === value)?.name : null) ?? "No folder"}
-      </span>
-      <select
-        value={value ?? "__root__"}
-        onChange={(e) => handleChange(e.target.value)}
-        aria-label="Folder"
-        className="absolute inset-0 h-full w-full cursor-pointer opacity-0"
-      >
-        <option value="__root__">No folder</option>
-        {folders.map((f) => (
-          <option key={f.id} value={f.id}>
-            {f.name}
-          </option>
-        ))}
-        <option value="__new__">+ New folder…</option>
-      </select>
-    </>
+    <SelectablePopover
+      ariaLabel="Folder"
+      trigger={
+        <span className="nd-meta is-interactive">
+          <Folder size={14} strokeWidth={1.6} />
+          <span className="truncate" style={{ maxWidth: 150 }}>{label}</span>
+        </span>
+      }
+      items={folders.map((f) => ({ id: f.id, label: f.name }))}
+      activeId={value}
+      onSelect={onChange}
+      noneLabel="No folder"
+      createLabel="New folder"
+      createPlaceholder="Folder name"
+      onCreate={async (name) => {
+        const folder = await ipc.createFolder(name);
+        upsertFolder(folder);
+        onChange(folder.id);
+      }}
+    />
   );
 }
 
@@ -1363,7 +1349,7 @@ function FolderPicker({
 // SelectablePopover primitive: assign / reassign / unassign plus full inline
 // create / rename / delete — all Client management lives here (there's no
 // browse-by-Client surface). Mirrors FolderPicker's placement but is richer,
-// which is why it uses the popover primitive rather than a native <select>.
+// which is why it carries create/rename/delete where FolderPicker doesn't.
 function ClientPicker({
   value,
   onChange,
@@ -1416,52 +1402,53 @@ function ClientPicker({
 }
 
 // Move a note between Personal (local-only) and any workspace you belong to.
-// Only rendered when signed in (workspaces exist).
+// Only rendered when signed in (workspaces exist). "Personal" is the none row
+// of the shared picker (#114); the chip's workspace-initial badge rides along
+// inside the trigger so the whole chip stays clickable.
 function WorkspacePicker({
   value,
   onChange,
+  badge,
   disabled = false,
 }: {
   value: string;
   onChange: (workspaceId: string) => void;
+  badge: React.ReactNode;
   disabled?: boolean;
 }) {
   const workspaces = useCloudStore((s) => s.status.workspaces);
+  const label = value
+    ? (workspaces.find((w) => w.id === value)?.name ?? "Workspace")
+    : "Personal (this device)";
+
   // Locked: show the workspace as plain text rather than an editable dropdown.
   // Used when the current user isn't allowed to move this note (not its creator
   // and not a workspace admin) or the note is otherwise read-only.
   if (disabled) {
-    const name = value
-      ? (workspaces.find((w) => w.id === value)?.name ?? "a workspace")
-      : "Personal (this device)";
     return (
       <span
-        className="text-[var(--color-text-muted)]"
+        className="nd-meta text-[var(--color-text-muted)]"
         title="Only the note’s creator or a workspace admin can move it to another workspace."
       >
-        {name}
+        {badge}
+        {value ? (workspaces.find((w) => w.id === value)?.name ?? "a workspace") : label}
       </span>
     );
   }
   return (
-    <>
-      <span className="truncate" style={{ maxWidth: 150 }}>
-        {value ? (workspaces.find((w) => w.id === value)?.name ?? "Workspace") : "Personal (this device)"}
-      </span>
-      <select
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        aria-label="Workspace"
-        className="absolute inset-0 h-full w-full cursor-pointer opacity-0"
-      >
-        <option value="">Personal (this device)</option>
-        {workspaces.map((w) => (
-          <option key={w.id} value={w.id}>
-            {w.name}
-          </option>
-        ))}
-      </select>
-    </>
+    <SelectablePopover
+      ariaLabel="Workspace"
+      trigger={
+        <span className="nd-meta is-interactive">
+          {badge}
+          <span className="truncate" style={{ maxWidth: 150 }}>{label}</span>
+        </span>
+      }
+      items={workspaces.map((w) => ({ id: w.id, label: w.name }))}
+      activeId={value || null}
+      onSelect={(id) => onChange(id ?? "")}
+      noneLabel="Personal (this device)"
+    />
   );
 }
 
@@ -1504,21 +1491,18 @@ function PresetPicker({
       value={value}
       onChange={onChange}
       title="Summary preset"
-    >
-      {SUMMARY_PRESETS.map((p) => (
-        <option key={p.value} value={p.value}>
-          {presetLabel(p)}
-        </option>
-      ))}
-      {userPrompts.length > 0 && <option disabled>──────────</option>}
-      {userPrompts.map((p) => (
-        <option key={p.id} value={`custom:${p.id}`}>
-          {p.name}
-        </option>
-      ))}
-      {valueIsMissingUserPrompt && <option value={value}>(deleted prompt)</option>}
-      {value === "custom" && <option value="custom">Custom (legacy)</option>}
-    </CtlSelect>
+      options={[
+        ...SUMMARY_PRESETS.map((p) => ({ value: p.value, label: presetLabel(p) })),
+        ...userPrompts.map((p, i) => ({
+          value: `custom:${p.id}`,
+          label: p.name,
+          // Divider between the built-ins and your own prompts.
+          separatorBefore: i === 0,
+        })),
+        ...(valueIsMissingUserPrompt ? [{ value, label: "(deleted prompt)" }] : []),
+        ...(value === "custom" ? [{ value: "custom", label: "Custom (legacy)" }] : []),
+      ]}
+    />
   );
 }
 
@@ -1537,13 +1521,8 @@ function LanguagePicker({
       value={value}
       onChange={onChange}
       title="Transcription language"
-    >
-      {LANGUAGES.map((l) => (
-        <option key={l.value} value={l.value}>
-          {languageOptionLabel(l)}
-        </option>
-      ))}
-    </CtlSelect>
+      options={LANGUAGES.map((l) => ({ value: l.value, label: languageOptionLabel(l) }))}
+    />
   );
 }
 
@@ -1572,8 +1551,8 @@ function SpeakersPicker({
   value: number | null;
   onChange: (n: number | null) => void;
 }) {
-  // Internal sentinel: 0 stands in for `null` (auto) since <select> values
-  // must be strings. Convert at the boundary.
+  // Internal sentinel: 0 stands in for `null` (auto), since the picker's
+  // values are strings. Convert at the boundary.
   const selected = value ?? 0;
   return (
     <CtlSelect
@@ -1585,13 +1564,11 @@ function SpeakersPicker({
         onChange(n > 0 ? n : null);
       }}
       title="Expected speakers — diarization hint. 'Auto' lets the model decide."
-    >
-      {SPEAKER_OPTIONS.map((o) => (
-        <option key={o.value} value={o.value}>
-          {o.label === "Auto" ? "Auto" : `${o.label} speakers`}
-        </option>
-      ))}
-    </CtlSelect>
+      options={SPEAKER_OPTIONS.map((o) => ({
+        value: String(o.value),
+        label: o.label === "Auto" ? "Auto" : `${o.label} speakers`,
+      }))}
+    />
   );
 }
 
@@ -1615,10 +1592,11 @@ function SummaryProviderChip({
       value={effective}
       onChange={onChange}
       title="Where this note's summary runs"
-    >
-      <option value="openai">Cloud</option>
-      <option value="local">Local</option>
-    </CtlSelect>
+      options={[
+        { value: "openai", label: "Cloud" },
+        { value: "local", label: "Local" },
+      ]}
+    />
   );
 }
 

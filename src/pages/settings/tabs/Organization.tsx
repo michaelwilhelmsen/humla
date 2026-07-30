@@ -14,7 +14,7 @@ import {
 import { useNotesStore } from "../../../lib/store";
 import { Row, Section } from "../components/Section";
 import { Btn } from "../components/Btn";
-import { Select } from "../components/Select";
+import { Select } from "../../../components/ui/Select";
 import { ValuePill } from "../components/ValuePill";
 import { ChatKeyPanel } from "./ChatKeyPanel";
 

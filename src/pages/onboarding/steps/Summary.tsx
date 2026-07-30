@@ -38,6 +38,7 @@ import {
   completionModels,
   isModelInstalled,
 } from "../../../lib/localModels";
+import { Select } from "../../../components/ui/Select";
 
 // Mirrors Settings → Summary defaults (settings/types.ts DEFAULTS).
 const DEFAULT_OPENAI_SUMMARY_MODEL = "gpt-5.4-mini";
@@ -532,25 +533,24 @@ function ModelSelect({
   onChange: (v: string) => void;
 }) {
   return (
-    <label className="block">
-      <span className="sr-only">Model</span>
-      <select
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        className="w-full px-3 py-2 rounded-md text-sm bg-[var(--color-input-bg)] border border-[var(--color-line)] focus:border-[var(--color-text-muted)]"
-      >
-        <option value="">— pick a model —</option>
-        {completionModels(installed).map((m) => (
-          <option key={m} value={m}>
-            {m}
-            {m === RECOMMENDED_OLLAMA_MODEL
+    <Select
+      ariaLabel="Model"
+      value={value}
+      onChange={onChange}
+      options={[
+        { value: "", label: "— pick a model —" },
+        ...completionModels(installed).map((m) => ({
+          value: m,
+          label:
+            m +
+            (m === RECOMMENDED_OLLAMA_MODEL
               ? " (recommended)"
               : m === RECOMMENDED_OLLAMA_MODEL_16GB
                 ? " (16 GB Macs)"
-                : ""}
-          </option>
-        ))}
-      </select>
-    </label>
+                : ""),
+        })),
+      ]}
+      className="w-full max-w-none justify-between px-3 py-2 bg-[var(--color-input-bg)] border-[var(--color-line)] hover:bg-[var(--color-input-bg)] focus:border-[var(--color-text-muted)]"
+    />
   );
 }

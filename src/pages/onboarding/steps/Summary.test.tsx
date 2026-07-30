@@ -94,10 +94,13 @@ describe("onboarding SummaryStep — local path", () => {
 
     // Gemma (the headline recommendation) isn't installed here, so the picker
     // preselects qwen3.5:4b — the 16 GB fallback — over the other installed model.
-    const select = screen.getByLabelText("Model");
-    expect(select).toHaveValue("qwen3.5:4b");
+    // The picker is the shared Select now (#114) — a listbox, not a native
+    // <select>, so its current value reads off the trigger.
+    const select = screen.getByRole("combobox", { name: "Model" });
+    expect(select).toHaveTextContent("qwen3.5:4b");
 
-    await userEvent.selectOptions(select, "llama3.2:3b");
+    await userEvent.click(select);
+    await userEvent.click(screen.getByRole("option", { name: "llama3.2:3b" }));
 
     expect(writes.summary_provider).toBe("local");
     expect(writes.local_llm_model).toBe("llama3.2:3b");

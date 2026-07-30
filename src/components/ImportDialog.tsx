@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { FileAudio } from "lucide-react";
 import { Modal } from "../pages/settings/components/Modal";
-import { Select } from "../pages/settings/components/Select";
+import { Select } from "./ui/Select";
 import { LANGUAGES, languageOptionLabel } from "../lib/languages";
 import { ipc } from "../lib/ipc";
 

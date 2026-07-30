@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import { ChatPanel, type ChatSessionControls } from "./ChatPanel";
 import { mockTauri } from "../test/tauri";
@@ -233,7 +234,7 @@ describe("ChatPanel retrieval UI (#47)", () => {
     mockTauri({ provider_key_get: () => "sk-test", chat_history: () => history() });
     renderPanel();
     const trigger = await screen.findByRole("button", { name: "Chat scope" });
-    fireEvent.click(trigger);
+    await userEvent.click(trigger);
     await waitFor(() => expect(screen.getByText("All notes")).toBeInTheDocument());
     // No folder on the anchor note → no "this folder" option.
     expect(screen.queryByText(/^Folder:/)).toBeNull();
@@ -892,8 +893,8 @@ describe("ChatPanel scope breadth (#58)", () => {
       },
     });
     renderPanel();
-    fireEvent.click(await screen.findByRole("button", { name: "Chat scope" }));
-    fireEvent.click(await screen.findByText("All notes"));
+    await userEvent.click(await screen.findByRole("button", { name: "Chat scope" }));
+    await userEvent.click(await screen.findByRole("menuitemradio", { name: "All notes" }));
     await waitFor(() => expect(setArgs?.breadth).toBe("all"));
     expect(setArgs?.noteId).toBe("n1");
   });
@@ -977,7 +978,7 @@ describe("ChatPanel with a library-wide target (#94)", () => {
     });
     renderPanel();
 
-    fireEvent.click(await screen.findByRole("button", { name: "Chat scope" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Chat scope" }));
     // "This note" appears twice (trigger + row); the other two once each.
     await waitFor(() => expect(screen.getAllByText("This note").length).toBeGreaterThan(0));
     expect(screen.getByText(/^Folder:/)).toBeInTheDocument();
@@ -1133,7 +1134,7 @@ describe("ChatPanel composer breadth + chrome (#63)", () => {
     seedNoteWithFolder("n1", "Roadmap");
     mockTauri({ provider_key_get: () => "sk-test", chat_history: () => history() });
     renderPanel();
-    fireEvent.click(await screen.findByRole("button", { name: "Chat scope" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Chat scope" }));
     expect(await screen.findByText("Folder: Roadmap")).toBeInTheDocument();
   });
 
@@ -1774,8 +1775,8 @@ describe("ChatPanel authorship pin", () => {
     await screen.findByPlaceholderText(/Ask about your notes/);
     expect(screen.queryByRole("button", PIN)).toBeNull();
 
-    fireEvent.click(await screen.findByRole("button", { name: "Chat scope" }));
-    fireEvent.click(await screen.findByText("All notes"));
+    await userEvent.click(await screen.findByRole("button", { name: "Chat scope" }));
+    await userEvent.click(await screen.findByRole("menuitemradio", { name: "All notes" }));
     await waitFor(() => expect(screen.getByRole("button", PIN)).toBeInTheDocument());
   });
 

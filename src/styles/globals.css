@@ -200,19 +200,19 @@
 
   button { font-family: inherit; color: inherit; }
 
-  input, select, textarea {
+  input, textarea {
     font-family: inherit;
     color: inherit;
     outline: none;
   }
 
   /* Default form-control surface. Inputs stay transparent (they're often
-     embedded in styled containers) but selects and textareas always read
-     as form fields. */
+     embedded in styled containers) but textareas always read as form
+     fields. */
   input { background: transparent; }
 }
 
-select, textarea {
+textarea {
   background: var(--color-input-bg);
   border: 1px solid var(--color-line);
   border-radius: 6px;
@@ -220,17 +220,8 @@ select, textarea {
   transition: border-color 200ms cubic-bezier(0.25, 0.1, 0.25, 1);
 }
 
-select:focus, textarea:focus {
+textarea:focus {
   border-color: var(--color-text-muted);
-}
-
-/* Selects inside .nd-chip inherit the chip's framing — the chip is the
-   surface, not the select. */
-.nd-chip select {
-  background: transparent;
-  border: none;
-  padding: 0;
-  border-radius: 0;
 }
 
 /* Transcript textarea is rendered inside a Card, which already provides the
@@ -243,7 +234,7 @@ select:focus, textarea:focus {
 }
 
 /* The chat composer's field on the `/chat` page, where the composer BOX is the
-   surface (#95). The `select, textarea` rule above is unlayered, so it outranks
+   surface (#95). The `textarea` rule above is unlayered, so it outranks
    every Tailwind utility — a field inside a styled container has to opt out with
    a rule of the same kind, and set its own padding while it's there. The right
    inset is the room the send button needs; without it long text slides under the
@@ -425,54 +416,19 @@ input::placeholder, textarea::placeholder {
 .nd-meta.is-interactive:hover { background: var(--color-pill-hover); color: var(--color-text); }
 .nd-meta > svg { opacity: 0.72; flex-shrink: 0; }
 
-/* Panel control chip — bordered surface-2 pill wrapping a borderless select,
-   used by the Summary (preset/provider) and Transcript (language/speakers)
-   tabs. */
-.nd-ctl {
-  display: inline-flex; align-items: center; gap: 6px;
-  font-size: 12px; font-weight: 500; color: var(--color-text);
-  padding: 5px 9px; border: 1px solid var(--color-line-visible);
-  border-radius: 8px; background: var(--color-surface-2);
-  cursor: pointer; white-space: nowrap; transition: border-color 120ms;
-}
-.nd-ctl:hover { border-color: var(--color-text-muted); }
-.nd-ctl > svg { opacity: 0.72; flex-shrink: 0; }
+/* Filled variant, for a chip that has to hold its own on a card rather than
+   sit under a line of metadata. A transparent chip needs surrounding text to
+   read as inset — in a left-aligned row of nothing else (the Summary and
+   Transcript panel pickers) it just looks like indented prose until you hover
+   it. `surface-2` is the recessed-chip step below the panel's own `surface`,
+   in both themes; hover lifts to `surface-raised`. */
+.nd-meta.is-filled { background: var(--color-surface-2); }
+.nd-meta.is-filled:hover { background: var(--color-surface-raised); color: var(--color-text); }
 
-/* Borderless selects inside meta items / control chips — strip the global
-   <select> chrome (native arrow + right padding) so the wrapper owns the
-   look and our own chevron (or none) shows instead. */
-.nd-meta select, .nd-ctl select {
-  -webkit-appearance: none !important;
-  appearance: none !important;
-  background-image: none !important;
-  background: transparent; border: none;
-  padding: 0 !important; border-radius: 0;
-  font: inherit; color: inherit; cursor: pointer;
-}
-.nd-meta select:focus, .nd-ctl select:focus { outline: none; }
-
-/* WebKit on macOS sometimes ignores `appearance: none` on <select>, leaking
-   the native arrow. Force it off everywhere we render a custom caret. */
-.nd-chip select {
-  -webkit-appearance: none !important;
-  -moz-appearance: none !important;
-  appearance: none !important;
-  background-image: none !important;
-}
-
-select {
-  appearance: none;
-  -webkit-appearance: none;
-  background-image:
-    linear-gradient(45deg, transparent 50%, currentColor 50%),
-    linear-gradient(135deg, currentColor 50%, transparent 50%);
-  background-position:
-    calc(100% - 14px) 50%,
-    calc(100% - 9px) 50%;
-  background-size: 5px 5px, 5px 5px;
-  background-repeat: no-repeat;
-  padding-right: 28px !important;
-}
+/* No <select> rules live here any more: every picker in the app goes through
+   the Radix-backed Popover / Menu / Select primitives (#114), so the chrome
+   resets and the hand-drawn caret that used to fight WebKit are gone with the
+   native elements they patched. */
 
 .drag { -webkit-app-region: drag; }
 .no-drag { -webkit-app-region: no-drag; }
