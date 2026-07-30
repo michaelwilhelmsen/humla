@@ -530,6 +530,13 @@ export function Note() {
 
   const dateChip = useMemo(() => (draft ? formatDateChip(draft.created_at) : "Today"), [draft]);
 
+  // Suggestion source for the speaker-rename picker (#116), fetched once there is
+  // a transcript to label. Must stay ABOVE the `!draft` return below: a hook
+  // after an early return changes the hook count as soon as a note loads.
+  const speakerSuggestions = useSpeakerSuggestions(
+    !!draft && draft.transcript.trim().length > 0 && !readOnly,
+  );
+
   if (!draft) return null;
 
   // Who may move this note to another workspace: its creator, or a workspace
@@ -547,9 +554,6 @@ export function Note() {
 
   const hasSummary = draft.summary.trim().length > 0;
   const hasTranscript = draft.transcript.trim().length > 0;
-  // Suggestion source for the speaker-rename picker (#116). One fetch, only once
-  // there is a transcript to label.
-  const speakerSuggestions = useSpeakerSuggestions(hasTranscript && !readOnly);
   // Live-feed alignment: while a recording is in flight, pin the
   // collapsed transcript card to its bottom so newly transcribed
   // chunks stay visible. After stop / on a saved note the user is
