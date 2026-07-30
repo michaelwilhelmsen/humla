@@ -18,6 +18,7 @@ import { useNotesStore } from "../lib/store";
 import { ipc, type Folder, type Note } from "../lib/ipc";
 import { cn } from "../lib/cn";
 import { ContextMenu, ContextMenuItem } from "./ContextMenu";
+import { Modal } from "../pages/settings/components/Modal";
 import { WorkspaceSwitcher } from "./WorkspaceSwitcher";
 import { SetupNag } from "./SetupNag";
 import { ImportDialog } from "./ImportDialog";
@@ -158,7 +159,11 @@ export function Sidebar({ onCollapse }: { onCollapse: () => void }) {
   const noResults = searching && searchResults.length === 0;
   // Search still wins over the route: searching notes from `/chat` is a reasonable
   // thing to do, and its results navigate away anyway.
-  const onChat = location.pathname === "/chat";
+  //
+  // A folder chat swaps the section for the same reason `/chat` does (#110) — the
+  // list on screen is that surface's conversations, and showing the folder tree
+  // beneath a folder's own chat would offer navigation the page already is.
+  const onChat = location.pathname === "/chat" || /^\/folder\/[^/]+\/chat$/.test(location.pathname);
 
   return (
     <div className="h-full flex flex-col px-2.5 pb-2.5">
@@ -398,6 +403,12 @@ function FolderRow({
   const [menuPos, setMenuPos] = useState<{ x: number; y: number } | null>(null);
   const [editing, setEditing] = useState(false);
   const [draftName, setDraftName] = useState(folder.name);
+  // `undefined` = closed. Otherwise the conversations about to be destroyed —
+  // `null` when the listing FAILED, which still confirms but can't name a number.
+  const [confirmDelete, setConfirmDelete] = useState<{ id: string }[] | null | undefined>(
+    undefined,
+  );
+  const [deleteError, setDeleteError] = useState<string | null>(null);
 
   function openMenu(e: React.MouseEvent) {
     e.preventDefault();
@@ -427,12 +438,66 @@ function FolderRow({
 
   async function deleteHere() {
     setMenuPos(null);
-    // Notes fall back to root rather than being deleted — recoverable
-    // so no confirm needed. If we're sitting on this folder's page,
-    // navigate home so we don't end up on a dead route.
+    // Notes fall back to root rather than being deleted, so THAT part is
+    // recoverable. The folder's chat conversations are not (#110): they go with
+    // it, because a folder thread's whole reach was that folder. So this confirms
+    // only when there is something unrecoverable to lose — a folder with no
+    // conversations deletes as immediately as it always did — and the prompt, when
+    // it appears, names the actual cost rather than asking "are you sure?" about
+    // something that isn't at risk.
+    //
+    // A FAILED listing confirms rather than proceeding. Treating "couldn't ask" as
+    // "nothing there" is the one wrong way to be wrong here: it turns an unknown
+    // number of unrecoverable threads into a silent hard delete. `null` says so.
+    let threads: { id: string }[] | null = null;
+    try {
+      threads = await ipc.chatListConversations({ kind: "folder", folderId: folder.id });
+    } catch {
+      threads = null;
+    }
+    if (threads !== null && threads.length === 0) {
+      await commitDelete([]);
+      return;
+    }
+    setConfirmDelete(threads);
+  }
+
+  async function commitDelete(threads: { id: string }[] | null) {
+    // Delete the conversations FIRST, and through the normal per-conversation
+    // command rather than by dropping local rows (#110).
+    //
+    // In a workspace a folder thread is server-authoritative — the local row is
+    // only a handle — so `db::delete_folder`'s local cascade would leave the real
+    // thread alive on the server, pointing at a folder that no longer exists:
+    // unreachable, still listed for teammates, and clamping to nothing. That
+    // command is also where the server's own rule lives (only the thread's
+    // creator, or a workspace owner/admin, may delete one).
+    //
+    // So a refusal ABORTS the folder delete rather than being swallowed. A folder
+    // that half-deleted — gone locally, its threads still on the server — is worse
+    // than one that didn't delete, because nothing would ever offer to finish it.
+    setDeleteError(null);
+    try {
+      // A listing that failed at menu time is retried here rather than treated as
+      // an empty one. Without it, "delete anyway" would delete the folder while
+      // every server-side thread survived pointing at it — precisely the orphan
+      // this whole function exists to prevent.
+      const doomed =
+        threads ??
+        (await ipc.chatListConversations({ kind: "folder", folderId: folder.id }));
+      for (const t of doomed) {
+        await ipc.chatDeleteConversation({ kind: "folder", folderId: folder.id }, t.id);
+      }
+    } catch (e) {
+      setDeleteError(String(e));
+      return;
+    }
     await ipc.deleteFolder(folder.id);
     removeFolder(folder.id);
-    if (location.pathname === `/folder/${folder.id}`) navigate("/all-notes");
+    setConfirmDelete(undefined);
+    // If we're sitting on this folder's page — or its chat — navigate home so we
+    // don't end up on a dead route.
+    if (location.pathname.startsWith(`/folder/${folder.id}`)) navigate("/all-notes");
   }
 
   if (editing) {
@@ -476,12 +541,61 @@ function FolderRow({
       </Link>
       {menuPos && (
         <ContextMenu x={menuPos.x} y={menuPos.y} onClose={() => setMenuPos(null)}>
+          <ContextMenuItem
+            onClick={() => {
+              setMenuPos(null);
+              navigate(`/folder/${folder.id}/chat`);
+            }}
+          >
+            Chat about this folder
+          </ContextMenuItem>
           <ContextMenuItem onClick={startRename}>Rename</ContextMenuItem>
-          <ContextMenuItem onClick={deleteHere} danger>
+          <ContextMenuItem onClick={() => void deleteHere()} danger>
             Delete
           </ContextMenuItem>
         </ContextMenu>
       )}
+      <Modal
+        open={confirmDelete !== undefined}
+        onClose={() => {
+          setConfirmDelete(undefined);
+          setDeleteError(null);
+        }}
+        title="Delete folder"
+      >
+        <p className="text-[14px] text-[var(--color-text)]">
+          Delete “{folder.name}”? Its notes move out of the folder, but{" "}
+          {confirmDelete === null
+            ? "any chat conversations about it are"
+            : confirmDelete?.length === 1
+              ? "its chat conversation is"
+              : `its ${confirmDelete?.length} chat conversations are`}{" "}
+          deleted for good.
+        </p>
+        {deleteError && (
+          <p className="mt-3 text-[13px]" style={{ color: "var(--color-danger)" }}>
+            {deleteError} — the folder was left alone.
+          </p>
+        )}
+        <div className="flex justify-end gap-2 mt-5">
+          <button
+            className="nd-btn"
+            onClick={() => {
+              setConfirmDelete(undefined);
+              setDeleteError(null);
+            }}
+          >
+            Cancel
+          </button>
+          <button
+            className="nd-btn"
+            style={{ color: "var(--color-danger)" }}
+            onClick={() => void commitDelete(confirmDelete ?? null)}
+          >
+            Delete
+          </button>
+        </div>
+      </Modal>
     </>
   );
 }

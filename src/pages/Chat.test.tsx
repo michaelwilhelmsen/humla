@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, Outlet, Route, Routes } from "react-router-dom";
-import { Chat } from "./Chat";
+import { Chat, FolderChat } from "./Chat";
 import { mockTauri } from "../test/tauri";
 import { useCloudStore, DISCONNECTED, type CloudRole } from "../lib/cloud";
 import { useNotesStore } from "../lib/store";
@@ -446,5 +446,92 @@ describe("/chat with nothing to retrieve", () => {
     const input = await screen.findByPlaceholderText(/Ask about your notes/);
     expect(input).not.toHaveAttribute("readonly");
     expect(input).not.toHaveAttribute("aria-disabled");
+  });
+});
+
+// #110: the same shell narrowed to one folder. What is worth testing here (rather
+// than in ChatPanel.test.tsx) is the page's own two jobs: naming the reach, and
+// deciding whether the folder in the URL is real.
+describe("/folder/:id/chat page (#110)", () => {
+  function renderFolderChat(id = "f1") {
+    return render(
+      <MemoryRouter initialEntries={[`/folder/${id}/chat`]}>
+        <Routes>
+          <Route path="/" element={<Outlet context={{ sidebarCollapsed: false }} />}>
+            <Route path="folder/:id/chat" element={<FolderChat />} />
+          </Route>
+        </Routes>
+      </MemoryRouter>,
+    );
+  }
+
+  function seedFolder(id = "f1", name = "K2 pilot") {
+    useNotesStore.setState({
+      notes: [{ id: "n0" } as unknown as Note],
+      folders: [{ id, name, created_at: 0, updated_at: 0 }],
+      loaded: true,
+    });
+  }
+
+  it("scopes the pane to the folder and names the reach in the bar", async () => {
+    const asked: unknown[] = [];
+    seedFolder();
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () => ({ conversationId: null, messages: [] }),
+      chat_list_conversations: (args) => {
+        asked.push(args);
+        return [];
+      },
+    });
+    renderFolderChat();
+
+    await waitFor(() => expect(asked.length).toBeGreaterThan(0));
+    expect(asked[0]).toMatchObject({ noteId: null, folderId: "f1" });
+    // The clamp has to be visible: it is the only thing distinguishing this page
+    // from `/chat`, and the user chose it.
+    expect(await screen.findByText("K2 pilot")).toBeInTheDocument();
+  });
+
+  it("falls back to the library-wide target when the folder is gone", async () => {
+    // A deleted folder takes its conversations with it, so a stale link has
+    // nothing to open. A folder target with a dead id would still LOOK like a
+    // working chat while clamping retrieval to nothing — the worst outcome of the
+    // three, because it fails silently.
+    const asked: unknown[] = [];
+    useNotesStore.setState({ notes: [], folders: [], loaded: true });
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () => ({ conversationId: null, messages: [] }),
+      chat_list_conversations: (args) => {
+        asked.push(args);
+        return [];
+      },
+    });
+    renderFolderChat("deleted-folder");
+
+    await waitFor(() => expect(asked.length).toBeGreaterThan(0));
+    expect(asked[0]).toMatchObject({ noteId: null, folderId: null });
+    expect(screen.queryByText("K2 pilot")).toBeNull();
+  });
+
+  it("does not retarget while the folders are still loading", async () => {
+    // Before the first load, "not in the store" means "not yet". Falling back then
+    // would retarget a perfectly good chat for a frame — and take the pane's draft
+    // with it.
+    const asked: unknown[] = [];
+    useNotesStore.setState({ notes: [], folders: [], loaded: false });
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () => ({ conversationId: null, messages: [] }),
+      chat_list_conversations: (args) => {
+        asked.push(args);
+        return [];
+      },
+    });
+    renderFolderChat();
+
+    await waitFor(() => expect(asked.length).toBeGreaterThan(0));
+    expect(asked[0]).toMatchObject({ folderId: "f1" });
   });
 });

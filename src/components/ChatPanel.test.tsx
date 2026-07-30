@@ -1011,6 +1011,94 @@ describe("ChatPanel with a library-wide target (#94)", () => {
   });
 });
 
+// #110: the third target. Retrieval has enforced a folder clamp since #47; what
+// was missing was a conversation that could carry one. These assert the two
+// halves that make it reachable — the wire shape, and the clamp being visible
+// and unwidenable in the pane.
+describe("ChatPanel with a folder target (#110)", () => {
+  function renderFolder(folderId = "f1") {
+    return render(
+      <MemoryRouter>
+        <ChatPanel target={{ kind: "folder", folderId }} />
+      </MemoryRouter>,
+    );
+  }
+
+  it("sends the folder id and a null anchor to every chat command", async () => {
+    // The two ids are ALTERNATIVES server-side (both at once is a 400), and an
+    // absent anchor is what selects a note-less scope — so the note id must be
+    // null rather than "" and the folder id must actually travel.
+    const seen: Record<string, unknown> = {};
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: (args) => {
+        seen.history = args;
+        return history();
+      },
+      chat_get_breadth: (args) => {
+        seen.breadth = args;
+        return "folder";
+      },
+      chat_list_conversations: (args) => {
+        seen.list = args;
+        return [];
+      },
+    });
+    renderFolder();
+
+    await waitFor(() => expect(seen.history).toBeDefined());
+    for (const [name, args] of Object.entries(seen)) {
+      expect((args as { noteId?: unknown }).noteId, `${name} anchor`).toBeNull();
+      expect((args as { folderId?: unknown }).folderId, `${name} folder`).toBe("f1");
+    }
+  });
+
+  it("states the folder it is clamped to, and offers no way to widen it", async () => {
+    // The clamp is the whole point of the surface, so unlike the library-wide pane
+    // (which shows no breadth chrome at all) this one must SAY its reach — and it
+    // must not be a picker, since `check_pinned_breadth` rejects every other value.
+    seedNoteWithFolder();
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () => history(),
+      chat_get_breadth: () => "folder",
+    });
+    renderFolder();
+
+    await screen.findByPlaceholderText(/Ask about your notes/);
+    expect(await screen.findByText("Folder: Roadmap")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Chat scope" })).toBeNull();
+    expect(screen.queryByText("All notes")).toBeNull();
+    expect(screen.queryByText("This note")).toBeNull();
+  });
+
+  it("publishes controls under a key distinct from a note with the same id", async () => {
+    // `(tenant, scope, scope_id)` is what keeps the populations apart on the
+    // backend; this is its frontend half — without the prefix, folder "f1" and
+    // note "f1" would share the header's stale-projection guard.
+    const captured: { current: ChatSessionControls | null } = { current: null };
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () => history(),
+      chat_get_breadth: () => "folder",
+      chat_list_conversations: () => [],
+    });
+    render(
+      <MemoryRouter>
+        <ChatPanel
+          target={{ kind: "folder", folderId: "f1" }}
+          onControls={(c) => {
+            captured.current = c;
+          }}
+        />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(captured.current).not.toBeNull());
+    expect(captured.current?.targetKey).toBe("folder:f1");
+    expect(captured.current?.targetKey).not.toBe("note:f1");
+  });
+});
+
 describe("ChatPanel accessibility + contrast (#64)", () => {
   it("exposes the message area as an aria-live log", async () => {
     mockTauri({
@@ -1703,7 +1791,10 @@ describe("ChatPanel stop (#80)", () => {
     fireEvent.click(stop);
 
     await waitFor(() => expect(cancels).toHaveLength(1));
-    expect(cancels[0]).toEqual({ noteId: "n1" });
+    // Both ids ride on every chat command (#110) — the pair is what the backend's
+    // `ChatTarget::from_ids` parses, and a folder pane's cancel is keyed the same
+    // way with the halves swapped.
+    expect(cancels[0]).toEqual({ noteId: "n1", folderId: null });
     await act(async () => release());
   });
 

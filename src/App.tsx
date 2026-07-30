@@ -10,7 +10,7 @@ import { useEffect, useState } from "react";
 import { Layout } from "./components/Layout";
 import { Home } from "./pages/Home";
 import { AllNotes } from "./pages/AllNotes";
-import { Chat } from "./pages/Chat";
+import { Chat, FolderChat } from "./pages/Chat";
 import { Note } from "./pages/Note";
 import { Folder } from "./pages/Folder";
 import { Trash } from "./pages/Trash";
@@ -126,6 +126,10 @@ function AppRoutes() {
           <Route path="/chat" element={<Chat />} />
           <Route path="/note/:id" element={<Note />} />
           <Route path="/folder/:id" element={<Folder />} />
+          {/* The same front door, narrowed to one folder (#110). Nested under the
+              folder rather than parameterising `/chat`, so the URL says what the
+              conversation can reach. */}
+          <Route path="/folder/:id/chat" element={<FolderChat />} />
           <Route path="/trash" element={<Trash />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Route>

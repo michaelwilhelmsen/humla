@@ -25,9 +25,9 @@
 // pretends to. Also absent: a scope picker (its only option would be "All notes";
 // narrowing stays a tool argument the model chooses, per #81).
 
-import { useEffect, useState } from "react";
-import { useOutletContext } from "react-router-dom";
-import { Lock, MoreHorizontal, Sparkles, Users, type LucideIcon } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+import { useOutletContext, useParams } from "react-router-dom";
+import { Folder as FolderIcon, Lock, MoreHorizontal, Sparkles, Users, type LucideIcon } from "lucide-react";
 import { ChatPanel } from "../components/ChatPanel";
 import { ChatHistoryControls } from "../components/ChatHistoryControls";
 import { ContextMenu, ContextMenuItem } from "../components/ContextMenu";
@@ -35,6 +35,7 @@ import { Modal } from "./settings/components/Modal";
 import type { LayoutOutletContext } from "../components/Layout";
 import { useGlobalChatStore } from "../lib/globalChat";
 import { useCloudStore } from "../lib/cloud";
+import { useNotesStore } from "../lib/store";
 import type { ChatTarget } from "../lib/chatTarget";
 import { cn } from "../lib/cn";
 
@@ -58,7 +59,44 @@ function StatusPill({ icon: Icon, children }: { icon: LucideIcon; children: Reac
   );
 }
 
-export function Chat() {
+/** The `/folder/:id/chat` route (#110): the same front door, narrowed.
+ *
+ *  A wrapper rather than a page of its own, because everything on the screen is
+ *  identical except which target the pane carries and one pill in the bar. The
+ *  folder's threads are a separate population server-side (`scope = "folder"`),
+ *  so the sidebar list, the history popover and the "+" button all follow the
+ *  target without either surface knowing the other exists.
+ *
+ *  A missing/unknown id falls back to the library-wide target rather than
+ *  erroring: a deleted folder takes its conversations with it (`delete_folder`),
+ *  and landing on the general front door is a better answer to a dead link than a
+ *  page that only apologises. */
+export function FolderChat() {
+  const { id } = useParams<{ id: string }>();
+  // A folder that no longer exists falls back to the library-wide front door.
+  // Deleting a folder takes its conversations with it (`delete_folder`), so a
+  // stale link has nothing to open — and a folder target with a dead id would
+  // still LOOK like a working chat while clamping retrieval to nothing, which is
+  // the worst of the three outcomes. Landing on the general front door is the
+  // better answer to a dead link than a page that only apologises.
+  //
+  // Gated on `loaded`: before the first folders load, "not in the store" means
+  // "not yet", and falling back then would retarget a perfectly good chat for a
+  // frame — dropping the pane's draft with it.
+  const foldersLoaded = useNotesStore((s) => s.loaded);
+  const folderName = useNotesStore((s) => s.folders.find((f) => f.id === id)?.name ?? null);
+  const known = !foldersLoaded || folderName !== null;
+  const target = useMemo<ChatTarget>(
+    () => (id && known ? { kind: "folder", folderId: id } : GLOBAL_TARGET),
+    [id, known],
+  );
+  return <Chat target={target} reachName={folderName} />;
+}
+
+export function Chat({
+  target = GLOBAL_TARGET,
+  reachName = null,
+}: { target?: ChatTarget; reachName?: string | null } = {}) {
   const { sidebarCollapsed } = useOutletContext<LayoutOutletContext>();
   const controls = useGlobalChatStore((s) => s.controls);
   const setControls = useGlobalChatStore((s) => s.setControls);
@@ -134,6 +172,11 @@ export function Chat() {
         <StatusPill icon={workspaceName ? Users : Lock}>
           {workspaceName ? "All members" : "Private"}
         </StatusPill>
+
+        {/* What this chat can reach (#110). Only shown when the reach is narrower
+            than the library — on `/chat` there is nothing to say, since "all your
+            notes" is what a chat without a qualifier already means. */}
+        {reachName && <StatusPill icon={FolderIcon}>{reachName}</StatusPill>}
 
         <div className="flex-1" />
 
@@ -211,7 +254,7 @@ export function Chat() {
       {/* Just the conversation: the log fills the height (so a new chat's prompt
           cards sit centred in it) and the composer is seated at the bottom. */}
       <div className="flex-1 min-h-0 max-w-[820px] mx-auto w-full px-8 pb-4 flex flex-col">
-        <ChatPanel target={GLOBAL_TARGET} onControls={setControls} variant="page" />
+        <ChatPanel target={target} onControls={setControls} variant="page" />
       </div>
     </div>
   );
