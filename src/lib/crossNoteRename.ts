@@ -1,5 +1,6 @@
 import { extractSpeakerLabels, renameSpeakerInTranscript } from "./speakers";
 import { ipc, type Note } from "./ipc";
+import { isPlaceholderLabel } from "./speakerSuggest";
 
 // Rename a speaker across every note that names them (#116 part 2).
 //
@@ -32,6 +33,39 @@ import { ipc, type Note } from "./ipc";
  */
 export function notesWithSpeaker(notes: Note[], label: string): Note[] {
   return notes.filter((n) => extractSpeakerLabels(n.transcript).includes(label));
+}
+
+/**
+ * Whether this label means a *different person* in every recording.
+ *
+ * `You` is whoever held the mic; `Speaker 1` is whoever the diarizer clustered
+ * first. Neither is a name, so neither may be renamed across notes: in a
+ * workspace that writes false attribution into a teammate's meeting — sweeping
+ * `You` → "Michael" turned the speaker in Kurt's recording into Michael, when
+ * `You` there was Kurt.
+ *
+ * A real name is the opposite, and that asymmetry is what makes the sweep sound
+ * at all: Hege is the same Hege in everyone's notes, which is why converging her
+ * four spellings across the library is a repair rather than a corruption.
+ *
+ * The one legitimate exception is the `You` action in Settings, which is scoped
+ * to [`notesIRecorded`] — inside my own recordings, `You` really is me.
+ */
+export function isPerRecordingLabel(label: string): boolean {
+  return isPlaceholderLabel(label);
+}
+
+/**
+ * The notes this user recorded, which is the only scope in which a per-recording
+ * label like `You` resolves to them.
+ *
+ * An empty `owner` counts as mine: that's a local-only or pre-sync note, and
+ * every Personal note. With no signed-in user, owned notes are excluded rather
+ * than assumed — a store left over from a previous session must not widen a
+ * sweep.
+ */
+export function notesIRecorded(notes: Note[], myUserId: string | undefined): Note[] {
+  return notes.filter((n) => !n.owner || n.owner === myUserId);
 }
 
 export type CrossNoteRenameOutcome = {
