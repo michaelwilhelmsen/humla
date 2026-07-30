@@ -114,7 +114,6 @@ export function PermissionsStep({ ctx }: { ctx: StepContext }) {
     return () => {
       window.removeEventListener("focus", onFocus);
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   async function requestMic() {

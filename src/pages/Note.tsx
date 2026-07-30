@@ -1849,7 +1849,7 @@ const TranscriptView = memo(function TranscriptView({
             } else {
               content = (
                 <div className="whitespace-pre-wrap">
-                  {`${line.lead}${line.label}: ${line.rest}` || " "}
+                  {`${line.lead}${line.label}: ${line.rest}`}
                 </div>
               );
             }
