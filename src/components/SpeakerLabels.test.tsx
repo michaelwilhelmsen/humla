@@ -327,6 +327,154 @@ describe("SpeakerLabels rename picker", () => {
   });
 });
 
+describe("SpeakerLabels cross-note rename", () => {
+  // #116 part 2. ADR-0002 forbids an alias table, so rewriting transcripts is
+  // the only repair for divergent spellings — and the choice of scope IS the
+  // commit: no modal, no destructive default, same reasoning as #23's merge menu.
+
+  it("offers the scope choice when the label is in other notes too", async () => {
+    const user = userEvent.setup();
+    render(
+      <SpeakerLabels
+        transcript={TWO_SPEAKERS}
+        onRename={vi.fn()}
+        onRenameEverywhere={vi.fn()}
+        otherNotesWithLabel={{ "Speaker 1": 11 }}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: /^Speaker 1$/ }));
+    await user.clear(screen.getByRole("combobox"));
+    await user.type(screen.getByRole("combobox"), "Hege");
+    await user.keyboard("{Enter}");
+
+    // The count says what it will touch: this note plus the other 11.
+    expect(screen.getByRole("menuitem", { name: /rename here only/i })).toBeTruthy();
+    expect(screen.getByRole("menuitem", { name: /rename in all 12 notes/i })).toBeTruthy();
+  });
+
+  it("does not rename until a scope is chosen", async () => {
+    const user = userEvent.setup();
+    const onRename = vi.fn();
+    render(
+      <SpeakerLabels
+        transcript={TWO_SPEAKERS}
+        onRename={onRename}
+        onRenameEverywhere={vi.fn()}
+        otherNotesWithLabel={{ "Speaker 1": 3 }}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: /^Speaker 1$/ }));
+    await user.clear(screen.getByRole("combobox"));
+    await user.type(screen.getByRole("combobox"), "Hege");
+    await user.keyboard("{Enter}");
+
+    expect(onRename).not.toHaveBeenCalled();
+  });
+
+  it("renames this note only when that is the choice", async () => {
+    const user = userEvent.setup();
+    const onRename = vi.fn();
+    const onRenameEverywhere = vi.fn();
+    render(
+      <SpeakerLabels
+        transcript={TWO_SPEAKERS}
+        onRename={onRename}
+        onRenameEverywhere={onRenameEverywhere}
+        otherNotesWithLabel={{ "Speaker 1": 3 }}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: /^Speaker 1$/ }));
+    await user.clear(screen.getByRole("combobox"));
+    await user.type(screen.getByRole("combobox"), "Hege");
+    await user.keyboard("{Enter}");
+    await user.click(screen.getByRole("menuitem", { name: /rename here only/i }));
+
+    expect(onRename).toHaveBeenCalledWith("Speaker 1", "Hege");
+    expect(onRenameEverywhere).not.toHaveBeenCalled();
+  });
+
+  it("renames everywhere when that is the choice", async () => {
+    const user = userEvent.setup();
+    const onRename = vi.fn();
+    const onRenameEverywhere = vi.fn();
+    render(
+      <SpeakerLabels
+        transcript={TWO_SPEAKERS}
+        onRename={onRename}
+        onRenameEverywhere={onRenameEverywhere}
+        otherNotesWithLabel={{ "Speaker 1": 3 }}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: /^Speaker 1$/ }));
+    await user.clear(screen.getByRole("combobox"));
+    await user.type(screen.getByRole("combobox"), "Hege");
+    await user.keyboard("{Enter}");
+    await user.click(screen.getByRole("menuitem", { name: /rename in all 4 notes/i }));
+
+    expect(onRenameEverywhere).toHaveBeenCalledWith("Speaker 1", "Hege");
+    // The per-note callback is NOT also fired — the sweep covers this note too.
+    expect(onRename).not.toHaveBeenCalled();
+  });
+
+  it("renames immediately when no other note carries the label", async () => {
+    const user = userEvent.setup();
+    const onRename = vi.fn();
+    render(
+      <SpeakerLabels
+        transcript={TWO_SPEAKERS}
+        onRename={onRename}
+        onRenameEverywhere={vi.fn()}
+        otherNotesWithLabel={{ "Speaker 1": 0 }}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: /^Speaker 1$/ }));
+    await user.clear(screen.getByRole("combobox"));
+    await user.type(screen.getByRole("combobox"), "Hege");
+    await user.keyboard("{Enter}");
+
+    // Nothing to choose between, so asking would be a pointless extra click.
+    expect(onRename).toHaveBeenCalledWith("Speaker 1", "Hege");
+    expect(screen.queryByRole("menuitem", { name: /rename here only/i })).toBeNull();
+  });
+
+  it("abandons the scope choice on Escape without renaming", async () => {
+    const user = userEvent.setup();
+    const onRename = vi.fn();
+    const onRenameEverywhere = vi.fn();
+    render(
+      <SpeakerLabels
+        transcript={TWO_SPEAKERS}
+        onRename={onRename}
+        onRenameEverywhere={onRenameEverywhere}
+        otherNotesWithLabel={{ "Speaker 1": 3 }}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: /^Speaker 1$/ }));
+    await user.clear(screen.getByRole("combobox"));
+    await user.type(screen.getByRole("combobox"), "Hege");
+    await user.keyboard("{Enter}");
+    await user.keyboard("{Escape}");
+
+    expect(screen.queryByRole("menuitem", { name: /rename here only/i })).toBeNull();
+    expect(onRename).not.toHaveBeenCalled();
+    expect(onRenameEverywhere).not.toHaveBeenCalled();
+  });
+
+  it("keeps renaming per-note when the parent offers no sweep", async () => {
+    const user = userEvent.setup();
+    const onRename = vi.fn();
+    // No `onRenameEverywhere` / no counts → the strip behaves exactly as it did
+    // before part 2 existed.
+    render(<SpeakerLabels transcript={TWO_SPEAKERS} onRename={onRename} />);
+    await user.click(screen.getByRole("button", { name: /^Speaker 1$/ }));
+    await user.clear(screen.getByRole("combobox"));
+    await user.type(screen.getByRole("combobox"), "Hege");
+    await user.keyboard("{Enter}");
+
+    expect(onRename).toHaveBeenCalledWith("Speaker 1", "Hege");
+  });
+});
+
 describe("SpeakerLabels read-only", () => {
   it("renders static pills with no rename or merge affordance", () => {
     render(<SpeakerLabels transcript={TWO_SPEAKERS} onRename={vi.fn()} readOnly />);

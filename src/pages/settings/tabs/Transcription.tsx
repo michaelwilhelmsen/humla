@@ -5,6 +5,7 @@ import { LocalModelManager } from "../components/LocalModelManager";
 import { PerLanguageOverrides } from "../components/PerLanguageOverrides";
 import { ProviderConfigForm } from "../components/ProviderConfigForm";
 import { Row, Section } from "../components/Section";
+import { RenameYouRow } from "../components/RenameYouRow";
 import { Select } from "../../../components/ui/Select";
 import { ProviderKeyCard, type KeyProvider } from "../../../components/provider/ProviderKeyCard";
 import { LANGUAGES, languageOptionLabel } from "../../../lib/languages";
@@ -281,6 +282,11 @@ export function TranscriptionTab({
             from its header to inspect where shifts landed.
           </p>
         </Disclosure>
+
+        {/* Count-gated, so it is absent for a new install and gone for good once
+            used (#116 part 2). In Transcription rather than Chat because the row
+            is about what transcripts say. */}
+        <RenameYouRow />
       </Section>
 
       <Section title="Vocabulary">

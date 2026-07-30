@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { open as openExternal } from "@tauri-apps/plugin-shell";
 import { Row, Section } from "../components/Section";
+import { s } from "../components/format";
 import { Select } from "../../../components/ui/Select";
 import { OllamaConnect } from "../../../components/provider/OllamaConnect";
 import { ProviderKeyCard } from "../../../components/provider/ProviderKeyCard";
@@ -181,7 +182,6 @@ type RebuildState =
 type StaleCount = { kind: "loading" } | { kind: "unknown" } | { kind: "known"; count: number };
 
 /** Plural suffix, so the row's copy doesn't repeat the same ternary four times. */
-const s = (n: number) => (n === 1 ? "" : "s");
 
 function RebuildIndexRow() {
   const [state, setState] = useState<RebuildState>({ kind: "idle" });

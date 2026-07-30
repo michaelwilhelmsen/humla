@@ -1218,12 +1218,48 @@ pub async fn chat_usage(app: AppHandle) -> Result<Option<chat::cloud::UsageDto>,
 ///
 /// Never fatal: any failure just omits the line from the prompt.
 pub(crate) fn asker_name(conn: &rusqlite::Connection) -> Option<String> {
-    let configured = crate::db::get_setting(conn, SETTING_DISPLAY_NAME)
+    // No cloud name: the prompt path has no `CloudStatus` to hand, and a
+    // network fetch here would put the model's identity line behind a request.
+    display_name_chain(conn, None)
+}
+
+/// The one name chain: `user_display_name` → the signed-in account's name →
+/// the macOS account's full name, first non-empty wins.
+///
+/// `cloud_name` is passed in rather than fetched because the only caller that has
+/// one already holds it in `CloudStatus.user`. Keeping the order here means the
+/// prompt's referent and the rename prefill can never disagree about who you are.
+fn display_name_chain(conn: &rusqlite::Connection, cloud_name: Option<&str>) -> Option<String> {
+    let non_empty = |s: &str| {
+        let t = s.trim();
+        if t.is_empty() { None } else { Some(t.to_string()) }
+    };
+    crate::db::get_setting(conn, SETTING_DISPLAY_NAME)
         .ok()
         .flatten()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty());
-    configured.or_else(os_full_name)
+        .and_then(|v| non_empty(&v))
+        .or_else(|| cloud_name.and_then(non_empty))
+        .or_else(os_full_name)
+}
+
+/// The name to prefill when renaming the literal `You:` label to a real one
+/// (#116 part 2).
+///
+/// The same [`display_name_chain`] the prompt's asker line uses, so the name a
+/// transcript gets renamed to and the name the model calls you cannot diverge.
+///
+/// The result is only ever a *suggestion*: the field is editable, deliberately.
+/// An automatic migration was rejected partly because Personal falls back to the
+/// OS name and could stamp `admin` across every transcript — showing the exact
+/// target before it runs is that mitigation, and an uneditable prefill would
+/// leave such a user stuck on the screen they're already on.
+#[tauri::command]
+pub fn speaker_default_name(
+    state: State<AppState>,
+    cloud_name: Option<String>,
+) -> Option<String> {
+    let conn = state.db.lock();
+    display_name_chain(&conn, cloud_name.as_deref())
 }
 
 /// The macOS account's full name ("Michael Wilhelmsen"), via `id -F`. `None` if
