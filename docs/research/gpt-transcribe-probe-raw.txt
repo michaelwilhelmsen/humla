@@ -1,0 +1,145 @@
+### 1 verbose_json + timestamp_granularities word
+  args: -F response_format=verbose_json -F timestamp_granularities[]=word
+  HTTP 400
+  {
+  "error": {
+    "message": "response_format 'verbose_json' is not compatible with model 'gpt-transcribe-api-ev3'. Use 'json' or 'text' instead.",
+    "type": "invalid_request_error",
+    "param": "response_format",
+    "code": "unsupported_value"
+  }
+}
+
+### 2 verbose_json alone
+  args: -F response_format=verbose_json
+  HTTP 400
+  {
+  "error": {
+    "message": "response_format 'verbose_json' is not compatible with model 'gpt-transcribe-api-ev3'. Use 'json' or 'text' instead.",
+    "type": "invalid_request_error",
+    "param": "response_format",
+    "code": "unsupported_value"
+  }
+}
+
+### 3 language singular
+  args: -F response_format=json -F language=no
+  HTTP 200
+  {"text":"Vi har gjort to ting som er viktige. Vi fjernet gebyret, altså prosjektet var på vei mot stopp, og da gjorde ...","languages":[{"code":"da"}],"usage":{"type":"duration","seconds":8}}
+
+### 4 languages[] repeated
+  args: -F response_format=json -F languages[]=no
+  HTTP 200
+  {"text":"De har gjort to ting som er viktige. De fjernet gebyret, altså prosjektet var på vei mot stopp, og da gjorde …","languages":[{"code":"no"}],"usage":{"type":"duration","seconds":8}}
+
+### 5 languages plain
+  args: -F response_format=json -F languages=no
+  HTTP 200
+  {"text":"Vi har gjort to ting som er viktig. Vi fjernet gebyret, altså prosjektet var på vei mot stopp, og da gjorde …","languages":[{"code":"no"}],"usage":{"type":"duration","seconds":8}}
+
+### 6 language=de (wrong lang, is singular ignored?)
+  args: -F response_format=json -F language=de
+  HTTP 200
+  {"text":"Vi har gjort to ting som er viktige. Vi fjernet gebyret, altså prosjektet var på vei mot stopp, og da gjorde …","languages":[{"code":"nb"}],"usage":{"type":"duration","seconds":8}}
+
+### 7 languages[] multi
+  args: -F response_format=json -F languages[]=no -F languages[]=en
+  HTTP 200
+  {"text":"Vi har gjort to ting som er viktig. Vi fjernet gebyret, altså prosjektet har vært på vei mot stopp, og da gjorde …","languages":[{"code":"no"}],"usage":{"type":"duration","seconds":8}}
+
+### 8 languages JSON array
+  args: -F response_format=json -F languages=["no","en"]
+  HTTP 400
+  {
+  "error": {
+    "message": "Invalid request.",
+    "type": "invalid_request_error",
+    "param": null,
+    "code": "invalid_value"
+  }
+}
+
+### 9 languages comma
+  args: -F response_format=json -F languages=no,en
+  HTTP 400
+  {
+  "error": {
+    "message": "Invalid request.",
+    "type": "invalid_request_error",
+    "param": null,
+    "code": "invalid_value"
+  }
+}
+
+### 10 temperature=0
+  args: -F response_format=json -F temperature=0
+  HTTP 200
+  {"text":"Vi har gjort to ting som er viktige. Vi fjernet gebyret, altså prosjektet var på vei mot stopp, og da gjorde …","languages":[{"code":"da"}],"usage":{"type":"duration","seconds":8}}
+
+### 11 prompt
+  args: -F response_format=json -F prompt=gebyret, framdrift, prosjektplan
+  HTTP 200
+  {"text":"Vi har gjort to ting som er viktig. Vi fjernet gebyret, altså prosjektet var på vei mot stopp, og da gjorde …","languages":[{"code":"da"}],"usage":{"type":"duration","seconds":8}}
+
+### 12 keywords
+  args: -F response_format=json -F keywords=gebyret,framdrift
+  HTTP 200
+  {"text":"Vi har gjort to ting som er viktige. Vi fjernet gebyret, altså prosjektet var på vei mot stopp, og da gjorde …","languages":[{"code":"da"}],"usage":{"type":"duration","seconds":8}}
+
+### 13 rf=text
+  args: -F response_format=text
+  HTTP 200
+  Vi har gjort to ting som er viktige. Vi fjernet gebyret, altså prosjektet var på vei mot stopp, og da gjorde …
+
+### 14 rf=srt
+  args: -F response_format=srt
+  HTTP 400
+  {
+  "error": {
+    "message": "response_format 'srt' is not compatible with model 'gpt-transcribe-api-ev3'. Use 'json' or 'text' instead.",
+    "type": "invalid_request_error",
+    "param": "response_format",
+    "code": "unsupported_value"
+  }
+}
+
+### 15 rf=vtt
+  args: -F response_format=vtt
+  HTTP 400
+  {
+  "error": {
+    "message": "response_format 'vtt' is not compatible with model 'gpt-transcribe-api-ev3'. Use 'json' or 'text' instead.",
+    "type": "invalid_request_error",
+    "param": "response_format",
+    "code": "unsupported_value"
+  }
+}
+
+### 16 rf=diarized_json
+  args: -F response_format=diarized_json
+  HTTP 400
+  {
+  "error": {
+    "message": "response_format 'diarized_json' is not compatible with model 'gpt-transcribe-api-ev3'.",
+    "type": "invalid_request_error",
+    "param": "response_format",
+    "code": "unsupported_value"
+  }
+}
+
+### 17 languages repeated no brackets
+  args: -F response_format=json -F languages=no -F languages=en
+  HTTP 200
+  {"text":"Vi har gjort to ting som er viktige. Vi fjernet gebyret, altså prosjektet var på vei mot stopp, og da gjorde …","languages":[{"code":"no"}],"usage":{"type":"duration","seconds":8}}
+
+### 18 unknown param (does it 400 or ignore?)
+  args: -F response_format=json -F bogus_param=xyz
+  HTTP 200
+  {"text":"De har gjort to ting som er viktige. De fjernet gebyret, altså prosjektet var på vei mot stopp, og da gjorde …","languages":[{"code":"nb"}],"usage":{"type":"duration","seconds":8}}
+
+data: {"type":"transcript.text.delta","delta":"De"}
+
+data: {"type":"transcript.text.delta","delta":" har"}
+
+data: {"type":"transcript.text.delta","delta":" gjort"}
+Vi har gjort to ting som er viktige. Vi fjernet gebyret, altså prosjektet var på vei mot stopp, og da gjorde …
