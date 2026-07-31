@@ -130,6 +130,20 @@ cat "$LATEST_JSON"
 echo
 
 # 6. Tag and push.
+#
+# The BRANCH goes first, then the tag. Pushing only the tag — which is what this
+# did until v0.42.0 — leaves the version bump sitting unpushed on the local branch
+# while the release itself looks complete: the tag resolves, the assets upload, the
+# updater works. What breaks is everything that reads the branch. GitHub's main
+# says the old version, a fresh clone can't reproduce the release it's tagged at,
+# and the next release's "is the version bumped past the latest release?" guard
+# compares against a tree that never got the last bump.
+#
+# Order matters for the same reason: a tag pushed ahead of its branch points at a
+# commit the remote branch doesn't contain yet, so anyone fetching in that window
+# sees a tag hanging off nothing.
+BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+git push origin "$BRANCH"
 git tag -a "$TAG" -m "Release $TAG"
 git push origin "$TAG"
 
