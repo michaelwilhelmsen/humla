@@ -3,6 +3,7 @@ import { useNavigate } from "react-router-dom";
 import { ipc } from "./ipc";
 import { useNotesStore, useRecordingStore } from "./store";
 import { useCloudStore } from "./cloud";
+import { useZoomStore } from "./zoom";
 
 export function useGlobalShortcuts() {
   const navigate = useNavigate();
@@ -44,6 +45,15 @@ export function useGlobalShortcuts() {
         e.preventDefault();
         const el = document.querySelector<HTMLInputElement>("[data-search-input]");
         el?.focus();
+      } else if (e.key === "=" || e.key === "+") {
+        e.preventDefault();
+        await useZoomStore.getState().zoomIn();
+      } else if (e.key === "-") {
+        e.preventDefault();
+        await useZoomStore.getState().zoomOut();
+      } else if (e.key === "0") {
+        e.preventDefault();
+        await useZoomStore.getState().zoomReset();
       }
     }
     window.addEventListener("keydown", onKey);
