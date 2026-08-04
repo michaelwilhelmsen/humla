@@ -330,6 +330,15 @@ async fn rediarize_apply_to_chunks(
     engine: diarize::Engine,
     thresholds: diarize::Thresholds,
 ) -> anyhow::Result<()> {
+    // Before deciding the capture mode — a hallucinated chunk on an otherwise
+    // silent stream would misclassify the whole recording. Also cleans up notes
+    // recorded before the transcribe-time guard existed, which is the point of
+    // running it here rather than trusting the chunk log.
+    let chunks = drop_incidental_stream_hallucinations(chunks);
+    if chunks.is_empty() {
+        emit_status(&app, None, Phase::Idle);
+        return Err(anyhow::anyhow!("no usable chunks after dropping collapsed ones"));
+    }
     let mic_chunks_present = chunks.iter().any(|c| c.source == ChunkSource::Mic);
     let sys_chunks_present = chunks.iter().any(|c| c.source == ChunkSource::Sys);
 
@@ -339,8 +348,11 @@ async fn rediarize_apply_to_chunks(
     struct DiarizeStage {
         splitter: Box<Splitter>,
         // Cloned so the diagnostic dump can resolve per-word speaker IDs
-        // after the original Vec has been moved into the closure.
-        segments_for_dump: Vec<diarize::Segment>,
+        // after the originals have been moved into the closure. Kept per
+        // source: a hybrid recording diarizes both streams, and a word's
+        // speaker id only means anything against its own stream's segments.
+        mic_segments_for_dump: Vec<diarize::Segment>,
+        sys_segments_for_dump: Vec<diarize::Segment>,
         source_tag: &'static str,
     }
     let stage: DiarizeStage = match (mic_chunks_present, sys_chunks_present) {
@@ -358,7 +370,8 @@ async fn rediarize_apply_to_chunks(
                 // pieces) before bailing so the user can still inspect
                 // "diarize ran but found nothing".
                 write_diagnostics_json(
-                    &app, &note_id, engine, "mic", &segments, &chunks, &thresholds, None, None,
+                    &app, &note_id, engine, "mic", &segments, &[], &chunks, &thresholds, None,
+                    None,
                 )
                 .await;
                 emit_status(&app, None, Phase::Idle);
@@ -370,7 +383,8 @@ async fn rediarize_apply_to_chunks(
                 splitter: Box::new(move |c: &ChunkRecord| {
                     split_by_segments(c, &segments, &display_map)
                 }),
-                segments_for_dump,
+                mic_segments_for_dump: segments_for_dump,
+                sys_segments_for_dump: Vec::new(),
                 source_tag: "mic",
             }
         }
@@ -385,7 +399,8 @@ async fn rediarize_apply_to_chunks(
                 diarize_and_maybe_clean(&app, &wav, expected_speakers, engine, thresholds).await?;
             if segments.is_empty() {
                 write_diagnostics_json(
-                    &app, &note_id, engine, "sys", &segments, &chunks, &thresholds, None, None,
+                    &app, &note_id, engine, "sys", &[], &segments, &chunks, &thresholds, None,
+                    None,
                 )
                 .await;
                 emit_status(&app, None, Phase::Idle);
@@ -397,38 +412,72 @@ async fn rediarize_apply_to_chunks(
                 splitter: Box::new(move |c: &ChunkRecord| {
                     split_by_segments(c, &segments, &display_map)
                 }),
-                segments_for_dump,
+                mic_segments_for_dump: Vec::new(),
+                sys_segments_for_dump: segments_for_dump,
                 source_tag: "sys",
             }
         }
         (true, true) => {
-            // Hybrid: mic = "You", sys = diarize (and split mid-chunk
-            // when sys chunks contain multiple remote speakers).
-            let sys_speaker_hint = expected_speakers.map(|n| (n - 1).max(1));
-            let segments = if let Some(p) = sys_wav.as_ref() {
+            // Hybrid: diarize both streams and number them off one counter.
+            // `You` is kept only when the mic resolves to a single voice —
+            // see `build_hybrid_labels`. Mirrors `diarize_and_apply`'s
+            // hybrid branch; change both together.
+            // System stream first, mic second with the remaining head-count —
+            // see `hybrid_sys_hint` / `mic_hint_after_sys` for why the hint is
+            // worth more on the mic. Errors are logged rather than swallowed:
+            // an empty result here is indistinguishable from "diarize refused",
+            // and that ambiguity cost a debugging round.
+            let sys_speaker_hint = hybrid_sys_hint(expected_speakers, &chunks);
+            let sys_segments = if let Some(p) = sys_wav.as_ref() {
                 diarize_and_maybe_clean(&app, p, sys_speaker_hint, engine, thresholds)
                     .await
-                    .unwrap_or_default()
+                    .unwrap_or_else(|e| {
+                        eprintln!("rediarize: sys diarize failed ({e}), sys falls back to one label");
+                        Vec::new()
+                    })
             } else {
                 Vec::new()
             };
-            let segments_for_dump = segments.clone();
-            let splitter: Box<Splitter> = if segments.is_empty() {
-                Box::new(move |c: &ChunkRecord| match c.source {
-                    ChunkSource::Mic => single_piece(c, Some("You".to_string())),
-                    ChunkSource::Sys => single_piece(c, Some("Speaker 1".to_string())),
-                })
+            let mic_speaker_hint = mic_hint_after_sys(expected_speakers, &sys_segments);
+            eprintln!(
+                "rediarize hybrid: sys hint {sys_speaker_hint:?} → {} sys voice(s); mic hint {mic_speaker_hint:?}",
+                distinct_speaker_count(&sys_segments)
+            );
+            let mic_segments = if let Some(p) = mic_wav.as_ref() {
+                diarize_and_maybe_clean(&app, p, mic_speaker_hint, engine, thresholds)
+                    .await
+                    .unwrap_or_else(|e| {
+                        eprintln!("rediarize: mic diarize failed ({e}), mic falls back to You");
+                        Vec::new()
+                    })
             } else {
-                let display_map = build_display_map(&chunks, &segments, ChunkSource::Sys);
-                Box::new(move |c: &ChunkRecord| match c.source {
-                    ChunkSource::Mic => single_piece(c, Some("You".to_string())),
-                    ChunkSource::Sys => split_by_segments(c, &segments, &display_map),
-                })
+                eprintln!("rediarize hybrid: no saved mic.wav, mic falls back to You");
+                Vec::new()
             };
+            eprintln!(
+                "rediarize hybrid: mic resolved to {} voice(s)",
+                distinct_speaker_count(&mic_segments)
+            );
+            let mic_segments_for_dump = mic_segments.clone();
+            let sys_segments_for_dump = sys_segments.clone();
+            let labels = build_hybrid_labels(&chunks, &mic_segments, &sys_segments);
+            let sys_fallback = format!("Speaker {}", labels.next_free);
+            let HybridLabels { mic: mic_labels, sys: sys_labels, .. } = labels;
+            let splitter: Box<Splitter> = Box::new(move |c: &ChunkRecord| match c.source {
+                ChunkSource::Mic if mic_segments.is_empty() => {
+                    single_piece(c, Some("You".to_string()))
+                }
+                ChunkSource::Mic => split_by_labels(c, &mic_segments, &mic_labels),
+                ChunkSource::Sys if sys_segments.is_empty() => {
+                    single_piece(c, Some(sys_fallback.clone()))
+                }
+                ChunkSource::Sys => split_by_labels(c, &sys_segments, &sys_labels),
+            });
             DiarizeStage {
                 splitter,
-                segments_for_dump,
-                source_tag: "sys",
+                mic_segments_for_dump,
+                sys_segments_for_dump,
+                source_tag: "hybrid",
             }
         }
         (false, false) => {
@@ -449,7 +498,8 @@ async fn rediarize_apply_to_chunks(
         &note_id,
         engine,
         stage.source_tag,
-        &stage.segments_for_dump,
+        &stage.mic_segments_for_dump,
+        &stage.sys_segments_for_dump,
         &chunks,
         &thresholds,
         Some(&pieces_pre),
@@ -1033,7 +1083,8 @@ async fn write_diagnostics_json(
     note_id: &str,
     engine: diarize::Engine,
     source: &str,
-    segments: &[diarize::Segment],
+    mic_segments: &[diarize::Segment],
+    sys_segments: &[diarize::Segment],
     chunks: &[ChunkRecord],
     thresholds: &diarize::Thresholds,
     pieces_pre: Option<&[LabelledPiece]>,
@@ -1069,6 +1120,15 @@ async fn write_diagnostics_json(
             // uses. Surfacing it lets us audit whether word-level
             // assignment is actually happening, or whether the chunk
             // fell through to the no-words fallback path.
+            //
+            // Resolved against the word's *own* stream: a hybrid recording
+            // diarizes mic and sys separately, and both segment lists are
+            // stream-relative, so looking a mic word up in sys segments
+            // would invent an id that never labelled anything.
+            let segments = match c.source {
+                ChunkSource::Mic => mic_segments,
+                ChunkSource::Sys => sys_segments,
+            };
             let words: Vec<_> = c
                 .words
                 .iter()
@@ -1131,7 +1191,8 @@ async fn write_diagnostics_json(
             "sortformer_silence": thresholds.sortformer_silence,
             "sortformer_pred": thresholds.sortformer_pred,
         },
-        "segments": segments,
+        "mic_segments": mic_segments,
+        "sys_segments": sys_segments,
         "chunks": chunk_payload,
         "pieces_before_bridge": pieces_pre_json,
         "pieces_after_bridge": pieces_post_json,
@@ -2410,7 +2471,10 @@ async fn diarize_and_apply(
     // not per-session.
     let mic_wav = post_stop.mic_wav.clone();
     let sys_wav = post_stop.sys_wav.clone();
-    let chunks = post_stop.chunks.clone();
+    // Defensive: `transcribe_chunk` already drops these, so this normally
+    // changes nothing. It matters for chunks that predate that guard, and it
+    // has to happen before the capture-mode decision below.
+    let chunks = drop_incidental_stream_hallucinations(post_stop.chunks.clone());
     let snapshot = post_stop.transcript_at_start.clone();
     let session_id = post_stop.session_id.clone();
     let (expected_speakers, engine, thresholds) = {
@@ -2505,7 +2569,7 @@ async fn diarize_and_apply(
                         single_speaker_fallback()
                     }
                     Ok(segments) => {
-                        write_diagnostics_json(&app, &note_id, engine, "mic", &segments, &chunks, &thresholds, None, None).await;
+                        write_diagnostics_json(&app, &note_id, engine, "mic", &segments, &[], &chunks, &thresholds, None, None).await;
                         let display_map = build_display_map(&chunks, &segments, ChunkSource::Mic);
                         Box::new(move |c: &ChunkRecord| split_by_segments(c, &segments, &display_map))
                     }
@@ -2548,7 +2612,7 @@ async fn diarize_and_apply(
                         single_speaker_fallback()
                     }
                     Ok(segments) => {
-                        write_diagnostics_json(&app, &note_id, engine, "sys", &segments, &chunks, &thresholds, None, None).await;
+                        write_diagnostics_json(&app, &note_id, engine, "sys", &[], &segments, &chunks, &thresholds, None, None).await;
                         let display_map = build_display_map(&chunks, &segments, ChunkSource::Sys);
                         Box::new(move |c: &ChunkRecord| split_by_segments(c, &segments, &display_map))
                     }
@@ -2556,71 +2620,84 @@ async fn diarize_and_apply(
             }
         }
         (true, true) => {
-            // Remote/hybrid call: mic = "You" by channel attribution; the
-            // system stream gets diarized for remote-side speakers. Skip
-            // the mic diarize call entirely — no information to gain when
-            // every mic chunk is the same person.
+            // Both streams carried speech. Diarize *both* — see
+            // `build_hybrid_labels` for why the mic can't be assumed to hold
+            // a single person just because the system stream has content.
             //
-            // The per-note speaker hint is the *total* count the user
-            // expects (themselves + remote participants). Subtract one for
-            // the user's `You:` label so the diarizer is asked to find the
-            // remaining N-1 on the system stream. Floors at 1 — entering
-            // a hint of 1 in remote mode is nonsensical (would mean "just
-            // me" yet sys has chunks), so treat it as "find 1 remote".
-            let sys_speaker_hint = expected_speakers.map(|n| (n - 1).max(1));
-            //
-            // Three failure modes drop us into the single-speaker fallback
-            // splitter (mic = "You", sys = "Speaker 1"):
-            //   1. sys_full.wav missing (sidecar SIGKILL'd before close).
-            //   2. diarize sidecar errored.
-            //   3. diarize returned zero segments.
-            //
-            // The fallback assigns sys chunks `Speaker 1` rather than a
-            // None label, because a None label causes
-            // `build_labelled_transcript` to glue the chunk's text onto the
-            // previous label's line — i.e. remote audio would silently
-            // merge into the user's `You:` line. Better to surface a single
-            // unlabeled-but-distinct speaker than to lose the boundary.
-            let single_speaker_fallback = || -> Box<Splitter> {
-                Box::new(|c: &ChunkRecord| match c.source {
-                    ChunkSource::Mic => single_piece(c, Some("You".to_string())),
-                    ChunkSource::Sys => single_piece(c, Some("Speaker 1".to_string())),
-                })
-            };
-            match sys_wav.clone() {
+            // Order matters, and so does who gets the speaker hint. The
+            // per-note hint is a *total* across both streams, and only one
+            // stream can be handed a derived count, because the second one's
+            // share is only knowable after the first has been diarized. The
+            // hint is worth far more on the mic: `withSpeakers(exactly:)` is
+            // the one reliable lever we have over VBx, which otherwise "tends
+            // to choose 1 on dominant-speaker conversations" (see
+            // speaker-diarize/main.swift) — exactly the in-person meeting
+            // where one person does most of the talking. So the system stream
+            // goes first and the mic takes the remainder.
+            let sys_speaker_hint = hybrid_sys_hint(expected_speakers, &chunks);
+            let sys_segments = match sys_wav.clone() {
                 None => {
-                    eprintln!("diarize: sys chunks present but sys_full.wav missing, falling back to single-speaker labels");
+                    eprintln!("diarize: sys chunks present but sys_full.wav missing");
                     emit_error(
                         &app,
                         Some(&note_id),
-                        "Diarization unavailable for the remote side; remote speakers grouped under Speaker 1.",
+                        "Diarization unavailable for the remote side; remote speech grouped under one speaker.",
                     );
-                    single_speaker_fallback()
+                    Vec::new()
                 }
-                Some(wav) => match diarize_and_maybe_clean(&app, &wav, sys_speaker_hint, engine, thresholds).await {
-                    Err(e) => {
-                        eprintln!("diarize: sys diarize failed ({e}), falling back to single-speaker labels");
+                Some(wav) => diarize_and_maybe_clean(&app, &wav, sys_speaker_hint, engine, thresholds)
+                    .await
+                    .unwrap_or_else(|e| {
+                        eprintln!("diarize: sys diarize failed ({e})");
                         emit_error(
                             &app,
                             Some(&note_id),
-                            &format!("Diarization failed for the remote side ({e}); remote speakers grouped under Speaker 1."),
+                            &format!("Diarization failed for the remote side ({e}); remote speech grouped under one speaker."),
                         );
-                        single_speaker_fallback()
-                    }
-                    Ok(segments) if segments.is_empty() => {
-                        eprintln!("diarize: sys diarize returned no segments, falling back to single-speaker labels");
-                        single_speaker_fallback()
-                    }
-                    Ok(segments) => {
-                        write_diagnostics_json(&app, &note_id, engine, "sys", &segments, &chunks, &thresholds, None, None).await;
-                        let display_map = build_display_map(&chunks, &segments, ChunkSource::Sys);
-                        Box::new(move |c: &ChunkRecord| match c.source {
-                            ChunkSource::Mic => single_piece(c, Some("You".to_string())),
-                            ChunkSource::Sys => split_by_segments(c, &segments, &display_map),
-                        })
-                    }
-                },
+                        Vec::new()
+                    }),
+            };
+            let mic_speaker_hint = mic_hint_after_sys(expected_speakers, &sys_segments);
+            let mic_segments = match mic_wav.clone() {
+                None => {
+                    eprintln!("diarize: hybrid but mic_full.wav missing, mic falls back to You");
+                    Vec::new()
+                }
+                Some(wav) => diarize_and_maybe_clean(&app, &wav, mic_speaker_hint, engine, thresholds)
+                    .await
+                    .unwrap_or_else(|e| {
+                        eprintln!("diarize: hybrid mic diarize failed ({e}), mic falls back to You");
+                        Vec::new()
+                    }),
+            };
+            if mic_segments.is_empty() && sys_segments.is_empty() {
+                emit_error(
+                    &app,
+                    Some(&note_id),
+                    "Diarization found no distinct speakers; speech grouped by audio source.",
+                );
             }
+            write_diagnostics_json(&app, &note_id, engine, "hybrid", &mic_segments, &sys_segments, &chunks, &thresholds, None, None).await;
+            let labels = build_hybrid_labels(&chunks, &mic_segments, &sys_segments);
+            // A stream whose diarize produced nothing still needs a distinct
+            // label. A `None` label makes `build_labelled_transcript` glue the
+            // chunk's text onto the previous line, which would silently merge
+            // remote speech into the user's own turn — the bug
+            // `hybrid_fallback_keeps_sys_chunks_distinct_from_mic` pins.
+            // `next_free` keeps that fallback off any number the other
+            // stream's real speakers already took.
+            let sys_fallback = format!("Speaker {}", labels.next_free);
+            let HybridLabels { mic: mic_labels, sys: sys_labels, .. } = labels;
+            Box::new(move |c: &ChunkRecord| match c.source {
+                ChunkSource::Mic if mic_segments.is_empty() => {
+                    single_piece(c, Some("You".to_string()))
+                }
+                ChunkSource::Mic => split_by_labels(c, &mic_segments, &mic_labels),
+                ChunkSource::Sys if sys_segments.is_empty() => {
+                    single_piece(c, Some(sys_fallback.clone()))
+                }
+                ChunkSource::Sys => split_by_labels(c, &sys_segments, &sys_labels),
+            })
         }
         (false, false) => unreachable!("chunks.is_empty() returned earlier"),
     };
@@ -2711,6 +2788,196 @@ fn build_display_map(
         }
     }
     map
+}
+
+/// Below this share of the chunks, the system stream is treated as incidental
+/// rather than as a side of the conversation — a notification chime or a few
+/// seconds of video during an in-person meeting. One sys chunk out of 157 is
+/// 0.6%; a real call puts tens of percent on the system side.
+const INCIDENTAL_STREAM_CHUNK_SHARE: f32 = 0.05;
+
+/// Speaker hint for the system stream of a hybrid recording.
+///
+/// The per-note hint is a total across both streams, and the old `n - 1`
+/// assumed exactly one person on the mic. That still holds for a real remote
+/// call, so it's kept — but only when the system stream is actually carrying
+/// one. When sys is incidental, asking the diarizer to find `n - 1` speakers in
+/// what is effectively silence is worse than asking it for nothing, so it gets
+/// no hint and the whole total stays available for the mic.
+fn hybrid_sys_hint(expected_speakers: Option<i64>, chunks: &[ChunkRecord]) -> Option<i64> {
+    if chunks.is_empty() {
+        return None;
+    }
+    let sys = chunks.iter().filter(|c| c.source == ChunkSource::Sys).count();
+    let share = sys as f32 / chunks.len() as f32;
+    if share < INCIDENTAL_STREAM_CHUNK_SHARE {
+        return None;
+    }
+    expected_speakers.map(|n| (n - 1).max(1))
+}
+
+/// Speaker hint for the mic stream, once the system stream has been diarized:
+/// the note's total minus the voices the system side actually accounted for,
+/// floored at 1.
+///
+/// This is where the hint earns its keep. `withSpeakers(exactly:)` is the only
+/// reliable override of VBx's cluster-count search, which collapses to a single
+/// speaker on conversations where one person dominates — so an in-person
+/// meeting of three where one does most of the talking needs the count to come
+/// through, or everyone merges into one label.
+fn mic_hint_after_sys(
+    expected_speakers: Option<i64>,
+    sys_segments: &[diarize::Segment],
+) -> Option<i64> {
+    let sys_voices = distinct_speaker_count(sys_segments) as i64;
+    expected_speakers.map(|n| (n - sys_voices).max(1))
+}
+
+/// How many distinct voices a segment list describes. Used to turn the
+/// per-note "expected speakers" hint — a total across both streams — into a
+/// hint for the stream that hasn't been diarized yet. Counts raw segment ids
+/// rather than ids a chunk reached, because it feeds a hint rather than a
+/// label; `build_hybrid_labels` does the stricter reached-only count for the
+/// numbering itself.
+fn distinct_speaker_count(segments: &[diarize::Segment]) -> usize {
+    segments
+        .iter()
+        .map(|s| s.speaker_id.as_str())
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+}
+
+/// Final display labels for a *hybrid* recording — one where both the mic
+/// and the system stream produced speech.
+struct HybridLabels {
+    mic: std::collections::HashMap<String, String>,
+    sys: std::collections::HashMap<String, String>,
+    /// First speaker number not handed out. A stream whose diarize failed
+    /// takes this as its fallback label, so the fallback can't collide with
+    /// a real speaker found on the stream that succeeded.
+    next_free: u32,
+}
+
+/// Number both streams' speakers for a hybrid recording.
+///
+/// This used to be channel attribution alone: every mic chunk was hard-
+/// labelled `You` and only the system stream was diarized, on the assumption
+/// that a two-stream recording is a remote call with exactly one person at
+/// the microphone. That assumption fails in two ordinary shapes:
+///
+///   * An in-person meeting where something incidental plays through the
+///     system output — a notification chime, a few seconds of video. A
+///     *single* stray sys chunk was enough to route a whole room into the
+///     remote-call branch, skip the mic diarize entirely, and collapse
+///     everyone present onto one `You:` line.
+///   * A genuine hybrid meeting: several people in a room, on a call with
+///     remote participants. Everyone in the room shares the mic.
+///
+/// So both streams get diarized and both get numbered. `You` survives only
+/// where it is actually earned — when the mic diarize resolves to exactly
+/// one voice, that voice is the user, which is what a solo remote call looks
+/// like. A stream with no segments (diarize unavailable, errored, or empty)
+/// registers nothing and is left to the caller's fallback.
+///
+/// Numbering walks the merged chunk sequence in `(start_ms, source)` order
+/// off one shared counter, so a mic speaker and a sys speaker can never land
+/// on the same number. Mirrors `build_unified_display_map`'s rule for the
+/// cross-session unify pass. As in `build_display_map`, only speaker ids a
+/// chunk actually reaches consume a number — a segment nobody spoke over
+/// doesn't burn `Speaker 2`.
+fn build_hybrid_labels(
+    chunks: &[ChunkRecord],
+    mic_segments: &[diarize::Segment],
+    sys_segments: &[diarize::Segment],
+) -> HybridLabels {
+    let mut mic_nums: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    let mut sys_nums: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    let mut next: u32 = 1;
+
+    let mut sorted: Vec<&ChunkRecord> = chunks.iter().collect();
+    sorted.sort_by_key(|c| {
+        let source_rank = match c.source {
+            ChunkSource::Mic => 0,
+            ChunkSource::Sys => 1,
+        };
+        (c.start_ms, source_rank)
+    });
+
+    for chunk in sorted {
+        let (segments, map) = match chunk.source {
+            ChunkSource::Mic => (mic_segments, &mut mic_nums),
+            ChunkSource::Sys => (sys_segments, &mut sys_nums),
+        };
+        if segments.is_empty() {
+            continue;
+        }
+        let mut record = |sid: &str, next: &mut u32| {
+            if !map.contains_key(sid) {
+                map.insert(sid.to_string(), *next);
+                *next += 1;
+            }
+        };
+        if chunk.words.is_empty() {
+            if let Some(sid) = assign_speaker(chunk.start_ms, segments) {
+                record(sid, &mut next);
+            }
+            continue;
+        }
+        for word in &chunk.words {
+            let half = word.end_ms.saturating_sub(word.start_ms) / 2;
+            let mid = word.start_ms.saturating_add(half);
+            let abs = chunk.start_ms.saturating_add(mid);
+            if let Some(sid) = assign_speaker(abs, segments) {
+                record(sid, &mut next);
+            }
+        }
+    }
+
+    finalise_stream_labels(mic_nums, sys_nums, true, next)
+}
+
+/// Shared final step for the per-take hybrid pass and the cross-session unify
+/// pass: turn `speaker_id → N` maps into the display labels the transcript
+/// actually carries.
+///
+/// When `allow_you` is set and the mic resolved to exactly one voice, that
+/// voice is the user and takes `You` — the solo-remote-call shape. `You`
+/// doesn't consume a number, so the sys side closes the hole by restarting at
+/// 1 in assignment order. Otherwise every voice is numbered, which is what
+/// keeps a room of people distinct.
+fn finalise_stream_labels(
+    mic_nums: std::collections::HashMap<String, u32>,
+    sys_nums: std::collections::HashMap<String, u32>,
+    allow_you: bool,
+    next: u32,
+) -> HybridLabels {
+    if allow_you && mic_nums.len() == 1 {
+        let mic_id = mic_nums.into_keys().next().expect("len checked == 1");
+        let mut sys_ranked: Vec<(String, u32)> = sys_nums.into_iter().collect();
+        sys_ranked.sort_by_key(|(_, n)| *n);
+        let sys: std::collections::HashMap<String, String> = sys_ranked
+            .into_iter()
+            .enumerate()
+            .map(|(i, (sid, _))| (sid, format!("Speaker {}", i + 1)))
+            .collect();
+        let next_free = sys.len() as u32 + 1;
+        return HybridLabels {
+            mic: std::iter::once((mic_id, "You".to_string())).collect(),
+            sys,
+            next_free,
+        };
+    }
+
+    let to_labels = |m: std::collections::HashMap<String, u32>| {
+        m.into_iter()
+            .map(|(sid, n)| (sid, format!("Speaker {n}")))
+            .collect()
+    };
+    HybridLabels {
+        mic: to_labels(mic_nums),
+        sys: to_labels(sys_nums),
+        next_free: next,
+    }
 }
 
 /// Stitch the prior transcript snapshot to a freshly diarized session.
@@ -2877,10 +3144,28 @@ fn split_by_segments(
     segments: &[diarize::Segment],
     display_map: &std::collections::HashMap<String, u32>,
 ) -> Vec<LabelledPiece> {
+    let labels: std::collections::HashMap<String, String> = display_map
+        .iter()
+        .map(|(sid, n)| (sid.clone(), format!("Speaker {n}")))
+        .collect();
+    split_by_labels(c, segments, &labels)
+}
+
+/// Same word-walking split as `split_by_segments`, but the label map holds
+/// the *final* display string per speaker id rather than a number. That
+/// lets the hybrid branch mix a channel-attributed label (`You`, when the
+/// mic diarize found a single voice) with numbered ones on the same
+/// recording, and lets the second stream's numbers continue past the
+/// first's instead of restarting at 1.
+fn split_by_labels(
+    c: &ChunkRecord,
+    segments: &[diarize::Segment],
+    labels: &std::collections::HashMap<String, String>,
+) -> Vec<LabelledPiece> {
     let label_for_time = |abs_ms: u64| -> Option<String> {
         assign_speaker(abs_ms, segments)
-            .and_then(|sid| display_map.get(sid))
-            .map(|n| format!("Speaker {n}"))
+            .and_then(|sid| labels.get(sid))
+            .cloned()
     };
     if c.words.is_empty() {
         return single_piece(c, label_for_time(c.start_ms));
@@ -3264,15 +3549,18 @@ fn session_mode(chunks: &[ChunkRecord]) -> Option<SessionMode> {
 }
 
 /// Whether a session can join the concatenated unify pass, given which source
-/// WAVs survive on disk. Mic-only needs `mic.wav` (that's the stream that gets
-/// diarized); sys-only and hybrid need `sys.wav` (hybrid mic is "You" by
-/// channel attribution and never diarized, so a missing mic.wav doesn't block
-/// it). Sessions that fail this stay "frozen": their existing labels are kept
-/// and the unified numbering is offset past them.
+/// WAVs survive on disk: it needs every WAV whose stream will be diarized.
+/// Mic-only needs `mic.wav`, sys-only needs `sys.wav`, and **hybrid needs
+/// both** — its mic is diarized now rather than being labelled `You` by
+/// channel attribution, and `concat_wavs` fails the whole pass on an
+/// unreadable input, which would also misalign every later session's concat
+/// offset. Sessions that fail this stay "frozen": their existing labels are
+/// kept and the unified numbering is offset past them.
 fn session_unifiable(mode: SessionMode, has_mic_wav: bool, has_sys_wav: bool) -> bool {
     match mode {
         SessionMode::MicOnly => has_mic_wav,
-        SessionMode::SysOnly | SessionMode::Hybrid => has_sys_wav,
+        SessionMode::SysOnly => has_sys_wav,
+        SessionMode::Hybrid => has_mic_wav && has_sys_wav,
     }
 }
 
@@ -3387,6 +3675,7 @@ fn build_unified_display_map(
 ) -> (
     std::collections::HashMap<String, u32>,
     std::collections::HashMap<String, u32>,
+    u32,
 ) {
     let mut mic_map: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
     let mut sys_map: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
@@ -3401,11 +3690,18 @@ fn build_unified_display_map(
             (c.start_ms, source_rank)
         });
         for chunk in sorted {
+            // A hybrid take's mic used to be skipped here — it was labelled
+            // `You` by channel attribution and never diarized. It now gets
+            // numbered like any other stream so several people sharing one
+            // mic stay distinct; `finalise_stream_labels` re-applies `You`
+            // when the mic really did resolve to a single voice.
             let (segments, offset, map) = match chunk.source {
-                ChunkSource::Mic if sess.mode == SessionMode::Hybrid => continue,
                 ChunkSource::Mic => (mic_segments, sess.mic_offset_ms, &mut mic_map),
                 ChunkSource::Sys => (sys_segments, sess.sys_offset_ms, &mut sys_map),
             };
+            if segments.is_empty() {
+                continue;
+            }
             if chunk.words.is_empty() {
                 if let Some(sid) = assign_speaker(chunk.start_ms.saturating_add(offset), segments) {
                     if !map.contains_key(sid) {
@@ -3431,7 +3727,7 @@ fn build_unified_display_map(
             }
         }
     }
-    (mic_map, sys_map)
+    (mic_map, sys_map, next)
 }
 
 /// Result of the pure relabel pass: per-session timeline JSONL (manifest
@@ -3518,27 +3814,45 @@ fn unify_relabel(
     sys_segments: &[diarize::Segment],
     label_offset: u32,
 ) -> UnifyOutcome {
-    let (mic_map, sys_map) = build_unified_display_map(sessions, mic_segments, sys_segments);
+    let (mic_nums, sys_nums, next) =
+        build_unified_display_map(sessions, mic_segments, sys_segments);
+    // `You` is a channel-attribution artifact of a *remote call*: it only holds
+    // when every take that captured mic was one, and the combined mic stream
+    // really did resolve to a single voice (see `finalise_stream_labels`). A
+    // note that also has an in-person take numbers its voices instead —
+    // otherwise unifying a solo remote take with an in-person one would relabel
+    // the in-person speaker `You`, which is not what that take recorded.
+    let mic_sessions: Vec<&UnifySession> = sessions
+        .iter()
+        .filter(|s| s.mode != SessionMode::SysOnly)
+        .collect();
+    let allow_you = !mic_sessions.is_empty()
+        && mic_sessions.iter().all(|s| s.mode == SessionMode::Hybrid);
+    let HybridLabels { mic: mic_map, sys: sys_map, .. } =
+        finalise_stream_labels(mic_nums, sys_nums, allow_you, next);
 
     let mut values_per_session: Vec<Vec<serde_json::Value>> = Vec::new();
     for sess in sessions {
-        let mode = sess.mode;
         let mic_off = sess.mic_offset_ms;
         let sys_off = sess.sys_offset_ms;
         let splitter = |c: &ChunkRecord| -> Vec<LabelledPiece> {
             match c.source {
-                ChunkSource::Mic if mode == SessionMode::Hybrid => {
+                // A mic stream with no segments (diarize unavailable for this
+                // note's mic side) keeps the old channel-attributed label
+                // rather than emitting `None`, which would glue the text onto
+                // whatever line came before it.
+                ChunkSource::Mic if mic_segments.is_empty() => {
                     single_piece(c, Some("You".to_string()))
                 }
                 ChunkSource::Mic => {
                     let mut shifted = c.clone();
                     shifted.start_ms = shifted.start_ms.saturating_add(mic_off);
-                    split_by_segments(&shifted, mic_segments, &mic_map)
+                    split_by_labels(&shifted, mic_segments, &mic_map)
                 }
                 ChunkSource::Sys => {
                     let mut shifted = c.clone();
                     shifted.start_ms = shifted.start_ms.saturating_add(sys_off);
-                    split_by_segments(&shifted, sys_segments, &sys_map)
+                    split_by_labels(&shifted, sys_segments, &sys_map)
                 }
             }
         };
@@ -3746,13 +4060,15 @@ async fn unify_apply(
     engine: diarize::Engine,
     thresholds: diarize::Thresholds,
 ) -> anyhow::Result<bool> {
-    // Per-stream concatenation in manifest order. Mic concat = mic-only
-    // sessions (hybrid mic is "You" by channel attribution, never
-    // diarized); sys concat = sys-only + hybrid sessions. Matches the
-    // per-source passes diarize_and_apply runs on a single take.
+    // Per-stream concatenation in manifest order. Mic concat = every session
+    // that captured mic (mic-only *and* hybrid — a hybrid take's mic is
+    // diarized now, not assumed to be one person); sys concat = sys-only +
+    // hybrid. Matches the per-source passes diarize_and_apply runs on a single
+    // take. `session_unifiable` guarantees a hybrid session has both WAVs, so
+    // neither concat can hit a missing file and misalign the offsets.
     let mic_paths: Vec<PathBuf> = unifiable
         .iter()
-        .filter(|c| c.mode == SessionMode::MicOnly)
+        .filter(|c| c.mode != SessionMode::SysOnly)
         .map(|c| c.dir.join("mic.wav"))
         .collect();
     let sys_paths: Vec<PathBuf> = unifiable
@@ -3765,24 +4081,26 @@ async fn unify_apply(
     let mic_offsets = concat_wavs(&mic_paths, &mic_concat).await?;
     let sys_offsets = concat_wavs(&sys_paths, &sys_concat).await?;
 
-    // Same speaker-count hint semantics as the per-take pass: the note's
-    // expected_speakers applies to the mic stream directly (in-person);
-    // when any take is hybrid, one of those speakers is the user ("You"),
-    // so the sys stream is asked to find the remaining N-1. Sortformer's
-    // 4-speaker cap applies to the combined audio exactly as it does to a
-    // single take — no special-casing.
+    // Same speaker-count hint semantics as the per-take pass. With no system
+    // stream in play the note's expected_speakers applies to the mic directly
+    // (in-person). Once both streams exist the total can't be split a priori,
+    // so the mic goes in unhinted and the sys stream is asked for whatever the
+    // mic didn't account for. Sortformer's 4-speaker cap applies to the
+    // combined audio exactly as it does to a single take — no special-casing.
+    let mic_hint = if sys_paths.is_empty() {
+        expected_speakers
+    } else {
+        None
+    };
     let mic_segments = match &mic_offsets {
-        Some(_) => {
-            diarize_and_maybe_clean(app, &mic_concat, expected_speakers, engine, thresholds)
-                .await?
-        }
+        Some(_) => diarize_and_maybe_clean(app, &mic_concat, mic_hint, engine, thresholds).await?,
         None => Vec::new(),
     };
-    let any_hybrid = unifiable.iter().any(|c| c.mode == SessionMode::Hybrid);
-    let sys_hint = if any_hybrid {
-        expected_speakers.map(|n| (n - 1).max(1))
+    let sys_hint = if mic_paths.is_empty() {
+        expected_speakers
     } else {
         expected_speakers
+            .map(|n| (n - distinct_speaker_count(&mic_segments).max(1) as i64).max(1))
     };
     let sys_segments = match &sys_offsets {
         Some(_) => {
@@ -3810,7 +4128,11 @@ async fn unify_apply(
     let sessions_in: Vec<UnifySession> = unifiable
         .iter()
         .map(|c| {
-            let mic_offset_ms = if c.mode == SessionMode::MicOnly {
+            // Must mirror `mic_paths` / `sys_paths` above exactly — these
+            // offsets are consumed in the same order the concat was built, so a
+            // filter that disagrees shifts every later session's segment
+            // lookups into the wrong take's audio.
+            let mic_offset_ms = if c.mode != SessionMode::SysOnly {
                 mic_iter.next().unwrap_or(0)
             } else {
                 0
@@ -4733,6 +5055,12 @@ async fn transcribe_chunk(
     if is_likely_hallucination(&text, &language) {
         return Ok(());
     }
+    // NOTE: no word-timing collapse check here, deliberately. Degenerate
+    // timings are common in real speech from the local Whisper models, so the
+    // signal is only usable together with "this stream is statistically noise"
+    // — and mid-recording we don't yet know each stream's share of the whole.
+    // That filter therefore runs post-stop, in
+    // `drop_incidental_stream_hallucinations`.
     // Drop chunks dominated by N-gram repetition (Whisper collapse). Letting
     // them land in the transcript is bad on its own, but worse: the trail-
     // prompt feeds the loop forward into the next chunk's `initial_prompt`
@@ -5100,6 +5428,102 @@ fn is_likely_hallucination(text: &str, _language: &str) -> bool {
 /// The double rule keeps "yes yes yes" or "ja ja ja" mid-conversation from
 /// being dropped — a 3-rep tiny chunk is plausibly real speech, but a 3-rep
 /// run dominating a longer chunk is collapse.
+/// Minimum run of consecutive words pinned to a single zero-length instant for
+/// `is_timing_collapse` to fire.
+///
+/// **This is a weak signal on its own — never use it alone to drop content.**
+/// Measured against a real 45-minute Norwegian recording (local NB Whisper):
+/// four separate mic chunks of perfectly ordinary speech contain pinned runs of
+/// 3, 4, 4 and **7**, longer than the 4 in the hallucinated chunk this was
+/// written to catch. Degenerate timings are just how this model reports short
+/// words and trailing tokens. Only meaningful in conjunction with a prior that
+/// already suggests hallucination — see
+/// `drop_incidental_stream_hallucinations`.
+const TIMING_COLLAPSE_RUN: usize = 3;
+
+/// Whether a chunk's word timings show the aligner giving up: consecutive words
+/// landing on the *same* instant with zero duration, which is what happens when
+/// the decoder emits high-prior text it has no audio to align against.
+///
+/// Corroborating evidence, not proof. See `TIMING_COLLAPSE_RUN` for the measured
+/// false-positive rate on real speech.
+fn is_timing_collapse(spans: &[(u64, u64)]) -> bool {
+    let mut run = 1usize;
+    for pair in spans.windows(2) {
+        let (prev, cur) = (pair[0], pair[1]);
+        let pinned_together = prev.0 == prev.1 && cur.0 == cur.1 && prev.0 == cur.0;
+        if pinned_together {
+            run += 1;
+            if run >= TIMING_COLLAPSE_RUN {
+                return true;
+            }
+        } else {
+            run = 1;
+        }
+    }
+    false
+}
+
+/// Drop hallucinated chunks from a stream that is statistically noise.
+///
+/// Two weak signals in conjunction, because neither is sufficient alone:
+///
+///  1. **The stream is incidental** — it contributed a negligible share of the
+///     recording's chunks. One sys chunk in 157 is a notification chime or a few
+///     seconds of video during an in-person meeting, not a side of a
+///     conversation.
+///  2. **The chunk's word timings collapsed** — see `is_timing_collapse`. On its
+///     own this fires on real speech (runs of 7 measured on genuine mic chunks),
+///     which is why it's only consulted for a stream already known to be noise.
+///
+/// Restricting to the incidental stream is what makes this safe: the stream
+/// carrying the meeting is never touched, so no amount of timing weirdness in
+/// real speech can delete it.
+///
+/// Runs *before* the capture-mode decision, because a hallucinated chunk's
+/// damage isn't limited to its own line — a single one on an otherwise silent
+/// system stream flips the recording into the hybrid branch and then invents a
+/// phantom speaker for itself. Removing it lets an in-person recording be
+/// recognised as one.
+///
+/// Chunks without word timings pass through untouched: some providers (the
+/// current OpenAI path) don't return them, and absence of evidence isn't
+/// evidence of collapse.
+fn drop_incidental_stream_hallucinations(chunks: Vec<ChunkRecord>) -> Vec<ChunkRecord> {
+    let total = chunks.len();
+    if total == 0 {
+        return chunks;
+    }
+    let mic_count = chunks.iter().filter(|c| c.source == ChunkSource::Mic).count();
+    let sys_count = total - mic_count;
+    let is_incidental = |source: ChunkSource| -> bool {
+        let n = match source {
+            ChunkSource::Mic => mic_count,
+            ChunkSource::Sys => sys_count,
+        };
+        n > 0 && (n as f32 / total as f32) < INCIDENTAL_STREAM_CHUNK_SHARE
+    };
+    chunks
+        .into_iter()
+        .filter(|c| {
+            if c.words.is_empty() || !is_incidental(c.source) {
+                return true;
+            }
+            let spans: Vec<(u64, u64)> = c.words.iter().map(|w| (w.start_ms, w.end_ms)).collect();
+            if is_timing_collapse(&spans) {
+                eprintln!(
+                    "diarize: dropping hallucinated {:?} chunk at {}ms from incidental stream: {:?}",
+                    c.source,
+                    c.start_ms,
+                    c.text.chars().take(60).collect::<String>()
+                );
+                return false;
+            }
+            true
+        })
+        .collect()
+}
+
 fn is_repetition_collapse(text: &str) -> bool {
     let words: Vec<String> = text
         .split_whitespace()
@@ -6021,6 +6445,464 @@ mod diarize_tests {
         );
     }
 
+    /// Mic chunk with explicit chunk-relative word timings — mirrors
+    /// `sys_with_words` for the stream that only started getting diarized
+    /// in hybrid mode once `build_hybrid_labels` landed.
+    fn mic_with_words(start_ms: u64, words: Vec<(&str, u64, u64)>) -> ChunkRecord {
+        let mut c = sys_with_words(start_ms, words);
+        c.source = ChunkSource::Mic;
+        c
+    }
+
+    /// Build the splitter `diarize_and_apply`'s hybrid branch builds, so the
+    /// end-to-end tests exercise the real labelling path without the sidecar.
+    fn hybrid_splitter(
+        chunks: &[ChunkRecord],
+        mic_segments: Vec<Segment>,
+        sys_segments: Vec<Segment>,
+    ) -> impl Fn(&ChunkRecord) -> Vec<LabelledPiece> + Send {
+        let labels = build_hybrid_labels(chunks, &mic_segments, &sys_segments);
+        let sys_fallback = format!("Speaker {}", labels.next_free);
+        let HybridLabels { mic, sys, .. } = labels;
+        move |c: &ChunkRecord| match c.source {
+            ChunkSource::Mic if mic_segments.is_empty() => {
+                single_piece(c, Some("You".to_string()))
+            }
+            ChunkSource::Mic => split_by_labels(c, &mic_segments, &mic),
+            ChunkSource::Sys if sys_segments.is_empty() => {
+                single_piece(c, Some(sys_fallback.clone()))
+            }
+            ChunkSource::Sys => split_by_labels(c, &sys_segments, &sys),
+        }
+    }
+
+    #[test]
+    fn hybrid_in_person_meeting_with_one_stray_sys_chunk_still_separates_the_room() {
+        // The regression this whole change exists for. A 45-minute in-person
+        // meeting with three people, where something played through the system
+        // output for a couple of seconds (a chime, a video). That single sys
+        // chunk used to flip the branch to (mic+sys) = "remote call", skip the
+        // mic diarize entirely, and hard-label all three people `You:` —
+        // producing three transcript lines for 45 minutes of speech.
+        let chunks = vec![
+            mic(0, "Michael opens."),
+            mic(20_000, "Stian answers."),
+            sys(110_000, "Enhver likhet med virkelige hendelser er tilfeldig."),
+            mic(120_000, "Petter weighs in."),
+            mic(140_000, "Michael again."),
+        ];
+        let mic_segs = vec![
+            seg(0, 15_000, "M"),
+            seg(20_000, 30_000, "S"),
+            seg(120_000, 130_000, "P"),
+            seg(140_000, 150_000, "M"),
+        ];
+        let sys_segs = vec![seg(110_000, 112_000, "TV")];
+
+        let labels = build_hybrid_labels(&chunks, &mic_segs, &sys_segs);
+        assert_eq!(labels.mic.len(), 3, "three voices on the mic stay distinct");
+        assert!(
+            !labels.mic.values().any(|l| l == "You"),
+            "a room of three is not one `You`"
+        );
+
+        // Numbering is chronological across the merged stream, so the sys blip
+        // takes the number its position earns (3) and the third person in the
+        // room follows it (4). What matters is that no two voices share one.
+        assert_eq!(labels.mic.get("M").map(String::as_str), Some("Speaker 1"));
+        assert_eq!(labels.mic.get("S").map(String::as_str), Some("Speaker 2"));
+        assert_eq!(labels.sys.get("TV").map(String::as_str), Some("Speaker 3"));
+        assert_eq!(labels.mic.get("P").map(String::as_str), Some("Speaker 4"));
+        assert_eq!(labels.next_free, 5);
+
+        let splitter = hybrid_splitter(&chunks, mic_segs, sys_segs);
+        assert_eq!(
+            build_labelled_transcript(&chunks, &splitter),
+            "Speaker 1: Michael opens.\n\
+             Speaker 2: Stian answers.\n\
+             Speaker 3: Enhver likhet med virkelige hendelser er tilfeldig.\n\
+             Speaker 4: Petter weighs in.\n\
+             Speaker 1: Michael again."
+        );
+    }
+
+    #[test]
+    fn hybrid_lone_mic_voice_keeps_the_you_label() {
+        // Solo remote call — the shape the `You` shortcut was built for. The
+        // mic diarize resolves to one voice, so that voice is the user and
+        // keeps `You`, and the remote side still numbers from 1.
+        let chunks = vec![
+            mic(0, "Hi there."),
+            sys(500, "Hello."),
+            mic(2500, "How are you?"),
+            sys(4000, "Doing well."),
+        ];
+        let mic_segs = vec![seg(0, 10_000, "ME")];
+        let sys_segs = vec![seg(0, 2000, "REMOTE_A"), seg(3500, 6000, "REMOTE_B")];
+
+        let labels = build_hybrid_labels(&chunks, &mic_segs, &sys_segs);
+        assert_eq!(labels.mic.get("ME").map(String::as_str), Some("You"));
+        assert_eq!(
+            labels.sys.get("REMOTE_A").map(String::as_str),
+            Some("Speaker 1"),
+            "remote side numbers from 1, not 2 — `You` doesn't consume a number"
+        );
+        assert_eq!(labels.sys.get("REMOTE_B").map(String::as_str), Some("Speaker 2"));
+        assert_eq!(labels.next_free, 3);
+
+        let splitter = hybrid_splitter(&chunks, mic_segs, sys_segs);
+        assert_eq!(
+            build_labelled_transcript(&chunks, &splitter),
+            "You: Hi there.\nSpeaker 1: Hello.\nYou: How are you?\nSpeaker 2: Doing well."
+        );
+    }
+
+    #[test]
+    fn hybrid_speaker_numbers_never_collide_across_streams() {
+        let chunks = vec![
+            mic(0, "Room one."),
+            mic(10_000, "Room two."),
+            sys(20_000, "Remote one."),
+            sys(30_000, "Remote two."),
+        ];
+        let mic_segs = vec![seg(0, 5000, "A"), seg(10_000, 15_000, "B")];
+        let sys_segs = vec![seg(20_000, 25_000, "X"), seg(30_000, 35_000, "Y")];
+
+        let labels = build_hybrid_labels(&chunks, &mic_segs, &sys_segs);
+        let mut all: Vec<&String> = labels.mic.values().chain(labels.sys.values()).collect();
+        all.sort();
+        let before = all.len();
+        all.dedup();
+        assert_eq!(before, all.len(), "every speaker got a unique label: {all:?}");
+        assert_eq!(all.len(), 4);
+        assert_eq!(labels.next_free, 5);
+    }
+
+    #[test]
+    fn hybrid_sys_fallback_number_clears_the_mic_speakers() {
+        // Mic diarize succeeded with two voices, sys diarize produced nothing.
+        // The sys fallback label must not reuse `Speaker 1` — that would merge
+        // the system stream into a person who is actually in the room.
+        let chunks = vec![
+            mic(0, "Room one."),
+            mic(10_000, "Room two."),
+            sys(20_000, "Undiarized remote audio."),
+        ];
+        let mic_segs = vec![seg(0, 5000, "A"), seg(10_000, 15_000, "B")];
+
+        let labels = build_hybrid_labels(&chunks, &mic_segs, &[]);
+        assert_eq!(labels.mic.len(), 2);
+        assert!(labels.sys.is_empty());
+        assert_eq!(labels.next_free, 3, "fallback takes Speaker 3");
+
+        let splitter = hybrid_splitter(&chunks, mic_segs, Vec::new());
+        assert_eq!(
+            build_labelled_transcript(&chunks, &splitter),
+            "Speaker 1: Room one.\nSpeaker 2: Room two.\nSpeaker 3: Undiarized remote audio."
+        );
+    }
+
+    #[test]
+    fn hybrid_total_diarize_failure_matches_the_legacy_labels() {
+        // Neither stream could be diarized. Degrade to exactly what the old
+        // channel-attribution branch produced, so a diarize outage is no
+        // worse than it was before: mic = You, sys = a distinct Speaker 1.
+        let chunks = vec![
+            mic(0, "Ok thanks."),
+            sys(500, "You got it."),
+            mic(2000, "See you tomorrow."),
+        ];
+        let labels = build_hybrid_labels(&chunks, &[], &[]);
+        assert!(labels.mic.is_empty() && labels.sys.is_empty());
+        assert_eq!(labels.next_free, 1);
+
+        let splitter = hybrid_splitter(&chunks, Vec::new(), Vec::new());
+        assert_eq!(
+            build_labelled_transcript(&chunks, &splitter),
+            "You: Ok thanks.\nSpeaker 1: You got it.\nYou: See you tomorrow."
+        );
+    }
+
+    #[test]
+    fn hybrid_mic_diarize_failure_alone_still_numbers_the_remote_side_from_one() {
+        // mic.wav missing (sidecar SIGKILL'd before close) but sys diarized
+        // fine — the old behaviour exactly, since there's no mic speaker to
+        // push the remote numbering past.
+        let chunks = vec![mic(0, "Mine."), sys(500, "Theirs."), sys(9000, "Other theirs.")];
+        let sys_segs = vec![seg(0, 5000, "X"), seg(8000, 12_000, "Y")];
+
+        let labels = build_hybrid_labels(&chunks, &[], &sys_segs);
+        assert!(labels.mic.is_empty());
+        assert_eq!(labels.sys.get("X").map(String::as_str), Some("Speaker 1"));
+        assert_eq!(labels.sys.get("Y").map(String::as_str), Some("Speaker 2"));
+
+        let splitter = hybrid_splitter(&chunks, Vec::new(), sys_segs);
+        assert_eq!(
+            build_labelled_transcript(&chunks, &splitter),
+            "You: Mine.\nSpeaker 1: Theirs.\nSpeaker 2: Other theirs."
+        );
+    }
+
+    #[test]
+    fn hybrid_mic_chunk_splits_mid_chunk_between_two_people_in_the_room() {
+        // Previously impossible: the hybrid branch wrapped every mic chunk in
+        // `single_piece("You")`, so a 15-second VAD chunk holding a two-person
+        // exchange in the room emitted a single line. Word timings now drive a
+        // mid-chunk split on the mic stream the same way they do on sys.
+        let chunks = vec![
+            mic_with_words(
+                0,
+                vec![
+                    ("Hva", 0, 500),
+                    ("mener", 500, 1000),
+                    ("du?", 1000, 1500),
+                    ("Jeg", 6000, 6500),
+                    ("er", 6500, 7000),
+                    ("enig.", 7000, 7500),
+                ],
+            ),
+            sys(20_000, "Chime."),
+        ];
+        let mic_segs = vec![seg(0, 3000, "A"), seg(5000, 9000, "B")];
+        let sys_segs = vec![seg(20_000, 21_000, "T")];
+
+        let labels = build_hybrid_labels(&chunks, &mic_segs, &sys_segs);
+        assert_eq!(labels.mic.len(), 2, "two voices inside one mic chunk");
+
+        let pieces = split_by_labels(&chunks[0], &mic_segs, &labels.mic);
+        assert_eq!(pieces.len(), 2, "chunk split at the speaker boundary");
+        assert_eq!(pieces[0].text, "Hva mener du?");
+        assert_eq!(pieces[1].text, "Jeg er enig.");
+        assert_ne!(pieces[0].label, pieces[1].label);
+    }
+
+    #[test]
+    fn hybrid_segment_no_chunk_reaches_does_not_consume_a_number() {
+        // Same rule `build_display_map` follows: a segment nobody spoke over
+        // must not burn a display number, or the labels a user sees start at
+        // `Speaker 2` for no visible reason.
+        let chunks = vec![mic(0, "Only voice."), sys(50_000, "Remote.")];
+        // "GHOST" covers 20-30s, where no chunk starts.
+        let mic_segs = vec![seg(0, 10_000, "A"), seg(20_000, 30_000, "GHOST")];
+        let sys_segs = vec![seg(50_000, 55_000, "X")];
+
+        let labels = build_hybrid_labels(&chunks, &mic_segs, &sys_segs);
+        assert_eq!(labels.mic.len(), 1, "GHOST never reached, so never numbered");
+        // One reached mic voice → it's the user, and sys numbers from 1.
+        assert_eq!(labels.mic.get("A").map(String::as_str), Some("You"));
+        assert_eq!(labels.sys.get("X").map(String::as_str), Some("Speaker 1"));
+    }
+
+    #[test]
+    fn timing_collapse_catches_the_real_hallucinated_chunk() {
+        // Verbatim word timings from the K2 recording's single sys chunk —
+        // "Enhver likhet med virkelige hendelser og personer er tilfeldig."
+        // hallucinated over a two-second notification chime. Four words pinned
+        // to 3050-3050.
+        let spans = vec![
+            (760, 760),
+            (760, 1200),
+            (1500, 1500),
+            (1570, 2260),
+            (2260, 3050),
+            (3050, 3050),
+            (3050, 3050),
+            (3050, 3050),
+            (3050, 3050),
+        ];
+        assert!(is_timing_collapse(&spans));
+    }
+
+    #[test]
+    fn timing_collapse_ignores_clean_timings() {
+        // Monotonic, non-degenerate timings — ordinary transcribed speech.
+        let spans = vec![(0, 260), (260, 520), (520, 860), (890, 1380), (1400, 1560)];
+        assert!(!is_timing_collapse(&spans));
+        // A lone zero-duration word (quantisation) is not collapse.
+        assert!(!is_timing_collapse(&[(0, 260), (300, 300), (400, 900)]));
+        // Two adjacent zeros at the same instant still isn't enough.
+        assert!(!is_timing_collapse(&[(0, 260), (300, 300), (300, 300), (400, 900)]));
+        // Zeros at *different* instants aren't a pinned run.
+        assert!(!is_timing_collapse(&[(100, 100), (200, 200), (300, 300)]));
+        assert!(!is_timing_collapse(&[]));
+    }
+
+    #[test]
+    fn timing_collapse_alone_would_flag_real_speech_so_never_use_it_alone() {
+        // Tripwire. This pattern is from a genuine mic chunk in the K2
+        // recording — "Det var den. Det var den, ja." — whose local-Whisper
+        // timings contain a pinned run of SEVEN, longer than the hallucinated
+        // chunk's four. `is_timing_collapse` fires on it, which is exactly why
+        // `drop_incidental_stream_hallucinations` consults it only for a stream
+        // that is already statistically noise. Anyone tempted to promote this
+        // into a standalone hallucination filter deletes real speech.
+        let real_speech_with_pinned_run = vec![
+            (0, 300),
+            (300, 620),
+            (900, 900),
+            (900, 900),
+            (900, 900),
+            (900, 900),
+            (900, 900),
+            (900, 900),
+            (900, 900),
+        ];
+        assert!(
+            is_timing_collapse(&real_speech_with_pinned_run),
+            "documents the false positive this signal has on its own"
+        );
+    }
+
+    #[test]
+    fn dominant_stream_keeps_its_chunks_however_odd_the_timings() {
+        // The safety property. 156 mic chunks to 1 sys chunk: the mic carries
+        // the meeting, so even a mic chunk with a pinned run of 7 survives.
+        // Without this the K2 note would have lost four chunks of real speech.
+        let mut chunks: Vec<ChunkRecord> = (0..156)
+            .map(|i| {
+                mic_with_words(
+                    i * 15_000,
+                    vec![("Det", 0, 300), ("var", 900, 900), ("den", 900, 900), ("ja", 900, 900)],
+                )
+            })
+            .collect();
+        chunks.push(sys_with_words(
+            110_019,
+            vec![
+                ("Enhver", 760, 760),
+                ("og", 3050, 3050),
+                ("personer", 3050, 3050),
+                ("er", 3050, 3050),
+            ],
+        ));
+
+        let kept = drop_incidental_stream_hallucinations(chunks);
+        assert_eq!(kept.len(), 156, "every mic chunk survives");
+        assert!(kept.iter().all(|c| c.source == ChunkSource::Mic));
+    }
+
+    #[test]
+    fn a_stream_carrying_real_share_is_not_pruned() {
+        // A genuine two-sided call: sys is well above the incidental share, so
+        // its chunks are never dropped on timing evidence alone.
+        let chunks = vec![
+            mic_with_words(0, vec![("me", 0, 300)]),
+            sys_with_words(
+                1_000,
+                vec![("a", 500, 500), ("b", 500, 500), ("c", 500, 500), ("d", 500, 500)],
+            ),
+            mic_with_words(2_000, vec![("me", 0, 300)]),
+            sys_with_words(3_000, vec![("them", 0, 400)]),
+        ];
+        assert_eq!(drop_incidental_stream_hallucinations(chunks).len(), 4);
+    }
+
+    #[test]
+    fn dropping_the_collapsed_chunk_makes_the_recording_mic_only_again() {
+        // The whole point of filtering before the capture-mode decision: with
+        // the hallucinated sys chunk gone, this is an in-person recording, so it
+        // takes the mic-only branch and the note's head-count goes straight to
+        // the mic instead of being split with a phantom remote side.
+        // 40 clean mic chunks to 1 collapsed sys chunk — a 2.4% sys share, well
+        // inside "incidental", matching the real 1-in-157.
+        let mut chunks: Vec<ChunkRecord> = (0..40)
+            .map(|i| mic_with_words(i * 15_000, vec![("Jeg", 0, 260), ("snakker", 260, 900)]))
+            .collect();
+        chunks.push(sys_with_words(
+            110_019,
+            vec![
+                ("Enhver", 760, 760),
+                ("likhet", 760, 1200),
+                ("og", 3050, 3050),
+                ("personer", 3050, 3050),
+                ("er", 3050, 3050),
+                ("tilfeldig.", 3050, 3050),
+            ],
+        ));
+        assert!(chunks.iter().any(|c| c.source == ChunkSource::Sys));
+
+        let kept = drop_incidental_stream_hallucinations(chunks);
+        assert_eq!(kept.len(), 40, "the collapsed sys chunk is gone");
+        assert!(
+            !kept.iter().any(|c| c.source == ChunkSource::Sys),
+            "no sys chunks left → mic-only branch, no phantom speaker"
+        );
+    }
+
+    #[test]
+    fn chunks_without_word_timings_survive_the_filter() {
+        // Providers that don't return word timings (the current OpenAI path)
+        // must not have their chunks dropped for lack of evidence.
+        let chunks = vec![mic(0, "no word timings here"), sys(5_000, "nor here")];
+        assert_eq!(drop_incidental_stream_hallucinations(chunks).len(), 2);
+    }
+
+    #[test]
+    fn incidental_sys_stream_gives_the_whole_head_count_to_the_mic() {
+        // The K2 shape: 156 mic chunks, 1 sys chunk. The sys side is a chime,
+        // not a participant, so it must not consume a speaker from the hint —
+        // the room needs all three, because `withSpeakers(exactly:)` is the
+        // only thing that stops VBx collapsing a dominant-speaker meeting onto
+        // one cluster.
+        let mut chunks: Vec<ChunkRecord> = (0..156).map(|i| mic(i * 15_000, "talk")).collect();
+        chunks.push(sys(110_000, "chime"));
+
+        assert_eq!(hybrid_sys_hint(Some(3), &chunks), None, "sys gets no hint");
+        // Sys found nothing, so the mic keeps the full total.
+        assert_eq!(mic_hint_after_sys(Some(3), &[]), Some(3));
+    }
+
+    #[test]
+    fn real_remote_call_still_reserves_one_speaker_for_the_mic() {
+        // A genuine call: the system stream carries a real share of the
+        // conversation, so the old `n - 1` semantics hold and the mic ends up
+        // forced to exactly the one voice that makes `You` correct.
+        let chunks = vec![
+            mic(0, "me"),
+            sys(1_000, "them"),
+            mic(2_000, "me"),
+            sys(3_000, "them"),
+        ];
+        assert_eq!(hybrid_sys_hint(Some(3), &chunks), Some(2));
+        let sys_segs = vec![seg(0, 5_000, "R1"), seg(5_000, 9_000, "R2")];
+        assert_eq!(mic_hint_after_sys(Some(3), &sys_segs), Some(1));
+    }
+
+    #[test]
+    fn hybrid_hints_are_none_without_a_note_head_count() {
+        // No hint set on the note ("Auto") → nothing to route. This is the
+        // state the K2 note was in, which is why VBx was left to guess.
+        let chunks = vec![mic(0, "a"), sys(1_000, "b")];
+        assert_eq!(hybrid_sys_hint(None, &chunks), None);
+        assert_eq!(mic_hint_after_sys(None, &[]), None);
+    }
+
+    #[test]
+    fn mic_hint_floors_at_one_speaker() {
+        // Sys accounted for as many voices as the user expected (or more) —
+        // never ask the diarizer for zero or a negative count.
+        let sys_segs = vec![seg(0, 1_000, "A"), seg(1_000, 2_000, "B"), seg(2_000, 3_000, "C")];
+        assert_eq!(mic_hint_after_sys(Some(3), &sys_segs), Some(1));
+        assert_eq!(mic_hint_after_sys(Some(2), &sys_segs), Some(1));
+    }
+
+    #[test]
+    fn hybrid_sys_hint_handles_no_chunks() {
+        assert_eq!(hybrid_sys_hint(Some(3), &[]), None);
+    }
+
+    #[test]
+    fn distinct_speaker_count_counts_voices_not_segments() {
+        let segs = vec![
+            seg(0, 1000, "A"),
+            seg(1000, 2000, "B"),
+            seg(2000, 3000, "A"),
+            seg(3000, 4000, "C"),
+        ];
+        assert_eq!(distinct_speaker_count(&segs), 3);
+        assert_eq!(distinct_speaker_count(&[]), 0);
+    }
+
     #[test]
     fn label_returning_none_glues_to_previous_label_dont_use_for_distinct_speakers() {
         // Documents the underlying behavior the fallback above protects
@@ -6628,15 +7510,18 @@ mod unify_tests {
     }
 
     #[test]
-    fn session_unifiable_requires_the_diarized_stream() {
-        // Mic-only diarizes mic.wav; hybrid + sys-only diarize sys.wav.
-        // Hybrid mic is "You" by channel attribution, so its mic.wav is
-        // not required.
+    fn session_unifiable_requires_every_diarized_stream() {
+        // Mic-only diarizes mic.wav; sys-only diarizes sys.wav; hybrid now
+        // diarizes BOTH, so it needs both on disk. A hybrid session missing one
+        // can't join the concat — `concat_wavs` fails the whole pass on an
+        // unreadable input, and skipping it would misalign later sessions'
+        // offsets — so it stays frozen with its existing labels.
         assert!(session_unifiable(SessionMode::MicOnly, true, false));
         assert!(!session_unifiable(SessionMode::MicOnly, false, true));
         assert!(session_unifiable(SessionMode::SysOnly, false, true));
         assert!(!session_unifiable(SessionMode::SysOnly, true, false));
-        assert!(session_unifiable(SessionMode::Hybrid, false, true));
+        assert!(session_unifiable(SessionMode::Hybrid, true, true));
+        assert!(!session_unifiable(SessionMode::Hybrid, false, true));
         assert!(!session_unifiable(SessionMode::Hybrid, true, false));
     }
 
@@ -6702,10 +7587,12 @@ mod unify_tests {
     }
 
     #[test]
-    fn hybrid_mic_stays_you_and_numbering_spans_streams() {
-        // Take 1 in-person (mic-only), take 2 a remote call (hybrid).
-        // Numbering is one sequence across streams in reading order:
-        // the in-person voice is Speaker 1, the remote voice Speaker 2.
+    fn hybrid_mic_is_diarized_and_unified_with_the_in_person_take() {
+        // Take 1 in-person (mic-only), take 2 a remote call (hybrid). The
+        // hybrid take's mic used to be hard-labelled `You`, which hid the fact
+        // that it's the same person who spoke in take 1. Diarizing it means the
+        // unify pass can recognise the voice and give both takes one label.
+        // Numbering stays one sequence across streams in reading order.
         let s1 = usess(
             "a",
             SessionMode::MicOnly,
@@ -6729,8 +7616,75 @@ mod unify_tests {
         let t1 = entries_of(&out.timelines[0].1);
         let t2 = entries_of(&out.timelines[1].1);
         assert_eq!(t1[0].0, "Speaker 1");
-        assert_eq!(t2[0].0, "You");
+        assert_eq!(
+            t2[0].0, "Speaker 1",
+            "one voice across both takes — not `You` on a note with an in-person take"
+        );
         assert_eq!(t2[1].0, "Speaker 2");
+    }
+
+    #[test]
+    fn all_hybrid_takes_with_a_lone_mic_voice_keep_you() {
+        // Every take is a remote call and the combined mic stream is one voice:
+        // that's the shape `You` was built for, so it survives the unify pass
+        // and the remote side still numbers from 1.
+        let s1 = usess(
+            "a",
+            SessionMode::Hybrid,
+            vec![mic(0, "me first."), sys(2_000, "them first.")],
+            0,
+            0,
+            Vec::new(),
+        );
+        let s2 = usess(
+            "b",
+            SessionMode::Hybrid,
+            vec![mic(0, "me again."), sys(2_000, "them again.")],
+            0,
+            0,
+            Vec::new(),
+        );
+        let mic_segs = vec![seg(0, 5_000, "spk_me")];
+        let sys_segs = vec![seg(1_500, 6_000, "spk_them")];
+        let out = unify_relabel(&[s1, s2], &mic_segs, &sys_segs, 0);
+
+        let t1 = entries_of(&out.timelines[0].1);
+        let t2 = entries_of(&out.timelines[1].1);
+        assert_eq!(t1[0].0, "You");
+        assert_eq!(t1[1].0, "Speaker 1", "`You` doesn't consume a number");
+        assert_eq!(t2[0].0, "You");
+        assert_eq!(t2[1].0, "Speaker 1");
+    }
+
+    #[test]
+    fn hybrid_takes_with_several_mic_voices_number_the_room() {
+        // The multi-session form of the in-person regression: a hybrid take
+        // whose mic holds more than one person must not collapse them onto
+        // `You`, even though every take is hybrid.
+        let s1 = usess(
+            "a",
+            SessionMode::Hybrid,
+            vec![
+                mic(0, "first colleague."),
+                mic(6_000, "second colleague."),
+                sys(12_000, "remote voice."),
+            ],
+            0,
+            0,
+            Vec::new(),
+        );
+        let mic_segs = vec![seg(0, 4_000, "spk_a"), seg(5_000, 9_000, "spk_b")];
+        let sys_segs = vec![seg(11_000, 15_000, "spk_r")];
+        let out = unify_relabel(&[s1], &mic_segs, &sys_segs, 0);
+
+        let t = entries_of(&out.timelines[0].1);
+        assert_eq!(t[0].0, "Speaker 1");
+        assert_eq!(t[1].0, "Speaker 2");
+        assert_eq!(t[2].0, "Speaker 3");
+        assert!(
+            !t.iter().any(|e| e.0 == "You"),
+            "two people sharing the mic are not one `You`"
+        );
     }
 
     #[test]
