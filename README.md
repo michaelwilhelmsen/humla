@@ -121,9 +121,18 @@ The hosted option: sign up in-app, nothing to set up. Team workspaces are a paid
 
 Run your own PocketBase server — on a VPS or on your own machine — and point Humla at it in **Settings → Account → Connect**. Self-hosted servers have **no paywall**: every team feature is free. Billing only activates when the server has `STRIPE_SECRET_KEY` set, so a self-hosted server never asks anyone to pay.
 
-Self-hosting also needs Humla's PocketBase schema (the workspace/notes/folders/summary_prompts collections plus the workspace-isolation rules) and route hooks. That server-side setup is maintained separately from this open-source app and isn't bundled in this repo — if you'd like to run your own server, [open an issue](https://github.com/michaelwilhelmsen/humla/issues) and I'll share the schema and deploy recipe.
+Humla Cloud is developed together with the app rather than bolted on afterwards, and that's deliberate: it's what makes every local feature behave the same way inside a shared workspace as it does on your own machine. The sync engine itself lives in this repo — [`src-tauri/crates/cloud-sync`](src-tauri/crates/cloud-sync) is the client side, open source like the rest of the app. What isn't distributed is the server half that Humla Cloud runs against it, because the two move in lockstep and I change them together.
 
-For a real deployment, put PocketBase behind HTTPS (a reverse proxy) and point it at S3/R2 storage (Settings → Files) so audio blobs don't fill the local disk.
+So the honest advice for self-hosting is to **fork this repo and build your cloud layer against that snapshot**. A fork pins a version of the client you control, so your server can't drift out from under it when the app moves on — and you maintain the pair. `cloud-sync` tells you exactly what the server has to answer: the collections it pushes and pulls, the fields on each record, soft deletes, and last-write-wins on `client_updated_at`.
+
+The stack Humla Cloud uses, if you want somewhere to start:
+
+- **[PocketBase](https://pocketbase.io)** — one Go binary: SQLite, auth, file storage, REST API, admin UI. The whole server is a `pb_data` directory, which is also your backup story.
+- **Caddy** — reverse proxy for automatic TLS. Skippable on a trusted LAN; plain `http://` works, so a NAS needs no domain or certificate.
+- **Object storage (S3 / Cloudflare R2)** — audio blobs, configured in PocketBase's Settings → Files, so recordings don't fill the local disk.
+- **[Litestream](https://litestream.io)** — continuous SQLite replication to the same bucket.
+- **SMTP** — transactional email for signup verification and invites. Without it, sync works fine but accounts stay unverified.
+- **A small [Hono](https://hono.dev) service on Node** for workspace chat, using the [Vercel AI SDK](https://sdk.vercel.ai) for the agentic SSE loop and its own SQLite vector index (`better-sqlite3` + [`sqlite-vec`](https://github.com/asg017/sqlite-vec)). Chat retrieval runs server-side, which doesn't fit inside PocketBase's JS hooks — hence the separate process.
 
 ## Quick start
 
