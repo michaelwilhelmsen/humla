@@ -274,64 +274,53 @@ struct ChatStreamDelta {
     content: Option<String>,
 }
 
-/// Stream a multi-turn chat completion from cloud OpenAI. The summary path
-/// deliberately doesn't stream cloud responses, but chat needs live tokens, so
-/// this uses `stream: true` and parses the SSE frames. `on_delta` fires once
-/// per content delta; the full assembled answer is returned.
-pub(crate) async fn openai_chat_stream<F>(
-    base_url: &str,
-    api_key: &str,
-    model: &str,
-    messages: &[(&str, &str)],
-    mut on_delta: F,
-) -> Result<String>
-where
-    F: FnMut(&str) + Send,
-{
-    let req = ChatStreamRequest {
-        model,
-        messages: messages
-            .iter()
-            .map(|(role, content)| ChatMessage { role, content })
-            .collect(),
-        stream: true,
-        // Reasoning models (gpt-5.x / o-series) reject a custom temperature.
-        temperature: if is_reasoning_model(model) { None } else { Some(0.3) },
-    };
-    let url = format!("{base_url}/chat/completions");
-    let started = std::time::Instant::now();
-    let r = summary_cloud_client()
-        .post(&url)
-        .bearer_auth(api_key)
-        .json(&req)
-        .send()
-        .await
-        .map_err(|e| {
-            if e.is_timeout() {
-                anyhow!("Timed out waiting for OpenAI. Try again.")
-            } else if e.is_connect() {
-                anyhow!("Couldn't reach OpenAI. Check your internet connection.")
-            } else {
-                anyhow!("Network error talking to OpenAI: {}", error_chain(&e))
-            }
-        })?;
-    let status = r.status();
-    if !status.is_success() {
-        let body = r.text().await.unwrap_or_default();
-        return Err(anyhow!("HTTP {status} from {base_url}: {body}"));
+/// Byte-level line buffer for newline-delimited streaming bodies — OpenAI SSE
+/// frames and Ollama NDJSON both arrive this way.
+///
+/// Buffering at the **byte** level is the whole point. Decoding each network
+/// chunk with `from_utf8_lossy` as it arrives corrupts any multi-byte character
+/// split across two reads: a Norwegian `ø` (2 bytes) landing on the boundary
+/// becomes two U+FFFD replacement chars, permanently, in the saved summary or
+/// chat answer. Nothing replays the prefix. Buffering bytes and decoding only
+/// at `\n` is safe, because a complete line never ends mid-character.
+#[derive(Default)]
+struct LineBuf {
+    buf: Vec<u8>,
+}
+
+impl LineBuf {
+    fn extend(&mut self, chunk: &[u8]) {
+        self.buf.extend_from_slice(chunk);
     }
 
-    // SSE: newline-delimited `data: {json}` frames, terminated by `data: [DONE]`.
-    // Frames can split across byte chunks, so buffer and parse per line.
-    use futures_util::StreamExt;
-    let mut byte_stream = r.bytes_stream();
-    let mut buf = String::new();
-    let mut answer = String::new();
-    while let Some(chunk_res) = byte_stream.next().await {
-        let bytes = chunk_res.map_err(|e| anyhow!("stream read: {e}"))?;
-        buf.push_str(&String::from_utf8_lossy(&bytes));
-        while let Some(idx) = buf.find('\n') {
-            let line: String = buf.drain(..=idx).collect();
+    /// Take the next complete line (including its trailing newline, which
+    /// callers trim). `None` while the buffer holds only a partial line.
+    fn next_line(&mut self) -> Option<String> {
+        let idx = self.buf.iter().position(|&b| b == b'\n')?;
+        let raw: Vec<u8> = self.buf.drain(..=idx).collect();
+        Some(String::from_utf8_lossy(&raw).into_owned())
+    }
+}
+
+/// Incremental parser for an OpenAI `/chat/completions` SSE body.
+///
+/// SSE is newline-delimited `data: {json}` frames terminated by `data: [DONE]`.
+/// A frame can split across *any* byte-chunk boundary, so the tail of an
+/// incomplete line stays buffered until its newline arrives. Pure and
+/// synchronous on purpose — it's what the streaming summary path now depends
+/// on, and this way it's unit-testable without a mock HTTP server.
+#[derive(Default)]
+struct ChatSseParser {
+    lines: LineBuf,
+    answer: String,
+}
+
+impl ChatSseParser {
+    /// Feed one raw network chunk. Fires `on_delta` once per non-empty content
+    /// delta and appends the same text to the assembled answer.
+    fn push<F: FnMut(&str)>(&mut self, chunk: &[u8], on_delta: &mut F) {
+        self.lines.extend(chunk);
+        while let Some(line) = self.lines.next_line() {
             let line = line.trim();
             let Some(data) = line.strip_prefix("data:") else {
                 continue;
@@ -353,12 +342,83 @@ where
                 .and_then(|c| c.delta.content)
             {
                 if !delta.is_empty() {
-                    answer.push_str(&delta);
+                    self.answer.push_str(&delta);
                     on_delta(&delta);
                 }
             }
         }
     }
+}
+
+/// Consume an OpenAI `/chat/completions` SSE body, assembling
+/// `choices[0].delta.content` into the full answer and firing `on_delta` once
+/// per non-empty delta. Shared by the chat and summary streaming paths.
+async fn consume_chat_sse<F>(
+    ep: &Endpoint<'_>,
+    r: reqwest::Response,
+    mut on_delta: F,
+) -> Result<String>
+where
+    F: FnMut(&str) + Send,
+{
+    use futures_util::StreamExt;
+    let started = std::time::Instant::now();
+    let mut byte_stream = r.bytes_stream();
+    let mut parser = ChatSseParser::default();
+    while let Some(chunk_res) = byte_stream.next().await {
+        // A mid-stream read error means the connection died after headers
+        // arrived. Two very different causes, so don't give one piece of
+        // advice for both: the client's own timeout covers body reads too, so
+        // a genuinely slow model lands here and deserves the timeout message,
+        // while an abrupt drop is a VPN/proxy reaping the tunnel.
+        //
+        // Either way we keep nothing — a truncated summary saved as if
+        // complete is worse than a visible failure.
+        let bytes = chunk_res.map_err(|e| {
+            if e.is_timeout() {
+                return ep.timeout_error(started.elapsed().as_secs());
+            }
+            anyhow!(
+                "Connection dropped mid-response after {} chars: {}. \
+                 Check your VPN / proxy and try again.",
+                parser.answer.len(),
+                error_chain(&e),
+            )
+        })?;
+        parser.push(&bytes, &mut on_delta);
+    }
+    Ok(parser.answer)
+}
+
+/// Stream a multi-turn chat completion from cloud OpenAI. `on_delta` fires
+/// once per content delta; the full assembled answer is returned.
+pub(crate) async fn openai_chat_stream<F>(
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    messages: &[(&str, &str)],
+    on_delta: F,
+) -> Result<String>
+where
+    F: FnMut(&str) + Send,
+{
+    let req = ChatStreamRequest {
+        model,
+        messages: messages
+            .iter()
+            .map(|(role, content)| ChatMessage { role, content })
+            .collect(),
+        stream: true,
+        // Reasoning models (gpt-5.x / o-series) reject a custom temperature.
+        temperature: if is_reasoning_model(model) { None } else { Some(0.3) },
+    };
+    // Shares `post_chat` with the summary path, so chat inherits its retry on
+    // transient send failures — the half-closed-pooled-connection case hits a
+    // chat turn exactly as readily as a summary.
+    let ep = Endpoint::from_base(base_url);
+    let started = std::time::Instant::now();
+    let r = post_chat(&ep, api_key, &req, started).await?;
+    let answer = consume_chat_sse(&ep, r, on_delta).await?;
     eprintln!(
         "[llm] openai chat stream done in {:?}, {} chars",
         started.elapsed(),
@@ -377,6 +437,215 @@ pub async fn summarize(
     transcript: &str,
 ) -> Result<String> {
     summarize_with_base(BASE, api_key, model, false, system_prompt, transcript, |_| {}).await
+}
+
+/// Which `/chat/completions` endpoint a call is talking to.
+///
+/// Everything that differs between cloud OpenAI and a local OpenAI-compatible
+/// server hangs off here: the client's timeout budget, the URL, and — the part
+/// worth having a type for — the vocabulary of its failure messages. Telling a
+/// user to restart `ollama serve` when their internet is down is worse than
+/// saying nothing, and the reverse is equally unhelpful.
+enum Endpoint<'a> {
+    Cloud,
+    /// Base URL of a local OpenAI-compat server (Ollama, LM Studio,
+    /// llama-server, vLLM).
+    Local(&'a str),
+}
+
+impl<'a> Endpoint<'a> {
+    fn from_base(base_url: &'a str) -> Self {
+        if base_url == BASE {
+            Self::Cloud
+        } else {
+            Self::Local(base_url)
+        }
+    }
+
+    fn base(&self) -> &str {
+        match self {
+            Self::Cloud => BASE,
+            Self::Local(base) => base,
+        }
+    }
+
+    fn url(&self) -> String {
+        format!("{}/chat/completions", self.base())
+    }
+
+    fn client(&self) -> reqwest::Client {
+        match self {
+            Self::Cloud => summary_cloud_client(),
+            Self::Local(_) => local_client(),
+        }
+    }
+
+    fn timeout_error(&self, secs: u64) -> anyhow::Error {
+        let base = self.base();
+        match self {
+            Self::Cloud => anyhow!(
+                "Timed out after {secs}s waiting for {base}. \
+                 OpenAI's response was unusually slow — try again, \
+                 or switch the summary provider to Local."
+            ),
+            Self::Local(_) => anyhow!(
+                "Timed out after {secs}s waiting for {base}. \
+                 The local model may be stuck — restart your \
+                 local-LLM server (e.g. `pkill ollama && ollama serve`)."
+            ),
+        }
+    }
+
+    fn connect_error(&self) -> anyhow::Error {
+        let base = self.base();
+        match self {
+            Self::Cloud => anyhow!(
+                "Couldn't reach {base}. Check your internet connection and try again."
+            ),
+            Self::Local(_) => anyhow!(
+                "Couldn't reach {base}. Is your local-LLM server running? (ollama serve, etc.)"
+            ),
+        }
+    }
+
+    fn network_error(&self, cause: &str) -> anyhow::Error {
+        let base = self.base();
+        match self {
+            Self::Cloud => anyhow!(
+                "Network error talking to OpenAI: {cause}. \
+                 Check your internet connection (DNS / VPN / proxy) and try again."
+            ),
+            Self::Local(_) => anyhow!(
+                "Network error talking to {base}: {cause}. \
+                 Check that your local-LLM server is reachable."
+            ),
+        }
+    }
+}
+
+/// POST a chat-completions body and hand back a **successful** response,
+/// retrying transient send-side failures and turning a non-2xx into an error
+/// carrying the server's body (which is where the useful part lives — bad model
+/// name, quota, context-length overflow).
+///
+/// reqwest reuses HTTP/2 connections from its pool; OpenAI's edge silently
+/// half-closes idle ones, so a long-running app's first request after a quiet
+/// period can fail with Kind::Request ("error sending request for url") before
+/// any bytes leave the wire. A fresh connection usually succeeds, but in the
+/// wild we've seen the second attempt also fail (brief DNS / TLS hiccups), so
+/// allow up to two retries. Don't retry on timeout (genuine slowness — a retry
+/// just doubles the wait) or connect-refused (the server is unreachable).
+///
+/// Note this only covers failures *before* response headers. A connection
+/// reaped while the model thinks lands here too but is not fixable by
+/// retrying — see the streaming note in `summarize_with_base`.
+async fn post_chat(
+    ep: &Endpoint<'_>,
+    api_key: &str,
+    body: &impl Serialize,
+    started: std::time::Instant,
+) -> Result<reqwest::Response> {
+    const MAX_RETRIES: u32 = 2;
+    let http = ep.client();
+    let url = ep.url();
+    let mut attempt: u32 = 0;
+    let r = loop {
+        let send_res = http.post(&url).bearer_auth(api_key).json(body).send().await;
+        match send_res {
+            Ok(resp) => break resp,
+            Err(e) => {
+                let retryable = !e.is_timeout() && !e.is_connect() && attempt < MAX_RETRIES;
+                eprintln!(
+                    "[llm] send error after {:?}: timeout={} connect={} attempt={} retrying={} body={} source={}",
+                    started.elapsed(),
+                    e.is_timeout(),
+                    e.is_connect(),
+                    attempt,
+                    retryable,
+                    e,
+                    error_chain(&e),
+                );
+                if retryable {
+                    attempt += 1;
+                    // Backoff lengthens with each retry so we don't immediately
+                    // reuse the same stale pooled connection and so brief
+                    // network blips have time to clear. 500ms then 1.5s.
+                    let backoff_ms = 500u64.saturating_mul(attempt as u64).max(500);
+                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                    continue;
+                }
+                if e.is_timeout() {
+                    return Err(ep.timeout_error(started.elapsed().as_secs()));
+                }
+                if e.is_connect() {
+                    return Err(ep.connect_error());
+                }
+                return Err(ep.network_error(&error_chain(&e)));
+            }
+        }
+    };
+
+    let status = r.status();
+    eprintln!("[llm] response {status} after {:?}", started.elapsed());
+    if !status.is_success() {
+        let body = r.text().await.unwrap_or_default();
+        eprintln!("[llm] error body: {body}");
+        return Err(anyhow!("HTTP {status} from {}: {body}", ep.base()));
+    }
+    Ok(r)
+}
+
+/// Cloud-OpenAI summary, streamed. Same contract as `summarize_with_base` —
+/// returns the assembled summary — but fires `on_chunk` per content delta so
+/// the UI shows tokens landing, and, crucially, keeps bytes moving on the wire
+/// so no middlebox reaps the connection while a reasoning model thinks.
+///
+/// Cloud `/chat/completions` doesn't expose reasoning tokens in its SSE
+/// deltas, so `StreamChunk::Thinking` is never emitted here — only the Ollama
+/// native path produces those.
+async fn summarize_cloud_stream<F>(
+    api_key: &str,
+    model: &str,
+    system_prompt: &str,
+    transcript: &str,
+    mut on_chunk: F,
+) -> Result<String>
+where
+    F: FnMut(StreamChunk) + Send,
+{
+    let req = ChatStreamRequest {
+        model,
+        messages: vec![
+            ChatMessage { role: "system", content: system_prompt },
+            ChatMessage { role: "user", content: transcript },
+        ],
+        stream: true,
+        // Reasoning models (gpt-5.x / o-series) reject a custom temperature.
+        temperature: if is_reasoning_model(model) { None } else { Some(0.2) },
+    };
+    let ep = Endpoint::Cloud;
+    let started = std::time::Instant::now();
+    eprintln!(
+        "[llm] POST {} (stream) model={model} system_chars={} user_chars={}",
+        ep.url(),
+        system_prompt.len(),
+        transcript.len()
+    );
+    let r = post_chat(&ep, api_key, &req, started).await?;
+    let summary = consume_chat_sse(&ep, r, |delta| on_chunk(StreamChunk::Content(delta))).await?;
+    eprintln!(
+        "[llm] stream success in {:?}, content {} chars",
+        started.elapsed(),
+        summary.len()
+    );
+    if summary.trim().is_empty() {
+        // 200 OK, frames arrived, no content in any of them. Cloud SSE deltas
+        // carry no reasoning, so we genuinely can't tell whether the model
+        // burned its budget thinking or something else went wrong — don't
+        // assert a cause we can't observe.
+        return Err(anyhow!("{model} returned an empty response"));
+    }
+    Ok(summary)
 }
 
 /// Same shape as `summarize` but takes an explicit base URL. Used to route
@@ -399,7 +668,8 @@ pub async fn summarize_with_base<F>(
 where
     F: FnMut(StreamChunk) + Send,
 {
-    let is_local = base_url != BASE;
+    let ep = Endpoint::from_base(base_url);
+    let is_local = matches!(ep, Endpoint::Local(_));
     // For Ollama, route through the native /api/chat endpoint so we can
     // pass an explicit `think` flag and reliably control Qwen 3+'s
     // thinking mode. The OpenAI-compat endpoint renders the chat template
@@ -414,7 +684,29 @@ where
             .await;
         }
     }
-    // Cloud OpenAI-compat path is non-streaming; on_chunk is unused.
+    // Cloud OpenAI streams. It must: a non-streaming reasoning-model call
+    // (gpt-5.x on a long transcript) sits with zero bytes on the wire for
+    // minutes while the model thinks, and anything stateful in the path — a
+    // VPN tunnel, a corporate proxy, NAT — reaps the idle connection and
+    // sends a bare FIN. reqwest surfaces that as Kind::Request
+    // ("peer closed connection without sending TLS close_notify") *before*
+    // response headers, so it reads as a send-side failure and the retry
+    // loop below can't help: every attempt goes silent for minutes too.
+    // Streaming keeps frames flowing, so nothing looks idle. Confirmed in
+    // the wild — summaries failed under NordVPN and succeeded with it off.
+    //
+    // Caveat worth knowing before trusting this: `/chat/completions` does not
+    // stream reasoning tokens, so on a gpt-5.x model the body can still be
+    // quiet for the whole thinking phase. Headers now return promptly and any
+    // reap lands mid-stream instead of pre-headers, but if the tunnel reaps on
+    // TCP idle rather than time-to-first-byte, the window is narrowed rather
+    // than closed.
+    if !is_local {
+        return summarize_cloud_stream(api_key, model, system_prompt, transcript, on_chunk).await;
+    }
+    // Local OpenAI-compat servers (LM Studio, llama-server, vLLM) stay
+    // non-streaming — they're on localhost, with no middlebox to reap the
+    // connection. Ollama already took the native streaming path above.
     let _ = on_chunk;
     let req = ChatRequest {
         model,
@@ -430,106 +722,14 @@ where
             ChatMessage { role: "user", content: transcript },
         ],
     };
-    let http = if is_local { local_client() } else { summary_cloud_client() };
-    let url = format!("{base_url}/chat/completions");
     let started = std::time::Instant::now();
     eprintln!(
-        "[llm] POST {url} model={model} system_chars={} user_chars={}",
+        "[llm] POST {} model={model} system_chars={} user_chars={}",
+        ep.url(),
         system_prompt.len(),
         transcript.len()
     );
-    // Retry transient send-side errors. reqwest reuses HTTP/2 connections
-    // from its pool; OpenAI's edge silently half-closes idle ones, so a
-    // long-running app's first request after a quiet period can fail with
-    // Kind::Request ("error sending request for url") before any bytes
-    // leave the wire. A fresh connection usually succeeds, but in the wild
-    // we've seen the second attempt also fail (brief DNS / TLS hiccups),
-    // so allow up to two retries. Don't retry on timeout (genuine slowness
-    // — a retry just doubles the wait) or connect-refused (the server is
-    // unreachable, retrying is pointless).
-    const MAX_RETRIES: u32 = 2;
-    let mut attempt: u32 = 0;
-    let r = loop {
-        let send_res = http
-            .post(&url)
-            .bearer_auth(api_key)
-            .json(&req)
-            .send()
-            .await;
-        match send_res {
-            Ok(resp) => break resp,
-            Err(e) => {
-                let retryable =
-                    !e.is_timeout() && !e.is_connect() && attempt < MAX_RETRIES;
-                eprintln!(
-                    "[llm] send error after {:?}: timeout={} connect={} attempt={} retrying={} body={} source={}",
-                    started.elapsed(),
-                    e.is_timeout(),
-                    e.is_connect(),
-                    attempt,
-                    retryable,
-                    e,
-                    error_chain(&e),
-                );
-                if retryable {
-                    attempt += 1;
-                    // Backoff lengthens with each retry so we don't immediately
-                    // reuse the same stale pooled connection and so brief
-                    // network blips have time to clear. 500ms then 1.5s.
-                    let backoff_ms = 500u64.saturating_mul(attempt as u64).max(500);
-                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms))
-                        .await;
-                    continue;
-                }
-                if e.is_timeout() {
-                    let secs = started.elapsed().as_secs();
-                    if is_local {
-                        return Err(anyhow!(
-                            "Timed out after {secs}s waiting for {base_url}. \
-                             The local model may be stuck — restart your \
-                             local-LLM server (e.g. `pkill ollama && ollama serve`)."
-                        ));
-                    }
-                    return Err(anyhow!(
-                        "Timed out after {secs}s waiting for {base_url}. \
-                         OpenAI's response was unusually slow — try again, \
-                         or switch the summary provider to Local."
-                    ));
-                }
-                if e.is_connect() {
-                    if is_local {
-                        return Err(anyhow!(
-                            "Couldn't reach {base_url}. Is your local-LLM \
-                             server running? (ollama serve, etc.)"
-                        ));
-                    }
-                    return Err(anyhow!(
-                        "Couldn't reach {base_url}. Check your internet \
-                         connection and try again."
-                    ));
-                }
-                let cause = error_chain(&e);
-                if is_local {
-                    return Err(anyhow!(
-                        "Network error talking to {base_url}: {cause}. \
-                         Check that your local-LLM server is reachable."
-                    ));
-                }
-                return Err(anyhow!(
-                    "Network error talking to OpenAI: {cause}. \
-                     Check your internet connection (DNS / VPN / proxy) and try again."
-                ));
-            }
-        }
-    };
-
-    let status = r.status();
-    eprintln!("[llm] response {status} after {:?}", started.elapsed());
-    if !status.is_success() {
-        let body = r.text().await.unwrap_or_default();
-        eprintln!("[llm] error body: {body}");
-        return Err(anyhow!("HTTP {status} from {base_url}: {body}"));
-    }
+    let r = post_chat(&ep, api_key, &req, started).await?;
     // Read the body once so we can log it on parse failure (Ollama's error
     // shape on quirky responses isn't always OpenAI-compat).
     let body_text = r.text().await?;
@@ -870,18 +1070,15 @@ where
     // for the return value and forward thinking to the caller's callback.
     use futures_util::StreamExt;
     let mut byte_stream = r.bytes_stream();
-    let mut buf = String::new();
+    let mut lines = LineBuf::default();
     let mut content = String::new();
     let mut thinking_chars: usize = 0;
     let mut chunks_seen: usize = 0;
 
     while let Some(chunk_res) = byte_stream.next().await {
         let bytes = chunk_res.map_err(|e| anyhow!("stream read: {e}"))?;
-        // Lossy is fine — Ollama's frames are ASCII/UTF-8 JSON; if a multibyte
-        // character spans frames the next chunk will replay the prefix.
-        buf.push_str(&String::from_utf8_lossy(&bytes));
-        while let Some(idx) = buf.find('\n') {
-            let line: String = buf.drain(..=idx).collect();
+        lines.extend(&bytes);
+        while let Some(line) = lines.next_line() {
             let line = line.trim();
             if line.is_empty() {
                 continue;
@@ -1054,7 +1251,7 @@ where
 
     use futures_util::StreamExt;
     let mut byte_stream = r.bytes_stream();
-    let mut buf = String::new();
+    let mut lines = LineBuf::default();
     let mut answer = String::new();
     // Accumulate tool-call fragments by index → (id, name, arguments).
     let mut calls: Vec<(String, String, String)> = Vec::new();
@@ -1063,9 +1260,8 @@ where
     let mut stop = false;
     while let Some(chunk_res) = byte_stream.next().await {
         let bytes = chunk_res.map_err(|e| anyhow!("stream read: {e}"))?;
-        buf.push_str(&String::from_utf8_lossy(&bytes));
-        while let Some(idx) = buf.find('\n') {
-            let line: String = buf.drain(..=idx).collect();
+        lines.extend(&bytes);
+        while let Some(line) = lines.next_line() {
             let line = line.trim();
             let Some(data) = line.strip_prefix("data:") else { continue };
             let data = data.trim();
@@ -1399,6 +1595,101 @@ pub(crate) async fn openai_embed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Feed a whole SSE body through the parser in fixed-size byte slices,
+    // returning (assembled answer, the deltas that fired). Slicing at
+    // arbitrary widths is the point: real chunk boundaries land mid-frame.
+    fn parse_sse(body: &str, slice: usize) -> (String, Vec<String>) {
+        let mut parser = ChatSseParser::default();
+        let mut deltas: Vec<String> = Vec::new();
+        let mut on_delta = |d: &str| deltas.push(d.to_string());
+        for part in body.as_bytes().chunks(slice) {
+            parser.push(part, &mut on_delta);
+        }
+        (parser.answer, deltas)
+    }
+
+    fn frame(content: &str) -> String {
+        format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":{}}}}}]}}\n\n",
+            serde_json::to_string(content).unwrap()
+        )
+    }
+
+    #[test]
+    fn sse_assembles_deltas_in_order() {
+        let body = format!("{}{}{}data: [DONE]\n", frame("Hello"), frame(", "), frame("world"));
+        let (answer, deltas) = parse_sse(&body, body.len());
+        assert_eq!(answer, "Hello, world");
+        assert_eq!(deltas, vec!["Hello", ", ", "world"]);
+    }
+
+    #[test]
+    fn sse_survives_frames_split_across_chunk_boundaries() {
+        // The failure this guards: a summary truncated because one frame
+        // straddled two TCP reads. Every slice width must yield the same
+        // answer, including 1 byte at a time (worst case: every frame split).
+        let body = format!(
+            "{}{}{}data: [DONE]\n",
+            frame("Oppsummering:"),
+            frame(" møtet"),
+            frame(" handlet om design.")
+        );
+        let expected = "Oppsummering: møtet handlet om design.";
+        for slice in [1, 3, 7, 17, 64, 4096] {
+            let (answer, _) = parse_sse(&body, slice);
+            assert_eq!(answer, expected, "split at {slice} bytes lost content");
+        }
+    }
+
+    #[test]
+    fn sse_keeps_multibyte_characters_split_across_chunk_boundaries_intact() {
+        // Regression: the parser used to decode each network chunk with
+        // from_utf8_lossy on arrival, so a 2-byte `ø` (or `æ`/`å`/an em dash)
+        // straddling two TCP reads became two U+FFFD chars in the saved
+        // summary. Slice at every width so the boundary lands inside each
+        // multi-byte char in turn.
+        let body = format!("{}data: [DONE]\n", frame("Blåbær — økt på tømmerhøgda"));
+        let expected = "Blåbær — økt på tømmerhøgda";
+        for slice in 1..=body.len() {
+            let (answer, _) = parse_sse(&body, slice);
+            assert_eq!(answer, expected, "split at {slice} bytes mangled UTF-8");
+            assert!(!answer.contains('\u{FFFD}'), "replacement char at slice {slice}");
+        }
+    }
+
+    #[test]
+    fn sse_skips_heartbeats_and_unparseable_frames() {
+        // OpenAI interleaves `:` comment keep-alives, and a role-only opening
+        // frame carries no content. Neither may abort the answer.
+        let body = format!(
+            ": ping\n\ndata: {{\"choices\":[{{\"delta\":{{\"role\":\"assistant\"}}}}]}}\n\n\
+             {}data: not-json\n\n{}data: [DONE]\n",
+            frame("A"),
+            frame("B")
+        );
+        let (answer, deltas) = parse_sse(&body, 5);
+        assert_eq!(answer, "AB");
+        assert_eq!(deltas, vec!["A", "B"]);
+    }
+
+    #[test]
+    fn sse_ignores_empty_deltas_so_the_ui_gets_no_noop_events() {
+        let body = format!("{}{}{}data: [DONE]\n", frame("A"), frame(""), frame("B"));
+        let (answer, deltas) = parse_sse(&body, 9);
+        assert_eq!(answer, "AB");
+        assert_eq!(deltas, vec!["A", "B"], "an empty delta must not fire on_delta");
+    }
+
+    #[test]
+    fn sse_truncated_at_the_last_frame_keeps_only_completed_frames() {
+        // A connection dropped mid-frame (the VPN case) leaves the partial
+        // line unparsed in the buffer rather than half-committing it.
+        let mut body = format!("{}{}", frame("Ferdig del"), frame("aldri fullført"));
+        body.truncate(body.len() - 30);
+        let (answer, _) = parse_sse(&body, 4);
+        assert_eq!(answer, "Ferdig del");
+    }
 
     #[test]
     fn qwen_family_detected() {

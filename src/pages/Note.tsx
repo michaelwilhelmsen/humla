@@ -86,6 +86,25 @@ function formatDateChip(ts: number) {
   return d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
 }
 
+/** Kick off a summary, surfacing any failure as a toast.
+ *
+ * Both entry points — the app bar's Summarize and the Summary panel's
+ * regenerate — must go through this. An uncaught rejection here is an
+ * unhandled promise: the spinner just stops, leaving no summary and no reason
+ * why. That's exactly how a VPN dropping the OpenAI connection presented.
+ *
+ * `onFailure` lets the caller that owns the live-stream state drop a partial
+ * response; see `clearSummaryStream` in `Note`.
+ */
+async function runSummarize(noteId: string, onFailure?: () => void) {
+  try {
+    await ipc.summarizeNote(noteId);
+  } catch (e) {
+    onFailure?.();
+    useRecordingStore.getState().pushError({ noteId, message: String(e), kind: "summary" });
+  }
+}
+
 export function Note() {
   const { id } = useParams<{ id: string }>();
   const { sidebarCollapsed } = useOutletContext<LayoutOutletContext>();
@@ -576,6 +595,13 @@ export function Note() {
 
   const dateChip = useMemo(() => (draft ? formatDateChip(draft.created_at) : "Today"), [draft]);
 
+  // Drop a partial streamed response. The Summary panel falls back to
+  // `contentStream` once `isSummarizing` clears, so a run that died mid-stream
+  // would otherwise leave a truncated summary on screen next to the error toast
+  // while the DB holds nothing. Both entry points route their failure here,
+  // since either one streams into this same panel.
+  const clearSummaryStream = () => setContentStream("");
+
   // Suggestion source for the speaker-rename picker (#116), fetched once there is
   // a transcript to label. Must stay ABOVE the `!draft` return below: a hook
   // after an early return changes the hook count as soon as a note loads.
@@ -657,6 +683,7 @@ export function Note() {
           canRecord={!otherActiveRecording && !lockedBy}
           panelOpen={panelOpen}
           onTogglePanel={() => setPanelOpen((v) => !v)}
+          onSummarizeFailed={clearSummaryStream}
           sidebarCollapsed={sidebarCollapsed}
         />
         <div className="flex-1 overflow-y-auto">
@@ -963,7 +990,7 @@ export function Note() {
                     {!readOnly && (
                       <button
                         type="button"
-                        onClick={() => ipc.summarizeNote(draft.id)}
+                        onClick={() => void runSummarize(draft.id, clearSummaryStream)}
                         title="Regenerate summary"
                         aria-label="Regenerate summary"
                         className="nd-btn-icon nd-btn-icon-sm"
@@ -1217,6 +1244,7 @@ function NoteToolbar({
   canRecord,
   panelOpen,
   onTogglePanel,
+  onSummarizeFailed,
   sidebarCollapsed,
 }: {
   noteId: string;
@@ -1227,6 +1255,9 @@ function NoteToolbar({
   canRecord: boolean;
   panelOpen: boolean;
   onTogglePanel: () => void;
+  // Summarize streams into the Summary panel, whose state lives in `Note` —
+  // so a failure here has to reach up there to drop the partial response.
+  onSummarizeFailed: () => void;
   sidebarCollapsed: boolean;
 }) {
   const navigate = useNavigate();
@@ -1270,13 +1301,6 @@ function NoteToolbar({
       useRecordingStore.getState().pushError({ noteId, message: String(e) });
     }
   }
-  async function summarize() {
-    try {
-      await ipc.summarizeNote(noteId);
-    } catch (e) {
-      useRecordingStore.getState().pushError({ noteId, message: String(e), kind: "summary" });
-    }
-  }
   async function onDelete() {
     setMenuPos(null);
     await ipc.deleteNote(noteId);
@@ -1304,7 +1328,11 @@ function NoteToolbar({
             <Circle size={10} fill="currentColor" strokeWidth={0} className="text-[var(--color-record)]" />
             <span>Record</span>
           </button>
-          <button onClick={summarize} className="no-drag nd-btn nd-btn-primary" title="Summarize">
+          <button
+            onClick={() => void runSummarize(noteId, onSummarizeFailed)}
+            className="no-drag nd-btn nd-btn-primary"
+            title="Summarize"
+          >
             <Sparkles size={15} strokeWidth={1.6} />
             <span>Summarize</span>
           </button>
