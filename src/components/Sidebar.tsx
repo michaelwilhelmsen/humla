@@ -24,6 +24,7 @@ import { SetupNag } from "./SetupNag";
 import { ImportDialog } from "./ImportDialog";
 import { ChatConversations } from "./ChatConversations";
 import { useCloudStore } from "../lib/cloud";
+import { trafficLightSpacerCssPx, useZoomStore } from "../lib/zoom";
 
 // Humla mark sourced from humla-small.svg — single-path silhouette of
 // the bee's head + antennae arc. Uses currentColor so it inherits text
@@ -164,12 +165,19 @@ export function Sidebar({ onCollapse }: { onCollapse: () => void }) {
   // list on screen is that surface's conversations, and showing the folder tree
   // beneath a folder's own chat would offer navigation the page already is.
   const onChat = location.pathname === "/chat" || /^\/folder\/[^/]+\/chat$/.test(location.pathname);
+  // Webview zoom scales the DOM but not the native traffic lights, so the
+  // clearance strip grows as 1/zoom to keep ~34 device px under the lights.
+  const zoom = useZoomStore((s) => s.zoom);
 
   return (
     <div className="h-full flex flex-col px-2.5 pb-2.5">
       {/* Traffic-light clearance + window drag handle — the macOS lights
           sit over this strip in the nav card's top-left. */}
-      <div data-tauri-drag-region className="h-[34px] w-full shrink-0" />
+      <div
+        data-tauri-drag-region
+        className="w-full shrink-0"
+        style={{ height: `${trafficLightSpacerCssPx(zoom)}px` }}
+      />
 
       {/* Brand */}
       <div
