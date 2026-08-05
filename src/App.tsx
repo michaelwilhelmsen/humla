@@ -22,11 +22,13 @@ import { bindBackendListeners, useNotesStore } from "./lib/store";
 import { useCloudStore } from "./lib/cloud";
 import { useThemeBoot } from "./lib/theme";
 import { usePaletteBoot } from "./lib/palette";
+import { useZoomBoot } from "./lib/zoom";
 
 export default function App() {
   useGlobalShortcuts();
   useThemeBoot();
   usePaletteBoot();
+  useZoomBoot();
   const refresh = useNotesStore((s) => s.refresh);
   const refreshCloud = useCloudStore((s) => s.refresh);
 
