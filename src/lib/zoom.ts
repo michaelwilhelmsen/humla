@@ -40,14 +40,19 @@ export const useZoomStore = create<ZoomState>((set, get) => ({
 
   setZoom: async (level) => {
     const z = clamp(level);
-    try {
-      await getCurrentWebview().setZoom(z);
-    } catch {
-      // Tests / non-Tauri shells lack webview metadata; shortcuts must not reject.
-      return;
-    }
+    // Commit synchronously, before awaiting the native call: zoomIn/zoomOut
+    // read get().zoom to compute the next step, and a held-down key fires
+    // the next keydown before this await resolves. Committing only after
+    // the await let two overlapping calls read the same stale zoom and
+    // collapse a held-down key's steps into one.
     set({ zoom: z });
     localStorage.setItem(ZOOM_KEY, String(z));
+    try {
+      await getCurrentWebview().setZoom(z);
+    } catch (err) {
+      // Tests / non-Tauri shells lack webview metadata; shortcuts must not reject.
+      console.error("setZoom failed", err);
+    }
   },
 
   zoomIn: () => get().setZoom(get().zoom + ZOOM_STEP),

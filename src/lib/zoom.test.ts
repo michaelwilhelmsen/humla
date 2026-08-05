@@ -76,3 +76,40 @@ describe("hydrate", () => {
     await expect(useZoomStore.getState().hydrate()).resolves.toBeUndefined();
   });
 });
+
+describe("setZoom / zoomIn / zoomOut / zoomReset", () => {
+  beforeEach(() => {
+    localStorage.clear();
+    useZoomStore.setState({ zoom: 1 });
+  });
+
+  // This is the exact path the global keydown handler awaits (shortcuts.ts) —
+  // the original bug report was an unhandled rejection from here, not from hydrate.
+  it("does not reject when the webview call fails", async () => {
+    await expect(useZoomStore.getState().zoomIn()).resolves.toBeUndefined();
+  });
+
+  it("commits the clamped zoom even when the webview call fails", async () => {
+    // setZoom must commit state (and persist it) *before* awaiting the native
+    // call, not after — a held-down key fires the next keydown before the
+    // previous call's native round-trip resolves, and zoomIn/zoomOut compute
+    // their step from get().zoom. Committing after the await would let two
+    // overlapping calls read the same stale zoom and collapse into one step.
+    await useZoomStore.getState().setZoom(1.4);
+    expect(useZoomStore.getState().zoom).toBe(1.4);
+    expect(localStorage.getItem("humla.zoom")).toBe("1.4");
+  });
+
+  it("zoomIn and zoomOut step from the current zoom", async () => {
+    await useZoomStore.getState().zoomIn();
+    expect(useZoomStore.getState().zoom).toBe(1.1);
+    await useZoomStore.getState().zoomOut();
+    expect(useZoomStore.getState().zoom).toBe(1);
+  });
+
+  it("zoomReset returns to the default", async () => {
+    await useZoomStore.getState().setZoom(1.7);
+    await useZoomStore.getState().zoomReset();
+    expect(useZoomStore.getState().zoom).toBe(1);
+  });
+});
