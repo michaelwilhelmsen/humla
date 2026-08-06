@@ -177,7 +177,7 @@ pub async fn rediarize_note(app: AppHandle, note_id: String) -> Result<(), Strin
     let sys_wav = if sys_path.exists() { Some(sys_path) } else { None };
     if mic_wav.is_none() && sys_wav.is_none() {
         return Err(
-            "No saved audio for this note. Enable Audio retention in Settings → Transcription before recording, then try again on a new recording."
+            "No saved audio for this note. Turn on Keep recorded audio in Settings → Recording before recording, then try again on a new recording."
                 .to_string(),
         );
     }
@@ -185,7 +185,7 @@ pub async fn rediarize_note(app: AppHandle, note_id: String) -> Result<(), Strin
     let chunks = read_chunks_for_note(&app, &note_id).map_err(err)?;
     if chunks.is_empty() {
         return Err(
-            "No saved chunk timings for this note. Re-diarize needs them to realign speaker labels against the transcript, and they're only written for recordings made with Audio retention enabled. Make a new recording with Audio retention on, then try again."
+            "No saved chunk timings for this note. Re-diarize needs them to realign speaker labels against the transcript, and they're only written for recordings made with Keep recorded audio on (Settings → Recording). Make a new recording with it on, then try again."
                 .to_string(),
         );
     }
@@ -2730,10 +2730,10 @@ async fn diarize_and_apply(
         },
     );
 
-    // Persist the playback bundle (mixed WAV + per-turn timeline) before
-    // we drop the temp full WAVs. Independent of keep_audio — playback
-    // is a first-class feature, not a debug knob. Best-effort: failures
-    // log to stderr but don't abort the post-stop chain. Compute the
+    // Persist the playback bundle before we drop the temp full WAVs: the
+    // per-turn timeline always, the mixed WAV only when keep_audio is on
+    // (#24 — see write_playback_assets). Best-effort: failures log to
+    // stderr but don't abort the post-stop chain. Compute the
     // timeline synchronously so the splitter doesn't have to be Send +
     // Sync to cross the awaits inside write_playback_assets.
     let timeline = serialize_timeline(&chunks, split_chunk.as_ref(), label_offset);

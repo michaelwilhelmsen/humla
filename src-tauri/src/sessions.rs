@@ -324,8 +324,9 @@ pub fn append_session(
 }
 
 /// Number of sessions already recorded (manifest entries, or 1 for a legacy
-/// flat note). Used to decide auto-retention: once a note gains a *second*
-/// session, source WAVs are kept regardless of the `keep_audio` setting.
+/// flat note). This used to also drive auto-retention ("a note's second take
+/// keeps its source WAVs regardless of `keep_audio`"); #24 removed that
+/// exception — see [`retain_audio`] — so this is now only a count.
 pub fn existing_session_count(recordings_dir: &Path) -> usize {
     resolve_sessions(recordings_dir).len()
 }
@@ -435,7 +436,7 @@ pub fn session_upload_plan(
 
 /// The shipped default for `keep_audio`: off. The single source of truth for
 /// the default; mirrored by the frontend's `settings/types.ts` default.
-const KEEP_AUDIO_DEFAULT_ON: bool = false;
+const KEEP_AUDIO_DEFAULT: bool = false;
 
 /// Whether this device should persist audio at all, from the raw `keep_audio`
 /// setting value. The single gate for every audio write and fetch (#24).
@@ -450,7 +451,7 @@ const KEEP_AUDIO_DEFAULT_ON: bool = false;
 pub fn retain_audio(keep_setting: Option<&str>) -> bool {
     match keep_setting {
         Some(v) => v == "true",
-        None => KEEP_AUDIO_DEFAULT_ON,
+        None => KEEP_AUDIO_DEFAULT,
     }
 }
 
@@ -459,28 +460,54 @@ pub fn retain_audio(keep_setting: Option<&str>) -> bool {
 /// someone else's recording either, so the setting describes the machine
 /// rather than just its own captures. The timeline comes down either way — it
 /// is text, and the reader needs it.
-pub fn session_download_plan(store_audio: bool) -> Vec<AssetField> {
+pub fn session_download_plan(keep_audio: bool) -> Vec<AssetField> {
     let mut plan = Vec::new();
-    if store_audio {
+    if keep_audio {
         plan.push(AssetField::Playback);
     }
     plan.push(AssetField::Timeline);
     plan
 }
 
-/// Every stored audio file under one note's recordings dir, across all
-/// resolved sessions (including a flat legacy layout). Text assets are
-/// excluded — see [`AssetField::is_audio`].
+/// Every stored audio file under one note's recordings dir: `*.wav` flat in the
+/// dir and in every immediate subdir, sorted for stable output.
+///
+/// Deliberately a filesystem sweep rather than a walk of
+/// [`resolve_sessions`] × [`AssetField`]. Once a `sessions.json` exists the
+/// manifest wins over flat assets and unlisted dirs are invisible to the
+/// reader — but a WAV in one is still a recording of a meeting sitting on
+/// disk. A tombstoned session pulled from the cloud, a stray flat file beside
+/// a migrated note, and a `mic.wav` in a dir no manifest mentions all have to
+/// count here, or "delete stored audio" would leave audio behind while
+/// reporting success — the same dishonesty #24 exists to remove.
 pub fn stored_audio_files(recordings_dir: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    for (_, dir) in resolve_sessions(recordings_dir) {
-        for field in AssetField::ALL.into_iter().filter(|f| f.is_audio()) {
-            let path = dir.join(field.file_name());
-            if path.exists() {
+    fn wavs_in(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file()
+                && path
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("wav"))
+            {
                 out.push(path);
             }
         }
     }
+
+    let mut out = Vec::new();
+    wavs_in(recordings_dir, &mut out);
+    if let Ok(entries) = std::fs::read_dir(recordings_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                wavs_in(&path, &mut out);
+            }
+        }
+    }
+    out.sort();
     out
 }
 
@@ -1206,6 +1233,36 @@ mod tests {
         assert!(found.iter().all(|p| p.extension().unwrap() == "wav"));
         assert!(found.iter().any(|p| p.ends_with("playback.wav")));
         assert!(found.iter().any(|p| p.ends_with("mic.wav")));
+    }
+
+    #[test]
+    fn stored_audio_finds_wavs_no_manifest_mentions() {
+        // The manifest wins over flat assets for *reading* (see
+        // manifest_wins_over_flat_assets), so a WAV in an unlisted dir — a
+        // tombstoned session pulled from the cloud, or a stray flat file left
+        // beside a migrated note — is invisible to the player. A privacy sweep
+        // must still see it: it is audio on disk.
+        let tmp = TempDir::new().unwrap();
+        let rec = recordings_dir(tmp.path(), "note1");
+        let listed = rec.join("aaaaaaaa-0000-0000-0000-000000000001");
+        touch(&listed.join("playback.wav"));
+        let mut manifest = SessionsManifest::empty();
+        manifest.sessions.push(SessionEntry {
+            id: listed.file_name().unwrap().to_str().unwrap().to_string(),
+            index: 1,
+            started_at: String::new(),
+            duration_ms: 0,
+            streams: vec![],
+        });
+        write_manifest(&rec, &manifest).unwrap();
+        // Neither of these is reachable through resolve_sessions.
+        touch(&rec.join("playback.wav")); // stray flat file
+        touch(&rec.join("bbbbbbbb-0000-0000-0000-000000000002").join("mic.wav"));
+
+        let found = stored_audio_files(&rec);
+        assert_eq!(found.len(), 3, "{found:?}");
+        assert_eq!(delete_stored_audio(&rec), 3);
+        assert!(stored_audio_files(&rec).is_empty());
     }
 
     #[test]

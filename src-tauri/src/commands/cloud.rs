@@ -1760,7 +1760,7 @@ pub(crate) async fn upload_note_sessions(app: &tauri::AppHandle, note_id: &str) 
 /// reconstructed — including on a no-audio device, where the note still becomes
 /// readable. No-op for Personal notes.
 pub(crate) async fn download_note_sessions(app: &tauri::AppHandle, note_id: &str) -> Result<bool, String> {
-    let store_audio = crate::commands::keep_audio_enabled(app);
+    let keep_audio = crate::commands::keep_audio_enabled(app);
     let state = app.state::<AppState>();
     let workspace = {
         let conn = state.db.lock();
@@ -1825,7 +1825,7 @@ pub(crate) async fn download_note_sessions(app: &tauri::AppHandle, note_id: &str
             continue;
         }
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        for field in crate::sessions::session_download_plan(store_audio) {
+        for field in crate::sessions::session_download_plan(keep_audio) {
             let filename = rec.files.get(field.field()).cloned().unwrap_or_default();
             if filename.is_empty() || !safe_path_seg(&filename) {
                 continue;

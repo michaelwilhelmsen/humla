@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { Permissions } from "../../../components/Permissions";
 import { ipc, type StoredAudioStats } from "../../../lib/ipc";
+import { formatBytes, s as plural } from "../components/format";
 import { Row, Section } from "../components/Section";
 import { Toggle } from "../components/Toggle";
 import type { SettingsHook } from "../useSettings";
@@ -45,13 +46,6 @@ export function RecordingSection({
       </Section>
     </>
   );
-}
-
-function formatBytes(bytes: number): string {
-  if (bytes >= 1024 * 1024 * 1024)
-    return `${(bytes / 1024 / 1024 / 1024).toFixed(1)} GB`;
-  if (bytes >= 1024 * 1024) return `${Math.round(bytes / 1024 / 1024)} MB`;
-  return `${Math.max(1, Math.round(bytes / 1024))} KB`;
 }
 
 // Turning the toggle off is going-forward only — existing notes keep their
@@ -101,18 +95,18 @@ function StoredAudioCleanup() {
   if (!stats || stats.notes === 0) {
     if (!done) return null;
     return (
-      <Row
-        label="Stored audio"
-        description="No audio stored — transcripts and speaker labels are untouched."
-        control={<span />}
-      />
+      <Row label="Stored audio">
+        <p className="text-xs text-[var(--color-text-muted)]">
+          No audio stored — transcripts and speaker labels are untouched.
+        </p>
+      </Row>
     );
   }
 
   return (
     <Row
       label="Stored audio"
-      description={`${stats.notes} ${stats.notes === 1 ? "note" : "notes"} · ${formatBytes(stats.bytes)}. Deleting keeps every transcript, speaker label and timeline — only the audio goes.`}
+      description={`${stats.notes} note${plural(stats.notes)} · ${formatBytes(stats.bytes)}. Deleting keeps every transcript, speaker label and timeline — only the audio goes.`}
       control={
         <div className="flex flex-col items-end gap-1">
           {armed ? (

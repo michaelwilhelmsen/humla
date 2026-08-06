@@ -225,10 +225,19 @@ export function Note() {
     ipc.getSetting("summary_provider").then((v) => {
       if (!cancelled && v) setGlobalProvider(v);
     });
-    // Picks which "no audio" explanation to show (#24), and gates the workspace
-    // audio fetch below. Re-read whenever the route changes: Settings is a
-    // route-backed dialog *over* this note, so flipping retention on and closing
-    // it has to take effect here without a navigation away and back.
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Audio retention (#24) — its own effect because it's the one setting here
+  // that has to be re-read on navigation, and the language/provider reads above
+  // shouldn't pay for that. Settings is a route-backed dialog *over* this note,
+  // so flipping retention on and closing it takes effect without navigating
+  // away and back. Picks which "no audio" explanation to show, and gates the
+  // workspace audio fetch below.
+  useEffect(() => {
+    let cancelled = false;
     ipc.getSetting("keep_audio").then((v) => {
       if (!cancelled) setKeepAudio(v === "true");
     });
@@ -2901,13 +2910,26 @@ function RediarizeAction({
     };
   }, [noteId, phase]);
 
+  // Greyed, not gone: the control stays visible with its reason beside it, so
+  // "why can't I fix these speaker labels" has an answer in place (#24).
   if (!hasAudio) {
+    const why = keepAudio
+      ? "needs the recording's audio, which isn't saved for this note"
+      : "needs stored audio — turn on Keep recorded audio in Settings → Recording";
     return (
-      <p className="text-xs text-[var(--color-text-muted)] mb-3">
-        {keepAudio
-          ? "Speaker re-detection needs the recording's audio, which isn't saved for this note."
-          : "Speaker re-detection needs stored audio — turn on Keep recorded audio in Settings → Recording."}
-      </p>
+      <div className="flex flex-col gap-1 mb-3">
+        <button
+          type="button"
+          disabled
+          className="self-start text-xs text-[var(--color-text-disabled)] cursor-not-allowed"
+          title={`Speaker re-detection ${why}.`}
+        >
+          Re-diarize speakers
+        </button>
+        <p className="text-xs text-[var(--color-text-muted)]">
+          Speaker re-detection {why}.
+        </p>
+      </div>
     );
   }
 
