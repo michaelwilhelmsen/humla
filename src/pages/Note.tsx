@@ -2518,6 +2518,10 @@ export const TranscriptPlayer = memo(function TranscriptPlayer({
         />
       </div>
       <div className={cn("flex items-center gap-2 mb-3", fill && "shrink-0")}>
+        {/* The no-audio line carries no "— Settings → Recording" pointer: the
+            user turned retention off themselves, so being told where the switch
+            is reads as nagging. The greyed re-diarize control's tooltip still
+            names it, for the case where someone wants the capability back. */}
         {audioAvailable ? (
           <audio
             ref={audioRef}
@@ -2535,7 +2539,7 @@ export const TranscriptPlayer = memo(function TranscriptPlayer({
           <p className="flex-1 text-xs text-[var(--color-text-muted)]">
             {keepAudio
               ? "No audio saved for this recording."
-              : "Audio not stored on this device — Settings → Recording"}
+              : "Audio not stored on this device."}
           </p>
         )}
         {!showEditor && !disabled && (

@@ -564,6 +564,18 @@ pub fn stored_audio_totals(recordings_root: &Path) -> StoredAudioTotals {
     totals
 }
 
+/// Whether one session dir holds any audio.
+///
+/// The tie-breaker for discarding an empty take: a take that transcribed
+/// nothing is only worth keeping if there's something to listen to. Deciding on
+/// the audio rather than on the chunk count alone is deliberate — every chunk
+/// failing (a provider outage, a revoked key) looks identical to silence from
+/// here, and deleting a recording the user could still play or re-diarize is
+/// not a recoverable mistake.
+pub fn session_has_audio(session_dir: &Path) -> bool {
+    !stored_audio_files(session_dir).is_empty()
+}
+
 /// Delete every stored audio file for one note, keeping timelines, chunk
 /// timings and (of course) the transcript. Returns how many files were
 /// removed. Best-effort per file: a failure is skipped rather than aborting
@@ -1263,6 +1275,19 @@ mod tests {
         assert_eq!(found.len(), 3, "{found:?}");
         assert_eq!(delete_stored_audio(&rec), 3);
         assert!(stored_audio_files(&rec).is_empty());
+    }
+
+    #[test]
+    fn session_has_audio_ignores_the_text_assets() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("s1");
+        touch(&dir.join("chunks.json"));
+        touch(&dir.join("timeline.jsonl"));
+        // A take whose chunks all failed to transcribe still wrote its WAVs;
+        // that is the case that must NOT be discarded.
+        assert!(!session_has_audio(&dir));
+        touch(&dir.join("mic.wav"));
+        assert!(session_has_audio(&dir));
     }
 
     #[test]

@@ -1324,6 +1324,35 @@ async fn finalize_session(
     }
 }
 
+/// Drop a take that transcribed nothing, when it also kept no audio: remove its
+/// session dir so it never reaches the manifest, the carousel or the cloud.
+/// Returns true when the take was discarded, false when it's worth keeping
+/// (audio present) and the caller should finalize it as normal.
+///
+/// The legacy flat layout is never touched — a legacy session id resolves to the
+/// note's whole recordings dir, and deleting that would take every take with it.
+async fn discard_empty_take(app: &AppHandle, note_id: &str, session_id: &str) -> bool {
+    if session_id == sessions::LEGACY_SESSION_ID {
+        return false;
+    }
+    let Ok(app_dir) = app.path().app_data_dir() else {
+        return false;
+    };
+    let recordings = sessions::recordings_dir(&app_dir, note_id);
+    let dir = sessions::session_dir(&recordings, session_id);
+    if sessions::session_has_audio(&dir) {
+        return false; // nothing transcribed, but there's something to listen to
+    }
+    if let Err(e) = tokio::fs::remove_dir_all(&dir).await {
+        // Absent is the common case (nothing was ever written for this take).
+        if e.kind() != std::io::ErrorKind::NotFound {
+            eprintln!("sessions: discard empty take {session_id}: {e}");
+        }
+    }
+    eprintln!("sessions: discarded empty take {session_id} (no transcript, no audio)");
+    true
+}
+
 /// Highest `end_ms` across a session dir's `timeline.jsonl`, i.e. the take's
 /// wall-clock length. 0 when the file is absent or empty.
 fn timeline_duration_ms(session_dir: &std::path::Path) -> u64 {
@@ -1957,6 +1986,7 @@ async fn run_post_stop_chain(
     let session_id = post_stop.session_id.clone();
     let session_started_at = post_stop.session_started_at.clone();
     let streams = session_streams(&post_stop.chunks);
+    let transcribed_nothing = post_stop.chunks.is_empty();
     if let Err(e) = diarize_and_apply(app.clone(), note_id.clone(), post_stop).await {
         eprintln!("diarize_and_apply: {e}");
         emit_error(
@@ -1965,6 +1995,28 @@ async fn run_post_stop_chain(
             &format!("Diarization failed (transcript still saved): {e}"),
         );
     }
+
+    // An aborted press — Record, then Stop a second or two later — used to
+    // become a permanent take: a manifest entry, a numbered pill in the
+    // carousel, and a session dir. It contributed no transcript, so the real
+    // recording after it showed up as "Recording 2" and the note looked split.
+    // Discard it instead.
+    //
+    // Gated on retained audio, not on the chunk count alone: from here, "every
+    // chunk failed to transcribe" (provider outage, revoked key) is
+    // indistinguishable from silence, and deleting a recording the user could
+    // still play or re-diarize has no undo. Nothing transcribed AND nothing to
+    // listen to is the only safe discard.
+    if transcribed_nothing && discard_empty_take(&app, &note_id, &session_id).await {
+        // No manifest row, no unify pass over a take that isn't there, and no
+        // sync pings for a session the server should never learn about.
+        if let Some(dir) = temp_dir {
+            let _ = tokio::fs::remove_dir_all(dir).await;
+        }
+        emit_status(&app, None, Phase::Idle);
+        return;
+    }
+
     // Append this take to the manifest so it shows up in the carousel and in
     // session-aware path resolution. Duration comes from the timeline
     // diarize_and_apply just wrote (max end_ms); 0 when nothing landed.
