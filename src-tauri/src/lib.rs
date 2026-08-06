@@ -327,6 +327,8 @@ where
             commands::note_diagnostics_dir,
             commands::note_audio_dir,
             commands::note_audio_files,
+            commands::stored_audio_stats,
+            commands::delete_stored_audio,
             commands::note_diagnostics_files,
             commands::note_playback_path,
             commands::note_sessions,

@@ -88,12 +88,10 @@ const DEFAULT_SORTFORMER_PRED_THRESHOLD: &str = "0.25";
 // silence_rms_threshold setting for noisy environments.
 const DEFAULT_SILENCE_RMS_THRESHOLD: f32 = 0.005;
 
-// Off by default — recordings live in the temp dir for the duration of
-// the post-stop pipeline and are deleted at the end. When this is on,
-// the audio-capture full WAVs are copied to <app_data>/recordings/<note_id>/
-// before cleanup so the user can re-run diarize at different thresholds,
-// or just listen back. Privacy posture stays opt-in.
-const DEFAULT_KEEP_AUDIO: &str = "false";
+// `keep_audio` defaults off. Its value is read through
+// `sessions::retain_audio` (which owns the default) via `keep_audio_enabled`;
+// off means recordings live in the temp dir for the post-stop pipeline and are
+// deleted at the end, with no playback.wav and no source copies left behind.
 
 // Bounded backlog for the import reader loop. An `--import` replay emits chunks
 // at full disk speed — far faster than realtime — so without a bound the reader
@@ -179,7 +177,7 @@ pub async fn rediarize_note(app: AppHandle, note_id: String) -> Result<(), Strin
     let sys_wav = if sys_path.exists() { Some(sys_path) } else { None };
     if mic_wav.is_none() && sys_wav.is_none() {
         return Err(
-            "No saved audio for this note. Enable Audio retention in Settings → Transcription before recording, then try again on a new recording."
+            "No saved audio for this note. Turn on Keep recorded audio in Settings → Recording before recording, then try again on a new recording."
                 .to_string(),
         );
     }
@@ -187,7 +185,7 @@ pub async fn rediarize_note(app: AppHandle, note_id: String) -> Result<(), Strin
     let chunks = read_chunks_for_note(&app, &note_id).map_err(err)?;
     if chunks.is_empty() {
         return Err(
-            "No saved chunk timings for this note. Re-diarize needs them to realign speaker labels against the transcript, and they're only written for recordings made with Audio retention enabled. Make a new recording with Audio retention on, then try again."
+            "No saved chunk timings for this note. Re-diarize needs them to realign speaker labels against the transcript, and they're only written for recordings made with Keep recorded audio on (Settings → Recording). Make a new recording with it on, then try again."
                 .to_string(),
         );
     }
@@ -1342,24 +1340,27 @@ fn timeline_duration_ms(session_dir: &std::path::Path) -> u64 {
         .unwrap_or(0)
 }
 
-async fn maybe_keep_audio(
-    app: &AppHandle,
-    note_id: &str,
-    snapshot: &PostStopSnapshot,
-    force_retain: bool,
-) {
+/// Read the device's `keep_audio` decision (#24). The single gate consulted by
+/// every path that would write, upload or download a WAV.
+pub(crate) fn keep_audio_enabled(app: &AppHandle) -> bool {
     let state: State<AppState> = app.state();
-    let keep = {
+    let raw = {
         let conn = state.db.lock();
-        db::get_setting(&conn, "keep_audio")
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| DEFAULT_KEEP_AUDIO.to_string())
+        db::get_setting(&conn, "keep_audio").ok().flatten()
     };
-    // Source WAVs are always retained once a note has a second session (so a
-    // later concatenated re-diarize / unification has every take's audio to
-    // work with — issue #16 decision), regardless of the keep_audio setting.
-    if keep != "true" && !force_retain {
+    sessions::retain_audio(raw.as_deref())
+}
+
+async fn maybe_keep_audio(app: &AppHandle, note_id: &str, snapshot: &PostStopSnapshot) {
+    // No exceptions above the setting — not even #16's "second take force-
+    // retains the sources so #17 can unify them". See `sessions::retain_audio`.
+    if !keep_audio_enabled(app) {
+        // Chunk timings are text and stay: re-diarize needs them as its
+        // alignment anchor, and they cost nothing to keep. Without the WAVs
+        // they can't resurrect audio, only re-label a transcript.
+        if let Some(target) = session_write_dir(app, note_id, &snapshot.session_id).await {
+            write_chunks_json(&target, &snapshot.chunks).await;
+        }
         return;
     }
     let mic_wav = snapshot.mic_wav.clone();
@@ -1943,15 +1944,15 @@ async fn run_post_stop_chain(
 
     // Make the note's storage session-shaped before writing this take. For a
     // pre-feature flat note, migrate its single take into a session subdir so
-    // both takes survive. Count existing sessions so we can force source-WAV
-    // retention once the note gains a second session (issue #16).
-    let prior_session_count = prepare_sessions_for_new_take(&app, &note_id).await;
-    let force_retain = prior_session_count >= 1;
+    // both takes survive.
+    let _ = prepare_sessions_for_new_take(&app, &note_id).await;
 
-    // Copy full WAVs into this session's subdir FIRST when keep_audio is on (or
-    // auto-retained because this is a 2nd+ session). diarize_and_apply cleans up
-    // the temp paths after it's done, so retention has to happen before it runs.
-    maybe_keep_audio(&app, &note_id, &post_stop, force_retain).await;
+    // Copy full WAVs into this session's subdir FIRST when keep_audio is on.
+    // diarize_and_apply cleans up the temp paths after it's done, so retention
+    // has to happen before it runs. (#16's "a 2nd+ session force-retains its
+    // sources" exception is gone — #24 made the setting absolute, so a
+    // multi-take note recorded with keep_audio off simply can't be unified.)
+    maybe_keep_audio(&app, &note_id, &post_stop).await;
 
     let session_id = post_stop.session_id.clone();
     let session_started_at = post_stop.session_started_at.clone();
@@ -2729,10 +2730,10 @@ async fn diarize_and_apply(
         },
     );
 
-    // Persist the playback bundle (mixed WAV + per-turn timeline) before
-    // we drop the temp full WAVs. Independent of keep_audio — playback
-    // is a first-class feature, not a debug knob. Best-effort: failures
-    // log to stderr but don't abort the post-stop chain. Compute the
+    // Persist the playback bundle before we drop the temp full WAVs: the
+    // per-turn timeline always, the mixed WAV only when keep_audio is on
+    // (#24 — see write_playback_assets). Best-effort: failures log to
+    // stderr but don't abort the post-stop chain. Compute the
     // timeline synchronously so the splitter doesn't have to be Send +
     // Sync to cross the awaits inside write_playback_assets.
     let timeline = serialize_timeline(&chunks, split_chunk.as_ref(), label_offset);
@@ -3288,9 +3289,13 @@ fn normalize_tokens(s: &str) -> Vec<String> {
 /// `playback.wav` plus a `timeline.jsonl` mapping each speaker turn
 /// back to its first-chunk start_ms, so the frontend can render the
 /// transcript with chunk spans and highlight whichever one matches the
-/// audio's current position. Always written when chunks exist —
-/// independent of `keep_audio`, which controls whether the *raw* per-
-/// source WAVs are also retained for re-diarize / debugging.
+/// audio's current position.
+///
+/// `playback.wav` is gated on `keep_audio` (#24) — it is a full recording of
+/// the meeting, so writing it while the setting said "keep nothing" was the
+/// dishonesty that issue names. `timeline.jsonl` is written either way: it is
+/// text (word timings), and the merged reader and session dividers are built
+/// from it whether or not there is anything to play.
 async fn write_playback_assets(
     app: &AppHandle,
     note_id: &str,
@@ -3307,8 +3312,10 @@ async fn write_playback_assets(
         return;
     };
 
-    if let Err(e) = build_playback_wav(mic_wav, sys_wav, &target.join("playback.wav")).await {
-        eprintln!("playback: build_playback_wav: {e}");
+    if keep_audio_enabled(app) {
+        if let Err(e) = build_playback_wav(mic_wav, sys_wav, &target.join("playback.wav")).await {
+            eprintln!("playback: build_playback_wav: {e}");
+        }
     }
 
     if !timeline.is_empty() {
@@ -5226,7 +5233,7 @@ fn emit_error(app: &AppHandle, note_id: Option<&str>, message: &str) {
 /// edits in the UI go through `notes_update`, so they're already covered). This
 /// enqueues a push so the generated transcript/summary actually replicate.
 /// No-op under the open-source `NoopSync`.
-fn note_changed_for_sync(app: &AppHandle, note_id: &str) {
+pub(crate) fn note_changed_for_sync(app: &AppHandle, note_id: &str) {
     app.state::<AppState>().sync.note_upserted(note_id);
 }
 

@@ -243,6 +243,16 @@ export type NoteSession = {
   hasPlayback: boolean;
 };
 
+// What a "delete stored audio for existing notes" sweep would remove (#24).
+// `notes` counts only notes that actually hold audio, so the confirm can be
+// specific about an irreversible action.
+export type StoredAudioStats = {
+  notes: number;
+  files: number;
+  bytes: number;
+  noteIds: string[];
+};
+
 export const ipc = {
   listNotes: () => invoke<Note[]>("notes_list"),
   getNote: (id: string) => invoke<Note>("notes_get", { id }),
@@ -294,6 +304,11 @@ export const ipc = {
     invoke<string>("note_audio_dir", { noteId }),
   noteAudioFiles: (noteId: string) =>
     invoke<string[]>("note_audio_files", { noteId }),
+  // Honest keep_audio (#24): what a cleanup sweep would remove across every
+  // note, and the sweep itself (returns the file count removed). Audio only —
+  // transcripts, timelines and chunk timings survive.
+  storedAudioStats: () => invoke<StoredAudioStats>("stored_audio_stats"),
+  deleteStoredAudio: () => invoke<number>("delete_stored_audio"),
   noteDiagnosticsFiles: (noteId: string) =>
     invoke<string[]>("note_diagnostics_files", { noteId }),
   notePlaybackPath: (noteId: string) =>

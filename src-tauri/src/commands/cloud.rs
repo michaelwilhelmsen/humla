@@ -1388,6 +1388,11 @@ fn playback_path(app: &tauri::AppHandle, note_id: &str) -> Result<std::path::Pat
 /// the playback file and for the note record to exist on the server (both happen
 /// asynchronously after a recording stops), so the caller can fire-and-forget.
 pub(crate) async fn upload_note_audio(app: &tauri::AppHandle, note_id: &str) -> Result<(), String> {
+    // Nothing was written to upload (#24). Bail before the 60 s wait loop below,
+    // which would otherwise poll for a playback.wav that by design never lands.
+    if !crate::commands::keep_audio_enabled(app) {
+        return Ok(());
+    }
     let state = app.state::<AppState>();
     let workspace = {
         let conn = state.db.lock();
@@ -1448,10 +1453,16 @@ pub(crate) async fn upload_note_audio(app: &tauri::AppHandle, note_id: &str) -> 
 
 /// Download a workspace note's audio to its local playback path so it can be
 /// played back. Returns true if the file is present locally afterwards. No-op
-/// for Personal notes, when local audio already exists, or when the note has no
-/// remote audio. The `audio` field is protected, so it's fetched with a
-/// short-lived file token.
+/// for Personal notes, when local audio already exists, when the note has no
+/// remote audio, or when this device has `keep_audio` off. The `audio` field is
+/// protected, so it's fetched with a short-lived file token.
 pub(crate) async fn download_note_audio(app: &tauri::AppHandle, note_id: &str) -> Result<bool, String> {
+    // `keep_audio` is device-scoped (#24): a Mac told to store no audio doesn't
+    // fetch a teammate's recording either, or the setting would only describe
+    // the notes this device happened to record.
+    if !crate::commands::keep_audio_enabled(app) {
+        return Ok(false);
+    }
     let state = app.state::<AppState>();
     let workspace = {
         let conn = state.db.lock();
@@ -1740,12 +1751,16 @@ pub(crate) async fn upload_note_sessions(app: &tauri::AppHandle, note_id: &str) 
 
 /// Download a shared note's per-session assets and rebuild `sessions.json` (#16).
 /// Reconstructs the local manifest from the remote `note_sessions` records
-/// (honouring tombstones), then fetches each live session's `playback.wav` +
-/// `timeline.jsonl` — the assets the reader/player/carousel need — via the
-/// protected file-token flow. Heavy raw `mic`/`sys`/`chunks` are left on the
-/// server (fetched only if a future re-diarize needs them). Returns true when
-/// at least one session was reconstructed. No-op for Personal notes.
+/// (honouring tombstones), then fetches each live session's assets — via the
+/// protected file-token flow. Which assets is `session_download_plan`'s call:
+/// `timeline.jsonl` always (text, and the reader is built from it),
+/// `playback.wav` only when this device stores audio (#24). Heavy raw
+/// `mic`/`sys`/`chunks` are left on the server (fetched only if a future
+/// re-diarize needs them). Returns true when at least one session was
+/// reconstructed — including on a no-audio device, where the note still becomes
+/// readable. No-op for Personal notes.
 pub(crate) async fn download_note_sessions(app: &tauri::AppHandle, note_id: &str) -> Result<bool, String> {
+    let keep_audio = crate::commands::keep_audio_enabled(app);
     let state = app.state::<AppState>();
     let workspace = {
         let conn = state.db.lock();
@@ -1810,7 +1825,7 @@ pub(crate) async fn download_note_sessions(app: &tauri::AppHandle, note_id: &str
             continue;
         }
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        for field in [crate::sessions::AssetField::Playback, crate::sessions::AssetField::Timeline] {
+        for field in crate::sessions::session_download_plan(keep_audio) {
             let filename = rec.files.get(field.field()).cloned().unwrap_or_default();
             if filename.is_empty() || !safe_path_seg(&filename) {
                 continue;

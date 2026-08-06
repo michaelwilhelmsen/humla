@@ -133,6 +133,41 @@ pub fn note_playback_path(app: AppHandle, note_id: String) -> Result<Option<Stri
     Ok(path.to_str().map(|s| s.to_string()))
 }
 
+/// What a "delete stored audio for existing notes" sweep would remove (#24):
+/// how many notes hold audio, how many files, and the total bytes. Drives the
+/// inline confirm in Settings → Recording, which has to be specific — the
+/// deletion is irreversible.
+#[tauri::command]
+pub fn stored_audio_stats(app: AppHandle) -> Result<crate::sessions::StoredAudioTotals, String> {
+    let app_dir = app.path().app_data_dir().map_err(err)?;
+    Ok(crate::sessions::stored_audio_totals(
+        &crate::sessions::recordings_root(&app_dir),
+    ))
+}
+
+/// Delete every note's stored audio (#24), keeping transcripts, timelines and
+/// chunk timings. Returns the number of files removed.
+///
+/// Turning `keep_audio` off is going-forward only, so this is the explicit
+/// action for audio already on disk. Each affected note is pinged to the sync
+/// observer: in a workspace the removal has to replicate, or the next open
+/// would pull the audio straight back down from the server.
+#[tauri::command]
+pub fn delete_stored_audio(app: AppHandle) -> Result<usize, String> {
+    let app_dir = app.path().app_data_dir().map_err(err)?;
+    let root = crate::sessions::recordings_root(&app_dir);
+    let totals = crate::sessions::stored_audio_totals(&root);
+    let mut removed = 0;
+    for note_id in &totals.note_ids {
+        let n = crate::sessions::delete_stored_audio(&root.join(note_id));
+        if n > 0 {
+            removed += n;
+            super::note_changed_for_sync(&app, note_id);
+        }
+    }
+    Ok(removed)
+}
+
 /// Lists which diagnostic dumps exist for a note (e.g. ["community1-mic.json",
 /// "sortformer-sys.json"]). Empty vec when no diarize has run yet.
 #[tauri::command]

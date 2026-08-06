@@ -97,6 +97,77 @@ describe("settings dialog", () => {
     expect(saved.keep_audio).toBe("true");
   });
 
+  // #24: the toggle's copy is the privacy promise, so it has to state which of
+  // the two regimes is in force rather than describing the feature generically.
+  it("states that nothing is stored while keep-audio is off", async () => {
+    renderApp("/settings?tab=recording", {
+      settings_set: () => null,
+    });
+    const dialog = await screen.findByRole("dialog", { name: /settings/i });
+    const toggle = await within(dialog).findByRole("switch", {
+      name: /keep recorded audio/i,
+    });
+
+    expect(within(dialog).getByText(/no audio is stored on this mac/i)).toBeInTheDocument();
+
+    await userEvent.click(toggle);
+
+    expect(
+      within(dialog).getByText(/keep recordings for playback and speaker re-detection/i),
+    ).toBeInTheDocument();
+    expect(
+      within(dialog).queryByText(/no audio is stored on this mac/i),
+    ).not.toBeInTheDocument();
+  });
+
+  it("deletes stored audio for existing notes behind an inline confirm", async () => {
+    let deleted = 0;
+    renderApp("/settings?tab=recording", {
+      settings_set: () => null,
+      // Stateful, like the real backend: once swept, there is nothing left.
+      stored_audio_stats: () =>
+        deleted > 0
+          ? { notes: 0, files: 0, bytes: 0, noteIds: [] }
+          : { notes: 3, files: 5, bytes: 12 * 1024 * 1024, noteIds: ["a", "b", "c"] },
+      delete_stored_audio: () => {
+        deleted += 1;
+        return 5;
+      },
+    });
+    const dialog = await screen.findByRole("dialog", { name: /settings/i });
+
+    // The action names what it would remove — the deletion is irreversible.
+    const start = await within(dialog).findByRole("button", {
+      name: /delete stored audio/i,
+    });
+    expect(within(dialog).getByText(/3 notes/i)).toBeInTheDocument();
+    expect(within(dialog).getByText(/12 MB/i)).toBeInTheDocument();
+
+    // First click arms, it does not delete (Tauri's webview no-ops
+    // window.confirm, so the confirm is a second button).
+    await userEvent.click(start);
+    expect(deleted).toBe(0);
+
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: /^delete 5 files$/i }),
+    );
+    expect(deleted).toBe(1);
+    // Nothing left to delete → the action retires itself.
+    expect(
+      await within(dialog).findByText(/no audio stored/i),
+    ).toBeInTheDocument();
+  });
+
+  it("offers no cleanup action when no audio is stored", async () => {
+    renderApp("/settings?tab=recording", { settings_set: () => null });
+    const dialog = await screen.findByRole("dialog", { name: /settings/i });
+    await within(dialog).findByRole("switch", { name: /keep recorded audio/i });
+
+    expect(
+      within(dialog).queryByRole("button", { name: /delete stored audio/i }),
+    ).not.toBeInTheDocument();
+  });
+
   it("switches theme via the segmented control in General", async () => {
     renderApp("/settings?tab=general");
     const dialog = await screen.findByRole("dialog", { name: /settings/i });

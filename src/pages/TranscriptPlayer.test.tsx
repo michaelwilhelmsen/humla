@@ -83,6 +83,8 @@ function renderPlayer(props: {
   sessions: NoteSession[];
   timeline: TimelineEntry[];
   fallbackPlaybackUrl: string | null;
+  audioAvailable?: boolean;
+  keepAudio?: boolean;
 }) {
   return render(
     <TranscriptPlayer
@@ -91,6 +93,8 @@ function renderPlayer(props: {
       setTimeline={vi.fn()}
       sessions={props.sessions}
       fallbackPlaybackUrl={props.fallbackPlaybackUrl}
+      audioAvailable={props.audioAvailable ?? true}
+      keepAudio={props.keepAudio ?? true}
       transcript="hello world"
       onChange={vi.fn()}
       disabled={false}
@@ -150,5 +154,69 @@ describe("TranscriptPlayer session seek (BUG A/B)", () => {
 
     const audio = audioEl(container);
     await waitFor(() => expect(audio.currentTime).toBe(2));
+  });
+});
+
+// #24: with keep_audio off there is no playback.wav, but timeline.jsonl is
+// still written — so the styled reader (speaker pills, session dividers,
+// rename) must survive without anything to play.
+describe("TranscriptPlayer without audio (#24)", () => {
+  beforeEach(() => {
+    mockTauri({ note_session_playback_path: () => null });
+  });
+
+  const timeline = [
+    entry({
+      sessionId: "s1",
+      sessionIndex: 0,
+      label: "Michael",
+      text: "hello",
+      words: [{ text: "hello", start_ms: 2000, end_ms: 3000 }],
+    }),
+  ];
+
+  it("renders the reader with no <audio> element and points at the setting", async () => {
+    const { container } = renderPlayer({
+      sessions: [session({ id: "s1", hasPlayback: false })],
+      timeline,
+      fallbackPlaybackUrl: null,
+      audioAvailable: false,
+      keepAudio: false,
+    });
+
+    // The transcript still reads, with its labels.
+    expect(await screen.findByText("hello")).toBeInTheDocument();
+    // No player: an <audio> with no source is the "jarring" thing to avoid.
+    expect(audioEl(container)).toBeNull();
+    expect(
+      screen.getByText(/audio not stored on this device/i),
+    ).toBeInTheDocument();
+  });
+
+  it("clicking a word is inert rather than throwing when there is no player", async () => {
+    renderPlayer({
+      sessions: [session({ id: "s1", hasPlayback: false })],
+      timeline,
+      fallbackPlaybackUrl: null,
+      audioAvailable: false,
+      keepAudio: false,
+    });
+    const word = await screen.findByText("hello");
+    expect(() => fireEvent.click(word)).not.toThrow();
+  });
+
+  it("says the audio is simply gone when retention is on (an old note)", async () => {
+    renderPlayer({
+      sessions: [session({ id: "s1", hasPlayback: false })],
+      timeline,
+      fallbackPlaybackUrl: null,
+      audioAvailable: false,
+      keepAudio: true,
+    });
+    // Don't send a user to a setting that is already on.
+    expect(await screen.findByText(/no audio saved/i)).toBeInTheDocument();
+    expect(
+      screen.queryByText(/audio not stored on this device/i),
+    ).not.toBeInTheDocument();
   });
 });

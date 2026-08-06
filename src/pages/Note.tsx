@@ -29,6 +29,7 @@ import {
 } from "lucide-react";
 import { ipc, onSummaryThinkingDelta, onSummaryContentDelta, type Note as TNote, type NoteRevision, type NoteSession, type SummaryPrompt, type TimelineEntry } from "../lib/ipc";
 import { convertFileSrc } from "@tauri-apps/api/core";
+import { useLiveSetting } from "../lib/settingsBus";
 import { useDownloadStore, useNotesStore, useRecordingStore } from "../lib/store";
 import { computeSetupStatus } from "../lib/setupStatus";
 import { useOwnerName, useCloudStore } from "../lib/cloud";
@@ -160,6 +161,12 @@ export function Note() {
   readOnlyRef.current = readOnly;
   const [uiLang, setUiLang] = useState<string>("no");
   const [globalProvider, setGlobalProvider] = useState<string>("openai");
+  // Device-wide audio retention (#24). Off is the shipped default, so an
+  // unresolved read means off — don't promise a player that isn't coming. Read
+  // through the settings bus, not a plain fetch: Settings is a dialog over a
+  // *pinned* router location, so this view never sees the trip to /settings and
+  // back and can't use navigation as its cue to re-read.
+  const keepAudio = useLiveSetting("keep_audio") === "true";
   // Live reasoning + content streamed from the local LLM. Cleared each time a
   // new summarize starts and again when the summary lands. Scoped by note id
   // so a delta from a different note's run doesn't leak into this view.
@@ -517,7 +524,10 @@ export function Note() {
     return () => {
       cancelled = true;
     };
-  }, [draft?.id, draft?.workspace_id, recPhase.phase]);
+    // keepAudio is a dep so turning retention back on fetches a shared note's
+    // audio right away (#24) rather than on the next open. The backend enforces
+    // the rule; this only decides when to ask again.
+  }, [draft?.id, draft?.workspace_id, recPhase.phase, keepAudio]);
 
   // patch / patchProvider intentionally read from `draftRef.current`
   // rather than the `draft` closure so they can stay stable across
@@ -1125,17 +1135,27 @@ export function Note() {
                             .catch((err) => console.error("noteTimelineRename failed", err));
                         }}
                       />
-                      {!readOnly && <RediarizeAction noteId={draft.id} />}
+                      {!readOnly && (
+                        <RediarizeAction noteId={draft.id} keepAudio={keepAudio} />
+                      )}
                       {devMode && <DiagnosticsLinks noteId={draft.id} />}
                     </div>
-                    {(playbackUrl || sessions.some((s) => s.hasPlayback)) &&
-                    timeline.length > 0 ? (
+                    {/* The styled reader is driven by the timeline, not by the
+                        audio: with keep_audio off (#24) the WAV is absent but
+                        timeline.jsonl is still written, so speaker pills,
+                        session dividers and rename all still work — the player
+                        row is what disappears. */}
+                    {timeline.length > 0 ? (
                       <TranscriptPlayer
                         noteId={draft.id}
                         timeline={timeline}
                         setTimeline={setTimeline}
                         sessions={sessions}
                         fallbackPlaybackUrl={playbackUrl}
+                        audioAvailable={
+                          !!playbackUrl || sessions.some((s) => s.hasPlayback)
+                        }
+                        keepAudio={keepAudio}
                         transcript={draft.transcript}
                         onChange={onTranscriptChange}
                         disabled={readOnly || recActive}
@@ -2031,6 +2051,8 @@ export const TranscriptPlayer = memo(function TranscriptPlayer({
   setTimeline,
   sessions,
   fallbackPlaybackUrl,
+  audioAvailable,
+  keepAudio,
   transcript,
   onChange,
   disabled,
@@ -2046,6 +2068,13 @@ export const TranscriptPlayer = memo(function TranscriptPlayer({
   // Latest/legacy single-file playback URL, used when a session has no
   // resolvable per-session file yet (e.g. a downloaded workspace note).
   fallbackPlaybackUrl: string | null;
+  // Whether anything is playable at all (#24). False for a note recorded (or
+  // synced) while `keep_audio` was off: the timeline is on disk, the WAV isn't,
+  // so the reader renders in full and the player is replaced by one line of
+  // explanation. `keepAudio` is the current setting, and only picks which
+  // explanation — pointing at a setting that is already on would be noise.
+  audioAvailable: boolean;
+  keepAudio: boolean;
   transcript: string;
   onChange: (v: string) => void;
   disabled: boolean;
@@ -2489,18 +2518,26 @@ export const TranscriptPlayer = memo(function TranscriptPlayer({
         />
       </div>
       <div className={cn("flex items-center gap-2 mb-3", fill && "shrink-0")}>
-        <audio
-          ref={audioRef}
-          src={activeUrl ?? undefined}
-          controls
-          // preload="auto" so the whole WAV streams in up-front and
-          // every subsequent seek is in-memory. With "metadata" each
-          // user click triggered a range-request through Tauri's
-          // asset protocol; rapid clicking flooded I/O and on at
-          // least one user's machine made the whole system lag.
-          preload="auto"
-          className="flex-1 h-8"
-        />
+        {audioAvailable ? (
+          <audio
+            ref={audioRef}
+            src={activeUrl ?? undefined}
+            controls
+            // preload="auto" so the whole WAV streams in up-front and
+            // every subsequent seek is in-memory. With "metadata" each
+            // user click triggered a range-request through Tauri's
+            // asset protocol; rapid clicking flooded I/O and on at
+            // least one user's machine made the whole system lag.
+            preload="auto"
+            className="flex-1 h-8"
+          />
+        ) : (
+          <p className="flex-1 text-xs text-[var(--color-text-muted)]">
+            {keepAudio
+              ? "No audio saved for this recording."
+              : "Audio not stored on this device — Settings → Recording"}
+          </p>
+        )}
         {!showEditor && !disabled && (
           <button
             type="button"
@@ -2813,16 +2850,27 @@ function DiagnosticsLinks({ noteId }: { noteId: string }) {
   );
 }
 
-// User-facing "Re-diarize" affordance — visible whenever audio retention
-// produced files for this note, regardless of dev mode. Sits above the
-// transcript player so it's adjacent to the speaker chip strip the user
-// just looked at to realise the speaker count is wrong.
+// User-facing "Re-diarize" affordance — sits above the transcript player so
+// it's adjacent to the speaker chip strip the user just looked at to realise
+// the speaker count is wrong. Visible regardless of dev mode.
+//
+// With no retained audio there is nothing to re-cluster, so it renders greyed
+// with a one-line reason instead of vanishing (#24): a silently absent control
+// reads as a bug, and the reason is actionable — it names the setting that
+// would keep the audio next time. Only shown at all once the note has a
+// transcript, so a fresh empty note isn't decorated with a dead control.
 //
 // Doesn't pre-check chunks.json existence; the backend has a clear error
 // message for notes recorded before chunks were persisted (audio is
 // there, chunks aren't) so we surface that on click rather than hiding
 // the button entirely.
-function RediarizeAction({ noteId }: { noteId: string }) {
+function RediarizeAction({
+  noteId,
+  keepAudio,
+}: {
+  noteId: string;
+  keepAudio: boolean;
+}) {
   const [hasAudio, setHasAudio] = useState(false);
   const [multiSession, setMultiSession] = useState(false);
   const [rediarizing, setRediarizing] = useState(false);
@@ -2849,7 +2897,35 @@ function RediarizeAction({ noteId }: { noteId: string }) {
     };
   }, [noteId, phase]);
 
-  if (!hasAudio) return null;
+  // Greyed, not gone: the control stays visible with its reason beside it, so
+  // "why can't I fix these speaker labels" has an answer in place (#24).
+  //
+  // The reason is deliberately terse — the panel already carries one line
+  // where the player would be ("Audio not stored on this device — Settings →
+  // Recording"), and stacking a second copy of that pointer above the
+  // transcript turned the top of the panel into three lines of grey apology.
+  // The full pointer lives in the tooltip.
+  if (!hasAudio) {
+    return (
+      <p className="text-xs mb-3">
+        <button
+          type="button"
+          disabled
+          className="text-[var(--color-text-disabled)] cursor-not-allowed"
+          title={
+            keepAudio
+              ? "Speaker re-detection needs the recording's audio, which isn't saved for this note."
+              : "Speaker re-detection needs stored audio — turn on Keep recorded audio in Settings → Recording."
+          }
+        >
+          Re-diarize speakers
+        </button>
+        <span className="text-[var(--color-text-muted)]">
+          {" · needs stored audio"}
+        </span>
+      </p>
+    );
+  }
 
   async function rediarize() {
     setRediarizing(true);
