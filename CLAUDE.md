@@ -184,6 +184,7 @@ Two Swift Package binaries that run alongside the Tauri main process. Both bundl
 | Command | What it does |
 |---|---|
 | `pnpm dev` | Vite dev server only (frontend) |
+| `pnpm mock` | Visual-check harness (`mock.html` + `src/mockBoot.tsx`): renders a real component against a mocked Tauri IPC in a plain browser, so layout/token bugs jsdom can't see are visible. Pick a scenario with `?case=<name>`. Dev-only — Vite builds `index.html` only, so it never ships. **A scenario wrapper must mirror the real container** (e.g. the onboarding canvas in `Onboarding.tsx`); a plain `<div>` wrapper left `StepShell`'s `max-w-lg` box hugging the left edge and looked exactly like a layout bug in the component under review |
 | `pnpm lint` | ESLint over `src/` — a **correctness** net, not a style pass (there's no formatter). `react-hooks/rules-of-hooks` is the reason it exists: a hook below an early return type-checks, passes every unit test of the components it renders, and then crashes the whole view with "Rendered more hooks than during the previous render". `exhaustive-deps` is a warning because several omissions here are deliberate and commented. Type-aware rules are off — `pnpm build` runs `tsc -b`. Expect 0 errors / ~5 warnings |
 | `pnpm tauri dev` | Tauri dev (assumes sidecars already built) |
 | `./scripts/build-sidecar.sh` | Build + Developer ID sign the audio-capture Swift sidecar (skips if unchanged) |
