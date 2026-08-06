@@ -16,13 +16,20 @@
 // in step 4), show BOTH options neutrally with the trade-off line and never
 // preselect Local.
 //
-// Skip: "Skip for now" advances without configuring. Summary is optional.
+// Skip: "Skip for now" advances without gating. Note it does NOT undo work
+// already done: on the local path, reaching a reachable server with a usable
+// model commits it immediately (#147), so skipping afterwards leaves a working
+// local summary provider configured rather than nothing. That's deliberate and
+// matches the wizard's write-through philosophy elsewhere — the Language step
+// persists its displayed default for the same reason (#9). The settings written
+// are valid and the model is genuinely installed, so the user ends up with a
+// working setup they can change in Settings, never a broken one.
 //
 // Which settings each path writes (mirrors Settings → Summary):
 //   OpenAI → summary_provider=openai, summary_model=gpt-5.4-mini
 //   Local  → summary_provider=local, local_llm_base_url=<probed>,
 //            local_llm_model=<selected>, local_llm_think=false
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { open as openExternal } from "@tauri-apps/plugin-shell";
 import { Sparkles, Cloud, Server, Check, Copy, ExternalLink } from "lucide-react";
 import { ipc } from "../../../lib/ipc";
@@ -34,6 +41,7 @@ import { StepShell } from "../StepShell";
 import {
   EMBEDDING_OLLAMA_MODEL,
   RECOMMENDED_OLLAMA_MODEL,
+  RECOMMENDED_OLLAMA_MODELS,
   RECOMMENDED_OLLAMA_MODEL_16GB,
   completionModels,
   isModelInstalled,
@@ -51,6 +59,19 @@ const OLLAMA_POLL_MS = 2000;
 
 type Option = "openai" | "local" | null;
 
+// Seed the AI Chat provider (issue #47) to mirror the summary choice, so chat
+// works out of the box without a second setup — chat reuses the same OpenAI key
+// / Ollama server. It can still be changed later in Settings → Chat. Module
+// scope so the commit paths below can be stable useCallbacks.
+async function seedChatProvider(chatProvider: "openai" | "ollama", chatModel: string) {
+  try {
+    await ipc.setSetting("chat_provider", chatProvider);
+    await ipc.setSetting("chat_model", chatModel);
+  } catch (e) {
+    console.warn("[onboarding] failed to seed chat provider:", e);
+  }
+}
+
 export function SummaryStep({ ctx }: { ctx: StepContext }) {
   // null = still resolving whether an OpenAI key exists.
   const [hasOpenAiKey, setHasOpenAiKey] = useState<boolean | null>(null);
@@ -63,7 +84,9 @@ export function SummaryStep({ ctx }: { ctx: StepContext }) {
 
   // Local (Ollama) sub-flow state. Reachability + model list come from the
   // shared probe hook (#22); presentation stays this wizard's staged cards.
-  const [selectedModel, setSelectedModel] = useState<string>("");
+  // `pickedModel` is the user's EXPLICIT choice — "" means they haven't made
+  // one and `effectiveModel` (below) resolves the preselect instead.
+  const [pickedModel, setPickedModel] = useState<string>("");
   const [localConfigured, setLocalConfigured] = useState(false);
   const [copied, setCopied] = useState(false);
 
@@ -97,32 +120,84 @@ export function SummaryStep({ ctx }: { ctx: StepContext }) {
     enabled: selection === "local",
   });
 
-  // Preselect the recommended model if present; else first installed; else
-  // leave empty so the pull command shows. Re-runs per poll so a pull that
-  // completes mid-wizard is picked up.
-  useEffect(() => {
-    if (!installed) return;
-    // Only completion models are valid picks — never embeddinggemma etc. (#48).
-    const usable = completionModels(installed);
-    setSelectedModel((prev) => {
-      if (prev && usable.includes(prev)) return prev;
-      if (usable.includes(RECOMMENDED_OLLAMA_MODEL)) return RECOMMENDED_OLLAMA_MODEL;
-      if (usable.includes(RECOMMENDED_OLLAMA_MODEL_16GB)) return RECOMMENDED_OLLAMA_MODEL_16GB;
-      return usable[0] ?? "";
-    });
-  }, [installed]);
+  // Only completion models are valid picks — never embeddinggemma etc. (#48).
+  const usable = completionModels(installed);
 
-  // Seed the AI Chat provider (issue #47) to mirror the summary choice, so
-  // chat works out of the box without a second setup — chat reuses the same
-  // OpenAI key / Ollama server. It can still be changed later in Settings → Chat.
-  async function seedChatProvider(chatProvider: "openai" | "ollama", chatModel: string) {
+  // The model the picker shows and the settings commit to: the user's explicit
+  // pick while it's still installed, else the recommended one for this Mac's
+  // RAM tier, else whatever else is installed, else "" (nothing usable → the
+  // pull command shows). DERIVED AT RENDER rather than pushed into state by an
+  // effect, so there is exactly one answer per render and no window in which
+  // the picker shows one model while the settings hold another — which is the
+  // bug class #147 belonged to.
+  const recommendedInstalled = RECOMMENDED_OLLAMA_MODELS.find((m) => usable.includes(m));
+  const effectiveModel =
+    pickedModel && usable.includes(pickedModel)
+      ? pickedModel
+      : (recommendedInstalled ?? usable[0] ?? "");
+
+  // ---- Local path: the single commit point --------------------------------
+  // Reached from the preselect effect below AND from the picker's onChange, so
+  // an auto-preselected model and a hand-picked one are indistinguishable
+  // downstream (#147).
+  //
+  // `committedRef` makes it idempotent, and it carries real load: the effect
+  // below re-runs on every ~2s probe re-list (deliberately — that's the retry),
+  // so without the ref each poll would rewrite all five settings. It also
+  // absorbs React StrictMode's dev-only double-invoke on mount, and tells the
+  // mid-flight supersede checks which commit is still the current one.
+  const committedRef = useRef<string>("");
+  const commitLocalModel = useCallback(async (model: string) => {
+    if (committedRef.current === model) return;
+    committedRef.current = model;
     try {
-      await ipc.setSetting("chat_provider", chatProvider);
-      await ipc.setSetting("chat_model", chatModel);
+      // These three are constants, so their order against a superseding commit
+      // doesn't matter.
+      await ipc.setSetting("summary_provider", "local");
+      await ipc.setSetting("local_llm_base_url", DEFAULT_LOCAL_BASE_URL);
+      await ipc.setSetting("local_llm_think", "false");
+      // The model-name writes DO matter. A pick made during the round-trips
+      // above has already claimed the ref; bail instead of racing its writes,
+      // or the last one to land wins and SQLite ends up disagreeing with the
+      // model the card says it's using.
+      if (committedRef.current !== model) return;
+      await ipc.setSetting("local_llm_model", model);
+      if (committedRef.current !== model) return;
+      await seedChatProvider("ollama", model);
+      if (committedRef.current !== model) return;
+      setLocalConfigured(true);
     } catch (e) {
-      console.warn("[onboarding] failed to seed chat provider:", e);
+      // Not committed after all: clear the guard so the next probe re-list
+      // retries (see the effect's `installed` dep), and keep Continue disabled
+      // rather than promising a setup that isn't there.
+      if (committedRef.current === model) committedRef.current = "";
+      setLocalConfigured(false);
+      console.warn("[onboarding] failed to write local summary settings:", e);
     }
-  }
+  }, []);
+
+  // #147 — accepting the preselected model must write the same settings an
+  // explicit pick writes. Preselection used to call setState directly, so it
+  // displayed a model while `localConfigured` stayed false: no ✓, no "Using
+  // <model>", and Continue disabled until the user poked the dropdown. Same
+  // shape as #9, where the Language step showed a default it never persisted.
+  // Committing here rather than in the picker's onChange is what makes the two
+  // paths literally the same code.
+  //
+  // `installed` is a dep on purpose, and it is what `committedRef` guards: the
+  // probe re-lists every ~2s with a fresh array identity, so this re-runs per
+  // poll and the ref turns all but the first into a no-op. That re-run IS the
+  // retry — a commit that failed cleared the ref, so the next poll attempts it
+  // again. Keying on `effectiveModel` alone was tidier but left a transient
+  // settings_set failure permanently stuck with Continue disabled, since
+  // re-picking the same model changes no state and fires no effect.
+  useEffect(() => {
+    if (!effectiveModel) {
+      setLocalConfigured(false);
+      return;
+    }
+    void commitLocalModel(effectiveModel);
+  }, [effectiveModel, commitLocalModel, installed]);
 
   // ---- OpenAI path --------------------------------------------------------
   async function useSameOpenAiKey() {
@@ -146,25 +221,6 @@ export function SummaryStep({ ctx }: { ctx: StepContext }) {
       setOpenaiConfigured(true);
     } catch (e) {
       console.warn("[onboarding] failed to write openai summary settings:", e);
-    }
-  }
-
-  // ---- Local path: write settings on model selection ----------------------
-  async function chooseLocalModel(model: string) {
-    setSelectedModel(model);
-    if (!model) {
-      setLocalConfigured(false);
-      return;
-    }
-    try {
-      await ipc.setSetting("summary_provider", "local");
-      await ipc.setSetting("local_llm_base_url", DEFAULT_LOCAL_BASE_URL);
-      await ipc.setSetting("local_llm_model", model);
-      await ipc.setSetting("local_llm_think", "false");
-      await seedChatProvider("ollama", model);
-      setLocalConfigured(true);
-    } catch (e) {
-      console.warn("[onboarding] failed to write local summary settings:", e);
     }
   }
 
@@ -387,11 +443,18 @@ export function SummaryStep({ ctx }: { ctx: StepContext }) {
               {/* Reachable → model selection. */}
               {reachable === true && installed !== null && (
                 <div className="flex flex-col gap-3">
-                  {installed.length === 0 ? (
+                  {/* Nothing usable to summarise with → the pull command is the
+                      only way forward, and Continue stays disabled. Keyed on
+                      `usable`, not `installed`: a server holding only
+                      embeddinggemma has models but none that can chat, and it
+                      used to land here with an empty picker and no waiting
+                      indicator. */}
+                  {usable.length === 0 ? (
                     <>
                       <p className="text-xs leading-relaxed text-[var(--color-text-muted)]">
-                        Ollama is running, but no models are installed. Pull the
-                        recommended one:
+                        {installed.length === 0
+                          ? "Ollama is running, but no models are installed. Pull the recommended one:"
+                          : "Ollama is running, but none of your installed models can write summaries. Pull the recommended one:"}
                       </p>
                       <PullCommand copied={copied} onCopy={copyPullCommand} />
                       <p className="text-xs text-[var(--color-text-muted)] flex items-center gap-2">
@@ -399,35 +462,34 @@ export function SummaryStep({ ctx }: { ctx: StepContext }) {
                         Waiting for the model…
                       </p>
                     </>
-                  ) : !installed.includes(RECOMMENDED_OLLAMA_MODEL) &&
-                    !installed.includes(RECOMMENDED_OLLAMA_MODEL_16GB) &&
-                    !selectedModel ? (
-                    <>
-                      <p className="text-xs leading-relaxed text-[var(--color-text-muted)]">
-                        The recommended model isn't installed. Pull it, or pick
-                        one of your existing models below.
-                      </p>
-                      <PullCommand copied={copied} onCopy={copyPullCommand} />
-                      <ModelSelect
-                        installed={installed}
-                        value={selectedModel}
-                        onChange={chooseLocalModel}
-                      />
-                    </>
                   ) : (
                     <>
                       <p className="text-xs text-[var(--color-success)] flex items-center gap-1.5">
                         <Check size={13} strokeWidth={2.5} />
                         Ollama is running
                       </p>
+                      {/* Neither recommendation installed: the model below is
+                          already committed, so this is an upgrade hint, not a
+                          blocker. It used to be an alternative branch gated on
+                          an empty selection — which auto-preselection made
+                          unreachable, so the hint silently vanished (#147). */}
+                      {!recommendedInstalled && (
+                        <>
+                          <p className="text-xs leading-relaxed text-[var(--color-text-muted)]">
+                            The recommended model isn't installed — Humla will
+                            use the one below. For better summaries, pull it:
+                          </p>
+                          <PullCommand copied={copied} onCopy={copyPullCommand} />
+                        </>
+                      )}
                       <ModelSelect
-                        installed={installed}
-                        value={selectedModel}
-                        onChange={chooseLocalModel}
+                        models={usable}
+                        value={effectiveModel}
+                        onChange={setPickedModel}
                       />
                       {localConfigured && (
                         <p className="text-xs text-[var(--color-text-muted)]">
-                          Using <code>{selectedModel}</code>.
+                          Using <code>{effectiveModel}</code>.
                         </p>
                       )}
                     </>
@@ -492,7 +554,10 @@ function PullCommand({ copied, onCopy }: { copied: boolean; onCopy: () => void }
       <div className="flex items-center gap-2">
         <code
           className="flex-1 min-w-0 truncate px-3 py-2 rounded-md text-xs bg-[var(--color-pill-hover)]"
-          style={{ fontFamily: "var(--font-mono)" }}
+          // --font-mono is a no-op alias onto the Hanken stack; a real shell
+          // command wants --font-code. Visible side by side with the embedding
+          // model's CommandSnippet, which already uses it.
+          style={{ fontFamily: "var(--font-code)" }}
         >
           ollama pull {RECOMMENDED_OLLAMA_MODEL}
         </code>
@@ -523,12 +588,15 @@ function PullCommand({ copied, onCopy }: { copied: boolean; onCopy: () => void }
   );
 }
 
+// `models` is already filtered to completion models by the caller — it must be,
+// since the same list decides what gets auto-committed. Re-filtering here would
+// be a second derivation of one truth, and the two could drift.
 function ModelSelect({
-  installed,
+  models,
   value,
   onChange,
 }: {
-  installed: string[];
+  models: string[];
   value: string;
   onChange: (v: string) => void;
 }) {
@@ -538,8 +606,11 @@ function ModelSelect({
       value={value}
       onChange={onChange}
       options={[
-        { value: "", label: "— pick a model —" },
-        ...completionModels(installed).map((m) => ({
+        // Placeholder only when there is genuinely nothing selected. Offering
+        // it alongside a committed model made "— pick a model —" a no-op that
+        // snapped straight back to the preselect.
+        ...(value === "" ? [{ value: "", label: "— pick a model —" }] : []),
+        ...models.map((m) => ({
           value: m,
           label:
             m +

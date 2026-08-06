@@ -9,6 +9,15 @@
 export const RECOMMENDED_OLLAMA_MODEL = "gemma4:12b-mlx";
 export const RECOMMENDED_OLLAMA_MODEL_16GB = "qwen3.5:4b";
 
+/// The recommendations in preference order, highest RAM tier first. Callers that
+/// need "the best recommended model this machine actually has" walk this rather
+/// than re-spelling the tier cascade — it was written out three times in the
+/// onboarding step alone, and a fourth tier would have had to find them all.
+export const RECOMMENDED_OLLAMA_MODELS = [
+  RECOMMENDED_OLLAMA_MODEL,
+  RECOMMENDED_OLLAMA_MODEL_16GB,
+] as const;
+
 // The local embedding model for semantic chat retrieval (issue #48). Small
 // (~600 MB) and the sole local embedder — no fallback. Optional: without it,
 // local chat still works keyword-only (semantic search degrades gracefully).
