@@ -1,4 +1,4 @@
-import { Link, useLocation, useNavigate, useOutletContext, useParams } from "react-router-dom";
+import { Link, useNavigate, useOutletContext, useParams } from "react-router-dom";
 import { Fragment, memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -29,6 +29,7 @@ import {
 } from "lucide-react";
 import { ipc, onSummaryThinkingDelta, onSummaryContentDelta, type Note as TNote, type NoteRevision, type NoteSession, type SummaryPrompt, type TimelineEntry } from "../lib/ipc";
 import { convertFileSrc } from "@tauri-apps/api/core";
+import { useLiveSetting } from "../lib/settingsBus";
 import { useDownloadStore, useNotesStore, useRecordingStore } from "../lib/store";
 import { computeSetupStatus } from "../lib/setupStatus";
 import { useOwnerName, useCloudStore } from "../lib/cloud";
@@ -160,10 +161,12 @@ export function Note() {
   readOnlyRef.current = readOnly;
   const [uiLang, setUiLang] = useState<string>("no");
   const [globalProvider, setGlobalProvider] = useState<string>("openai");
-  // Device-wide audio retention (#24). Off is the shipped default, so assume
-  // off until the setting resolves rather than promising a player that won't come.
-  const [keepAudio, setKeepAudio] = useState(false);
-  const { pathname } = useLocation();
+  // Device-wide audio retention (#24). Off is the shipped default, so an
+  // unresolved read means off — don't promise a player that isn't coming. Read
+  // through the settings bus, not a plain fetch: Settings is a dialog over a
+  // *pinned* router location, so this view never sees the trip to /settings and
+  // back and can't use navigation as its cue to re-read.
+  const keepAudio = useLiveSetting("keep_audio") === "true";
   // Live reasoning + content streamed from the local LLM. Cleared each time a
   // new summarize starts and again when the summary lands. Scoped by note id
   // so a delta from a different note's run doesn't leak into this view.
@@ -229,22 +232,6 @@ export function Note() {
       cancelled = true;
     };
   }, []);
-
-  // Audio retention (#24) — its own effect because it's the one setting here
-  // that has to be re-read on navigation, and the language/provider reads above
-  // shouldn't pay for that. Settings is a route-backed dialog *over* this note,
-  // so flipping retention on and closing it takes effect without navigating
-  // away and back. Picks which "no audio" explanation to show, and gates the
-  // workspace audio fetch below.
-  useEffect(() => {
-    let cancelled = false;
-    ipc.getSetting("keep_audio").then((v) => {
-      if (!cancelled) setKeepAudio(v === "true");
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [pathname]);
 
   // On unmount, flush any pending edits that haven't fired their timer
   // yet. Fire-and-forget — the Tauri invoke promise survives the React
@@ -2912,24 +2899,31 @@ function RediarizeAction({
 
   // Greyed, not gone: the control stays visible with its reason beside it, so
   // "why can't I fix these speaker labels" has an answer in place (#24).
+  //
+  // The reason is deliberately terse — the panel already carries one line
+  // where the player would be ("Audio not stored on this device — Settings →
+  // Recording"), and stacking a second copy of that pointer above the
+  // transcript turned the top of the panel into three lines of grey apology.
+  // The full pointer lives in the tooltip.
   if (!hasAudio) {
-    const why = keepAudio
-      ? "needs the recording's audio, which isn't saved for this note"
-      : "needs stored audio — turn on Keep recorded audio in Settings → Recording";
     return (
-      <div className="flex flex-col gap-1 mb-3">
+      <p className="text-xs mb-3">
         <button
           type="button"
           disabled
-          className="self-start text-xs text-[var(--color-text-disabled)] cursor-not-allowed"
-          title={`Speaker re-detection ${why}.`}
+          className="text-[var(--color-text-disabled)] cursor-not-allowed"
+          title={
+            keepAudio
+              ? "Speaker re-detection needs the recording's audio, which isn't saved for this note."
+              : "Speaker re-detection needs stored audio — turn on Keep recorded audio in Settings → Recording."
+          }
         >
           Re-diarize speakers
         </button>
-        <p className="text-xs text-[var(--color-text-muted)]">
-          Speaker re-detection {why}.
-        </p>
-      </div>
+        <span className="text-[var(--color-text-muted)]">
+          {" · needs stored audio"}
+        </span>
+      </p>
     );
   }
 

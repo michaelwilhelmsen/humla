@@ -119,9 +119,14 @@ function StoredAudioCleanup() {
               >
                 Cancel
               </button>
+              {/* Inline style, not a text-* utility: `.nd-btn` is unlayered, so
+                  it wins the cascade over Tailwind's layered utilities and the
+                  destructive red silently doesn't render. Same pattern as the
+                  Sidebar's delete confirm. */}
               <button
                 type="button"
-                className="nd-btn text-[var(--color-danger)]"
+                className="nd-btn"
+                style={{ color: "var(--color-danger)" }}
                 onClick={remove}
                 disabled={busy}
               >

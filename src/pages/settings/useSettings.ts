@@ -7,6 +7,7 @@ import {
   type ProviderConfig,
   type TranscribeConfig,
 } from "../../lib/ipc";
+import { broadcastSettingChange } from "../../lib/settingsBus";
 import {
   DEFAULTS,
   EMPTY_DIARIZE_STATE,
@@ -394,6 +395,9 @@ export function useSettings() {
   async function update(key: EditableKey, value: string) {
     setS((prev) => ({ ...prev, [key]: value }));
     await ipc.setSetting(key, value);
+    // Tell views outside this dialog (see settingsBus for why they can't
+    // notice on their own).
+    broadcastSettingChange(key, value);
   }
 
   async function updateTranscribeConfig(cfg: TranscribeConfig) {
