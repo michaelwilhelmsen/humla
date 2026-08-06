@@ -381,6 +381,17 @@ impl AssetField {
         }
     }
 
+    /// Whether this asset is *audio* — the thing `keep_audio` governs (#24).
+    /// `timeline` and `chunks` are text (word timings / chunk timings) and are
+    /// kept regardless: they drive the merged reader and the re-diarize anchors,
+    /// and they carry no recording of anyone's voice.
+    pub fn is_audio(self) -> bool {
+        matches!(
+            self,
+            AssetField::Playback | AssetField::Mic | AssetField::Sys
+        )
+    }
+
     /// The MIME type to stamp on the multipart upload. The JSON-ish assets go
     /// up as octet-stream (the server's timeline/chunks fields have no mime
     /// restriction — jsonl/json content-sniff inconsistently).
@@ -416,6 +427,125 @@ pub fn session_upload_plan(
             matches!(f, AssetField::Timeline) || !remote_present.contains(f)
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Honest keep_audio (#24) — the storage decision and the cleanup primitives.
+// ---------------------------------------------------------------------------
+
+/// The shipped default for `keep_audio`: off. The single source of truth for
+/// the default; mirrored by the frontend's `settings/types.ts` default.
+const KEEP_AUDIO_DEFAULT_ON: bool = false;
+
+/// Whether this device should persist audio at all, from the raw `keep_audio`
+/// setting value. The single gate for every audio write and fetch (#24).
+///
+/// **The setting is the outer gate, with nothing above it.** Before #24 it only
+/// governed the *raw* mic/sys copies: `playback.wav` was written
+/// unconditionally, and #16 force-retained the sources once a note had a second
+/// take — so "off" silently kept a full recording of the meeting on disk. Off
+/// now means no audio, which costs cross-session unification (#17) on those
+/// notes. That trade-off is what the setting buys; it is not a regression to
+/// route around with another force-retain exception.
+pub fn retain_audio(keep_setting: Option<&str>) -> bool {
+    match keep_setting {
+        Some(v) => v == "true",
+        None => KEEP_AUDIO_DEFAULT_ON,
+    }
+}
+
+/// Which of a teammate's session assets this device should fetch (#24). The
+/// rule is *device-scoped*: a Mac with `keep_audio` off doesn't download
+/// someone else's recording either, so the setting describes the machine
+/// rather than just its own captures. The timeline comes down either way — it
+/// is text, and the reader needs it.
+pub fn session_download_plan(store_audio: bool) -> Vec<AssetField> {
+    let mut plan = Vec::new();
+    if store_audio {
+        plan.push(AssetField::Playback);
+    }
+    plan.push(AssetField::Timeline);
+    plan
+}
+
+/// Every stored audio file under one note's recordings dir, across all
+/// resolved sessions (including a flat legacy layout). Text assets are
+/// excluded — see [`AssetField::is_audio`].
+pub fn stored_audio_files(recordings_dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for (_, dir) in resolve_sessions(recordings_dir) {
+        for field in AssetField::ALL.into_iter().filter(|f| f.is_audio()) {
+            let path = dir.join(field.file_name());
+            if path.exists() {
+                out.push(path);
+            }
+        }
+    }
+    out
+}
+
+/// `<app_data>/recordings` — the parent of every note's recordings dir.
+pub fn recordings_root(app_data_dir: &Path) -> PathBuf {
+    app_data_dir.join("recordings")
+}
+
+/// What a "delete stored audio" sweep would cover, for the Settings confirm.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoredAudioTotals {
+    /// Notes that hold at least one audio file.
+    pub notes: usize,
+    /// Audio files across those notes (all sessions).
+    pub files: usize,
+    /// Total bytes on disk.
+    pub bytes: u64,
+    /// The note ids holding audio, so the caller can ping the sync observer
+    /// for exactly the notes a deletion changed.
+    pub note_ids: Vec<String>,
+}
+
+/// Tally stored audio across every note under `recordings_root`. Notes with no
+/// audio (transcript-only, or already cleaned) don't count toward `notes` — the
+/// confirm should say how much a deletion actually removes.
+pub fn stored_audio_totals(recordings_root: &Path) -> StoredAudioTotals {
+    let mut totals = StoredAudioTotals::default();
+    let Ok(entries) = std::fs::read_dir(recordings_root) else {
+        return totals; // nothing recorded on this device yet
+    };
+    let mut ids: Vec<(String, Vec<PathBuf>)> = entries
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| e.file_name().to_str().map(|s| s.to_string()))
+        .map(|id| {
+            let files = stored_audio_files(&recordings_root.join(&id));
+            (id, files)
+        })
+        .filter(|(_, files)| !files.is_empty())
+        .collect();
+    // Stable output: read_dir order is filesystem-dependent.
+    ids.sort_by(|a, b| a.0.cmp(&b.0));
+    for (id, files) in ids {
+        totals.notes += 1;
+        totals.files += files.len();
+        totals.bytes += files
+            .iter()
+            .filter_map(|p| std::fs::metadata(p).ok())
+            .map(|m| m.len())
+            .sum::<u64>();
+        totals.note_ids.push(id);
+    }
+    totals
+}
+
+/// Delete every stored audio file for one note, keeping timelines, chunk
+/// timings and (of course) the transcript. Returns how many files were
+/// removed. Best-effort per file: a failure is skipped rather than aborting
+/// the sweep, so one locked file can't strand the rest on disk.
+pub fn delete_stored_audio(recordings_dir: &Path) -> usize {
+    stored_audio_files(recordings_dir)
+        .into_iter()
+        .filter(|p| std::fs::remove_file(p).is_ok())
+        .count()
 }
 
 /// Metadata for one remote `note_sessions` record, used to reconstruct the
@@ -1006,5 +1136,130 @@ mod tests {
         // note_session_playback_path feeds a frontend id through here; a poisoned
         // manifest must not resolve to a traversal path.
         assert!(resolve_session_dir(&rec, "../../../../Desktop").is_none());
+    }
+
+    // ---- honest keep_audio (#24) ------------------------------------------
+
+    #[test]
+    fn audio_assets_are_the_three_wavs() {
+        let audio: Vec<AssetField> =
+            AssetField::ALL.into_iter().filter(|f| f.is_audio()).collect();
+        assert_eq!(
+            audio,
+            vec![AssetField::Playback, AssetField::Mic, AssetField::Sys]
+        );
+        // The text assets are word timings and chunk timings — never audio.
+        assert!(!AssetField::Timeline.is_audio());
+        assert!(!AssetField::Chunks.is_audio());
+    }
+
+    #[test]
+    fn retain_audio_follows_the_setting() {
+        assert!(retain_audio(Some("true")));
+        assert!(!retain_audio(Some("false")));
+        // Unset falls back to the shipped default (off).
+        assert!(!retain_audio(None));
+        // Anything that isn't the literal "true" is off — the setting is stored
+        // as a string and a garbled value must fail closed, not open.
+        assert!(!retain_audio(Some("")));
+        assert!(!retain_audio(Some("1")));
+    }
+
+    #[test]
+    fn download_plan_drops_audio_when_not_storing() {
+        // A device that stores audio pulls a teammate's playback + timeline.
+        assert_eq!(
+            session_download_plan(true),
+            vec![AssetField::Playback, AssetField::Timeline]
+        );
+        // A device with keep_audio off pulls only the text timeline, so the
+        // reader and session dividers still work with no WAV on disk.
+        assert_eq!(session_download_plan(false), vec![AssetField::Timeline]);
+    }
+
+    #[test]
+    fn stored_audio_lists_only_wavs_across_sessions() {
+        let tmp = TempDir::new().unwrap();
+        let rec = recordings_dir(tmp.path(), "note1");
+        let a = rec.join("aaaaaaaa-0000-0000-0000-000000000001");
+        let b = rec.join("aaaaaaaa-0000-0000-0000-000000000002");
+        for dir in [&a, &b] {
+            touch(&dir.join("playback.wav"));
+            touch(&dir.join("mic.wav"));
+            touch(&dir.join("timeline.jsonl"));
+            touch(&dir.join("chunks.json"));
+        }
+        let mut manifest = SessionsManifest::empty();
+        for (i, dir) in [&a, &b].into_iter().enumerate() {
+            manifest.sessions.push(SessionEntry {
+                id: dir.file_name().unwrap().to_str().unwrap().to_string(),
+                index: i as u32 + 1,
+                started_at: String::new(),
+                duration_ms: 0,
+                streams: vec![],
+            });
+        }
+        write_manifest(&rec, &manifest).unwrap();
+
+        let found = stored_audio_files(&rec);
+        assert_eq!(found.len(), 4, "two sessions × playback + mic: {found:?}");
+        assert!(found.iter().all(|p| p.extension().unwrap() == "wav"));
+        assert!(found.iter().any(|p| p.ends_with("playback.wav")));
+        assert!(found.iter().any(|p| p.ends_with("mic.wav")));
+    }
+
+    #[test]
+    fn stored_audio_covers_a_flat_legacy_note() {
+        let tmp = TempDir::new().unwrap();
+        let rec = recordings_dir(tmp.path(), "note1");
+        touch(&rec.join("playback.wav"));
+        touch(&rec.join("timeline.jsonl"));
+        let found = stored_audio_files(&rec);
+        assert_eq!(found, vec![rec.join("playback.wav")]);
+    }
+
+    #[test]
+    fn audio_totals_count_notes_with_audio_only() {
+        let tmp = TempDir::new().unwrap();
+        // note1: has audio. note2: transcript-only (timeline but no WAV).
+        touch(&recordings_dir(tmp.path(), "note1").join("playback.wav"));
+        touch(&recordings_dir(tmp.path(), "note1").join("mic.wav"));
+        touch(&recordings_dir(tmp.path(), "note2").join("timeline.jsonl"));
+
+        let stats = stored_audio_totals(&recordings_root(tmp.path()));
+        assert_eq!(stats.notes, 1, "note2 has no audio to delete");
+        assert_eq!(stats.files, 2);
+        assert_eq!(stats.bytes, 2, "touch() writes one byte per file");
+        assert_eq!(stats.note_ids, vec!["note1".to_string()]);
+    }
+
+    #[test]
+    fn audio_totals_are_empty_before_any_recording() {
+        let tmp = TempDir::new().unwrap();
+        let stats = stored_audio_totals(&recordings_root(tmp.path()));
+        assert_eq!(stats.notes, 0);
+        assert_eq!(stats.bytes, 0);
+        assert!(stats.note_ids.is_empty());
+    }
+
+    #[test]
+    fn delete_stored_audio_keeps_the_text_assets() {
+        let tmp = TempDir::new().unwrap();
+        let rec = recordings_dir(tmp.path(), "note1");
+        touch(&rec.join("playback.wav"));
+        touch(&rec.join("mic.wav"));
+        touch(&rec.join("timeline.jsonl"));
+        touch(&rec.join("chunks.json"));
+
+        let removed = delete_stored_audio(&rec);
+        assert_eq!(removed, 2);
+        assert!(!rec.join("playback.wav").exists());
+        assert!(!rec.join("mic.wav").exists());
+        // Timelines and chunk timings are text; they survive so the reader,
+        // session dividers and re-diarize anchors aren't destroyed with the audio.
+        assert!(rec.join("timeline.jsonl").exists());
+        assert!(rec.join("chunks.json").exists());
+        // Idempotent: a second pass has nothing left to remove.
+        assert_eq!(delete_stored_audio(&rec), 0);
     }
 }
