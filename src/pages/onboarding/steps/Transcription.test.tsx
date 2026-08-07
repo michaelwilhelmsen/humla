@@ -1,7 +1,11 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, act, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import type { LocalWhisperModelStatus, TranscribeConfig } from "../../../lib/ipc";
+import type {
+  LocalWhisperModelStatus,
+  ProviderConfig,
+  TranscribeConfig,
+} from "../../../lib/ipc";
 import { useDownloadStore } from "../../../lib/store";
 import { mockTauri } from "../../../test/tauri";
 import { TranscriptionStep } from "./Transcription";
@@ -567,6 +571,173 @@ describe("onboarding TranscriptionStep — cloud path", () => {
 
     expect(await screen.findByText(/invalid api key/i)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /^continue$/i })).toBeDisabled();
+  });
+});
+
+// #149 — a returning user's stored choice must be readable off the config.
+// The old guard pre-selected "any cloud provider that isn't openai", because
+// openai is ALSO the fresh-install fallback and the step couldn't tell "nobody
+// has chosen yet" from "the user chose OpenAI". Key presence is what separates
+// them — the same rule computeSetupStatus already uses to decide whether a
+// cloud default is working or is the fresh-install "none" state.
+describe("onboarding TranscriptionStep — resuming a stored config", () => {
+  // Config + Keychain state for a returning user, with per-provider keys so a
+  // test can store a key for one provider and not another.
+  function resume(
+    def: ProviderConfig,
+    keys: Partial<Record<"openai" | "deepgram" | "groq", string>> = {},
+  ): Parameters<typeof mockTauri>[0] {
+    return {
+      get_transcribe_config: () => ({ default: def, per_language: {} }),
+      provider_key_get: (args) =>
+        keys[(args as { provider: "openai" | "deepgram" | "groq" }).provider] ?? null,
+    };
+  }
+
+  function providerTrigger() {
+    return screen.getByRole("combobox", { name: "Provider" });
+  }
+
+  it("pre-selects Cloud for a stored OpenAI default whose key is present", async () => {
+    renderStep(
+      resume({ provider: "openai", model: "whisper-1" }, { openai: "sk-stored" }),
+    );
+
+    await onDeviceCard(); // wait out the loading gate
+
+    // The panel is open, showing OpenAI and the stored-key sentinel...
+    expect(await screen.findByPlaceholderText("•••••••• stored")).toBeInTheDocument();
+    expect(providerTrigger()).toHaveTextContent("OpenAI");
+    // ...and Test is live with no re-Save.
+    expect(screen.getByRole("button", { name: /^test$/i })).toBeEnabled();
+  });
+
+  it("pre-selects Cloud for a stored Deepgram or Groq default", async () => {
+    const { unmount } = renderStep(
+      resume({ provider: "deepgram", model: "nova-3" }, { deepgram: "dg-stored" }),
+    );
+    await onDeviceCard();
+    expect(await screen.findByPlaceholderText("•••••••• stored")).toBeInTheDocument();
+    expect(providerTrigger()).toHaveTextContent("Deepgram");
+    unmount();
+
+    renderStep(
+      resume(
+        { provider: "groq", model: "whisper-large-v3-turbo" },
+        { groq: "gsk-stored" },
+      ),
+    );
+    await onDeviceCard();
+    expect(await screen.findByPlaceholderText("•••••••• stored")).toBeInTheDocument();
+    expect(providerTrigger()).toHaveTextContent("Groq");
+  });
+
+  // The whole point of keying off the Keychain: openai-with-no-key IS the
+  // fresh-install fallback, and must stay indistinguishable from it.
+  it("selects nothing for an OpenAI default with no stored key (fresh install)", async () => {
+    renderStep(resume({ provider: "openai", model: "whisper-1" }));
+
+    await onDeviceCard();
+
+    // Cloud panel closed — its fields aren't in the DOM at all.
+    expect(screen.queryByRole("combobox", { name: "Provider" })).not.toBeInTheDocument();
+    expect(screen.queryByPlaceholderText("sk-…")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^continue$/i })).toBeDisabled();
+  });
+
+  // Same for a cloud provider the user configured elsewhere and then dropped
+  // the key for: without a key there is nothing to resume onto.
+  it("selects nothing for a cloud default whose key has gone missing", async () => {
+    renderStep(resume({ provider: "deepgram", model: "nova-3" }));
+
+    await onDeviceCard();
+
+    expect(screen.queryByRole("combobox", { name: "Provider" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^continue$/i })).toBeDisabled();
+  });
+
+  it("selects nothing when the config read fails, and writes nothing", async () => {
+    let writes = 0;
+    renderStep({
+      get_transcribe_config: () => {
+        throw new Error("db is on fire");
+      },
+      provider_key_get: () => "sk-stored",
+      set_transcribe_config: () => {
+        writes++;
+        return null;
+      },
+    });
+
+    await onDeviceCard();
+
+    expect(screen.queryByRole("combobox", { name: "Provider" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^continue$/i })).toBeDisabled();
+    await new Promise((r) => setTimeout(r, 50));
+    expect(writes).toBe(0);
+  });
+
+  // A failed Keychain read is not evidence of a choice. It must degrade to
+  // "no key" (select nothing) rather than throwing or pre-selecting blind.
+  it("selects nothing when the key read fails, and writes nothing", async () => {
+    let writes = 0;
+    renderStep({
+      get_transcribe_config: () => ({
+        default: { provider: "openai", model: "whisper-1" },
+        per_language: {},
+      }),
+      provider_key_get: () => {
+        throw new Error("keychain locked");
+      },
+      set_transcribe_config: () => {
+        writes++;
+        return null;
+      },
+    });
+
+    await onDeviceCard();
+
+    expect(screen.queryByRole("combobox", { name: "Provider" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^continue$/i })).toBeDisabled();
+    await new Promise((r) => setTimeout(r, 50));
+    expect(writes).toBe(0);
+  });
+
+  // Pre-selection is display-only. The commit points are unchanged: selecting
+  // On-device (or its reconcile effect) and a passed cloud key Test.
+  it("writes no config merely by resuming onto the Cloud card", async () => {
+    let writes = 0;
+    renderStep({
+      ...resume({ provider: "openai", model: "whisper-1" }, { openai: "sk-stored" }),
+      set_transcribe_config: () => {
+        writes++;
+        return null;
+      },
+    });
+
+    await onDeviceCard();
+    expect(await screen.findByPlaceholderText("•••••••• stored")).toBeInTheDocument();
+    await new Promise((r) => setTimeout(r, 50));
+    expect(writes).toBe(0);
+  });
+
+  // Continue still gates on a Test that passed in THIS mount — a stored key is
+  // not a verified one. Deliberately unchanged by #149 (it applies equally to
+  // all three cloud providers and is a separate design call).
+  it("still gates Continue on a fresh Test, even with a stored key", async () => {
+    renderStep({
+      ...resume({ provider: "openai", model: "whisper-1" }, { openai: "sk-stored" }),
+      provider_key_test: () => ({ ok: true, status: 200, error: null }),
+    });
+
+    await onDeviceCard();
+    await screen.findByPlaceholderText("•••••••• stored");
+    expect(screen.getByRole("button", { name: /^continue$/i })).toBeDisabled();
+
+    await userEvent.click(screen.getByRole("button", { name: /^test$/i }));
+
+    expect(await screen.findByText(/connected — openai/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^continue$/i })).toBeEnabled();
   });
 });
 

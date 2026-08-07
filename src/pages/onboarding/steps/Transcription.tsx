@@ -44,6 +44,10 @@ import {
   type LocalWhisperModelStatus,
   type ProviderConfig,
 } from "../../../lib/ipc";
+import {
+  chosenCloudProvider,
+  type CloudTranscribeProvider,
+} from "../../../lib/transcribeDefault";
 import { useDownloadStore } from "../../../lib/store";
 import { useProviderKey } from "../../../components/provider/useProviderKey";
 import type { StepContext } from "../types";
@@ -69,7 +73,7 @@ function localConfig(modelId: string): ProviderConfig {
 
 // Same per-provider default models Settings → Transcription uses
 // (see ProviderConfigForm.tsx / settings/types.ts).
-function cloudConfig(provider: CloudProvider): ProviderConfig {
+function cloudConfig(provider: CloudTranscribeProvider): ProviderConfig {
   switch (provider) {
     case "openai":
       return { provider: "openai", model: "whisper-1" };
@@ -80,15 +84,13 @@ function cloudConfig(provider: CloudProvider): ProviderConfig {
   }
 }
 
-type CloudProvider = "openai" | "deepgram" | "groq";
-
-const CLOUD_PROVIDERS: { value: CloudProvider; label: string }[] = [
+const CLOUD_PROVIDERS: { value: CloudTranscribeProvider; label: string }[] = [
   { value: "openai", label: "OpenAI" },
   { value: "deepgram", label: "Deepgram" },
   { value: "groq", label: "Groq (Whisper Large v3 Turbo)" },
 ];
 
-function keyPlaceholder(p: CloudProvider): string {
+function keyPlaceholder(p: CloudTranscribeProvider): string {
   return p === "openai" ? "sk-…" : p === "deepgram" ? "Deepgram API key" : "gsk_…";
 }
 
@@ -131,7 +133,7 @@ export function TranscriptionStep({ ctx }: { ctx: StepContext }) {
   // Cloud card state. Key mechanics come from the shared hook (#22) — it
   // resets the surface itself when the provider changes; the step wraps
   // test() with its commit point (write the provider as the default).
-  const [cloudProvider, setCloudProvider] = useState<CloudProvider>("openai");
+  const [cloudProvider, setCloudProvider] = useState<CloudTranscribeProvider>("openai");
   const key = useProviderKey(cloudProvider);
 
   const modelId = modelIdForLanguage(language);
@@ -162,7 +164,7 @@ export function TranscriptionStep({ ctx }: { ctx: StepContext }) {
       ipc.systemArch().catch(() => "aarch64"),
       ipc.localWhisperModels().catch(() => [] as LocalWhisperModelStatus[]),
       ipc.getTranscribeConfig().catch(() => null),
-    ]).then(([langRead, a, ms, cfg]) => {
+    ]).then(async ([langRead, a, ms, cfg]) => {
       if (cancelled) return;
       const lang = langRead.value;
       setLanguage(lang);
@@ -176,6 +178,7 @@ export function TranscriptionStep({ ctx }: { ctx: StepContext }) {
       // Pre-select from live config so a resuming user sees their prior
       // choice. An in-flight download needs no special-casing here: the
       // store-transition effect below reflects it the moment it renders.
+      // Display-only: the commit points (below) still own every write.
       if (cfg?.default.provider === "local") {
         setSelection("local");
         // Seed the commit guard with what's actually stored, so the reconcile
@@ -183,11 +186,19 @@ export function TranscriptionStep({ ctx }: { ctx: StepContext }) {
         // moved on since" (rewrite + fetch the new model).
         committedModelRef.current = cfg.default.model_id;
         if (already) setDownloadDone(true);
-      } else if (cfg && cfg.default.provider !== "openai") {
-        // A non-openai, non-local default means a cloud provider was chosen.
-        setSelection("cloud");
-        setCloudProvider(cfg.default.provider as CloudProvider);
+        return;
       }
+
+      // A cloud default is only evidence of a choice once its key is stored —
+      // see transcribeDefault.ts for why, and computeSetupStatus for the other
+      // reader of the same rule. The old guard here was "any cloud provider
+      // except openai", which could never resume the likeliest cloud pick
+      // (#149). Null covers no-config, a local default, and an unreadable
+      // key alike; all three leave the step in its fresh-install state.
+      const chosen = await chosenCloudProvider(cfg?.default);
+      if (cancelled || !chosen) return;
+      setSelection("cloud");
+      setCloudProvider(chosen);
     });
     return () => {
       cancelled = true;
@@ -357,7 +368,7 @@ export function TranscriptionStep({ ctx }: { ctx: StepContext }) {
 
   // Each provider has its own Keychain slot + Test; the hook resets its
   // surface when this changes.
-  function changeCloudProvider(p: CloudProvider) {
+  function changeCloudProvider(p: CloudTranscribeProvider) {
     setCloudProvider(p);
   }
 
@@ -550,7 +561,7 @@ export function TranscriptionStep({ ctx }: { ctx: StepContext }) {
               <Select
                 ariaLabel="Provider"
                 value={cloudProvider}
-                onChange={(v) => changeCloudProvider(v as CloudProvider)}
+                onChange={(v) => changeCloudProvider(v as CloudTranscribeProvider)}
                 options={CLOUD_PROVIDERS.map((p) => ({ value: p.value, label: p.label }))}
                 className="w-full max-w-none justify-between px-3 py-2 bg-[var(--color-input-bg)] border-[var(--color-line)] hover:bg-[var(--color-input-bg)] focus:border-[var(--color-text-muted)]"
               />
