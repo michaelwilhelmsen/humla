@@ -1,7 +1,12 @@
 import { useEffect, useState } from "react";
 import { ipc } from "../../lib/ipc";
+import type { CloudTranscribeProvider } from "../../lib/transcribeDefault";
 
-export type KeyProvider = "openai" | "deepgram" | "groq";
+// "A provider with a Keychain slot" and "a provider whose stored key proves it
+// was chosen" are the same set, so this aliases the canonical definition
+// instead of re-spelling it. The name stays because ProviderKeyCard and
+// Settings → Transcription already import it.
+export type KeyProvider = CloudTranscribeProvider;
 
 // Shared per-provider API-key mechanics: stored-sentinel load, save, test.
 // Presentation and commit semantics stay with the consumer — settings'

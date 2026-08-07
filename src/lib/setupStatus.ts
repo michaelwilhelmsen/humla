@@ -13,6 +13,7 @@
 // summary is optional, cloud never nags).
 
 import { ipc, type TranscribeProvider } from "./ipc";
+import { chosenCloudProvider, isCloudProvider } from "./transcribeDefault";
 import { cloudApi } from "./cloud";
 
 // A model download the chip / recap can surface as "Downloading — NN%".
@@ -57,12 +58,6 @@ export type SetupStatus = {
   pipelineReady: boolean;
 };
 
-// A cloud provider whose key lives in the Keychain and whose presence means
-// "working". Local has no key; openai/deepgram/groq do.
-function isCloudProvider(p: TranscribeProvider): p is "openai" | "deepgram" | "groq" {
-  return p === "openai" || p === "deepgram" || p === "groq";
-}
-
 // Compute the full setup picture from live backend state. Every read is
 // individually fault-tolerant so a single failing IPC (e.g. a sidecar that
 // isn't present in some build config) degrades to "not configured" rather than
@@ -101,8 +96,9 @@ export async function computeSetupStatus(): Promise<SetupStatus> {
       model: modelId,
     };
   } else if (def && isCloudProvider(def.provider)) {
-    const key = await ipc.getProviderKey(def.provider).catch(() => null);
-    const working = !!key;
+    // Shared with the onboarding resume so the two can't disagree on what
+    // counts as a configured cloud default (see transcribeDefault.ts).
+    const working = (await chosenCloudProvider(def)) !== null;
     stt = {
       working,
       // A cloud default with no key is the "none" (fresh-install) state — the
