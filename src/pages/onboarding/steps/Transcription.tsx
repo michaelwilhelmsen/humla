@@ -4,8 +4,12 @@
 //
 //   Card A — "On-device": private, free, offline. Model is chosen by the
 //     step-3 `language` setting (Norwegian → nb-whisper-large-q5, else
-//     large-v3-turbo-q5). Selecting it writes transcribe_config.default =
-//     local + that model AND kicks off the background model download.
+//     large-v3-turbo-q5) and so is DERIVED, not stored. Whenever this card is
+//     the selected one, an effect keeps transcribe_config.default in agreement
+//     with that derived model and fetches it — including when the user goes
+//     back and changes the language, which used to leave the card advertising
+//     one model while the config still routed to another (#148). Clicking the
+//     card selects it and asks for the model; the effect owns the config.
 //   Card B — "Cloud API": provider dropdown (OpenAI / Deepgram / Groq) +
 //     key field with Save + Test. A passed Test writes transcribe_config
 //     .default = that provider with the same default model Settings uses.
@@ -90,8 +94,23 @@ function keyPlaceholder(p: CloudProvider): string {
 
 type Selection = "local" | "cloud" | null;
 
+// Set transcribe_config.default, preserving whatever per-language overrides the
+// user already has. Both commit points (the on-device model and a passed cloud
+// key Test) need exactly this, and per-language overrides are easy to drop by
+// writing a bare config — so there's one place that gets it right.
+async function writeDefaultProvider(next: ProviderConfig) {
+  const cfg = await ipc.getTranscribeConfig().catch(() => null);
+  await ipc.setTranscribeConfig({
+    default: next,
+    per_language: cfg?.per_language ?? {},
+  });
+}
+
 export function TranscriptionStep({ ctx }: { ctx: StepContext }) {
   const [language, setLanguage] = useState<string | null>(null);
+  // Whether `language` reflects a successful read. Only then may the reconcile
+  // effect rewrite a stored config on its own initiative.
+  const [languageKnown, setLanguageKnown] = useState(false);
   const [arch, setArch] = useState<string | null>(null);
   const [models, setModels] = useState<LocalWhisperModelStatus[] | null>(null);
 
@@ -103,6 +122,9 @@ export function TranscriptionStep({ ctx }: { ctx: StepContext }) {
   // and `downloadDone` records on-disk presence.
   const [downloadStarted, setDownloadStarted] = useState(false);
   const [downloadDone, setDownloadDone] = useState(false);
+  // A failed config write. Surfaced on the card: Continue is NOT gated on it,
+  // so without this the step would silently disagree with what it displays.
+  const [configError, setConfigError] = useState<string | null>(null);
   const activeDownload = useDownloadStore((s) => s.active);
   const downloadFailure = useDownloadStore((s) => s.error);
 
@@ -128,13 +150,23 @@ export function TranscriptionStep({ ctx }: { ctx: StepContext }) {
   useEffect(() => {
     let cancelled = false;
     Promise.all([
-      ipc.getSetting("language").catch(() => null),
+      // `read: false` distinguishes "the read failed" from "the setting is
+      // unset". Both used to collapse to null, and null routes to the
+      // multilingual default — so a failed read would have let the reconcile
+      // effect below "correct" a perfectly good Norwegian config down to the
+      // default model and fetch a gigabyte to do it.
+      ipc
+        .getSetting("language")
+        .then((v) => ({ read: true, value: v }))
+        .catch(() => ({ read: false, value: null as string | null })),
       ipc.systemArch().catch(() => "aarch64"),
       ipc.localWhisperModels().catch(() => [] as LocalWhisperModelStatus[]),
       ipc.getTranscribeConfig().catch(() => null),
-    ]).then(([lang, a, ms, cfg]) => {
+    ]).then(([langRead, a, ms, cfg]) => {
       if (cancelled) return;
+      const lang = langRead.value;
       setLanguage(lang);
+      setLanguageKnown(langRead.read);
       setArch(a);
       setModels(ms);
 
@@ -146,6 +178,10 @@ export function TranscriptionStep({ ctx }: { ctx: StepContext }) {
       // store-transition effect below reflects it the moment it renders.
       if (cfg?.default.provider === "local") {
         setSelection("local");
+        // Seed the commit guard with what's actually stored, so the reconcile
+        // effect can tell "already agrees" (write nothing) from "the language
+        // moved on since" (rewrite + fetch the new model).
+        committedModelRef.current = cfg.default.model_id;
         if (already) setDownloadDone(true);
       } else if (cfg && cfg.default.provider !== "openai") {
         // A non-openai, non-local default means a cloud provider was chosen.
@@ -221,21 +257,88 @@ export function TranscriptionStep({ ctx }: { ctx: StepContext }) {
     [],
   );
 
-  async function selectLocal() {
+  // The model whose config has been persisted and whose download has been
+  // kicked off. Seeded from the stored config on mount, so resuming a step
+  // that already agrees with the language writes nothing.
+  const committedModelRef = useRef<string | null>(null);
+
+  // Per-mount dedup for download starts. `startDownload` already no-ops for an
+  // on-disk model and merely reflects an in-flight one, but two calls racing
+  // each other before the store's `active` slice is set would both invoke.
+  const requestedDownloadRef = useRef<string | null>(null);
+  const requestDownload = useCallback(
+    (id: string) => {
+      if (requestedDownloadRef.current === id) return;
+      requestedDownloadRef.current = id;
+      void startDownload(id);
+    },
+    [startDownload],
+  );
+
+  // Persist transcribe_config.default = local + `id`, preserving any
+  // per-language overrides, and fetch that model. Driven by the effect below,
+  // so choosing the card and having the language change under it are the same
+  // code path.
+  const commitLocalModel = useCallback(
+    async (id: string) => {
+      if (committedModelRef.current === id) return;
+      committedModelRef.current = id;
+      try {
+        await writeDefaultProvider(localConfig(id));
+        setConfigError(null);
+      } catch (e) {
+        // Clear the claim so re-selecting the card retries, and SAY SO on the
+        // card. Swallowing this was the whole bug: a card advertising NB Whisper
+        // over a config still routing to the default model IS #148 again.
+        // Continue stays enabled regardless — deliberately, it must not become
+        // harder to proceed than before — so silence here would let the user
+        // walk out with the wrong model and nothing on screen to say so.
+        committedModelRef.current = null;
+        setConfigError(String(e));
+        console.warn("[onboarding] failed to write local transcribe_config:", e);
+      }
+      // Newly configured model → it has to actually be on disk. NOT done when
+      // the config already agreed: merely mounting must never kick off a
+      // download, because `startDownload` clears the global download slice to
+      // drop a stale error, which would erase a failure the user still needs
+      // to see. Wanting the model is the click's job, below.
+      requestDownload(id);
+    },
+    [requestDownload],
+  );
+
+  function selectLocal() {
     setSelection("local");
-    try {
-      // Write transcribe_config.default = local + chosen model, preserving
-      // any per-language overrides the user might already have.
-      const cfg = await ipc.getTranscribeConfig().catch(() => null);
-      await ipc.setTranscribeConfig({
-        default: localConfig(modelId),
-        per_language: cfg?.per_language ?? {},
-      });
-    } catch (e) {
-      console.warn("[onboarding] failed to write local transcribe_config:", e);
-    }
-    void startDownload(modelId);
+    // A click is explicit intent AND the only retry affordance on this card, so
+    // it drops the download claim: a failed fetch has to be re-attemptable, and
+    // before this the guard made "Download failed" a dead end for the life of
+    // the mount. `startDownload` still refuses to double-start something already
+    // in flight or on disk, so dropping the claim is safe.
+    requestedDownloadRef.current = null;
+    // Also covers a wizard abandoned mid-download: the config already names the
+    // model, so the effect won't act, but nothing is on disk. commitLocalModel
+    // no-ops when the config already agrees, and retries it when it didn't take.
+    void commitLocalModel(modelId);
+    requestDownload(modelId);
   }
+
+  // #148 — the advertised model is DERIVED from the meeting language, but the
+  // config used to be written only by the click handler. Changing the language
+  // after choosing On-device therefore left the card promising NB Whisper while
+  // the stored config still routed to the multilingual turbo model, Continue
+  // enabled and NB Whisper never fetched — silently the wrong model. Keeping
+  // the two in agreement is this effect's whole job; `committedModelRef` makes
+  // it a no-op whenever they already agree, which matters because this step
+  // re-renders on every download-store tick.
+  useEffect(() => {
+    if (selection !== "local") return;
+    // Only reconcile on our own initiative once the language is actually known.
+    // An unread language falls back to the multilingual default, which would
+    // otherwise "correct" a good Norwegian config down to it. A click still
+    // commits, so a failed read costs nothing the user asked for.
+    if (!languageKnown) return;
+    void commitLocalModel(modelId);
+  }, [selection, modelId, languageKnown, commitLocalModel]);
 
   function selectCloud() {
     setSelection("cloud");
@@ -246,11 +349,7 @@ export function TranscriptionStep({ ctx }: { ctx: StepContext }) {
     // A passed Test is the commit point: write the cloud provider as
     // the default, preserving per-language overrides.
     try {
-      const cfg = await ipc.getTranscribeConfig().catch(() => null);
-      await ipc.setTranscribeConfig({
-        default: cloudConfig(cloudProvider),
-        per_language: cfg?.per_language ?? {},
-      });
+      await writeDefaultProvider(cloudConfig(cloudProvider));
     } catch (e) {
       console.warn("[onboarding] failed to write cloud transcribe_config:", e);
     }
@@ -349,6 +448,16 @@ export function TranscriptionStep({ ctx }: { ctx: StepContext }) {
               {isIntel && (
                 <p className="mt-1 text-xs leading-relaxed text-[var(--color-warning-text)]">
                   On-device transcription is slow on Intel Macs.
+                </p>
+              )}
+
+              {/* A config write that didn't land. Shown even though Continue
+                  stays open, because the alternative is a card advertising a
+                  model the stored config doesn't route to — #148 all over. */}
+              {selection === "local" && configError !== null && (
+                <p className="mt-3 text-xs text-[var(--color-danger)] break-all">
+                  Couldn't save this choice: {configError}. Select the card again
+                  to retry, or set the model in Settings → Transcription.
                 </p>
               )}
 
