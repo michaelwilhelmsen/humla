@@ -214,6 +214,189 @@ describe("onboarding TranscriptionStep — on-device download flow", () => {
     act(() => useDownloadStore.getState().clear());
   });
 
+  // #148 — the on-device model is derived from the meeting language, but the
+  // config was only ever written from the card's click handler. Going back to
+  // change the language left the card advertising NB Whisper while the stored
+  // config still routed to the multilingual turbo model, with Continue enabled
+  // and NB Whisper never downloaded. Same root cause as #147, but silent.
+  it("reconciles the stored config when the language changed after On-device was chosen", async () => {
+    const downloads: string[] = [];
+    let written: TranscribeConfig | null = null;
+    const dl = deferred<null>();
+    renderStep({
+      // Language is now Norwegian…
+      settings_get: (args) =>
+        (args as { key: string }).key === "language" ? "no" : null,
+      // …but the stored config is from the earlier English pass.
+      get_transcribe_config: () => ({
+        default: { provider: "local", model_id: TURBO, preset: "quality", use_gpu: true },
+        per_language: { fr: { provider: "deepgram", model: "nova-3" } },
+      }),
+      set_transcribe_config: (args) => {
+        written = (args as { config: TranscribeConfig }).config;
+        return null;
+      },
+      local_whisper_download: (args) => {
+        downloads.push((args as { modelId: string }).modelId);
+        return dl.promise;
+      },
+    });
+
+    // The card resumes as selected and advertises the Norwegian model...
+    expect(
+      await screen.findByText(/national library of norway/i),
+    ).toBeInTheDocument();
+
+    // ...so the stored config must agree, with no user interaction at all.
+    await waitFor(() =>
+      expect(written!.default).toMatchObject({ provider: "local", model_id: NB }),
+    );
+    // Per-language overrides survive the reconciliation.
+    expect(written!.per_language).toMatchObject({ fr: { provider: "deepgram" } });
+    // And the model it now claims is actually being fetched.
+    await waitFor(() => expect(downloads).toEqual([NB]));
+
+    // The card's download state describes NB, not the turbo model it used to.
+    expect(
+      await screen.findByText(/you can continue while it finishes/i),
+    ).toBeInTheDocument();
+    storeProgress(NB, 580_000_000, 1_160_000_000);
+    expect(await screen.findByText(/downloading/i)).toBeInTheDocument();
+    // A stale progress event for the old model must not be adopted.
+    storeProgress(TURBO, 574_000_000, 574_000_000);
+    await waitFor(() => expect(screen.queryByText(/model ready/i)).toBeNull());
+
+    dl.resolve(null);
+    act(() => useDownloadStore.getState().clear());
+  });
+
+  // The reconciliation must be idempotent: this step re-renders on every
+  // download-store tick, and a write per tick would hammer the DB.
+  it("writes nothing when the stored config already names the derived model", async () => {
+    let writes = 0;
+    const downloads: string[] = [];
+    renderStep({
+      settings_get: (args) =>
+        (args as { key: string }).key === "language" ? "no" : null,
+      local_whisper_models: () => whisperModels(),
+      get_transcribe_config: () => ({
+        default: { provider: "local", model_id: NB, preset: "quality", use_gpu: true },
+        per_language: {},
+      }),
+      set_transcribe_config: () => {
+        writes++;
+        return null;
+      },
+      local_whisper_download: (args) => {
+        downloads.push((args as { modelId: string }).modelId);
+        return null;
+      },
+    });
+
+    expect(
+      await screen.findByText(/national library of norway/i),
+    ).toBeInTheDocument();
+
+    // Several store ticks' worth of re-renders (this is the back-navigation
+    // path: a live download for this model makes the panel show).
+    storeProgress(NB, 100, 1000);
+    storeProgress(NB, 400, 1000);
+    storeProgress(NB, 900, 1000);
+    await waitFor(() => expect(screen.getByText(/downloading/i)).toBeInTheDocument());
+    expect(writes).toBe(0);
+
+    // Re-selecting the card explicitly is also not a reason to rewrite.
+    await userEvent.click(await onDeviceCard());
+    await new Promise((r) => setTimeout(r, 50));
+    expect(writes).toBe(0);
+    expect(downloads).toHaveLength(0); // already in flight per the store
+
+    act(() => useDownloadStore.getState().clear());
+  });
+
+  // Found reviewing the #148 fix. `language` is read with a catch, and a failed
+  // read is indistinguishable from an unset one — both route to the default
+  // model. Left unguarded, the reconcile effect would "correct" a perfectly good
+  // Norwegian config down to the default and fetch a gigabyte to do it.
+  it("does not rewrite a stored config when the language read failed", async () => {
+    let writes = 0;
+    const downloads: string[] = [];
+    renderStep({
+      settings_get: (args) => {
+        if ((args as { key: string }).key === "language") throw new Error("db locked");
+        return null;
+      },
+      get_transcribe_config: () => ({
+        default: { provider: "local", model_id: NB, preset: "quality", use_gpu: true },
+        per_language: {},
+      }),
+      set_transcribe_config: () => {
+        writes++;
+        return null;
+      },
+      local_whisper_download: (args) => {
+        downloads.push((args as { modelId: string }).modelId);
+        return null;
+      },
+    });
+
+    await onDeviceCard(); // the step still renders and is usable
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect(writes).toBe(0);
+    expect(downloads).toHaveLength(0);
+  });
+
+  // Found reviewing the #148 fix. A failed config write must not be silent:
+  // Continue stays open by design, so with no message the user walks out with a
+  // card advertising one model and a config routing to another — #148 again.
+  it("surfaces a failed config write and retries it on re-selection", async () => {
+    let attempts = 0;
+    renderStep({
+      set_transcribe_config: () => {
+        attempts++;
+        if (attempts === 1) throw new Error("disk full");
+        return null;
+      },
+      local_whisper_download: () => null,
+    });
+
+    await userEvent.click(await onDeviceCard());
+
+    expect(await screen.findByText(/couldn't save this choice/i)).toBeInTheDocument();
+    expect(screen.getByText(/disk full/i)).toBeInTheDocument();
+    // Continue must NOT become harder to reach than before.
+    expect(screen.getByRole("button", { name: /^continue$/i })).toBeEnabled();
+
+    // Re-selecting the card retries, and the message clears.
+    await userEvent.click(await onDeviceCard());
+    await waitFor(() => expect(attempts).toBe(2));
+    await waitFor(() =>
+      expect(screen.queryByText(/couldn't save this choice/i)).toBeNull(),
+    );
+  });
+
+  // Found reviewing the #148 fix. The per-mount download guard made a failed
+  // download a dead end: the card is the only retry affordance, and the guard
+  // swallowed the second click.
+  it("retries a failed download when the card is selected again", async () => {
+    const downloads: string[] = [];
+    renderStep({
+      local_whisper_download: (args) => {
+        downloads.push((args as { modelId: string }).modelId);
+        throw new Error("connection reset");
+      },
+    });
+
+    await userEvent.click(await onDeviceCard());
+    expect(await screen.findByText(/download failed/i)).toBeInTheDocument();
+
+    await userEvent.click(await onDeviceCard());
+    await waitFor(() => expect(downloads).toEqual([TURBO, TURBO]));
+
+    act(() => useDownloadStore.getState().clear());
+  });
+
   it("shows Model ready without re-downloading when the model is already on disk", async () => {
     const downloads: string[] = [];
     renderStep({
