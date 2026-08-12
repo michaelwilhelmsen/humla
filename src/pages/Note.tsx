@@ -1918,17 +1918,23 @@ const TranscriptEditor = memo(function TranscriptEditor({
   );
 });
 
-// Styled transcript reader. Each line is its own block so we can hang
-// a coloured speaker dot at the line's left edge. The label prefix that
-// the textarea shows as raw text ("Speaker 1: ") is rendered inside the
-// line as transparent — keeps the wrap identical to the textarea so
-// flipping into edit mode doesn't jolt the page height, and gives the
-// dot blank space to sit in.
+// Styled transcript reader. Each speaker line is a two-column flex row:
+// a narrow gutter holding the coloured dot, then the words. Same shape
+// as the playback view below, so the two readers line up.
 //
-// The dot is positioned by `.nd-speaker-dot` at `left: 0`, deliberately
-// *inside* the line box: this view's scroll container clips anything at
-// a negative x (a scroll container resolves its other axis to `auto`),
-// which is what made every dot here invisible. See globals.css.
+// The dot lives *inside* the line box (`.nd-speaker-dot` at `left: 0`,
+// positioned within the gutter column) rather than hanging in a negative
+// margin: this view's scroll container clips anything at a negative x,
+// because CSS resolves the other axis of a scroll container to `auto`.
+// That is what made every dot here invisible. See globals.css.
+//
+// The label text itself ("Speaker 1: ") is dropped in read mode — the
+// dot carries the identity, and the chip strip above names it. It used
+// to be rendered as a transparent prefix so the wrap matched the
+// textarea exactly, but at real label widths that reserved a blank
+// hole the width of a name beside every dot. The names reappear when
+// the user clicks into edit mode, which is the moment the raw text
+// matters; a modest reflow between the two modes is the cheaper trade.
 //
 // The whole view is click-to-edit unless `disabled` (recording in
 // flight). The dot's click bubbles up to enter edit mode too — its
@@ -2018,18 +2024,18 @@ const TranscriptView = memo(function TranscriptView({
             const color = colors.get(line.trimmedLabel);
             if (color) {
               content = (
-                <div className="relative whitespace-pre-wrap">
-                  <span
-                    className="nd-speaker-dot"
-                    style={{ background: color }}
-                    title={line.trimmedLabel}
-                    aria-label={`Speaker: ${line.trimmedLabel}`}
-                  />
-                  <span aria-hidden className="opacity-0 select-none">
-                    {line.lead}
-                    {line.label}:{" "}
-                  </span>
-                  {line.rest || " "}
+                <div className="flex items-start gap-1">
+                  <div className="relative w-3 shrink-0 self-stretch">
+                    <span
+                      className="nd-speaker-dot"
+                      style={{ background: color }}
+                      title={line.trimmedLabel}
+                      aria-label={`Speaker: ${line.trimmedLabel}`}
+                    />
+                  </div>
+                  <div className="flex-1 whitespace-pre-wrap">
+                    {line.rest || " "}
+                  </div>
                 </div>
               );
             } else {

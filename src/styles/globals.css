@@ -305,14 +305,12 @@ input::placeholder, textarea::placeholder {
      gutter. In the styled reader it sat inside a scroll container
      (`overflow-y-auto`), and CSS resolves the other axis of a scroll container
      to `auto` rather than `visible` — so every dot was clipped away and a
-     transcript rendered with no speaker markers at all (worse: that view draws
-     the "Speaker 1: " prefix transparent to keep click-to-edit wrap identical,
-     so nothing named the speaker either). Notes recorded on this device took
-     the player path and looked fine; a teammate's note, whose timeline may not
-     be local, fell to the styled reader and looked speaker-less.
-     At 0 the dot sits over the start of that transparent label prefix, so it
-     costs no layout and can't be clipped. Callers with a real gutter position
-     it themselves. */
+     transcript rendered with no speaker markers at all. Notes recorded on this
+     device took the player path and looked fine; a teammate's note, whose
+     timeline may not be local, fell to the styled reader and looked
+     speaker-less.
+     Both callers now give the dot a real gutter column to sit in, so `left: 0`
+     positions it inside that column and nothing can clip it. */
   left: 0;
   /* Centre on the *first* line of the turn (not the full multi-line
      block) by anchoring to one line-height in `lh` units, then
