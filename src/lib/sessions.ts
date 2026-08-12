@@ -108,3 +108,24 @@ export function resolveActivePill(opts: {
   if (topVisibleSessionId) return topVisibleSessionId;
   return sessions[0]?.id ?? null;
 }
+
+/// Whether opening this note should ask the workspace for its per-session
+/// assets. Shared notes only — a Personal note's takes never left the device.
+///
+/// **A missing timeline counts, not just missing audio.** The gate used to be
+/// "no local playback", which quietly excluded the case this exists for: the
+/// legacy single-file fallback writes a flat `playback.wav` and no timeline at
+/// all, so one trip through it left the note looking "already local" forever
+/// and the per-session pull — the only thing that fetches `timeline.jsonl` —
+/// was never attempted again. Without word timings the note falls back to the
+/// plain reader, which shows no speaker labels, so a teammate's meeting read as
+/// a single anonymous wall of text.
+export function needsSessionPull(opts: {
+  shared: boolean;
+  hasLocalPlayback: boolean;
+  timelineEntries: number;
+}): boolean {
+  const { shared, hasLocalPlayback, timelineEntries } = opts;
+  if (!shared) return false;
+  return !hasLocalPlayback || timelineEntries === 0;
+}

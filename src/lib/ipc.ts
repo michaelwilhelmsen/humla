@@ -329,6 +329,12 @@ export const ipc = {
   uploadNoteSessions: (noteId: string) => invoke<void>("cloud_upload_note_sessions", { noteId }),
   downloadNoteSessions: (noteId: string) =>
     invoke<boolean>("cloud_download_note_sessions", { noteId }),
+  // Opportunistic repair on note open: attach any per-session asset the server
+  // is missing, re-sending nothing it already has. Covers the post-recording
+  // upload never having run (app quit, network down) — without it, a stranded
+  // timeline is stranded for good and teammates never see the speaker labels.
+  repairNoteSessions: (noteId: string) =>
+    invoke<void>("cloud_repair_note_sessions", { noteId }),
   // Who (if anyone) is currently recording a shared note. null = nobody, a
   // Personal note, or the cloud isn't configured. Drives the recording-lock
   // banner + disabled Record button so teammates don't record the same note.

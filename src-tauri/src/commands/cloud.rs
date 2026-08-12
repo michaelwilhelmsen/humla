@@ -1652,17 +1652,32 @@ fn remote_present_assets(rec: &RemoteSession) -> Vec<crate::sessions::AssetField
 /// Upload a note's per-session assets to the cloud (#16). For each locally
 /// recorded session (skipping the synthesized legacy flat entry), attach the
 /// assets the server doesn't have yet — plus the timeline every time, since
-/// re-diarize / unification rewrites it. No-op for Personal notes or when
-/// `sync_audio` is "false". Fire-and-forget: waits (bounded) for the note +
-/// session records to sync, then PATCHes.
-pub(crate) async fn upload_note_sessions(app: &tauri::AppHandle, note_id: &str) -> Result<(), String> {
+/// re-diarize / unification rewrites it. No-op for Personal notes.
+///
+/// `sync_audio = false` withholds the *audio* assets only. It used to return
+/// early and skip the whole upload, which took `timeline.jsonl` with it — so a
+/// teammate opening the note got no word timings and therefore no speaker
+/// labels at all. The timeline is text and carries no voice; the setting has no
+/// business suppressing it.
+///
+/// In `missing_only` mode this is a repair pass (see
+/// [`crate::sessions::session_repair_plan`]): it re-sends nothing the server
+/// already holds and doesn't wait around for records to appear, because the
+/// next note open runs it again.
+///
+/// Fire-and-forget: waits (bounded) for the note + session records to sync,
+/// then PATCHes.
+pub(crate) async fn upload_note_sessions(
+    app: &tauri::AppHandle,
+    note_id: &str,
+    missing_only: bool,
+) -> Result<(), String> {
     let state = app.state::<AppState>();
-    let workspace = {
+    let (workspace, sync_audio) = {
         let conn = state.db.lock();
-        if db::get_setting(&conn, "sync_audio").ok().flatten().as_deref() == Some("false") {
-            return Ok(());
-        }
-        db::get_note(&conn, note_id).map_err(err)?.workspace_id
+        let sync_audio =
+            db::get_setting(&conn, "sync_audio").ok().flatten().as_deref() != Some("false");
+        (db::get_note(&conn, note_id).map_err(err)?.workspace_id, sync_audio)
     };
     if workspace.is_empty() {
         return Ok(()); // Personal — never leaves the device
@@ -1681,9 +1696,12 @@ pub(crate) async fn upload_note_sessions(app: &tauri::AppHandle, note_id: &str) 
     }
 
     let (base, session) = ensure_session(&state).await?;
+    // A repair pass looks once and leaves; the post-recording pass waits, since
+    // it is racing the sync worker that pushes the records it needs.
+    let attempts = if missing_only { 1 } else { 20 };
     // The note record syncs asynchronously post-stop; wait for it to exist.
     let mut note_pb = None;
-    for _ in 0..20 {
+    for _ in 0..attempts {
         if let Some((id, _)) = find_note_remote(&base, &session.token, note_id, &workspace).await? {
             note_pb = Some(id);
             break;
@@ -1699,7 +1717,7 @@ pub(crate) async fn upload_note_sessions(app: &tauri::AppHandle, note_id: &str) 
     let wanted: std::collections::HashSet<String> =
         sessions.iter().map(|(e, _)| e.id.clone()).collect();
     let mut records: Vec<RemoteSession> = Vec::new();
-    for _ in 0..20 {
+    for _ in 0..attempts {
         records = find_session_records(&base, &session.token, &note_pb).await?;
         let have: std::collections::HashSet<&str> =
             records.iter().map(|r| r.client_id.as_str()).collect();
@@ -1715,9 +1733,15 @@ pub(crate) async fn upload_note_sessions(app: &tauri::AppHandle, note_id: &str) 
         let Some(rec) = by_client.get(entry.id.as_str()) else {
             continue; // its metadata hasn't synced yet — try again next time
         };
-        let plan = crate::sessions::session_upload_plan(
-            &local_present_assets(dir),
-            &remote_present_assets(rec),
+        let local = local_present_assets(dir);
+        let remote = remote_present_assets(rec);
+        let plan = crate::sessions::retain_syncable(
+            if missing_only {
+                crate::sessions::session_repair_plan(&local, &remote)
+            } else {
+                crate::sessions::session_upload_plan(&local, &remote)
+            },
+            sync_audio,
         );
         if plan.is_empty() {
             continue;
@@ -1827,12 +1851,24 @@ pub(crate) async fn download_note_sessions(app: &tauri::AppHandle, note_id: &str
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         for field in crate::sessions::session_download_plan(keep_audio) {
             let filename = rec.files.get(field.field()).cloned().unwrap_or_default();
-            if filename.is_empty() || !safe_path_seg(&filename) {
+            if !filename.is_empty() && !safe_path_seg(&filename) {
                 continue;
             }
             let dest = dir.join(field.file_name());
-            if dest.exists() {
-                continue; // already local
+            // A timeline already on disk is re-fetched when the server's copy is
+            // a different upload — the author rewrites it whenever they
+            // re-diarize, unify or rename a speaker, and the old rule ("exists →
+            // skip") pinned the reader to whatever labels they happened to pull
+            // first. Audio is fetched once and never again.
+            let stamp_path = crate::sessions::remote_stamp_path(&dir, field);
+            let stamp = std::fs::read_to_string(&stamp_path).ok();
+            if !crate::sessions::should_fetch_asset(
+                field,
+                dest.exists(),
+                stamp.as_deref(),
+                &filename,
+            ) {
+                continue;
             }
             let url = format!("{base}/api/files/note_sessions/{}/{}", rec.pb_id, filename);
             let resp = http()
@@ -1847,6 +1883,10 @@ pub(crate) async fn download_note_sessions(app: &tauri::AppHandle, note_id: &str
             }
             let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
             std::fs::write(&dest, &bytes).map_err(|e| e.to_string())?;
+            // Record which upload this copy came from, so the next open can tell
+            // "same file" from "the author changed the labels". Best-effort: a
+            // missing stamp just costs one redundant fetch.
+            let _ = std::fs::write(&stamp_path, &filename);
         }
     }
     Ok(true)
@@ -1854,7 +1894,16 @@ pub(crate) async fn download_note_sessions(app: &tauri::AppHandle, note_id: &str
 
 #[tauri::command]
 pub async fn cloud_upload_note_sessions(app: tauri::AppHandle, note_id: String) -> Result<(), String> {
-    upload_note_sessions(&app, &note_id).await
+    upload_note_sessions(&app, &note_id, false).await
+}
+
+/// Opportunistic repair: attach any per-session asset the server is missing for
+/// this note. Called on note open for a shared note this device has recordings
+/// for, so an upload that never happened (app quit inside the post-recording
+/// window, network down) is retried instead of being lost forever.
+#[tauri::command]
+pub async fn cloud_repair_note_sessions(app: tauri::AppHandle, note_id: String) -> Result<(), String> {
+    upload_note_sessions(&app, &note_id, true).await
 }
 
 #[tauri::command]

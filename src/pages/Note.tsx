@@ -37,7 +37,12 @@ import { extractSpeakerLabels, renameSpeakerInTranscript } from "../lib/speakers
 import { shouldAdoptRemoteBody } from "../lib/noteSync";
 import { SpeakerLabels, speakerColorMap } from "../components/SpeakerLabels";
 import { RecordingSessions } from "../components/RecordingSessions";
-import { groupTimeline, resolveActivePill, formatSessionCaption } from "../lib/sessions";
+import {
+  groupTimeline,
+  needsSessionPull,
+  resolveActivePill,
+  formatSessionCaption,
+} from "../lib/sessions";
 import { RecordingBar } from "../components/RecordingBar";
 import { ChatPanel, type ChatSessionControls } from "../components/ChatPanel";
 import { SelectablePopover } from "../components/SelectablePopover";
@@ -501,13 +506,29 @@ export function Note() {
         ipc.noteTimeline(draft.id).catch((): TimelineEntry[] => []),
         ipc.noteSessions(draft.id).catch((): NoteSession[] => []),
       ]);
-      // No local audio but the note is shared → pull it from the workspace.
-      // Prefer per-session sync (#16): rebuild sessions.json + fetch each take's
-      // playback/timeline. Fall back to the legacy single-file notes.audio for
-      // notes that predate sessions (or were uploaded by an old client).
-      if (!path && draft.workspace_id) {
+      // Something's missing locally and the note is shared → pull it from the
+      // workspace. Prefer per-session sync (#16): rebuild sessions.json + fetch
+      // each take's playback/timeline. Fall back to the legacy single-file
+      // notes.audio for notes that predate sessions (or were uploaded by an old
+      // client).
+      //
+      // A MISSING TIMELINE is reason enough to ask, not just missing audio. The
+      // gate used to be `!path` alone, which had a trap: the legacy fallback
+      // writes a flat playback.wav and no timeline at all, so one visit through
+      // it left `path` non-null forever and the per-session pull — the only
+      // thing that fetches timelines — was never attempted again for that note.
+      // A teammate's note stayed permanently without word timings, and with
+      // them, without speaker labels.
+      if (
+        needsSessionPull({
+          shared: !!draft.workspace_id,
+          hasLocalPlayback: !!path,
+          timelineEntries: tl.length,
+        })
+      ) {
         let got = await ipc.downloadNoteSessions(draft.id).catch(() => false);
-        if (!got) {
+        // Only worth the legacy round-trip if we still have no audio at all.
+        if (!got && !path) {
           got = await ipc.downloadNoteAudio(draft.id).catch(() => false);
         }
         if (got && !cancelled) {
@@ -520,6 +541,17 @@ export function Note() {
       setPlaybackUrl(path ? convertFileSrc(path) : null);
       setTimeline(tl);
       setSessions(sess);
+      // The mirror image, for takes recorded HERE: re-attach any per-session
+      // asset the server never received. The post-recording upload is a single
+      // fire-and-forget call with no retry, so quitting the app (or a dropped
+      // network) inside the minute after a recording stranded the timeline on
+      // this device — the note synced, teammates got the text, and nobody ever
+      // got the speaker labels. Repairing on open costs one lookup and re-sends
+      // nothing the server already holds. Viewers skip it; the server would
+      // reject the write anyway.
+      if (draft.workspace_id && sess.length > 0 && !readOnlyRef.current) {
+        void ipc.repairNoteSessions(draft.id).catch(() => {});
+      }
     })();
     return () => {
       cancelled = true;
@@ -1887,12 +1919,16 @@ const TranscriptEditor = memo(function TranscriptEditor({
 });
 
 // Styled transcript reader. Each line is its own block so we can hang
-// a coloured speaker dot in the left gutter (absolute-positioned at
-// `left: -14px` from the line's edge, outside the text flow). The
-// label prefix that the textarea shows as raw text ("Speaker 1: ") is
-// rendered inside the line as transparent — keeps the wrap identical
-// to the textarea so flipping into edit mode doesn't jolt the page
-// height.
+// a coloured speaker dot at the line's left edge. The label prefix that
+// the textarea shows as raw text ("Speaker 1: ") is rendered inside the
+// line as transparent — keeps the wrap identical to the textarea so
+// flipping into edit mode doesn't jolt the page height, and gives the
+// dot blank space to sit in.
+//
+// The dot is positioned by `.nd-speaker-dot` at `left: 0`, deliberately
+// *inside* the line box: this view's scroll container clips anything at
+// a negative x (a scroll container resolves its other axis to `auto`),
+// which is what made every dot here invisible. See globals.css.
 //
 // The whole view is click-to-edit unless `disabled` (recording in
 // flight). The dot's click bubbles up to enter edit mode too — its
