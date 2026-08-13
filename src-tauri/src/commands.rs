@@ -2914,11 +2914,15 @@ async fn diarize_and_apply(
     // declared on the trait object.
     type Splitter = dyn Fn(&ChunkRecord) -> Vec<LabelledPiece> + Send;
     let split_chunk: Box<Splitter> = if !diarize_available {
-        // No model, so no speaker assignment to make. The text and the
-        // per-chunk bounds are what matter here: they give the reader
-        // something to render and playback something to anchor to, and a
-        // later re-diarize has a session dir to attach to.
-        Box::new(unlabelled_piece)
+        // No model, so no speaker assignment to make — but the word timings
+        // are kept. Diarization decides *who* spoke, not when each word
+        // landed, so its absence says nothing about the timings the provider
+        // returned for this audio. (ADR-0004 drops `words` when a turn's text
+        // is *edited*, where the mapping describes words that are gone. That
+        // isn't this case, and a timeline with real timings gives these notes
+        // per-word highlighting plus the tighter turn bounds
+        // `serialize_timeline` derives from words when it has them.)
+        Box::new(|c: &ChunkRecord| single_piece(c, None))
     } else {
         match (mic_chunks_present, sys_chunks_present) {
         (true, false) => {
@@ -3520,18 +3524,6 @@ fn single_piece(c: &ChunkRecord, label: Option<String>) -> Vec<LabelledPiece> {
         label,
         text: c.text.clone(),
         words: c.words.clone(),
-    }]
-}
-
-/// Wrap a chunk's text as a single piece with no speaker and no word
-/// timings — the shape the diarize-skipped path serialises (ADR-0004: a
-/// recording that lands text always writes a timeline behind it, even when
-/// nothing could be said about who spoke).
-fn unlabelled_piece(c: &ChunkRecord) -> Vec<LabelledPiece> {
-    vec![LabelledPiece {
-        label: None,
-        text: c.text.clone(),
-        words: Vec::new(),
     }]
 }
 
@@ -7711,29 +7703,34 @@ mod diarize_tests {
 
     /// The diarize-skipped path still has to leave a timeline behind, or the
     /// text it live-appended becomes the next orphan. No model means nothing
-    /// can be said about who spoke, so the entries carry the words and the
-    /// chunk bounds and nothing else.
+    /// can be said about who spoke — so the label is empty, and *only* the
+    /// label: word timings describe when each word landed, which diarization
+    /// has no bearing on, so they are kept and the note keeps per-word
+    /// highlighting.
     #[test]
-    fn diarize_skipped_timeline_carries_text_with_no_label_and_no_words() {
+    fn diarize_skipped_timeline_carries_text_and_timings_with_no_label() {
         let chunks = vec![
-            mic(0, "so where did we land on the freeze."),
-            sys(4_000, "pushing it to the following Friday."),
+            sys_with_words(0, vec![("where", 0, 400), ("now", 400, 900)]),
+            sys_with_words(4_000, vec![("friday", 0, 500)]),
         ];
-        let values = jsonl_values(&serialize_timeline(&chunks, &unlabelled_piece, 0));
+        let split = |c: &ChunkRecord| single_piece(c, None);
+        let values = jsonl_values(&serialize_timeline(&chunks, &split, 0));
         assert_eq!(values.len(), 2);
         for v in &values {
             assert_eq!(v["label"], "");
-            assert_eq!(v["words"].as_array().unwrap().len(), 0);
         }
-        assert_eq!(values[0]["text"], "so where did we land on the freeze.");
-        assert_eq!(values[1]["text"], "pushing it to the following Friday.");
-        assert_eq!(values[0]["start_ms"], 0);
-        assert_eq!(values[1]["start_ms"], 4_000);
+        assert_eq!(values[0]["text"], "where now");
+        assert_eq!(values[1]["text"], "friday");
+        // The provider's word timings survive a missing diarize model, rebased
+        // to stream-absolute as usual...
+        assert_eq!(values[0]["words"][1]["text"], "now");
+        assert_eq!(values[0]["words"][1]["start_ms"], 400);
+        assert_eq!(values[1]["words"][0]["start_ms"], 4_000);
+        // ...which also gives the entry the tighter bounds `serialize_timeline`
+        // derives from words rather than the coarse chunk fallback.
+        assert_eq!(values[0]["end_ms"], 900);
         // And it projects back to the text the live append had already saved.
-        assert_eq!(
-            group_values_to_transcript(&values),
-            "so where did we land on the freeze. pushing it to the following Friday.",
-        );
+        assert_eq!(group_values_to_transcript(&values), "where now friday");
     }
 
     #[test]
