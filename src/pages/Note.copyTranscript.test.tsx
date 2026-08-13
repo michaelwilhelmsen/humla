@@ -4,22 +4,14 @@ import userEvent from "@testing-library/user-event";
 import { renderApp } from "../test/app";
 import { makeNote } from "../test/fixtures";
 import { useNotesStore } from "../lib/store";
+import { mockLayoutBox } from "../test/layout";
 
 // #166: the summary panel has a copy control; the transcript panel had none,
 // so getting the transcript out meant dragging a selection across a long
 // scrolling region.
 
 // Both readers virtualize their lines and jsdom pins offsetWidth/Height to 0.
-beforeAll(() => {
-  Object.defineProperty(window.HTMLElement.prototype, "offsetHeight", {
-    configurable: true,
-    get: () => 600,
-  });
-  Object.defineProperty(window.HTMLElement.prototype, "offsetWidth", {
-    configurable: true,
-    get: () => 400,
-  });
-});
+beforeAll(() => mockLayoutBox());
 
 const TRANSCRIPT = "Speaker 1: so where did we land on the freeze\nSpeaker 2: friday";
 
