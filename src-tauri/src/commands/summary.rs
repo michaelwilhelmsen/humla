@@ -138,6 +138,27 @@ fn resolve_prompt(conn: &rusqlite::Connection, note: &Note, language: &str) -> S
     }
 }
 
+/// Turn `auto` into the language the recording was actually in, when the
+/// STT provider told us (issue #167).
+///
+/// Everything downstream then takes the ordinary explicit-language path and
+/// emits a hard "write the entire response in X" directive, rather than
+/// asking a model to infer the target from a prompt whose every label is
+/// Norwegian.
+///
+/// The `auto` branches survive as the fallback for notes with no detection:
+/// notes recorded before this shipped, Deepgram, `gpt-4o-transcribe`, and
+/// recordings too bilingual for the vote to call.
+fn resolve_auto(language: &str, note: &Note) -> String {
+    if language != "auto" {
+        return language.to_string();
+    }
+    match note.detected_language.as_deref() {
+        Some(code) if !code.trim().is_empty() => code.to_string(),
+        _ => language.to_string(),
+    }
+}
+
 async fn run_summary(app: AppHandle, note_id: String) -> anyhow::Result<()> {
     let state: State<AppState> = app.state();
     // Read the API key out of band — keychain lookup shouldn't sit
@@ -157,7 +178,7 @@ async fn run_summary(app: AppHandle, note_id: String) -> anyhow::Result<()> {
         } else {
             n.language.clone()
         };
-        (p_resolved, lang, n)
+        (p_resolved, resolve_auto(&lang, &n), n)
     };
     if note.transcript.trim().is_empty() && note.body.trim().is_empty() {
         return Ok(());
@@ -343,6 +364,48 @@ mod tests {
         let d = language_directive("auto");
         assert!(d.contains("instructions"), "{d}");
         assert!(d.contains("labels"), "{d}");
+    }
+
+    // Issue #167 — `auto` resolves to what was actually spoken, so the
+    // summary takes the hard-directive path instead of inferring the target
+    // from a Norwegian-labelled prompt.
+    #[test]
+    fn auto_resolves_to_the_detected_language() {
+        let (_dir, conn) = temp_conn();
+        let note = db::create_note(&conn, "auto", "meeting", "").unwrap();
+        db::update_note(&conn, &note.id, &db::NotePatch {
+            detected_language: Some("en".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+        let note = db::get_note(&conn, &note.id).unwrap();
+        assert_eq!(resolve_auto("auto", &note), "en");
+        assert!(language_directive(&resolve_auto("auto", &note)).contains("English"));
+    }
+
+    #[test]
+    fn auto_stays_auto_without_a_detection() {
+        // Pre-change notes, Deepgram, gpt-4o-transcribe, and recordings too
+        // bilingual to call all land here — and fall back to Fix 2's
+        // transcript-anchored directive.
+        let (_dir, conn) = temp_conn();
+        let note = db::create_note(&conn, "auto", "meeting", "").unwrap();
+        assert_eq!(resolve_auto("auto", &note), "auto");
+    }
+
+    #[test]
+    fn an_explicit_language_ignores_the_detection() {
+        // The user asked for Norwegian output on an English recording. That's
+        // a choice, not a mistake — don't override it.
+        let (_dir, conn) = temp_conn();
+        let note = db::create_note(&conn, "no", "meeting", "").unwrap();
+        db::update_note(&conn, &note.id, &db::NotePatch {
+            detected_language: Some("en".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+        let note = db::get_note(&conn, &note.id).unwrap();
+        assert_eq!(resolve_auto("no", &note), "no");
     }
 
     #[test]

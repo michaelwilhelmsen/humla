@@ -1989,6 +1989,12 @@ async fn run_post_stop_chain(
     let session_started_at = post_stop.session_started_at.clone();
     let streams = session_streams(&post_stop.chunks);
     let transcribed_nothing = post_stop.chunks.is_empty();
+    // Record what the provider heard before diarizing (issue #167).
+    // Deliberately *not* inside diarize_and_apply: that returns early when
+    // the diarize model isn't downloaded, so a user without it would never
+    // get a detected language. File import inherits this for free — it
+    // drives the same chain.
+    record_detected_language(&app, &note_id, &post_stop.chunks);
     if let Err(e) = diarize_and_apply(app.clone(), note_id.clone(), post_stop).await {
         eprintln!("diarize_and_apply: {e}");
         emit_error(
@@ -5665,6 +5671,37 @@ fn majority_language(chunks: &[ChunkRecord]) -> Option<String> {
         Some(lang.to_string())
     } else {
         None
+    }
+}
+
+/// Persist the recording's detected language on the note, if this capture
+/// produced one and the note doesn't already carry one (issue #167).
+///
+/// No "was the capture on auto?" check is needed here: the adapters only
+/// report a detection when they weren't given a language, so a chunk with
+/// `Some(code)` is by construction from an `auto` capture.
+///
+/// First detection wins — a resumed recording appends to an existing note
+/// and shouldn't overwrite what the original take established.
+fn record_detected_language(app: &AppHandle, note_id: &str, chunks: &[ChunkRecord]) {
+    let Some(lang) = majority_language(chunks) else { return };
+    let state: State<AppState> = app.state();
+    let conn = state.db.lock();
+    match db::get_note(&conn, note_id) {
+        Ok(n) if n.detected_language.is_some() => return,
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!("record_detected_language: {e}");
+            return;
+        }
+    }
+    if let Err(e) = db::update_note(&conn, note_id, &db::NotePatch {
+        detected_language: Some(lang.clone()),
+        ..Default::default()
+    }) {
+        eprintln!("record_detected_language: {e}");
+    } else {
+        eprintln!("[stt] detected recording language: {lang}");
     }
 }
 

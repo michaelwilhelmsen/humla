@@ -31,6 +31,16 @@ pub struct Note {
     // value pins the cluster count, which is the most reliable fix for
     // dominant-speaker conversations where auto-detect collapses to 1.
     pub expected_speakers: Option<i64>,
+    // ISO 639-1 code the STT provider reported for this recording, decided
+    // by a length-weighted vote across chunks (issue #167). Only written
+    // when the note was captured on `auto`; `None` on every note recorded
+    // with an explicit language, on providers that don't report one, and on
+    // recordings too bilingual to call.
+    //
+    // Derived and local-only, like `speakers` (ADR 0002): a cache of what
+    // the model heard, not a record, so it stays off the sync wire.
+    #[serde(default)]
+    pub detected_language: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
     // Cloud sync: the PocketBase user id of the note's creator. Empty for
@@ -253,6 +263,12 @@ pub fn open(path: &Path) -> Result<Connection> {
         "ALTER TABLE notes ADD COLUMN expected_speakers INTEGER",
         [],
     );
+    // What the STT provider detected the recording was in (issue #167).
+    // Derived, local-only, never synced — see the Note field's comment.
+    let _ = conn.execute(
+        "ALTER TABLE notes ADD COLUMN detected_language TEXT",
+        [],
+    );
     // Cloud sync: note creator (PocketBase user id). Empty for local/pre-sync
     // notes; populated from the server on pull.
     let _ = conn.execute(
@@ -389,7 +405,9 @@ pub fn now_ms() -> i64 {
 // paths default it to NULL safely. When Client cloud-sync lands (#49), the
 // remote-note apply path must include `client_id` in its upsert or a pulled
 // note would clobber a local tag.
-const NOTE_COLS: &str = "id, title, body, transcript, summary, audio_path, summary_preset, folder_id, language, summary_provider, expected_speakers, created_at, updated_at, owner, workspace_id, deleted_at, client_id";
+// Appended-only: `map_note` reads by position, so new columns go on the end
+// to keep every existing index stable.
+const NOTE_COLS: &str = "id, title, body, transcript, summary, audio_path, summary_preset, folder_id, language, summary_provider, expected_speakers, created_at, updated_at, owner, workspace_id, deleted_at, client_id, detected_language";
 
 /// List live notes in the active workspace (`""` = Personal / local-only).
 /// Excludes trashed notes (`deleted_at` set). Scoping by workspace keeps one
@@ -657,6 +675,11 @@ pub struct NotePatch {
     // this field?", the inner one says "what value to write?".
     #[serde(default, deserialize_with = "deserialize_optional_optional")]
     pub expected_speakers: Option<Option<i64>>,
+    // Detected recording language (issue #167). A plain `Option` unlike
+    // `expected_speakers`: there's no "clear it back to auto" gesture —
+    // it's written once by the post-stop chain and otherwise left alone.
+    #[serde(default)]
+    pub detected_language: Option<String>,
 }
 
 /// Custom deserializer so the JSON shapes `{}`, `{"expectedSpeakers": null}`,
@@ -734,6 +757,12 @@ pub fn update_note(conn: &Connection, id: &str, patch: &NotePatch) -> Result<()>
         conn.execute(
             "UPDATE notes SET expected_speakers = ?1, updated_at = ?2 WHERE id = ?3",
             params![es, now, id],
+        )?;
+    }
+    if let Some(dl) = &patch.detected_language {
+        conn.execute(
+            "UPDATE notes SET detected_language = ?1, updated_at = ?2 WHERE id = ?3",
+            params![dl, now, id],
         )?;
     }
     Ok(())
@@ -2924,12 +2953,44 @@ fn map_note(row: &rusqlite::Row) -> rusqlite::Result<Note> {
         workspace_id: row.get(14)?,
         deleted_at: row.get(15)?,
         client_id: row.get(16)?,
+        detected_language: row.get(17)?,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #167 — the detected recording language round-trips, starts
+    /// NULL, and isn't disturbed by an unrelated patch.
+    #[test]
+    fn detected_language_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("detected.sqlite")).unwrap();
+        let note = create_note(&conn, "auto", "meeting", "").unwrap();
+        assert_eq!(note.detected_language, None, "fresh notes start undetected");
+
+        update_note(&conn, &note.id, &NotePatch {
+            detected_language: Some("en".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            get_note(&conn, &note.id).unwrap().detected_language.as_deref(),
+            Some("en")
+        );
+
+        // A patch that doesn't mention the field leaves it alone.
+        update_note(&conn, &note.id, &NotePatch {
+            title: Some("Renamed".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            get_note(&conn, &note.id).unwrap().detected_language.as_deref(),
+            Some("en")
+        );
+    }
 
     /// The core P0 guard: a note created in one workspace must not appear when
     /// listing another, and Personal ("") is its own bucket.
