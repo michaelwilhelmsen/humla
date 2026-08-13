@@ -12,11 +12,11 @@
 import ReactDOM from "react-dom/client";
 import { StrictMode, useState } from "react";
 import { mockIPC } from "@tauri-apps/api/mocks";
-import { TranscriptEditor } from "./pages/Note";
+import { TranscriptEditor, TranscriptPlayer } from "./pages/Note";
 import { SummaryStep } from "./pages/onboarding/steps/Summary";
 import { TranscriptionStep } from "./pages/onboarding/steps/Transcription";
 import { STEP_ORDER, type StepContext, type StepId } from "./pages/onboarding/types";
-import type { ProviderConfig } from "./lib/ipc";
+import type { ProviderConfig, TimelineEntry } from "./lib/ipc";
 import "@fontsource/hanken-grotesk/400.css";
 import "@fontsource/hanken-grotesk/500.css";
 import "@fontsource/hanken-grotesk/600.css";
@@ -125,6 +125,79 @@ function TranscriptEditorHarness({ disabled }: { disabled: boolean }) {
   );
 }
 
+// ---- #170 axis: per-turn editing on a timeline-backed note ----------------
+// The reader renders from the timeline, so editing must too. What needs eyes:
+// the hover pencil sitting beside the delete ×, and the open textarea keeping
+// the turn's place in the flow instead of jumping the page.
+function playerCase(disabled: boolean): Scenario {
+  return {
+    wrap: (node) => (
+      <div className="flex-1 min-h-0 flex justify-center px-6 py-8">
+        <div className="w-full max-w-[420px] rounded-[var(--radius-card)] bg-[var(--color-surface)] flex flex-col min-h-0 px-4 py-4">
+          {node}
+        </div>
+      </div>
+    ),
+    render: () => <TranscriptPlayerHarness disabled={disabled} />,
+    ipc: {
+      note_session_playback_path: () => null,
+      note_timeline_set_chunk_text: () => null,
+      cloud_upload_note_sessions: () => null,
+    },
+  };
+}
+
+function TranscriptPlayerHarness({ disabled }: { disabled: boolean }) {
+  const turn = (
+    chunkIdx: number,
+    label: string,
+    text: string,
+    startMs: number,
+  ): TimelineEntry => ({
+    start_ms: startMs,
+    end_ms: startMs + 3000,
+    label,
+    text,
+    words: text.split(" ").map((w, i) => ({
+      text: w,
+      start_ms: startMs + i * 300,
+      end_ms: startMs + i * 300 + 300,
+    })),
+    sessionId: "s1",
+    sessionIndex: 0,
+    chunkIdx,
+  });
+  const [timeline, setTimeline] = useState<TimelineEntry[]>([
+    turn(0, "Michael", "Skal vi ta gjennomgangen nå?", 0),
+    turn(1, "Hege", "Ja, jeg har notatene klare", 3000),
+    turn(2, "Hege", "og tallene fra forrige kvartal", 6000),
+    turn(3, "Michael", "Bra — da starter vi der.", 9000),
+  ]);
+  return (
+    <TranscriptPlayer
+      noteId="mock-note"
+      timeline={timeline}
+      setTimeline={setTimeline}
+      sessions={[
+        {
+          id: "s1",
+          index: 1,
+          startedAt: new Date().toISOString(),
+          durationMs: 12000,
+          streams: ["mic"],
+          hasPlayback: false,
+        },
+      ]}
+      fallbackPlaybackUrl={null}
+      audioAvailable={false}
+      keepAudio={false}
+      disabled={disabled}
+      fill
+      bottomAligned={false}
+    />
+  );
+}
+
 const CASES: Record<string, Scenario> = {
   // --- #147: the issue's exact report — recommended model already pulled.
   recommended: summaryCase(["gemma4:12b-mlx", "embeddinggemma"]),
@@ -163,6 +236,11 @@ const CASES: Record<string, Scenario> = {
   transcript: transcriptCase(false),
   // Recording in flight — no mode to enter, so the header slot is empty.
   "transcript-recording": transcriptCase(true),
+
+  // --- #170: per-turn editing on a timeline-backed note.
+  player: playerCase(false),
+  // Recording in flight — no edit or delete affordance on any turn.
+  "player-recording": playerCase(true),
 };
 
 const which = new URLSearchParams(location.search).get("case") ?? "recommended";

@@ -376,6 +376,24 @@ export const ipc = {
       chunkIdx,
       newLabel,
     }),
+  // Rewrite one rendered turn's text (#170). Takes the whole run of chunk
+  // indices `groupTimeline` merged into that turn, so a multi-entry turn is one
+  // atomic call: the backend writes the text into the lowest index, empties the
+  // rest, drops their word timings, and re-derives `note.transcript` from every
+  // session's timeline — which is what stops an edit from orphaning the source
+  // it is rendered from.
+  noteTimelineSetChunkText: (
+    noteId: string,
+    sessionId: string,
+    chunkIdxs: number[],
+    newText: string,
+  ) =>
+    invoke<void>("note_timeline_set_chunk_text", {
+      noteId,
+      sessionId,
+      chunkIdxs,
+      newText,
+    }),
   noteTimelineDeleteChunk: (noteId: string, sessionId: string, chunkIdx: number) =>
     invoke<void>("note_timeline_delete_chunk", { noteId, sessionId, chunkIdx }),
   openInFinder: (path: string) => invoke<void>("open_in_finder", { path }),
