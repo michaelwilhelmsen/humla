@@ -23,6 +23,7 @@ function makeNote(id: string, title: string): Note {
     language: "en",
     summary_provider: "",
     expected_speakers: null,
+    detected_language: null,
     created_at: Date.now(),
     updated_at: Date.now(),
     owner: "",

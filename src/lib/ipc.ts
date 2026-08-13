@@ -36,7 +36,7 @@ export type Note = {
   // captured on `auto`; null on explicit-language notes, on providers that
   // don't report one, and on recordings too bilingual to call. Derived and
   // local-only — never synced (ADR 0002).
-  detected_language?: string | null;
+  detected_language: string | null;
   created_at: number;
   updated_at: number;
   // Cloud sync: PocketBase user id of the note's creator. Empty for

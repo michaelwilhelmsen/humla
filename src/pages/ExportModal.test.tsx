@@ -18,6 +18,7 @@ function makeNote(over: Partial<Note> = {}): Note {
     language: "en",
     summary_provider: "",
     expected_speakers: null,
+    detected_language: null,
     created_at: 0,
     updated_at: 0,
     owner: "",

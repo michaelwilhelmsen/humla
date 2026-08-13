@@ -675,11 +675,6 @@ pub struct NotePatch {
     // this field?", the inner one says "what value to write?".
     #[serde(default, deserialize_with = "deserialize_optional_optional")]
     pub expected_speakers: Option<Option<i64>>,
-    // Detected recording language (issue #167). A plain `Option` unlike
-    // `expected_speakers`: there's no "clear it back to auto" gesture —
-    // it's written once by the post-stop chain and otherwise left alone.
-    #[serde(default)]
-    pub detected_language: Option<String>,
 }
 
 /// Custom deserializer so the JSON shapes `{}`, `{"expectedSpeakers": null}`,
@@ -759,12 +754,21 @@ pub fn update_note(conn: &Connection, id: &str, patch: &NotePatch) -> Result<()>
             params![es, now, id],
         )?;
     }
-    if let Some(dl) = &patch.detected_language {
-        conn.execute(
-            "UPDATE notes SET detected_language = ?1, updated_at = ?2 WHERE id = ?3",
-            params![dl, now, id],
-        )?;
-    }
+    Ok(())
+}
+
+/// Record what the STT provider detected the recording was in (issue #167).
+///
+/// Deliberately NOT a `NotePatch` field, and deliberately does NOT touch
+/// `updated_at` — same rule as `reindex_note`'s `speakers` write. This is
+/// derived, local-only data that never reaches the sync wire, and
+/// `updated_at` is cloud-sync's last-write-wins key: bumping it would let a
+/// purely local cache write beat a teammate's real edit.
+pub fn set_detected_language(conn: &Connection, id: &str, code: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE notes SET detected_language = ?1 WHERE id = ?2",
+        params![code, id],
+    )?;
     Ok(())
 }
 
@@ -2961,8 +2965,8 @@ fn map_note(row: &rusqlite::Row) -> rusqlite::Result<Note> {
 mod tests {
     use super::*;
 
-    /// Issue #167 — the detected recording language round-trips, starts
-    /// NULL, and isn't disturbed by an unrelated patch.
+    /// Issue #167 — the detected recording language round-trips and starts
+    /// NULL.
     #[test]
     fn detected_language_round_trips() {
         let dir = tempfile::tempdir().unwrap();
@@ -2970,17 +2974,13 @@ mod tests {
         let note = create_note(&conn, "auto", "meeting", "").unwrap();
         assert_eq!(note.detected_language, None, "fresh notes start undetected");
 
-        update_note(&conn, &note.id, &NotePatch {
-            detected_language: Some("en".to_string()),
-            ..Default::default()
-        })
-        .unwrap();
+        set_detected_language(&conn, &note.id, "en").unwrap();
         assert_eq!(
             get_note(&conn, &note.id).unwrap().detected_language.as_deref(),
             Some("en")
         );
 
-        // A patch that doesn't mention the field leaves it alone.
+        // An unrelated edit leaves it alone.
         update_note(&conn, &note.id, &NotePatch {
             title: Some("Renamed".to_string()),
             ..Default::default()
@@ -2989,6 +2989,26 @@ mod tests {
         assert_eq!(
             get_note(&conn, &note.id).unwrap().detected_language.as_deref(),
             Some("en")
+        );
+    }
+
+    /// Writing derived data must not advance the note's last-write-wins
+    /// clock. `updated_at` is cloud-sync's conflict key, so bumping it here
+    /// would let a purely local cache write beat a teammate's real edit —
+    /// the same reason `reindex_note`'s `speakers` write leaves it alone.
+    #[test]
+    fn detected_language_does_not_bump_updated_at() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("detected-clock.sqlite")).unwrap();
+        let note = create_note(&conn, "auto", "meeting", "").unwrap();
+        let before = get_note(&conn, &note.id).unwrap().updated_at;
+
+        set_detected_language(&conn, &note.id, "en").unwrap();
+
+        assert_eq!(
+            get_note(&conn, &note.id).unwrap().updated_at,
+            before,
+            "a derived, never-synced write must not mark the note dirty"
         );
     }
 

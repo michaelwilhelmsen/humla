@@ -5677,28 +5677,43 @@ fn majority_language(chunks: &[ChunkRecord]) -> Option<String> {
 /// Persist the recording's detected language on the note, if this capture
 /// produced one and the note doesn't already carry one (issue #167).
 ///
-/// No "was the capture on auto?" check is needed here: the adapters only
-/// report a detection when they weren't given a language, so a chunk with
-/// `Some(code)` is by construction from an `auto` capture.
-///
 /// First detection wins — a resumed recording appends to an existing note
 /// and shouldn't overwrite what the original take established.
+///
+/// The adapters already suppress a detection whenever we named a language
+/// ourselves, so in principle a `Some(code)` chunk can only come from an
+/// `auto` capture. The note's own language is re-checked here anyway: the
+/// invariant lives in four separate adapters, and the cost of one of them
+/// drifting is that we silently persist our own request echoed back and
+/// then summarise against it.
 fn record_detected_language(app: &AppHandle, note_id: &str, chunks: &[ChunkRecord]) {
     let Some(lang) = majority_language(chunks) else { return };
     let state: State<AppState> = app.state();
     let conn = state.db.lock();
-    match db::get_note(&conn, note_id) {
-        Ok(n) if n.detected_language.is_some() => return,
-        Ok(_) => {}
+    let note = match db::get_note(&conn, note_id) {
+        Ok(n) => n,
         Err(e) => {
             eprintln!("record_detected_language: {e}");
             return;
         }
+    };
+    if note.detected_language.is_some() {
+        return;
     }
-    if let Err(e) = db::update_note(&conn, note_id, &db::NotePatch {
-        detected_language: Some(lang.clone()),
-        ..Default::default()
-    }) {
+    // Same resolution rule as transcription and summary: the note's own
+    // language wins, empty falls back to the global setting.
+    let resolved = if note.language.trim().is_empty() {
+        db::get_setting(&conn, "language")
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| DEFAULT_LANGUAGE.to_string())
+    } else {
+        note.language.clone()
+    };
+    if resolved != "auto" {
+        return;
+    }
+    if let Err(e) = db::set_detected_language(&conn, note_id, &lang) {
         eprintln!("record_detected_language: {e}");
     } else {
         eprintln!("[stt] detected recording language: {lang}");

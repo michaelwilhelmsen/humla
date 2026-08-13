@@ -17,6 +17,7 @@ export function makeNote(overrides: Partial<Note> & { id: string }): Note {
     language: "",
     summary_provider: "",
     expected_speakers: null,
+    detected_language: null,
     created_at: 0,
     updated_at: 0,
     owner: "",

@@ -373,11 +373,7 @@ mod tests {
     fn auto_resolves_to_the_detected_language() {
         let (_dir, conn) = temp_conn();
         let note = db::create_note(&conn, "auto", "meeting", "").unwrap();
-        db::update_note(&conn, &note.id, &db::NotePatch {
-            detected_language: Some("en".to_string()),
-            ..Default::default()
-        })
-        .unwrap();
+        db::set_detected_language(&conn, &note.id, "en").unwrap();
         let note = db::get_note(&conn, &note.id).unwrap();
         assert_eq!(resolve_auto("auto", &note), "en");
         assert!(language_directive(&resolve_auto("auto", &note)).contains("English"));
@@ -399,11 +395,7 @@ mod tests {
         // a choice, not a mistake — don't override it.
         let (_dir, conn) = temp_conn();
         let note = db::create_note(&conn, "no", "meeting", "").unwrap();
-        db::update_note(&conn, &note.id, &db::NotePatch {
-            detected_language: Some("en".to_string()),
-            ..Default::default()
-        })
-        .unwrap();
+        db::set_detected_language(&conn, &note.id, "en").unwrap();
         let note = db::get_note(&conn, &note.id).unwrap();
         assert_eq!(resolve_auto("no", &note), "no");
     }
