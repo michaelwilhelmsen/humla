@@ -53,7 +53,7 @@ impl BatchSttAdapter for LocalWhisperAdapter {
     ) -> Result<TranscribeResult> {
         let prompt =
             crate::stt::openai_compat::build_whisper_prompt(ctx.bias_terms, ctx.prior_context);
-        let (text, words) = local_whisper::transcribe_file_with_words(
+        let (text, words, detected_language) = local_whisper::transcribe_file_with_words(
             self.shared.clone(),
             self.model_path.clone(),
             self.use_gpu,
@@ -65,7 +65,7 @@ impl BatchSttAdapter for LocalWhisperAdapter {
         .await?;
         // local_whisper::Word is now a re-export of stt::Word so no
         // conversion is needed.
-        Ok(TranscribeResult { text, words })
+        Ok(TranscribeResult { text, words, detected_language })
     }
 }
 

@@ -50,6 +50,12 @@ pub struct TranscribeCtx<'a> {
 pub struct TranscribeResult {
     pub text: String,
     pub words: Vec<Word>,
+    /// ISO 639-1 code the provider reported detecting, when it reports one
+    /// at all. Coverage is genuinely partial — `None` on Deepgram, on
+    /// OpenAI's non-`whisper-1` models (they reject `verbose_json`), and
+    /// whenever we forced a language rather than asking for detection.
+    /// Callers must treat absence as normal, not as an error.
+    pub detected_language: Option<String>,
 }
 
 /// One word's display text + millisecond bounds. Mirrors the existing

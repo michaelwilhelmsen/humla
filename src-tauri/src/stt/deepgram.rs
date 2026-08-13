@@ -168,6 +168,12 @@ impl BatchSttAdapter for DeepgramAdapter {
         Ok(TranscribeResult {
             text: alt.transcript,
             words,
+            // Deepgram only reports a detected language when asked with
+            // `detect_language=true`, which is a request-shape change and a
+            // nested response field. Left as a follow-up (issue #167); on
+            // `auto` these notes fall back to the transcript-anchored
+            // directive rather than a resolved code.
+            detected_language: None,
         })
     }
 }

@@ -74,7 +74,10 @@ const LANGUAGE_LABELS: Record<string, string> = {
   en: "English",
   sv: "Swedish",
   da: "Danish",
-  auto: "the same language as the input",
+  // Mirror of presets.rs — issue #167. "the input" includes the Norwegian
+  // block labels and the `(ingen)` empty-notes placeholder; the transcript
+  // is the only block that carries the meeting's own language.
+  auto: "the same language as the transcript",
 };
 
 export function presetPromptForLang(preset: PresetSpec, lang: string): string {

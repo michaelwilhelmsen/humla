@@ -7,11 +7,11 @@
 //! the parent re-export.
 
 use super::read_provider_api_key;
-use super::{DEFAULT_LANGUAGE, DEFAULT_LOCAL_LLM_BASE_URL, DEFAULT_SUMMARY_MODEL, DEFAULT_SUMMARY_PROMPT};
+use super::{DEFAULT_LANGUAGE, DEFAULT_LOCAL_LLM_BASE_URL, DEFAULT_SUMMARY_MODEL};
 use crate::db::{self, Note, NotePatch};
 use crate::languages;
 use crate::openai;
-use crate::presets;
+use crate::presets::{self, DEFAULT_SUMMARY_PRESET};
 use crate::recording::{StreamDeltaPayload, SummaryPayload, SummaryStatusPayload};
 use crate::AppState;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -125,16 +125,48 @@ pub async fn summarize_note(app: AppHandle, note_id: String) -> Result<(), Strin
 ///      prompt.
 ///   3. Built-in preset value ("meeting", "lecture", etc.) — language-aware
 ///      via presets::prompt.
+///
+/// Both fallbacks in 1 and 2 resolve to the Meeting preset rather than to a
+/// prompt of their own (issue #167). The constant they used to return was
+/// hardcoded Norwegian down to "Skriv på norsk", so on any other language
+/// setting it contradicted the directive appended right after it — and it
+/// had drifted from the house style in two other ways besides: an explicit
+/// "trust the notes over the transcript" rule that the parenthetical
+/// `(brukerens)` / `(automatisk)` tags replaced, and a fixed section list
+/// of the kind small thinking models re-litigate instead of following.
+/// Meeting is the built-in default preset and is already language-aware,
+/// so there is nothing for a second copy to add.
 fn resolve_prompt(conn: &rusqlite::Connection, note: &Note, language: &str) -> String {
     if let Some(id) = note.summary_preset.strip_prefix("custom:") {
         match db::get_summary_prompt(conn, id) {
             Ok(p) => p.content,
-            Err(_) => DEFAULT_SUMMARY_PROMPT.to_string(),
+            Err(_) => presets::prompt(DEFAULT_SUMMARY_PRESET, language),
         }
     } else if note.summary_preset == "custom" {
-        DEFAULT_SUMMARY_PROMPT.to_string()
+        presets::prompt(DEFAULT_SUMMARY_PRESET, language)
     } else {
         presets::prompt(&note.summary_preset, language)
+    }
+}
+
+/// Turn `auto` into the language the recording was actually in, when the
+/// STT provider told us (issue #167).
+///
+/// Everything downstream then takes the ordinary explicit-language path and
+/// emits a hard "write the entire response in X" directive, rather than
+/// asking a model to infer the target from a prompt whose every label is
+/// Norwegian.
+///
+/// The `auto` branches survive as the fallback for notes with no detection:
+/// notes recorded before this shipped, Deepgram, `gpt-4o-transcribe`, and
+/// recordings too bilingual for the vote to call.
+fn resolve_auto(language: &str, note: &Note) -> String {
+    if language != "auto" {
+        return language.to_string();
+    }
+    match note.detected_language.as_deref() {
+        Some(code) if !code.trim().is_empty() => code.to_string(),
+        _ => language.to_string(),
     }
 }
 
@@ -157,7 +189,7 @@ async fn run_summary(app: AppHandle, note_id: String) -> anyhow::Result<()> {
         } else {
             n.language.clone()
         };
-        (p_resolved, lang, n)
+        (p_resolved, resolve_auto(&lang, &n), n)
     };
     if note.transcript.trim().is_empty() && note.body.trim().is_empty() {
         return Ok(());
@@ -259,7 +291,16 @@ fn language_directive(lang: &str) -> String {
         "no" => "VIKTIG: Skriv hele svaret på norsk.".to_string(),
         "sv" => "VIKTIGT: Skriv hela svaret på svenska.".to_string(),
         "da" => "VIGTIGT: Skriv hele svaret på dansk.".to_string(),
-        "auto" => "Respond in the same language as the user's notes.".to_string(),
+        // Issue #167: this used to say "the user's notes", which with an
+        // empty body resolves to the Norwegian `(ingen)` literal — every
+        // language cue the model could see was Norwegian, so an English
+        // meeting came back in Norwegian. Anchor on the transcript, and
+        // say out loud that the Norwegian frame isn't the target.
+        "auto" => {
+            "Respond in the same language as the transcript block, not the language of these \
+             instructions or labels."
+                .to_string()
+        }
         other => format!(
             "IMPORTANT: Write the entire response in {}.",
             languages::english_name(other)
@@ -292,7 +333,7 @@ mod tests {
         // the retired `summary_prompt` setting.
         let (_dir, conn) = temp_conn();
         let note = db::create_note(&conn, "no", "custom:does-not-exist", "").unwrap();
-        assert_eq!(resolve_prompt(&conn, &note, "no"), DEFAULT_SUMMARY_PROMPT);
+        assert_eq!(resolve_prompt(&conn, &note, "no"), presets::prompt("meeting", "no"));
     }
 
     #[test]
@@ -301,7 +342,31 @@ mod tests {
         // reads the legacy `summary_prompt` setting.
         let (_dir, conn) = temp_conn();
         let note = db::create_note(&conn, "no", "custom", "").unwrap();
-        assert_eq!(resolve_prompt(&conn, &note, "no"), DEFAULT_SUMMARY_PROMPT);
+        assert_eq!(resolve_prompt(&conn, &note, "no"), presets::prompt("meeting", "no"));
+    }
+
+    // Issue #167. The fallback used to be a hardcoded Norwegian prompt
+    // containing "Skriv på norsk", so on any other language setting it
+    // contradicted the directive appended right after it — and once `auto`
+    // started resolving to a detected language, an English recording could
+    // pair "Skriv på norsk" with "Write the entire response in English."
+    #[test]
+    fn the_fallback_prompt_follows_the_requested_language() {
+        let (_dir, conn) = temp_conn();
+        for preset in ["custom", "custom:does-not-exist"] {
+            let note = db::create_note(&conn, "en", preset, "").unwrap();
+            let p = resolve_prompt(&conn, &note, "en");
+            assert!(p.contains("Reply in English"), "{preset}: {p}");
+            assert!(!p.contains("Skriv på norsk"), "{preset}: {p}");
+        }
+    }
+
+    #[test]
+    fn the_fallback_prompt_anchors_on_the_transcript_when_auto() {
+        let (_dir, conn) = temp_conn();
+        let note = db::create_note(&conn, "auto", "custom", "").unwrap();
+        let p = resolve_prompt(&conn, &note, "auto");
+        assert!(p.contains("the same language as the transcript"), "{p}");
     }
 
     #[test]
@@ -312,5 +377,67 @@ mod tests {
             resolve_prompt(&conn, &note, "no"),
             presets::prompt("meeting", "no")
         );
+    }
+
+    // Issue #167. On `auto` the directive is the only thing telling the
+    // model where to look, and the whole prompt frame around it — labels,
+    // the `(ingen)` empty-notes literal — is Norwegian. Pointing it at the
+    // notes meant an English meeting with no typed notes had exactly one
+    // language cue in reach, and it was Norwegian. Pin the target so a
+    // future reword can't quietly drift back.
+    #[test]
+    fn auto_directive_anchors_on_the_transcript_not_the_notes() {
+        let d = language_directive("auto");
+        assert!(d.contains("transcript"), "{d}");
+        assert!(!d.contains("notes"), "{d}");
+    }
+
+    #[test]
+    fn auto_directive_disowns_the_surrounding_scaffolding() {
+        // The labels and instructions are Norwegian; without this clause the
+        // model is free to read the frame as the target.
+        let d = language_directive("auto");
+        assert!(d.contains("instructions"), "{d}");
+        assert!(d.contains("labels"), "{d}");
+    }
+
+    // Issue #167 — `auto` resolves to what was actually spoken, so the
+    // summary takes the hard-directive path instead of inferring the target
+    // from a Norwegian-labelled prompt.
+    #[test]
+    fn auto_resolves_to_the_detected_language() {
+        let (_dir, conn) = temp_conn();
+        let note = db::create_note(&conn, "auto", "meeting", "").unwrap();
+        db::set_detected_language(&conn, &note.id, "en").unwrap();
+        let note = db::get_note(&conn, &note.id).unwrap();
+        assert_eq!(resolve_auto("auto", &note), "en");
+        assert!(language_directive(&resolve_auto("auto", &note)).contains("English"));
+    }
+
+    #[test]
+    fn auto_stays_auto_without_a_detection() {
+        // Pre-change notes, Deepgram, gpt-4o-transcribe, and recordings too
+        // bilingual to call all land here — and fall back to Fix 2's
+        // transcript-anchored directive.
+        let (_dir, conn) = temp_conn();
+        let note = db::create_note(&conn, "auto", "meeting", "").unwrap();
+        assert_eq!(resolve_auto("auto", &note), "auto");
+    }
+
+    #[test]
+    fn an_explicit_language_ignores_the_detection() {
+        // The user asked for Norwegian output on an English recording. That's
+        // a choice, not a mistake — don't override it.
+        let (_dir, conn) = temp_conn();
+        let note = db::create_note(&conn, "no", "meeting", "").unwrap();
+        db::set_detected_language(&conn, &note.id, "en").unwrap();
+        let note = db::get_note(&conn, &note.id).unwrap();
+        assert_eq!(resolve_auto("no", &note), "no");
+    }
+
+    #[test]
+    fn explicit_languages_still_get_their_hard_directive() {
+        assert!(language_directive("no").contains("norsk"));
+        assert!(language_directive("en").contains("English"));
     }
 }

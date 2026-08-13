@@ -31,6 +31,12 @@ export type Note = {
   // count via VBx's `withSpeakers(exactly:)`. Most reliable fix for
   // dominant-speaker conversations where auto collapses to 1 cluster.
   expected_speakers: number | null;
+  // ISO 639-1 code the STT provider reported for the recording (issue #167),
+  // decided by a length-weighted vote across chunks. Only set for notes
+  // captured on `auto`; null on explicit-language notes, on providers that
+  // don't report one, and on recordings too bilingual to call. Derived and
+  // local-only — never synced (ADR 0002).
+  detected_language: string | null;
   created_at: number;
   updated_at: number;
   // Cloud sync: PocketBase user id of the note's creator. Empty for

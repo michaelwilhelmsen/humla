@@ -7,7 +7,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use std::path::Path;
 
-use crate::stt::adapter::{BatchSttAdapter, TranscribeCtx, TranscribeResult, Word};
+use crate::stt::adapter::{BatchSttAdapter, TranscribeCtx, TranscribeResult};
 use crate::stt::openai_compat;
 
 const GROQ_BASE: &str = "https://api.groq.com/openai/v1";
@@ -53,7 +53,7 @@ impl BatchSttAdapter for GroqAdapter {
             .api_key
             .ok_or_else(|| anyhow::anyhow!("Groq adapter requires api_key"))?;
         let base_url = ctx.base_url.unwrap_or(GROQ_BASE);
-        let (text, words) = openai_compat::transcribe(
+        openai_compat::transcribe(
             base_url,
             api_key,
             ctx.model,
@@ -64,8 +64,7 @@ impl BatchSttAdapter for GroqAdapter {
             true, // always request verbose_json — Groq accepts it
             None,
         )
-        .await?;
-        Ok(TranscribeResult { text, words })
+        .await
     }
 }
 

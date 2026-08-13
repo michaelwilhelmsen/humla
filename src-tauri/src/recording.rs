@@ -141,6 +141,11 @@ pub struct ChunkRecord {
     pub start_ms: u64,
     pub text: String,
     pub words: Vec<ChunkWord>,
+    /// What the STT provider thought this chunk was spoken in, when it
+    /// says at all (issue #167). Per-chunk rather than per-recording
+    /// because a 2-second "mm-hm" detects as anything — the post-stop
+    /// vote in `majority_language` is what turns these into an answer.
+    pub detected_language: Option<String>,
 }
 
 /// Live in-memory state for the *currently capturing* recording — child

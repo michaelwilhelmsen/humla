@@ -6,7 +6,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use std::path::Path;
 
-use crate::stt::adapter::{BatchSttAdapter, TranscribeCtx, TranscribeResult, Word};
+use crate::stt::adapter::{BatchSttAdapter, TranscribeCtx, TranscribeResult};
 use crate::stt::openai_compat;
 
 #[derive(Default)]
@@ -49,7 +49,9 @@ impl BatchSttAdapter for OpenAiAdapter {
             .ok_or_else(|| anyhow::anyhow!("OpenAI adapter requires api_key"))?;
         let base_url = ctx.base_url.unwrap_or("https://api.openai.com/v1");
         let verbose = self.supports_word_timestamps(ctx.model);
-        let (text, words) = openai_compat::transcribe(
+        // Note the detection gap: `verbose` is `whisper-1` only, so the
+        // gpt-4o-transcribe family never reports a language (issue #167).
+        openai_compat::transcribe(
             base_url,
             api_key,
             ctx.model,
@@ -61,16 +63,7 @@ impl BatchSttAdapter for OpenAiAdapter {
             // Per OpenAI docs, gpt-4o-transcribe-diarize doesn't accept prompt.
             Some("gpt-4o-transcribe-diarize"),
         )
-        .await?;
-        let words = words
-            .into_iter()
-            .map(|w| Word {
-                text: w.text,
-                start_ms: w.start_ms,
-                end_ms: w.end_ms,
-            })
-            .collect();
-        Ok(TranscribeResult { text, words })
+        .await
     }
 }
 
