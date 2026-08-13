@@ -3,6 +3,7 @@ import { screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { renderApp } from "../test/app";
 import { makeNote } from "../test/fixtures";
+import { mockLayoutBox } from "../test/layout";
 import type { TimelineEntry } from "../lib/ipc";
 
 // #169: the styled reader renders from the merged timelines, so transcript
@@ -10,18 +11,8 @@ import type { TimelineEntry } from "../lib/ipc";
 // shapes it can explain; these cover what happens on either side of that.
 
 // Both readers virtualize their lines, and jsdom pins offsetWidth/Height to 0
-// — a zero-height scroll window renders no rows at all. Same shim as
-// TranscriptEditor.test.tsx.
-beforeAll(() => {
-  Object.defineProperty(window.HTMLElement.prototype, "offsetHeight", {
-    configurable: true,
-    get: () => 600,
-  });
-  Object.defineProperty(window.HTMLElement.prototype, "offsetWidth", {
-    configurable: true,
-    get: () => 400,
-  });
-});
+// — a zero-height scroll window renders no rows at all.
+beforeAll(() => mockLayoutBox());
 
 const ORPHAN = "we kicked off by agreeing the deadline slips a week";
 const COVERED = "so where did we land on the freeze";
