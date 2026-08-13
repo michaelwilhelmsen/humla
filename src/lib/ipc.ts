@@ -238,6 +238,16 @@ export type TimelineEntry = {
   chunkIdx: number;
 };
 
+// Outcome of the on-open orphaned-text repair (#169). `coversTranscript` is
+// the backend's own comparison of `note.transcript` against what the merged
+// timelines project — the client never re-derives the grouping rule to work
+// this out, because the two rules differ deliberately (Rust groups on label,
+// `groupTimeline` on label *and* session).
+export type TimelineRepair = {
+  repaired: boolean;
+  coversTranscript: boolean;
+};
+
 // One recording session (a single recording_start→stop cycle) for a note.
 // Drives the playback carousel + the styled reader's session dividers.
 export type NoteSession = {
@@ -362,6 +372,13 @@ export const ipc = {
     invoke<string | null>("speaker_default_name", { cloudName }),
   noteTimeline: (noteId: string) =>
     invoke<TimelineEntry[]>("note_timeline", { noteId }),
+  // Repair transcript text no session timeline accounts for (#169), and report
+  // whether a gap remains. Call this BEFORE `noteTimeline` on open: the four
+  // paths that rebuild the transcript from the timelines would otherwise
+  // delete that text on the first click, and `coversTranscript: false` is what
+  // switches the reader to the plain view so nothing stays hidden.
+  noteTimelineRepair: (noteId: string) =>
+    invoke<TimelineRepair>("note_timeline_repair", { noteId }),
   noteTimelineRename: (noteId: string, oldLabel: string, newLabel: string) =>
     invoke<void>("note_timeline_rename", { noteId, oldLabel, newLabel }),
   noteTimelineSetChunkLabel: (

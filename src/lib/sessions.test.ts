@@ -53,6 +53,11 @@ describe("formatSessionCaption", () => {
   it("includes duration when known", () => {
     expect(formatSessionCaption(session({ durationMs: 312_000 }))).toContain("5:12");
   });
+  it("names rather than numbers the synthesized repair session (#169)", () => {
+    // Index 0 is written by repair-on-open for transcript text that predates
+    // every take. "Recording 0" would promise a take there is nothing to play.
+    expect(formatSessionCaption(session({ index: 0 }))).toBe("Earlier transcript");
+  });
 });
 
 describe("groupTimeline", () => {

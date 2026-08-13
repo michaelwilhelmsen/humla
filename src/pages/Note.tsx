@@ -210,6 +210,14 @@ export function Note() {
   // TranscriptEditor in that case.
   const [playbackUrl, setPlaybackUrl] = useState<string | null>(null);
   const [timeline, setTimeline] = useState<TimelineEntry[]>([]);
+  // Whether the merged timelines account for every word of the transcript
+  // (#169). Repair-on-open makes this true for the shapes it can explain; it
+  // stays false for the ones it can't — a timeline present but short because
+  // malformed lines were skipped, an asset that never downloaded — and the
+  // reader then shows the whole transcript plainly rather than a turn list
+  // that silently omits part of it. The comparison is the backend's; the
+  // client never re-derives the grouping rule.
+  const [timelineCoversTranscript, setTimelineCoversTranscript] = useState(true);
   // Recording sessions (#16): every take on this note, in order. Drives the
   // playback carousel + the session-switched player. Empty for notes with no
   // recordings.
@@ -540,6 +548,34 @@ export function Note() {
         }
       }
       if (cancelled) return;
+
+      // Repair before rendering (#169). Transcript text that no session
+      // timeline accounts for is invisible in the styled reader, and the first
+      // rebuild deletes it outright — cycling a speaker pill is one click and
+      // reads as cosmetic. Synthesizing its session here puts the repair ahead
+      // of every one of those paths, since all four are UI actions on an
+      // already-open note.
+      //
+      // AFTER the session pull above, not before: a shared note whose
+      // timelines are still arriving would otherwise get a synthesized session
+      // for text the download was about to account for, and the words would
+      // land twice. A read-only viewer skips it — repairing a teammate's note
+      // is not theirs to do, and the owner's own open will fix it.
+      const repair =
+        readOnlyRef.current || tl.length === 0
+          ? { repaired: false, coversTranscript: true }
+          : await ipc
+              .noteTimelineRepair(draft.id)
+              .catch(() => ({ repaired: false, coversTranscript: true }));
+      if (cancelled) return;
+      if (repair.repaired) {
+        tl = await ipc.noteTimeline(draft.id).catch(() => tl);
+        sess = await ipc.noteSessions(draft.id).catch(() => sess);
+        void ipc.uploadNoteSessions(draft.id).catch(() => {});
+        if (cancelled) return;
+      }
+      setTimelineCoversTranscript(repair.coversTranscript);
+
       setPlaybackUrl(path ? convertFileSrc(path) : null);
       setTimeline(tl);
       setSessions(sess);
@@ -1179,7 +1215,29 @@ export function Note() {
                         timeline.jsonl is still written, so speaker pills,
                         session dividers and rename all still work — the player
                         row is what disappears. */}
-                    {timeline.length > 0 ? (
+                    {timeline.length > 0 && !timelineCoversTranscript ? (
+                      // The turn list renders from the timeline alone, so any
+                      // transcript text the timeline doesn't carry would simply
+                      // not be drawn (#169). When repair-on-open couldn't
+                      // account for the difference, show the whole transcript
+                      // in the plain labelled reader: the same speaker dots,
+                      // parsed out of the string, and nothing hidden. What is
+                      // lost is playback highlighting and per-turn editing,
+                      // both of which need the timeline this note is missing.
+                      <div className={cn("flex flex-col", "min-h-0 flex-1")}>
+                        <p className="nd-meta mb-2 shrink-0">
+                          Part of this transcript has no recording timeline behind it, so
+                          playback highlighting and per-turn editing are unavailable here.
+                        </p>
+                        <TranscriptView
+                          transcript={draft.transcript}
+                          onClick={() => {}}
+                          disabled
+                          fill
+                          bottomAligned={transcriptLive}
+                        />
+                      </div>
+                    ) : timeline.length > 0 ? (
                       <TranscriptPlayer
                         noteId={draft.id}
                         timeline={timeline}
@@ -2918,10 +2976,14 @@ function SessionDivider({
   index: number;
 }) {
   const caption = session ? formatSessionCaption(session) : "";
+  // Index 0 is the synthesized session repair-on-open writes for transcript
+  // text that predates every recorded take (#169). It is not a recording and
+  // must not be numbered as one — there is no take 0 to go back and listen to.
+  const title = index > 0 ? `Recording ${index}` : "Earlier transcript";
   return (
     <div className="flex items-center gap-2 px-2 pt-3 pb-1 select-none">
-      <span className="nd-label shrink-0">Recording {index}</span>
-      {caption && caption !== `Recording ${index}` && (
+      <span className="nd-label shrink-0">{title}</span>
+      {caption && caption !== title && (
         <span className="text-[10px] text-[color:var(--color-text-muted)] tracking-[0.02em]">
           {caption}
         </span>

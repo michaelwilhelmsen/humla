@@ -18,6 +18,10 @@ export function formatDuration(ms: number): string {
 /// One-line caption for a session pill's tooltip / divider: local date-time
 /// plus duration, falling back to "Recording N" when nothing is known (e.g. a
 /// legacy flat session with no started_at / duration).
+///
+/// Index 0 is the synthesized session that repair-on-open writes for
+/// transcript text no take accounts for (#169). It never was a recording, so
+/// it is named rather than numbered.
 export function formatSessionCaption(session: NoteSession): string {
   const parts: string[] = [];
   if (session.startedAt) {
@@ -34,7 +38,8 @@ export function formatSessionCaption(session: NoteSession): string {
     }
   }
   if (session.durationMs > 0) parts.push(formatDuration(session.durationMs));
-  return parts.length > 0 ? parts.join(" · ") : `Recording ${session.index}`;
+  if (parts.length > 0) return parts.join(" · ");
+  return session.index > 0 ? `Recording ${session.index}` : "Earlier transcript";
 }
 
 export type TimelineGroup = {
