@@ -31,6 +31,8 @@ export function mockTauri(handlers: Record<string, Handler> = {}) {
       case "note_diagnostics_files":
       case "note_sessions":
       case "note_timeline":
+      case "speaker_label_stats":
+      case "cloud_speaker_roster":
         return [];
       case "recording_state":
         return "idle";
