@@ -1,8 +1,8 @@
 # Exposing Humla to Claude Code over MCP
 
 Research, 2026-08-13. Question: what's the best way for Humla to speak MCP so
-Claude Code (and any other MCP client) can read notes, search transcripts, and
-possibly write back?
+Claude Code, Codex, and any other MCP client can read notes, search transcripts,
+and possibly write back?
 
 Verified against the code as it stands on `main` at v0.44.0, the Claude Code MCP
 docs (code.claude.com/docs/en/mcp), and `rmcp` 3.1.2 (the official Rust SDK,
@@ -221,11 +221,20 @@ is documented as the single absolute gate on audio (#24) and an MCP tool must
 not become an exception above it. Deletion has a Trash in the UI and no undo
 over a wire protocol.
 
-**Resources.** Claude Code supports MCP resources as `@` mentions
-(`@humla:humla://note/<id>`), fuzzy-searchable in the autocomplete, fetched and
-attached automatically. Exposing notes as `humla://note/<id>` resources is a
-better fit than a tool for "put this meeting in context" and costs almost
-nothing once `get_note` exists.
+**Resources — implement them, but never depend on them.** Claude Code supports
+MCP resources as `@` mentions (`@humla:humla://note/<id>`), fuzzy-searchable in
+the autocomplete and attached automatically, so `humla://note/<id>` is a nicer
+fit than a tool for "put this meeting in context" and costs little once
+`get_note` exists. Codex, though, documents **tools and server instructions
+only** — no resources, prompts, sampling or elicitation. So resources are a
+Claude Code bonus and the tool surface has to stand alone.
+
+There is still a concrete reason to implement `resources/list` rather than skip
+it: Codex has used `resources/list` when deciding whether a server is available,
+so a healthy **tools-only server can be reported as unavailable or not
+installed** ([openai/codex#8565](https://github.com/openai/codex/issues/8565)).
+Declaring the capability and listing notes dodges that failure mode and buys the
+`@`-mentions at the same time.
 
 **Server instructions matter more than they used to.** Claude Code defers MCP
 tool schemas by default and loads only names plus the server `instructions`
@@ -233,6 +242,56 @@ field at session start, then searches for tools on demand. So `ServerInfo`'s
 `instructions` is what decides whether Humla's tools get found at all — write it
 as "when to reach for this", not as a tool list, and keep it under 2 KB
 (descriptions and instructions are both truncated there).
+
+## Client portability: Codex, and anything else
+
+The target isn't Claude Code specifically — it's MCP clients. Codex is the second
+one to check, and it changes nothing structural while adding four concrete
+constraints.
+
+**Both clients speak stdio and streamable HTTP**, so the phased plan holds
+unchanged. Codex config lives in `~/.codex/config.toml` (or a project-scoped
+`.codex/config.toml` in a trusted project), shared by its CLI, IDE extension and
+desktop app:
+
+```toml
+[mcp_servers.humla]
+command = "/Applications/Humla.app/Contents/MacOS/humla-mcp"
+```
+
+or `codex mcp add humla -- /Applications/Humla.app/Contents/MacOS/humla-mcp`.
+The remote/teams path is `url` + `bearer_token_env_var` (or `auth = "oauth"`),
+which is a **better** shape than Claude Code's inline `--header` — the PAT comes
+from the environment instead of being written into a config file. Worth
+documenting that way round for both.
+
+What Codex actually constrains:
+
+1. **Tools must be self-sufficient** — no resources, no prompts. Any capability
+   that only exists as a resource or a prompt template is invisible to half the
+   audience. (See the tool surface above for the `resources/list` wrinkle, which
+   is a reason to implement resources, not to rely on them.)
+2. **`startup_timeout_sec` defaults to 10 seconds.** Initialization has to be
+   cheap: open SQLite, answer `initialize`, done. Nothing eager — no backfill, no
+   embedding warm-up, and emphatically **no waking the app**. That's a real
+   constraint on option C's fallback: `open -a Humla` on a cold start takes
+   longer than the budget, so the shim must connect-or-degrade immediately and
+   never block the handshake on a launch.
+3. **Server instructions matter to both**, for different reasons — Claude Code
+   uses them to decide whether to search for the tools at all, Codex reads them
+   at initialization. One well-written `instructions` string serves both; keep it
+   under Claude Code's 2 KB truncation.
+4. **Tool names are the user-facing knob in Codex** — `enabled_tools`,
+   `disabled_tools`, and per-tool `approval_mode` are all keyed on the bare name.
+   That's another argument against a `humla_` prefix, and an argument for naming
+   write tools distinctly enough that a user can pin the server read-only from
+   their own config.
+
+The portable distribution story is therefore the documented snippet per client
+plus the official registry for discovery — **not** Claude Code plugins, which are
+Claude-only (Codex has its own `[plugins."x".mcp_servers.y]` shape). One
+`claude mcp add` line and one `config.toml` block in the docs, with copy buttons
+in Settings, covers both without picking a side.
 
 ## Team workspaces
 
@@ -352,6 +411,98 @@ argues for:
   session can't read workspace notes and vice versa.
 - **No query logging.** Same rule as chat: don't retain what was searched.
 
+## Prior art: bundle something, or write it?
+
+Two separate questions hide in "is there a standard" — the *implementation* and
+the *packaging* — and they have different answers.
+
+### Implementation: standard plumbing, custom tools
+
+Use the official SDK (`rmcp` for Rust) and write Humla's own tools on it. Don't
+hand-roll JSON-RPC, and don't bundle a generic database server:
+
+- **The official reference SQLite server is archived** — it lives in
+  `modelcontextprotocol/servers-archived`. Not a foundation.
+- **Generic SQL servers exist and are decent** — [DBHub](https://github.com/bytebase/dbhub)
+  (read-only mode, row limits, multi-DB), plus read-only forks and FastMCP
+  explorers. Pointing one at `notes.sqlite` is a fine ten-minute personal hack
+  and the wrong product. It exposes the raw schema, so the model burns context
+  learning `note_chunks.chunker_version` before it can ask a question; it has no
+  FTS5 sanitisation, and `fts_match_query` exists precisely because a raw MATCH
+  string is a syntax error on ordinary punctuation; **workspace scoping becomes
+  advisory** — `workspace_id = ?` is something the model must remember, so
+  Personal and workspace notes leak into each other on the first forgotten
+  predicate; bodies come out as HTML because nothing calls `html_to_text`; and
+  there are no citations. Worst of all it makes the schema the public API, so
+  every migration is a user-visible break.
+
+The tool vocabulary is already converged, which is a quiet validation of
+`chat/tools.rs`: Obsidian's ecosystem settles on `search_notes`, `get_note` /
+`read_note`, `list_notes`, and the Granola servers below are the same shape.
+Humla's three tools already carry those names — keep them, and don't add a
+`humla_` prefix, since Claude Code namespaces them as `mcp__humla__search_notes`
+already.
+
+### Packaging: three formats, and only one fits Claude Code
+
+- **`.mcpb` (MCP Bundle, formerly DXT)** — zip + `manifest.json`, one-click
+  install. It targets GUI Claude apps and **does not work with Claude Code in the
+  terminal**, so for the stated goal it's the wrong target despite being the most
+  "standard"-looking option.
+- **Claude Code plugins** — a versioned bundle of `.mcp.json` plus skills and
+  slash commands, distributed via a marketplace. This is Claude Code's actual
+  distribution mechanism, and the interesting one: a `humla` plugin could ship
+  the server config *and* skills ("brief me on last week's meetings"). Note
+  plugin-bundled tools get the longer callable name
+  `mcp__plugin_humla_<server>__<tool>`, which matters for permission rules.
+- **The official registry** (`registry.modelcontextprotocol.io`) — a `server.json`
+  under a reverse-DNS namespace with proven domain ownership. Humla controls
+  `humla.team` and already uses `no.humla.app` as its bundle id, so the namespace
+  is available. Discovery, not installation; worth doing once the server exists.
+
+And the option that needs no format at all: a documented `claude mcp add`
+one-liner, with a copy-button in Settings next to the toggle. That is almost
+certainly the whole of v1.
+
+### The Granola lesson
+
+Granola never shipped a first-party MCP server, so the community wrote at least
+nine — [btn0s](https://github.com/btn0s/granola-mcp),
+[Bencockin](https://github.com/Bencockin/granola-mcp) (reads the local macOS
+store directly), [bhandzo/pantry](https://github.com/bhandzo/granola-mcp),
+[chrisguillory](https://github.com/chrisguillory/granola-mcp),
+[jeffmm](https://github.com/jeffmm/granola-fast-mcp),
+[mishkinf](https://github.com/mishkinf/granola-mcp) (adds LanceDB vector search),
+and more. Three things follow:
+
+1. **Demand is proven, and it's shaped exactly like option A** — several of these
+   read the app's own local cache, which is what a first-party stdio binary over
+   `notes.sqlite` does with none of the reverse-engineering.
+2. **If Humla doesn't ship one, someone will write one against `notes.sqlite`** —
+   and then the schema is a de facto public API maintained by strangers, breaking
+   on every migration. Shipping first-party inverts that: `search_notes` /
+   `get_note` become the stable contract and the schema stays free to move. This
+   is the strongest argument for doing it at all, ahead of any user-facing
+   feature case.
+3. **It's a live differentiator.** Steno — the closest competitor — has no
+   first-party MCP either; the integration that exists in that direction is a
+   *Granola*-MCP-to-Steno skill. First-party MCP fits Humla's open, local-first
+   posture better than either of them, and nobody has claimed it yet.
+
+### One honest point against my own recommendation
+
+[Figma Desktop ships exactly the architecture I argued against](https://developers.figma.com/docs/figma-mcp-server/local-server-installation):
+a built-in HTTP MCP server on `127.0.0.1:3845/mcp`, toggled in-app, consumed by
+Claude Code, Cursor, VS Code, Xcode and others. So option B is proven at scale,
+not exotic, and the port is clearly tolerable to serious clients.
+
+It doesn't change the conclusion, and the reason is the payload rather than the
+plumbing: Figma's endpoint exposes the current selection in a design file, while
+Humla's would expose years of confidential meeting transcripts to anything that
+can reach a loopback port. The asymmetry in what a stray reader gets is why a
+Unix socket is worth the extra 60-line shim here even though Figma got away
+without one.
+
 ## Sources
 
 - Claude Code MCP reference — https://code.claude.com/docs/en/mcp
@@ -359,5 +510,29 @@ argues for:
   search and the 2 KB instructions budget)
 - `rmcp` 3.1.2 — https://docs.rs/rmcp (`#[tool_router]` / `#[tool]` macros,
   `serve_server`, `AsyncRwTransport::new_server`, `StreamableHttpService`)
+- Codex MCP docs — https://learn.chatgpt.com/docs/extend/mcp?surface=cli
+  (`config.toml` shapes, `codex mcp add`, tools + server instructions only,
+  `startup_timeout_sec` default 10s, per-tool approval modes)
+- Codex tools-only availability bug —
+  https://github.com/openai/codex/issues/8565
+- MCP Bundles — https://github.com/modelcontextprotocol/mcpb and
+  https://blog.modelcontextprotocol.io/posts/2025-11-20-adopting-mcpb/ (GUI
+  clients only; not Claude Code in the terminal)
+- Official registry `server.json` requirements —
+  https://github.com/modelcontextprotocol/registry (reverse-DNS namespace,
+  proven domain ownership)
+- Archived reference SQLite server —
+  https://github.com/modelcontextprotocol/servers-archived/tree/main/src/sqlite
+- DBHub — https://github.com/bytebase/dbhub (the generic-SQL option, rejected)
+- Figma's local desktop MCP server —
+  https://developers.figma.com/docs/figma-mcp-server/local-server-installation
+- Granola community servers (a sample) —
+  https://github.com/Bencockin/granola-mcp,
+  https://github.com/chrisguillory/granola-mcp,
+  https://github.com/mishkinf/granola-mcp
+- Obsidian ecosystem tool naming —
+  https://github.com/cyanheads/obsidian-mcp-server,
+  https://community.obsidian.md/plugins/vault-as-mcp
 - In-tree: `src-tauri/src/chat/tools.rs`, `src-tauri/src/db.rs`,
-  `src-tauri/src/sync.rs`, `src-tauri/crates/cloud-sync/src/lib.rs`
+  `src-tauri/src/embed.rs`, `src-tauri/src/sync.rs`,
+  `src-tauri/crates/cloud-sync/src/lib.rs`
