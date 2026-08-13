@@ -34,6 +34,8 @@ function renderEditor(over?: { disabled?: boolean; onChange?: (v: string) => voi
 }
 
 const textarea = () => screen.queryByRole("textbox");
+const header = () => screen.getByTestId("transcript-mode-header");
+const liveRegion = () => screen.getByTestId("transcript-mode-live");
 
 describe("TranscriptEditor edit mode (#168)", () => {
   it("shows an explicit Edit control in view mode and enters edit mode from it", () => {
@@ -114,5 +116,74 @@ describe("TranscriptEditor edit mode (#168)", () => {
     expect(screen.queryByRole("button", { name: "Edit" })).toBeNull();
     fireEvent.click(screen.getByText("hello"));
     expect(textarea()).toBeNull();
+  });
+});
+
+describe("TranscriptEditor header slot + mode announcement (#171)", () => {
+  // jsdom measures nothing — every element is 0×0 — so the reserved height
+  // itself is unassertable here. What IS assertable is the structure that
+  // produces it: the same header row renders in both states, holding a
+  // placeholder that carries the control's own text (and so its line box)
+  // when there is no control to show. The pixel check is the mock harness's
+  // job (`?case=transcript` vs `?case=transcript-recording`).
+  it("keeps the header slot in the tree while editing is disabled", () => {
+    renderEditor({ disabled: true });
+
+    expect(header()).toBeTruthy();
+    expect(header().textContent).toBe("Edit");
+  });
+
+  it("hides the disabled placeholder from assistive tech and offers no control", () => {
+    renderEditor({ disabled: true });
+
+    expect(header().querySelector("button")).toBeNull();
+    expect(header().firstElementChild?.getAttribute("aria-hidden")).toBe("true");
+  });
+
+  it("announces nothing on first render, in either mode", () => {
+    const { unmount } = renderEditor();
+    expect(liveRegion().textContent).toBe("");
+    unmount();
+
+    renderEditor({ disabled: true });
+    expect(liveRegion().textContent).toBe("");
+  });
+
+  it("uses a polite live region that stays mounted across the mode swap", () => {
+    renderEditor();
+    expect(liveRegion()).toHaveAttribute("aria-live", "polite");
+
+    const before = liveRegion();
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+
+    expect(liveRegion()).toBe(before);
+  });
+
+  it("announces entering edit mode", () => {
+    renderEditor();
+
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+
+    expect(liveRegion().textContent).toBe("Editing transcript");
+  });
+
+  it.each([
+    ["Done", () => fireEvent.click(screen.getByRole("button", { name: "Done" }))],
+    ["Escape", () => fireEvent.keyDown(textarea() as HTMLTextAreaElement, { key: "Escape" })],
+    ["clicking away", () => fireEvent.blur(textarea() as HTMLTextAreaElement)],
+  ])("announces leaving edit mode via %s", (_route, leave) => {
+    renderEditor();
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+
+    leave();
+
+    expect(liveRegion().textContent).toBe("Transcript no longer editable");
+  });
+
+  it("gives the textarea an accessible name", () => {
+    renderEditor();
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+
+    expect(screen.getByRole("textbox", { name: "Transcript" })).toBeTruthy();
   });
 });
