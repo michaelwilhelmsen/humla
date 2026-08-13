@@ -43,6 +43,7 @@ import {
   needsSessionPull,
   resolveActivePill,
   formatSessionCaption,
+  sessionTitle,
   type TimelineGroup,
 } from "../lib/sessions";
 import { RecordingBar } from "../components/RecordingBar";
@@ -559,19 +560,29 @@ export function Note() {
       // AFTER the session pull above, not before: a shared note whose
       // timelines are still arriving would otherwise get a synthesized session
       // for text the download was about to account for, and the words would
-      // land twice. A read-only viewer skips it — repairing a teammate's note
-      // is not theirs to do, and the owner's own open will fix it.
+      // land twice.
+      //
+      // Viewers repair too. The synthesized session is derived from the note's
+      // own transcript and written locally, so a read-only note is no less
+      // entitled to it — what a viewer skips is the upload, which the server
+      // would reject anyway. Skipping the call outright would leave a
+      // teammate's note on the turn list with text missing from it, which is
+      // the bug rather than a polite version of it.
+      //
+      // On failure the answer is "not covered", not "fine": a repair we
+      // couldn't run is exactly when the turn list is most likely to be hiding
+      // something, and the plain reader loses highlighting rather than words.
       const repair =
-        readOnlyRef.current || tl.length === 0
+        tl.length === 0
           ? { repaired: false, coversTranscript: true }
           : await ipc
               .noteTimelineRepair(draft.id)
-              .catch(() => ({ repaired: false, coversTranscript: true }));
+              .catch(() => ({ repaired: false, coversTranscript: false }));
       if (cancelled) return;
       if (repair.repaired) {
         tl = await ipc.noteTimeline(draft.id).catch(() => tl);
         sess = await ipc.noteSessions(draft.id).catch(() => sess);
-        void ipc.uploadNoteSessions(draft.id).catch(() => {});
+        if (!readOnlyRef.current) void ipc.uploadNoteSessions(draft.id).catch(() => {});
         if (cancelled) return;
       }
       setTimelineCoversTranscript(repair.coversTranscript);
@@ -2976,10 +2987,7 @@ function SessionDivider({
   index: number;
 }) {
   const caption = session ? formatSessionCaption(session) : "";
-  // Index 0 is the synthesized session repair-on-open writes for transcript
-  // text that predates every recorded take (#169). It is not a recording and
-  // must not be numbered as one — there is no take 0 to go back and listen to.
-  const title = index > 0 ? `Recording ${index}` : "Earlier transcript";
+  const title = sessionTitle(index);
   return (
     <div className="flex items-center gap-2 px-2 pt-3 pb-1 select-none">
       <span className="nd-label shrink-0">{title}</span>

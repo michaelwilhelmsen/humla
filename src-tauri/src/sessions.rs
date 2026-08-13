@@ -778,6 +778,33 @@ mod tests {
         assert_eq!(dir, &rec);
     }
 
+    /// #169's repair writes its synthesized session at index 0, in front of
+    /// every recorded take, and migrates a legacy flat note first so the take
+    /// it is repairing around doesn't vanish behind the new manifest.
+    #[test]
+    fn a_synthesized_session_at_index_zero_resolves_before_a_migrated_legacy_take() {
+        let tmp = TempDir::new().unwrap();
+        let rec = recordings_dir(tmp.path(), "note1");
+        touch(&rec.join("playback.wav"));
+        touch(&rec.join("timeline.jsonl"));
+        assert!(migrate_flat_if_needed(&rec, "take-1").unwrap());
+
+        let mut manifest = read_manifest(&rec).unwrap();
+        manifest.sessions.push(SessionEntry {
+            id: "repair".to_string(),
+            index: 0,
+            started_at: String::new(),
+            duration_ms: 0,
+            streams: Vec::new(),
+        });
+        write_manifest(&rec, &manifest).unwrap();
+
+        let ids: Vec<String> = resolve_sessions(&rec).into_iter().map(|(e, _)| e.id).collect();
+        assert_eq!(ids, vec!["repair", "take-1"]);
+        // And the next real recording still numbers itself past both.
+        assert_eq!(append_session(&rec, "take-2", "", 0, vec![]).unwrap(), 2);
+    }
+
     #[test]
     fn flat_legacy_streams_reflect_retained_wavs() {
         let tmp = TempDir::new().unwrap();

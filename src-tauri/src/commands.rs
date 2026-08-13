@@ -534,32 +534,17 @@ async fn rediarize_apply_to_chunks(
     )
     .await;
 
+    // Through the shared commit, so re-diarize inherits its refusal to trade a
+    // non-empty transcript for an empty projection rather than restating it.
     let full_transcript = rebuild_note_transcript(&app, &note_id).map_err(|e| anyhow::anyhow!(e))?;
-    {
-        let state: State<AppState> = app.state();
-        let conn = state.db.lock();
-        // Same guard `commit_rebuilt_transcript` applies: never trade a
-        // non-empty transcript for an empty projection.
-        if full_transcript.trim().is_empty() {
-            emit_status(&app, None, Phase::Idle);
-            return Err(anyhow::anyhow!(
-                "re-diarize produced no timeline to rebuild the transcript from"
-            ));
-        }
-        db::set_transcript(&conn, &note_id, &full_transcript)?;
+    if let Err(e) = commit_rebuilt_transcript(&app, &note_id, full_transcript) {
+        emit_status(&app, None, Phase::Idle);
+        return Err(anyhow::anyhow!(e));
     }
-    note_changed_for_sync(&app, &note_id); // re-diarize rewrote the transcript
     // Re-diarize rewrote this session's timeline.jsonl — re-push the metadata
     // (idempotent) so the record exists; the frontend re-uploads the timeline
     // asset after the command returns.
     session_changed_for_sync(&app, &note_id, &session_id);
-    let _ = app.emit(
-        "transcript_replaced",
-        TranscriptPayload {
-            note_id: note_id.clone(),
-            text: full_transcript,
-        },
-    );
 
     emit_status(&app, None, Phase::Idle);
     Ok(())
@@ -770,7 +755,7 @@ pub async fn note_timeline_repair(
     if projection.trim().is_empty() {
         return Ok(clean); // no timeline at all — not this issue's shape
     }
-    if comparable_words(&projection) == comparable_words(&transcript) {
+    if projection_covers(&transcript, &projection) {
         return Ok(clean);
     }
     let Some(lines) = orphaned_prefix(&transcript, &projection) else {
@@ -819,7 +804,14 @@ pub async fn note_timeline_repair(
     .map_err(|e| format!("repair timeline: {e}"))?;
 
     session_changed_for_sync(&app, &note_id, &session_id);
-    Ok(TimelineRepair { repaired: true, covers_transcript: true })
+    // Re-project rather than assume: the reader's fallback is driven by this
+    // answer, and claiming a coverage the files don't actually have is how the
+    // text would stay hidden. Cheap — only a repair that happened pays for it.
+    let repaired_projection = rebuild_note_transcript(&app, &note_id)?;
+    Ok(TimelineRepair {
+        repaired: true,
+        covers_transcript: projection_covers(&transcript, &repaired_projection),
+    })
 }
 
 /// Session metadata for a note, in recording order. Drives the playback
@@ -986,6 +978,22 @@ fn comparable_words(transcript: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// Whether the timelines' projection accounts for every word of the
+/// transcript, in order.
+///
+/// Deliberately directional: the reader renders the timelines, so a projection
+/// carrying *more* than the transcript hides nothing and needs no fallback —
+/// only words the transcript has and the projection lacks are invisible. A
+/// subsequence test says exactly that, and it is insensitive to the two
+/// grouping rules disagreeing about where lines break (they do, on purpose).
+fn projection_covers(transcript: &str, projection: &str) -> bool {
+    let pw = comparable_words(projection);
+    let mut p = pw.iter();
+    comparable_words(transcript)
+        .iter()
+        .all(|w| p.any(|c| c == w))
 }
 
 /// The leading transcript lines that `projection` — what the note's session
@@ -7669,15 +7677,23 @@ mod diarize_tests {
             );
         }
 
-        // ...and the repair is a fixed point: a second open finds nothing
-        // left to account for.
+        // The rebuild paths are the other half of the bug: `rebuild_note_transcript`
+        // derives the transcript from the timelines alone, so before the repair
+        // cycling one speaker pill deleted the snapshot outright. After it, a
+        // rebuild reproduces the same words.
         let repaired_projection = group_values_to_transcript(&jsonl_values(&timeline));
         assert_eq!(
             comparable_words(&repaired_projection),
             comparable_words(&combined),
-            "repair must be idempotent — a second open would add another session",
+            "a rebuild after the repair must not change the transcript's words",
         );
-        assert!(orphaned_prefix(&combined, &repaired_projection).is_none());
+        // ...which is also what makes the repair a fixed point: a second open
+        // finds nothing left to account for, so it adds no second session.
+        assert!(
+            projection_covers(&combined, &repaired_projection)
+                && orphaned_prefix(&combined, &repaired_projection).is_none(),
+            "repair must be idempotent",
+        );
     }
 
     /// Parse a serialised timeline back into the values the projection and
@@ -7741,6 +7757,21 @@ mod diarize_tests {
         // A cross-note rename rewrites the transcript and leaves the timeline
         // alone; that must not read as a gap.
         assert_eq!(comparable_words("Speaker 2: a b"), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn projection_covers_is_directional() {
+        let t = "Speaker 1: a b c\nYou: d e";
+        assert!(projection_covers(t, t));
+        // Grouped differently, same words — the two rules differ on purpose.
+        assert!(projection_covers(t, "Michael: a b c d e"));
+        // The projection carrying more than the transcript hides nothing: the
+        // reader renders the timeline, so there is no fallback to make.
+        assert!(projection_covers(t, "Speaker 1: a b c\nYou: d e f g"));
+        // Words the transcript has and the timeline lacks are the invisible
+        // ones, wherever they sit.
+        assert!(!projection_covers(t, "Speaker 1: a b c"));
+        assert!(!projection_covers("A: one\nB: two\nC: three", "A: one\nC: three"));
     }
 
     #[test]

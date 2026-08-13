@@ -98,6 +98,18 @@ describe("transcript reader guard (#169)", () => {
     expect(timeline).toHaveBeenCalledTimes(2);
   });
 
+  it("falls back to the plain reader when the repair call itself fails", async () => {
+    await openTranscriptTab({
+      note_timeline_repair: () => {
+        throw new Error("disk went away");
+      },
+    });
+    // A repair we couldn't run is exactly when the turn list is most likely to
+    // be hiding something, so the unknown answer is "not covered".
+    expect(await screen.findByText(new RegExp(ORPHAN))).toBeInTheDocument();
+    expect(screen.getByText(/no recording timeline behind it/i)).toBeInTheDocument();
+  });
+
   it("does not repair a note that has no timeline at all", async () => {
     const repair = vi.fn(() => ({ repaired: false, coversTranscript: true }));
     await openTranscriptTab({
