@@ -268,7 +268,9 @@ fn parse_chunks_json(path: &std::path::Path) -> anyhow::Result<Vec<ChunkRecord>>
                     .collect()
             })
             .unwrap_or_default();
-        out.push(ChunkRecord { source, start_ms, text, words });
+        // Replayed from a saved diagnostic dump — those predate the field
+        // and don't carry a detection.
+        out.push(ChunkRecord { source, start_ms, text, words, detected_language: None });
     }
     Ok(out)
 }
@@ -5110,7 +5112,8 @@ async fn transcribe_chunk(
         api_key: api_key.as_deref(),
         base_url: provider_cfg.base_url(),
     };
-    let crate::stt::TranscribeResult { text, words } = adapter.transcribe(ctx, &path).await?;
+    let crate::stt::TranscribeResult { text, words, detected_language } =
+        adapter.transcribe(ctx, &path).await?;
     if is_likely_hallucination(&text, &language) {
         return Ok(());
     }
@@ -5223,6 +5226,7 @@ async fn transcribe_chunk(
             start_ms,
             text: trimmed.clone(),
             words: chunk_words,
+            detected_language,
         });
     }
 
@@ -5622,6 +5626,124 @@ fn is_repetition_collapse(text: &str) -> bool {
     false
 }
 
+/// Minimum share of the weighted vote the winning language must hold for
+/// `majority_language` to answer at all.
+const LANGUAGE_VOTE_MIN_SHARE: f64 = 0.6;
+
+/// Decide what language a recording was actually in, from the per-chunk
+/// detections the STT provider handed back (issue #167).
+///
+/// Votes are weighted by chunk text length, not counted one-per-chunk: a
+/// 40-word chunk is far better evidence than a 3-word one, and unweighted
+/// counting is exactly how a handful of "mm-hm" fillers — which detect as
+/// anything — would outvote the meeting. Chunks with no detection are
+/// ignored rather than counted as a language.
+///
+/// Returns `None` when nothing clears `LANGUAGE_VOTE_MIN_SHARE`. A
+/// genuinely bilingual recording should decline to answer rather than pick
+/// a side; the caller then falls back to the transcript-anchored `auto`
+/// directive, which is the right behaviour for mixed audio anyway.
+fn majority_language(chunks: &[ChunkRecord]) -> Option<String> {
+    let mut weights: std::collections::HashMap<&str, u64> = std::collections::HashMap::new();
+    let mut total: u64 = 0;
+    for c in chunks {
+        let Some(lang) = c.detected_language.as_deref() else { continue };
+        if lang.is_empty() {
+            continue;
+        }
+        // Length in words, floored at 1 so a detection on a short-but-real
+        // chunk still carries some weight.
+        let weight = c.text.split_whitespace().count().max(1) as u64;
+        *weights.entry(lang).or_insert(0) += weight;
+        total += weight;
+    }
+    if total == 0 {
+        return None;
+    }
+    let (lang, weight) = weights.into_iter().max_by_key(|&(_, w)| w)?;
+    if (weight as f64) / (total as f64) >= LANGUAGE_VOTE_MIN_SHARE {
+        Some(lang.to_string())
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod language_vote_tests {
+    use super::*;
+
+    fn chunk(text: &str, lang: Option<&str>) -> ChunkRecord {
+        ChunkRecord {
+            source: ChunkSource::Mic,
+            start_ms: 0,
+            text: text.to_string(),
+            words: Vec::new(),
+            detected_language: lang.map(str::to_string),
+        }
+    }
+
+    fn words(n: usize) -> String {
+        vec!["ord"; n].join(" ")
+    }
+
+    #[test]
+    fn no_chunks_and_no_detections_both_decline() {
+        assert_eq!(majority_language(&[]), None);
+        assert_eq!(majority_language(&[chunk("hello there", None)]), None);
+    }
+
+    #[test]
+    fn unanimous_detection_wins() {
+        let chunks = vec![chunk(&words(20), Some("en")), chunk(&words(30), Some("en"))];
+        assert_eq!(majority_language(&chunks), Some("en".to_string()));
+    }
+
+    // The regression test for the whole feature: an English meeting with one
+    // stray filler chunk misdetected as Norwegian must still resolve to `en`.
+    #[test]
+    fn a_short_stray_chunk_does_not_outvote_the_meeting() {
+        let chunks = vec![
+            chunk(&words(60), Some("en")),
+            chunk(&words(40), Some("en")),
+            chunk("mm", Some("no")),
+            chunk("ja", Some("cy")),
+        ];
+        assert_eq!(majority_language(&chunks), Some("en".to_string()));
+    }
+
+    // Unweighted counting would call this 3–1 for Norwegian. Weighted, the
+    // English body holds ~96% and wins — that's the point of the weighting.
+    #[test]
+    fn many_tiny_chunks_lose_to_one_long_one() {
+        let mut chunks = vec![chunk(&words(200), Some("en"))];
+        for _ in 0..8 {
+            chunks.push(chunk("hm", Some("no")));
+        }
+        assert_eq!(majority_language(&chunks), Some("en".to_string()));
+    }
+
+    #[test]
+    fn an_even_bilingual_split_declines_to_answer() {
+        let chunks = vec![chunk(&words(50), Some("en")), chunk(&words(50), Some("no"))];
+        assert_eq!(majority_language(&chunks), None);
+    }
+
+    #[test]
+    fn chunks_without_a_detection_are_ignored_not_counted() {
+        // The undetected bulk must not dilute the winner below the threshold —
+        // otherwise a provider that only reports sometimes would never answer.
+        let chunks = vec![chunk(&words(500), None), chunk(&words(10), Some("en"))];
+        assert_eq!(majority_language(&chunks), Some("en".to_string()));
+    }
+
+    #[test]
+    fn a_bare_majority_below_the_threshold_declines() {
+        // 55/45 is a bilingual recording, not an English one.
+        let chunks = vec![chunk(&words(55), Some("en")), chunk(&words(45), Some("no"))];
+        assert_eq!(majority_language(&chunks), None);
+    }
+}
+
 #[cfg(test)]
 mod unify_concurrency_tests {
     use super::*;
@@ -5681,6 +5803,7 @@ mod diarize_tests {
             start_ms,
             text: text.to_string(),
             words: Vec::new(),
+            detected_language: None,
         }
     }
 
@@ -5690,6 +5813,7 @@ mod diarize_tests {
             start_ms,
             text: text.to_string(),
             words: Vec::new(),
+            detected_language: None,
         }
     }
 
@@ -5713,6 +5837,7 @@ mod diarize_tests {
                     end_ms: e,
                 })
                 .collect(),
+            detected_language: None,
         }
     }
 
@@ -7489,6 +7614,7 @@ mod unify_tests {
             start_ms,
             text: text.to_string(),
             words: Vec::new(),
+            detected_language: None,
         }
     }
 
@@ -7498,6 +7624,7 @@ mod unify_tests {
             start_ms,
             text: text.to_string(),
             words: Vec::new(),
+            detected_language: None,
         }
     }
 

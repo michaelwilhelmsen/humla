@@ -329,7 +329,7 @@ pub async fn transcribe_file(
     preset: Preset,
     audio_path: &Path,
 ) -> Result<String> {
-    let (text, _words) = transcribe_file_with_words(
+    let (text, _words, _lang) = transcribe_file_with_words(
         shared,
         model_path,
         use_gpu,
@@ -354,8 +354,8 @@ pub async fn transcribe_file_with_words(
     initial_prompt: Option<&str>,
     preset: Preset,
     audio_path: &Path,
-) -> Result<(String, Vec<Word>)> {
-    let segs = transcribe_file_segments(
+) -> Result<(String, Vec<Word>, Option<String>)> {
+    let out = transcribe_file_segments(
         shared,
         model_path,
         use_gpu,
@@ -367,14 +367,14 @@ pub async fn transcribe_file_with_words(
     .await?;
     let mut text = String::new();
     let mut words = Vec::new();
-    for seg in segs {
+    for seg in out.segments {
         if !text.is_empty() && !text.ends_with(' ') {
             text.push(' ');
         }
         text.push_str(seg.text.trim());
         words.extend(seg.words);
     }
-    Ok((text, words))
+    Ok((text, words, out.detected_language))
 }
 
 /// One whisper-emitted text segment with its time bounds in milliseconds
@@ -397,6 +397,17 @@ pub struct TextSegment {
 /// (whisper.cpp's word-boundary convention).
 pub use crate::stt::Word;
 
+/// A whole file's segments plus what the model thought it was hearing.
+///
+/// `detected_language` is `Some` only when we passed no language — i.e.
+/// the caller asked for `"auto"`. With a forced language whisper's
+/// `full_lang_id` just echoes it back, and an echo stored as a detection
+/// is worse than no detection (issue #167).
+pub struct SegmentedTranscript {
+    pub segments: Vec<TextSegment>,
+    pub detected_language: Option<String>,
+}
+
 pub async fn transcribe_file_segments(
     shared: SharedContext,
     model_path: PathBuf,
@@ -405,7 +416,7 @@ pub async fn transcribe_file_segments(
     initial_prompt: Option<&str>,
     preset: Preset,
     audio_path: &Path,
-) -> Result<Vec<TextSegment>> {
+) -> Result<SegmentedTranscript> {
     let mut samples = wav::read_f32_mono_16k(audio_path).await?;
     // Workaround for an abort inside whisper.cpp's DTW token-timestamp pass.
     // `whisper_exp_compute_token_level_timestamps_dtw` runs `median_filter`
@@ -424,7 +435,8 @@ pub async fn transcribe_file_segments(
     // whisper-rs is sync and CPU/GPU-bound. Run on a blocking thread so we
     // don't stall the tokio reactor. Each call gets its own state; the
     // underlying model is shared.
-    tokio::task::spawn_blocking(move || -> Result<Vec<TextSegment>> {
+    let detect = lang.is_none();
+    tokio::task::spawn_blocking(move || -> Result<SegmentedTranscript> {
         let ctx = ensure_loaded(&shared, &model_path, use_gpu)?;
         let mut state = ctx
             .create_state()
@@ -455,6 +467,15 @@ pub async fn transcribe_file_segments(
         state
             .full(params, &samples)
             .map_err(|e| anyhow!("whisper full: {e}"))?;
+
+        // Only meaningful when we let whisper pick — see SegmentedTranscript.
+        // `get_lang_str` already yields an ISO 639-1 code ("en"), so no
+        // name→code lookup is needed on this path.
+        let detected_language = if detect {
+            whisper_rs::get_lang_str(state.full_lang_id_from_state()).map(str::to_string)
+        } else {
+            None
+        };
 
         let n = state.full_n_segments();
         let mut out = Vec::with_capacity(n as usize);
@@ -504,7 +525,10 @@ pub async fn transcribe_file_segments(
                 words,
             });
         }
-        Ok(out)
+        Ok(SegmentedTranscript {
+            segments: out,
+            detected_language,
+        })
     })
     .await
     .map_err(|e| anyhow!("blocking task: {e}"))?

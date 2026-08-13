@@ -8,7 +8,7 @@ use anyhow::{anyhow, Result};
 use serde::Deserialize;
 use std::path::Path;
 
-use crate::stt::adapter::Word;
+use crate::stt::adapter::{TranscribeResult, Word};
 
 #[derive(Deserialize)]
 struct PlainResponse {
@@ -18,6 +18,10 @@ struct PlainResponse {
 #[derive(Deserialize)]
 struct VerboseResponse {
     text: String,
+    /// English *name* of the detected language ("english", "norwegian"),
+    /// not a code — see `verbose_to_result`. Absent on some compat servers.
+    #[serde(default)]
+    language: Option<String>,
     #[serde(default)]
     words: Vec<VerboseWord>,
 }
@@ -48,7 +52,11 @@ pub async fn transcribe(
     audio_path: &Path,
     verbose: bool,
     skip_prompt_for_model: Option<&str>,
-) -> Result<(String, Vec<Word>)> {
+) -> Result<TranscribeResult> {
+    // A reported language is only a *detection* when we didn't name one —
+    // otherwise the response just echoes what we forced, and storing an
+    // echo as a detection would defeat the point (issue #167).
+    let asked_to_detect = matches!(language, None | Some("auto"));
     let bytes = tokio::fs::read(audio_path).await?;
     let file_name = audio_path
         .file_name()
@@ -100,27 +108,52 @@ pub async fn transcribe(
 
     if verbose {
         let body: VerboseResponse = r.json().await?;
-        let words = body
-            .words
-            .into_iter()
-            .filter_map(|w| {
-                let text = w.word.trim().to_string();
-                if text.is_empty() {
-                    return None;
-                }
-                let start_ms = (w.start.max(0.0) * 1000.0).round() as u64;
-                let end_ms = (w.end.max(0.0) * 1000.0).round() as u64;
-                Some(Word {
-                    text,
-                    start_ms,
-                    end_ms: end_ms.max(start_ms),
-                })
-            })
-            .collect();
-        Ok((body.text, words))
+        let mut out = verbose_to_result(body);
+        if !asked_to_detect {
+            out.detected_language = None;
+        }
+        Ok(out)
     } else {
         let body: PlainResponse = r.json().await?;
-        Ok((body.text, Vec::new()))
+        Ok(TranscribeResult {
+            text: body.text,
+            ..Default::default()
+        })
+    }
+}
+
+/// Shape a `verbose_json` payload into the adapter result. Split out from
+/// the request so the parsing is testable against a fixture.
+///
+/// `language` arrives as an English name and is mapped back to a code;
+/// anything outside Whisper's table yields `None` rather than a guess.
+fn verbose_to_result(body: VerboseResponse) -> TranscribeResult {
+    let words = body
+        .words
+        .into_iter()
+        .filter_map(|w| {
+            let text = w.word.trim().to_string();
+            if text.is_empty() {
+                return None;
+            }
+            let start_ms = (w.start.max(0.0) * 1000.0).round() as u64;
+            let end_ms = (w.end.max(0.0) * 1000.0).round() as u64;
+            Some(Word {
+                text,
+                start_ms,
+                end_ms: end_ms.max(start_ms),
+            })
+        })
+        .collect();
+    let detected_language = body
+        .language
+        .as_deref()
+        .and_then(crate::languages::code_for_english_name)
+        .map(str::to_string);
+    TranscribeResult {
+        text: body.text,
+        words,
+        detected_language,
     }
 }
 
@@ -186,5 +219,36 @@ mod tests {
             build_whisper_prompt(&["Humla"], Some("hello world")),
             Some("hello world. Humla".to_string())
         );
+    }
+
+    // Issue #167 — verbose_json reports the detected language as an English
+    // name, and that is the only place OpenAI/Groq tell us what was spoken.
+    #[test]
+    fn verbose_language_name_becomes_a_code() {
+        let json = r#"{
+          "text": "hello world",
+          "language": "english",
+          "words": [{"word": "hello", "start": 0.5, "end": 0.9}]
+        }"#;
+        let parsed: VerboseResponse = serde_json::from_str(json).unwrap();
+        let out = verbose_to_result(parsed);
+        assert_eq!(out.text, "hello world");
+        assert_eq!(out.words.len(), 1);
+        assert_eq!(out.detected_language.as_deref(), Some("en"));
+    }
+
+    #[test]
+    fn verbose_without_a_language_field_detects_nothing() {
+        let json = r#"{"text": "hei", "words": []}"#;
+        let parsed: VerboseResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(verbose_to_result(parsed).detected_language, None);
+    }
+
+    // A name outside Whisper's table is an absent detection, not English.
+    #[test]
+    fn an_unmappable_language_name_detects_nothing() {
+        let json = r#"{"text": "x", "language": "klingon", "words": []}"#;
+        let parsed: VerboseResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(verbose_to_result(parsed).detected_language, None);
     }
 }
