@@ -725,6 +725,24 @@ export function Note() {
     );
   }, [notesForSweep, draft]);
 
+  // What Copy hands over (#166), which is not always `draft.transcript`. A
+  // per-turn edit, a chunk delete or a label cycle (#170) rebuilds the string
+  // in the backend and it arrives on `transcript_replaced`; the draft
+  // deliberately refuses to adopt store transcript updates while idle (see
+  // `allowTranscriptSync`) so a debounced save can't clobber typing. So read
+  // the store — except while our own free-text edit is still queued, where the
+  // draft is the newer of the two. Nothing here re-derives the transcript from
+  // the timeline: the backend owns that projection (ADR-0004).
+  const copyableTranscript = useCallback(
+    () =>
+      ("transcript" in pendingChanges.current
+        ? draftRef.current?.transcript
+        : note?.transcript) ??
+      draftRef.current?.transcript ??
+      "",
+    [note?.transcript],
+  );
+
   if (!draft) return null;
 
   // Who may move this note to another workspace: its creator, or a workspace
@@ -1158,6 +1176,18 @@ export function Note() {
                       upsert(next);
                     }}
                   />
+                  {/* Copies the raw stored string, labels and all — view mode
+                      drops the label text in favour of the coloured dot, but a
+                      pasted transcript is only useful elsewhere if it says who
+                      spoke. The guard is on the wrapper, not inside it: unlike
+                      the Summary group this holds one control, so an inner
+                      guard would leave an empty flex box on every note without
+                      a transcript. */}
+                  {hasTranscript && (
+                    <div className="ml-auto flex items-center gap-0.5">
+                      <CopyButton label="Transcript" getText={copyableTranscript} />
+                    </div>
+                  )}
                 </div>
 
                 {(isRecording || isPaused) && <ListeningHeader noteId={draft.id} />}
@@ -1860,9 +1890,11 @@ function SummaryProviderChip({
   );
 }
 
-// Small copy-to-clipboard button rendered in the Summary panel header.
+// Small copy-to-clipboard button rendered in a panel header — Summary and
+// Transcript (#166) both use it, which is why the payload arrives as a
+// closure rather than the component reaching for a field itself.
 // 1.5s "Copied" feedback via a Check icon swap. stopPropagation keeps
-// the click from toggling the surrounding header row's collapse state.
+// the click from reaching a header row that acts on clicks of its own.
 function CopyButton({ getText, label }: { getText: () => string; label: string }) {
   const [copied, setCopied] = useState(false);
   return (
