@@ -6,6 +6,12 @@
 
 use crate::languages;
 
+/// The built-in default preset. What an unknown or missing preset value
+/// resolves to, and what the `custom` fallbacks in `resolve_prompt` use
+/// when the user's own prompt row isn't available. Pinned to `ALL[0]` by
+/// `the_default_preset_is_the_first_entry`.
+pub const DEFAULT_SUMMARY_PRESET: &str = "meeting";
+
 pub fn prompt(preset: &str, lang: &str) -> String {
     let entry = ALL.iter().find(|p| p.value == preset).unwrap_or(&ALL[0]);
     if lang == "no" {
@@ -92,6 +98,18 @@ mod tests {
                 p.value
             );
         }
+    }
+
+    // `prompt` falls back to `ALL[0]` for an unrecognised preset, so the
+    // named default has to be that same entry or the two disagree about
+    // what "the built-in default" means.
+    #[test]
+    fn the_default_preset_is_the_first_entry() {
+        assert_eq!(ALL[0].value, DEFAULT_SUMMARY_PRESET);
+        assert_eq!(
+            prompt("no-such-preset", "en"),
+            prompt(DEFAULT_SUMMARY_PRESET, "en")
+        );
     }
 
     #[test]

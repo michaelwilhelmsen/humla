@@ -7,11 +7,11 @@
 //! the parent re-export.
 
 use super::read_provider_api_key;
-use super::{DEFAULT_LANGUAGE, DEFAULT_LOCAL_LLM_BASE_URL, DEFAULT_SUMMARY_MODEL, DEFAULT_SUMMARY_PROMPT};
+use super::{DEFAULT_LANGUAGE, DEFAULT_LOCAL_LLM_BASE_URL, DEFAULT_SUMMARY_MODEL};
 use crate::db::{self, Note, NotePatch};
 use crate::languages;
 use crate::openai;
-use crate::presets;
+use crate::presets::{self, DEFAULT_SUMMARY_PRESET};
 use crate::recording::{StreamDeltaPayload, SummaryPayload, SummaryStatusPayload};
 use crate::AppState;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -125,14 +125,25 @@ pub async fn summarize_note(app: AppHandle, note_id: String) -> Result<(), Strin
 ///      prompt.
 ///   3. Built-in preset value ("meeting", "lecture", etc.) — language-aware
 ///      via presets::prompt.
+///
+/// Both fallbacks in 1 and 2 resolve to the Meeting preset rather than to a
+/// prompt of their own (issue #167). The constant they used to return was
+/// hardcoded Norwegian down to "Skriv på norsk", so on any other language
+/// setting it contradicted the directive appended right after it — and it
+/// had drifted from the house style in two other ways besides: an explicit
+/// "trust the notes over the transcript" rule that the parenthetical
+/// `(brukerens)` / `(automatisk)` tags replaced, and a fixed section list
+/// of the kind small thinking models re-litigate instead of following.
+/// Meeting is the built-in default preset and is already language-aware,
+/// so there is nothing for a second copy to add.
 fn resolve_prompt(conn: &rusqlite::Connection, note: &Note, language: &str) -> String {
     if let Some(id) = note.summary_preset.strip_prefix("custom:") {
         match db::get_summary_prompt(conn, id) {
             Ok(p) => p.content,
-            Err(_) => DEFAULT_SUMMARY_PROMPT.to_string(),
+            Err(_) => presets::prompt(DEFAULT_SUMMARY_PRESET, language),
         }
     } else if note.summary_preset == "custom" {
-        DEFAULT_SUMMARY_PROMPT.to_string()
+        presets::prompt(DEFAULT_SUMMARY_PRESET, language)
     } else {
         presets::prompt(&note.summary_preset, language)
     }
@@ -322,7 +333,7 @@ mod tests {
         // the retired `summary_prompt` setting.
         let (_dir, conn) = temp_conn();
         let note = db::create_note(&conn, "no", "custom:does-not-exist", "").unwrap();
-        assert_eq!(resolve_prompt(&conn, &note, "no"), DEFAULT_SUMMARY_PROMPT);
+        assert_eq!(resolve_prompt(&conn, &note, "no"), presets::prompt("meeting", "no"));
     }
 
     #[test]
@@ -331,7 +342,31 @@ mod tests {
         // reads the legacy `summary_prompt` setting.
         let (_dir, conn) = temp_conn();
         let note = db::create_note(&conn, "no", "custom", "").unwrap();
-        assert_eq!(resolve_prompt(&conn, &note, "no"), DEFAULT_SUMMARY_PROMPT);
+        assert_eq!(resolve_prompt(&conn, &note, "no"), presets::prompt("meeting", "no"));
+    }
+
+    // Issue #167. The fallback used to be a hardcoded Norwegian prompt
+    // containing "Skriv på norsk", so on any other language setting it
+    // contradicted the directive appended right after it — and once `auto`
+    // started resolving to a detected language, an English recording could
+    // pair "Skriv på norsk" with "Write the entire response in English."
+    #[test]
+    fn the_fallback_prompt_follows_the_requested_language() {
+        let (_dir, conn) = temp_conn();
+        for preset in ["custom", "custom:does-not-exist"] {
+            let note = db::create_note(&conn, "en", preset, "").unwrap();
+            let p = resolve_prompt(&conn, &note, "en");
+            assert!(p.contains("Reply in English"), "{preset}: {p}");
+            assert!(!p.contains("Skriv på norsk"), "{preset}: {p}");
+        }
+    }
+
+    #[test]
+    fn the_fallback_prompt_anchors_on_the_transcript_when_auto() {
+        let (_dir, conn) = temp_conn();
+        let note = db::create_note(&conn, "auto", "custom", "").unwrap();
+        let p = resolve_prompt(&conn, &note, "auto");
+        assert!(p.contains("the same language as the transcript"), "{p}");
     }
 
     #[test]
