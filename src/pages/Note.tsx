@@ -1949,19 +1949,50 @@ export const TranscriptEditor = memo(function TranscriptEditor({
   // replace via diarize.
   const showEditor = editing && !disabled;
 
+  // Announce the mode change (#171). The controls are reachable and labelled,
+  // but the *transition* was silent: activating `Edit` swapped the reader for
+  // a textarea with nothing said about it. The region is rendered
+  // unconditionally, outside the header, so the announcement survives the
+  // header's contents being swapped out from under it — a live region that
+  // mounts at the same moment as its text is not reliably read.
+  // `null` on first render (and only then) keeps opening the panel silent:
+  // the ref guard skips the effect's initial run, so nothing is announced
+  // until an actual transition happens.
+  const [announcement, setAnnouncement] = useState<string | null>(null);
+  const announcedOnce = useRef(false);
+  useEffect(() => {
+    if (!announcedOnce.current) {
+      announcedOnce.current = true;
+      return;
+    }
+    setAnnouncement(showEditor ? "Editing transcript" : "Transcript no longer editable");
+  }, [showEditor]);
+
   // Persistent header slot (#168). Before this, entering edit mode was an
   // undocumented click on the body and leaving it was Escape or an outside
   // click — neither visible. The slot always occupies the same place: `Edit`
   // in view mode, `Editing` + `Done` while the textarea is open, so the mode
   // is stated rather than inferred from the speaker pills disappearing.
-  // Nothing is offered while `disabled` — a recording in flight, or a
-  // teammate's read-only note — since on those there is no mode to enter and
-  // an inert `Edit` would promise one.
+  // Nothing interactive is offered while `disabled` — a recording in flight,
+  // or a teammate's read-only note — since on those there is no mode to enter
+  // and an inert `Edit` would promise one. The row itself stays (#171): when
+  // it vanished with its control, the transcript below jumped up as a
+  // recording started and back down when it stopped. The placeholder carries
+  // the control's own text so the line box matches exactly whatever the font
+  // and size happen to be, rather than a min-height guess that drifts; it is
+  // `aria-hidden` because there is nothing there to offer.
   const modeLink =
     "nd-bare text-xs text-[var(--color-text-muted)] underline hover:text-[var(--color-text)] shrink-0";
-  const header = disabled ? null : (
-    <div className={cn("flex items-center justify-end gap-2 mb-2", fill && "shrink-0")}>
-      {showEditor ? (
+  const header = (
+    <div
+      data-testid="transcript-mode-header"
+      className={cn("flex items-center justify-end gap-2 mb-2", fill && "shrink-0")}
+    >
+      {disabled ? (
+        <span aria-hidden="true" className="invisible text-xs shrink-0">
+          Edit
+        </span>
+      ) : showEditor ? (
         <>
           <span className="text-xs text-[var(--color-text-muted)]">Editing</span>
           <button
@@ -1987,10 +2018,14 @@ export const TranscriptEditor = memo(function TranscriptEditor({
 
   return (
     <div className={cn("flex flex-col", fill && "min-h-0 flex-1")}>
+      <span data-testid="transcript-mode-live" className="sr-only" role="status" aria-live="polite">
+        {announcement ?? ""}
+      </span>
       {header}
       {showEditor ? (
         <textarea
           ref={taRef}
+          aria-label="Transcript"
           value={value}
           onChange={(e) => onChange(e.target.value)}
           onBlur={() => setEditing(false)}
