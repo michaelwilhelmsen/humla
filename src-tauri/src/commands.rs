@@ -534,24 +534,17 @@ async fn rediarize_apply_to_chunks(
     )
     .await;
 
+    // Through the shared commit, so re-diarize inherits its refusal to trade a
+    // non-empty transcript for an empty projection rather than restating it.
     let full_transcript = rebuild_note_transcript(&app, &note_id).map_err(|e| anyhow::anyhow!(e))?;
-    {
-        let state: State<AppState> = app.state();
-        let conn = state.db.lock();
-        db::set_transcript(&conn, &note_id, &full_transcript)?;
+    if let Err(e) = commit_rebuilt_transcript(&app, &note_id, full_transcript) {
+        emit_status(&app, None, Phase::Idle);
+        return Err(anyhow::anyhow!(e));
     }
-    note_changed_for_sync(&app, &note_id); // re-diarize rewrote the transcript
     // Re-diarize rewrote this session's timeline.jsonl — re-push the metadata
     // (idempotent) so the record exists; the frontend re-uploads the timeline
     // asset after the command returns.
     session_changed_for_sync(&app, &note_id, &session_id);
-    let _ = app.emit(
-        "transcript_replaced",
-        TranscriptPayload {
-            note_id: note_id.clone(),
-            text: full_transcript,
-        },
-    );
 
     emit_status(&app, None, Phase::Idle);
     Ok(())
@@ -712,6 +705,115 @@ pub fn note_timeline(app: AppHandle, note_id: String) -> Result<Vec<TimelineEntr
     Ok(out)
 }
 
+/// Outcome of [`note_timeline_repair`].
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TimelineRepair {
+    /// A synthesized session was written for text no timeline accounted for.
+    pub repaired: bool,
+    /// Whether the merged timelines now account for every word of
+    /// `note.transcript`. When false the reader must fall back to the plain
+    /// labelled view — the turn list would hide the difference.
+    pub covers_transcript: bool,
+}
+
+/// Detect and repair transcript text that no session timeline accounts for
+/// (#169), then report whether the note still has a gap.
+///
+/// Called on note open, which is deliberately the whole migration (ADR-0004):
+/// the merged timeline is parsed and in memory at that point, so detection is
+/// a comparison over data we already have rather than new I/O, and all four
+/// paths that rebuild the transcript from the timelines — cycling a chunk's
+/// speaker label, deleting a chunk, re-diarizing, unifying sessions — are UI
+/// actions on an already-open note, so the repair always precedes them. That
+/// ordering is the point: before it, any of those four rewrote
+/// `note.transcript` to the projection and permanently deleted the orphaned
+/// text, taking it out of the summary, chat retrieval and embeddings.
+///
+/// Idempotent: after a repair the projection covers the transcript, so the
+/// next open finds nothing to do.
+///
+/// A note with *no* timeline at all is left alone. It renders the plain
+/// textarea, so it hides nothing, and synthesizing a session for it would
+/// take its free-text editing away; `commit_rebuilt_transcript` is what
+/// protects those from the destructive paths.
+#[tauri::command]
+pub async fn note_timeline_repair(
+    app: AppHandle,
+    note_id: String,
+) -> Result<TimelineRepair, String> {
+    let clean = TimelineRepair { repaired: false, covers_transcript: true };
+    let transcript = {
+        let state: State<AppState> = app.state();
+        let conn = state.db.lock();
+        db::get_note(&conn, &note_id).map_err(err)?.transcript
+    };
+    if transcript.trim().is_empty() {
+        return Ok(clean);
+    }
+    let projection = rebuild_note_transcript(&app, &note_id)?;
+    if projection.trim().is_empty() {
+        return Ok(clean); // no timeline at all — not this issue's shape
+    }
+    if projection_covers(&transcript, &projection) {
+        return Ok(clean);
+    }
+    let Some(lines) = orphaned_prefix(&transcript, &projection) else {
+        // Something diverged that a prefix repair can't explain (a timeline
+        // present but short because malformed lines were skipped, an asset
+        // that never downloaded). Leave it to the render-time guard, which
+        // shows all the text rather than guessing at its shape.
+        return Ok(TimelineRepair { repaired: false, covers_transcript: false });
+    };
+    let jsonl = synthesize_orphan_timeline(&lines);
+
+    let app_dir = app.path().app_data_dir().map_err(err)?;
+    let recordings = sessions::recordings_dir(&app_dir, &note_id);
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let write_id = session_id.clone();
+    // Serialize the manifest read-modify-write against the cloud pull worker
+    // and the post-stop append, exactly as the other manifest writers do.
+    let lock = app.state::<AppState>().manifest_lock.clone();
+    let _manifest_guard = lock.lock().await;
+    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        // A legacy flat note has no manifest, so its take only resolves via
+        // the flat fallback — which `resolve_sessions` stops applying the
+        // moment a manifest exists. Migrate it into a real entry first, or
+        // writing ours would hide the take we are repairing around.
+        sessions::migrate_flat_if_needed(&recordings, &uuid::Uuid::new_v4().to_string())?;
+        let dir = sessions::session_dir(&recordings, &write_id);
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(dir.join("timeline.jsonl"), jsonl)?;
+        let mut manifest =
+            sessions::read_manifest(&recordings).unwrap_or_else(sessions::SessionsManifest::empty);
+        // Index 0: the orphaned text predates every recorded take, and
+        // sessions resolve in index order. Existing indices are left alone so
+        // a concurrent sync reconcile has nothing to disagree with, and
+        // `append_session` (max + 1) is unaffected.
+        manifest.sessions.push(sessions::SessionEntry {
+            id: write_id,
+            index: 0,
+            started_at: String::new(),
+            duration_ms: 0,
+            streams: Vec::new(),
+        });
+        sessions::write_manifest(&recordings, &manifest)
+    })
+    .await
+    .map_err(err)?
+    .map_err(|e| format!("repair timeline: {e}"))?;
+
+    session_changed_for_sync(&app, &note_id, &session_id);
+    // Re-project rather than assume: the reader's fallback is driven by this
+    // answer, and claiming a coverage the files don't actually have is how the
+    // text would stay hidden. Cheap — only a repair that happened pays for it.
+    let repaired_projection = rebuild_note_transcript(&app, &note_id)?;
+    Ok(TimelineRepair {
+        repaired: true,
+        covers_transcript: projection_covers(&transcript, &repaired_projection),
+    })
+}
+
 /// Session metadata for a note, in recording order. Drives the playback
 /// carousel (numbered pills + per-session date/duration/streams) and the
 /// styled reader's session dividers. Empty for notes with no recordings.
@@ -839,11 +941,148 @@ fn rebuild_note_transcript(app: &AppHandle, note_id: &str) -> Result<String, Str
     Ok(parts.join("\n"))
 }
 
+/// Split a transcript line into its speaker label and the words after it,
+/// mirroring the reader's parse (`parseTranscriptLines` in `Note.tsx`): an
+/// unbroken run of at most 40 non-colon characters, then `": "`. Anything
+/// else is an unlabelled line.
+fn split_label(line: &str) -> (Option<&str>, &str) {
+    let trimmed = line.trim();
+    let Some((label, rest)) = trimmed.split_once(": ") else {
+        return (None, trimmed);
+    };
+    if label.is_empty() || label.chars().count() > 40 || label.contains(':') {
+        return (None, trimmed);
+    }
+    (Some(label), rest)
+}
+
+/// A transcript reduced to comparable words: speaker labels dropped, case and
+/// punctuation folded away. This is how the transcript and the timelines'
+/// projection are compared — never by line count, because the two grouping
+/// rules differ on purpose (Rust groups on label, `groupTimeline` on label
+/// *and* session), and never by raw text, because a cross-note speaker rename
+/// rewrites the transcript and leaves the timeline alone.
+fn comparable_words(transcript: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in transcript.lines() {
+        let (_, rest) = split_label(line);
+        for word in rest.split_whitespace() {
+            let w: String = word
+                .chars()
+                .filter(|c| c.is_alphanumeric())
+                .flat_map(|c| c.to_lowercase())
+                .collect();
+            if !w.is_empty() {
+                out.push(w);
+            }
+        }
+    }
+    out
+}
+
+/// Whether the timelines' projection accounts for every word of the
+/// transcript, in order.
+///
+/// Deliberately directional: the reader renders the timelines, so a projection
+/// carrying *more* than the transcript hides nothing and needs no fallback —
+/// only words the transcript has and the projection lacks are invisible. A
+/// subsequence test says exactly that, and it is insensitive to the two
+/// grouping rules disagreeing about where lines break (they do, on purpose).
+fn projection_covers(transcript: &str, projection: &str) -> bool {
+    let pw = comparable_words(projection);
+    let mut p = pw.iter();
+    comparable_words(transcript)
+        .iter()
+        .all(|w| p.any(|c| c == w))
+}
+
+/// The leading transcript lines that `projection` — what the note's session
+/// timelines can account for — does not cover.
+///
+/// `combine_with_snapshot` prepends the prior take's transcript to the new
+/// one, so orphaned text is always a *prefix*: the projection is a suffix of
+/// the transcript in word order. Returns `None` when nothing is orphaned, or
+/// when the gap can't be attributed to a whole run of leading lines — the
+/// render-time guard covers those shapes rather than guessing at a repair.
+fn orphaned_prefix<'a>(transcript: &'a str, projection: &str) -> Option<Vec<&'a str>> {
+    let tw = comparable_words(transcript);
+    let pw = comparable_words(projection);
+    if pw.is_empty() || tw.len() <= pw.len() {
+        return None;
+    }
+    let mut missing = tw.len() - pw.len();
+    if tw[missing..] != pw[..] {
+        return None; // not a clean prefix gap — something else diverged
+    }
+    let mut out = Vec::new();
+    for line in transcript.lines() {
+        if missing == 0 {
+            break;
+        }
+        let n = comparable_words(line).len();
+        if n > missing {
+            return None; // the gap ends mid-line; don't split a turn to fit
+        }
+        missing -= n;
+        out.push(line);
+    }
+    out.retain(|l| !l.trim().is_empty());
+    if missing > 0 || out.is_empty() {
+        return None;
+    }
+    Some(out)
+}
+
+/// Milliseconds each synthesized entry occupies. Arbitrary: a repaired
+/// session has no audio, so the bounds only have to be ordered and distinct.
+const SYNTHESIZED_ENTRY_MS: u64 = 5_000;
+
+/// Serialise orphaned transcript lines as a session timeline. Each line keeps
+/// whatever speaker label it carried and loses nothing else; there are no word
+/// timings to recover, and none are invented (ADR-0004 — a stale mapping is
+/// worse than none).
+fn synthesize_orphan_timeline(lines: &[&str]) -> String {
+    let mut out = String::new();
+    for (i, line) in lines.iter().enumerate() {
+        let (label, text) = split_label(line);
+        let start = i as u64 * SYNTHESIZED_ENTRY_MS;
+        out.push_str(
+            &serde_json::json!({
+                "start_ms": start,
+                "end_ms": start + SYNTHESIZED_ENTRY_MS,
+                "label": label.unwrap_or(""),
+                "text": text,
+                "words": [],
+            })
+            .to_string(),
+        );
+        out.push('\n');
+    }
+    out
+}
+
 /// Persist a rebuilt transcript to the DB, ping sync, and notify the UI.
+///
+/// Refuses to replace a non-empty transcript with an empty projection. Notes
+/// recorded before sessions existed have a transcript and no timeline at all,
+/// and every rebuild path is a UI action (cycle a label, delete a chunk,
+/// re-diarize, unify) that would otherwise blank them in one click. Those
+/// notes are out of #169's reader symptom — with no timeline they render the
+/// textarea and hide nothing — but they sit behind the same destructive paths.
 fn commit_rebuilt_transcript(app: &AppHandle, note_id: &str, transcript: String) -> Result<(), String> {
     {
         let state: State<AppState> = app.state();
         let conn = state.db.lock();
+        if transcript.trim().is_empty()
+            && db::get_note(&conn, note_id)
+                .map(|n| !n.transcript.trim().is_empty())
+                .unwrap_or(false)
+        {
+            return Err(
+                "refusing to clear the transcript: this note's recordings have no timeline to rebuild from"
+                    .to_string(),
+            );
+        }
         db::set_transcript(&conn, note_id, &transcript).map_err(err)?;
     }
     note_changed_for_sync(app, note_id); // timeline edit rewrote the transcript
@@ -2642,26 +2881,29 @@ async fn diarize_and_apply(
         eprintln!("diarize: no chunks captured, skipping");
         return Ok(());
     }
-    // Skip when the model isn't downloaded — diarization is optional, but
-    // tell the user so they don't sit confused waiting for speaker labels
-    // that will never arrive.
-    match diarize::status(&app, engine).await {
-        Ok(s) if s.downloaded => {}
-        _ => {
-            eprintln!("diarize: model not downloaded, skipping");
-            emit_error(
-                &app,
-                Some(&note_id),
-                "Speaker diarization model isn't downloaded — transcript saved without speaker labels. Download it from Settings → Speaker diarization.",
-            );
-            return Ok(());
-        }
+    // Diarization is optional — the model may not be downloaded. This used to
+    // `return Ok(())` right here, which is the origin of #169: the chunks had
+    // already been live-appended to `note.transcript`, so the recording ended
+    // with text in the note and no session, no timeline behind it. Under
+    // ADR-0004 the timeline is canonical for a note's content, so a recording
+    // that lands text always writes a session — this path just writes it with
+    // no speaker labels. Tell the user why the labels never arrive.
+    let diarize_available = matches!(diarize::status(&app, engine).await, Ok(s) if s.downloaded);
+    if !diarize_available {
+        eprintln!("diarize: model not downloaded, saving the timeline without labels");
+        emit_error(
+            &app,
+            Some(&note_id),
+            "Speaker diarization model isn't downloaded — transcript saved without speaker labels. Download it from Settings → Speaker diarization.",
+        );
     }
 
     let mic_chunks_present = chunks.iter().any(|c| c.source == ChunkSource::Mic);
     let sys_chunks_present = chunks.iter().any(|c| c.source == ChunkSource::Sys);
 
-    emit_status(&app, Some(&note_id), Phase::Diarizing);
+    if diarize_available {
+        emit_status(&app, Some(&note_id), Phase::Diarizing);
+    }
 
     // Decide which WAV to diarize and how to label chunks. The label
     // assignment is a per-chunk closure so the merge step doesn't need to
@@ -2671,7 +2913,18 @@ async fn diarize_and_apply(
     // segments + display map are both Send, so the bound just needs to be
     // declared on the trait object.
     type Splitter = dyn Fn(&ChunkRecord) -> Vec<LabelledPiece> + Send;
-    let split_chunk: Box<Splitter> = match (mic_chunks_present, sys_chunks_present) {
+    let split_chunk: Box<Splitter> = if !diarize_available {
+        // No model, so no speaker assignment to make — but the word timings
+        // are kept. Diarization decides *who* spoke, not when each word
+        // landed, so its absence says nothing about the timings the provider
+        // returned for this audio. (ADR-0004 drops `words` when a turn's text
+        // is *edited*, where the mapping describes words that are gone. That
+        // isn't this case, and a timeline with real timings gives these notes
+        // per-word highlighting plus the tighter turn bounds
+        // `serialize_timeline` derives from words when it has them.)
+        Box::new(|c: &ChunkRecord| single_piece(c, None))
+    } else {
+        match (mic_chunks_present, sys_chunks_present) {
         (true, false) => {
             // In-person mode: diarize the mic stream, every chunk gets a
             // numbered label from its segment. The per-note expected
@@ -2850,6 +3103,7 @@ async fn diarize_and_apply(
             })
         }
         (false, false) => unreachable!("chunks.is_empty() returned earlier"),
+        }
     };
 
     let new_session = build_labelled_transcript(&chunks, split_chunk.as_ref());
@@ -7357,10 +7611,10 @@ mod diarize_tests {
     /// have evidence for — and a later take on the same note becomes the only
     /// session with a timeline.
     ///
-    /// Ignored because it asserts the invariant we *want*, and it fails today.
-    /// Remove the `#[ignore]` as part of the fix; do not weaken the assertion.
+    /// Closed by repair-on-open: `orphaned_prefix` spots the snapshot the
+    /// projection doesn't cover and `synthesize_orphan_timeline` gives it a
+    /// session, so the merged timeline accounts for the whole transcript.
     #[test]
-    #[ignore = "#169: reproduces the orphaned-snapshot gap; un-ignore when fixed"]
     fn orphaned_snapshot_text_survives_in_the_timeline() {
         // Take 1 left this behind: live-appended text, unlabelled, because the
         // pass that would have labelled it (and written its timeline) returned
@@ -7379,7 +7633,15 @@ mod diarize_tests {
         let split = whole_chunk_pieces(labeller);
 
         let combined = combine_with_snapshot(&snapshot, &build_labelled_transcript(&chunks, &split));
-        let timeline = serialize_timeline(&chunks, &split, session_speaker_offset(snapshot));
+        let session_two = serialize_timeline(&chunks, &split, session_speaker_offset(snapshot));
+
+        // What opening the note does: project the sessions that exist, find
+        // the text the projection can't account for, and give it a session of
+        // its own in front of them.
+        let projection = group_values_to_transcript(&jsonl_values(&session_two));
+        let orphans =
+            orphaned_prefix(&combined, &projection).expect("the snapshot is orphaned today");
+        let timeline = format!("{}{}", synthesize_orphan_timeline(&orphans), session_two);
 
         // What the reader can actually show: every text the merged timeline
         // carries. Anything in the transcript but absent here is unreachable.
@@ -7406,6 +7668,161 @@ mod diarize_tests {
                  show it and a rebuild would delete it: {words:?}",
             );
         }
+
+        // The rebuild paths are the other half of the bug: `rebuild_note_transcript`
+        // derives the transcript from the timelines alone, so before the repair
+        // cycling one speaker pill deleted the snapshot outright. After it, a
+        // rebuild reproduces the same words.
+        let repaired_projection = group_values_to_transcript(&jsonl_values(&timeline));
+        assert_eq!(
+            comparable_words(&repaired_projection),
+            comparable_words(&combined),
+            "a rebuild after the repair must not change the transcript's words",
+        );
+        // ...which is also what makes the repair a fixed point: a second open
+        // finds nothing left to account for, so it adds no second session.
+        assert!(
+            projection_covers(&combined, &repaired_projection)
+                && orphaned_prefix(&combined, &repaired_projection).is_none(),
+            "repair must be idempotent",
+        );
+    }
+
+    /// Parse a serialised timeline back into the values the projection and
+    /// per-chunk edit paths work on. `read_timeline_values` does this from a
+    /// path; tests hold the JSONL in memory.
+    fn jsonl_values(jsonl: &str) -> Vec<serde_json::Value> {
+        jsonl
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect()
+    }
+
+    // ---- Orphaned transcript text (#169) --------------------------------
+
+    /// The diarize-skipped path still has to leave a timeline behind, or the
+    /// text it live-appended becomes the next orphan. No model means nothing
+    /// can be said about who spoke — so the label is empty, and *only* the
+    /// label: word timings describe when each word landed, which diarization
+    /// has no bearing on, so they are kept and the note keeps per-word
+    /// highlighting.
+    #[test]
+    fn diarize_skipped_timeline_carries_text_and_timings_with_no_label() {
+        let chunks = vec![
+            sys_with_words(0, vec![("where", 0, 400), ("now", 400, 900)]),
+            sys_with_words(4_000, vec![("friday", 0, 500)]),
+        ];
+        let split = |c: &ChunkRecord| single_piece(c, None);
+        let values = jsonl_values(&serialize_timeline(&chunks, &split, 0));
+        assert_eq!(values.len(), 2);
+        for v in &values {
+            assert_eq!(v["label"], "");
+        }
+        assert_eq!(values[0]["text"], "where now");
+        assert_eq!(values[1]["text"], "friday");
+        // The provider's word timings survive a missing diarize model, rebased
+        // to stream-absolute as usual...
+        assert_eq!(values[0]["words"][1]["text"], "now");
+        assert_eq!(values[0]["words"][1]["start_ms"], 400);
+        assert_eq!(values[1]["words"][0]["start_ms"], 4_000);
+        // ...which also gives the entry the tighter bounds `serialize_timeline`
+        // derives from words rather than the coarse chunk fallback.
+        assert_eq!(values[0]["end_ms"], 900);
+        // And it projects back to the text the live append had already saved.
+        assert_eq!(group_values_to_transcript(&values), "where now friday");
+    }
+
+    #[test]
+    fn split_label_matches_the_readers_parse() {
+        assert_eq!(split_label("Speaker 1: hello"), (Some("Speaker 1"), "hello"));
+        assert_eq!(split_label("  Michael: hi there"), (Some("Michael"), "hi there"));
+        // No label: an unlabelled line, a colon inside the words, or a "label"
+        // longer than the reader would accept.
+        assert_eq!(split_label("just words"), (None, "just words"));
+        let long = format!("{}: x", "a".repeat(41));
+        assert_eq!(split_label(&long).0, None);
+        assert_eq!(split_label("10:30: the standup").0, None);
+    }
+
+    #[test]
+    fn comparable_words_ignores_labels_case_and_punctuation() {
+        assert_eq!(
+            comparable_words("Speaker 1: Hello, world!"),
+            comparable_words("Michael: hello world"),
+        );
+        // A cross-note rename rewrites the transcript and leaves the timeline
+        // alone; that must not read as a gap.
+        assert_eq!(comparable_words("Speaker 2: a b"), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn projection_covers_is_directional() {
+        let t = "Speaker 1: a b c\nYou: d e";
+        assert!(projection_covers(t, t));
+        // Grouped differently, same words — the two rules differ on purpose.
+        assert!(projection_covers(t, "Michael: a b c d e"));
+        // The projection carrying more than the transcript hides nothing: the
+        // reader renders the timeline, so there is no fallback to make.
+        assert!(projection_covers(t, "Speaker 1: a b c\nYou: d e f g"));
+        // Words the transcript has and the timeline lacks are the invisible
+        // ones, wherever they sit.
+        assert!(!projection_covers(t, "Speaker 1: a b c"));
+        assert!(!projection_covers("A: one\nB: two\nC: three", "A: one\nC: three"));
+    }
+
+    #[test]
+    fn orphaned_prefix_returns_the_uncovered_leading_lines() {
+        let transcript = "we kicked off by agreeing the deadline slips\nSpeaker 1: so where did we land\nYou: the following Friday";
+        let projection = "Speaker 1: so where did we land\nYou: the following Friday";
+        assert_eq!(
+            orphaned_prefix(transcript, projection),
+            Some(vec!["we kicked off by agreeing the deadline slips"]),
+        );
+    }
+
+    #[test]
+    fn orphaned_prefix_is_none_when_the_projection_covers_the_transcript() {
+        let t = "Speaker 1: a b c\nYou: d e";
+        assert_eq!(orphaned_prefix(t, t), None);
+        // Same words, different grouping — the two rules differ on purpose.
+        assert_eq!(orphaned_prefix(t, "Michael: a b c d e"), None);
+    }
+
+    #[test]
+    fn orphaned_prefix_is_none_when_the_gap_is_not_a_clean_prefix() {
+        // Missing from the middle: not the combine_with_snapshot shape, so a
+        // prefix repair would put the words back in the wrong place. The
+        // render-time guard shows all the text instead.
+        assert_eq!(
+            orphaned_prefix("A: one\nB: two\nC: three", "A: one\nC: three"),
+            None,
+        );
+        // Gap ends mid-line: don't split a turn to make it fit.
+        assert_eq!(orphaned_prefix("A: one two three", "A: three"), None);
+        // Nothing to compare against — a note with no timeline is left alone.
+        assert_eq!(orphaned_prefix("A: one", ""), None);
+    }
+
+    #[test]
+    fn synthesized_entries_keep_labels_and_carry_no_timings() {
+        let lines = vec!["Michael: hei der", "unlabelled tail"];
+        let values = jsonl_values(&synthesize_orphan_timeline(&lines));
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0]["label"], "Michael");
+        assert_eq!(values[0]["text"], "hei der");
+        assert_eq!(values[1]["label"], "");
+        assert_eq!(values[1]["text"], "unlabelled tail");
+        assert!(values[0]["end_ms"].as_u64() <= values[1]["start_ms"].as_u64());
+        for v in &values {
+            assert_eq!(v["words"].as_array().unwrap().len(), 0);
+        }
+        // The projection of the synthesized session reproduces the lines it
+        // was built from, which is what makes the repair a fixed point.
+        assert_eq!(
+            comparable_words(&group_values_to_transcript(&values)),
+            comparable_words("Michael: hei der\nunlabelled tail"),
+        );
     }
 
     // ---- Per-turn transcript editing (#170) -----------------------------

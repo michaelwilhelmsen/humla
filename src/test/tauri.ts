@@ -34,6 +34,8 @@ export function mockTauri(handlers: Record<string, Handler> = {}) {
         return [];
       case "recording_state":
         return "idle";
+      case "note_timeline_repair":
+        return { repaired: false, coversTranscript: true };
       case "stored_audio_stats":
         return { notes: 0, files: 0, bytes: 0, noteIds: [] };
       case "chat_get_breadth":
