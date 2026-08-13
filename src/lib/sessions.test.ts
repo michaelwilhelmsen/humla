@@ -3,6 +3,7 @@ import {
   formatDuration,
   formatSessionCaption,
   groupTimeline,
+  needsSessionPull,
   resolveActivePill,
   type TimelineGroup,
 } from "./sessions";
@@ -136,5 +137,35 @@ describe("resolveActivePill", () => {
         sessions,
       }),
     ).toBe("s1");
+  });
+});
+
+describe("needsSessionPull", () => {
+  it("never asks the network for a Personal note", () => {
+    expect(
+      needsSessionPull({ shared: false, hasLocalPlayback: false, timelineEntries: 0 }),
+    ).toBe(false);
+  });
+
+  it("asks when a shared note has no local audio", () => {
+    expect(
+      needsSessionPull({ shared: true, hasLocalPlayback: false, timelineEntries: 0 }),
+    ).toBe(true);
+  });
+
+  it("asks when audio is local but the timeline is not", () => {
+    // The regression: the legacy single-file fallback drops a flat playback.wav
+    // and no timeline, and the old `!path` gate then treated the note as fully
+    // local forever — so it never got word timings, and rendered with no
+    // speaker labels at all.
+    expect(
+      needsSessionPull({ shared: true, hasLocalPlayback: true, timelineEntries: 0 }),
+    ).toBe(true);
+  });
+
+  it("stays quiet once both are local", () => {
+    expect(
+      needsSessionPull({ shared: true, hasLocalPlayback: true, timelineEntries: 12 }),
+    ).toBe(false);
   });
 });

@@ -314,6 +314,7 @@ where
             commands::cloud_upload_note_audio,
             commands::cloud_download_note_audio,
             commands::cloud_upload_note_sessions,
+            commands::cloud_repair_note_sessions,
             commands::cloud_download_note_sessions,
             commands::cloud_note_recording_status,
             commands::cloud_add_member,

@@ -430,6 +430,81 @@ pub fn session_upload_plan(
         .collect()
 }
 
+/// The *repair* variant of [`session_upload_plan`]: only the assets the server
+/// is missing outright, never a re-send of one it already holds.
+///
+/// The full plan runs after an event that changed the timeline (a recording
+/// finishing, a re-diarize, a speaker rename), so re-sending it is the point.
+/// This one runs opportunistically on note open, to close the window where the
+/// author's post-recording upload never happened at all — the asset PATCH is a
+/// separate fire-and-forget call from the sync worker's metadata push, so
+/// quitting the app (or losing the network) in the minute after a recording
+/// leaves the session records on the server with no `timeline` file attached,
+/// and nothing retries. Teammates then see a note with sessions but no speaker
+/// labels. Repair-on-open is that retry, and it stays cheap by never re-sending
+/// what is already up.
+pub fn session_repair_plan(
+    local_present: &[AssetField],
+    remote_present: &[AssetField],
+) -> Vec<AssetField> {
+    AssetField::ALL
+        .into_iter()
+        .filter(|f| local_present.contains(f) && !remote_present.contains(f))
+        .collect()
+}
+
+/// Drop the audio assets from an upload plan when this device is set not to
+/// sync audio. The setting is about *recordings*, so it must not take the
+/// timeline down with them: withholding word timings doesn't protect anything
+/// (they carry no voice) and costs teammates every speaker label in the note.
+pub fn retain_syncable(plan: Vec<AssetField>, sync_audio: bool) -> Vec<AssetField> {
+    if sync_audio {
+        return plan;
+    }
+    plan.into_iter().filter(|f| !f.is_audio()).collect()
+}
+
+/// Whether an asset already on disk is worth re-fetching when the server's copy
+/// changed. Only the timeline: it is small text that the author *rewrites* after
+/// the fact (re-diarize, cross-session unification, speaker rename), so a cached
+/// copy silently pins the reader to stale labels. Audio is immutable per take
+/// and can be hundreds of MB — fetched once, never again.
+pub fn refetch_when_changed(field: AssetField) -> bool {
+    matches!(field, AssetField::Timeline)
+}
+
+/// Decide whether to fetch one asset, given what's on disk and what the server
+/// holds.
+///
+/// `stamp` is the remote filename recorded when this device last downloaded the
+/// asset (see [`remote_stamp_path`]). PocketBase mints a fresh random suffix on
+/// every upload (`timeline_x7rwstj5qc.jsonl`), so a differing filename is an
+/// exact "the server's copy is not the one I have" signal — no clock comparison,
+/// no skew.
+pub fn should_fetch_asset(
+    field: AssetField,
+    dest_exists: bool,
+    stamp: Option<&str>,
+    remote_filename: &str,
+) -> bool {
+    if remote_filename.is_empty() {
+        return false; // nothing attached to the record
+    }
+    if !dest_exists {
+        return true;
+    }
+    if !refetch_when_changed(field) {
+        return false;
+    }
+    stamp != Some(remote_filename)
+}
+
+/// Where the last-downloaded remote filename for an asset is recorded, beside
+/// the asset itself. A dotfile so it never looks like a recording artefact.
+pub fn remote_stamp_path(session_dir: &Path, field: AssetField) -> PathBuf {
+    session_dir.join(format!(".{}.remote", field.file_name()))
+}
+
 // ---------------------------------------------------------------------------
 // Honest keep_audio (#24) — the storage decision and the cleanup primitives.
 // ---------------------------------------------------------------------------
@@ -1028,6 +1103,71 @@ mod tests {
 
         // Nothing local → nothing uploaded, even if the server expects it.
         assert!(session_upload_plan(&[], &[Playback]).is_empty());
+    }
+
+    #[test]
+    fn repair_plan_sends_only_what_the_server_is_missing() {
+        use AssetField::*;
+        // The case this exists for: the metadata record synced but the asset
+        // PATCH never ran, so the server has the session and none of its files.
+        let plan = session_repair_plan(&[Playback, Timeline], &[]);
+        assert_eq!(plan, vec![Playback, Timeline]);
+
+        // Everything already up → a repair pass is free (no re-send of the
+        // timeline, unlike the post-recording plan).
+        assert!(session_repair_plan(&[Playback, Timeline], &[Playback, Timeline]).is_empty());
+
+        // Half-finished upload: only the gap is filled.
+        assert_eq!(session_repair_plan(&[Playback, Timeline], &[Playback]), vec![Timeline]);
+    }
+
+    #[test]
+    fn sync_audio_off_withholds_audio_but_never_the_timeline() {
+        use AssetField::*;
+        let plan = vec![Playback, Mic, Sys, Timeline, Chunks];
+        assert_eq!(retain_syncable(plan.clone(), true), plan);
+        // The regression this guards: `sync_audio = false` used to skip the whole
+        // upload, so teammates got no word timings and therefore no speaker
+        // labels. Audio is withheld; text is not.
+        assert_eq!(retain_syncable(plan, false), vec![Timeline, Chunks]);
+    }
+
+    #[test]
+    fn only_a_changed_timeline_is_re_fetched() {
+        use AssetField::*;
+        // Nothing local yet → fetch whatever the record holds.
+        assert!(should_fetch_asset(Timeline, false, None, "timeline_abc.jsonl"));
+        assert!(should_fetch_asset(Playback, false, None, "playback_abc.wav"));
+
+        // Record holds no file for the field → nothing to fetch.
+        assert!(!should_fetch_asset(Timeline, false, None, ""));
+
+        // Same upload as the copy on disk → skip.
+        assert!(!should_fetch_asset(
+            Timeline,
+            true,
+            Some("timeline_abc.jsonl"),
+            "timeline_abc.jsonl"
+        ));
+        // The author re-diarized / renamed a speaker: PocketBase minted a new
+        // stored filename, so the local copy's labels are stale → re-fetch.
+        assert!(should_fetch_asset(
+            Timeline,
+            true,
+            Some("timeline_abc.jsonl"),
+            "timeline_zzz.jsonl"
+        ));
+        // Downloaded before stamps existed → one redundant fetch, then stamped.
+        assert!(should_fetch_asset(Timeline, true, None, "timeline_abc.jsonl"));
+
+        // Audio is immutable per take and huge — fetched once, never again,
+        // whatever the server's filename says.
+        assert!(!should_fetch_asset(
+            Playback,
+            true,
+            Some("playback_abc.wav"),
+            "playback_zzz.wav"
+        ));
     }
 
     #[test]
