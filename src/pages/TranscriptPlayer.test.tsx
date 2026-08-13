@@ -2,6 +2,7 @@ import { describe, it, expect, beforeAll, beforeEach, vi } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { TranscriptPlayer } from "./Note";
 import { mockTauri } from "../test/tauri";
+import { mockLayoutBox } from "../test/layout";
 import type { NoteSession, TimelineEntry } from "../lib/ipc";
 
 // TranscriptPlayer drives an <audio> element and @tanstack/react-virtual, neither
@@ -35,22 +36,9 @@ beforeAll(() => {
       disconnect() {}
     };
   }
-  // jsdom pins offsetWidth/offsetHeight to 0; @tanstack/react-virtual reads them
-  // to size the scroll window and measure rows, so with zero height it renders
-  // no rows (no word spans to click). Report a non-zero box so the timeline
-  // groups render.
-  Object.defineProperty(window.HTMLElement.prototype, "offsetHeight", {
-    configurable: true,
-    get() {
-      return 600;
-    },
-  });
-  Object.defineProperty(window.HTMLElement.prototype, "offsetWidth", {
-    configurable: true,
-    get() {
-      return 400;
-    },
-  });
+  // @tanstack/react-virtual measures rows off the layout box, which jsdom
+  // reports as zero — no rows means no word spans to click.
+  mockLayoutBox();
 });
 
 function entry(over: Partial<TimelineEntry>): TimelineEntry {

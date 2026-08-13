@@ -1,26 +1,13 @@
 import { describe, it, expect, beforeAll, vi } from "vitest";
 import { render, screen, fireEvent } from "@testing-library/react";
 import { TranscriptEditor } from "./Note";
+import { mockLayoutBox } from "../test/layout";
 
-// TranscriptView virtualizes its lines via @tanstack/react-virtual. jsdom pins
-// offsetWidth/offsetHeight to 0, so with a zero-height scroll window the
-// virtualizer renders no rows at all and there is no transcript to click.
+// TranscriptView virtualizes its lines via @tanstack/react-virtual, which reads
+// a zero-sized box in jsdom and renders no rows at all — nothing to click.
 // (The ResizeObserver the virtualizer also needs is already shimmed globally
 // in src/test/setup.ts.)
-beforeAll(() => {
-  Object.defineProperty(window.HTMLElement.prototype, "offsetHeight", {
-    configurable: true,
-    get() {
-      return 600;
-    },
-  });
-  Object.defineProperty(window.HTMLElement.prototype, "offsetWidth", {
-    configurable: true,
-    get() {
-      return 400;
-    },
-  });
-});
+beforeAll(() => mockLayoutBox());
 
 function renderEditor(over?: { disabled?: boolean; onChange?: (v: string) => void }) {
   return render(
