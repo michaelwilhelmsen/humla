@@ -36,7 +36,7 @@ whisper-rs = { version = "0.16", features = ["metal", "raw-api"] }
 # the user runs (Ollama, LM Studio, llama-server, vLLM, …). We reuse the
 # existing reqwest client; no in-process GGML runtime to avoid the static
 # duplicate-GGML conflict with whisper-rs.
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "v5"] }
 anyhow = "1"
 thiserror = "2"
 async-trait = "0.1"

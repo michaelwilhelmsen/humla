@@ -769,7 +769,7 @@ pub async fn note_timeline_repair(
 
     let app_dir = app.path().app_data_dir().map_err(err)?;
     let recordings = sessions::recordings_dir(&app_dir, &note_id);
-    let session_id = uuid::Uuid::new_v4().to_string();
+    let session_id = repair_session_id(&note_id, &lines);
     let write_id = session_id.clone();
     // Serialize the manifest read-modify-write against the cloud pull worker
     // and the post-stop append, exactly as the other manifest writers do.
@@ -790,13 +790,21 @@ pub async fn note_timeline_repair(
         // sessions resolve in index order. Existing indices are left alone so
         // a concurrent sync reconcile has nothing to disagree with, and
         // `append_session` (max + 1) is unaffected.
-        manifest.sessions.push(sessions::SessionEntry {
-            id: write_id,
+        //
+        // Replace rather than append: the id is derived, so a manifest pulled
+        // from a device that already repaired this note carries the same entry,
+        // and pushing a second copy of it would project the orphan twice.
+        let entry = sessions::SessionEntry {
+            id: write_id.clone(),
             index: 0,
             started_at: String::new(),
             duration_ms: 0,
             streams: Vec::new(),
-        });
+        };
+        match manifest.sessions.iter_mut().find(|e| e.id == write_id) {
+            Some(existing) => *existing = entry,
+            None => manifest.sessions.push(entry),
+        }
         sessions::write_manifest(&recordings, &manifest)
     })
     .await
@@ -1036,6 +1044,35 @@ fn orphaned_prefix<'a>(transcript: &'a str, projection: &str) -> Option<Vec<&'a 
 /// Milliseconds each synthesized entry occupies. Arbitrary: a repaired
 /// session has no audio, so the bounds only have to be ordered and distinct.
 const SYNTHESIZED_ENTRY_MS: u64 = 5_000;
+
+/// UUID namespace for the ids repair-on-open mints. **Fixed forever** — change
+/// it and two app versions stop agreeing on the id, which is the whole point.
+const REPAIR_SESSION_NAMESPACE: uuid::Uuid =
+    uuid::Uuid::from_u128(0x0169_c0de_5e55_1047_a11e_d7ea_11ce_0001);
+
+/// The synthesized session's id, derived from what it repairs rather than
+/// minted at random.
+///
+/// Every device that opens a shared note sees the same orphan — the transcript
+/// syncs whole and the sessions that fail to account for it sync too — so every
+/// device repairs it independently. With random ids each mints a *different*
+/// session, the server's unique key is `(note, client_id)` so both records are
+/// accepted, and the note ends up projecting the orphan twice; the next rebuild
+/// then writes the duplicate into `note.transcript`. Deriving the id from the
+/// note and the orphaned lines makes those writes the same write:
+/// `upsert_record` finds the existing record and PATCHes it, and
+/// `reconcile_manifest` (keyed by id) collapses the manifests locally.
+///
+/// A v5 UUID keeps the id in the `^[A-Za-z0-9-]{1,64}$` shape the server pins
+/// `client_id` to — a readable sentinel like `__orphan__` would be rejected.
+fn repair_session_id(note_id: &str, lines: &[&str]) -> String {
+    let mut seed = String::from(note_id);
+    for line in lines {
+        seed.push('\n');
+        seed.push_str(line.trim());
+    }
+    uuid::Uuid::new_v5(&REPAIR_SESSION_NAMESPACE, seed.as_bytes()).to_string()
+}
 
 /// Serialise orphaned transcript lines as a session timeline. Each line keeps
 /// whatever speaker label it carried and loses nothing else; there are no word
@@ -7802,6 +7839,30 @@ mod diarize_tests {
         assert_eq!(orphaned_prefix("A: one two three", "A: three"), None);
         // Nothing to compare against — a note with no timeline is left alone.
         assert_eq!(orphaned_prefix("A: one", ""), None);
+    }
+
+    /// Two devices open the same shared note, both see the same orphan, and
+    /// both repair it. With random ids that made two sessions and projected
+    /// the text twice; the id has to be a function of what it repairs.
+    #[test]
+    fn the_repair_session_id_is_the_same_on_every_device() {
+        let lines = vec!["we kicked off by agreeing the deadline slips", "a second line"];
+        assert_eq!(repair_session_id("note-a", &lines), repair_session_id("note-a", &lines));
+        // Leading/trailing space on a line is not a difference — the entries
+        // are written trimmed, so the id must not see it either.
+        let padded = vec!["  we kicked off by agreeing the deadline slips  ", "a second line"];
+        assert_eq!(repair_session_id("note-a", &lines), repair_session_id("note-a", &padded));
+        // Different note, or different orphan, is a different session.
+        assert_ne!(repair_session_id("note-a", &lines), repair_session_id("note-b", &lines));
+        assert_ne!(
+            repair_session_id("note-a", &lines),
+            repair_session_id("note-a", &lines[..1]),
+        );
+        // And it stays inside the shape the server pins `client_id` to, which
+        // rules out a readable sentinel like `__orphan__`.
+        let id = repair_session_id("note-a", &lines);
+        assert!(id.len() <= 64 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
+        assert!(sessions::is_safe_session_id(&id));
     }
 
     #[test]
