@@ -337,6 +337,7 @@ where
             commands::note_timeline,
             commands::note_timeline_rename,
             commands::note_timeline_set_chunk_label,
+            commands::note_timeline_set_chunk_text,
             commands::note_timeline_delete_chunk,
             commands::open_in_finder,
             commands::export_note,

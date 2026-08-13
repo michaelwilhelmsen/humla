@@ -22,6 +22,7 @@ import {
   MessageSquare,
   MoreHorizontal,
   PanelRight,
+  Pencil,
   RefreshCw,
   Sparkles,
   Users,
@@ -42,6 +43,7 @@ import {
   needsSessionPull,
   resolveActivePill,
   formatSessionCaption,
+  type TimelineGroup,
 } from "../lib/sessions";
 import { RecordingBar } from "../components/RecordingBar";
 import { ChatPanel, type ChatSessionControls } from "../components/ChatPanel";
@@ -1188,8 +1190,6 @@ export function Note() {
                           !!playbackUrl || sessions.some((s) => s.hasPlayback)
                         }
                         keepAudio={keepAudio}
-                        transcript={draft.transcript}
-                        onChange={onTranscriptChange}
                         disabled={readOnly || recActive}
                         fill
                         bottomAligned={transcriptLive}
@@ -2124,12 +2124,15 @@ const TranscriptView = memo(function TranscriptView({
 // for currentTime; we read it via timeupdate and pick the active turn
 // by binary scan (timeline is small enough that linear is also fine).
 //
-// Edit mode: textarea on the raw note.transcript text, same convention
-// as TranscriptEditor — the timeline isn't kept in sync with edits, so
-// after a manual edit the highlights might mismatch slightly until the
-// next recording or re-diarize regenerates the bundle. Acceptable
-// trade-off for v1; the alternative (chunk-level edit UI) is a much
-// bigger refactor.
+// Edit mode: per-turn (#170), never the whole string. This view renders
+// from the timeline, and `note.transcript` is a projection of it, so a
+// textarea bound to that string wrote the derived copy and orphaned the
+// source: the edit was invisible here (permanently, and across reopens)
+// while summary, chat and embeddings read the edited text. Editing a turn
+// now writes the timeline and the backend re-derives the transcript, the
+// same path the label cycle and the chunk delete already take. The
+// no-timeline reader (`TranscriptEditor`) keeps its whole-transcript
+// textarea — with no timeline there is no second copy to orphan.
 // Exported for unit tests (session-switch seek behaviour, BUG A/B).
 export const TranscriptPlayer = memo(function TranscriptPlayer({
   noteId,
@@ -2139,8 +2142,6 @@ export const TranscriptPlayer = memo(function TranscriptPlayer({
   fallbackPlaybackUrl,
   audioAvailable,
   keepAudio,
-  transcript,
-  onChange,
   disabled,
   fill,
   bottomAligned,
@@ -2161,8 +2162,6 @@ export const TranscriptPlayer = memo(function TranscriptPlayer({
   // explanation — pointing at a setting that is already on would be noise.
   audioAvailable: boolean;
   keepAudio: boolean;
-  transcript: string;
-  onChange: (v: string) => void;
   disabled: boolean;
   fill?: boolean;
   bottomAligned: boolean;
@@ -2257,7 +2256,11 @@ export const TranscriptPlayer = memo(function TranscriptPlayer({
   // overlap: when a new line lights up, the viewport eases toward it
   // without losing the prior line's highlight.
   const [scrollAnchorIdx, setScrollAnchorIdx] = useState(-1);
-  const [editing, setEditing] = useState(false);
+  // Which turn is open for editing (#170), identified by its session and its
+  // first constituent chunk — stable across the re-group that follows a commit,
+  // unlike a group position. `null` is view mode.
+  const [editingKey, setEditingKey] = useState<string | null>(null);
+  const [editText, setEditText] = useState("");
   const taRef = useRef<HTMLTextAreaElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
   // Held in a ref so the rAF tick can read the latest timeline
@@ -2466,22 +2469,28 @@ export const TranscriptPlayer = memo(function TranscriptPlayer({
     };
   }, []);
 
+  // Focus the open turn's textarea and park the cursor at the end. Keyed on
+  // which turn is open, NOT on its text — an `editText` dependency would send
+  // the cursor to the end after every keystroke.
   useEffect(() => {
-    if (!editing || fill) return;
-    const el = taRef.current;
-    if (!el) return;
-    el.style.height = "auto";
-    el.style.height = el.scrollHeight + "px";
-  }, [editing, transcript, fill]);
-
-  useEffect(() => {
-    if (!editing) return;
+    if (!editingKey) return;
     const el = taRef.current;
     if (!el) return;
     el.focus({ preventScroll: true });
     const len = el.value.length;
     el.setSelectionRange(len, len);
-  }, [editing]);
+  }, [editingKey]);
+
+  // Grow the open textarea with its content. Separate from the focus effect
+  // above precisely because this one must re-run on every keystroke: `rows={1}`
+  // plus `resize-none` would otherwise clip a turn the user types past.
+  useEffect(() => {
+    if (!editingKey) return;
+    const el = taRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = el.scrollHeight + "px";
+  }, [editingKey, editText]);
 
   // Seek to a millisecond offset within a given session. When it's the
   // already-loaded session, seek + play inline; otherwise swap the source to
@@ -2592,7 +2601,43 @@ export const TranscriptPlayer = memo(function TranscriptPlayer({
     void ipc.uploadNoteSessions(noteId);
   }
 
-  const showEditor = editing && !disabled;
+  // Rewrite one turn's text (#170). The edit lands in the timeline — the
+  // source the reader renders from — and the backend re-derives
+  // `note.transcript` from every session's timeline, so the two can't drift.
+  // Word timings on this turn are dropped: they describe the words that were
+  // there. The turn's bounds survive, so it still highlights during playback;
+  // only per-word karaoke is lost, on this turn alone.
+  async function commitGroupText(g: TimelineGroup, next: string) {
+    const text = next.trim().replace(/\s+/g, " ");
+    setEditingKey(null);
+    if (!text || text === g.text.trim()) return;
+    const sessionId = timeline[g.indices[0]]?.sessionId;
+    if (sessionId == null) return;
+    const chunkIdxs = g.indices
+      .map((ci) => timeline[ci]?.chunkIdx)
+      .filter((ci): ci is number => ci != null);
+    if (chunkIdxs.length === 0) return;
+    const lowest = Math.min(...g.indices);
+    // Optimistic: mirror exactly what the backend does to the file, so the
+    // reader shows the edit before `transcript_replaced` comes back.
+    setTimeline((tl) =>
+      tl.map((e, i) =>
+        i === lowest
+          ? { ...e, text, words: [] }
+          : g.indices.includes(i)
+            ? { ...e, text: "", words: [] }
+            : e,
+      ),
+    );
+    try {
+      await ipc.noteTimelineSetChunkText(noteId, sessionId, chunkIdxs, text);
+    } catch (err) {
+      console.error("noteTimelineSetChunkText failed", err);
+    }
+    // Push the rewritten session timeline to the workspace (#16), or a
+    // teammate keeps the pre-edit text; Personal notes short-circuit.
+    void ipc.uploadNoteSessions(noteId);
+  }
 
   return (
     <div className={fill ? "flex flex-col min-h-0 flex-1" : undefined}>
@@ -2628,35 +2673,8 @@ export const TranscriptPlayer = memo(function TranscriptPlayer({
               : "Audio not stored on this device."}
           </p>
         )}
-        {!showEditor && !disabled && (
-          <button
-            type="button"
-            onClick={() => setEditing(true)}
-            className="nd-bare text-xs text-[var(--color-text-muted)] underline hover:text-[var(--color-text)] shrink-0"
-          >
-            Edit
-          </button>
-        )}
       </div>
-      {showEditor ? (
-        <textarea
-          ref={taRef}
-          value={transcript}
-          onChange={(e) => onChange(e.target.value)}
-          onBlur={() => setEditing(false)}
-          onKeyDown={(e) => {
-            if (e.key === "Escape") {
-              e.preventDefault();
-              setEditing(false);
-            }
-          }}
-          className={cn(
-            "nd-bare w-full resize-none text-sm leading-relaxed text-[var(--color-text-muted)] focus:outline-none",
-            fill && "flex-1 min-h-0 overflow-y-auto",
-          )}
-        />
-      ) : (
-        <div
+      <div
           ref={scrollRef}
           onScroll={handleScroll}
           className={cn(
@@ -2687,6 +2705,10 @@ export const TranscriptPlayer = memo(function TranscriptPlayer({
             const isActive = g.indices.some((ci) => activeChunkSet.has(ci));
             const color = g.label ? colors.get(g.label) : undefined;
             const cyclable = labelCount >= 2 && !!g.label;
+            // Identity of the turn for edit mode (#170): session + first
+            // constituent chunk, so it survives the re-group after a commit.
+            const groupKey = `${g.sessionId}:${g.indices[0]}`;
+            const isEditingGroup = editingKey === groupKey && !disabled;
             // Map the (chunk idx, word idx within chunk) pair the rAF
             // tick tracks into the flattened position in g.words. Each
             // chunk contributes wordCountByChunk[k] words; sum prior
@@ -2761,7 +2783,30 @@ export const TranscriptPlayer = memo(function TranscriptPlayer({
                     />
                   </div>
                 )}
-                {g.words.length > 0 ? (
+                {isEditingGroup ? (
+                  // Per-turn edit (#170). One textarea over this turn's text,
+                  // committing into the timeline. Enter commits — a turn is one
+                  // transcript line, so a newline inside it has nothing to
+                  // mean. Blur commits too; Escape discards.
+                  <textarea
+                    ref={taRef}
+                    value={editText}
+                    onChange={(e) => setEditText(e.target.value)}
+                    onBlur={() => void commitGroupText(g, editText)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Escape") {
+                        e.preventDefault();
+                        setEditingKey(null);
+                      } else if (e.key === "Enter") {
+                        e.preventDefault();
+                        void commitGroupText(g, editText);
+                      }
+                    }}
+                    rows={1}
+                    aria-label="Edit this turn"
+                    className="flex-1 resize-none text-sm leading-relaxed bg-transparent"
+                  />
+                ) : g.words.length > 0 ? (
                   <div className="flex-1 nd-bare cursor-text leading-relaxed">
                     {g.words.map((w, wi) => {
                       const wordActive = activeFlatIdxs.has(wi);
@@ -2799,7 +2844,35 @@ export const TranscriptPlayer = memo(function TranscriptPlayer({
                     {g.text}
                   </button>
                 )}
-                {!disabled && (
+                {!disabled && !isEditingGroup && (
+                  <button
+                    type="button"
+                    // mousedown with the default prevented, not click: an open
+                    // textarea's blur would otherwise re-render this row out
+                    // from under the click. The cost is that the open turn
+                    // never blurs, so this handler has to commit it — dropping
+                    // it here would silently discard a typed edit.
+                    onMouseDown={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      const open =
+                        editingKey && editingKey !== groupKey
+                          ? groups.find(
+                              (x) => `${x.sessionId}:${x.indices[0]}` === editingKey,
+                            )
+                          : undefined;
+                      if (open) void commitGroupText(open, editText);
+                      setEditText(g.text);
+                      setEditingKey(groupKey);
+                    }}
+                    title="Edit this turn"
+                    aria-label="Edit this turn"
+                    className="nd-bare shrink-0 self-start opacity-0 group-hover:opacity-100 transition-opacity p-0.5 rounded text-[var(--color-text-muted)] hover:text-[var(--color-text)] hover:bg-[var(--color-pill-hover)]"
+                  >
+                    <Pencil size={14} strokeWidth={1.5} />
+                  </button>
+                )}
+                {!disabled && !isEditingGroup && (
                   <button
                     type="button"
                     onClick={(e) => {
@@ -2827,8 +2900,7 @@ export const TranscriptPlayer = memo(function TranscriptPlayer({
           });
           })()}
         </div>
-        </div>
-      )}
+      </div>
     </div>
   );
 });

@@ -85,19 +85,19 @@ function renderPlayer(props: {
   fallbackPlaybackUrl: string | null;
   audioAvailable?: boolean;
   keepAudio?: boolean;
+  disabled?: boolean;
+  setTimeline?: React.Dispatch<React.SetStateAction<TimelineEntry[]>>;
 }) {
   return render(
     <TranscriptPlayer
       noteId="note-1"
       timeline={props.timeline}
-      setTimeline={vi.fn()}
+      setTimeline={props.setTimeline ?? vi.fn()}
       sessions={props.sessions}
       fallbackPlaybackUrl={props.fallbackPlaybackUrl}
       audioAvailable={props.audioAvailable ?? true}
       keepAudio={props.keepAudio ?? true}
-      transcript="hello world"
-      onChange={vi.fn()}
-      disabled={false}
+      disabled={props.disabled ?? false}
       bottomAligned={false}
     />,
   );
@@ -218,5 +218,211 @@ describe("TranscriptPlayer without audio (#24)", () => {
     expect(
       screen.queryByText(/audio not stored on this device/i),
     ).not.toBeInTheDocument();
+  });
+});
+
+// #170: a free-text edit used to write `note.transcript` directly and touch no
+// timeline, so on a timeline-backed note the edit was invisible in the styled
+// reader (which renders from the timeline) while summary, chat and embeddings
+// read the edited string. Editing is now per-turn and lands in the timeline;
+// the transcript is re-derived from it by the backend.
+describe("TranscriptPlayer per-turn editing (#170)", () => {
+  const calls: { cmd: string; args: unknown }[] = [];
+
+  beforeEach(() => {
+    calls.length = 0;
+    const record = (cmd: string) => (args: unknown) => {
+      calls.push({ cmd, args });
+      return null;
+    };
+    mockTauri({
+      note_session_playback_path: () => null,
+      note_timeline_set_chunk_text: record("note_timeline_set_chunk_text"),
+      cloud_upload_note_sessions: record("cloud_upload_note_sessions"),
+    });
+  });
+
+  // One rendered turn spanning two timeline entries — the case a
+  // single-index command would have forced into two non-atomic calls.
+  const turn = [
+    entry({
+      sessionId: "s1",
+      sessionIndex: 0,
+      label: "Michael",
+      text: "so where did we",
+      start_ms: 0,
+      end_ms: 1000,
+      chunkIdx: 0,
+      words: [{ text: "so", start_ms: 0, end_ms: 1000 }],
+    }),
+    entry({
+      sessionId: "s1",
+      sessionIndex: 0,
+      label: "Michael",
+      text: "land on the freeze",
+      start_ms: 1000,
+      end_ms: 2000,
+      chunkIdx: 1,
+      words: [{ text: "land", start_ms: 1000, end_ms: 2000 }],
+    }),
+  ];
+
+  async function openTurnEditor() {
+    const edit = await screen.findByRole("button", { name: /edit this turn/i });
+    // mouseDown, not click: the affordance opens on mousedown so an already-open
+    // textarea's blur can't re-render the row out from under the gesture.
+    fireEvent.mouseDown(edit);
+    return screen.getByRole("textbox") as HTMLTextAreaElement;
+  }
+
+  it("sends the whole turn's chunk indices in one call and re-uploads the timeline", async () => {
+    const setTimeline = vi.fn();
+    renderPlayer({
+      sessions: [session({ id: "s1", hasPlayback: false })],
+      timeline: turn,
+      fallbackPlaybackUrl: null,
+      audioAvailable: false,
+      setTimeline,
+    });
+
+    const ta = await openTurnEditor();
+    fireEvent.change(ta, { target: { value: "so where did we land on the freeze?" } });
+    fireEvent.blur(ta);
+
+    await waitFor(() =>
+      expect(calls.filter((c) => c.cmd === "note_timeline_set_chunk_text")).toHaveLength(1),
+    );
+    const call = calls.find((c) => c.cmd === "note_timeline_set_chunk_text")!;
+    expect(call.args).toMatchObject({
+      noteId: "note-1",
+      sessionId: "s1",
+      chunkIdxs: [0, 1],
+      newText: "so where did we land on the freeze?",
+    });
+    // The optimistic local update keeps the reader showing the edit before
+    // `transcript_replaced` lands.
+    expect(setTimeline).toHaveBeenCalled();
+    // A workspace note's rewritten timeline is pushed; Personal short-circuits
+    // in the backend.
+    await waitFor(() =>
+      expect(calls.some((c) => c.cmd === "cloud_upload_note_sessions")).toBe(true),
+    );
+  });
+
+  it("enter commits, since a turn is one transcript line", async () => {
+    renderPlayer({
+      sessions: [session({ id: "s1", hasPlayback: false })],
+      timeline: turn,
+      fallbackPlaybackUrl: null,
+      audioAvailable: false,
+    });
+
+    const ta = await openTurnEditor();
+    fireEvent.change(ta, { target: { value: "committed by enter" } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+
+    await waitFor(() =>
+      expect(
+        calls.find((c) => c.cmd === "note_timeline_set_chunk_text")?.args,
+      ).toMatchObject({ newText: "committed by enter" }),
+    );
+    expect(screen.queryByRole("textbox")).toBeNull();
+  });
+
+  it("opening another turn commits the one already open", async () => {
+    // The pencil opens on mousedown with the default prevented, so the open
+    // turn never blurs — without an explicit commit the typed edit would be
+    // silently dropped when its textarea unmounts.
+    renderPlayer({
+      sessions: [session({ id: "s1", hasPlayback: false })],
+      timeline: [
+        ...turn,
+        entry({
+          sessionId: "s1",
+          sessionIndex: 0,
+          label: "Hege",
+          text: "next Friday",
+          start_ms: 2000,
+          end_ms: 3000,
+          chunkIdx: 2,
+        }),
+      ],
+      fallbackPlaybackUrl: null,
+      audioAvailable: false,
+    });
+
+    const pencils = await screen.findAllByRole("button", { name: /edit this turn/i });
+    fireEvent.mouseDown(pencils[0]);
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "typed but not blurred" } });
+    // The open turn hides its own pencil, so what's left is the other turn's.
+    const remaining = screen.getAllByRole("button", { name: /edit this turn/i });
+    expect(remaining).toHaveLength(1);
+    fireEvent.mouseDown(remaining[0]);
+
+    await waitFor(() =>
+      expect(
+        calls.find((c) => c.cmd === "note_timeline_set_chunk_text")?.args,
+      ).toMatchObject({ chunkIdxs: [0, 1], newText: "typed but not blurred" }),
+    );
+    // …and the second turn is now the one open.
+    expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe("next Friday");
+  });
+
+  it("escape cancels without writing anything", async () => {
+    renderPlayer({
+      sessions: [session({ id: "s1", hasPlayback: false })],
+      timeline: turn,
+      fallbackPlaybackUrl: null,
+      audioAvailable: false,
+    });
+
+    const ta = await openTurnEditor();
+    fireEvent.change(ta, { target: { value: "discarded" } });
+    fireEvent.keyDown(ta, { key: "Escape" });
+
+    expect(screen.queryByRole("textbox")).toBeNull();
+    expect(calls.some((c) => c.cmd === "note_timeline_set_chunk_text")).toBe(false);
+  });
+
+  it("an unchanged turn writes nothing", async () => {
+    renderPlayer({
+      sessions: [session({ id: "s1", hasPlayback: false })],
+      timeline: turn,
+      fallbackPlaybackUrl: null,
+      audioAvailable: false,
+    });
+
+    const ta = await openTurnEditor();
+    expect(ta.value).toBe("so where did we land on the freeze");
+    fireEvent.blur(ta);
+    expect(calls.some((c) => c.cmd === "note_timeline_set_chunk_text")).toBe(false);
+  });
+
+  it("offers no editing while a recording is in flight", async () => {
+    renderPlayer({
+      sessions: [session({ id: "s1", hasPlayback: false })],
+      timeline: turn,
+      fallbackPlaybackUrl: null,
+      audioAvailable: false,
+      disabled: true,
+    });
+
+    // The turn still reads (its words render as click-to-seek spans).
+    expect(await screen.findByText("so")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /edit this turn/i })).toBeNull();
+  });
+
+  it("no longer offers a whole-transcript textarea", async () => {
+    renderPlayer({
+      sessions: [session({ id: "s1", hasPlayback: false })],
+      timeline: turn,
+      fallbackPlaybackUrl: null,
+      audioAvailable: false,
+    });
+
+    expect(await screen.findByText("so")).toBeInTheDocument();
+    // The panel-wide `Edit` affordance is gone — it wrote the derived copy.
+    expect(screen.queryByRole("button", { name: /^edit$/i })).toBeNull();
+    expect(screen.queryByRole("textbox")).toBeNull();
   });
 });

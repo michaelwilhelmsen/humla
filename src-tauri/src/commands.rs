@@ -897,6 +897,96 @@ pub fn note_timeline_set_chunk_label(
     commit_rebuilt_transcript(&app, &note_id, transcript)
 }
 
+/// Rewrite the text of one rendered *turn* — a run of same-label entries the
+/// reader merged into a single paragraph — inside a session's parsed timeline
+/// values.
+///
+/// The replacement lands in the lowest index and every other entry in the run
+/// is emptied; `group_values_to_transcript` skips empty-text entries, so the
+/// turn re-derives as one line with no blank where the tail entries were. The
+/// entries are kept rather than removed because a chunk index *is* a line
+/// position: dropping one would misroute the next label cycle or delete.
+///
+/// Word timings are dropped on every entry in the run — they describe the text
+/// that was there, and a stale word→time mapping is worse than none. Entry
+/// bounds stay, so the turn still highlights as playback passes it; only
+/// per-word karaoke is lost, on that turn alone.
+///
+/// Bounds are checked before any write, so a bad index can't leave a
+/// multi-entry turn half-rewritten.
+fn apply_group_text(
+    entries: &mut [serde_json::Value],
+    chunk_idxs: &[usize],
+    new_text: &str,
+) -> Result<(), String> {
+    if chunk_idxs.is_empty() {
+        return Err("no chunk indices given".to_string());
+    }
+    for &idx in chunk_idxs {
+        if idx >= entries.len() {
+            return Err(format!(
+                "chunk_idx {idx} out of bounds (timeline has {} entries)",
+                entries.len()
+            ));
+        }
+        // Assigning a key into a non-object `Value` panics, and a panic in a
+        // command takes the app with it. A timeline line that parsed as valid
+        // JSON but isn't an object is malformed either way — fail it here.
+        if !entries[idx].is_object() {
+            return Err(format!("timeline entry {idx} is not an object"));
+        }
+    }
+    // One transcript line per turn: a newline typed into the textarea would
+    // otherwise produce text no timeline entry accounts for.
+    let text = new_text.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    let mut sorted: Vec<usize> = chunk_idxs.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    for (n, &idx) in sorted.iter().enumerate() {
+        entries[idx]["text"] = serde_json::Value::String(if n == 0 {
+            text.clone()
+        } else {
+            String::new()
+        });
+        entries[idx]["words"] = serde_json::Value::Array(Vec::new());
+    }
+    Ok(())
+}
+
+/// Replace the text of one turn in a session's timeline, then rebuild
+/// `note.transcript` across all sessions from the result — so the transcript
+/// stays a projection of the timeline and a free-text edit can no longer
+/// orphan it (#170).
+///
+/// `chunk_idxs` is the full run of entries the reader merged into that turn
+/// (`TimelineGroup.indices`), so a multi-entry turn is one atomic call that
+/// re-derives the transcript once.
+#[tauri::command]
+pub fn note_timeline_set_chunk_text(
+    app: AppHandle,
+    note_id: String,
+    session_id: String,
+    chunk_idxs: Vec<usize>,
+    new_text: String,
+) -> Result<(), String> {
+    let app_dir = app.path().app_data_dir().map_err(err)?;
+    let recordings = sessions::recordings_dir(&app_dir, &note_id);
+    let Some(dir) = sessions::resolve_session_dir(&recordings, &session_id) else {
+        return Err("no timeline for this session".to_string());
+    };
+    let path = dir.join("timeline.jsonl");
+    if !path.exists() {
+        return Err("no timeline for this note".to_string());
+    }
+    let mut entries = read_timeline_values(&path);
+    apply_group_text(&mut entries, &chunk_idxs, &new_text)?;
+    write_timeline_values(&path, &entries)?;
+
+    let transcript = rebuild_note_transcript(&app, &note_id)?;
+    commit_rebuilt_transcript(&app, &note_id, transcript)
+}
+
 /// Drop a single chunk from a session's timeline by index, then rebuild
 /// `note.transcript` across all sessions from what's left. Used when the user
 /// clicks the per-row × in the player view to remove an off-topic chunk.
@@ -7316,6 +7406,142 @@ mod diarize_tests {
                  show it and a rebuild would delete it: {words:?}",
             );
         }
+    }
+
+    // ---- Per-turn transcript editing (#170) -----------------------------
+
+    /// A timeline line as it sits on disk: bounds, label, text, word timings.
+    fn tl(start_ms: u64, end_ms: u64, label: &str, text: &str) -> serde_json::Value {
+        let words: Vec<serde_json::Value> = text
+            .split_whitespace()
+            .enumerate()
+            .map(|(i, w)| {
+                serde_json::json!({
+                    "text": w,
+                    "start_ms": start_ms + i as u64 * 100,
+                    "end_ms": start_ms + i as u64 * 100 + 100,
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "start_ms": start_ms,
+            "end_ms": end_ms,
+            "label": label,
+            "text": text,
+            "words": words,
+        })
+    }
+
+    fn text_of(v: &serde_json::Value) -> &str {
+        v.get("text").and_then(|t| t.as_str()).unwrap_or("")
+    }
+
+    fn word_count(v: &serde_json::Value) -> usize {
+        v.get("words").and_then(|w| w.as_array()).map_or(0, |a| a.len())
+    }
+
+    #[test]
+    fn apply_group_text_writes_the_lowest_index_and_clears_the_rest() {
+        // A rendered turn is a run of same-label entries; the edit is one call
+        // over all of them. The replacement lands in the first, the others go
+        // empty so the transcript builder skips them — the same mechanism a
+        // chunk delete relies on, and what keeps the rebuilt transcript free of
+        // a blank line where the tail entries were.
+        let mut entries = vec![
+            tl(0, 1_000, "Michael", "so where did we"),
+            tl(1_000, 2_000, "Michael", "land on the freeze"),
+            tl(2_000, 3_000, "Hege", "next Friday"),
+        ];
+        apply_group_text(&mut entries, &[0, 1], "so where did we land on the freeze?").unwrap();
+
+        assert_eq!(text_of(&entries[0]), "so where did we land on the freeze?");
+        assert_eq!(text_of(&entries[1]), "");
+        assert_eq!(text_of(&entries[2]), "next Friday");
+        // Entry count is untouched: chunk indices are line positions, and a
+        // shifted index would misroute the next label cycle or delete.
+        assert_eq!(entries.len(), 3);
+    }
+
+    #[test]
+    fn apply_group_text_drops_word_timings_but_keeps_bounds() {
+        // The old word timings no longer describe the new text, and a stale
+        // mapping is worse than none. The entry bounds stay, so the turn still
+        // highlights as playback passes it — only per-word karaoke is lost.
+        let mut entries = vec![
+            tl(0, 1_000, "Michael", "so where did we"),
+            tl(1_000, 2_500, "Michael", "land on the freeze"),
+        ];
+        apply_group_text(&mut entries, &[0, 1], "rewritten").unwrap();
+
+        assert_eq!(word_count(&entries[0]), 0);
+        assert_eq!(word_count(&entries[1]), 0);
+        assert_eq!(entries[0]["start_ms"], 0);
+        assert_eq!(entries[0]["end_ms"], 1_000);
+        assert_eq!(entries[1]["start_ms"], 1_000);
+        assert_eq!(entries[1]["end_ms"], 2_500);
+        // Labels are #170-out-of-scope: editing text never reassigns a speaker.
+        assert_eq!(entries[0]["label"], "Michael");
+        assert_eq!(entries[1]["label"], "Michael");
+    }
+
+    #[test]
+    fn apply_group_text_rejects_out_of_bounds_without_mutating() {
+        let mut entries = vec![tl(0, 1_000, "Michael", "original")];
+        let err = apply_group_text(&mut entries, &[0, 4], "rewritten").unwrap_err();
+        assert!(err.contains("out of bounds"), "unexpected error: {err}");
+        // Bounds are checked before any write, so a bad index in a multi-entry
+        // group can't leave the turn half-rewritten.
+        assert_eq!(text_of(&entries[0]), "original");
+        assert_eq!(word_count(&entries[0]), 1);
+    }
+
+    #[test]
+    fn apply_group_text_rejects_a_non_object_entry() {
+        // `read_timeline_values` keeps any line that parses as JSON, so a
+        // malformed timeline can hold a bare array. Assigning a key into one
+        // panics, and a panic in a command takes the app down.
+        let mut entries = vec![serde_json::json!(["not", "an", "object"])];
+        assert!(apply_group_text(&mut entries, &[0], "rewritten").is_err());
+    }
+
+    #[test]
+    fn apply_group_text_rejects_an_empty_index_list() {
+        let mut entries = vec![tl(0, 1_000, "Michael", "original")];
+        assert!(apply_group_text(&mut entries, &[], "rewritten").is_err());
+        assert_eq!(text_of(&entries[0]), "original");
+    }
+
+    #[test]
+    fn transcript_rederived_after_an_edit_matches_the_timeline() {
+        // The acceptance criterion: after an edit, the derived transcript is
+        // exactly what re-deriving from the timeline produces — so a later
+        // label cycle, delete, re-diarize or unify neither resurrects the
+        // pre-edit text nor discards the edit. And no blank line survives
+        // where the emptied tail entries sit.
+        let mut entries = vec![
+            tl(0, 1_000, "Michael", "so where did we"),
+            tl(1_000, 2_000, "Michael", "land on the freeze"),
+            tl(2_000, 3_000, "Hege", "next Friday"),
+        ];
+        apply_group_text(&mut entries, &[0, 1], "so where did we land on the freeze?").unwrap();
+
+        assert_eq!(
+            group_values_to_transcript(&entries),
+            "Michael: so where did we land on the freeze?\nHege: next Friday"
+        );
+    }
+
+    #[test]
+    fn apply_group_text_trims_and_collapses_the_replacement() {
+        let mut entries = vec![tl(0, 1_000, "Michael", "original")];
+        apply_group_text(&mut entries, &[0], "  padded on both sides \n").unwrap();
+        assert_eq!(text_of(&entries[0]), "padded on both sides");
+
+        // A newline typed into the turn's textarea would otherwise become a
+        // transcript line the timeline has no entry for — the very drift #170
+        // closes. Fold it into a space.
+        apply_group_text(&mut entries, &[0], "first line\nsecond line").unwrap();
+        assert_eq!(text_of(&entries[0]), "first line second line");
     }
 
     // ---- Per-session (#16) label offset + timeline plumbing -------------
