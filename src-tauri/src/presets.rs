@@ -11,8 +11,13 @@ pub fn prompt(preset: &str, lang: &str) -> String {
     if lang == "no" {
         entry.no.to_string()
     } else {
+        // Issue #167: "the input" includes this prompt's own Norwegian
+        // labels and, when the user typed nothing, the Norwegian `(ingen)`
+        // placeholder — so on `auto` the only language cue in reach was
+        // Norwegian. The transcript is the one block that carries the
+        // meeting's actual language.
         let label = if lang == "auto" {
-            "the same language as the input"
+            "the same language as the transcript"
         } else {
             languages::english_name(lang)
         };
@@ -69,3 +74,29 @@ const ALL: &[Preset] = &[
         en: "You clean up a voice memo from [Notater] (user-written) and [Transkripsjon] (auto). Preserve the user's voice. Reply in {LANGUAGE} using Markdown.",
     },
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Issue #167 — "the input" is ambiguous when the notes are empty, and
+    // the Norwegian block labels are part of "the input" too. Name the one
+    // block that actually carries the meeting's language.
+    #[test]
+    fn auto_points_every_preset_at_the_transcript() {
+        for p in ALL {
+            let out = prompt(p.value, "auto");
+            assert!(
+                out.contains("the same language as the transcript"),
+                "{}: {out}",
+                p.value
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_language_substitutes_its_english_name() {
+        assert!(prompt("meeting", "en").contains("Reply in English"));
+        assert!(prompt("meeting", "no").contains("Skriv på norsk"));
+    }
+}

@@ -259,7 +259,16 @@ fn language_directive(lang: &str) -> String {
         "no" => "VIKTIG: Skriv hele svaret på norsk.".to_string(),
         "sv" => "VIKTIGT: Skriv hela svaret på svenska.".to_string(),
         "da" => "VIGTIGT: Skriv hele svaret på dansk.".to_string(),
-        "auto" => "Respond in the same language as the user's notes.".to_string(),
+        // Issue #167: this used to say "the user's notes", which with an
+        // empty body resolves to the Norwegian `(ingen)` literal — every
+        // language cue the model could see was Norwegian, so an English
+        // meeting came back in Norwegian. Anchor on the transcript, and
+        // say out loud that the Norwegian frame isn't the target.
+        "auto" => {
+            "Respond in the same language as the transcript block, not the language of these \
+             instructions or labels."
+                .to_string()
+        }
         other => format!(
             "IMPORTANT: Write the entire response in {}.",
             languages::english_name(other)
@@ -312,5 +321,33 @@ mod tests {
             resolve_prompt(&conn, &note, "no"),
             presets::prompt("meeting", "no")
         );
+    }
+
+    // Issue #167. On `auto` the directive is the only thing telling the
+    // model where to look, and the whole prompt frame around it — labels,
+    // the `(ingen)` empty-notes literal — is Norwegian. Pointing it at the
+    // notes meant an English meeting with no typed notes had exactly one
+    // language cue in reach, and it was Norwegian. Pin the target so a
+    // future reword can't quietly drift back.
+    #[test]
+    fn auto_directive_anchors_on_the_transcript_not_the_notes() {
+        let d = language_directive("auto");
+        assert!(d.contains("transcript"), "{d}");
+        assert!(!d.contains("notes"), "{d}");
+    }
+
+    #[test]
+    fn auto_directive_disowns_the_surrounding_scaffolding() {
+        // The labels and instructions are Norwegian; without this clause the
+        // model is free to read the frame as the target.
+        let d = language_directive("auto");
+        assert!(d.contains("instructions"), "{d}");
+        assert!(d.contains("labels"), "{d}");
+    }
+
+    #[test]
+    fn explicit_languages_still_get_their_hard_directive() {
+        assert!(language_directive("no").contains("norsk"));
+        assert!(language_directive("en").contains("English"));
     }
 }
