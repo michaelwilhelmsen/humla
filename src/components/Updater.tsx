@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { check, type Update } from "@tauri-apps/plugin-updater";
-import { relaunch } from "@tauri-apps/plugin-process";
+import { ipc } from "../lib/ipc";
 
 type Phase =
   | { kind: "idle" }
@@ -63,7 +63,10 @@ export function Updater() {
           setPhase({ kind: "installing" });
         }
       });
-      await relaunch();
+      // Spawns the freshly-installed bundle and hard-exits this process. The
+      // plugin's `relaunch()` used to sit here and only ever did the exit half
+      // — see the note on `relaunchApp` in lib/ipc.ts.
+      await ipc.relaunchApp();
     } catch (e) {
       setPhase({ kind: "error", message: String(e) });
     }
