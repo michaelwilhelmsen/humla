@@ -370,6 +370,12 @@ export const ipc = {
   // waits on the network.
   speakerDefaultName: (cloudName: string | null) =>
     invoke<string | null>("speaker_default_name", { cloudName }),
+  // Restart the app. NOT `relaunch()` from @tauri-apps/plugin-process: Tauri
+  // re-execs only after the `RunEvent::Exit` callback returns, and ours never
+  // returns (it `_exit(0)`s past whisper.cpp's GGML Metal destructor), so the
+  // plugin's relaunch closed the app without ever bringing it back. The Rust
+  // side spawns the replacement first. Never resolves — the process is gone.
+  relaunchApp: () => invoke<void>("app_relaunch"),
   noteTimeline: (noteId: string) =>
     invoke<TimelineEntry[]>("note_timeline", { noteId }),
   // Repair transcript text no session timeline accounts for (#169), and report

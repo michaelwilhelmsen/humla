@@ -389,6 +389,7 @@ where
             commands::permissions_status,
             commands::permissions_request,
             commands::permissions_open_settings,
+            app_relaunch,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri app")
@@ -409,6 +410,40 @@ where
                 unsafe { libc::_exit(0) };
             }
         });
+}
+
+/// Start a fresh copy of ourselves, then hard-exit this one.
+///
+/// This exists because `tauri_plugin_process::relaunch` (and `AppHandle::restart`,
+/// which it calls) cannot work in this app: Tauri performs the re-exec *after*
+/// the `RunEvent::Exit` callback returns, and ours never returns — it `_exit(0)`s
+/// to skip whisper.cpp's GGML Metal static destructor (see the note in `run()`).
+/// So `relaunch()` set the restart flag, asked the loop to exit, and the process
+/// died before Tauri reached the spawn: every update and every onboarding
+/// "Restart" merely closed the app. Doing the spawn ourselves, first, keeps the
+/// ordering in our hands.
+///
+/// The path is deliberately re-read at call time rather than captured at launch:
+/// on an update the bundle at this path has just been deleted and replaced by
+/// the updater, so this resolves to the *new* binary — which is the point.
+/// Nothing verifies the child came up. If the exec fails there is no UI left to
+/// report it to, and the user is no worse off than with the silent close this
+/// replaces.
+#[tauri::command]
+fn app_relaunch() {
+    match std::env::current_exe() {
+        Ok(exe) => {
+            if let Err(e) = std::process::Command::new(&exe).spawn() {
+                eprintln!("[relaunch] failed to spawn {}: {e}", exe.display());
+            }
+        }
+        Err(e) => eprintln!("[relaunch] current_exe failed: {e}"),
+    }
+    // Same reasoning as the `RunEvent::Exit` handler in `run()` — and the same
+    // trade-off it already makes: this skips `cleanup_before_exit`, so anything
+    // still sitting in the frontend's debounced save is lost, exactly as it is
+    // on Cmd+Q today.
+    unsafe { libc::_exit(0) };
 }
 
 fn build_menu(app: &tauri::AppHandle) -> tauri::Result<Menu<tauri::Wry>> {

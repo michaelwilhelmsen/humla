@@ -17,11 +17,12 @@
 // running, a restart is required. Already-granted-at-mount → no restart. The
 // wizard owns this: it persists the resume cursor (belt-and-suspenders on top
 // of the shell's own write-through) then offers a Restart Humla button that
-// relaunches via the Tauri process plugin. The resume machinery lands the user
-// back on this step showing the granted state.
+// relaunches via `ipc.relaunchApp` — NOT the Tauri process plugin, whose
+// relaunch closes this app without bringing it back (see the note on
+// `relaunchApp` in lib/ipc.ts). The resume machinery lands the user back on
+// this step showing the granted state.
 import { useEffect, useRef, useState } from "react";
 import { ShieldCheck, Mic, MonitorSpeaker, RotateCw, ArrowRight } from "lucide-react";
-import { relaunch } from "@tauri-apps/plugin-process";
 import { ipc, type PermissionStatus, type PermissionsStatus } from "../../../lib/ipc";
 import type { StepContext } from "../types";
 import { StepShell } from "../StepShell";
@@ -156,7 +157,7 @@ export function PermissionsStep({ ctx }: { ctx: StepContext }) {
 
   async function doRestart() {
     try {
-      await relaunch();
+      await ipc.relaunchApp();
     } catch (e) {
       console.warn("[onboarding] relaunch failed:", e);
     }
