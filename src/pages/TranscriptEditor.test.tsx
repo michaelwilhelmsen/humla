@@ -1,0 +1,118 @@
+import { describe, it, expect, beforeAll, vi } from "vitest";
+import { render, screen, fireEvent } from "@testing-library/react";
+import { TranscriptEditor } from "./Note";
+
+// TranscriptView virtualizes its lines via @tanstack/react-virtual. jsdom pins
+// offsetWidth/offsetHeight to 0, so with a zero-height scroll window the
+// virtualizer renders no rows at all and there is no transcript to click.
+// (The ResizeObserver the virtualizer also needs is already shimmed globally
+// in src/test/setup.ts.)
+beforeAll(() => {
+  Object.defineProperty(window.HTMLElement.prototype, "offsetHeight", {
+    configurable: true,
+    get() {
+      return 600;
+    },
+  });
+  Object.defineProperty(window.HTMLElement.prototype, "offsetWidth", {
+    configurable: true,
+    get() {
+      return 400;
+    },
+  });
+});
+
+function renderEditor(over?: { disabled?: boolean; onChange?: (v: string) => void }) {
+  return render(
+    <TranscriptEditor
+      value={"Speaker 1: hello\nSpeaker 2: world"}
+      onChange={over?.onChange ?? vi.fn()}
+      disabled={over?.disabled ?? false}
+      bottomAligned={false}
+    />,
+  );
+}
+
+const textarea = () => screen.queryByRole("textbox");
+
+describe("TranscriptEditor edit mode (#168)", () => {
+  it("shows an explicit Edit control in view mode and enters edit mode from it", () => {
+    renderEditor();
+    expect(textarea()).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+
+    expect(textarea()).not.toBeNull();
+  });
+
+  it("swaps the header for an Editing indicator and a Done control", () => {
+    renderEditor();
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+
+    expect(screen.getByText("Editing")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Done" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Edit" })).toBeNull();
+  });
+
+  it("leaves edit mode when Done is clicked", () => {
+    renderEditor();
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+
+    fireEvent.click(screen.getByRole("button", { name: "Done" }));
+
+    expect(textarea()).toBeNull();
+    expect(screen.getByRole("button", { name: "Edit" })).toBeTruthy();
+  });
+
+  it("prevents the default mousedown on Done so blur can't unmount it first", () => {
+    // onBlur exits edit mode, and blur fires before the click would land — so
+    // without preventDefault the Done button is gone by the time it is clicked.
+    renderEditor();
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+
+    const notPrevented = fireEvent.mouseDown(screen.getByRole("button", { name: "Done" }));
+
+    expect(notPrevented).toBe(false);
+  });
+
+  it("gives the textarea a visible border while editing", () => {
+    renderEditor();
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+
+    // The border comes from the unlayered `textarea` rule in globals.css
+    // (1px border + a focus border-colour shift). `.nd-bare` strips it with
+    // `border: none !important` and beats any Tailwind utility, so keeping
+    // that class off is the whole of the fix — jsdom loads no CSS, so the
+    // absence of the opt-out is what's assertable here.
+    const el = textarea() as HTMLTextAreaElement;
+    expect(el.className).not.toContain("nd-bare");
+    expect(el.className).not.toContain("focus:outline-none");
+  });
+
+  it("keeps Escape as a shortcut out of edit mode", () => {
+    renderEditor();
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+
+    fireEvent.keyDown(textarea() as HTMLTextAreaElement, { key: "Escape" });
+
+    expect(textarea()).toBeNull();
+  });
+
+  it("keeps click-to-edit on the transcript body", () => {
+    renderEditor();
+
+    fireEvent.click(screen.getByText("hello"));
+
+    expect(textarea()).not.toBeNull();
+  });
+
+  // `disabled` covers both a recording in flight and a teammate's read-only
+  // note — neither has a mode to enter, so neither gets the affordance.
+  it("offers no edit affordance when editing is disabled", () => {
+    renderEditor({ disabled: true });
+
+    expect(screen.queryByRole("button", { name: "Edit" })).toBeNull();
+    fireEvent.click(screen.getByText("hello"));
+    expect(textarea()).toBeNull();
+  });
+});
