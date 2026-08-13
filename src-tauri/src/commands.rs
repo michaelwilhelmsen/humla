@@ -7251,6 +7251,73 @@ mod diarize_tests {
         );
     }
 
+    /// Issue #169: the transcript and the timeline are written from the same
+    /// post-stop pass, but only the transcript gets the prior-take snapshot
+    /// prepended — `serialize_timeline` sees this session's chunks alone. So a
+    /// snapshot that no *earlier session's* timeline accounts for is text that
+    /// exists in `note.transcript` and in no timeline at all. The styled reader
+    /// renders from the merged timelines, so that text is invisible while the
+    /// edit textarea (bound to the raw string) shows it — and any later
+    /// `rebuild_note_transcript` (cycle a chunk label, delete a chunk,
+    /// re-diarize, unify) rewrites the transcript to the timeline projection
+    /// and deletes it outright.
+    ///
+    /// A note reaches that state when a recording lands text but writes no
+    /// session assets — the diarize-model-missing early return is the route we
+    /// have evidence for — and a later take on the same note becomes the only
+    /// session with a timeline.
+    ///
+    /// Ignored because it asserts the invariant we *want*, and it fails today.
+    /// Remove the `#[ignore]` as part of the fix; do not weaken the assertion.
+    #[test]
+    #[ignore = "#169: reproduces the orphaned-snapshot gap; un-ignore when fixed"]
+    fn orphaned_snapshot_text_survives_in_the_timeline() {
+        // Take 1 left this behind: live-appended text, unlabelled, because the
+        // pass that would have labelled it (and written its timeline) returned
+        // early when the diarize model was missing.
+        let snapshot = "we kicked off by agreeing the deadline slips a week";
+
+        // Take 2, diarized normally: its own chunks, its own timeline.
+        let chunks = vec![
+            sys(30, "so where did we land on the freeze."),
+            mic(4_000, "pushing it to the following Friday."),
+        ];
+        let labeller = |c: &ChunkRecord| match c.source {
+            ChunkSource::Mic => Some("You".to_string()),
+            ChunkSource::Sys => Some("Speaker 1".to_string()),
+        };
+        let split = whole_chunk_pieces(labeller);
+
+        let combined = combine_with_snapshot(&snapshot, &build_labelled_transcript(&chunks, &split));
+        let timeline = serialize_timeline(&chunks, &split, session_speaker_offset(snapshot));
+
+        // What the reader can actually show: every text the merged timeline
+        // carries. Anything in the transcript but absent here is unreachable.
+        let shown: String = timeline
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| {
+                serde_json::from_str::<serde_json::Value>(l)
+                    .ok()?
+                    .get("text")?
+                    .as_str()
+                    .map(|s| s.to_string())
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        for line in combined.lines().filter(|l| !l.trim().is_empty()) {
+            // Strip any "Label: " prefix — the reader draws identity as a dot
+            // rather than text, so only the words themselves must be reachable.
+            let words = line.split_once(": ").map_or(line, |(_, rest)| rest);
+            assert!(
+                shown.contains(words),
+                "transcript line is in no timeline entry, so the reader cannot \
+                 show it and a rebuild would delete it: {words:?}",
+            );
+        }
+    }
+
     // ---- Per-session (#16) label offset + timeline plumbing -------------
 
     #[test]
