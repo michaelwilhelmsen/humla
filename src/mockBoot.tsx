@@ -10,8 +10,9 @@
 // review, so scenarios from past reviews stay runnable as the harness moves on
 // to the next step.
 import ReactDOM from "react-dom/client";
-import { StrictMode } from "react";
+import { StrictMode, useState } from "react";
 import { mockIPC } from "@tauri-apps/api/mocks";
+import { TranscriptEditor } from "./pages/Note";
 import { SummaryStep } from "./pages/onboarding/steps/Summary";
 import { TranscriptionStep } from "./pages/onboarding/steps/Transcription";
 import { STEP_ORDER, type StepContext, type StepId } from "./pages/onboarding/types";
@@ -28,8 +29,14 @@ type Handler = (args: unknown) => unknown;
 // `*Case` builder, not extending a union and every switch on it. The wizard
 // position is derived from STEP_ORDER rather than written down, so a step
 // moving in the real wizard can't leave the harness claiming the old slot.
+// `step` is what the onboarding wrapper needs; a scenario for a component that
+// isn't a wizard step leaves it off. `wrap` is the container the scenario is
+// rendered into — a function rather than a named variant, so a new kind of
+// scenario is still one more builder and never a union with a switch on it
+// (see the file header).
 type Scenario = {
-  step: StepId;
+  step?: StepId;
+  wrap?: (node: React.ReactNode) => React.ReactNode;
   render: (ctx: StepContext) => React.ReactNode;
   ipc: Record<string, Handler>;
 };
@@ -84,6 +91,40 @@ function resumeCase(
   };
 }
 
+// ---- #168 axis: the free-text transcript editor's mode header --------------
+// The panel wrapper mirrors the real Transcript tab (Note.tsx: the
+// `flex-1 min-h-0 flex flex-col px-4 py-4` column inside the right context
+// panel) — the editor sizes itself against that column, so a plain block
+// wrapper would collapse it and read as a layout bug in the component.
+function transcriptCase(disabled: boolean): Scenario {
+  return {
+    wrap: (node) => (
+      <div className="flex-1 min-h-0 flex justify-center px-6 py-8">
+        <div className="w-full max-w-[420px] rounded-[var(--radius-card)] bg-[var(--color-surface)] flex flex-col min-h-0 px-4 py-4">
+          {node}
+        </div>
+      </div>
+    ),
+    render: () => <TranscriptEditorHarness disabled={disabled} />,
+    ipc: {},
+  };
+}
+
+function TranscriptEditorHarness({ disabled }: { disabled: boolean }) {
+  const [text, setText] = useState(
+    "Michael: Skal vi ta gjennomgangen nå?\nHege: Ja, jeg har notatene klare.\nMichael: Bra — da starter vi med tallene fra forrige kvartal.",
+  );
+  return (
+    <TranscriptEditor
+      value={text}
+      onChange={setText}
+      disabled={disabled}
+      fill
+      bottomAligned={false}
+    />
+  );
+}
+
 const CASES: Record<string, Scenario> = {
   // --- #147: the issue's exact report — recommended model already pulled.
   recommended: summaryCase(["gemma4:12b-mlx", "embeddinggemma"]),
@@ -117,6 +158,11 @@ const CASES: Record<string, Scenario> = {
   }),
   // No config at all.
   "resume-none": resumeCase(null),
+
+  // --- #168: the free-text transcript editor (notes with no timeline).
+  transcript: transcriptCase(false),
+  // Recording in flight — no mode to enter, so the header slot is empty.
+  "transcript-recording": transcriptCase(true),
 };
 
 const which = new URLSearchParams(location.search).get("case") ?? "recommended";
@@ -135,7 +181,7 @@ mockIPC(async (cmd, args) => {
 
 const ctx = {
   stepId: scenario.step,
-  index: STEP_ORDER.indexOf(scenario.step),
+  index: scenario.step ? STEP_ORDER.indexOf(scenario.step) : 0,
   total: STEP_ORDER.length,
   goNext: () => console.log("[mock] goNext"),
   goBack: () => {},
@@ -144,20 +190,26 @@ const ctx = {
   complete: () => {},
 } as unknown as StepContext;
 
-// The wrapper MUST mirror the real wizard shell (Onboarding.tsx: the
-// `flex-1 … flex items-center justify-center px-6 py-16` canvas). StepShell is
-// `w-full max-w-lg` and centres its own contents but never itself, so a plain
-// block wrapper pins the whole step to the left edge — a harness artefact that
-// looks exactly like a layout bug in the component under review.
+// A wrapper MUST mirror the real container the component lives in. This one is
+// the wizard shell (Onboarding.tsx: the `flex-1 … flex items-center
+// justify-center px-6 py-16` canvas), and is the default for wizard steps.
+// StepShell is `w-full max-w-lg` and centres its own contents but never
+// itself, so a plain block wrapper pins the whole step to the left edge — a
+// harness artefact that looks exactly like a layout bug in the component under
+// review. Scenarios for non-wizard components bring their own `wrap`.
+const onboardingCanvas = (node: React.ReactNode) => (
+  <div className="flex-1 min-h-0 overflow-y-auto flex items-center justify-center px-6 py-16">
+    {node}
+  </div>
+);
+
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <StrictMode>
     <div className="relative h-screen w-full flex flex-col bg-[var(--color-canvas)]">
       <p className="pt-4 text-center text-xs text-[var(--color-text-muted)]">
         mock case: <code>{which}</code> — {Object.keys(CASES).join(" · ")}
       </p>
-      <div className="flex-1 min-h-0 overflow-y-auto flex items-center justify-center px-6 py-16">
-        {scenario.render(ctx)}
-      </div>
+      {(scenario.wrap ?? onboardingCanvas)(scenario.render(ctx))}
     </div>
   </StrictMode>,
 );

@@ -1833,7 +1833,7 @@ function CopyButton({ getText, label }: { getText: () => string; label: string }
 // the merge affordance (#23) — can be unit-tested in isolation.
 // extractSpeakerLabels / renameSpeakerInTranscript live in ../lib/speakers.
 
-const TranscriptEditor = memo(function TranscriptEditor({
+export const TranscriptEditor = memo(function TranscriptEditor({
   value,
   onChange,
   disabled,
@@ -1880,41 +1880,85 @@ const TranscriptEditor = memo(function TranscriptEditor({
   // replace via diarize.
   const showEditor = editing && !disabled;
 
-  if (showEditor) {
-    return (
-      <textarea
-        ref={taRef}
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        onBlur={() => setEditing(false)}
-        onKeyDown={(e) => {
-          if (e.key === "Escape") {
-            e.preventDefault();
-            setEditing(false);
-          }
-        }}
-        className={cn(
-          "nd-bare w-full resize-none text-sm leading-relaxed text-[var(--color-text-muted)] focus:outline-none",
-          fill && "flex-1 min-h-0 overflow-y-auto",
-        )}
-      />
-    );
-  }
+  // Persistent header slot (#168). Before this, entering edit mode was an
+  // undocumented click on the body and leaving it was Escape or an outside
+  // click — neither visible. The slot always occupies the same place: `Edit`
+  // in view mode, `Editing` + `Done` while the textarea is open, so the mode
+  // is stated rather than inferred from the speaker pills disappearing.
+  // Nothing is offered while `disabled` — a recording in flight, or a
+  // teammate's read-only note — since on those there is no mode to enter and
+  // an inert `Edit` would promise one.
+  const modeLink =
+    "nd-bare text-xs text-[var(--color-text-muted)] underline hover:text-[var(--color-text)] shrink-0";
+  const header = disabled ? null : (
+    <div className={cn("flex items-center justify-end gap-2 mb-2", fill && "shrink-0")}>
+      {showEditor ? (
+        <>
+          <span className="text-xs text-[var(--color-text-muted)]">Editing</span>
+          <button
+            type="button"
+            // blur fires before the click would land, and the blur handler
+            // exits edit mode — which unmounts this button mid-gesture. Keep
+            // focus in the textarea by killing the mousedown default; the
+            // click then reaches onClick as normal.
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={() => setEditing(false)}
+            className={modeLink}
+          >
+            Done
+          </button>
+        </>
+      ) : (
+        <button type="button" onClick={() => setEditing(true)} className={modeLink}>
+          Edit
+        </button>
+      )}
+    </div>
+  );
 
-  // TranscriptView owns its own scroll container so the virtualizer can
-  // measure visible items. Bypass CollapsibleScroll here — its
-  // bottomAligned + maxHeight role is taken over by TranscriptView's
-  // built-in scroller.
   return (
-    <TranscriptView
-      transcript={value}
-      onClick={() => {
-        if (!disabled) setEditing(true);
-      }}
-      disabled={disabled}
-      fill={fill}
-      bottomAligned={bottomAligned}
-    />
+    <div className={cn("flex flex-col", fill && "min-h-0 flex-1")}>
+      {header}
+      {showEditor ? (
+        <textarea
+          ref={taRef}
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          onBlur={() => setEditing(false)}
+          onKeyDown={(e) => {
+            if (e.key === "Escape") {
+              e.preventDefault();
+              setEditing(false);
+            }
+          }}
+          // No `.nd-bare` (#168). That opt-out exists to strip the field
+          // chrome when the surrounding Card is the surface — which is what
+          // left this textarea borderless and indistinguishable from the
+          // reader. The base `textarea` rule in globals.css already gives a
+          // 1px border plus a focus border-colour shift, and being unlayered
+          // it beats any Tailwind border utility we could ask for here, so
+          // dropping the opt-out IS the focus border the issue asks for.
+          className={cn(
+            "w-full resize-none text-sm leading-relaxed text-[var(--color-text-muted)]",
+            fill && "flex-1 min-h-0 overflow-y-auto",
+          )}
+        />
+      ) : (
+        // TranscriptView owns its own scroll container so the virtualizer can
+        // measure visible items. Bypass CollapsibleScroll here — its
+        // bottomAligned + maxHeight role is taken over by TranscriptView's
+        // built-in scroller.
+        <TranscriptView
+          transcript={value}
+          onClick={() => {
+            if (!disabled) setEditing(true);
+          }}
+          disabled={disabled}
+          fill={fill}
+          bottomAligned={bottomAligned}
+        />
+      )}
+    </div>
   );
 });
 
