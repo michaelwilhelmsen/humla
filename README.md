@@ -94,8 +94,6 @@ Six read-only tools: `search_notes`, `get_note`, `get_transcript`, `list_notes`,
 - **No key, no network, no server.** It's a small local binary that reads your SQLite database directly, so search is keyword-based rather than embedding-based: nothing to pay for, nothing to send anywhere, and no Keychain prompt. There's no port and no token — the file permissions on your own machine are the authorization.
 - **Works whether or not Humla is open**, and always reads the workspace you're currently in. The workspace is resolved on Humla's side, never passed in, so a client can't ask its way from Personal notes into a shared workspace or back.
 
-One honest limitation: because search is keyword-based, a query has to match the language a note is written in. When a search comes back empty, the server says which languages your notes are actually in, so the agent can retry rather than report that you never discussed it.
-
 ### Stays out of your way
 
 - **Custom vocabulary** — names, jargon, acronyms biased into the transcription so they spell consistently.
