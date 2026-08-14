@@ -6,6 +6,11 @@ authors = ["Michael Wilhelmsen"]
 edition = "2021"
 rust-version = "1.85"
 license = "MIT"
+# The app is THE binary. Required since `humla-mcp` (#172) became a second
+# `[[bin]]`: `tauri dev` shells out to a bare `cargo run`, which refuses to pick
+# between two binaries and fails the whole dev command with "could not determine
+# which binary to run".
+default-run = "humla"
 
 [lib]
 name = "humla_lib"
