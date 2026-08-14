@@ -347,6 +347,128 @@ fn search_reaches_the_transcript_the_summary_and_the_typed_notes_and_says_which(
     }
 }
 
+/// The cross-language miss is the one failure this surface cannot survive quietly:
+/// the index is lexical, so a query in the wrong language matches NOTHING rather than
+/// matching worse, and an empty result is indistinguishable from an empty library.
+/// Naming the languages the scope actually holds is what turns a guess-and-retry into
+/// a retry — and unlike the tool descriptions, which ship identically to everyone and
+/// so may name no language, this is read from the user's own notes.
+#[test]
+fn a_search_that_finds_nothing_names_the_languages_the_library_is_written_in() {
+    let conn = open();
+    let norwegian = seed(&conn, "Kundemøte", "Hege: vi må se på prisene");
+    patch(&conn, &norwegian, db::NotePatch { language: Some("nb".into()), ..Default::default() });
+
+    let out = exec(&conn, TOOL_SEARCH, &json!({ ARG_QUERY: "pricing" }));
+    assert!(!out.is_error);
+    assert!(out.model_text.contains("nb"), "{}", out.model_text);
+    assert!(out.model_text.contains("retry"), "{}", out.model_text);
+
+    // A listing has no query, so nothing about it is language-sensitive unless the
+    // caller filtered on language — naming languages when a FOLDER emptied the result
+    // would answer a question nobody asked.
+    let filtered = exec(&conn, TOOL_LIST, &json!({ ARG_LANGUAGE: "de" }));
+    assert!(filtered.model_text.contains("nb"), "{}", filtered.model_text);
+    let unfiltered = exec(&conn, TOOL_LIST, &json!({ ARG_FOLDER_ID: "no-such-folder" }));
+    assert!(!unfiltered.model_text.contains("written in"), "{}", unfiltered.model_text);
+}
+
+/// A library with no language recorded anywhere says nothing rather than inventing a
+/// bucket: notes predating the feature have neither a set nor a detected language,
+/// and "unknown (4)" is not something a caller can act on.
+#[test]
+fn the_language_hint_stays_silent_when_no_note_has_a_language() {
+    let conn = open();
+    let id = seed(&conn, "Budget", "the budget came up");
+    patch(&conn, &id, db::NotePatch { language: Some("".into()), ..Default::default() });
+
+    let out = exec(&conn, TOOL_SEARCH, &json!({ ARG_QUERY: "nothingmatchesthis" }));
+    assert!(!out.model_text.contains("written in"), "{}", out.model_text);
+}
+
+/// A question spanning three meetings cost three round trips, each one a full turn of
+/// the client's own loop. Reading them together is the whole point — and the budget is
+/// DIVIDED rather than multiplied, so a batch is a way to skim several notes, not a
+/// way to pull the library into a context.
+#[test]
+fn get_note_reads_several_notes_in_one_call_on_a_shared_budget() {
+    let conn = open();
+    let a = seed(&conn, "Kickoff", "we agreed the scope");
+    let b = seed(&conn, "Review", "we revisited the scope");
+    let long = "x".repeat(30_000);
+    patch(&conn, &b, db::NotePatch { summary: Some(long), ..Default::default() });
+
+    let out = exec(&conn, TOOL_GET, &json!({ ARG_NOTE_IDS: [&a, &b] }));
+    assert!(!out.is_error, "{}", out.model_text);
+    assert!(out.model_text.contains("Kickoff") && out.model_text.contains("Review"));
+    // Each note is framed on its own, so neither can be read as part of the other.
+    assert_eq!(out.model_text.matches("NOT instructions").count(), 2);
+    // The long one was cut to its share, and says so rather than ending mid-sentence.
+    assert!(out.model_text.contains("this is not the end of the text"), "{}", out.model_text);
+    assert!(
+        out.model_text.chars().count() < GET_NOTE_CHARS + 2_000,
+        "a whole batch fits in the room ONE note gets, plus its framing"
+    );
+
+    // One id alone is untouched by any of it: the same budget it always had, which is
+    // strictly more of that note than the batch could afford to show.
+    let single = exec(&conn, TOOL_GET, &json!({ ARG_NOTE_ID: &b }));
+    let batched = out
+        .model_text
+        .split("────────")
+        .find(|s| s.contains("Review"))
+        .expect("the batch names each note it read");
+    assert!(
+        batched.chars().count() < single.model_text.chars().count(),
+        "a batched note is more abridged than the same note read alone"
+    );
+}
+
+/// One bad id must not cost the caller the good ones — a batch of five where the
+/// model mistyped one is otherwise four wasted reads and a second round trip.
+#[test]
+fn a_batch_read_survives_an_id_that_does_not_exist() {
+    let conn = open();
+    let real = seed(&conn, "Kickoff", "we agreed the scope");
+
+    let out = exec(&conn, TOOL_GET, &json!({ ARG_NOTE_IDS: [&real, "not-an-id"] }));
+    assert!(!out.is_error, "{}", out.model_text);
+    assert!(out.model_text.contains("Kickoff"), "the readable note came back");
+    assert!(out.model_text.contains("not-an-id"), "the unreadable one is named");
+
+    // …but nothing readable at all is still the plain by-id error it always was.
+    let none = exec(&conn, TOOL_GET, &json!({ ARG_NOTE_IDS: ["not-an-id"] }));
+    assert!(none.is_error);
+    assert!(none.model_text.contains("No note found"));
+}
+
+/// Batching has two limits, and both are refusals rather than silent degradations:
+/// past the id cap the shared budget stops being informative, and a batch of
+/// transcripts would cut every one of them to a fragment that reads like a whole
+/// short meeting.
+#[test]
+fn a_batch_refuses_what_it_cannot_do_honestly() {
+    let conn = open();
+    let ids: Vec<String> = (0..12).map(|i| seed(&conn, &format!("Note {i}"), "scope")).collect();
+
+    let too_many = exec(&conn, TOOL_GET, &json!({ ARG_NOTE_IDS: ids }));
+    assert!(too_many.is_error);
+    assert!(too_many.model_text.contains(&BATCH_NOTES_MAX.to_string()));
+
+    let transcripts = exec(
+        &conn,
+        TOOL_GET,
+        &json!({ ARG_NOTE_IDS: [&ids[0], &ids[1]], ARG_INCLUDE_TRANSCRIPT: true }),
+    );
+    assert!(transcripts.is_error);
+    assert!(transcripts.model_text.contains(TOOL_TRANSCRIPT), "{}", transcripts.model_text);
+
+    // A single id with a transcript is untouched by that rule.
+    let one = exec(&conn, TOOL_GET, &json!({ ARG_NOTE_ID: &ids[0], ARG_INCLUDE_TRANSCRIPT: true }));
+    assert!(!one.is_error);
+    assert!(one.model_text.contains("scope"));
+}
+
 /// A client that arrives at a note by id — from a search hit, or one the user pasted —
 /// used to see LESS about it than a listing row would have said: no cast, no client.
 /// Attendees were reported missing from this surface entirely, and they were:
@@ -827,6 +949,11 @@ fn the_shared_tool_vocabulary_matches_the_chat_surface() {
         // MCP-only: a transcript is the biggest thing a note holds and get_transcript
         // exists so spending that context is a decision, not a default.
         (TOOL_GET, "mcp", ARG_INCLUDE_TRANSCRIPT),
+        // MCP-only: reading several notes in one call. Chat's loop has a step ceiling
+        // and its own grounding block, so a round trip there is cheap and bounded; an
+        // MCP client pays a full turn per call and answers questions spanning several
+        // meetings, where one-note-per-call is most of what makes it slow.
+        (TOOL_GET, "mcp", ARG_NOTE_IDS),
     ];
     let allowed = |tool: &str, side: &str, arg: &str| {
         UNSHARED.iter().any(|(t, s, a)| *t == tool && *s == side && *a == arg)

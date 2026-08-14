@@ -89,6 +89,7 @@ const ARG_UNTIL: &str = "until_days";
 /// 29th is the kind of off-by-one nobody reports and everybody mis-answers from.
 const ARG_SINCE: &str = "since";
 const ARG_UNTIL_DATE: &str = "until";
+const ARG_NOTE_IDS: &str = "note_ids";
 const ARG_LIMIT: &str = "limit";
 const ARG_INCLUDE_TRANSCRIPT: &str = "include_transcript";
 
@@ -108,6 +109,17 @@ const EXCERPT_CHARS: usize = 400;
 /// the context — that is why it is a separate tool.
 const GET_NOTE_CHARS: usize = 20_000;
 const TRANSCRIPT_CHARS: usize = 120_000;
+/// Notes one `get_note` may read at once, and the budget they SHARE.
+///
+/// A batch read exists to save round-trips while sizing up several candidates, not to
+/// pull the library into a context — so a whole batch fits in the room ONE note gets,
+/// divided, rather than multiplying it. Ten notes at the floor is exactly the total,
+/// which is what the id cap is for: past it the division stops being informative and
+/// the caller should choose from a listing instead. A single id is untouched by any of
+/// this and still gets the whole of [`GET_NOTE_CHARS`].
+const BATCH_NOTES_MAX: usize = 10;
+const BATCH_TOTAL_CHARS: usize = GET_NOTE_CHARS;
+const BATCH_MIN_CHARS: usize = GET_NOTE_CHARS / BATCH_NOTES_MAX;
 /// Upper bound on the relative date window, so the arithmetic can't underflow the
 /// epoch on an absurd `within_days`.
 const MAX_WINDOW_DAYS: i64 = 3_650;
@@ -193,18 +205,26 @@ pub fn specs() -> Vec<Spec> {
         Spec {
             name: TOOL_GET,
             description: format!(
-                "Read one note in full: the user's own written notes and the AI summary, by \
-                 id. Ids come from {TOOL_SEARCH} hits and {TOOL_LIST} rows. The transcript is \
-                 NOT included by default because it is large — pass \
-                 {ARG_INCLUDE_TRANSCRIPT}, or call {TOOL_TRANSCRIPT}, once you know you need it."
+                "Read notes in full: the user's own written notes and the AI summary, by id. \
+                 Ids come from {TOOL_SEARCH} hits and {TOOL_LIST} rows. Pass {ARG_NOTE_IDS} \
+                 with up to {BATCH_NOTES_MAX} ids to read several at once — one call instead \
+                 of one per note when a question spans a few meetings — and note that a batch \
+                 shares one budget, so each note comes back more abridged than it would alone. \
+                 The transcript is NOT included by default because it is large: pass \
+                 {ARG_INCLUDE_TRANSCRIPT}, or call {TOOL_TRANSCRIPT}, once you know you need \
+                 it, and one note at a time."
             ),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    ARG_NOTE_ID: { "type": "string", "description": "The note id to read." },
-                    ARG_INCLUDE_TRANSCRIPT: { "type": "boolean", "description": "Optional: also include the meeting transcript (default false; it can be very long)." },
+                    ARG_NOTE_ID: { "type": "string", "description": "The note id to read. Use this, or note_ids for several." },
+                    ARG_NOTE_IDS: {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": format!("Optional: several note ids to read in one call (at most {BATCH_NOTES_MAX}). Each is abridged to share one budget; re-read a single id for more of it."),
+                    },
+                    ARG_INCLUDE_TRANSCRIPT: { "type": "boolean", "description": "Optional: also include the meeting transcript (default false; it can be very long). Only with a single note id." },
                 },
-                "required": [ARG_NOTE_ID],
             }),
         },
         Spec {
@@ -630,11 +650,12 @@ fn run_search(conn: &Connection, workspace: &str, args: &Value, now_ms: i64) -> 
             }
         }
         return Outcome::ok(format!(
-            "Nothing in the notes matches \"{query}\".{} That is a real absence in what was \
+            "Nothing in the notes matches \"{query}\".{}{} That is a real absence in what was \
              searched, not a truncated list — but the index is keyword-based, so try other \
              wording, or {TOOL_LIST} to see what exists, before telling the user there is \
              nothing. Do not invent an answer.",
-            window_echo(&filter)
+            window_echo(&filter),
+            language_echo(conn, filter, workspace)
         ));
     }
 
@@ -734,14 +755,10 @@ fn fetch_note(conn: &Connection, workspace: &str, note_id: &str) -> Result<db::N
 fn fetch_with_header(
     conn: &Connection,
     workspace: &str,
-    args: &Value,
-    tool: &str,
+    note_id: &str,
     lead: &str,
     tail: &str,
 ) -> Result<(db::Note, String), Outcome> {
-    let Some(note_id) = str_arg(args, ARG_NOTE_ID) else {
-        return Err(Outcome::error(format!("{tool} needs a \"{ARG_NOTE_ID}\" string.")));
-    };
     let note = fetch_note(conn, workspace, note_id)?;
     let langs = db::note_languages(conn, &[note_id]).unwrap_or_default();
     // The same descriptor a listing row is built from, for the one note. Without it a
@@ -775,11 +792,45 @@ fn fetch_with_header(
     Ok((note, header))
 }
 
-fn run_get(conn: &Connection, workspace: &str, args: &Value) -> Outcome {
-    let (note, header) = match fetch_with_header(conn, workspace, args, TOOL_GET, "Note", "") {
-        Ok(pair) => pair,
-        Err(out) => return out,
-    };
+/// The ids one `get_note` call is asking for: `note_id`, `note_ids`, or both, in the
+/// order given and deduplicated.
+///
+/// Both at once is a union rather than an error — the two arguments cannot contradict
+/// each other, so there is no ambiguity to protect the caller from, and refusing would
+/// spend a round trip teaching a lesson with no consequence.
+fn requested_ids(args: &Value) -> Vec<&str> {
+    let mut ids: Vec<&str> = Vec::new();
+    if let Some(one) = str_arg(args, ARG_NOTE_ID) {
+        ids.push(one);
+    }
+    if let Some(many) = args.get(ARG_NOTE_IDS).and_then(Value::as_array) {
+        for v in many {
+            if let Some(s) = v.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                ids.push(s);
+            }
+        }
+    }
+    let mut seen: Vec<&str> = Vec::new();
+    ids.retain(|id| {
+        if seen.contains(id) {
+            false
+        } else {
+            seen.push(id);
+            true
+        }
+    });
+    ids
+}
+
+/// One note rendered for `get_note`, within `budget` characters.
+fn note_section(
+    conn: &Connection,
+    workspace: &str,
+    note_id: &str,
+    include_transcript: bool,
+    budget: usize,
+) -> Result<String, Outcome> {
+    let (note, header) = fetch_with_header(conn, workspace, note_id, "Note", "")?;
     // Bodies are Tiptap HTML on disk; a client must never see the markup.
     let body_text = crate::html_text::html_to_text(&note.body);
     let mut sections = vec![
@@ -788,7 +839,7 @@ fn run_get(conn: &Connection, workspace: &str, args: &Value) -> Outcome {
     ];
     // Off by default: a transcript is the largest thing a note holds, and the
     // caller should decide to spend that context rather than have it spent for them.
-    if bool_arg(args, ARG_INCLUDE_TRANSCRIPT) {
+    if include_transcript {
         sections.push(format!("[Transcript]\n{}", blank_or(&note.transcript)));
     } else if !note.transcript.trim().is_empty() {
         sections.push(format!(
@@ -796,18 +847,83 @@ fn run_get(conn: &Connection, workspace: &str, args: &Value) -> Outcome {
              {ARG_INCLUDE_TRANSCRIPT}, to read what was said)"
         ));
     }
-    Outcome::ok(format!(
-        "{header}\n{}",
-        truncate_block(&sections.join("\n\n"), GET_NOTE_CHARS)
-    ))
+    Ok(format!("{header}\n{}", truncate_block(&sections.join("\n\n"), budget)))
+}
+
+fn run_get(conn: &Connection, workspace: &str, args: &Value) -> Outcome {
+    let ids = requested_ids(args);
+    if ids.is_empty() {
+        return Outcome::error(format!(
+            "{TOOL_GET} needs a \"{ARG_NOTE_ID}\" string, or \"{ARG_NOTE_IDS}\" as a list of \
+             ids to read several at once."
+        ));
+    }
+    if ids.len() > BATCH_NOTES_MAX {
+        return Outcome::error(format!(
+            "{TOOL_GET} reads at most {BATCH_NOTES_MAX} notes at once, and {} were asked for. \
+             Read the most promising {BATCH_NOTES_MAX} first — {TOOL_LIST} rows carry a summary \
+             line to choose by.",
+            ids.len()
+        ));
+    }
+    let include_transcript = bool_arg(args, ARG_INCLUDE_TRANSCRIPT);
+    // A batch of transcripts is not a smaller version of one transcript: the shared
+    // budget would cut every one of them to a fragment, and a fragment of a meeting
+    // reads exactly like the whole of a short one.
+    if include_transcript && ids.len() > 1 {
+        return Outcome::error(format!(
+            "{ARG_INCLUDE_TRANSCRIPT} works with a single {ARG_NOTE_ID} only — transcripts are \
+             far too long to share one budget. Read the notes together first, then call \
+             {TOOL_TRANSCRIPT} for the one that matters."
+        ));
+    }
+
+    // A single id keeps the whole budget it always had; a batch divides one budget
+    // rather than multiplying it.
+    let budget = if ids.len() == 1 {
+        GET_NOTE_CHARS
+    } else {
+        (BATCH_TOTAL_CHARS / ids.len()).max(BATCH_MIN_CHARS)
+    };
+
+    let mut sections: Vec<String> = Vec::new();
+    let mut missing: Vec<&str> = Vec::new();
+    let mut first_error: Option<Outcome> = None;
+    for id in &ids {
+        match note_section(conn, workspace, id, include_transcript, budget) {
+            Ok(text) => sections.push(text),
+            Err(out) => {
+                missing.push(id);
+                first_error.get_or_insert(out);
+            }
+        }
+    }
+    // One unreadable id must not cost the caller the other nine — but if NOTHING was
+    // readable there is nothing to report against, so the single-id error stands as it
+    // always has.
+    if sections.is_empty() {
+        return first_error.unwrap_or_else(|| Outcome::error("No notes found.".to_string()));
+    }
+    if !missing.is_empty() {
+        sections.push(format!(
+            "No note in this library has {}: {}. The {} that could be read are above — this is \
+             not a failure of the whole call.",
+            if missing.len() == 1 { "this id" } else { "these ids" },
+            missing.join(", "),
+            sections.len()
+        ));
+    }
+    Outcome::ok(sections.join("\n\n────────\n\n"))
 }
 
 fn run_transcript(conn: &Connection, workspace: &str, args: &Value) -> Outcome {
+    let Some(note_id) = str_arg(args, ARG_NOTE_ID) else {
+        return Outcome::error(format!("{TOOL_TRANSCRIPT} needs a \"{ARG_NOTE_ID}\" string."));
+    };
     let (note, header) = match fetch_with_header(
         conn,
         workspace,
-        args,
-        TOOL_TRANSCRIPT,
+        note_id,
         "Transcript of",
         ". Lines are labelled with who spoke",
     ) {
@@ -855,10 +971,20 @@ fn run_list(conn: &Connection, workspace: &str, args: &Value, now_ms: i64) -> Ou
                 return Outcome::ok(text);
             }
         }
+        // The language echo only when a `language` filter was actually passed. A
+        // listing has no query, so nothing else here is language-sensitive — naming
+        // the languages present when a FOLDER emptied the result would be answering
+        // a question the caller didn't ask. Search is the opposite case: there the
+        // mismatch bites through the query itself, with no filter involved.
+        let languages = match filter.language {
+            Some(_) => language_echo(conn, filter, workspace),
+            None => String::new(),
+        };
         return Outcome::ok(format!(
-            "No notes match those filters.{} Widen them, or drop them entirely to see what \
+            "No notes match those filters.{}{} Widen them, or drop them entirely to see what \
              exists, before concluding the library has nothing.",
-            window_echo(&filter)
+            window_echo(&filter),
+            languages
         ));
     }
     let overflow = notes.len() > limit;
@@ -934,6 +1060,31 @@ fn run_clients(conn: &Connection, workspace: &str) -> Outcome {
         ARG_CLIENT_ID,
         "this library does not tag notes with a business relationship",
         db::list_clients(conn, workspace).map(|cs| cs.into_iter().map(|c| (c.name, c.id)).collect()),
+    )
+}
+
+/// What an empty result says about the languages the scope actually holds — nothing
+/// when no note in it has a language either way.
+///
+/// [`LANGUAGE_NOTE`] tells a client that language matters and names none, on purpose:
+/// a tool DESCRIPTION ships identically to every user, and Humla transcribes around
+/// ninety-nine languages, so any name in it is wrong for nearly everyone. This is the
+/// other half, and the distinction is the one that makes both correct — here the
+/// names are read out of the user's own library at the moment a search came back
+/// empty, which is exactly when guessing is what the client would otherwise do.
+fn language_echo(conn: &Connection, filter: NoteFilter<'_>, workspace: &str) -> String {
+    let found = db::languages_in_scope(conn, filter, workspace).unwrap_or_default();
+    if found.is_empty() {
+        return String::new();
+    }
+    let counted: Vec<String> = found.iter().map(|(l, n)| format!("{l} ({n})")).collect();
+    let (shown, tail) = shown_names(&counted);
+    format!(
+        " The notes in scope are written in: {}{}. The index is lexical, so a query has to \
+         match the language a note is written in — retry in one of these before concluding \
+         there is nothing.",
+        shown.join(", "),
+        tail
     )
 }
 

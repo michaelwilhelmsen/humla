@@ -2644,6 +2644,42 @@ pub fn speakers_in_scope(
     Ok(out)
 }
 
+/// The distinct languages present in a scope with a count of notes each, most
+/// common first (#172 follow-up).
+///
+/// Same job as [`speakers_in_scope`] for the other filter that can empty a result
+/// while looking like an absence — and here it is worse, because the language
+/// mismatch needs no filter to bite: the index is lexical, so a query in the wrong
+/// language matches NOTHING at all rather than matching worse. A model handed a bare
+/// zero concludes the library holds nothing on the subject; one told the notes are in
+/// `nb` retries in Norwegian and finds them.
+///
+/// The `language` filter itself is dropped, like the speaker one above: the question
+/// is what else is there.
+pub fn languages_in_scope(
+    conn: &Connection,
+    filter: NoteFilter<'_>,
+    workspace_id: &str,
+) -> Result<Vec<(String, usize)>> {
+    let lang = effective_language_sql("n");
+    let mut sql = format!(
+        "SELECT {lang} AS lang, COUNT(*) AS n FROM notes n \
+         WHERE n.workspace_id = ?1 AND n.deleted_at IS NULL"
+    );
+    let mut args: Vec<rusqlite::types::Value> =
+        vec![rusqlite::types::Value::Text(workspace_id.to_string())];
+    push_note_filters(&mut sql, &mut args, NoteFilter { language: None, ..filter }, "n");
+    // Notes with neither a set nor a detected language are omitted rather than
+    // bucketed as unknown: naming a bucket the caller cannot filter on is noise.
+    sql.push_str(" GROUP BY lang HAVING lang != '' ORDER BY n DESC, lang ASC");
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(args), |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as usize))
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+}
+
 /// The size of each per-signal candidate pool fused by RRF. Bigger than the
 /// final `limit` so a chunk ranked mid-pack by one signal can still win on the
 /// other.
@@ -4415,6 +4451,37 @@ mod tests {
         assert!(present.contains(&"Hege".to_string()));
         assert!(present.contains(&"Michael Berg".to_string()));
         assert_eq!(present.len(), 3, "distinct, no repeats: {present:?}");
+    }
+
+    /// Counted and ordered so the caller can say "these notes are in nb (41), en (6)"
+    /// — the most common first, because that is the one to retry in. A note with
+    /// neither a set nor a detected language is omitted rather than bucketed: the
+    /// caller cannot filter on "unknown", so naming it is noise.
+    #[test]
+    fn the_languages_in_a_scope_are_counted_most_common_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("t.sqlite")).unwrap();
+        for _ in 0..3 {
+            create_note(&conn, "nb", "meeting", "").unwrap();
+        }
+        create_note(&conn, "en", "meeting", "").unwrap();
+        // Recorded on `auto`, so the language is the one detected at capture.
+        let detected = create_note(&conn, "", "meeting", "").unwrap();
+        set_detected_language(&conn, &detected.id, "de").unwrap();
+        create_note(&conn, "", "meeting", "").unwrap();
+
+        let found = languages_in_scope(&conn, NoteFilter::default(), "").unwrap();
+        assert_eq!(found, vec![("nb".into(), 3), ("de".into(), 1), ("en".into(), 1)]);
+
+        // The language filter itself is dropped — the question is what else is there,
+        // and a filter that matched nothing is exactly when it gets asked.
+        let filtered =
+            languages_in_scope(&conn, NoteFilter { language: Some("fr"), ..Default::default() }, "")
+                .unwrap();
+        assert_eq!(filtered, found);
+        // Every other filter still binds.
+        let elsewhere = languages_in_scope(&conn, NoteFilter::default(), "ws_other").unwrap();
+        assert!(elsewhere.is_empty());
     }
 
     #[test]
