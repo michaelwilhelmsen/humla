@@ -90,6 +90,12 @@ pub fn open(path: &Path) -> Result<Connection> {
         r#"
         PRAGMA journal_mode=WAL;
         PRAGMA foreign_keys=ON;
+        -- Wait rather than fail on a locked database. Until the MCP server (#172)
+        -- the only writer was the app itself behind one `parking_lot` mutex, so a
+        -- `SQLITE_BUSY` could not arise and no timeout was needed. A second process
+        -- reading while the recording pipeline appends transcript makes it a real
+        -- hazard, and the pragma costs nothing when nothing else holds the lock.
+        PRAGMA busy_timeout=5000;
 
         CREATE TABLE IF NOT EXISTS notes (
             id              TEXT PRIMARY KEY,
@@ -1710,6 +1716,59 @@ pub struct NoteFilter<'a> {
     /// Ignored unless `speaker` is set. The transcript text is never rewritten — this
     /// is the query-side half of resolving the sentinel.
     pub speaker_alias: Option<&'a str>,
+    /// Optional ISO 639-1 language code, matched against the note's EFFECTIVE
+    /// language (#172) — see [`effective_language_sql`] for what that means.
+    ///
+    /// Exists because the keyword index is lexical: a query in one language returns
+    /// *nothing at all* against a note written in another, so a client that can see
+    /// which languages a library contains can retry in the right one. Compared
+    /// case-insensitively, since a code is a code however it was cased.
+    pub language: Option<&'a str>,
+}
+
+/// A note's EFFECTIVE language: the one the user set on the note, falling back to
+/// the code the STT provider reported after capture (`detected_language`, #167),
+/// falling back to empty.
+///
+/// A fragment rather than a function so the filter and the projections that
+/// *display* the language cannot drift onto different definitions — a filter that
+/// narrows on one rule while a listing row prints another is worse than no
+/// language at all, because the mismatch it exists to reveal becomes invisible.
+fn effective_language_sql(t: &str) -> String {
+    format!("lower(COALESCE(NULLIF({t}.language, ''), {t}.detected_language, ''))")
+}
+
+/// The effective language of each of `note_ids`, keyed by note id (#172). Ids with
+/// no row, or with no language either way, are simply absent.
+///
+/// A separate lookup rather than a column on [`ChunkHit`] / [`NoteMeta`]: those two
+/// structs are the chat surface's shape, and language is a thing only the MCP
+/// surface presents. One extra query per tool call is cheaper than a field every
+/// chat construction site has to carry.
+pub fn note_languages(
+    conn: &Connection,
+    note_ids: &[&str],
+) -> Result<std::collections::HashMap<String, String>> {
+    let mut out = std::collections::HashMap::new();
+    if note_ids.is_empty() {
+        return Ok(out);
+    }
+    let placeholders = vec!["?"; note_ids.len()].join(",");
+    let sql = format!(
+        "SELECT id, {} FROM notes WHERE id IN ({placeholders})",
+        effective_language_sql("notes")
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(note_ids.iter()), |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (id, lang) = row?;
+        if !lang.trim().is_empty() {
+            out.insert(id, lang);
+        }
+    }
+    Ok(out)
 }
 
 /// The maximum length of a speaker label, in chars. Mirrors the `{1,40}` bound in
@@ -2420,6 +2479,10 @@ fn push_note_filters(
     if let Some(until) = filter.until_ms {
         args.push(Value::Integer(until));
         sql.push_str(&format!(" AND {t}.created_at < ?{}", args.len()));
+    }
+    if let Some(lang) = filter.language {
+        args.push(Value::Text(lang.trim().to_lowercase()));
+        sql.push_str(&format!(" AND {} = ?{}", effective_language_sql(t), args.len()));
     }
     if let Some(speaker) = filter.speaker {
         push_speaker_clause(sql, args, speaker, filter.speaker_alias, t);

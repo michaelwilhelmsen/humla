@@ -123,6 +123,10 @@ export type SettingsKey =
   | "theme"
   | "palette"
   | "developer_mode"
+  // MCP integration (#172). Off until explicitly enabled: the `humla-mcp`
+  // server process reads this key on every call, so the switch takes effect
+  // without restarting the MCP client.
+  | "mcp_enabled"
   | "silence_rms_threshold"
   // Onboarding wizard (v0.31): completion flag + resume cursor. Both are
   // plain settings rows so the grandfathering migration and the frontend
@@ -314,6 +318,9 @@ export const ipc = {
   // CPU architecture of the running process ("aarch64", "x86_64", …).
   // Onboarding uses it to steer Intel Macs toward cloud transcription.
   systemArch: () => invoke<string>("system_arch"),
+  // Absolute path to the bundled `humla-mcp` executable, so Settings can offer
+  // a config snippet that actually works on this install (#172).
+  mcpServerPath: () => invoke<string>("mcp_server_path"),
   noteDiagnosticsDir: (noteId: string) =>
     invoke<string>("note_diagnostics_dir", { noteId }),
   noteAudioDir: (noteId: string) =>

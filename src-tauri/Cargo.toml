@@ -6,6 +6,11 @@ authors = ["Michael Wilhelmsen"]
 edition = "2021"
 rust-version = "1.85"
 license = "MIT"
+# The app is THE binary. Required since `humla-mcp` (#172) became a second
+# `[[bin]]`: `tauri dev` shells out to a bare `cargo run`, which refuses to pick
+# between two binaries and fails the whole dev command with "could not determine
+# which binary to run".
+default-run = "humla"
 
 [lib]
 name = "humla_lib"
@@ -57,6 +62,7 @@ keyring = { version = "3", default-features = false, features = ["apple-native"]
 # build can drop it (and all sync networking) entirely. Its deps are a strict
 # subset of the core's, so enabling it adds no new transitive crates.
 cloud-sync = { path = "crates/cloud-sync", optional = true }
+rmcp = { version = "3", default-features = false, features = ["server", "transport-io", "macros"] }
 
 [dev-dependencies]
 tempfile = "3"

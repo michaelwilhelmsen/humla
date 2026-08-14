@@ -12,6 +12,9 @@ mod commands;
 mod stt;
 mod chat;
 mod embed;
+// Public so the `humla-mcp` binary (#172) can drive it. Everything below it —
+// `db`, `html_text` — stays private to the crate.
+pub mod mcp;
 pub mod sync;
 
 use std::sync::Arc;
@@ -325,6 +328,7 @@ where
             commands::cloud_billing_portal,
             commands::app_data_dir,
             commands::system_arch,
+            commands::mcp_server_path,
             commands::note_diagnostics_dir,
             commands::note_audio_dir,
             commands::note_audio_files,

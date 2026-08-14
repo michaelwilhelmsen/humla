@@ -39,6 +39,7 @@ export const DEFAULTS: Record<EditableKey, string> = {
   chat_model: "",
   developer_mode: "false",
   silence_rms_threshold: "0.005",
+  mcp_enabled: "false",
 };
 
 export const PROVIDERS_BASE = [
