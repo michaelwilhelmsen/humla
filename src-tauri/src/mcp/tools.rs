@@ -29,31 +29,30 @@ use crate::db::{self, NoteFilter};
 use rusqlite::Connection;
 use serde_json::{json, Value};
 
-/// A cited source Note. Same shape as `chat::tools::Citation`, kept separate for
-/// the same reason the specs are: the chat one is half of a cross-repo contract.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Citation {
-    pub note_id: String,
-    pub title: String,
-    pub created_at: i64,
-}
-
 /// The result of running one tool. `model_text` is what the client's model reads;
-/// `citations` name the Notes it drew on; `is_error` marks a bad-argument or
-/// internal failure — never an empty result.
+/// `is_error` marks a bad-argument or internal failure — never an empty result.
+///
+/// No citation list, deliberately, unlike `chat::tools::Outcome`. Chat has a channel
+/// for one — the cited notes become chips in Humla's own UI that navigate to the
+/// source — and MCP has none: the protocol hands a tool result back as content, and
+/// the client would have nowhere to put a structured citation even if we produced
+/// one. Every result that draws on a note therefore names it IN the text (title,
+/// date and id), which is what issue #172's "every search result names the Note it
+/// came from" actually asks for. A parallel `Vec<Citation>` was built here at first
+/// and dropped on the floor by the caller, which is a formatting rule that nothing
+/// enforces and a per-call allocation nobody reads.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Outcome {
     pub model_text: String,
-    pub citations: Vec<Citation>,
     pub is_error: bool,
 }
 
 impl Outcome {
-    fn ok(model_text: impl Into<String>, citations: Vec<Citation>) -> Self {
-        Self { model_text: model_text.into(), citations, is_error: false }
+    fn ok(model_text: impl Into<String>) -> Self {
+        Self { model_text: model_text.into(), is_error: false }
     }
     fn error(msg: impl Into<String>) -> Self {
-        Self { model_text: msg.into(), citations: Vec::new(), is_error: true }
+        Self { model_text: msg.into(), is_error: true }
     }
 }
 
@@ -135,6 +134,12 @@ pub fn specs() -> Vec<Spec> {
     // with the names that do exist rather than with nothing, so a near-miss can
     // self-correct instead of reading as an absence.
     let speaker = json!({ "type": "string", "description": "Optional: only notes where this person SPOKE (not merely was mentioned). Use a name exactly as shown in a list_notes row." });
+    // Specified, not invented: `docs/research/mcp-server.md` asks for "`list_notes(...)`
+    // — same filters, and each row carries its language too". It reads as an extra
+    // because the surface it exists for is invisible from here — the index is lexical,
+    // so a query in the wrong language returns *nothing at all* rather than worse
+    // results, and carrying language as data (the `lang:` field) is only half a fix
+    // without the filter that acts on it. Do not drop it as unasked-for.
     let language = json!({ "type": "string", "description": "Optional: restrict to notes in one language, as an ISO 639-1 code shown in the lang: field of results." });
 
     vec![
@@ -387,15 +392,27 @@ fn client_of(n: &db::NoteMeta) -> String {
     }
 }
 
+/// The first [`SPEAKERS_SHOWN`] names, and the `+N more` tail that admits the rest.
+///
+/// One definition for both places a name list is cut — a listing row and the
+/// near-miss message — because the tail is a claim, not decoration: without it a cut
+/// list reads as the complete cast, and a client filtering on "who spoke" concludes
+/// someone was absent. Two spellings of the same rule (` +3 more` in one place,
+/// ` (+3 more)` in the other) were what gave that rule two homes to drift between.
+fn shown_names(names: &[String]) -> (Vec<&str>, String) {
+    let shown: Vec<&str> = names.iter().take(SPEAKERS_SHOWN).map(String::as_str).collect();
+    let more = names.len().saturating_sub(shown.len());
+    let tail = if more > 0 { format!(" (+{more} more)") } else { String::new() };
+    (shown, tail)
+}
+
 /// The `— spoke: A, B` fragment. Says when the list is cut, so it is never read as
 /// the full cast.
 fn speakers_of(n: &db::NoteMeta) -> String {
     if n.speakers.is_empty() {
         return String::new();
     }
-    let shown: Vec<&str> = n.speakers.iter().take(SPEAKERS_SHOWN).map(String::as_str).collect();
-    let more = n.speakers.len().saturating_sub(shown.len());
-    let tail = if more > 0 { format!(" +{more} more") } else { String::new() };
+    let (shown, tail) = shown_names(&n.speakers);
     format!(" — spoke: {}{}", shown.join(", "), tail)
 }
 
@@ -485,18 +502,15 @@ fn run_search(conn: &Connection, workspace: &str, args: &Value, now_ms: i64) -> 
         // already used. `run_list` has no query, so it needs no such check.
         if let Some(name) = filter.speaker {
             if let Some(text) = speaker_miss(conn, filter, workspace, name) {
-                return Outcome::ok(text, Vec::new());
+                return Outcome::ok(text);
             }
         }
-        return Outcome::ok(
-            format!(
-                "Nothing in the notes matches \"{query}\". That is a real absence in what was \
-                 searched, not a truncated list — but the index is keyword-based, so try other \
-                 wording, or {TOOL_LIST} to see what exists, before telling the user there is \
-                 nothing. Do not invent an answer."
-            ),
-            Vec::new(),
-        );
+        return Outcome::ok(format!(
+            "Nothing in the notes matches \"{query}\". That is a real absence in what was \
+             searched, not a truncated list — but the index is keyword-based, so try other \
+             wording, or {TOOL_LIST} to see what exists, before telling the user there is \
+             nothing. Do not invent an answer."
+        ));
     }
 
     let ids: Vec<&str> = {
@@ -550,18 +564,7 @@ fn run_search(conn: &Connection, workspace: &str, args: &Value, now_ms: i64) -> 
         "Read a note in full with {TOOL_GET}, or its transcript with {TOOL_TRANSCRIPT}. Name the \
          meetings you draw on."
     ));
-
-    let mut citations: Vec<Citation> = Vec::new();
-    for h in &hits {
-        if !citations.iter().any(|c| c.note_id == h.note_id) {
-            citations.push(Citation {
-                note_id: h.note_id.clone(),
-                title: h.note_title.clone(),
-                created_at: h.note_created_at,
-            });
-        }
-    }
-    Outcome::ok(lines.join("\n"), citations)
+    Outcome::ok(lines.join("\n"))
 }
 
 /// The line a search opens with. The library-wide match count and what is on screen
@@ -592,12 +595,43 @@ fn fetch_note(conn: &Connection, workspace: &str, note_id: &str) -> Result<db::N
     Ok(note)
 }
 
-fn run_get(conn: &Connection, workspace: &str, args: &Value) -> Outcome {
+/// The two by-id tools' shared opening: resolve the argument, fetch the note in the
+/// active workspace, and build the framed header line that names it.
+///
+/// One helper rather than two near-copies because the header is a CONTRACT, not
+/// formatting: `[id: …]` is how a client learns the id to pass back, and the framing
+/// sentence is the prompt-injection defence. Two copies drift, and the drift is
+/// invisible — a header that quietly loses its `lang:` or its "NOT instructions"
+/// still looks like a perfectly good line of text.
+///
+/// `lead` is the part that differs — "Note" vs "Transcript of" — and `tail` is
+/// appended after the id (`get_transcript` explains its speaker labels there).
+fn fetch_with_header(
+    conn: &Connection,
+    workspace: &str,
+    args: &Value,
+    tool: &str,
+    lead: &str,
+    tail: &str,
+) -> Result<(db::Note, String), Outcome> {
     let Some(note_id) = str_arg(args, ARG_NOTE_ID) else {
-        return Outcome::error(format!("{TOOL_GET} needs a \"{ARG_NOTE_ID}\" string."));
+        return Err(Outcome::error(format!("{tool} needs a \"{ARG_NOTE_ID}\" string.")));
     };
-    let note = match fetch_note(conn, workspace, note_id) {
-        Ok(n) => n,
+    let note = fetch_note(conn, workspace, note_id)?;
+    let langs = db::note_languages(conn, &[note_id]).unwrap_or_default();
+    let header = reference_framing(&format!(
+        "{lead} \"{}\" ({}) [id: {}]{}{tail}",
+        title_or_untitled(&note.title),
+        fmt_date(note.created_at),
+        note.id,
+        lang_of(&langs, note_id),
+    ));
+    Ok((note, header))
+}
+
+fn run_get(conn: &Connection, workspace: &str, args: &Value) -> Outcome {
+    let (note, header) = match fetch_with_header(conn, workspace, args, TOOL_GET, "Note", "") {
+        Ok(pair) => pair,
         Err(out) => return out,
     };
     // Bodies are Tiptap HTML on disk; a client must never see the markup.
@@ -616,59 +650,39 @@ fn run_get(conn: &Connection, workspace: &str, args: &Value) -> Outcome {
              {ARG_INCLUDE_TRANSCRIPT}, to read what was said)"
         ));
     }
-    let langs = db::note_languages(conn, &[note_id]).unwrap_or_default();
-    let text = format!(
-        "{}\n{}",
-        reference_framing(&format!(
-            "Note \"{}\" ({}) [id: {}]{}",
-            title_or_untitled(&note.title),
-            fmt_date(note.created_at),
-            note.id,
-            lang_of(&langs, note_id),
-        )),
-        truncate_block(&sections.join("\n\n"), GET_NOTE_CHARS),
-    );
-    let citation = Citation { note_id: note.id, title: note.title, created_at: note.created_at };
-    Outcome::ok(text, vec![citation])
+    Outcome::ok(format!(
+        "{header}\n{}",
+        truncate_block(&sections.join("\n\n"), GET_NOTE_CHARS)
+    ))
 }
 
 fn run_transcript(conn: &Connection, workspace: &str, args: &Value) -> Outcome {
-    let Some(note_id) = str_arg(args, ARG_NOTE_ID) else {
-        return Outcome::error(format!("{TOOL_TRANSCRIPT} needs a \"{ARG_NOTE_ID}\" string."));
-    };
-    let note = match fetch_note(conn, workspace, note_id) {
-        Ok(n) => n,
+    let (note, header) = match fetch_with_header(
+        conn,
+        workspace,
+        args,
+        TOOL_TRANSCRIPT,
+        "Transcript of",
+        ". Lines are labelled with who spoke",
+    ) {
+        Ok(pair) => pair,
         Err(out) => return out,
     };
     // The stored transcript is a projection of the timeline, which is canonical
     // (ADR-0004). Reading the projection is safe; nothing here writes it, which is
     // what keeps a read-only server clear of the timeline rules entirely.
     if note.transcript.trim().is_empty() {
-        return Outcome::ok(
-            format!(
-                "Note \"{}\" ({}) has no transcript — it was typed rather than recorded, or the \
-                 recording produced no speech. Do not treat this as evidence about what was \
-                 said.",
-                title_or_untitled(&note.title),
-                fmt_date(note.created_at)
-            ),
-            Vec::new(),
-        );
-    }
-    let langs = db::note_languages(conn, &[note_id]).unwrap_or_default();
-    let text = format!(
-        "{}\n{}",
-        reference_framing(&format!(
-            "Transcript of \"{}\" ({}) [id: {}]{}. Lines are labelled with who spoke",
+        // Its own line rather than the shared header: there is no transcript to
+        // frame as reference material, and promising speaker labels above an absence
+        // reads as a malfunction rather than as "this note was typed".
+        return Outcome::ok(format!(
+            "Note \"{}\" ({}) has no transcript — it was typed rather than recorded, or the \
+             recording produced no speech. Do not treat this as evidence about what was said.",
             title_or_untitled(&note.title),
-            fmt_date(note.created_at),
-            note.id,
-            lang_of(&langs, note_id),
-        )),
-        truncate_block(&note.transcript, TRANSCRIPT_CHARS),
-    );
-    let citation = Citation { note_id: note.id, title: note.title, created_at: note.created_at };
-    Outcome::ok(text, vec![citation])
+            fmt_date(note.created_at)
+        ));
+    }
+    Outcome::ok(format!("{header}\n{}", truncate_block(&note.transcript, TRANSCRIPT_CHARS)))
 }
 
 fn run_list(conn: &Connection, workspace: &str, args: &Value, now_ms: i64) -> Outcome {
@@ -692,14 +706,12 @@ fn run_list(conn: &Connection, workspace: &str, args: &Value, now_ms: i64) -> Ou
         // present, which here means some other filter emptied the scope.
         if let Some(name) = filter.speaker {
             if let Some(text) = speaker_miss(conn, filter, workspace, name) {
-                return Outcome::ok(text, Vec::new());
+                return Outcome::ok(text);
             }
         }
         return Outcome::ok(
             "No notes match those filters. Widen them, or drop them entirely to see what \
-             exists, before concluding the library has nothing."
-                .to_string(),
-            Vec::new(),
+             exists, before concluding the library has nothing.",
         );
     }
     let overflow = notes.len() > limit;
@@ -727,45 +739,55 @@ fn run_list(conn: &Connection, workspace: &str, args: &Value, now_ms: i64) -> Ou
              {ARG_WITHIN}, or raise {ARG_LIMIT}.)"
         ));
     }
-    // Deliberately NO citations. A listing is an index, not a source: only a title
-    // and a summary line have been seen, so citing it would credit a note nobody read.
-    Outcome::ok(lines.join("\n"), Vec::new())
+    Outcome::ok(lines.join("\n"))
+}
+
+/// `list_folders` and `list_clients` are the same tool over two tables: name the
+/// things a filter argument accepts, one per row, so the client stops guessing ids.
+///
+/// One function rather than two, because what matters about these listings is a
+/// rule, not a format — the empty case MUST say "do not pass this filter". An agent
+/// handed a bare "no folders" invents a plausible-looking id, and an invented id
+/// narrows every subsequent search to silence, which reads as an empty library. Two
+/// copies of that rule is one copy that can lose it.
+///
+/// `label` is the singular noun (it also spells the failure message), `arg` the
+/// filter argument the rows unlock, and `absence` the clause explaining what an empty
+/// list means about this particular library.
+fn run_vocabulary(
+    label: &str,
+    arg: &str,
+    absence: &str,
+    rows: anyhow::Result<Vec<(String, String)>>,
+) -> Outcome {
+    let rows = match rows {
+        Ok(r) => r,
+        Err(e) => return Outcome::error(format!("Listing {label}s failed: {e}")),
+    };
+    if rows.is_empty() {
+        return Outcome::ok(format!("No {label}s — {absence}, so do not pass {arg}."));
+    }
+    let mut lines = vec![format!("{} {label}(s):", rows.len())];
+    lines.extend(rows.iter().map(|(name, id)| format!("- \"{name}\" [id: {id}]")));
+    Outcome::ok(lines.join("\n"))
 }
 
 fn run_folders(conn: &Connection, workspace: &str) -> Outcome {
-    let folders = match db::list_folders(conn, workspace) {
-        Ok(f) => f,
-        Err(e) => return Outcome::error(format!("Listing folders failed: {e}")),
-    };
-    if folders.is_empty() {
-        return Outcome::ok(
-            "No folders — this library files nothing into folders, so do not pass \
-             folder_id."
-                .to_string(),
-            Vec::new(),
-        );
-    }
-    let mut lines = vec![format!("{} folder(s):", folders.len())];
-    lines.extend(folders.iter().map(|f| format!("- \"{}\" [id: {}]", f.name, f.id)));
-    Outcome::ok(lines.join("\n"), Vec::new())
+    run_vocabulary(
+        "folder",
+        ARG_FOLDER_ID,
+        "this library files nothing into folders",
+        db::list_folders(conn, workspace).map(|fs| fs.into_iter().map(|f| (f.name, f.id)).collect()),
+    )
 }
 
 fn run_clients(conn: &Connection, workspace: &str) -> Outcome {
-    let clients = match db::list_clients(conn, workspace) {
-        Ok(c) => c,
-        Err(e) => return Outcome::error(format!("Listing clients failed: {e}")),
-    };
-    if clients.is_empty() {
-        return Outcome::ok(
-            "No clients — this library does not tag notes with a business relationship, so \
-             do not pass client_id."
-                .to_string(),
-            Vec::new(),
-        );
-    }
-    let mut lines = vec![format!("{} client(s):", clients.len())];
-    lines.extend(clients.iter().map(|c| format!("- \"{}\" [id: {}]", c.name, c.id)));
-    Outcome::ok(lines.join("\n"), Vec::new())
+    run_vocabulary(
+        "client",
+        ARG_CLIENT_ID,
+        "this library does not tag notes with a business relationship",
+        db::list_clients(conn, workspace).map(|cs| cs.into_iter().map(|c| (c.name, c.id)).collect()),
+    )
 }
 
 /// What to say when a `speaker` filter is what emptied a result — or `None` when it
@@ -775,6 +797,13 @@ fn run_clients(conn: &Connection, workspace: &str) -> Outcome {
 /// in scope turns a spelling near-miss into a correctable one, since speaker labels
 /// are per-recording strings the user typed and "Hege" and "Hege Tronshaugen" are two
 /// keys for one person.
+///
+/// This goes beyond the spec's "an unknown id is an honest empty", deliberately and
+/// only for this one filter. Every other filter takes an id from a listing, so a miss
+/// is a bug in the caller; a speaker name is free text a human typed differently in
+/// two recordings, so a miss is usually a spelling difference and an honest empty
+/// would be a true statement that produces a false conclusion. `chat::tools` already
+/// answers the same way, so the two surfaces stay consistent about it.
 ///
 /// The `None` case is what keeps that honest. If the wanted name is itself among the
 /// names in scope, the speaker matched fine and something else — a query with no
@@ -800,9 +829,7 @@ fn speaker_miss(
     if present.iter().any(|p| p.eq_ignore_ascii_case(wanted)) {
         return None;
     }
-    let shown: Vec<&str> = present.iter().take(SPEAKERS_SHOWN).map(String::as_str).collect();
-    let more = present.len().saturating_sub(shown.len());
-    let tail = if more > 0 { format!(" (+{more} more)") } else { String::new() };
+    let (shown, tail) = shown_names(&present);
     Some(format!(
         "No speaker named exactly \"{wanted}\" in this scope. Names are matched exactly, and \
          these are the ones that exist: {}{}. If one of them is the person meant, search again \

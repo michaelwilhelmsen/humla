@@ -15,7 +15,9 @@
 //!   them into `@` mentions; Codex documents tools and server instructions only, so
 //!   every capability stays reachable through tools alone. Listing them also dodges
 //!   a Codex behaviour where a tools-only server is reported as unavailable because
-//!   its resource list is empty.
+//!   its resource list is empty — which is why the DISABLED state lists a
+//!   placeholder rather than nothing, the default state being the one that would
+//!   otherwise trip it.
 
 use std::sync::Arc;
 
@@ -36,6 +38,10 @@ use super::tools;
 
 /// The `humla://note/<id>` scheme notes are exposed under.
 const RESOURCE_PREFIX: &str = "humla://note/";
+/// The one resource offered while the integration is switched off. Deliberately NOT
+/// under [`RESOURCE_PREFIX`]: it is not a note, it names none, and reading it must
+/// not go anywhere near the library.
+const RESOURCE_DISABLED: &str = "humla://disabled";
 /// How many notes to advertise as resources. An `@` menu is a picker, not an
 /// archive — the tools are the way to reach anything older, and a list of every
 /// note in a years-old library would cost the client more than it is worth.
@@ -62,6 +68,65 @@ impl HumlaMcp {
         let workspace = super::active_workspace(&conn);
         let out = tools::execute(&conn, &workspace, name, &args, crate::db::now_ms());
         (out.model_text, out.is_error)
+    }
+
+    /// The resources to advertise. Split out of the handler for the same reason
+    /// [`Self::dispatch`] is: `rmcp`'s `RequestContext` cannot be built outside that
+    /// crate, so anything left inside a handler signature is unreachable from a test
+    /// — and what this decides (whether a disabled server answers at all, and whether
+    /// its answer names a note) is exactly what needs pinning.
+    fn resources(&self) -> Vec<Resource> {
+        let conn = self.db.lock();
+        if !super::is_enabled(&conn) {
+            // A PLACEHOLDER, not an empty list — for exactly the reason resources are
+            // implemented at all. Codex has reported a server whose resource list is
+            // empty as unavailable, and "off" is the DEFAULT state, so answering an
+            // honest `[]` here would make the feature's own shipping configuration
+            // reproduce the failure it exists to avoid: the user turns the switch on
+            // and finds a server the client already wrote off. `list_tools` answers
+            // while disabled for the same reason.
+            //
+            // It carries no note title and no note id: the whole promise of the gate
+            // is that nothing from the library is readable until the user opts in,
+            // and a resource list is readable without any tool being called.
+            return vec![Resource::new(RESOURCE_DISABLED, "Humla — integration turned off")
+                .with_description(super::disabled_message())
+                .with_mime_type("text/plain")];
+        }
+        let workspace = super::active_workspace(&conn);
+        let notes =
+            crate::db::list_notes_filtered(&conn, Default::default(), &workspace, RESOURCE_LIMIT)
+                .unwrap_or_default();
+        notes
+            .into_iter()
+            .map(|n| {
+                let title = if n.title.trim().is_empty() { "(untitled)" } else { n.title.trim() };
+                Resource::new(format!("{RESOURCE_PREFIX}{}", n.id), title.to_string())
+                    .with_mime_type("text/plain")
+            })
+            .collect()
+    }
+
+    /// What one resource URI reads as, or the error the client should see.
+    fn read_uri(&self, uri: &str) -> Result<String, ErrorData> {
+        // The placeholder the disabled listing advertises. Answered rather than
+        // 404'd: a client that lists a resource and cannot read it concludes the
+        // server is broken, which is the opposite of the message — and the message is
+        // the entire point of offering it.
+        if uri == RESOURCE_DISABLED {
+            return Ok(super::disabled_message());
+        }
+        let Some(note_id) = uri.strip_prefix(RESOURCE_PREFIX) else {
+            return Err(ErrorData::resource_not_found(format!("Not a Humla note URI: {uri}"), None));
+        };
+        // Straight through the same seam the tool takes, so a resource read and a
+        // `get_note` call can never come to mean different things — including the
+        // workspace check and the reference-material framing.
+        let (text, is_error) = self.dispatch(tools::TOOL_GET, serde_json::json!({ "note_id": note_id }));
+        if is_error {
+            return Err(ErrorData::resource_not_found(text, None));
+        }
+        Ok(text)
     }
 }
 
@@ -125,23 +190,7 @@ impl ServerHandler for HumlaMcp {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, ErrorData> {
-        let conn = self.db.lock();
-        if !super::is_enabled(&conn) {
-            return Ok(ListResourcesResult::with_all_items(Vec::new()));
-        }
-        let workspace = super::active_workspace(&conn);
-        let notes =
-            crate::db::list_notes_filtered(&conn, Default::default(), &workspace, RESOURCE_LIMIT)
-                .unwrap_or_default();
-        let resources = notes
-            .into_iter()
-            .map(|n| {
-                let title = if n.title.trim().is_empty() { "(untitled)" } else { n.title.trim() };
-                Resource::new(format!("{RESOURCE_PREFIX}{}", n.id), title.to_string())
-                    .with_mime_type("text/plain")
-            })
-            .collect();
-        Ok(ListResourcesResult::with_all_items(resources))
+        Ok(ListResourcesResult::with_all_items(self.resources()))
     }
 
     async fn read_resource(
@@ -149,19 +198,7 @@ impl ServerHandler for HumlaMcp {
         request: ReadResourceRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResponse, ErrorData> {
-        let Some(note_id) = request.uri.strip_prefix(RESOURCE_PREFIX) else {
-            return Err(ErrorData::resource_not_found(
-                format!("Not a Humla note URI: {}", request.uri),
-                None,
-            ));
-        };
-        // Straight through the same seam the tool takes, so a resource read and a
-        // `get_note` call can never come to mean different things — including the
-        // workspace check and the reference-material framing.
-        let (text, is_error) = self.dispatch(tools::TOOL_GET, serde_json::json!({ "note_id": note_id }));
-        if is_error {
-            return Err(ErrorData::resource_not_found(text, None));
-        }
+        let text = self.read_uri(&request.uri)?;
         Ok(ReadResourceResult::new(vec![ResourceContents::text(text, request.uri)]).into())
     }
 }
@@ -207,6 +244,67 @@ mod tests {
             let (text, _) = server.dispatch(spec.name, serde_json::json!({ "query": "x", "note_id": "x" }));
             assert!(!text.contains("Unknown tool"), "{} does not dispatch", spec.name);
         }
+    }
+
+    /// The disabled state is the DEFAULT state, so it is the one that decides whether
+    /// a client ever comes back. An empty resource list is what Codex reads as "this
+    /// server is unavailable" — the exact failure resources are implemented to avoid —
+    /// so the off switch must still answer with something, and that something must
+    /// carry nothing from the library: a resource list is readable without any tool
+    /// being called, so a note title here would walk straight past the gate.
+    #[test]
+    fn a_disabled_server_still_lists_a_resource_and_it_names_no_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("t.sqlite")).unwrap();
+        let note = crate::db::create_note(&conn, "en", "meeting", "").unwrap();
+        crate::db::update_note(
+            &conn,
+            &note.id,
+            &crate::db::NotePatch { title: Some("Secret meeting".into()), ..Default::default() },
+        )
+        .unwrap();
+        let server = HumlaMcp::new(conn);
+
+        let listed = server.resources();
+        assert!(!listed.is_empty(), "an empty list reads as a broken server");
+        let rendered = serde_json::to_string(&listed).unwrap();
+        assert!(!rendered.contains("Secret meeting"), "leaked a title while disabled: {rendered}");
+        assert!(!rendered.contains(&note.id), "leaked an id while disabled: {rendered}");
+        assert!(rendered.contains("Settings"), "says how to turn it on: {rendered}");
+
+        // …and the placeholder must READ, not 404: a listed resource that cannot be
+        // opened is the same "broken server" conclusion by another route.
+        let text = server.read_uri(RESOURCE_DISABLED).expect("the placeholder reads");
+        assert!(text.contains("Settings"), "the read explains the switch: {text}");
+        assert!(!text.contains("Secret meeting"), "{text}");
+    }
+
+    /// Once enabled, the listing is the `@` menu: real notes, each reachable by the
+    /// URI it is listed under. The placeholder must be gone — leaving it in an
+    /// enabled list would advertise "turned off" beside notes that plainly are not.
+    #[test]
+    fn an_enabled_server_lists_the_notes_themselves_and_they_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("t.sqlite")).unwrap();
+        let note = crate::db::create_note(&conn, "en", "meeting", "").unwrap();
+        crate::db::update_note(
+            &conn,
+            &note.id,
+            &crate::db::NotePatch { title: Some("Kickoff".into()), ..Default::default() },
+        )
+        .unwrap();
+        crate::db::set_setting(&conn, super::super::SETTING_ENABLED, "true").unwrap();
+        let server = HumlaMcp::new(conn);
+
+        let listed = server.resources();
+        let rendered = serde_json::to_string(&listed).unwrap();
+        assert!(rendered.contains("Kickoff"), "{rendered}");
+        assert!(!rendered.contains(RESOURCE_DISABLED), "the placeholder outstayed its state");
+
+        let uri = format!("{RESOURCE_PREFIX}{}", note.id);
+        assert!(server.read_uri(&uri).unwrap().contains("Kickoff"));
+        // A URI in no scheme this server owns is a genuine not-found.
+        assert!(server.read_uri("file:///etc/passwd").is_err());
     }
 
     /// The gate is the whole privacy promise: until the user turns it on, no tool

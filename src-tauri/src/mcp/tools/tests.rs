@@ -2,7 +2,9 @@
 //!
 //! Every one of these drives [`execute`] with a tool name and arguments over a
 //! seeded temporary database, and asserts on what a CLIENT would observe: the text
-//! handed to the model, the citations, whether the outcome is an error. None of them
+//! handed to the model, whether the outcome is an error. MCP has no channel for a
+//! structured citation, so "this result names the note it came from" is asserted the
+//! only way a client can see it — the id and the title appearing in the text. None of them
 //! reaches into SQL, private helpers or formatting internals that carry no meaning
 //! to a caller — and where the assertion is about wording it checks the load-bearing
 //! claim rather than the whole string, so honest rewording doesn't break the suite.
@@ -67,23 +69,27 @@ fn set_created_at(conn: &Connection, id: &str, created_at: i64) {
 
 // ── each tool answers over a seeded library ─────────────────────────────────
 
+/// Issue #172 asks every search result to name the Note it came from, and in MCP the
+/// only place a name can go is the text. Without the id an agent has read an excerpt
+/// it cannot follow up on — it cannot call `get_note`, and it cannot tell the user
+/// which meeting it is quoting — so an excerpt whose note is anonymous is worse than
+/// no hit at all.
 #[test]
-fn search_returns_excerpts_and_cites_the_notes_they_came_from() {
+fn search_returns_excerpts_and_names_the_notes_they_came_from() {
     let conn = open();
     let budget = seed(&conn, "Budget review", "We cut the marketing budget in Q3.");
     seed(&conn, "Hiring", "Interviewed two backend engineers.");
 
     let out = exec(&conn, TOOL_SEARCH, &json!({ ARG_QUERY: "budget" }));
     assert!(!out.is_error);
-    assert!(out.model_text.contains("Budget review"));
+    assert!(out.model_text.contains("Budget review"), "the title");
+    assert!(out.model_text.contains(&budget), "the id get_note needs: {}", out.model_text);
     assert!(out.model_text.contains("marketing budget"));
     assert!(!out.model_text.contains("Hiring"));
-    assert_eq!(out.citations.len(), 1);
-    assert_eq!(out.citations[0].note_id, budget);
 }
 
 #[test]
-fn get_note_returns_the_notes_own_text_and_its_summary_and_cites_it() {
+fn get_note_returns_the_notes_own_text_and_its_summary_and_names_it() {
     let conn = open();
     let id = seed(&conn, "Kickoff", "Project kickoff transcript.");
     patch(
@@ -100,8 +106,7 @@ fn get_note_returns_the_notes_own_text_and_its_summary_and_cites_it() {
     assert!(!out.is_error);
     assert!(out.model_text.contains("Ship by Friday"));
     assert!(out.model_text.contains("Launch slipped two weeks."));
-    assert_eq!(out.citations.len(), 1);
-    assert_eq!(out.citations[0].note_id, id);
+    assert!(out.model_text.contains("Kickoff") && out.model_text.contains(&id), "names itself");
 }
 
 /// A transcript is the largest thing a note holds, so spending that context has to
@@ -125,14 +130,13 @@ fn get_note_withholds_the_transcript_until_asked_but_says_it_is_there() {
 }
 
 #[test]
-fn get_transcript_returns_the_labelled_transcript_and_cites_the_note() {
+fn get_transcript_returns_the_labelled_transcript_and_names_the_note() {
     let conn = open();
     let id = seed(&conn, "Standup", "Ada: the deadline moves.\nBo: understood.");
     let out = exec(&conn, TOOL_TRANSCRIPT, &json!({ ARG_NOTE_ID: id }));
     assert!(!out.is_error);
     assert!(out.model_text.contains("Ada: the deadline moves."));
-    assert_eq!(out.citations.len(), 1);
-    assert_eq!(out.citations[0].note_id, id);
+    assert!(out.model_text.contains("Standup") && out.model_text.contains(&id), "names the note");
 }
 
 /// A note with no transcript is a typed note, not a failure — and saying so is what
@@ -148,18 +152,24 @@ fn get_transcript_on_a_typed_note_explains_the_absence_rather_than_erroring() {
     assert!(out.model_text.contains("Do not treat this as evidence"));
 }
 
+/// A listing is an INDEX, not a source — which is a claim about what it may contain
+/// as much as about how it should be used. It carries titles, dates, ids and a
+/// summary line, and emphatically not the notes' own text: a model handed transcripts
+/// under the heading "list" would assert what a meeting said without ever opening it,
+/// and the tool description's "open a note with get_note before asserting what it
+/// says" would be advice contradicted by the payload it arrives with.
 #[test]
-fn list_notes_reports_titles_dates_and_the_ids_the_other_tools_take() {
+fn list_notes_reports_titles_dates_and_the_ids_the_other_tools_take_but_not_their_content() {
     let conn = open();
-    let first = seed(&conn, "First", "a");
-    seed(&conn, "Second", "b");
+    let first = seed(&conn, "First", "Ada said the deadline moves");
+    seed(&conn, "Second", "Bo disagreed at length");
     let out = exec(&conn, TOOL_LIST, &json!({}));
     assert!(!out.is_error);
     assert!(out.model_text.contains("First") && out.model_text.contains("Second"));
     assert!(out.model_text.contains(&first), "the id get_note needs");
     assert!(out.model_text.contains("2 note(s)"));
-    // A listing is an index, not a source: nobody has read these notes yet.
-    assert!(out.citations.is_empty());
+    assert!(!out.model_text.contains("Ada said the deadline moves"), "{}", out.model_text);
+    assert!(!out.model_text.contains("Bo disagreed"), "{}", out.model_text);
 }
 
 #[test]
@@ -320,7 +330,9 @@ fn a_limit_caps_results_and_a_capped_listing_says_so() {
     assert!(out.model_text.contains("more than 2 notes match"), "{}", out.model_text);
 
     let hits = exec(&conn, TOOL_SEARCH, &json!({ ARG_QUERY: "budget", ARG_LIMIT: 1 }));
-    assert_eq!(hits.citations.len(), 1);
+    assert!(hits.model_text.contains("Showing 1 excerpt(s)"), "{}", hits.model_text);
+    let named = (0..5).filter(|i| hits.model_text.contains(&format!("Note {i}"))).count();
+    assert_eq!(named, 1, "one note, not five: {}", hits.model_text);
 }
 
 // ── workspace isolation, in both directions ─────────────────────────────────
@@ -342,7 +354,10 @@ fn personal_and_workspace_notes_never_see_each_other() {
             execute(&conn, workspace, TOOL_SEARCH, &json!({ ARG_QUERY: "budget" }), NOW);
         assert!(search.model_text.contains(mine_title), "{workspace}: own note reachable");
         assert!(!search.model_text.contains(theirs_title), "{workspace}: other tenant leaked");
-        assert!(search.citations.iter().all(|c| c.note_id == *mine), "{workspace}: citations");
+        // The id as well as the title: an id is enough to fetch a note by, so a
+        // result that named one without its title would still be a leak.
+        assert!(search.model_text.contains(mine.as_str()), "{workspace}: own id");
+        assert!(!search.model_text.contains(theirs.as_str()), "{workspace}: other tenant's id");
 
         let list = execute(&conn, workspace, TOOL_LIST, &json!({}), NOW);
         assert!(list.model_text.contains(mine_title), "{workspace}");
@@ -464,10 +479,12 @@ fn a_language_filter_narrows_to_notes_in_that_language() {
 #[test]
 fn a_search_matching_nothing_reports_a_real_absence_without_inventing_one() {
     let conn = open();
-    seed(&conn, "Budget", "money talk");
+    let id = seed(&conn, "Budget", "money talk");
     let out = exec(&conn, TOOL_SEARCH, &json!({ ARG_QUERY: "zzznonexistent" }));
     assert!(!out.is_error, "an empty result is a valid answer, not a failure");
-    assert!(out.citations.is_empty());
+    // Nothing matched, so nothing may be named: a note offered under a query it did
+    // not match is one an agent will quote as if it had.
+    assert!(!out.model_text.contains("Budget") && !out.model_text.contains(&id));
     assert!(out.model_text.contains("Do not invent an answer"));
 }
 
@@ -521,8 +538,10 @@ fn queries_containing_full_text_syntax_are_answered_rather_than_erroring() {
         let out = exec(&conn, TOOL_SEARCH, &json!({ ARG_QUERY: query }));
         assert!(!out.is_error, "{query:?} should not surface as a syntax error: {}", out.model_text);
     }
-    // And a query whose only content is punctuation is an honest empty, not a hit.
-    assert!(exec(&conn, TOOL_SEARCH, &json!({ ARG_QUERY: "***" })).citations.is_empty());
+    // And a query whose only content is punctuation is an honest empty, not a hit —
+    // sanitising a query down to nothing must not quietly match everything.
+    let empty = exec(&conn, TOOL_SEARCH, &json!({ ARG_QUERY: "***" }));
+    assert!(!empty.model_text.contains("Budget"), "{}", empty.model_text);
 }
 
 // ── what must never reach a client ──────────────────────────────────────────
@@ -610,7 +629,13 @@ fn every_tool_returning_note_content_frames_it_as_data_not_instructions() {
 fn the_shared_tool_vocabulary_matches_the_chat_surface() {
     use std::collections::BTreeSet;
 
-    let chat = crate::chat::tools::tool_specs();
+    // Through the crate's existing public re-export, NOT `chat::tools::tool_specs`.
+    // The modules under `chat` are private on purpose — `mod.rs`'s `pub use` line is
+    // the deliberate surface, and everything else is chat's business. Widening `mod
+    // tools` to `pub(crate)` for one assertion in another module's test would make a
+    // test the reason a production boundary is looser than it needs to be, and the
+    // next reader has no way to tell that the extra reach is test-only.
+    let chat = crate::chat::tool_specs();
     let mine = specs();
     let names = |args: &Value| -> BTreeSet<String> {
         args["properties"]

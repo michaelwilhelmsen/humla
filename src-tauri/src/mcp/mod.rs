@@ -39,6 +39,20 @@ use std::path::{Path, PathBuf};
 /// only then does this fall back to the app's own opener — self-healing once, rather
 /// than migrating on every start or failing with `no such column`.
 ///
+/// That fallback WRITES, from a server the spec calls read-only, and it was argued
+/// once that it should therefore be replaced by an error telling the user to open
+/// Humla. It stays, deliberately. The read-only promise — in the spec, in the
+/// Settings copy, in every tool description — is a claim about NOTES: an agent cannot
+/// alter or destroy a meeting record, and no path in this module touches one. Schema
+/// bookkeeping is not what that promise is about. The migrations are idempotent and
+/// flag-guarded and byte-identical to the ones the app runs, so two processes racing
+/// them duplicates work rather than corrupting anything. And the alternative is worse
+/// than the impurity: without the self-heal, a skewed install answers every tool call
+/// with an error until the user thinks to relaunch the app, having been given no
+/// reason to connect the two. The real concern was the cost on the handshake budget,
+/// and the probe already settles that — the fallback runs on skew alone, never on an
+/// ordinary start.
+///
 /// Not opened with `SQLITE_OPEN_READ_ONLY`: a WAL database needs to create its `-shm`
 /// file, so a read-only connection fails outright when the app isn't running — which
 /// is the case this whole binary exists to serve.
@@ -131,9 +145,17 @@ pub fn active_workspace(conn: &Connection) -> String {
 
 /// The app's database, at the same path the app itself uses.
 ///
-/// `HUMLA_DB_PATH` overrides it, which is what makes the binary testable by hand
-/// against a scratch library instead of the user's real one.
+/// In DEBUG builds only, `HUMLA_DB_PATH` overrides it, which is what makes the binary
+/// testable by hand against a scratch library instead of the user's real one. It is
+/// compiled out of release builds on purpose: this server's entire authorization
+/// story is filesystem permissions on the application-support directory, and an env
+/// var that repoints a shipped binary at an arbitrary SQLite file is a way around
+/// that — anything able to set the environment of the process a client spawns could
+/// serve a library the user never consented to, under Humla's name. Same shape and
+/// same reasoning as `commands::cloud::read_creds`, whose `HUMLA_DEV_SYNC_EMAIL` /
+/// `HUMLA_DEV_SYNC_PASSWORD` are debug-only for the equivalent reason.
 pub fn db_path() -> Option<PathBuf> {
+    #[cfg(debug_assertions)]
     if let Some(p) = std::env::var_os("HUMLA_DB_PATH") {
         return Some(PathBuf::from(p));
     }
@@ -213,6 +235,33 @@ mod tests {
         }
         let conn = open_db(&path).unwrap();
         assert!(schema_is_current(&conn), "the fallback migrated it");
+    }
+
+    /// The env override is a debug-build convenience and must not exist in a shipped
+    /// binary. This server's whole authorization story is filesystem permissions on
+    /// the application-support directory; an env var that repoints it at any SQLite
+    /// file on the machine is a way around that, and the process's environment is set
+    /// by whatever spawned it, not by the user.
+    ///
+    /// The test runs in a debug build, so it can only pin the compiled-in half
+    /// directly — the release half is asserted structurally, by the fact that the
+    /// override never applies unless `debug_assertions` is on.
+    #[test]
+    fn the_database_path_override_exists_only_in_debug_builds() {
+        // SAFETY: single-threaded within this test, and the var is removed again
+        // before it returns so no other test can observe it.
+        unsafe { std::env::set_var("HUMLA_DB_PATH", "/tmp/humla-scratch.sqlite") };
+        let overridden = db_path();
+        unsafe { std::env::remove_var("HUMLA_DB_PATH") };
+
+        if cfg!(debug_assertions) {
+            assert_eq!(overridden, Some(PathBuf::from("/tmp/humla-scratch.sqlite")));
+        } else {
+            let real = db_path().expect("a data directory");
+            assert_eq!(overridden.as_ref(), Some(&real), "the override survived into release");
+        }
+        // Either way, the default is the app's own library and nothing else.
+        assert!(db_path().unwrap().ends_with(format!("{BUNDLE_ID}/notes.sqlite")));
     }
 
     #[test]
