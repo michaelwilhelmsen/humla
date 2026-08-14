@@ -138,6 +138,35 @@ fn schema_object(v: &Value) -> Arc<Map<String, Value>> {
 }
 
 impl ServerHandler for HumlaMcp {
+    /// Every protocol version `rmcp` knows EXCEPT `2026-07-28`, which it advertises
+    /// by default and cannot actually serve.
+    ///
+    /// That version's SEP-2549 makes `ttlMs` and `cacheScope` REQUIRED on every
+    /// result, and `rmcp` 3.1.2 declares both as `Option` with
+    /// `skip_serializing_if = "Option::is_none"` — so it omits them and emits a
+    /// `tools/list` that does not satisfy the version it just agreed to. Negotiation
+    /// echoes whatever the client asks for as long as this list contains it, so
+    /// declaring the version was enough to break every client that asks for it:
+    /// Claude Code connected, failed `tools/list` on schema validation, and
+    /// registered ZERO tools while still reporting the server as connected — the
+    /// worst shape of failure, because the static instructions still arrive at
+    /// initialization and the server looks healthy.
+    ///
+    /// `get_info`'s `protocol_version` is NOT the cap — it is only the fallback for a
+    /// client whose request isn't in this list. This is the cap.
+    ///
+    /// Delete this override once `rmcp` serializes those fields; until then a version
+    /// we cannot serve is worse than one we don't offer.
+    fn supported_protocol_versions(&self) -> std::borrow::Cow<'static, [ProtocolVersion]> {
+        std::borrow::Cow::Owned(
+            ProtocolVersion::KNOWN_VERSIONS
+                .iter()
+                .filter(|v| **v != ProtocolVersion::V_2026_07_28)
+                .cloned()
+                .collect(),
+        )
+    }
+
     fn get_info(&self) -> ServerInfo {
         // Resources are declared as well as tools: Claude Code turns them into `@`
         // mentions, and a server that declares none has been reported by Codex as
@@ -211,6 +240,38 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let conn = crate::db::open(&dir.path().join("t.sqlite")).unwrap();
         HumlaMcp::new(conn).get_info()
+    }
+
+    /// A client that asks for `2026-07-28` must be answered with a version we can
+    /// actually serialize. `rmcp` advertises that version by default and then omits
+    /// the `ttlMs` / `cacheScope` its SEP-2549 makes required, so a client validating
+    /// the response registers no tools at all — while still showing the server as
+    /// connected, because the handshake and the instructions both succeed. Shipped
+    /// once (v0.45.0) and reported from a real Claude Code session.
+    #[test]
+    fn the_server_never_agrees_to_a_protocol_version_it_cannot_serialize() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("t.sqlite")).unwrap();
+        let supported = HumlaMcp::new(conn).supported_protocol_versions();
+
+        assert!(
+            !supported.contains(&ProtocolVersion::V_2026_07_28),
+            "2026-07-28 requires ttlMs + cacheScope on every result, which rmcp omits"
+        );
+        // …and the versions we DO serve are still offered, or narrowing the list
+        // would have traded one connection failure for another.
+        for v in [
+            ProtocolVersion::V_2025_11_25,
+            ProtocolVersion::V_2025_06_18,
+            ProtocolVersion::V_2025_03_26,
+            ProtocolVersion::V_2024_11_05,
+        ] {
+            assert!(supported.contains(&v), "{v} must stay supported");
+        }
+        // The fallback for an unknown request has to be one we serve, too.
+        assert!(supported.contains(&HumlaMcp::new(
+            crate::db::open(&dir.path().join("t2.sqlite")).unwrap()
+        ).get_info().protocol_version));
     }
 
     /// Resources are a Claude Code bonus, but declaring the capability is not
