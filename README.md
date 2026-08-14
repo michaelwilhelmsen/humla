@@ -109,10 +109,12 @@ The defaults are designed so nothing leaves your machine unless you tell it to.
 
 - **No telemetry, no backend by default.** Humla doesn't phone home. The only outbound traffic is to the API endpoints you've explicitly configured — plus, *if* you opt into sync, the server you connect to (Humla Cloud or your own).
 - **Your notes and transcripts** live in a single SQLite database at `~/Library/Application Support/no.humla.app/`.
-- **Recorded audio:**
-  - During the recording, audio is held in a per-recording temp directory.
-  - After you stop, Humla saves a mixed `playback.wav` per note to `~/Library/Application Support/no.humla.app/recordings/<note_id>/` so you can play the meeting back with word-by-word transcript highlight. The temp directory is then deleted.
-  - The raw per-source streams (separate mic + system WAVs) are *not* kept by default. Turn on Settings → Recording → Audio retention to keep those too — useful for re-running diarization at different thresholds.
+- **Recorded audio is not kept unless you ask for it.**
+  - While recording, audio lives in a per-recording temp directory, deleted once transcription and the speaker pass are finished.
+  - By default **nothing survives that** — no playback file, no raw streams. The note keeps its transcript and word timings, so it still renders in full; you just don't get a player.
+  - Turn on Settings → Recording → **Keep recorded audio** to store meetings under `~/Library/Application Support/no.humla.app/recordings/<note_id>/`: a mixed `playback.wav` for playing the meeting back with word-by-word highlight, plus the raw per-source mic and system WAVs, useful for re-running speaker detection. Roughly 1 MB per minute per channel.
+  - The setting describes **this Mac**, not just its own recordings — with it off, a teammate's synced audio isn't downloaded here either.
+  - Turning it off is going-forward only. **Delete stored audio…**, in the same settings section, sweeps what's already on disk and keeps every transcript and timeline.
 - **The MCP server is off until you enable it**, and read-only when you do. It's a local binary reading the same SQLite database — no port, no network, and no tool that can reach a recording. Turning it off in Settings takes effect on the next tool call, not at the client's next restart.
 - **API keys** are stored in the macOS **Keychain** (one entry per provider — OpenAI, Deepgram, Groq), not in plaintext on disk.
 - **Model downloads** are one-time fetches from HuggingFace; the files live in `~/Library/Application Support/no.humla.app/models/` and `~/Library/Application Support/FluidAudio/Models/`.
