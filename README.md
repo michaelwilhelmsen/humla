@@ -83,6 +83,19 @@ Every note has a **Chat** tab that answers questions about your meetings. It isn
 - **See its work** — it shows what it searched and read, so an answer is auditable rather than a black box.
 - **Local or cloud** — point it at Ollama for fully on-device chat, or OpenAI. Configured under Settings → Chat, separately from your transcription and summary providers.
 
+### Use your notes from Claude Code, Codex, or any MCP client
+
+Humla ships its own **[Model Context Protocol](https://modelcontextprotocol.io) server**, so the agent you already work in can search and read your meeting notes without you switching apps. Ask Claude Code *"what did we agree with Acme about the renewal?"* and it looks it up in your actual meetings.
+
+Six read-only tools: `search_notes`, `get_note`, `get_transcript`, `list_notes`, `list_folders`, `list_clients`. Search spans your typed notes, the summary **and** the spoken transcript, and each result says which of the three it came from — so "what did they actually say" is a question you can ask. Results can be narrowed by folder, client, who spoke, language, and a date window (relative — *the last 30 days* — or absolute, *2026-06-01 to 2026-06-30*).
+
+- **Off until you turn it on.** Settings → General → Integrations, which then hands you a ready-to-paste config line for Claude Code and for Codex. Installing an update never quietly opens your meetings to anything.
+- **Read-only, and no audio.** Nothing an agent does can change or delete a note, and no tool returns or references a recording — the same absolute rule the rest of the app follows.
+- **No key, no network, no server.** It's a small local binary that reads your SQLite database directly, so search is keyword-based rather than embedding-based: nothing to pay for, nothing to send anywhere, and no Keychain prompt. There's no port and no token — the file permissions on your own machine are the authorization.
+- **Works whether or not Humla is open**, and always reads the workspace you're currently in. The workspace is resolved on Humla's side, never passed in, so a client can't ask its way from Personal notes into a shared workspace or back.
+
+One honest limitation: because search is keyword-based, a query has to match the language a note is written in. When a search comes back empty, the server says which languages your notes are actually in, so the agent can retry rather than report that you never discussed it.
+
 ### Stays out of your way
 
 - **Custom vocabulary** — names, jargon, acronyms biased into the transcription so they spell consistently.
@@ -102,6 +115,7 @@ The defaults are designed so nothing leaves your machine unless you tell it to.
   - During the recording, audio is held in a per-recording temp directory.
   - After you stop, Humla saves a mixed `playback.wav` per note to `~/Library/Application Support/no.humla.app/recordings/<note_id>/` so you can play the meeting back with word-by-word transcript highlight. The temp directory is then deleted.
   - The raw per-source streams (separate mic + system WAVs) are *not* kept by default. Turn on Settings → Recording → Audio retention to keep those too — useful for re-running diarization at different thresholds.
+- **The MCP server is off until you enable it**, and read-only when you do. It's a local binary reading the same SQLite database — no port, no network, and no tool that can reach a recording. Turning it off in Settings takes effect on the next tool call, not at the client's next restart.
 - **API keys** are stored in the macOS **Keychain** (one entry per provider — OpenAI, Deepgram, Groq), not in plaintext on disk.
 - **Model downloads** are one-time fetches from HuggingFace; the files live in `~/Library/Application Support/no.humla.app/models/` and `~/Library/Application Support/FluidAudio/Models/`.
 
@@ -174,7 +188,7 @@ Humla auto-updates: existing installs detect new releases on launch and prompt t
 └─────────────────────────────────────────────────────────────┘
 ```
 
-In plain language: when you hit Record, a small native Swift helper captures your microphone and your system audio as two separate streams, splits each one into short clips at natural speech pauses, and feeds the clips to whichever transcription engine you picked. Your typed notes are saved continuously alongside the transcript. When you stop, Humla runs speaker identification offline (still no audio leaves your Mac) and labels the transcript. *Summarize* sends your notes + the transcript to your chosen LLM and produces a structured Markdown summary. Notes are also indexed for search — full-text plus embeddings — which is what the Chat tab draws on when it goes looking for an answer.
+In plain language: when you hit Record, a small native Swift helper captures your microphone and your system audio as two separate streams, splits each one into short clips at natural speech pauses, and feeds the clips to whichever transcription engine you picked. Your typed notes are saved continuously alongside the transcript. When you stop, Humla runs speaker identification offline (still no audio leaves your Mac) and labels the transcript. *Summarize* sends your notes + the transcript to your chosen LLM and produces a structured Markdown summary. Notes are also indexed for search — full-text plus embeddings — which is what the Chat tab draws on when it goes looking for an answer. The MCP server reads that same database — the keyword half of the index, so it needs no API key — which is why an outside agent searches the notes you already have rather than a copy of them.
 
 For a deep dive into the architecture — module map, data flow, gotchas — see [`CLAUDE.md`](CLAUDE.md).
 
@@ -194,8 +208,11 @@ cd humla
 pnpm install
 ./scripts/build-sidecar.sh    # builds the audio-capture Swift sidecar
 ./scripts/build-diarize.sh    # builds the speaker-diarize Swift sidecar
+./scripts/build-mcp.sh        # builds the humla-mcp server binary
 pnpm tauri dev
 ```
+
+All three are bundled binaries the app declares up front, so the build fails if any is missing — run them once after cloning, and again only when you change their source.
 
 To build a launchable `.app` bundle locally:
 
@@ -219,6 +236,8 @@ humla/
 │   │   ├── recording.rs        # session state, per-source trails
 │   │   ├── stt/                # STT adapter abstraction (OpenAI/Local/Deepgram/Groq)
 │   │   ├── chat/               # agentic note-chat: tool loop, retrieval, providers
+│   │   ├── mcp/                # the MCP server's six read-only tools over your notes
+│   │   ├── bin/humla-mcp.rs    # that server as a second binary, shipped in the bundle
 │   │   ├── diarize.rs          # speaker-diarize sidecar wrapper
 │   │   ├── local_whisper.rs    # whisper-rs + Metal model registry
 │   │   └── openai.rs           # OpenAI HTTP client + summary endpoint
@@ -234,6 +253,7 @@ humla/
 - **Local Whisper** — `whisper-rs` 0.16 (binds `whisper.cpp`) with the `metal` feature; `large-v3-turbo-q5` default plus alternative multilingual models and NB Whisper Large for Norwegian
 - **Speaker diarization** — FluidAudio Swift package; pyannote community-1 + VBx clustering with PLDA, *or* NVIDIA Sortformer; CoreML on Apple Neural Engine
 - **Note chat** — agentic tool loop over three retrieval tools; hybrid search combining SQLite **FTS5** keyword ranking with semantic embedding similarity; OpenAI or Ollama as the chat provider
+- **MCP server** — `rmcp` (the official Rust MCP SDK) over stdio, built as a second binary from the same crate and signed into the app bundle; opens the notes database directly, so it runs with or without the app
 - **Audio capture** — Swift, `AVAudioEngine`, `ScreenCaptureKit`; sandbox-detached via `setsid` so TCC permissions bind to the sidecar binary
 
 ## Acknowledgements
