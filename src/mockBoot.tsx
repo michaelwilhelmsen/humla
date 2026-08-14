@@ -13,6 +13,8 @@ import ReactDOM from "react-dom/client";
 import { StrictMode, useState } from "react";
 import { mockIPC } from "@tauri-apps/api/mocks";
 import { TranscriptEditor, TranscriptPlayer } from "./pages/Note";
+import { IntegrationsSection } from "./pages/settings/tabs/Integrations";
+import { DEFAULTS, type EditableKey } from "./pages/settings/types";
 import { SummaryStep } from "./pages/onboarding/steps/Summary";
 import { TranscriptionStep } from "./pages/onboarding/steps/Transcription";
 import { STEP_ORDER, type StepContext, type StepId } from "./pages/onboarding/types";
@@ -198,7 +200,39 @@ function TranscriptPlayerHarness({ disabled }: { disabled: boolean }) {
   );
 }
 
+// ---- #172 axis: the MCP integration section in Settings --------------------
+// What needs eyes here is the multi-line Codex snippet: CommandSnippet's block
+// mode wraps instead of truncating, and a config stanza next to a Copy button
+// is the one row in this section that isn't a plain control row.
+//
+// The wrapper mirrors SettingsLayout's content column (`max-w-2xl mx-auto px-8
+// py-7`) — the Section card fills its container, so a full-width wrapper would
+// stretch the snippets far past what they ever get in the real dialog.
+function integrationsCase(enabled: boolean): Scenario {
+  return {
+    wrap: (node) => (
+      <div className="flex-1 min-h-0 overflow-y-auto">
+        <div className="max-w-2xl mx-auto px-8 py-7">{node}</div>
+      </div>
+    ),
+    render: () => <IntegrationsHarness enabled={enabled} />,
+    ipc: {
+      mcp_server_path: () => "/Applications/Humla.app/Contents/MacOS/humla-mcp",
+    },
+  };
+}
+
+function IntegrationsHarness({ enabled }: { enabled: boolean }) {
+  const [on, setOn] = useState(enabled ? "true" : "false");
+  const s = { ...DEFAULTS, mcp_enabled: on } as Record<EditableKey, string>;
+  return <IntegrationsSection s={s} update={(_k, v) => setOn(v)} />;
+}
+
 const CASES: Record<string, Scenario> = {
+  // --- #172: the MCP switch, off (the default) and on (snippets revealed).
+  "mcp-off": integrationsCase(false),
+  "mcp-on": integrationsCase(true),
+
   // --- #147: the issue's exact report — recommended model already pulled.
   recommended: summaryCase(["gemma4:12b-mlx", "embeddinggemma"]),
   // 16 GB tier fallback.

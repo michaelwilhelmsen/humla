@@ -4,10 +4,10 @@
 //! + streaming together. The `#[tauri::command]` wrappers live in
 //! `commands::chat`; everything here is Tauri-free so it's unit-testable.
 
-mod adapter;
+pub(crate) mod adapter;
 pub mod cloud;
 mod providers;
-mod tools;
+pub(crate) mod tools;
 
 pub use adapter::{CancelFlag, ChatAdapter, ChatCtx, ChatStreamEvent, ChatTurn, ToolSpec};
 pub use providers::{OllamaChatAdapter, OpenAiChatAdapter};

@@ -57,6 +57,7 @@ keyring = { version = "3", default-features = false, features = ["apple-native"]
 # build can drop it (and all sync networking) entirely. Its deps are a strict
 # subset of the core's, so enabling it adds no new transitive crates.
 cloud-sync = { path = "crates/cloud-sync", optional = true }
+rmcp = { version = "3", default-features = false, features = ["server", "transport-io", "macros"] }
 
 [dev-dependencies]
 tempfile = "3"
