@@ -319,6 +319,157 @@ fn a_nonsensical_date_window_is_ignored_rather_than_returning_nothing() {
     assert!(!out.model_text.contains("Ancient"));
 }
 
+/// Three kinds of text are indexed together, and which one a hit came from is the
+/// difference between what someone SAID and what was written down about it. The tag
+/// was always emitted; nothing said the transcript was searchable at all, so a client
+/// asking "did they actually mention clause 4.2" had no way to know this was the tool
+/// for it.
+#[test]
+fn search_reaches_the_transcript_the_summary_and_the_typed_notes_and_says_which() {
+    let conn = open();
+    let id = seed(&conn, "Renewal call", "Hege: the indemnity clause is the sticking point");
+    patch(
+        &conn,
+        &id,
+        db::NotePatch {
+            body: Some("<p>my own scribble about pricing</p>".into()),
+            summary: Some("They will revert on the escalation path.".into()),
+            ..Default::default()
+        },
+    );
+
+    for (term, tag) in [("indemnity", "transcript"), ("scribble", "body"), ("escalation", "summary")]
+    {
+        let out = exec(&conn, TOOL_SEARCH, &json!({ ARG_QUERY: term }));
+        assert!(!out.is_error, "{term}");
+        assert!(out.model_text.contains("Renewal call"), "{term} found no hit: {}", out.model_text);
+        assert!(out.model_text.contains(&format!("[{tag}]")), "{term} untagged: {}", out.model_text);
+    }
+}
+
+/// A client that arrives at a note by id — from a search hit, or one the user pasted —
+/// used to see LESS about it than a listing row would have said: no cast, no client.
+/// Attendees were reported missing from this surface entirely, and they were:
+/// `notes.speakers` is derived on every reindex and was simply never shown here.
+#[test]
+fn reading_one_note_names_who_spoke_its_client_and_its_folder() {
+    let conn = open();
+    let id = seed(&conn, "Renewal call", "Hege: shall we start\nMichael: yes");
+    let client = db::create_client(&conn, "Cefor", "").unwrap();
+    let folder = db::create_folder(&conn, "Insurance", "").unwrap();
+    db::set_note_client(&conn, &id, Some(&client.id)).unwrap();
+    db::move_note(&conn, &id, Some(&folder.id)).unwrap();
+
+    // Both by-id tools, because they share one header: a transcript's cast up front
+    // is also the canonical spelling of the names the speaker filter takes.
+    for tool in [TOOL_GET, TOOL_TRANSCRIPT] {
+        let out = exec(&conn, tool, &json!({ ARG_NOTE_ID: &id }));
+        assert!(!out.is_error, "{tool}: {}", out.model_text);
+        assert!(out.model_text.contains("Hege"), "{tool} named no speaker");
+        assert!(out.model_text.contains("Michael"), "{tool} named only one speaker");
+        assert!(out.model_text.contains("Cefor"), "{tool} named no client");
+        assert!(out.model_text.contains("Insurance"), "{tool} named no folder");
+        // Names alone are unusable as filter arguments — the ids are what the other
+        // tools take, so both travel together.
+        assert!(out.model_text.contains(&client.id), "{tool} gave the client name but no id");
+        assert!(out.model_text.contains(&folder.id), "{tool} gave the folder name but no id");
+    }
+
+    // An unfiled, untagged, typed-up note claims none of it rather than saying "none".
+    let bare = seed(&conn, "Solo jotting", "");
+    let out = exec(&conn, TOOL_GET, &json!({ ARG_NOTE_ID: bare }));
+    assert!(!out.model_text.contains("client:"), "{}", out.model_text);
+    assert!(!out.model_text.contains("folder:"), "{}", out.model_text);
+    assert!(!out.model_text.contains("spoke:"), "{}", out.model_text);
+}
+
+/// "Notes from June 2026" cannot be said in the relative form without knowing what
+/// today is, and an agent that cannot say it over-fetches and filters on its own side.
+/// The upper bound INCLUDES the day named — a note recorded on the 30th belongs to a
+/// window that ends on the 30th, and the alternative is an off-by-one nobody reports.
+#[test]
+fn an_absolute_date_window_selects_a_named_month_including_its_last_day() {
+    let conn = open();
+    // NOW is 2026-07-26, so these land on 2026-06-15, 2026-06-30 midday, 2026-07-20.
+    let mid_june = seed(&conn, "Mid-June budget", "the budget came up");
+    let last_june = seed(&conn, "Last-June budget", "the budget came up");
+    let july = seed(&conn, "July budget", "the budget came up");
+    set_created_at(&conn, &mid_june, NOW - 41 * DAY);
+    set_created_at(&conn, &last_june, NOW - 26 * DAY + DAY / 2);
+    set_created_at(&conn, &july, NOW - 6 * DAY);
+
+    for tool in [TOOL_LIST, TOOL_SEARCH] {
+        let out = exec(
+            &conn,
+            tool,
+            &json!({ ARG_QUERY: "budget", ARG_SINCE: "2026-06-01", ARG_UNTIL_DATE: "2026-06-30" }),
+        );
+        assert!(!out.is_error, "{tool}: {}", out.model_text);
+        assert!(out.model_text.contains("Mid-June"), "{tool}");
+        assert!(out.model_text.contains("Last-June"), "{tool} includes the day named as the end");
+        assert!(!out.model_text.contains("July"), "{tool}");
+    }
+}
+
+/// Unlike every other argument here, a date that cannot be read is an error. There is
+/// no truthful "no filter" reading of it: the caller asked for a bound, and widening
+/// to the whole library hands back notes from any year to be described as that month.
+#[test]
+fn a_date_that_is_not_a_date_is_an_error_that_names_the_format() {
+    let conn = open();
+    seed(&conn, "Budget", "the budget came up");
+    for bad in ["June 2026", "2026", "01/06/2026", "yesterday"] {
+        let out = exec(&conn, TOOL_LIST, &json!({ ARG_SINCE: bad }));
+        assert!(out.is_error, "{bad} should not pass");
+        assert!(out.model_text.contains("YYYY-MM-DD"), "{bad}: {}", out.model_text);
+        assert!(!out.model_text.contains("Budget"), "{bad} must not answer over everything");
+    }
+}
+
+/// Two ways of saying where the same edge sits is a caller that means two different
+/// things. Picking either silently answers a question nobody asked; the opposite
+/// pairing (a relative start with an absolute end) is legal and means what it says.
+#[test]
+fn the_two_forms_of_one_window_edge_cannot_be_combined() {
+    let conn = open();
+    let old = seed(&conn, "Ancient budget", "the budget came up");
+    set_created_at(&conn, &old, NOW - 400 * DAY);
+
+    let clash = exec(&conn, TOOL_LIST, &json!({ ARG_WITHIN: 30, ARG_SINCE: "2026-06-01" }));
+    assert!(clash.is_error);
+    assert!(clash.model_text.contains(ARG_SINCE) && clash.model_text.contains(ARG_WITHIN));
+
+    let mixed = exec(&conn, TOOL_LIST, &json!({ ARG_WITHIN: 3_000, ARG_UNTIL_DATE: "2026-06-30" }));
+    assert!(!mixed.is_error, "{}", mixed.model_text);
+    assert!(mixed.model_text.contains("Ancient"));
+}
+
+/// The objection that kept absolute dates out at first: a hallucinated year returns
+/// an empty a model reads as "nothing happened then". Spelling the resolved window
+/// back is what makes the mistake visible instead of silent.
+#[test]
+fn an_empty_result_says_which_window_it_ran_under() {
+    let conn = open();
+    seed(&conn, "Budget", "the budget came up");
+
+    let listed = exec(&conn, TOOL_LIST, &json!({ ARG_SINCE: "2027-06-01" }));
+    assert!(!listed.is_error);
+    assert!(listed.model_text.contains("2027-06-01"), "{}", listed.model_text);
+
+    let searched = exec(
+        &conn,
+        TOOL_SEARCH,
+        &json!({ ARG_QUERY: "budget", ARG_SINCE: "2027-06-01", ARG_UNTIL_DATE: "2027-06-30" }),
+    );
+    assert!(searched.model_text.contains("2027-06-01"), "{}", searched.model_text);
+    // The inclusive last day, as the caller wrote it — not the exclusive bound it is
+    // stored as, which would echo back a date the caller never mentioned.
+    assert!(searched.model_text.contains("2027-06-30"), "{}", searched.model_text);
+    // A search with no window says nothing about one.
+    let plain = exec(&conn, TOOL_SEARCH, &json!({ ARG_QUERY: "nothingmatchesthis" }));
+    assert!(!plain.model_text.contains("date window"), "{}", plain.model_text);
+}
+
 #[test]
 fn a_limit_caps_results_and_a_capped_listing_says_so() {
     let conn = open();
@@ -664,6 +815,15 @@ fn the_shared_tool_vocabulary_matches_the_chat_surface() {
         // MCP-only: the caller pays for its own context, so it may choose how much.
         (TOOL_SEARCH, "mcp", ARG_LIMIT),
         (TOOL_LIST, "mcp", ARG_LIMIT),
+        // MCP-only: the absolute half of the date window. Chat keeps the relative
+        // form alone for two reasons — its specs are pinned pairwise against
+        // humla-cloud, so an argument here would be a cross-repo change; and it runs
+        // on models small enough that calendar arithmetic is where they go wrong. An
+        // MCP client asks "what happened in June" and has the arithmetic to back it.
+        (TOOL_SEARCH, "mcp", ARG_SINCE),
+        (TOOL_SEARCH, "mcp", ARG_UNTIL_DATE),
+        (TOOL_LIST, "mcp", ARG_SINCE),
+        (TOOL_LIST, "mcp", ARG_UNTIL_DATE),
         // MCP-only: a transcript is the biggest thing a note holds and get_transcript
         // exists so spending that context is a decision, not a default.
         (TOOL_GET, "mcp", ARG_INCLUDE_TRANSCRIPT),

@@ -83,6 +83,12 @@ const ARG_SPEAKER: &str = "speaker";
 const ARG_LANGUAGE: &str = "language";
 const ARG_WITHIN: &str = "within_days";
 const ARG_UNTIL: &str = "until_days";
+/// The absolute half of the date window. Both take `YYYY-MM-DD`, and both are
+/// INCLUSIVE of the day named — `until` is converted to the exclusive bound
+/// [`NoteFilter`] wants, because "until 30 June" naming a window that stops on the
+/// 29th is the kind of off-by-one nobody reports and everybody mis-answers from.
+const ARG_SINCE: &str = "since";
+const ARG_UNTIL_DATE: &str = "until";
 const ARG_LIMIT: &str = "limit";
 const ARG_INCLUDE_TRANSCRIPT: &str = "include_transcript";
 
@@ -123,12 +129,23 @@ const LANGUAGE_NOTE: &str = "The index is lexical, so terms must match the langu
 pub fn specs() -> Vec<Spec> {
     let folder_id = json!({ "type": "string", "description": "Optional: restrict to one folder id, as shown by list_folders." });
     let client_id = json!({ "type": "string", "description": "Optional: restrict to notes tagged with one client id, as shown by list_clients. A Client is the business relationship a note is about, so this spans every note tagged with it." });
-    // RELATIVE, not absolute dates: an absolute range makes the model do calendar
-    // arithmetic, and a hallucinated year returns a silent empty. Both ends count
-    // back from today, so a window that ENDS in the past is expressible without
-    // either side knowing today's date.
-    let within = json!({ "type": "integer", "description": "Optional: only notes from the last N days (7 for last week)." });
+    // Two shapes of the same window, because the questions come in two shapes.
+    //
+    // RELATIVE (`within_days` / `until_days`) is still the safer default: it makes no
+    // calendar arithmetic necessary, and a window that ENDS in the past is expressible
+    // without either side knowing today's date.
+    //
+    // ABSOLUTE (`since` / `until`) exists because "notes from June 2026" cannot be said
+    // in the relative form at all without knowing today, and over-fetching then
+    // filtering client-side is the workaround an agent reaches for otherwise. The
+    // original objection stands — a hallucinated year returns an empty a model reads as
+    // "nothing happened then" — so an empty result under a date filter echoes the
+    // window it actually resolved to (see `window_echo`), which is what makes a wrong
+    // year visible rather than silent.
+    let within = json!({ "type": "integer", "description": "Optional: only notes from the last N days (7 for last week). Use this, not since/until, when the question is relative to today." });
     let until = json!({ "type": "integer", "description": "Optional: exclude notes from the last N days, so the window ends in the past. within_days 35 with until_days 7 is the four weeks before last week." });
+    let since = json!({ "type": "string", "description": "Optional: only notes created on or after this calendar date, as YYYY-MM-DD. For a named month or a fixed range; cannot be combined with within_days." });
+    let until_date = json!({ "type": "string", "description": "Optional: only notes created on or before this calendar date, as YYYY-MM-DD — the day itself is included. since 2026-06-01 with until 2026-06-30 is the whole of June. Cannot be combined with until_days." });
     // Who SPOKE, not who was mentioned. Matched exactly against the labels in the
     // transcript, so names must come from a listing row — an unmatched name answers
     // with the names that do exist rather than with nothing, so a near-miss can
@@ -147,7 +164,11 @@ pub fn specs() -> Vec<Spec> {
             name: TOOL_SEARCH,
             description: format!(
                 "Keyword-search the user's meeting notes and return the matching excerpts, \
-                 each naming the note it came from. This is the way in: use it to find which \
+                 each naming the note it came from. Three kinds of text are indexed and \
+                 searched together — what the user typed during the meeting, the AI summary, \
+                 and the full spoken transcript — and every excerpt is tagged [body], \
+                 [summary] or [transcript] so you can tell what someone actually SAID from \
+                 what was written down about it. This is the way in: use it to find which \
                  meetings are relevant, then {TOOL_GET} to read one. Repeat with different \
                  wording when a search comes back thin — the index is keyword-based, so \
                  synonyms and inflections are not matched for you. {LANGUAGE_NOTE}"
@@ -162,6 +183,8 @@ pub fn specs() -> Vec<Spec> {
                     ARG_LANGUAGE: language,
                     ARG_WITHIN: within,
                     ARG_UNTIL: until,
+                    ARG_SINCE: since,
+                    ARG_UNTIL_DATE: until_date,
                     ARG_LIMIT: { "type": "integer", "description": "Optional: how many excerpts to return (default 10)." },
                 },
                 "required": [ARG_QUERY],
@@ -204,7 +227,7 @@ pub fn specs() -> Vec<Spec> {
             description: format!(
                 "List the user's notes most-recent first — title, date, id, client, who spoke \
                  and a one-line summary — optionally narrowed by folder, client, speaker, \
-                 language or a relative date window. Use it to skim what exists, to answer \
+                 language or a date window, relative or absolute. Use it to skim what exists, to answer \
                  \"which meetings were about X\" when a keyword search is too narrow, and to \
                  learn the exact ids and speaker names the filters take. It is an index, not a \
                  source: open a note with {TOOL_GET} before asserting what it says. \
@@ -219,6 +242,8 @@ pub fn specs() -> Vec<Spec> {
                     ARG_LANGUAGE: language,
                     ARG_WITHIN: within,
                     ARG_UNTIL: until,
+                    ARG_SINCE: since,
+                    ARG_UNTIL_DATE: until_date,
                     ARG_LIMIT: { "type": "integer", "description": "Optional: how many notes to list (default 40)." },
                 },
             }),
@@ -290,40 +315,120 @@ fn window_edge(args: &Value, key: &str, now_ms: i64) -> Option<i64> {
     Some(now_ms - days.min(MAX_WINDOW_DAYS) * MS_PER_DAY)
 }
 
-/// Reject a window that cannot contain anything — an upper bound at or below the
-/// lower one. The one date argument that earns an error rather than being ignored:
-/// the others have a truthful "no filter" reading, an inverted range has none.
-/// Ignoring it would answer over the whole library and running it would return an
-/// empty the model reads as "nothing happened then" — both assert something false.
-fn validate_window(args: &Value, now_ms: i64) -> Result<(), String> {
-    let (Some(since), Some(until)) =
-        (window_edge(args, ARG_WITHIN, now_ms), window_edge(args, ARG_UNTIL, now_ms))
-    else {
-        return Ok(());
+/// One end of the window given as a calendar date, at UTC midnight of the day named.
+///
+/// A malformed date ERRORS rather than being ignored, unlike every other argument
+/// here. The others have a truthful "no filter" reading; this one does not — a caller
+/// who wrote `since: "June 2026"` wants a bound, and quietly widening to the whole
+/// library hands back notes from any year for the model to describe as that month.
+/// The error is one round trip and is correctable; a silent wrong answer is neither.
+fn date_arg(args: &Value, key: &str) -> Result<Option<i64>, String> {
+    let Some(raw) = str_arg(args, key) else {
+        return Ok(None);
     };
-    if until <= since {
-        return Err(format!(
-            "{ARG_UNTIL} must be smaller than {ARG_WITHIN} — both count back from today, so \
-             {ARG_UNTIL} marks where the window ENDS. For the four weeks before last week: \
-             {ARG_WITHIN} 35, {ARG_UNTIL} 7."
-        ));
-    }
-    Ok(())
+    chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d")
+        .ok()
+        .and_then(|d| d.and_hms_opt(0, 0, 0))
+        .map(|dt| Some(dt.and_utc().timestamp_millis()))
+        .ok_or_else(|| {
+            format!(
+                "\"{key}\" must be a calendar date as YYYY-MM-DD (for example 2026-06-01), not \
+                 \"{raw}\". For a window relative to today, use {ARG_WITHIN}/{ARG_UNTIL} instead."
+            )
+        })
 }
 
-/// The `NoteFilter` a set of tool arguments describes. There is no breadth clamp
-/// here — unlike chat, where the user picks a scope in the UI, an MCP caller's reach
-/// is the whole active workspace and nothing narrower is on offer. Workspace itself
-/// is not part of this: it is resolved above and passed separately to every query.
-fn resolve_filter<'a>(args: &'a Value, now_ms: i64) -> NoteFilter<'a> {
-    NoteFilter {
+/// The `NoteFilter` a set of tool arguments describes, or the message a client should
+/// see. There is no breadth clamp here — unlike chat, where the user picks a scope in
+/// the UI, an MCP caller's reach is the whole active workspace and nothing narrower is
+/// on offer. Workspace itself is not part of this: it is resolved above and passed
+/// separately to every query.
+///
+/// Fallible because of the date window alone, and it owns that whole rule so the two
+/// call sites cannot come to disagree about which windows are legal.
+fn resolve_filter<'a>(args: &'a Value, now_ms: i64) -> Result<NoteFilter<'a>, String> {
+    let rel_since = window_edge(args, ARG_WITHIN, now_ms);
+    let rel_until = window_edge(args, ARG_UNTIL, now_ms);
+    let abs_since = date_arg(args, ARG_SINCE)?;
+    // Inclusive of the day named, converted to the exclusive upper bound the filter
+    // takes. Successive windows still tile without double-counting, because the
+    // boundary that moves is a whole day later than the one the caller wrote.
+    let abs_until = date_arg(args, ARG_UNTIL_DATE)?.map(|ms| ms + MS_PER_DAY);
+
+    // Two forms of the same edge is not a narrowing to combine — it is a caller that
+    // means two different things, and picking either one silently answers a question
+    // nobody asked. The opposite pairing (`within_days` with `until`) is legal and
+    // means what it says.
+    if rel_since.is_some() && abs_since.is_some() {
+        return Err(format!(
+            "Pass either {ARG_WITHIN} or {ARG_SINCE}, not both — they are two ways to say where \
+             the window starts. Use {ARG_SINCE} for a calendar date, {ARG_WITHIN} for a count of \
+             days back from today."
+        ));
+    }
+    if rel_until.is_some() && abs_until.is_some() {
+        return Err(format!(
+            "Pass either {ARG_UNTIL} or {ARG_UNTIL_DATE}, not both — they are two ways to say \
+             where the window ends."
+        ));
+    }
+    let since_ms = abs_since.or(rel_since);
+    let until_ms = abs_until.or(rel_until);
+
+    // A window that cannot contain anything. The one date mistake that earns an error
+    // rather than a shrug: ignoring it would answer over the whole library, and
+    // running it would return an empty the model reads as "nothing happened then" —
+    // both assert something false.
+    if let (Some(since), Some(until)) = (since_ms, until_ms) {
+        if until <= since {
+            return Err(if abs_since.is_some() || abs_until.is_some() {
+                format!(
+                    "That date window is empty: it ends on or before it starts. Resolved to \
+                     {} – {}.",
+                    fmt_date(since),
+                    fmt_date(until - MS_PER_DAY)
+                )
+            } else {
+                format!(
+                    "{ARG_UNTIL} must be smaller than {ARG_WITHIN} — both count back from today, \
+                     so {ARG_UNTIL} marks where the window ENDS. For the four weeks before last \
+                     week: {ARG_WITHIN} 35, {ARG_UNTIL} 7."
+                )
+            });
+        }
+    }
+
+    Ok(NoteFilter {
         folder_id: str_arg(args, ARG_FOLDER_ID),
         client_id: str_arg(args, ARG_CLIENT_ID),
         speaker: str_arg(args, ARG_SPEAKER),
         language: str_arg(args, ARG_LANGUAGE),
-        since_ms: window_edge(args, ARG_WITHIN, now_ms),
-        until_ms: window_edge(args, ARG_UNTIL, now_ms),
+        since_ms,
+        until_ms,
         ..Default::default()
+    })
+}
+
+/// What an EMPTY result says about the date window it ran under, as the dates it
+/// actually resolved to — nothing at all when no window was in play.
+///
+/// This is what makes absolute dates safe to offer. The objection to them was that a
+/// hallucinated year returns an empty the model reads as an absence; spelling the
+/// window back turns that into something the model can see and correct, rather than a
+/// silence it has no reason to distrust. The upper bound is shown as the inclusive
+/// last day, matching how the caller wrote it rather than how it is stored.
+fn window_echo(filter: &NoteFilter<'_>) -> String {
+    match (filter.since_ms, filter.until_ms) {
+        (None, None) => String::new(),
+        (Some(s), None) => format!(" The date window was {} onwards.", fmt_date(s)),
+        (None, Some(u)) => {
+            format!(" The date window was everything up to {}.", fmt_date(u - MS_PER_DAY))
+        }
+        (Some(s), Some(u)) => format!(
+            " The date window was {} – {}.",
+            fmt_date(s),
+            fmt_date(u - MS_PER_DAY)
+        ),
     }
 }
 
@@ -389,6 +494,25 @@ fn client_of(n: &db::NoteMeta) -> String {
     match n.client_name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         Some(name) => format!(" [client: {name} | {id}]"),
         None => format!(" [client: {id}]"),
+    }
+}
+
+/// The ` [folder: Name | id]` fragment for one note, or nothing when it is unfiled.
+///
+/// Shown when READING a note, not on listing rows: it is what unlocks "what else is
+/// filed with this?" at the point that question occurs, whereas forty rows each
+/// repeating the same folder name is noise on a surface built for skimming. The id is
+/// carried alongside the name because the name is not what the filter takes.
+fn folder_of(conn: &Connection, workspace: &str, note: &db::Note) -> String {
+    let Some(id) = note.folder_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+        return String::new();
+    };
+    let name = db::list_folders(conn, workspace)
+        .ok()
+        .and_then(|fs| fs.into_iter().find(|f| f.id == id).map(|f| f.name));
+    match name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(n) => format!(" [folder: {n} | {id}]"),
+        None => format!(" [folder: {id}]"),
     }
 }
 
@@ -479,10 +603,10 @@ fn run_search(conn: &Connection, workspace: &str, args: &Value, now_ms: i64) -> 
     let Some(query) = str_arg(args, ARG_QUERY) else {
         return Outcome::error(format!("{TOOL_SEARCH} needs a non-empty \"{ARG_QUERY}\" string."));
     };
-    if let Err(msg) = validate_window(args, now_ms) {
-        return Outcome::error(msg);
-    }
-    let filter = resolve_filter(args, now_ms);
+    let filter = match resolve_filter(args, now_ms) {
+        Ok(f) => f,
+        Err(msg) => return Outcome::error(msg),
+    };
     let limit = limit_arg(args, SEARCH_LIMIT, SEARCH_LIMIT_MAX);
     // `query_vec: None` — retrieval here is keyword-only by choice (#172). The
     // hybrid function's degraded path is a supported one, not a workaround: an
@@ -506,10 +630,11 @@ fn run_search(conn: &Connection, workspace: &str, args: &Value, now_ms: i64) -> 
             }
         }
         return Outcome::ok(format!(
-            "Nothing in the notes matches \"{query}\". That is a real absence in what was \
+            "Nothing in the notes matches \"{query}\".{} That is a real absence in what was \
              searched, not a truncated list — but the index is keyword-based, so try other \
              wording, or {TOOL_LIST} to see what exists, before telling the user there is \
-             nothing. Do not invent an answer."
+             nothing. Do not invent an answer.",
+            window_echo(&filter)
         ));
     }
 
@@ -619,12 +744,33 @@ fn fetch_with_header(
     };
     let note = fetch_note(conn, workspace, note_id)?;
     let langs = db::note_languages(conn, &[note_id]).unwrap_or_default();
+    // The same descriptor a listing row is built from, for the one note. Without it a
+    // client that jumps straight to an id — from a search hit, or one the user pasted —
+    // sees LESS about the note than a listing would have told it: no client, no cast.
+    // Attendees in particular were reported as missing from this surface entirely, and
+    // they were: `notes.speakers` is derived on every reindex and was simply never
+    // shown here.
+    let meta = db::list_notes_filtered(
+        conn,
+        NoteFilter { note_id: Some(note_id), ..Default::default() },
+        workspace,
+        1,
+    )
+    .ok()
+    .and_then(|rows| rows.into_iter().next());
+    let (client, speakers) = match &meta {
+        Some(m) => (client_of(m), speakers_of(m)),
+        None => (String::new(), String::new()),
+    };
     let header = reference_framing(&format!(
-        "{lead} \"{}\" ({}) [id: {}]{}{tail}",
+        "{lead} \"{}\" ({}) [id: {}]{}{}{}{}{tail}",
         title_or_untitled(&note.title),
         fmt_date(note.created_at),
         note.id,
         lang_of(&langs, note_id),
+        client,
+        folder_of(conn, workspace, &note),
+        speakers,
     ));
     Ok((note, header))
 }
@@ -686,10 +832,10 @@ fn run_transcript(conn: &Connection, workspace: &str, args: &Value) -> Outcome {
 }
 
 fn run_list(conn: &Connection, workspace: &str, args: &Value, now_ms: i64) -> Outcome {
-    if let Err(msg) = validate_window(args, now_ms) {
-        return Outcome::error(msg);
-    }
-    let filter = resolve_filter(args, now_ms);
+    let filter = match resolve_filter(args, now_ms) {
+        Ok(f) => f,
+        Err(msg) => return Outcome::error(msg),
+    };
     let limit = limit_arg(args, LIST_LIMIT, LIST_LIMIT_MAX);
     // One past the cap, so a truncated listing can say so rather than reading as
     // complete — a capped listing that looks whole is how a model ends up asserting
@@ -709,10 +855,11 @@ fn run_list(conn: &Connection, workspace: &str, args: &Value, now_ms: i64) -> Ou
                 return Outcome::ok(text);
             }
         }
-        return Outcome::ok(
-            "No notes match those filters. Widen them, or drop them entirely to see what \
+        return Outcome::ok(format!(
+            "No notes match those filters.{} Widen them, or drop them entirely to see what \
              exists, before concluding the library has nothing.",
-        );
+            window_echo(&filter)
+        ));
     }
     let overflow = notes.len() > limit;
     let kept = if overflow { &notes[..limit] } else { &notes[..] };
