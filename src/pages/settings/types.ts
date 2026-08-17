@@ -8,7 +8,7 @@
 import type { DiarizeModelStatus, LocalWhisperModelStatus, SettingsKey } from "../../lib/ipc";
 import { SUMMARY_PRESETS, presetPromptForLang } from "../../lib/presets";
 import type { Theme } from "../../lib/theme";
-import type { Palette } from "../../lib/palette";
+import { PALETTE_REGISTRY, type Palette } from "../../lib/palette";
 
 // The Settings form manages every key except the ones with their own
 // dedicated controls (theme/palette) and the onboarding wizard's internal
@@ -76,10 +76,14 @@ export const THEMES: { value: Theme; label: string }[] = [
   { value: "dark", label: "Dark" },
 ];
 
-export const PALETTES: { value: Palette; label: string; description: string }[] = [
-  { value: "warm", label: "Warm", description: "Paper-cream surfaces, white sidebar hover." },
-  { value: "nothing", label: "Nothing", description: "Neutral grays, mono-line accents." },
-];
+// Derived from the theme registry rather than restated: a new theme file plus a
+// registry row is all it takes to appear here.
+export const PALETTES: { value: Palette; label: string; description: string }[] =
+  PALETTE_REGISTRY.map((p) => ({
+    value: p.id,
+    label: p.label,
+    description: p.description,
+  }));
 
 export const TRANSCRIBE_MODELS = [
   "whisper-1",

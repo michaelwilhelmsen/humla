@@ -1,0 +1,246 @@
+/* ==========================================================================
+   Theme: warm — Humla's shipped design (v0.30.0 redesign).
+
+   Cream-paper canvas, one typeface (Hanken Grotesk), Humla gold accent. This
+   file is the reference implementation of the token contract: every value here
+   is the value the app shipped with before themes were split apart, so `warm`
+   must look pixel-identical to v0.46.
+
+   It is also the DEFAULT theme, which is why its selectors carry the
+   `:root:not([data-palette])` fallback — a document that never got the
+   attribute (an unrecognised stored value, a test renderer, the first paint
+   before hydrate runs) still gets a complete token set instead of an unstyled
+   app. No other theme file has that fallback.
+
+   Elevation ladder (dark especially): canvas (darkest) → sidebar/card bg →
+   surface (pills) → raised, with a visible warm --color-card-border on the
+   inset cards so the layers stay distinct.
+
+   Accent is Humla gold (#ffdc6c) — the logo yellow, the SAME value in both
+   modes (gold reads on light and dark alike, so no inversion). Text/icons
+   placed ON a filled-gold surface use --color-on-accent (dark ink). For
+   accent-COLOURED text/icons/links sitting on a normal surface, use
+   --color-accent-text (a readable amber) — raw gold is too light to read as
+   text. Red is reserved for recording (--color-record) and destructive
+   actions (--color-danger).
+   ========================================================================== */
+
+[data-palette="warm"],
+:root:not([data-palette]) {
+  /* --- shape: typeface ------------------------------------------------- */
+  --font-sans: "Hanken Grotesk", ui-sans-serif, system-ui, sans-serif;
+  --font-code: ui-monospace, "SF Mono", SFMono-Regular, Menlo, monospace;
+
+  /* --- shape: type scale ----------------------------------------------- */
+  --text-title-size: 30px;          /* note title */
+  --text-title-weight: 600;
+  --text-title-line: 1.18;
+  --text-title-tracking: -0.022em;
+  --text-heading-size: 25px;        /* page h1 + prose h1; h2–h4 scale off it */
+  --text-body-size: 15.5px;
+  --text-body-line: 1.5;
+  --text-body-tracking: 0em;
+  --text-ui-size: 13px;             /* buttons, controls */
+  --text-label-size: 11px;          /* .nd-label micro-caps */
+  --text-code-size: 12px;           /* command snippets */
+
+  /* --- shape: icons ----------------------------------------------------- */
+  --icon-size: 16px;
+  --icon-gap: 7px;
+  --icon-btn-size: 33px;
+
+  /* --- shape: controls -------------------------------------------------- */
+  --control-height: 32px;
+  --control-pad-x: 14px;
+  --control-radius: 999px;
+  --control-min-width: 0px;         /* 0, not auto: it is read inside min() */
+
+  /* --- shape: rows + rhythm --------------------------------------------- */
+  --row-height: 30px;               /* single-line list rows */
+  --row-height-lg: 58px;            /* two-line note-list rows */
+  --row-gap: 2px;
+  --col-gap: 6px;
+
+  /* --- shape: navigation ------------------------------------------------ */
+  --nav-row-height: 32px;
+  --nav-label-size: 13.5px;
+  --nav-radius: var(--radius);
+
+  /* --- shape: bars (search + inline input rows) ------------------------- */
+  --bar-height: 36px;
+  --bar-pad-left: 10px;
+  --bar-radius: var(--radius);
+
+  /* --- shape: badge + switch ------------------------------------------- */
+  --badge-height: 20px;
+  --badge-radius: 6px;
+  --switch-w: 38px;
+  --switch-h: 22px;
+  --switch-thumb: 16px;
+
+  /* --- shape: radii ----------------------------------------------------- */
+  --radius: 9px;
+  --radius-card: 14px;
+
+  /* --- colour: light --------------------------------------------------- */
+  --color-canvas: #faf8f2;            /* main writing pane + gutter */
+  --color-sidebar-bg: #f1ece1;        /* inset cards: nav + right panel */
+  --color-surface: #fffef9;           /* pills, content surfaces */
+  --color-surface-2: #f4efe4;         /* recessed chips, scrubber */
+  --color-surface-raised: #ebe5d6;    /* hover, avatars */
+  --color-sidebar-active: var(--color-surface);
+  --color-text: #211e17;
+  --color-text-display: #211e17;
+  --color-text-muted: #6d695e;
+  --color-text-disabled: #a7a08f;
+  --color-line: #e9e3d4;              /* hairline dividers */
+  --color-line-visible: #ddd5c2;
+  --color-card-border: #ddd5c2;       /* inset-card border */
+  --color-pill: transparent;
+  --color-pill-hover: rgba(33, 30, 23, 0.05);
+  --color-input-bg: #fffef9;
+  --color-shadow: transparent;
+  --color-icon: var(--color-text-muted);
+
+  --color-accent: #ffdc6c;            /* Humla gold — fill for primary action / active */
+  --color-accent-2: #f3cb4d;          /* gold hover (slightly deeper) */
+  --color-accent-soft: #fbeecb;       /* gold tint behind active states */
+  --color-on-accent: #2a2206;         /* dark ink on a filled-gold surface */
+  --color-accent-text: #7a5a12;       /* readable amber for accent text/icons/links */
+
+  --color-record: #cf352c;            /* red — recording indicators only */
+  --color-danger: #c4362e;            /* red — destructive actions */
+
+  --color-interactive: #2f6fb0;       /* speaker blue + links */
+  --color-success: #5b8a45;           /* speaker green + synced */
+  --color-warning: #bd962f;           /* speaker gold + override */
+  --color-warning-text: #8a6a1a;      /* readable gold for warning-as-text (light) */
+  --color-speaker-4: #c0463f;         /* speaker red (4th, cycling) */
+
+  /* Usage-meter status colours (#69) — AAA (>=7:1) on --color-surface, the
+     panel/composer background. Warm gold + red hues darkened for the light
+     canvas; distinct from --color-warning/-danger, which don't clear AAA. */
+  --color-status-warning: #69531a;    /* 7.29:1 on #fffef9 */
+  --color-status-danger: #9f2c25;     /* 7.27:1 on #fffef9 */
+
+  --color-badge-bg: var(--color-surface);
+  --color-badge-border: var(--color-line-visible);
+  --color-badge-text: var(--color-text-muted);
+  --color-switch-on: var(--color-accent);
+
+  --color-ink: var(--color-text);
+  --color-ink-muted: var(--color-text-muted);
+
+  --shadow-card: 0 1px 2px rgba(60, 46, 18, 0.04), 0 4px 14px -10px rgba(60, 46, 18, 0.18);
+  color-scheme: light;
+}
+
+/* --- colour: dark via system ------------------------------------------- */
+@media (prefers-color-scheme: dark) {
+  [data-palette="warm"]:not([data-theme="light"]),
+  :root:not([data-palette]):not([data-theme="light"]) {
+    --color-canvas: #0e0c08;
+    --color-sidebar-bg: #1d1912;
+    --color-surface: #2a2418;
+    --color-surface-2: #241f16;
+    --color-surface-raised: #342d20;
+    --color-sidebar-active: var(--color-surface);
+    --color-text: #ece5d6;
+    --color-text-display: #ece5d6;
+    --color-text-muted: #9c968a;
+    --color-text-disabled: #6a655b;
+    --color-line: #322c22;
+    --color-line-visible: #423a27;
+    --color-card-border: #423a27;
+    --color-pill: transparent;
+    --color-pill-hover: rgba(236, 229, 214, 0.06);
+    --color-input-bg: #2a2418;
+    --color-shadow: transparent;
+    --color-icon: var(--color-text-muted);
+
+    --color-accent: #ffdc6c;          /* Humla gold — same value in dark (no inversion) */
+    --color-accent-2: #f3cb4d;
+    --color-accent-soft: #38301a;     /* gold-tinted dark */
+    --color-on-accent: #2a2206;       /* dark ink on filled gold */
+    --color-accent-text: #f3d178;     /* readable amber on dark surfaces */
+
+    --color-record: #e5544b;
+    --color-danger: #e0564d;
+
+    --color-interactive: #6aa3e0;
+    --color-success: #8cc06f;
+    --color-warning: #ddb255;
+    --color-warning-text: #ddb255;
+    --color-speaker-4: #e07a72;
+
+    /* Usage-meter status colours (#69) — AAA (>=7:1) on --color-surface #2a2418,
+       the panel/composer background. Warm hues lightened for the dark canvas. */
+    --color-status-warning: #d3ae4c;  /* 7.28:1 on #2a2418 */
+    --color-status-danger: #e8a09c;   /* 7.29:1 on #2a2418 */
+
+    --color-badge-bg: var(--color-surface);
+    --color-badge-border: var(--color-line-visible);
+    --color-badge-text: var(--color-text-muted);
+    --color-switch-on: var(--color-accent);
+
+    --color-ink: var(--color-text);
+    --color-ink-muted: var(--color-text-muted);
+
+    --shadow-card: 0 10px 28px -14px rgba(0, 0, 0, 0.7);
+    color-scheme: dark;
+  }
+}
+
+/* --- colour: dark explicit --------------------------------------------- */
+[data-palette="warm"][data-theme="dark"],
+:root:not([data-palette])[data-theme="dark"] {
+  --color-canvas: #0e0c08;
+  --color-sidebar-bg: #1d1912;
+  --color-surface: #2a2418;
+  --color-surface-2: #241f16;
+  --color-surface-raised: #342d20;
+  --color-sidebar-active: var(--color-surface);
+  --color-text: #ece5d6;
+  --color-text-display: #ece5d6;
+  --color-text-muted: #9c968a;
+  --color-text-disabled: #6a655b;
+  --color-line: #322c22;
+  --color-line-visible: #423a27;
+  --color-card-border: #423a27;
+  --color-pill: transparent;
+  --color-pill-hover: rgba(236, 229, 214, 0.06);
+  --color-input-bg: #2a2418;
+  --color-shadow: transparent;
+  --color-icon: var(--color-text-muted);
+
+  --color-accent: #ffdc6c;          /* Humla gold — same value in dark (no inversion) */
+  --color-accent-2: #f3cb4d;
+  --color-accent-soft: #38301a;     /* gold-tinted dark */
+  --color-on-accent: #2a2206;       /* dark ink on filled gold */
+  --color-accent-text: #f3d178;     /* readable amber on dark surfaces */
+
+  --color-record: #e5544b;
+  --color-danger: #e0564d;
+
+  --color-interactive: #6aa3e0;
+  --color-success: #8cc06f;
+  --color-warning: #ddb255;
+  --color-warning-text: #ddb255;
+  --color-speaker-4: #e07a72;
+
+  /* Usage-meter status colours (#69) — AAA (>=7:1) on --color-surface #2a2418,
+     the panel/composer background. Warm hues lightened for the dark canvas. */
+  --color-status-warning: #d3ae4c;  /* 7.28:1 on #2a2418 */
+  --color-status-danger: #e8a09c;   /* 7.29:1 on #2a2418 */
+
+  --color-badge-bg: var(--color-surface);
+  --color-badge-border: var(--color-line-visible);
+  --color-badge-text: var(--color-text-muted);
+  --color-switch-on: var(--color-accent);
+
+  --color-ink: var(--color-text);
+  --color-ink-muted: var(--color-text-muted);
+
+  --shadow-card: 0 10px 28px -14px rgba(0, 0, 0, 0.7);
+  color-scheme: dark;
+}

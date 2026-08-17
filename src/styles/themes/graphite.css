@@ -1,0 +1,231 @@
+/* ==========================================================================
+   Theme: graphite — SF Pro on white, DM Mono for commands, ink accent.
+
+   Built from a supplied design recipe. Values the recipe named are marked
+   `recipe`; the rest are `derived`.
+
+   The recipe is LIGHT-NATIVE (three text greys on an unstated background), so
+   the light block is the recipe and the dark blocks are a derived counterpart.
+   It also names no accent and no background, so two decisions were taken and
+   are recorded here rather than left implicit:
+   - background is plain white, and the ladder above it is neutral grey;
+   - the accent is the recipe's own strong ink (#292929), inverted to #f0f0f0 in
+     dark. No new hue enters the theme. The speaker/status hues stay chromatic
+     because they encode meaning, not brand.
+
+   SF Pro is not bundled — it's requested through the system stack, which
+   resolves to SF Pro on macOS (Humla is macOS-only) and degrades to the
+   platform sans anywhere else. DM Mono IS bundled, via @fontsource.
+   ========================================================================== */
+
+[data-palette="graphite"] {
+  /* --- shape: typeface ------------------------------------------------- */
+  --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro", ui-sans-serif, system-ui, sans-serif;
+  --font-code: "DM Mono", ui-monospace, SFMono-Regular, Menlo, monospace; /* recipe */
+
+  /* --- shape: type scale ----------------------------------------------- */
+  --text-title-size: 24px;          /* recipe */
+  --text-title-weight: 500;         /* recipe: Medium */
+  --text-title-line: 1.25;          /* derived: recipe gives no title leading */
+  --text-title-tracking: -0.15px;   /* recipe */
+  --text-heading-size: 24px;        /* recipe: titles */
+  --text-body-size: 16px;           /* recipe */
+  --text-body-line: 26px;           /* recipe */
+  --text-body-tracking: -0.15px;    /* recipe */
+  --text-ui-size: 13px;             /* derived: matches the recipe's label size */
+  --text-label-size: 11px;          /* derived */
+  --text-code-size: 12px;           /* the recipe says 14px; overridden — every
+                                       command in the app sits under 12px small
+                                       print, and DM Mono at 14px outgrew it */
+
+  /* --- shape: icons ----------------------------------------------------- */
+  --icon-size: 16px;                /* derived: sized to the 13px label */
+  --icon-gap: 8px;                  /* derived */
+  --icon-btn-size: 28px;            /* derived: the nav row height */
+
+  /* --- shape: controls -------------------------------------------------- */
+  --control-height: 38px;           /* recipe: bar height is this theme's control height */
+  --control-pad-x: 12px;            /* recipe: 12px */
+  --control-radius: 10px;           /* recipe: 10px */
+  --control-min-width: 0px;         /* derived: 0, not auto — it is read inside min() */
+
+  /* --- shape: rows + rhythm --------------------------------------------- */
+  --row-height: 28px;               /* recipe: 28px rows */
+  --row-height-lg: 52px;            /* derived: two-line note rows */
+  --row-gap: 2px;                   /* derived: a 28px row implies a tight list */
+  --col-gap: 8px;                   /* derived */
+
+  /* --- shape: navigation ------------------------------------------------ */
+  --nav-row-height: 28px;           /* recipe */
+  --nav-label-size: 13px;           /* recipe */
+  --nav-radius: 9px;                /* recipe */
+
+  /* --- shape: bars ------------------------------------------------------ */
+  --bar-height: 38px;               /* recipe */
+  --bar-pad-left: 12px;             /* recipe */
+  --bar-radius: 10px;               /* recipe */
+
+  /* --- shape: badge + switch ------------------------------------------- */
+  --badge-height: 18px;             /* derived */
+  --badge-radius: 6px;              /* derived */
+  --switch-w: 34px;                 /* derived: scaled to the compact metrics */
+  --switch-h: 20px;                 /* derived */
+  --switch-thumb: 14px;             /* derived */
+
+  /* --- shape: radii ----------------------------------------------------- */
+  --radius: 9px;                    /* recipe: the navigation radius, generalised */
+  --radius-card: 12px;              /* derived */
+
+  /* --- colour: light (the recipe) --------------------------------------- */
+  --color-canvas: #ffffff;            /* derived: recipe states no background */
+  --color-sidebar-bg: #f7f7f7;
+  --color-surface: #ffffff;
+  --color-surface-2: #f2f2f2;
+  --color-surface-raised: #eaeaea;
+  --color-sidebar-active: var(--color-surface);
+  --color-text-display: #292929;      /* recipe: strong */
+  --color-text: #5d5d5d;              /* recipe: body */
+  --color-text-muted: #7f7f7f;        /* recipe: muted */
+  --color-text-disabled: #a5a5a5;     /* derived: the recipe's three greys are spoken for */
+  --color-line: #ececec;
+  --color-line-visible: #dedede;
+  --color-card-border: #e4e4e4;
+  --color-pill: transparent;
+  --color-pill-hover: rgba(41, 41, 41, 0.05);
+  --color-input-bg: #ffffff;
+  --color-shadow: transparent;
+  --color-icon: #7f7f7f;              /* recipe: muted */
+
+  --color-accent: #292929;            /* derived: the recipe's strong ink, as the accent */
+  --color-accent-2: #111111;
+  --color-accent-soft: #efefef;
+  --color-on-accent: #ffffff;
+  --color-accent-text: #292929;
+
+  --color-record: #c8322a;
+  --color-danger: #b3352d;
+
+  --color-interactive: #3b6fa8;       /* speaker/link hues stay chromatic — they carry meaning */
+  --color-success: #3f7d3a;
+  --color-warning: #9b7a1e;
+  --color-warning-text: #7d6118;
+  --color-speaker-4: #b0453e;
+
+  --color-status-warning: #6b5314;    /* 7.3:1 on #ffffff */
+  --color-status-danger: #98291f;     /* 8.2:1 on #ffffff */
+
+  --color-badge-bg: #f2f2f2;
+  --color-badge-border: transparent;
+  --color-badge-text: #5d5d5d;
+  --color-switch-on: #292929;
+
+  --color-ink: var(--color-text);
+  --color-ink-muted: var(--color-text-muted);
+
+  --shadow-card: 0 1px 2px rgba(41, 41, 41, 0.05), 0 4px 14px -10px rgba(41, 41, 41, 0.22);
+  color-scheme: light;
+}
+
+/* --- colour: dark via system (derived counterpart) ---------------------- */
+@media (prefers-color-scheme: dark) {
+  [data-palette="graphite"]:not([data-theme="light"]) {
+    --color-canvas: #1b1b1b;
+    --color-sidebar-bg: #232323;
+    --color-surface: #292929;        /* the recipe's strong ink, now the surface */
+    --color-surface-2: #242424;
+    --color-surface-raised: #333333;
+    --color-sidebar-active: var(--color-surface);
+    --color-text-display: #f5f5f5;
+    --color-text: #c4c4c4;
+    --color-text-muted: #9a9a9a;
+    --color-text-disabled: #6e6e6e;
+    --color-line: #2f2f2f;
+    --color-line-visible: #3d3d3d;
+    --color-card-border: #3d3d3d;
+    --color-pill: transparent;
+    --color-pill-hover: rgba(255, 255, 255, 0.06);
+    --color-input-bg: #292929;
+    --color-shadow: transparent;
+    --color-icon: #9a9a9a;
+
+    --color-accent: #f0f0f0;          /* graphite inverted */
+    --color-accent-2: #ffffff;
+    --color-accent-soft: #333333;
+    --color-on-accent: #1b1b1b;
+    --color-accent-text: #f0f0f0;
+
+    --color-record: #ef5a50;
+    --color-danger: #ee6259;
+
+    --color-interactive: #7aaae2;
+    --color-success: #7fc36f;
+    --color-warning: #d9b45b;
+    --color-warning-text: #d9b45b;
+    --color-speaker-4: #e08078;
+
+    --color-status-warning: #d8b45e;  /* 7.1:1 on #292929 */
+    --color-status-danger: #eda6a0;   /* 7.2:1 on #292929 */
+
+    --color-badge-bg: #333333;
+    --color-badge-border: transparent;
+    --color-badge-text: #c4c4c4;
+    --color-switch-on: #f0f0f0;
+
+    --color-ink: var(--color-text);
+    --color-ink-muted: var(--color-text-muted);
+
+    --shadow-card: 0 10px 28px -14px rgba(0, 0, 0, 0.75);
+    color-scheme: dark;
+  }
+}
+
+/* --- colour: dark explicit (derived counterpart) ------------------------ */
+[data-palette="graphite"][data-theme="dark"] {
+  --color-canvas: #1b1b1b;
+  --color-sidebar-bg: #232323;
+  --color-surface: #292929;        /* the recipe's strong ink, now the surface */
+  --color-surface-2: #242424;
+  --color-surface-raised: #333333;
+  --color-sidebar-active: var(--color-surface);
+  --color-text-display: #f5f5f5;
+  --color-text: #c4c4c4;
+  --color-text-muted: #9a9a9a;
+  --color-text-disabled: #6e6e6e;
+  --color-line: #2f2f2f;
+  --color-line-visible: #3d3d3d;
+  --color-card-border: #3d3d3d;
+  --color-pill: transparent;
+  --color-pill-hover: rgba(255, 255, 255, 0.06);
+  --color-input-bg: #292929;
+  --color-shadow: transparent;
+  --color-icon: #9a9a9a;
+
+  --color-accent: #f0f0f0;          /* graphite inverted */
+  --color-accent-2: #ffffff;
+  --color-accent-soft: #333333;
+  --color-on-accent: #1b1b1b;
+  --color-accent-text: #f0f0f0;
+
+  --color-record: #ef5a50;
+  --color-danger: #ee6259;
+
+  --color-interactive: #7aaae2;
+  --color-success: #7fc36f;
+  --color-warning: #d9b45b;
+  --color-warning-text: #d9b45b;
+  --color-speaker-4: #e08078;
+
+  --color-status-warning: #d8b45e;  /* 7.1:1 on #292929 */
+  --color-status-danger: #eda6a0;   /* 7.2:1 on #292929 */
+
+  --color-badge-bg: #333333;
+  --color-badge-border: transparent;
+  --color-badge-text: #c4c4c4;
+  --color-switch-on: #f0f0f0;
+
+  --color-ink: var(--color-text);
+  --color-ink-muted: var(--color-text-muted);
+
+  --shadow-card: 0 10px 28px -14px rgba(0, 0, 0, 0.75);
+  color-scheme: dark;
+}

@@ -12,6 +12,17 @@
 import ReactDOM from "react-dom/client";
 import { StrictMode, useState } from "react";
 import { mockIPC } from "@tauri-apps/api/mocks";
+import {
+  Check,
+  Copy,
+  FileText as Files,
+  Folder as FolderIcon,
+  MessageCircle,
+  Search,
+} from "lucide-react";
+import { CommandSnippet } from "./components/CommandSnippet";
+import { Segmented } from "./pages/settings/components/Segmented";
+import { Toggle } from "./pages/settings/components/Toggle";
 import { TranscriptEditor, TranscriptPlayer } from "./pages/Note";
 import { IntegrationsSection } from "./pages/settings/tabs/Integrations";
 import { DEFAULTS, type EditableKey } from "./pages/settings/types";
@@ -19,10 +30,13 @@ import { SummaryStep } from "./pages/onboarding/steps/Summary";
 import { TranscriptionStep } from "./pages/onboarding/steps/Transcription";
 import { STEP_ORDER, type StepContext, type StepId } from "./pages/onboarding/types";
 import type { ProviderConfig, TimelineEntry } from "./lib/ipc";
+// Mirrors src/main.tsx — every theme's typeface, so a scenario reviewed under
+// `?palette=<id>` renders in that design's face rather than falling back.
 import "@fontsource/hanken-grotesk/400.css";
 import "@fontsource/hanken-grotesk/500.css";
 import "@fontsource/hanken-grotesk/600.css";
 import "@fontsource/hanken-grotesk/700.css";
+import "@fontsource/dm-mono/400.css";
 import "./styles/globals.css";
 
 type Handler = (args: unknown) => unknown;
@@ -228,6 +242,117 @@ function IntegrationsHarness({ enabled }: { enabled: boolean }) {
   return <IntegrationsSection s={s} update={(_k, v) => setOn(v)} />;
 }
 
+// ---- theme axis: every token-driven surface on one page --------------------
+// Real components where one exists (Toggle, Segmented, CommandSnippet's mono
+// block); the utility classes themselves where the component is a page (a nav
+// row, a bar, a badge). The point is to see a whole design at once — type scale,
+// control language, icon size, row rhythm — not to exercise behaviour.
+function ThemeSpecimen() {
+  const [on, setOn] = useState(true);
+  const [seg, setSeg] = useState("balanced");
+  return (
+    <div className="max-w-3xl mx-auto flex flex-col gap-7">
+      <div>
+        <div className="nd-title">Weekly sync with Hege</div>
+        <p className="prose-note mt-2">
+          Body copy in the theme’s own size, leading and tracking. Long enough to
+          show the measure and how the line spacing reads over more than one line
+          of actual prose.
+        </p>
+      </div>
+
+      <div className="flex flex-col gap-2">
+        <div className="nd-label">Controls</div>
+        <div className="flex flex-wrap items-center gap-3">
+          <button className="nd-btn-primary nd-btn">
+            <Check size={14} strokeWidth={2} />
+            Summarise
+          </button>
+          <button className="nd-btn">
+            <Copy size={14} strokeWidth={2} />
+            Secondary
+          </button>
+          <button className="nd-btn-icon" aria-label="Icon button">
+            <Copy strokeWidth={1.6} />
+          </button>
+          <button className="nd-btn-icon is-active" aria-label="Active icon button">
+            <Check strokeWidth={1.6} />
+          </button>
+          <span className="nd-badge">Synced</span>
+          <Toggle checked={on} onChange={setOn} label="A switch" />
+        </div>
+        <Segmented
+          label="Quality"
+          value={seg}
+          onChange={setSeg}
+          options={[
+            { value: "fast", label: "Fast" },
+            { value: "balanced", label: "Balanced" },
+            { value: "quality", label: "Quality" },
+          ]}
+        />
+      </div>
+
+      <div className="flex flex-col gap-2">
+        <div className="nd-label">Navigation + bars</div>
+        <div className="nd-bar max-w-sm">
+          <Search strokeWidth={1.5} className="text-[var(--color-icon)] shrink-0" />
+          <input placeholder="Search notes" className="flex-1 text-sm min-w-0 bg-transparent" />
+        </div>
+        <div className="nd-list max-w-sm mt-1">
+          <div className="nd-navrow is-active">
+            <Files strokeWidth={1.6} className="shrink-0 opacity-85" />
+            <span className="flex-1 truncate">All notes</span>
+            <span className="text-[11px] text-[var(--color-text-disabled)]">12</span>
+          </div>
+          <div className="nd-navrow">
+            <MessageCircle strokeWidth={1.6} className="shrink-0 opacity-85" />
+            <span className="flex-1 truncate">Chat</span>
+          </div>
+          <div className="nd-navrow">
+            <FolderIcon strokeWidth={1.6} className="shrink-0 opacity-85" />
+            <span className="flex-1 truncate">Kundemøter</span>
+          </div>
+        </div>
+      </div>
+
+      <div className="flex flex-col gap-2">
+        <div className="nd-label">Commands</div>
+        <CommandSnippet command="ollama pull gemma4:12b-mlx" />
+      </div>
+
+      <div className="flex flex-col gap-2">
+        <div className="nd-label">Tokens</div>
+        <div className="flex flex-wrap gap-2">
+          {[
+            "--color-canvas",
+            "--color-sidebar-bg",
+            "--color-surface",
+            "--color-surface-2",
+            "--color-surface-raised",
+            "--color-accent",
+            "--color-accent-soft",
+            "--color-record",
+            "--color-danger",
+            "--color-interactive",
+            "--color-success",
+            "--color-warning",
+            "--color-speaker-4",
+          ].map((t) => (
+            <div key={t} className="flex items-center gap-2 text-[11px] text-[var(--color-text-muted)]">
+              <span
+                className="w-5 h-5 rounded border border-[var(--color-line-visible)]"
+                style={{ background: `var(${t})` }}
+              />
+              {t.replace("--color-", "")}
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 const CASES: Record<string, Scenario> = {
   // --- #172: the MCP switch, off (the default) and on (snippets revealed).
   "mcp-off": integrationsCase(false),
@@ -275,10 +400,29 @@ const CASES: Record<string, Scenario> = {
   player: playerCase(false),
   // Recording in flight — no edit or delete affordance on any turn.
   "player-recording": playerCase(true),
+
+  // --- Themes: the token-driven chrome on one page, so a theme can be judged
+  // as a design rather than as a diff. Combine with ?palette= and ?theme=.
+  themes: {
+    wrap: (node) => <div className="flex-1 min-h-0 overflow-y-auto px-8 py-6">{node}</div>,
+    render: () => <ThemeSpecimen />,
+    ipc: {},
+  },
 };
 
-const which = new URLSearchParams(location.search).get("case") ?? "recommended";
+const params = new URLSearchParams(location.search);
+const which = params.get("case") ?? "recommended";
 const scenario = CASES[which] ?? CASES.recommended;
+
+// The theme axes are attributes on <html> — exactly what palette.ts and theme.ts
+// write at runtime — so the harness sets them the same way instead of faking a
+// store. ?palette=<id> picks the design, ?theme=light|dark pins the mode
+// (omitted = follow the OS, which is what "System" does in the app).
+document.documentElement.setAttribute("data-palette", params.get("palette") ?? "warm");
+const mode = params.get("theme");
+if (mode === "light" || mode === "dark") {
+  document.documentElement.setAttribute("data-theme", mode);
+}
 
 mockIPC(async (cmd, args) => {
   if (cmd in scenario.ipc) return scenario.ipc[cmd](args);

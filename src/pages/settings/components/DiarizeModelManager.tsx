@@ -42,7 +42,7 @@ export function DiarizeModelManager({
           {state.status.sizeBytes ? ` (${formatBytes(state.status.sizeBytes)})` : ""}
         </div>
         {state.status.path && (
-          <div className="text-xs text-[var(--color-text-muted)] font-mono break-all">
+          <div className="nd-code text-[var(--color-text-muted)] break-all">
             {state.status.path}
           </div>
         )}

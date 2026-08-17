@@ -91,7 +91,9 @@ export function NoteListRow({
       <div className="group max-w-[880px] mx-auto w-full px-8">
         <div
           className={cn(
-            "flex items-start p-3 rounded-[11px] transition-colors",
+            // .nd-row-lg is the theme's floor for a two-line content row; the
+            // row still grows past it when the snippet wraps.
+            "nd-row-lg flex items-start p-3 rounded-[11px] transition-colors",
             selected
               ? "bg-[var(--color-accent-soft)]"
               : "hover:bg-[var(--color-pill-hover)]",
@@ -164,8 +166,10 @@ export function NoteListRow({
               <span className="text-[12px] text-[var(--color-text-disabled)] tabular-nums whitespace-nowrap">
                 {formatMeetingTime(note.created_at)}
               </span>
+              {/* The folder name is a badge — state, not action — so it takes the
+                  theme's badge shape and colour pair. */}
               {folder && (
-                <span className="inline-flex items-center gap-1.5 max-w-[12rem] text-[11.5px] text-[var(--color-text-muted)] border border-[var(--color-line-visible)] rounded-md px-1.5 py-0.5">
+                <span className="nd-badge max-w-[12rem]">
                   <FolderIcon size={12} strokeWidth={1.6} className="shrink-0 opacity-70" />
                   <span className="truncate">{folder.name}</span>
                 </span>

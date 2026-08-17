@@ -127,7 +127,7 @@ export function SummaryPromptsManager({ language }: { language: string }) {
                   <div className="flex items-center gap-2">
                     <div className="flex-1 min-w-0">
                       <div className="text-sm font-medium truncate">{p.name}</div>
-                      <p className="text-xs text-[var(--color-text-muted)] truncate font-mono">
+                      <p className="text-xs text-[var(--color-text-muted)] truncate">
                         {p.content.split("\n")[0].slice(0, 80) || "—"}
                       </p>
                     </div>

@@ -43,7 +43,7 @@ export function Folder() {
             <span className="shrink-0 grid place-items-center w-8 h-8 rounded-[9px] bg-[var(--color-surface-raised)] border border-[var(--color-line-visible)] text-[var(--color-text-muted)]">
               <FolderIcon size={16} strokeWidth={1.7} />
             </span>
-            <h1 className="text-[25px] font-semibold tracking-[-0.022em] truncate">{folder.name}</h1>
+            <h1 className="nd-heading truncate">{folder.name}</h1>
             <span className="text-[14px] text-[var(--color-text-disabled)] tabular-nums shrink-0">{count}</span>
           </div>
         </div>

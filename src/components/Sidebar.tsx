@@ -201,8 +201,10 @@ export function Sidebar({ onCollapse }: { onCollapse: () => void }) {
 
       <WorkspaceSwitcher />
 
-      <div className="no-drag mt-2.5 flex items-center gap-2 px-2.5 h-9 rounded-[var(--radius)] border border-[var(--color-line-visible)] bg-[var(--color-surface)] focus-within:border-[var(--color-text-muted)] transition-colors">
-        <Search size={14} strokeWidth={1.5} className="text-[var(--color-text-muted)] shrink-0" />
+      {/* .nd-bar owns height, side padding and radius — graphite's recipe names
+          all three for a bar, and they differ from its nav rows. */}
+      <div className="no-drag nd-bar mt-2.5">
+        <Search size={14} strokeWidth={1.5} className="text-[var(--color-icon)] shrink-0" />
         <input
           data-search-input
           value={q}
@@ -239,7 +241,7 @@ export function Sidebar({ onCollapse }: { onCollapse: () => void }) {
             type="button"
             onClick={importAudio}
             title="Import an existing audio file as a new note"
-            className="no-drag flex items-center gap-2.5 px-2.5 py-2 rounded-[var(--radius)] text-[13.5px] transition-colors text-[var(--color-text-muted)] hover:bg-[var(--color-pill-hover)] hover:text-[var(--color-text)]"
+            className="no-drag nd-navrow w-full"
           >
             <FileAudio size={16} strokeWidth={1.6} className="shrink-0 opacity-85" />
             <span className="flex-1 truncate text-left">Import audio</span>
@@ -380,12 +382,16 @@ function NavItem({
       to={to}
       title={title}
       className={cn(
-        "no-drag flex items-center gap-2.5 px-2.5 py-2 rounded-[var(--radius)] text-[13.5px] transition-colors",
-        active
-          ? "bg-[var(--color-sidebar-active)] text-[var(--color-text)] font-medium shadow-[0_1px_2px_rgba(0,0,0,0.05)]"
-          : "text-[var(--color-text-muted)] hover:bg-[var(--color-pill-hover)] hover:text-[var(--color-text)]",
+        // .nd-navrow owns the height, radius, label size and icon gap so a
+        // theme can restate the navigation (graphite: 28px rows, 13px labels,
+        // 9px radius) without touching this file.
+        "no-drag nd-navrow",
+        active &&
+          "is-active font-medium shadow-[0_1px_2px_rgba(0,0,0,0.05)]",
       )}
     >
+      {/* `size` stays as the fallback for any context the .nd-navrow > svg rule
+          doesn't reach; the theme's --icon-size overrides it where it does. */}
       <Icon size={16} strokeWidth={1.6} className="shrink-0 opacity-85" />
       <span className="flex-1 truncate">{label}</span>
       {count !== undefined && count > 0 && (
@@ -533,10 +539,8 @@ function FolderRow({
         to={`/folder/${folder.id}`}
         onContextMenu={openMenu}
         className={cn(
-          "no-drag group flex items-center gap-2.5 px-2.5 py-2 mb-0.5 rounded-[var(--radius)] text-[13.5px] transition-colors",
-          active
-            ? "bg-[var(--color-sidebar-active)] text-[var(--color-text)] font-medium shadow-[0_1px_2px_rgba(0,0,0,0.05)]"
-            : "text-[var(--color-text-muted)] hover:bg-[var(--color-pill-hover)] hover:text-[var(--color-text)]",
+          "no-drag group nd-navrow mb-0.5",
+          active && "is-active font-medium shadow-[0_1px_2px_rgba(0,0,0,0.05)]",
         )}
       >
         <FolderIcon size={16} strokeWidth={1.6} className="shrink-0 opacity-85" />
@@ -623,10 +627,8 @@ function NoteRow({
     <Link
       to={`/note/${note.id}`}
       className={cn(
-        "no-drag group flex items-center gap-1 pl-2.5 pr-1 py-2 rounded-[var(--radius)] text-[13.5px] transition-colors",
-        active
-          ? "bg-[var(--color-sidebar-active)] text-[var(--color-text)]"
-          : "text-[var(--color-text-muted)] hover:bg-[var(--color-pill-hover)] hover:text-[var(--color-text)]"
+        "no-drag group nd-navrow gap-1 pr-1",
+        active && "is-active"
       )}
     >
       <span className="flex-1 min-w-0 flex flex-col">

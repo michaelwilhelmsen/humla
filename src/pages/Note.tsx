@@ -836,7 +836,7 @@ export function Note() {
           }}
           placeholder="New note"
           rows={1}
-          className="nd-bare block w-full mb-4 text-[30px] font-semibold leading-[1.18] tracking-[-0.022em] placeholder:text-[var(--color-text-muted)]/50 resize-none overflow-hidden focus:outline-none"
+          className="nd-bare nd-title block w-full mb-4 placeholder:text-[var(--color-text-muted)]/50 resize-none overflow-hidden focus:outline-none"
         />
 
         <div className="mb-8 pb-4 border-b border-[var(--color-line)]">

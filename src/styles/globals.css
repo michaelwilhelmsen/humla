@@ -1,184 +1,31 @@
 @import "tailwindcss";
 @import "tippy.js/dist/tippy.css";
 
-/* One typeface — Hanken Grotesk — used throughout; hierarchy comes from
-   size + weight only. Bundled locally via @fontsource (imported in
-   src/main.tsx) so the app renders offline and the CSP stays font-src
-   'self'. --font-serif and --font-mono are transition aliases pointing at
-   the same Hanken stack so any lingering `font-serif` / `font-mono` class
-   or `var(--font-*)` ref renders Hanken; they get swept out per phase.
-   Genuine code blocks use --font-code (a real monospace stack). */
+/* Themes. Each file declares the whole token contract (src/lib/themeContract.ts)
+   for its own `data-palette` value and nothing else — no component rules. The
+   structural CSS below reads only contract tokens, which is what lets a theme
+   restate the typeface, type scale and control metrics without touching a
+   component. See src/styles/themes/README.md for how to add one. */
+@import "./themes/warm.css";
+@import "./themes/graphite.css";
+
+/* The @theme block is Tailwind's utility generator, not the source of truth for
+   any value: `font-sans`, `font-code` and `rounded-card` exist as utilities
+   because these names are here. The values are the default theme's, and every
+   theme file overrides them — theme files are unlayered, so they outrank
+   `@layer theme` whatever the source order.
+
+   --font-serif and --font-mono are transition aliases pointing at the same
+   stack as --font-sans, so any lingering `font-serif` / `font-mono` class
+   renders the theme's sans rather than a stray typeface. Genuine code blocks
+   use --font-code. */
 
 @theme {
   --font-sans: "Hanken Grotesk", ui-sans-serif, system-ui, sans-serif;
-  --font-serif: "Hanken Grotesk", ui-sans-serif, system-ui, sans-serif;
-  --font-mono: "Hanken Grotesk", ui-sans-serif, system-ui, sans-serif;
+  --font-serif: var(--font-sans);
+  --font-mono: var(--font-sans);
   --font-code: ui-monospace, "SF Mono", SFMono-Regular, Menlo, monospace;
   --radius-card: 14px;
-}
-
-/* Single warm-paper palette, light + dark. data-theme picks light/dark
-   explicitly; otherwise prefers-color-scheme decides. The Settings palette
-   picker still writes data-palette, but every value now renders this one
-   design (no palette-specific overrides remain).
-
-   Elevation ladder (dark especially): canvas (darkest) → sidebar/card bg →
-   surface (pills) → raised, with a visible warm --color-card-border on the
-   inset cards so the layers stay distinct.
-
-   Accent is Humla gold (#ffdc6c) — the logo yellow, the SAME value in both
-   themes (gold reads on light and dark alike, so no inversion). Text/icons
-   placed ON a filled-gold surface use --color-on-accent (dark ink). For
-   accent-COLOURED text/icons/links sitting on a normal surface, use
-   --color-accent-text (a readable amber) — raw gold is too light to read as
-   text. Red is reserved for recording (--color-record) and destructive
-   actions (--color-danger). */
-
-/* === LIGHT === */
-:root,
-:root[data-theme="light"] {
-  --color-canvas: #faf8f2;            /* main writing pane + gutter */
-  --color-sidebar-bg: #f1ece1;        /* inset cards: nav + right panel */
-  --color-surface: #fffef9;           /* pills, content surfaces */
-  --color-surface-2: #f4efe4;         /* recessed chips, scrubber */
-  --color-surface-raised: #ebe5d6;    /* hover, avatars */
-  --color-sidebar-active: var(--color-surface);
-  --color-text: #211e17;
-  --color-text-display: #211e17;
-  --color-text-muted: #6d695e;
-  --color-text-disabled: #a7a08f;
-  --color-line: #e9e3d4;              /* hairline dividers */
-  --color-line-visible: #ddd5c2;
-  --color-card-border: #ddd5c2;       /* inset-card border */
-  --color-pill: transparent;
-  --color-pill-hover: rgba(33, 30, 23, 0.05);
-  --color-input-bg: #fffef9;
-  --color-shadow: transparent;
-
-  --color-accent: #ffdc6c;            /* Humla gold — fill for primary action / active */
-  --color-accent-2: #f3cb4d;          /* gold hover (slightly deeper) */
-  --color-accent-soft: #fbeecb;       /* gold tint behind active states */
-  --color-on-accent: #2a2206;         /* dark ink on a filled-gold surface */
-  --color-accent-text: #7a5a12;       /* readable amber for accent text/icons/links */
-
-  --color-record: #cf352c;            /* red — recording indicators only */
-  --color-danger: #c4362e;            /* red — destructive actions */
-
-  --color-interactive: #2f6fb0;       /* speaker blue + links */
-  --color-success: #5b8a45;           /* speaker green + synced */
-  --color-warning: #bd962f;           /* speaker gold + override */
-  --color-warning-text: #8a6a1a;      /* readable gold for warning-as-text (light) */
-  --color-speaker-4: #c0463f;         /* speaker red (4th, cycling) */
-
-  /* Usage-meter status colours (#69) — AAA (>=7:1) on --color-surface, the
-     panel/composer background. Warm gold + red hues darkened for the light
-     canvas; distinct from --color-warning/-danger, which don't clear AAA. */
-  --color-status-warning: #69531a;    /* 7.29:1 on #fffef9 */
-  --color-status-danger: #9f2c25;     /* 7.27:1 on #fffef9 */
-
-  --color-ink: var(--color-text);
-  --color-ink-muted: var(--color-text-muted);
-
-  --radius: 9px;
-  --shadow-card: 0 1px 2px rgba(60, 46, 18, 0.04), 0 4px 14px -10px rgba(60, 46, 18, 0.18);
-  color-scheme: light;
-}
-
-/* === DARK via system === */
-@media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) {
-    --color-canvas: #0e0c08;
-    --color-sidebar-bg: #1d1912;
-    --color-surface: #2a2418;
-    --color-surface-2: #241f16;
-    --color-surface-raised: #342d20;
-    --color-sidebar-active: var(--color-surface);
-    --color-text: #ece5d6;
-    --color-text-display: #ece5d6;
-    --color-text-muted: #9c968a;
-    --color-text-disabled: #6a655b;
-    --color-line: #322c22;
-    --color-line-visible: #423a27;
-    --color-card-border: #423a27;
-    --color-pill: transparent;
-    --color-pill-hover: rgba(236, 229, 214, 0.06);
-    --color-input-bg: #2a2418;
-    --color-shadow: transparent;
-
-    --color-accent: #ffdc6c;          /* Humla gold — same value in dark (no inversion) */
-    --color-accent-2: #f3cb4d;
-    --color-accent-soft: #38301a;     /* gold-tinted dark */
-    --color-on-accent: #2a2206;       /* dark ink on filled gold */
-    --color-accent-text: #f3d178;     /* readable amber on dark surfaces */
-
-    --color-record: #e5544b;
-    --color-danger: #e0564d;
-
-    --color-interactive: #6aa3e0;
-    --color-success: #8cc06f;
-    --color-warning: #ddb255;
-    --color-warning-text: #ddb255;
-    --color-speaker-4: #e07a72;
-
-    /* Usage-meter status colours (#69) — AAA (>=7:1) on --color-surface #2a2418,
-       the panel/composer background. Warm hues lightened for the dark canvas. */
-    --color-status-warning: #d3ae4c;  /* 7.28:1 on #2a2418 */
-    --color-status-danger: #e8a09c;   /* 7.29:1 on #2a2418 */
-
-    --color-ink: var(--color-text);
-    --color-ink-muted: var(--color-text-muted);
-
-    --radius: 9px;
-    --shadow-card: 0 10px 28px -14px rgba(0, 0, 0, 0.7);
-    color-scheme: dark;
-  }
-}
-
-/* === DARK explicit === */
-:root[data-theme="dark"] {
-  /* Usage-meter status colours (#69) — AAA (>=7:1) on --color-surface #2a2418,
-     the panel/composer background. Warm hues lightened for the dark canvas. */
-  --color-status-warning: #d3ae4c;  /* 7.28:1 on #2a2418 */
-  --color-status-danger: #e8a09c;   /* 7.29:1 on #2a2418 */
-  --color-canvas: #0e0c08;
-  --color-sidebar-bg: #1d1912;
-  --color-surface: #2a2418;
-  --color-surface-2: #241f16;
-  --color-surface-raised: #342d20;
-  --color-sidebar-active: var(--color-surface);
-  --color-text: #ece5d6;
-  --color-text-display: #ece5d6;
-  --color-text-muted: #9c968a;
-  --color-text-disabled: #6a655b;
-  --color-line: #322c22;
-  --color-line-visible: #423a27;
-  --color-card-border: #423a27;
-  --color-pill: transparent;
-  --color-pill-hover: rgba(236, 229, 214, 0.06);
-  --color-input-bg: #2a2418;
-  --color-shadow: transparent;
-
-  --color-accent: #ffdc6c;            /* Humla gold — same value in dark (no inversion) */
-  --color-accent-2: #f3cb4d;
-  --color-accent-soft: #38301a;       /* gold-tinted dark */
-  --color-on-accent: #2a2206;         /* dark ink on filled gold */
-  --color-accent-text: #f3d178;       /* readable amber on dark surfaces */
-
-  --color-record: #e5544b;
-  --color-danger: #e0564d;
-
-  --color-interactive: #6aa3e0;
-  --color-success: #8cc06f;
-  --color-warning: #ddb255;
-  --color-warning-text: #ddb255;
-  --color-speaker-4: #e07a72;
-
-  --color-ink: var(--color-text);
-  --color-ink-muted: var(--color-text-muted);
-
-  --radius: 9px;
-  --shadow-card: 0 10px 28px -14px rgba(0, 0, 0, 0.7);
-  color-scheme: dark;
 }
 
 /* Wrap base resets in @layer base so Tailwind utilities (which live in
@@ -267,7 +114,7 @@ input::placeholder, textarea::placeholder {
    fill. */
 .nd-label {
   font-family: var(--font-sans);
-  font-size: 11px;
+  font-size: var(--text-label-size);
   font-weight: 600;
   letter-spacing: 0.05em;
   text-transform: uppercase;
@@ -377,12 +224,19 @@ input::placeholder, textarea::placeholder {
 
 /* Solid action buttons — the redesign's primary chrome (note toolbar, list
    headers). .nd-btn = secondary (surface + hairline border); .nd-btn-primary
-   = ink fill (inverts in dark via the accent token); .nd-btn-icon = square
-   icon button with an active (accent-soft) state. */
+   = accent fill; .nd-btn-icon = icon-only button with an active
+   (accent-soft) state.
+
+   Every metric is a contract token, so a theme sets the whole control language
+   in one place: `warm` keeps the 32px pill, `graphite` states a 38px bar. The
+   height is explicit rather than padding-derived precisely so a theme can name
+   it. */
 .nd-btn {
-  display: inline-flex; align-items: center; gap: 7px;
-  font-size: 13px; font-weight: 500; line-height: 1.2;
-  padding: 7px 14px; border-radius: 999px;
+  display: inline-flex; align-items: center; gap: var(--icon-gap);
+  font-size: var(--text-ui-size); font-weight: 500; line-height: 1.2;
+  height: var(--control-height);
+  padding: 0 var(--control-pad-x);
+  border-radius: var(--control-radius);
   border: 1px solid var(--color-line-visible);
   background: var(--color-surface); color: var(--color-text);
   cursor: pointer; white-space: nowrap; flex-shrink: 0;
@@ -392,18 +246,27 @@ input::placeholder, textarea::placeholder {
 }
 .nd-btn:hover:not(:disabled) { border-color: var(--color-text-muted); }
 .nd-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+/* The primary button is the one a theme may give a fixed width, so it centres
+   its label and can shrink below that width rather than overflow a narrow panel.
+   Secondary buttons keep hugging their label.
+   --control-min-width is therefore a LENGTH in every theme, `0px` where the
+   button should hug: `min()` rejects `auto`, and a theme that wrote `auto` would
+   be relying on the whole declaration being dropped as invalid. */
 .nd-btn-primary {
   background: var(--color-accent); border-color: var(--color-accent);
   color: var(--color-on-accent);
+  justify-content: center;
+  min-width: min(var(--control-min-width), 100%);
 }
 .nd-btn-primary:hover:not(:disabled) {
   background: var(--color-accent-2); border-color: var(--color-accent-2);
 }
 .nd-btn-icon {
   display: inline-flex; align-items: center; justify-content: center;
-  width: 33px; height: 33px; padding: 0; border-radius: 999px;
+  width: var(--icon-btn-size); height: var(--icon-btn-size);
+  padding: 0; border-radius: var(--control-radius);
   border: 1px solid transparent; background: transparent;
-  color: var(--color-text-muted); cursor: pointer; flex-shrink: 0;
+  color: var(--color-icon); cursor: pointer; flex-shrink: 0;
   transition: color 140ms, background-color 140ms, border-color 140ms;
 }
 .nd-btn-icon:hover { background: var(--color-pill-hover); color: var(--color-text); }
@@ -412,7 +275,21 @@ input::placeholder, textarea::placeholder {
   color: var(--color-accent-text);
 }
 /* Smaller icon-button variant for secondary/inline affordances. */
-.nd-btn-icon-sm { width: 28px; height: 28px; }
+.nd-btn-icon-sm {
+  width: calc(var(--icon-btn-size) - 5px);
+  height: calc(var(--icon-btn-size) - 5px);
+}
+/* Chrome glyphs take the theme's icon size, overriding the per-call `size`
+   prop lucide writes as width/height attributes (CSS beats a presentation
+   attribute). Only the uniform chrome slots do this — icons that carry a
+   deliberate one-off size (a 10px chevron, a 12px checkmark inside a custom
+   control) are not in one of these slots. */
+.nd-btn-icon > svg,
+.nd-navrow > svg,
+.nd-bar > svg {
+  width: var(--icon-size);
+  height: var(--icon-size);
+}
 
 /* Meta-bar item (note identity row) — borderless, icon + label, hover tint
    on the interactive ones (folder, workspace pickers). */
@@ -425,7 +302,8 @@ input::placeholder, textarea::placeholder {
 }
 .nd-meta.is-interactive { cursor: pointer; }
 .nd-meta.is-interactive:hover { background: var(--color-pill-hover); color: var(--color-text); }
-.nd-meta > svg { opacity: 0.72; flex-shrink: 0; }
+.nd-meta > svg { opacity: 0.72; flex-shrink: 0; color: var(--color-icon); }
+
 
 /* Filled variant, for a chip that has to hold its own on a card rather than
    sit under a line of metadata. A transparent chip needs surrounding text to
@@ -435,6 +313,109 @@ input::placeholder, textarea::placeholder {
    in both themes; hover lifts to `surface-raised`. */
 .nd-meta.is-filled { background: var(--color-surface-2); }
 .nd-meta.is-filled:hover { background: var(--color-surface-raised); color: var(--color-text); }
+
+/* Theme-driven chrome lives in @layer components, NOT unlayered like
+   .nd-btn above: these are component defaults a caller is expected to nudge
+   with a Tailwind utility (a row that needs `pr-1` for its trailing icon
+   button). An unlayered rule beats every utility regardless of specificity,
+   so the same class written unlayered would silently swallow that `pr-1`. */
+@layer components {
+  /* ------------------------------------------------------------------ */
+  /* Theme-driven chrome: type, nav rows, bars, badges                  */
+  /*                                                                    */
+  /* These exist so the metrics a design recipe actually names — title   */
+  /* size, nav row height, bar height and radius, badge shape — have one */
+  /* place to land. Each reads only contract tokens, so a theme restates */
+  /* them without a component edit. See src/styles/themes/README.md.     */
+  /* ------------------------------------------------------------------ */
+
+  /* The note title: the largest type in the app. */
+  .nd-title {
+    font-size: var(--text-title-size);
+    font-weight: var(--text-title-weight);
+    line-height: var(--text-title-line);
+    letter-spacing: var(--text-title-tracking);
+    color: var(--color-text-display);
+  }
+
+  /* A view's h1 (All notes, Folder, Chat). One step below the note title in
+     `warm`; the same size in themes whose recipe names a single heading size. */
+  .nd-heading {
+    font-size: var(--text-heading-size);
+    font-weight: var(--text-title-weight);
+    line-height: 1.2;
+    letter-spacing: var(--text-title-tracking);
+    color: var(--color-text-display);
+  }
+
+  /* A navigation row: sidebar items, folder rows, conversation rows. Height is a
+     minimum, not a fix — a row that wraps grows rather than clipping its label. */
+  .nd-navrow {
+    display: flex;
+    align-items: center;
+    gap: var(--icon-gap);
+    min-height: var(--nav-row-height);
+    padding: 0 10px;
+    border-radius: var(--nav-radius);
+    font-size: var(--nav-label-size);
+    color: var(--color-text-muted);
+    transition: background-color 120ms, color 120ms;
+  }
+  .nd-navrow:hover { background: var(--color-pill-hover); color: var(--color-text); }
+  .nd-navrow.is-active { background: var(--color-sidebar-active); color: var(--color-text); }
+
+  /* A full-width input bar: the sidebar's search field and its inline-rename
+     siblings. Distinct from a control (.nd-btn) because a theme may size the two
+     differently — graphite's recipe names bars at 38px and nav rows at 28px. */
+  .nd-bar {
+    display: flex;
+    align-items: center;
+    gap: var(--icon-gap);
+    height: var(--bar-height);
+    padding-left: var(--bar-pad-left);
+    padding-right: var(--bar-pad-left);
+    border-radius: var(--bar-radius);
+    border: 1px solid var(--color-line-visible);
+    background: var(--color-surface);
+    transition: border-color 200ms cubic-bezier(0.25, 0.1, 0.25, 1);
+  }
+  .nd-bar:focus-within { border-color: var(--color-text-muted); }
+
+  /* A status badge — a filled, non-interactive label. Its own colour pair rather
+     than the accent's, because a badge marks state, not action. */
+  .nd-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    height: var(--badge-height);
+    padding: 0 7px;
+    border-radius: var(--badge-radius);
+    background: var(--color-badge-bg);
+    border: 1px solid var(--color-badge-border);
+    color: var(--color-badge-text);
+    font-size: var(--text-label-size);
+    line-height: 1;
+    white-space: nowrap;
+  }
+
+  /* A shell command or config stanza — the one place --font-code and
+     --text-code-size are the point rather than an afterthought.
+     --text-code-size tracks the SMALL PRINT a command sits under (12px, the
+     `text-xs` every settings description and mono detail uses), not the body
+     size: a monospace face at the same nominal size as the sans reads larger,
+     so matching body would make the command the loudest thing in the panel. */
+  .nd-code {
+    font-family: var(--font-code);
+    font-size: var(--text-code-size);
+    line-height: 1.5;
+  }
+
+  /* Vertical rhythm for a list of rows, and the min-height of a two-line content
+     row (a note in a list). Both are minimums. */
+  .nd-list { display: flex; flex-direction: column; gap: var(--row-gap); }
+  .nd-row { min-height: var(--row-height); }
+  .nd-row-lg { min-height: var(--row-height-lg); }
+}
 
 /* No <select> rules live here any more: every picker in the app goes through
    the Radix-backed Popover / Menu / Select primitives (#114), so the chrome
@@ -510,8 +491,9 @@ input::placeholder, textarea::placeholder {
 /* ------------------------------------------------------------------ */
 
 .prose-note {
-  font-size: 15.5px;
-  line-height: 1.5;
+  font-size: var(--text-body-size);
+  line-height: var(--text-body-line);
+  letter-spacing: var(--text-body-tracking);
   color: var(--color-text);
 }
 
@@ -559,33 +541,36 @@ input::placeholder, textarea::placeholder {
 /* Headings: generous top margin so sections feel distinct, modest bottom
    margin so the heading breathes from the body that follows. The :first-child
    override prevents an awkward leading gap when a note opens with a heading. */
+/* The heading ladder is derived from --text-heading-size rather than written
+   out four times, so a theme states one number and the whole scale follows.
+   The ratios reproduce the shipped `warm` sizes (25 / 19.4 / 16.9 / 15.3px). */
 .prose-note h1 {
-  font-size: 1.55rem;
+  font-size: var(--text-heading-size);
   line-height: 1.25;
-  font-weight: 600;
-  letter-spacing: -0.014em;
+  font-weight: var(--text-title-weight);
+  letter-spacing: var(--text-title-tracking);
   margin-top: 1.4em;
   margin-bottom: 0.35em;
 }
 .prose-note h2 {
-  font-size: 1.2rem;
+  font-size: calc(var(--text-heading-size) * 0.775);
   line-height: 1.3;
-  font-weight: 600;
-  letter-spacing: -0.012em;
+  font-weight: var(--text-title-weight);
+  letter-spacing: var(--text-title-tracking);
   margin-top: 1.3em;
   margin-bottom: 0.3em;
 }
 .prose-note h3 {
-  font-size: 1.05rem;
+  font-size: calc(var(--text-heading-size) * 0.677);
   line-height: 1.35;
-  font-weight: 600;
+  font-weight: var(--text-title-weight);
   margin-top: 1.15em;
   margin-bottom: 0.3em;
 }
 .prose-note h4 {
-  font-size: 0.95rem;
+  font-size: calc(var(--text-heading-size) * 0.613);
   line-height: 1.4;
-  font-weight: 600;
+  font-weight: var(--text-title-weight);
   margin-top: 1em;
   margin-bottom: 0.25em;
 }
@@ -650,9 +635,9 @@ input::placeholder, textarea::placeholder {
 .prose-summary h3,
 .prose-summary h4 {
   font-family: var(--font-sans);
-  font-weight: 600;
+  font-weight: var(--text-title-weight);
   line-height: 1.2;
-  letter-spacing: -0.01em;
+  letter-spacing: var(--text-title-tracking);
   margin-bottom: 0.4em;
 }
 /* Headings need extra breathing room above them. The first heading in the
@@ -669,10 +654,12 @@ input::placeholder, textarea::placeholder {
 .prose-summary > h2:first-child,
 .prose-summary > h3:first-child,
 .prose-summary > h4:first-child { margin-top: 0; }
-.prose-summary h1 { font-size: 1.5rem; }
-.prose-summary h2 { font-size: 1.25rem; }
-.prose-summary h3 { font-size: 1.1rem; }
-.prose-summary h4 { font-size: 1rem; }
+/* Same derived ladder as .prose-note, one step smaller — the summary sits in a
+   panel, not the page. Ratios reproduce the shipped 24 / 20 / 17.6 / 16px. */
+.prose-summary h1 { font-size: calc(var(--text-heading-size) * 0.96); }
+.prose-summary h2 { font-size: calc(var(--text-heading-size) * 0.8); }
+.prose-summary h3 { font-size: calc(var(--text-heading-size) * 0.704); }
+.prose-summary h4 { font-size: calc(var(--text-heading-size) * 0.64); }
 .prose-summary code {
   font-family: var(--font-code);
 }

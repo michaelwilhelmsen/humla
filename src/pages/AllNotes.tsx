@@ -177,7 +177,7 @@ export function AllNotes() {
       <div className="shrink-0">
         <div className="max-w-[880px] mx-auto w-full px-8 pt-14">
           <div className="flex items-center gap-3 px-2">
-            <h1 className="text-[25px] font-semibold tracking-[-0.022em] truncate">All notes</h1>
+            <h1 className="nd-heading truncate">All notes</h1>
             <span className="text-[14px] text-[var(--color-text-disabled)] tabular-nums shrink-0">{total}</span>
           </div>
           {total > 0 && (

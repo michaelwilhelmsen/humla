@@ -35,11 +35,12 @@ export function CommandSnippet({
   return (
     <div className={block ? "flex items-start gap-2" : "flex items-center gap-2"}>
       <code
+        // .nd-code carries the theme's mono face AND its command size — this is
+        // the surface graphite's "DM Mono 14px" is about.
         className={
-          "flex-1 min-w-0 px-3 py-2 rounded-md text-xs bg-[var(--color-pill-hover)] " +
+          "nd-code flex-1 min-w-0 px-3 py-2 rounded-md bg-[var(--color-pill-hover)] " +
           (block ? "whitespace-pre-wrap break-words" : "truncate")
         }
-        style={{ fontFamily: "var(--font-code)" }}
       >
         {command}
       </code>

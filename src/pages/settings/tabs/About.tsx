@@ -149,7 +149,7 @@ export function AboutTab() {
       <Section title="Storage">
         <Row label="Data directory">
           <div className="flex items-center gap-2">
-            <code className="text-xs px-2 py-1 rounded bg-[var(--color-pill-hover)] flex-1 break-all font-mono">
+            <code className="nd-code px-2 py-1 rounded bg-[var(--color-pill-hover)] flex-1 break-all">
               {dataDir || "—"}
             </code>
             <Btn onClick={() => dataDir && openExternal(dataDir)} disabled={!dataDir}>
