@@ -59,9 +59,7 @@ export function TelemetryNotice() {
 
   return (
     <p className="text-[11px] leading-relaxed text-[var(--color-text-muted)] text-center max-w-md">
-      {on
-        ? "Anonymous setup counters are on — no identifier, nothing about your notes."
-        : "Anonymous setup counters are off."}{" "}
+      {on ? "Anonymous setup counters are on" : "Anonymous setup counters are off"}{" "}
       <button
         type="button"
         onClick={toggle}
