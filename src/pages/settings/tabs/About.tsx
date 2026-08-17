@@ -6,8 +6,55 @@ import { ipc } from "../../../lib/ipc";
 import { emitDeveloperModeChange } from "../../../lib/useDeveloperMode";
 import { Btn } from "../components/Btn";
 import { Row, Section } from "../components/Section";
+import { Toggle } from "../components/Toggle";
 
 const REPO_URL = "https://github.com/michaelwilhelmsen/humla";
+
+/** Anonymous usage counters, deliberately placed directly under the Privacy claim
+ *  rather than tucked into another tab. The claim and its one exception belong on
+ *  the same screen — a promise stated in one place and qualified somewhere else is
+ *  the shape that erodes trust.
+ *
+ *  It owns its own read/write instead of going through the settings map, because
+ *  UNSET is a real third state: it means the install predates this feature and was
+ *  never enrolled. Unset and "false" both render as off, but only an explicit "true"
+ *  ever sends, so an older install stays silent until the person reading this row
+ *  turns it on. */
+function UsageCountersRow() {
+  const [on, setOn] = useState<boolean | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    ipc
+      .getSetting("telemetry_enabled")
+      .then((v) => {
+        if (!cancelled) setOn(v === "true");
+      })
+      .catch(() => {
+        if (!cancelled) setOn(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  return (
+    <Row
+      label="Send anonymous usage counters"
+      description="Counts first launch and whether you finished setup. No identifier, no account, nothing about your notes or recordings — they are stored as plain daily tallies."
+      control={
+        <Toggle
+          checked={on === true}
+          onChange={(next) => {
+            setOn(next);
+            void ipc.setSetting("telemetry_enabled", next ? "true" : "false");
+          }}
+          label="Send anonymous usage counters"
+        />
+      }
+    />
+  );
+}
 
 // Number of taps on the version number required to enable developer
 // mode. Borrowed from the Android pattern — quietly discoverable, no UI
@@ -137,13 +184,14 @@ export function AboutTab() {
           </p>
         </Row>
         <Row label="Privacy">
-          <p className="text-sm">No telemetry, no tracking, no analytics.</p>
+          <p className="text-sm">No tracking, no profiles, no third-party analytics.</p>
           <p className="text-xs text-[var(--color-text-muted)] mt-2">
             Your notes, audio, and transcripts stay on your Mac. Cloud
             transcription / summarisation only sends data to OpenAI when
             you explicitly select cloud providers.
           </p>
         </Row>
+        <UsageCountersRow />
       </Section>
 
       <Section title="Storage">
