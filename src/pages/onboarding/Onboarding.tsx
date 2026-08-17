@@ -16,6 +16,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { X } from "lucide-react";
 import { ipc } from "../../lib/ipc";
+import { TelemetryNotice } from "./TelemetryNotice";
 import {
   STEP_ORDER,
   resolveResumeStep,
@@ -101,6 +102,14 @@ export function Onboarding({
     };
   }, [startAt]);
 
+  // Report the furthest step reached, which is what turns "people abandon setup"
+  // into "people abandon setup HERE". Each step counts at most once per install
+  // (the backend holds the marker), so re-entering a step or walking back is free.
+  useEffect(() => {
+    if (!current) return;
+    void ipc.telemetryEvent(`onboarding_reached_${current}`);
+  }, [current]);
+
   const index = current ? STEP_ORDER.indexOf(current) : 0;
   const total = STEP_ORDER.length;
   // Soft progress: fraction of the way through, growing as steps complete.
@@ -132,6 +141,7 @@ export function Onboarding({
       // chip decides from live pipeline state whether to prompt again, so we
       // never need to distinguish here. `destination` (if any) is handed to
       // onDone so the app lands on the right route in both entry modes.
+      void ipc.telemetryEvent(opts?.skipped ? "onboarding_skipped" : "onboarding_finished");
       ipc
         .setSetting("onboarding_completed", "true")
         .catch((e) => console.warn("[onboarding] failed to complete:", e))
@@ -200,6 +210,12 @@ export function Onboarding({
       {/* Centred step content. */}
       <div className="flex-1 min-h-0 overflow-y-auto flex items-center justify-center px-6 py-16">
         <StepComponent ctx={ctx} />
+      </div>
+
+      {/* Telemetry disclosure + its control. Canvas-level so it shows on every
+          step and on every entry point (a resumed wizard skips `welcome`). */}
+      <div className="absolute bottom-4 left-0 right-0 z-20 flex justify-center px-24">
+        <TelemetryNotice />
       </div>
 
       {/* Back navigation — bottom-left, only when there's somewhere to go. */}

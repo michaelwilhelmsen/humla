@@ -39,6 +39,7 @@ mod permissions;
 mod settings;
 mod summary;
 mod summary_prompts;
+mod telemetry;
 mod transcription_config;
 pub use api_keys::*;
 pub use assets::*;
@@ -54,6 +55,7 @@ pub use notes::*;
 pub use permissions::*;
 pub use settings::*;
 pub use summary::*;
+pub use telemetry::*;
 pub use summary_prompts::*;
 pub use transcription_config::*;
 

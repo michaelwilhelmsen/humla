@@ -298,6 +298,7 @@ where
             commands::notes_set_client,
             commands::settings_get,
             commands::settings_set,
+            commands::telemetry_event,
             commands::cloud_status,
             commands::cloud_configure,
             commands::cloud_login,

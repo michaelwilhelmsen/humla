@@ -15,7 +15,10 @@ import { PALETTE_REGISTRY, type Palette } from "../../lib/palette";
 // bookkeeping keys (owned by the wizard shell, never surfaced in Settings).
 export type EditableKey = Exclude<
   SettingsKey,
-  "theme" | "palette" | "onboarding_completed" | "onboarding_step"
+  // `telemetry_enabled` is excluded for the same reason as theme/palette: it is
+  // owned by its own self-contained row (which must distinguish UNSET from "false"),
+  // not by the generic settings map, whose DEFAULTS would collapse that distinction.
+  "theme" | "palette" | "onboarding_completed" | "onboarding_step" | "telemetry_enabled"
 >;
 
 export type Provider = "openai" | "local" | "deepgram" | "groq";

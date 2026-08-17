@@ -132,7 +132,12 @@ export type SettingsKey =
   // plain settings rows so the grandfathering migration and the frontend
   // takeover guard read the same source of truth.
   | "onboarding_completed"
-  | "onboarding_step";
+  | "onboarding_step"
+  // Anonymous onboarding counters. UNSET MEANS OFF — that is what grandfathers
+  // installs made before the feature existed (they were promised no telemetry and
+  // never see the wizard again). Written by the wizard footer, which is also the
+  // disclosure, so the user is always told before anything is sent.
+  | "telemetry_enabled";
 
 export type TranscribeProvider = "openai" | "local" | "deepgram" | "groq";
 
@@ -314,6 +319,10 @@ export const ipc = {
 
   getSetting: (key: SettingsKey) => invoke<string | null>("settings_get", { key }),
   setSetting: (key: SettingsKey, value: string) => invoke<void>("settings_set", { key, value }),
+  /** Report one anonymous milestone. Fire-and-forget: the backend gates on the
+   *  setting and on a once-per-install marker, so callers may call it freely and
+   *  never need to know whether anything was sent. */
+  telemetryEvent: (event: string) => invoke<void>("telemetry_event", { event }),
   appDataDir: () => invoke<string>("app_data_dir"),
   // CPU architecture of the running process ("aarch64", "x86_64", …).
   // Onboarding uses it to steer Intel Macs toward cloud transcription.

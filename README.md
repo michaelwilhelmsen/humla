@@ -39,7 +39,7 @@ Built around one principle: **your audio and your data stay on your machine** un
 The name is Norwegian for *bumblebee* — small, hum, personal.
 
 > [!NOTE]
-> Humla is an indie project, not a big SaaS. The app is **local-first and free** — no account, no telemetry, bring your own API keys (or run fully local). If you want to sync across devices or share workspaces with a team, **Humla Cloud** is an optional paid add-on — and you can self-host the sync server instead. Either way, transcription and summaries still run through your own providers or on-device. See [Team sync & self-hosting](#team-sync--self-hosting).
+> Humla is an indie project, not a big SaaS. The app is **local-first and free** — no account, your notes never leave your Mac, bring your own API keys (or run fully local). If you want to sync across devices or share workspaces with a team, **Humla Cloud** is an optional paid add-on — and you can self-host the sync server instead. Either way, transcription and summaries still run through your own providers or on-device. See [Team sync & self-hosting](#team-sync--self-hosting).
 
 ## What it does
 
@@ -105,9 +105,10 @@ Six read-only tools: `search_notes`, `get_note`, `get_transcript`, `list_notes`,
 
 ## Privacy
 
-The defaults are designed so nothing leaves your machine unless you tell it to.
+The defaults are designed so nothing you write leaves your machine unless you tell it to.
 
-- **No telemetry, no backend by default.** Humla doesn't phone home. The only outbound traffic is to the API endpoints you've explicitly configured — plus, *if* you opt into sync, the server you connect to (Humla Cloud or your own).
+- **No backend by default.** Your notes, transcripts and audio never leave this Mac unless you turn on sync. Outbound traffic is limited to the API endpoints you've configured, the update check against GitHub on launch, and — *if* you opt into sync — the server you connect to (Humla Cloud or your own).
+- **Anonymous counters, and you can switch them off.** To find out whether people actually get the app working, Humla counts a few milestones: first launch, and whether onboarding was finished or skipped. Each is sent at most once per install and carries nothing else — no identifier, no account, no version, nothing about what you configured or recorded. They're stored as plain daily tallies, so there's nothing to tie back to you even in principle. The setup wizard says so on every step and lets you turn it off there; afterwards it lives in Settings → General → **Send anonymous usage counters**. If you installed Humla before this existed, you're not counted unless you switch it on yourself.
 - **Your notes and transcripts** live in a single SQLite database at `~/Library/Application Support/no.humla.app/`.
 - **Recorded audio is not kept unless you ask for it.**
   - While recording, audio lives in a per-recording temp directory, deleted once transcription and the speaker pass are finished.
