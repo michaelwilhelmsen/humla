@@ -53,7 +53,6 @@
 //   while we poll cloud_status after opening Stripe. "timeout" is a CALM note,
 //   never an error (billing can be finished later in Settings).
 import { useEffect, useRef, useState } from "react";
-import { open as openExternal } from "@tauri-apps/plugin-shell";
 import {
   Cloud,
   User,
@@ -70,24 +69,14 @@ import {
   HUMLA_CLOUD_URL,
   type CloudWorkspace,
 } from "../../../lib/cloud";
+import { checkoutKind, offersTrial, planIsLive, useCheckout } from "../../../lib/billing";
 import type { StepContext } from "../types";
 import { StepShell } from "../StepShell";
 
-// Poll cadence + soft ceiling while waiting for Stripe Checkout to complete.
-// The ceiling is deliberately generous (checkout can involve typing a card,
-// 3D-Secure, etc.) and never turns into an error — just a calm "finish later".
-const CHECKOUT_POLL_MS = 3000;
-const CHECKOUT_TIMEOUT_MS = 5 * 60 * 1000;
-
 type Option = "solo" | "team" | "existing";
-type CheckoutState = "idle" | "waiting" | "timeout";
 
 const inputCls =
   "w-full min-w-0 px-3 py-2 rounded-md text-sm bg-[var(--color-input-bg)] border border-[var(--color-line)] focus:border-[var(--color-text-muted)]";
-
-function planIsLive(ws: CloudWorkspace | null | undefined): boolean {
-  return ws?.plan_status === "trialing" || ws?.plan_status === "active";
-}
 
 export function CloudStep({ ctx }: { ctx: StepContext }) {
   const status = useCloudStore((s) => s.status);
@@ -598,74 +587,14 @@ function WorkspaceStage({ mode }: { mode: "signup" | "signin" }) {
 // throughout.
 
 function TrialStage({ ws, ctx }: { ws: CloudWorkspace; ctx: StepContext }) {
-  // The server grants the 14-day trial only to workspaces that never had a
-  // subscription (humla-cloud billing.pb.js) — a canceled/past_due workspace
-  // re-subscribes without a new trial, so don't promise one.
-  const firstSub = ws.plan_status === "none";
-  // A past-due subscription still exists on Stripe — opening a fresh Checkout
-  // would create a SECOND subscription (double billing). Send the owner to the
-  // Customer Portal to fix the failed payment instead; once it settles the plan
-  // flips to active and the poll below lands on SuccessStage.
-  const pastDue = ws.plan_status === "past_due";
-  const refresh = useCloudStore((s) => s.refresh);
-  const [checkout, setCheckout] = useState<CheckoutState>("idle");
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  // Poll cloud_status while "waiting". Cancellation-flag + interval cleanup so
-  // this can't leak past unmount or an option change (which unmounts us).
-  useEffect(() => {
-    if (checkout !== "waiting") return;
-    let cancelled = false;
-    const startedAt = Date.now();
-
-    const tick = async () => {
-      try {
-        await refresh();
-      } catch {
-        // Transient — keep polling; the ceiling handles a persistent outage.
-      }
-      if (cancelled) return;
-      const live = planIsLive(
-        useCloudStore
-          .getState()
-          .status.workspaces.find((w) => w.id === ws.id) ??
-          useCloudStore.getState().status.current_workspace,
-      );
-      if (live) {
-        // Stage derivation in TeamFunnel will now render SuccessStage.
-        setCheckout("idle");
-        return;
-      }
-      if (Date.now() - startedAt >= CHECKOUT_TIMEOUT_MS) {
-        setCheckout("timeout");
-      }
-    };
-
-    const timer = window.setInterval(() => void tick(), CHECKOUT_POLL_MS);
-    return () => {
-      cancelled = true;
-      window.clearInterval(timer);
-    };
-  }, [checkout, refresh, ws.id]);
-
-  async function startTrial() {
-    setBusy(true);
-    setError(null);
-    try {
-      // past_due → fix the existing subscription in the Customer Portal;
-      // otherwise start a new Checkout (trial or fresh subscription).
-      const url = pastDue
-        ? await cloudApi.billingPortal(ws.id)
-        : await cloudApi.billingCheckout(ws.id);
-      await openExternal(url);
-      setCheckout("waiting");
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setBusy(false);
-    }
-  }
+  // Trial promises and Portal-vs-Checkout routing are plan rules, not step
+  // logic — they live in lib/billing so this step and the New workspace sheet
+  // can't disagree about when a trial is on offer or when opening Checkout
+  // would double-bill a past-due workspace.
+  const firstSub = offersTrial(ws);
+  const kind = checkoutKind(ws);
+  const pastDue = kind === "portal";
+  const { state: checkout, busy, error, start } = useCheckout(ws.id);
 
   return (
     <div className="flex flex-col gap-3">
@@ -692,7 +621,7 @@ function TrialStage({ ws, ctx }: { ws: CloudWorkspace; ctx: StepContext }) {
       {checkout === "idle" && (
         <button
           type="button"
-          onClick={startTrial}
+          onClick={() => void start(kind)}
           disabled={busy}
           className="nd-btn nd-btn-primary self-start"
         >
@@ -711,7 +640,7 @@ function TrialStage({ ws, ctx }: { ws: CloudWorkspace; ctx: StepContext }) {
           </p>
           <button
             type="button"
-            onClick={startTrial}
+            onClick={() => void start(kind)}
             disabled={busy}
             className="self-start text-xs text-[var(--color-text-muted)] hover:text-[var(--color-text)] underline transition-colors"
           >

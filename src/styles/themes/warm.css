@@ -104,7 +104,7 @@
 
   --color-accent: #ffdc6c;            /* Humla gold — fill for primary action / active */
   --color-accent-2: #f3cb4d;          /* gold hover (slightly deeper) */
-  --color-accent-soft: #fbeecb;       /* gold tint behind active states */
+  --color-accent-soft: #fff1cd;       /* gold tint behind active states */
   --color-on-accent: #2a2206;         /* dark ink on a filled-gold surface */
   --color-accent-text: #7a5a12;       /* readable amber for accent text/icons/links */
 

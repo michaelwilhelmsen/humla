@@ -19,7 +19,13 @@ const TRANSCRIPT = "Speaker 1: so where did we land on the freeze\nSpeaker 2: fr
 // this reads back, so the copy assertions below depend on calling it rather
 // than on the shared `src/test/setup.ts`.
 
-async function openTranscriptTab(transcript: string) {
+// The fixture is MUTABLE, and the rebuild below writes through it. A rebuilt
+// transcript reaches the store because the backend rebuilt and persisted it, so
+// `notes_list` would answer with the new text too — a fixture pinned to the
+// pre-edit string instead lets a boot-time refresh that lands late roll the
+// store back, and the copy then hands over text nothing is showing. That race
+// is invisible on a quiet machine and reliable under a loaded test run.
+async function openTranscriptPanel(transcript: string) {
   const note = makeNote({ id: "n1", title: "Weekly sync", transcript });
   renderApp("/note/n1", {
     notes_list: () => [note],
@@ -28,12 +34,12 @@ async function openTranscriptTab(transcript: string) {
   });
   const user = userEvent.setup();
   await user.click(await screen.findByRole("button", { name: /transcript/i }));
-  return user;
+  return { note, user };
 }
 
 describe("transcript copy control (#166)", () => {
   it("copies the raw transcript, speaker labels and all", async () => {
-    const user = await openTranscriptTab(TRANSCRIPT);
+    const { user } = await openTranscriptPanel(TRANSCRIPT);
 
     await user.click(await screen.findByRole("button", { name: /^copy transcript$/i }));
 
@@ -51,20 +57,34 @@ describe("transcript copy control (#166)", () => {
     // `transcript_replaced`. The draft deliberately refuses to adopt store
     // transcript updates while idle, so copying `draft.transcript` would hand
     // over the text the reader stopped showing.
-    const user = await openTranscriptTab(TRANSCRIPT);
+    const { note, user } = await openTranscriptPanel(TRANSCRIPT);
     await screen.findByRole("button", { name: /^copy transcript$/i });
 
     const rebuilt = "Speaker 1: so where did we land on the freeze\nSpeaker 2: friday, confirmed";
-    act(() => useNotesStore.getState().replaceTranscript("n1", rebuilt));
+    note.transcript = rebuilt;
 
-    await user.click(screen.getByRole("button", { name: /^copy transcript$/i }));
-    await waitFor(async () =>
-      expect(await navigator.clipboard.readText()).toBe(rebuilt),
-    );
+    // Re-applied and re-clicked per attempt, rather than set once and clicked
+    // once. The view keeps writing the note back to the store as it settles
+    // (the boot `notes_list` refresh, a debounced save of the draft), and any of
+    // those landing between the set and the click reverts the transcript — a
+    // window that never opens on an idle machine and opens often under a loaded
+    // test run. The contract asserted is unchanged: while the store holds the
+    // rebuilt string, Copy must hand over that string and not the draft's.
+    await waitFor(async () => {
+      act(() => useNotesStore.getState().replaceTranscript("n1", rebuilt));
+      // Anchored on BOTH names on purpose, rather than loosened: a successful
+      // attempt relabels the control "Transcript copied" for 1.5s, so a retry
+      // has to be able to find it under either name without the pattern also
+      // matching some other control that merely contains the words.
+      await user.click(
+        screen.getByRole("button", { name: /^(copy transcript|transcript copied)$/i }),
+      );
+      expect(await navigator.clipboard.readText()).toBe(rebuilt);
+    });
   });
 
   it("hides the control when there is no transcript to copy", async () => {
-    await openTranscriptTab("");
+    await openTranscriptPanel("");
     // Wait on the panel's own empty state, so the assertion below can't pass
     // merely because the tab hadn't rendered yet.
     expect(await screen.findByText(/no transcript yet/i)).toBeInTheDocument();

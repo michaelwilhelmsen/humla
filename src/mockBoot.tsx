@@ -25,6 +25,8 @@ import { Segmented } from "./pages/settings/components/Segmented";
 import { Toggle } from "./pages/settings/components/Toggle";
 import { TranscriptEditor, TranscriptPlayer } from "./pages/Note";
 import { IntegrationsSection } from "./pages/settings/tabs/Integrations";
+import { NewWorkspaceModal } from "./components/NewWorkspaceModal";
+import { DISCONNECTED, useCloudStore, type CloudStatus, type CloudWorkspace } from "./lib/cloud";
 import { DEFAULTS, type EditableKey } from "./pages/settings/types";
 import { SummaryStep } from "./pages/onboarding/steps/Summary";
 import { TranscriptionStep } from "./pages/onboarding/steps/Transcription";
@@ -242,6 +244,71 @@ function IntegrationsHarness({ enabled }: { enabled: boolean }) {
   return <IntegrationsSection s={s} update={(_k, v) => setOn(v)} />;
 }
 
+// ---- workspace-creation axis: the sheet's five stages ----------------------
+// Five separate scenarios rather than one clickable flow: the stages are DERIVED
+// from cloud status, so seeding the status is how you reach one — and each is a
+// distinct layout to judge (a pitch panel, a form, a named field, a wait state,
+// a growing list). No `wrap`: the sheet portals to <body> and covers the
+// viewport, which is exactly what it does in the app.
+function workspaceCase(stage: "connect" | "auth" | "name" | "trial" | "invite"): Scenario {
+  const ws = (plan: CloudWorkspace["plan_status"]): CloudWorkspace => ({
+    id: "w1",
+    name: "Acme Inc",
+    role: "owner",
+    plan_status: plan,
+  });
+  const signedIn: CloudStatus = {
+    ...DISCONNECTED,
+    configured: true,
+    logged_in: true,
+    base_url: "https://sync.humla.team",
+    user: { id: "u1", email: "michael@example.no", name: "Michael", verified: true },
+    billing_enabled: true,
+    seat_price_cents: 500,
+    seat_currency: "usd",
+  };
+  const status: CloudStatus =
+    stage === "connect"
+      ? { ...DISCONNECTED, configured: false }
+      : stage === "auth"
+        ? { ...signedIn, logged_in: false, user: null }
+        : stage === "name"
+          ? signedIn
+          : {
+              ...signedIn,
+              current_workspace: ws(stage === "trial" ? "none" : "trialing"),
+              workspaces: [ws(stage === "trial" ? "none" : "trialing")],
+            };
+  return {
+    wrap: (node) => <div className="flex-1 min-h-0">{node}</div>,
+    render: () => <WorkspaceHarness status={status} pinned={stage === "trial" || stage === "invite"} />,
+    ipc: {
+      cloud_status: () => status,
+      cloud_create_workspace: () => ws("none"),
+      cloud_invite_member: () => "invited",
+      cloud_billing_checkout: () => "https://checkout.stripe.test/x",
+    },
+  };
+}
+
+function WorkspaceHarness({ status, pinned }: { status: CloudStatus; pinned: boolean }) {
+  // Seed before the first paint so the sheet never renders a stage it is about
+  // to leave — the store is the component's only input.
+  const [ready] = useState(() => {
+    useCloudStore.setState({ status, ready: true });
+    return true;
+  });
+  // `pinned` scenarios work an EXISTING workspace, which is how the read-only
+  // banner enters; the others create one, so they pass no id.
+  return ready ? (
+    <NewWorkspaceModal
+      open
+      onClose={() => console.log("[mock] close")}
+      workspaceId={pinned ? "w1" : null}
+    />
+  ) : null;
+}
+
 // ---- theme axis: every token-driven surface on one page --------------------
 // Real components where one exists (Toggle, Segmented, CommandSnippet's mono
 // block); the utility classes themselves where the component is a page (a nav
@@ -400,6 +467,13 @@ const CASES: Record<string, Scenario> = {
   player: playerCase(false),
   // Recording in flight — no edit or delete affordance on any turn.
   "player-recording": playerCase(true),
+
+  // --- The create-team-workspace sheet, one scenario per derived stage.
+  "ws-connect": workspaceCase("connect"),
+  "ws-auth": workspaceCase("auth"),
+  "ws-name": workspaceCase("name"),
+  "ws-trial": workspaceCase("trial"),
+  "ws-invite": workspaceCase("invite"),
 
   // --- Themes: the token-driven chrome on one page, so a theme can be judged
   // as a design rather than as a diff. Combine with ?palette= and ?theme=.

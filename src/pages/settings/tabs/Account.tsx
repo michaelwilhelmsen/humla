@@ -275,7 +275,12 @@ export function AccountTab({ s, update }: Pick<SettingsHook, "s" | "update">) {
         {/* Humla Cloud pitch: the one place the hosted offer gets to sell
             itself — accent-washed so it stands out from the surrounding
             settings chrome without shouting. */}
-        <div className="rounded-lg border border-[var(--color-accent)] bg-[var(--color-accent-soft)] p-4 flex flex-col gap-1.5">
+        {/* Borderless, matching the create-team-workspace sheet's pitch panel —
+            the same element, and two of them styled differently reads as a bug.
+            The onboarding SELECTION cards keep their accent border: there it
+            distinguishes the chosen card from the unchosen, so it is state
+            rather than decoration. */}
+        <div className="rounded-lg bg-[var(--color-accent-soft)] p-4 flex flex-col gap-1.5">
           <div className="flex items-center gap-1.5 text-sm font-medium">
             <Cloud size={15} strokeWidth={1.7} /> Humla Cloud
           </div>

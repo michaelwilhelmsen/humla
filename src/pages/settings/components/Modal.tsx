@@ -36,11 +36,27 @@ export function Modal({
   onClose,
   children,
   title,
+  showHeader = true,
+  size = "md",
+  padded = true,
 }: {
   open: boolean;
   onClose: () => void;
   children: ReactNode;
   title?: string;
+  /** False when the body supplies its own visible heading. `title` still names
+   *  the dialog for assistive tech either way — it is the ONE source for that
+   *  name, and this only decides whether a header row is drawn. */
+  showHeader?: boolean;
+  /** Panel width. "md" (default) is the settings-editor width; "sm" is for a
+   *  focused single-decision flow, where the full width leaves a short form
+   *  stranded in the middle of a very wide sheet. */
+  size?: "md" | "sm";
+  /** Set false when the body owns its own padding. Not the same as padding zero:
+   *  a body that pads its own sections can still let ONE of them reach the panel
+   *  edge — a footer rule spanning the full width, say — which a single pad on
+   *  this wrapper cannot express however it is valued. */
+  padded?: boolean;
 }) {
   const panelRef = useRef<HTMLDivElement>(null);
 
@@ -123,14 +139,25 @@ export function Modal({
       <div
         ref={panelRef}
         tabIndex={-1}
-        className="relative z-10 max-w-2xl w-[min(48rem,calc(100vw-3rem))] max-h-[calc(100vh-4rem)] overflow-y-auto bg-[var(--color-canvas)] border border-[var(--color-line-visible)] rounded-lg shadow-xl outline-none"
+        className={
+          // `--color-surface`, not `--color-canvas`: this panel is borderless, so
+          // its background is the only thing separating it from the dimmed app
+          // behind. In warm dark, canvas (#0e0c08) against a black/50 backdrop
+          // over that same canvas differs by single digits out of 255, and
+          // `--color-shadow` is transparent in both modes — the panel simply
+          // had no edge. Surface is the next rung up the documented ladder.
+          "relative z-10 max-h-[calc(100vh-4rem)] overflow-y-auto bg-[var(--color-surface)] rounded-lg shadow-xl outline-none " +
+          (size === "sm"
+            ? "max-w-md w-[min(30rem,calc(100vw-3rem))]"
+            : "max-w-2xl w-[min(48rem,calc(100vw-3rem))]")
+        }
       >
-        {title && (
+        {title && showHeader && (
           <div className="px-6 py-4 border-b border-[var(--color-line)]">
             <h2 className="text-lg font-medium">{title}</h2>
           </div>
         )}
-        <div className="px-6 py-5">{children}</div>
+        <div className={padded ? "px-6 py-5" : ""}>{children}</div>
       </div>
     </div>,
     document.body,

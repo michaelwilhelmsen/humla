@@ -17,6 +17,7 @@ import { Btn } from "../components/Btn";
 import { Select } from "../../../components/ui/Select";
 import { ValuePill } from "../components/ValuePill";
 import { ChatKeyPanel } from "./ChatKeyPanel";
+import { NewWorkspaceModal } from "../../../components/NewWorkspaceModal";
 
 const inputCls =
   "flex-1 min-w-0 text-sm px-3 py-2 rounded-md border border-[var(--color-line-visible)] bg-[var(--color-surface)] focus:border-[var(--color-text-muted)] transition-colors";
@@ -186,7 +187,7 @@ export function OrganizationTab() {
   const [notice, setNotice] = useState<string | null>(null);
   const [addEmail, setAddEmail] = useState("");
   const [busy, setBusy] = useState(false);
-  const [newWs, setNewWs] = useState("");
+  const [creatingOpen, setCreatingOpen] = useState(false);
   const [nameDraft, setNameDraft] = useState("");
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [confirmLeave, setConfirmLeave] = useState(false);
@@ -228,19 +229,6 @@ export function OrganizationTab() {
 
   // No active workspace -----------------------------------------------------
   if (!ws) {
-    async function create() {
-      const name = newWs.trim();
-      if (!name) return;
-      setBusy(true);
-      try {
-        await cloudApi.createWorkspace(name);
-        setNewWs("");
-        await refreshCloud();
-        await refreshNotes();
-      } finally {
-        setBusy(false);
-      }
-    }
     return (
       <Section title="Workspace">
         <p className="text-sm text-[var(--color-text-muted)] py-3.5">
@@ -267,18 +255,13 @@ export function OrganizationTab() {
             </div>
           </Row>
         )}
-        <Row label="New workspace">
-          <div className="flex gap-2">
-            <input
-              className={inputCls}
-              value={newWs}
-              onChange={(e) => setNewWs(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && create()}
-              placeholder="Acme Inc"
-            />
-            <Btn onClick={create} disabled={busy || !newWs.trim()}>Create</Btn>
-          </div>
+        {/* One create flow, not two: this used to be a second bare name input
+            (the switcher had the other), and both left the new workspace
+            read-only with no hint of what to do next. */}
+        <Row label="Team workspace">
+          <Btn onClick={() => setCreatingOpen(true)}>Create team workspace…</Btn>
         </Row>
+        <NewWorkspaceModal open={creatingOpen} onClose={() => setCreatingOpen(false)} />
       </Section>
     );
   }

@@ -34,6 +34,7 @@ import { useLiveSetting } from "../lib/settingsBus";
 import { useDownloadStore, useNotesStore, useRecordingStore } from "../lib/store";
 import { computeSetupStatus } from "../lib/setupStatus";
 import { useOwnerName, useCloudStore } from "../lib/cloud";
+import { billingCta, planIsLive } from "../lib/billing";
 import { extractSpeakerLabels, renameSpeakerInTranscript } from "../lib/speakers";
 import { shouldAdoptRemoteBody } from "../lib/noteSync";
 import { SpeakerLabels, speakerColorMap } from "../components/SpeakerLabels";
@@ -47,6 +48,7 @@ import {
   type TimelineGroup,
 } from "../lib/sessions";
 import { RecordingBar } from "../components/RecordingBar";
+import { NewWorkspaceModal } from "../components/NewWorkspaceModal";
 import { ChatPanel, type ChatSessionControls } from "../components/ChatPanel";
 import { SelectablePopover } from "../components/SelectablePopover";
 import {
@@ -160,13 +162,16 @@ export function Note() {
   // On humla-cloud, a workspace with no active/trialing subscription is read-only
   // until it's paid — the server blocks writes, so mirror that in the UI rather
   // than letting edits look saved locally but silently fail to sync.
-  const lockedByPlan =
-    billingEnabled && !!noteWs && noteWs.plan_status !== "active" && noteWs.plan_status !== "trialing";
+  const lockedByPlan = billingEnabled && !!noteWs && !planIsLive(noteWs);
+  // The owner can resolve a plan lock from right here, so the banner offers the
+  // trial sheet instead of naming a Settings path to walk to.
+  const canFixPlan = lockedByPlan && noteWs?.role === "owner";
   const readOnly = !!draft?.workspace_id && (isViewer || lockedByPlan);
   // Mirror into a ref so the memoised patch callbacks can gate without changing
   // identity (which would bust the transcript-view memos).
   const readOnlyRef = useRef(readOnly);
   readOnlyRef.current = readOnly;
+  const [billingOpen, setBillingOpen] = useState(false);
   const [uiLang, setUiLang] = useState<string>("no");
   const [globalProvider, setGlobalProvider] = useState<string>("openai");
   // Device-wide audio retention (#24). Off is the shipped default, so an
@@ -805,11 +810,27 @@ export function Note() {
         {readOnly && (
           <div className="mb-4 flex items-center gap-2 px-3 py-2 rounded-md border border-[var(--color-line)] bg-[var(--color-pill-hover)] text-xs text-[var(--color-text-muted)]">
             <Eye size={13} strokeWidth={1.5} className="shrink-0" />
-            <span>
+            <span className="flex-1">
               {isViewer
                 ? "View-only — you have viewer access to this workspace, so this note can’t be edited."
-                : "Read-only — this workspace needs an active subscription. The owner can start it in Settings → Account → Billing."}
+                : !canFixPlan
+                  ? "Read-only — this workspace needs an active subscription. Ask the workspace owner to start it."
+                  : noteWs?.plan_status === "past_due"
+                    ? "Read-only — a payment for this workspace didn’t go through, so nothing syncs and nobody can edit."
+                    : "Read-only until this workspace’s plan is live — nothing syncs and nobody can edit."}
             </span>
+            {canFixPlan && (
+              <button
+                type="button"
+                onClick={() => setBillingOpen(true)}
+                className="shrink-0 font-medium text-[var(--color-accent-text)] hover:underline"
+              >
+                {/* Shared with the sheet's own CTA: a third hand-rolled cascade
+                    on plan_status is how "past_due opens the Portal, not a
+                    second Checkout" drifts out of true in one of them. */}
+                {noteWs ? billingCta(noteWs).label : "Subscribe"}
+              </button>
+            )}
           </div>
         )}
         {!readOnly && lockedBy && (
@@ -819,6 +840,16 @@ export function Note() {
               <strong className="font-medium text-[var(--color-text)]">{lockedBy.holderName}</strong> is recording this note. Only one person can record a shared note at a time — the transcript will sync here when they stop.
             </span>
           </div>
+        )}
+        {/* Deliberately outside the banner's own condition: a completed checkout
+            makes this note writable, which unmounts the banner — and with it
+            would go the sheet, one stage before it offers the first invite. */}
+        {noteWs && (
+          <NewWorkspaceModal
+            open={billingOpen}
+            onClose={() => setBillingOpen(false)}
+            workspaceId={noteWs.id}
+          />
         )}
         <textarea
           ref={titleRef}
