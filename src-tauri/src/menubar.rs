@@ -633,9 +633,9 @@ async fn headless_stop(app: &AppHandle) {
 /// in the active workspace, titled with the start time.
 ///
 /// The title is what makes the note findable — both in the sidebar and in the
-/// notification that names it. #90 (titles from the summary) is expected to
-/// replace it; [`is_generated_title`] is the seam for recognising a title as
-/// ours to overwrite.
+/// notification that names it. #90's automatic titler replaces it once the
+/// recording has content; [`is_replaceable_title`] is the seam for recognising
+/// a title as ours to overwrite.
 fn create_headless_note(app: &AppHandle) -> Result<(String, String), String> {
     let state = app.state::<AppState>();
     let title = headless_note_title(chrono::Local::now());
@@ -669,17 +669,26 @@ pub(crate) fn headless_note_title(now: chrono::DateTime<chrono::Local>) -> Strin
     format!("Recording {}", now.format("%-d %b %H:%M"))
 }
 
-/// Whether a title is one [`headless_note_title`] produced, and so may be
-/// replaced by a better one. Kept next to the generator (and pinned by a test)
-/// so the two can't drift apart.
+/// May Humla overwrite this title with a better one? (#90)
 ///
-/// Nothing calls it yet: it exists for #90 (titles derived from the summary),
-/// whose rule is "a generated timestamp is fair game, a human title is not".
-/// That question has exactly one correct answer and it belongs here, beside the
-/// format it has to recognise — not in whatever file #90 lands in.
-#[allow(dead_code)]
-pub fn is_generated_title(title: &str) -> bool {
-    let Some(rest) = title.trim().strip_prefix("Recording ") else { return false };
+/// The single answer to that question, for every caller. Three titles are ours:
+/// an empty one (`notes_create` leaves it empty and the UI renders "Untitled"),
+/// one [`headless_note_title`] produced, and the `Imported audio` literal
+/// [`crate::commands::title_from_filename`] falls back to when a path had no
+/// usable stem. Everything else — including a real filename stem, which is the
+/// name the user gave the file — is user-owned and is never touched
+/// automatically.
+///
+/// Lives next to the generator whose output it has to recognise (and is pinned
+/// by tests here) so the two can't drift apart. Humla stores no flag recording
+/// who wrote a title, so the distinction is read off the title's *shape*: see
+/// the Title entry in `CONTEXT.md`.
+pub fn is_replaceable_title(title: &str) -> bool {
+    let title = title.trim();
+    if title.is_empty() || title == crate::commands::IMPORTED_AUDIO_TITLE {
+        return true;
+    }
+    let Some(rest) = title.strip_prefix("Recording ") else { return false };
     chrono::NaiveDateTime::parse_from_str(
         // The format carries no year, so parse against a fixed one — we only
         // care whether the shape matches.
@@ -844,17 +853,48 @@ mod tests {
         assert_eq!(headless_note_title(single_digit), "Recording 3 Aug 09:05");
     }
 
-    // #90 will want to replace a generated title with one derived from the
-    // summary, and must never touch a title a human wrote.
+    // #90: the automatic titler replaces a title Humla wrote and never one a
+    // human did. This predicate is the whole of that rule.
     #[test]
-    fn recognises_its_own_titles_and_nobody_elses() {
+    fn a_timestamp_title_is_ours_to_replace() {
         let at = chrono::Local.with_ymd_and_hms(2026, 8, 19, 14, 32, 0).unwrap();
-        assert!(is_generated_title(&headless_note_title(at)));
-        assert!(is_generated_title("Recording 3 Aug 09:05"));
-        assert!(!is_generated_title(""));
-        assert!(!is_generated_title("Recording"));
-        assert!(!is_generated_title("Recording kickoff with Hege"));
-        assert!(!is_generated_title("Standup 19 Aug 14:32"));
+        assert!(is_replaceable_title(&headless_note_title(at)));
+        assert!(is_replaceable_title("Recording 3 Aug 09:05"));
+    }
+
+    #[test]
+    fn an_unnamed_note_is_ours_to_replace() {
+        // `notes_create` leaves the title empty; the UI renders "Untitled".
+        assert!(is_replaceable_title(""));
+        assert!(is_replaceable_title("   \n "));
+    }
+
+    #[test]
+    fn the_import_fallback_is_ours_but_a_real_filename_is_not() {
+        // `title_from_filename` reaches for this literal only when the path had
+        // no usable stem — it carries no information from the user.
+        assert!(is_replaceable_title("Imported audio"));
+        // A real stem is the name the user gave the file. User-owned.
+        assert!(!is_replaceable_title("standup_2026-07-09"));
+        assert!(!is_replaceable_title("Imported audio from Hege"));
+    }
+
+    // Mirrored in TS as `isReplaceableTitle` (src/lib/noteSync.ts), which has to
+    // reject exactly these — a looser rule there would have the open Note view
+    // adopt over a title this side calls user-owned.
+    #[test]
+    fn a_timestamp_shape_with_impossible_values_is_not_ours() {
+        assert!(!is_replaceable_title("Recording 99 Aug 14:32"));
+        assert!(!is_replaceable_title("Recording 19 Zzz 14:32"));
+        assert!(!is_replaceable_title("Recording 19 Aug 99:32"));
+        assert!(!is_replaceable_title("Recording 19 Aug 14:99"));
+    }
+
+    #[test]
+    fn a_human_title_is_never_ours_to_replace() {
+        assert!(!is_replaceable_title("Recording"));
+        assert!(!is_replaceable_title("Recording kickoff with Hege"));
+        assert!(!is_replaceable_title("Standup 19 Aug 14:32"));
     }
 
     const PX: u32 = 44;

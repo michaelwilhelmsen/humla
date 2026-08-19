@@ -37,7 +37,9 @@ export function Toaster() {
                 ? "Speakers merged"
                 : e.kind === "summary"
                   ? "Summary failed"
-                  : "Recording issue"}
+                  : e.kind === "title"
+                    ? "Couldn’t write a title"
+                    : "Recording issue"}
             </div>
             <div className="text-[var(--color-text)]">{e.message}</div>
             {/* Copy-coupled: error messages that mention "permission" or

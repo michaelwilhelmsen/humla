@@ -113,8 +113,8 @@ type RecordingState = {
   // `sticky` errors skip the auto-dismiss timer — for failures that block the
   // user's next action (e.g. Record refused because setup is incomplete),
   // where vanishing after a few seconds reads as "the button did nothing".
-  errors: { id: number; noteId: string | null; message: string; kind?: "recording" | "summary"; sticky?: boolean }[];
-  pushError: (e: { noteId: string | null; message: string; kind?: "recording" | "summary"; sticky?: boolean }) => void;
+  errors: { id: number; noteId: string | null; message: string; kind?: "recording" | "summary" | "title"; sticky?: boolean }[];
+  pushError: (e: { noteId: string | null; message: string; kind?: "recording" | "summary" | "title"; sticky?: boolean }) => void;
   dismissError: (id: number) => void;
   flashes: Flash[];
   pushFlash: (message: string) => void;

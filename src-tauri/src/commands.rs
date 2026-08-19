@@ -43,6 +43,7 @@ mod settings;
 mod summary;
 mod summary_prompts;
 mod telemetry;
+mod title;
 mod transcription_config;
 pub use api_keys::*;
 pub use assets::*;
@@ -60,6 +61,7 @@ pub use permissions::*;
 pub use settings::*;
 pub use summary::*;
 pub use telemetry::*;
+pub use title::*;
 pub use summary_prompts::*;
 pub use transcription_config::*;
 
@@ -112,6 +114,15 @@ const DEFAULT_SILENCE_RMS_THRESHOLD: f32 = 0.005;
 const IMPORT_BACKLOG_PERMITS: usize = 16;
 
 const DEFAULT_SUMMARY_MODEL: &str = "gpt-5.4-mini";
+/// The cloud model an automatic title call falls back to when the configured
+/// summary model reasons (#90) — which the default above does, so this is the
+/// model the default configuration actually titles with.
+///
+/// Pinned rather than derived: a reasoning model would spend thousands of
+/// invisible reasoning tokens on five words, in a call the user never asked
+/// for. It has to be a model every OpenAI key can reach, since a failure here
+/// is silent by design and would present as titling simply never happening.
+pub(crate) const TITLE_FALLBACK_MODEL: &str = "gpt-4o-mini";
 // Ollama's default port + OpenAI-compat path. Any user running LM Studio,
 // llama-server, or vLLM will override this in Settings.
 const DEFAULT_LOCAL_LLM_BASE_URL: &str = "http://localhost:11434/v1";
@@ -2438,6 +2449,16 @@ async fn run_post_stop_chain(
         let _ = tokio::fs::remove_dir_all(dir).await;
     }
     emit_status(&app, None, Phase::Idle);
+    // The content has settled: the transcript is final and written. Give the
+    // note a real title if it is still carrying one of ours (#90).
+    //
+    // AFTER Idle, not before. It is a network call to a provider that may be a
+    // local model cold-loading from disk, and holding the phase in Diarizing
+    // for that would stall the record button, the "saved to …" notification
+    // and the frontend's session upload behind a nicety. Backgrounding costs
+    // only that the menu-bar notification names the timestamp title; the
+    // sidebar catches up on the `notes_changed` the write emits.
+    tauri::async_runtime::spawn(title::generate_note_title(app.clone(), note_id));
 }
 
 /// Resolve the active transcription provider for `note_id`'s language and
@@ -2619,10 +2640,16 @@ async fn dispatch_sidecar_event(
     }
 }
 
+/// The title an import falls back to when the path had no usable stem. Named
+/// because it is not user-owned: `menubar::is_replaceable_title` has to
+/// recognise it as Humla's own, and a second copy of the literal would be a
+/// second place for the two to drift apart (#90).
+pub(crate) const IMPORTED_AUDIO_TITLE: &str = "Imported audio";
+
 /// Seed a note title from an imported audio file's name: the file stem with no
-/// extension, trimmed. Falls back to "Imported audio" for a path with no usable
-/// stem. Kept deliberately literal — the user's filename is meaningful, so we
-/// don't reflow or re-case it.
+/// extension, trimmed. Falls back to [`IMPORTED_AUDIO_TITLE`] for a path with
+/// no usable stem. Kept deliberately literal — the user's filename is
+/// meaningful, so we don't reflow or re-case it.
 pub(crate) fn title_from_filename(path: &std::path::Path) -> String {
     let stem = path
         .file_stem()
@@ -2630,7 +2657,7 @@ pub(crate) fn title_from_filename(path: &std::path::Path) -> String {
         .map(|s| s.trim())
         .unwrap_or("");
     if stem.is_empty() {
-        "Imported audio".to_string()
+        IMPORTED_AUDIO_TITLE.to_string()
     } else {
         stem.to_string()
     }

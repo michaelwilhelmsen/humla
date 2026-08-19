@@ -53,17 +53,21 @@ export function groupByDate(notes: Note[]) {
   return groups.filter((g) => g.items.length > 0);
 }
 
-// One-line snippet for a row. The body is Tiptap HTML, so strip tags via a
-// detached element (textContent only — never inserted live, so no script
-// runs); fall back to the transcript for pure voice memos.
+// Plain text behind Tiptap's HTML, via a detached element (textContent only —
+// never inserted live, so no script runs). The backend does this properly with
+// `html_text::html_to_text` when it builds a prompt; this is the client's
+// version, for display and for length checks.
+export function htmlToText(html: string | null | undefined): string {
+  const trimmed = html?.trim();
+  if (!trimmed) return "";
+  const el = document.createElement("div");
+  el.innerHTML = trimmed;
+  return el.textContent || "";
+}
+
+// One-line snippet for a row; falls back to the transcript for pure voice memos.
 export function notePreview(n: Note): string {
-  let text = "";
-  const html = n.body?.trim();
-  if (html) {
-    const el = document.createElement("div");
-    el.innerHTML = html;
-    text = el.textContent || "";
-  }
+  let text = htmlToText(n.body);
   if (!text.trim() && n.transcript) text = n.transcript;
   return text.replace(/\s+/g, " ").trim();
 }

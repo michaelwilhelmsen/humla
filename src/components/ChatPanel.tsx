@@ -54,6 +54,7 @@ import { opensPromptPicker, promptsFor, type ChatPrompt } from "../lib/chatPromp
 import { RECOMMENDED_OLLAMA_MODEL } from "../lib/localModels";
 import { CommandSnippet } from "./CommandSnippet";
 import { cn } from "../lib/cn";
+import { htmlToText } from "../lib/noteList";
 
 // Chat over the user's Notes (issues #46 + #47). The assistant runs an agentic
 // retrieval loop on the backend: it searches/reads notes with tools, streams
@@ -331,10 +332,8 @@ export function ChatPanel({
     if (!anchorNote) return false;
     // Body is HTML in the store but plain text in the prompt — measure the text,
     // or tag-heavy markup would trip the hint far too early.
-    const el = document.createElement("div");
-    el.innerHTML = anchorNote.body ?? "";
     return groundingLikelyTruncated({
-      bodyText: el.textContent || "",
+      bodyText: htmlToText(anchorNote.body),
       transcript: anchorNote.transcript ?? "",
       summary: anchorNote.summary ?? "",
     });

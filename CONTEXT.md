@@ -9,7 +9,7 @@ A single meeting record: the user's typed notes, the audio transcript, and an AI
 _Avoid_: Meeting, recording, entry
 
 **Title**:
-A Note's name, as it shows in the notes list and above the body. Either **user-owned** — typed by the user, or carried in from an imported file's own name — or **generated**, written by Humla for a Note that had no name of its own: the `Recording 19 Aug 14:32` a menu-bar capture starts with, and the short phrase derived from the Note's first paragraphs once it has content. Only a generated Title is ever overwritten automatically; a user-owned one changes only when the user edits it or explicitly asks for a new one. The distinction is read off the Title's *shape* at the moment it matters — Humla stores no flag recording who wrote it, so a generated Title that happens to look human-written is treated as human-written.
+A Note's name, as it shows in the notes list and above the body. Either **user-owned** — typed by the user, or carried in from an imported file's own name — or **generated**, written by Humla for a Note that had no name of its own: the `Recording 19 Aug 14:32` a menu-bar capture starts with, the `Imported audio` an import falls back to when the file had no usable name of its own, and the short phrase derived from the Note's first paragraphs once it has content. Only a generated Title is ever overwritten automatically; a user-owned one changes only when the user edits it or explicitly asks for a new one. The distinction is read off the Title's *shape* at the moment it matters — Humla stores no flag recording who wrote it, so a generated Title that happens to look human-written is treated as human-written.
 _Avoid_: Name, heading, subject, label
 
 **Folder**:

@@ -504,6 +504,11 @@ export const ipc = {
   recordingResume: () => invoke<void>("recording_resume"),
   recordingState: () => invoke<"idle" | "recording">("recording_state"),
   summarizeNote: (noteId: string) => invoke<void>("summarize_note", { noteId }),
+  // Regenerate a note's title from its content (#90). Resolves to the new title,
+  // or null when the model gave back nothing usable — in which case the existing
+  // title is deliberately left as it was.
+  noteGenerateTitle: (noteId: string, force: boolean) =>
+    invoke<string | null>("note_generate_title", { noteId, force }),
 
   // AI chat over a single Note (issue #46). `chatSend` runs one grounded,
   // streamed completion — the answer arrives via chat_* events, so the
@@ -796,9 +801,11 @@ export function onLocalWhisperDownloadError(
 export function onDiarizeDownloadProgress(cb: (e: DiarizeDownloadProgress) => void): Promise<UnlistenFn> {
   return listen<DiarizeDownloadProgress>("diarize_download_progress", (e) => cb(e.payload));
 }
-// Emitted by the cloud sync worker after it applies pulled remote changes to
-// the local store, so the UI refetches. Fires only when sync is active (cloud
-// feature + signed in + a workspace selected); inert otherwise.
+// "The notes table changed underneath you — refetch." Two emitters: the cloud
+// sync worker, after it applies pulled remote changes (only when sync is active
+// — cloud feature + signed in + a workspace selected), and any backend write
+// the UI never asked for — a menu-bar capture creating its note, the automatic
+// titler writing a title (#90).
 export function onNotesChanged(cb: () => void): Promise<UnlistenFn> {
   return listen("notes_changed", () => cb());
 }

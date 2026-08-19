@@ -36,7 +36,8 @@ import { computeSetupStatus } from "../lib/setupStatus";
 import { useOwnerName, useCloudStore } from "../lib/cloud";
 import { billingCta, planIsLive } from "../lib/billing";
 import { extractSpeakerLabels, renameSpeakerInTranscript } from "../lib/speakers";
-import { shouldAdoptRemoteBody } from "../lib/noteSync";
+import { htmlToText } from "../lib/noteList";
+import { shouldAdoptRemoteBody, shouldAdoptRemoteTitle, shouldRequestTitleForBody } from "../lib/noteSync";
 import { SpeakerLabels, speakerColorMap } from "../components/SpeakerLabels";
 import { RecordingSessions } from "../components/RecordingSessions";
 import {
@@ -116,6 +117,37 @@ async function runSummarize(noteId: string, onFailure?: () => void) {
   }
 }
 
+/** How long the body has to sit still before #90's typed-note titler fires.
+ *
+ * Long enough that it reads as "the user stopped writing", not "the user paused
+ * to think" — this spends a model call, and the note has the rest of its life to
+ * get a title. */
+const TITLE_BODY_SETTLE_MS = 10_000;
+
+/** Regenerate a note's title on demand (#90), surfacing any failure as a toast.
+ *
+ * The automatic titler is silent — a user who never asked for a title must not
+ * be told one failed. This one is not: the user pressed a button and is owed an
+ * answer, including "the model gave back nothing usable, so your title is
+ * unchanged".
+ */
+async function runGenerateTitle(noteId: string, onTitle: (title: string) => void) {
+  try {
+    const title = await ipc.noteGenerateTitle(noteId, true);
+    if (title) {
+      onTitle(title);
+      return;
+    }
+    useRecordingStore.getState().pushError({
+      noteId,
+      kind: "title",
+      message: "The model gave back nothing usable, so the title is unchanged.",
+    });
+  } catch (e) {
+    useRecordingStore.getState().pushError({ noteId, kind: "title", message: String(e) });
+  }
+}
+
 export function Note() {
   const { id } = useParams<{ id: string }>();
   const { sidebarCollapsed } = useOutletContext<LayoutOutletContext>();
@@ -134,6 +166,9 @@ export function Note() {
   const [historyOpen, setHistoryOpen] = useState(false);
   const [revisions, setRevisions] = useState<NoteRevision[]>([]);
   const [restoreNonce, setRestoreNonce] = useState(0);
+  // A "Regenerate title" call is in flight (#90) — the title box goes read-only
+  // and dims while it runs.
+  const [titling, setTitling] = useState(false);
   // "Created by" attribution — resolves to a name only when the note was
   // authored by a teammate in the active workspace (null when it's yours,
   // local, or unresolvable). Called unconditionally before the early return.
@@ -500,12 +535,62 @@ export function Note() {
       const nextBody = shouldAdoptRemoteBody(d.body, note.body, "body" in pendingChanges.current)
         ? note.body
         : d.body;
-      if (d.summary === nextSummary && d.transcript === nextTranscript && d.body === nextBody) {
+      // The automatic titler (#90) is a backend write: it reaches the store via
+      // `notes_changed`, and without adopting it here the new title shows up in
+      // the sidebar while this note's title box still reads "Recording 19 Aug
+      // 14:32". Guarded like the body — see shouldAdoptRemoteTitle.
+      const nextTitle = shouldAdoptRemoteTitle(d.title, note.title, "title" in pendingChanges.current)
+        ? note.title
+        : d.title;
+      if (
+        d.summary === nextSummary &&
+        d.transcript === nextTranscript &&
+        d.body === nextBody &&
+        d.title === nextTitle
+      ) {
         return d;
       }
-      return { ...d, summary: nextSummary, transcript: nextTranscript, body: nextBody };
+      return { ...d, summary: nextSummary, transcript: nextTranscript, body: nextBody, title: nextTitle };
     });
-  }, [note?.transcript, note?.summary, note?.body, allowTranscriptSync]);
+  }, [note?.transcript, note?.summary, note?.body, note?.title, allowTranscriptSync]);
+
+  // #90's other half: a note that is typed and never recorded gets its title
+  // here, at a body-settled checkpoint. The post-stop recording chain covers
+  // everything that was recorded.
+  //
+  // The effect re-runs on every keystroke, so the timer restarts each time and
+  // only a real pause in typing reaches the call — this IS the debounce. The
+  // ref makes it one shot per note per view: a model that answers with junk
+  // doesn't get asked again every time the user resumes typing, and the ⋯ menu
+  // is the way to try again.
+  const bodyTitledRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!draft) return;
+    if (bodyTitledRef.current === draft.id) return;
+    if (
+      !shouldRequestTitleForBody({
+        title: draft.title,
+        bodyText: htmlToText(draft.body),
+        hasTranscript: draft.transcript.trim() !== "",
+        // ANY capture, not this note's. `recActive` is note-scoped, so it would
+        // let a typed note B fire a model call while note A records — exactly
+        // the contention for the GPU (and for a local Ollama model's slot) that
+        // keeping this out of a recording is for.
+        recording: recPhase.noteId !== null,
+        readOnly,
+      })
+    ) {
+      return;
+    }
+    const t = window.setTimeout(() => {
+      bodyTitledRef.current = draft.id;
+      // Silent, like the post-stop path: the user didn't ask for a title, so a
+      // provider they haven't configured must not toast them. The backend
+      // re-checks eligibility, and `notes_changed` carries the result back.
+      void ipc.noteGenerateTitle(draft.id, false).catch(() => {});
+    }, TITLE_BODY_SETTLE_MS);
+    return () => window.clearTimeout(t);
+  }, [draft?.id, draft?.title, draft?.body, draft?.transcript, recPhase.noteId, readOnly]);
 
   // Re-fetch the playback bundle whenever the note id or recording
   // phase changes. The post-stop diarize step writes the bundle, so
@@ -641,6 +726,24 @@ export function Note() {
     },
     [upsert],
   );
+
+  // ⋯ → Regenerate title (#90). The title box goes read-only and dims while the
+  // model works — the menu closes on select, so that is the only place a busy
+  // state can actually be seen, and it is where the user is already looking.
+  //
+  // Adopting the result bypasses shouldAdoptRemoteTitle deliberately: that guard
+  // refuses to overwrite a user-owned title, and here the user asked for exactly
+  // that. The backend has already persisted it, so this only catches the draft up
+  // — and drops any queued rename, which the user has just superseded.
+  const regenerateTitle = useCallback(() => {
+    const cur = draftRef.current;
+    if (!cur) return;
+    setTitling(true);
+    void runGenerateTitle(cur.id, (title) => {
+      delete pendingChanges.current.title;
+      setDraft((d) => (d ? { ...d, title } : d));
+    }).finally(() => setTitling(false));
+  }, []);
 
   // Empty-string-as-null for summary_provider. "" clears the override and
   // lets the global setting kick in; "openai" / "local" sets it explicitly.
@@ -798,6 +901,7 @@ export function Note() {
           panelOpen={panelOpen}
           onTogglePanel={() => setPanelOpen((v) => !v)}
           onSummarizeFailed={clearSummaryStream}
+          onRegenerateTitle={regenerateTitle}
           sidebarCollapsed={sidebarCollapsed}
         />
         <div className="flex-1 overflow-y-auto">
@@ -855,7 +959,7 @@ export function Note() {
           ref={titleRef}
           value={draft.title}
           onChange={(e) => patch("title", e.target.value)}
-          readOnly={readOnly}
+          readOnly={readOnly || titling}
           onKeyDown={(e) => {
             // Block Enter so the title behaves like a single-line conceptual
             // field — text still wraps when wider than the column, but the
@@ -867,7 +971,10 @@ export function Note() {
           }}
           placeholder="New note"
           rows={1}
-          className="nd-bare nd-title block w-full mb-4 placeholder:text-[var(--color-text-muted)]/50 resize-none overflow-hidden focus:outline-none"
+          className={cn(
+            "nd-bare nd-title block w-full mb-4 placeholder:text-[var(--color-text-muted)]/50 resize-none overflow-hidden focus:outline-none",
+            titling && "opacity-50 transition-opacity",
+          )}
         />
 
         <div className="mb-8 pb-4 border-b border-[var(--color-line)]">
@@ -1427,6 +1534,7 @@ function NoteToolbar({
   panelOpen,
   onTogglePanel,
   onSummarizeFailed,
+  onRegenerateTitle,
   sidebarCollapsed,
 }: {
   noteId: string;
@@ -1440,6 +1548,9 @@ function NoteToolbar({
   // Summarize streams into the Summary panel, whose state lives in `Note` —
   // so a failure here has to reach up there to drop the partial response.
   onSummarizeFailed: () => void;
+  // Regenerate title (#90). Owned by `Note` rather than run here: the busy
+  // state belongs on the title box, not in a menu Radix closes on select.
+  onRegenerateTitle: () => void;
   sidebarCollapsed: boolean;
 }) {
   const navigate = useNavigate();
@@ -1546,6 +1657,14 @@ function NoteToolbar({
               Export…
             </ContextMenuItem>
           )}
+          <ContextMenuItem
+            onClick={() => {
+              setMenuPos(null);
+              onRegenerateTitle();
+            }}
+          >
+            Regenerate title
+          </ContextMenuItem>
           <ContextMenuItem onClick={onDelete} danger>
             Delete note
           </ContextMenuItem>

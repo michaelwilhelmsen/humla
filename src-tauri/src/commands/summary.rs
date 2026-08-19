@@ -19,14 +19,14 @@ use tauri::{AppHandle, Emitter, Manager, State};
 // Resolved provider for a single summary call. Both cloud OpenAI and any
 // local OpenAI-compatible server (Ollama, LM Studio, llama-server, vLLM)
 // flow through this same shape — the only difference is `base_url`.
-struct ResolvedProvider {
-    base_url: String,
-    api_key: String,
-    model: String,
+pub(super) struct ResolvedProvider {
+    pub(super) base_url: String,
+    pub(super) api_key: String,
+    pub(super) model: String,
     // Ollama-only knob: enable thinking mode (Qwen 3+ <think>...</think>
     // chain-of-thought). Default off; flipping it on lets users A/B the
     // quality difference in dev. Ignored for cloud + non-Ollama servers.
-    think: bool,
+    pub(super) think: bool,
 }
 
 // Decide whether this note's summary call should hit cloud OpenAI or a
@@ -36,7 +36,7 @@ struct ResolvedProvider {
 // For local: reads `local_llm_base_url` and `local_llm_model` from settings.
 // `api_key` is forwarded as-is — local servers typically ignore it but
 // Ollama requires a non-empty bearer string, so we send a sentinel.
-fn resolve_provider(
+pub(super) fn resolve_provider(
     conn: &rusqlite::Connection,
     note: &Note,
     openai_api_key: Option<String>,
@@ -160,7 +160,7 @@ fn resolve_prompt(conn: &rusqlite::Connection, note: &Note, language: &str) -> S
 /// The `auto` branches survive as the fallback for notes with no detection:
 /// notes recorded before this shipped, Deepgram, `gpt-4o-transcribe`, and
 /// recordings too bilingual for the vote to call.
-fn resolve_auto(language: &str, note: &Note) -> String {
+pub(super) fn resolve_auto(language: &str, note: &Note) -> String {
     if language != "auto" {
         return language.to_string();
     }
@@ -281,7 +281,7 @@ fn emit_summary_status(app: &AppHandle, note_id: &str, active: bool) {
 
 // Hard directive appended to the summary system prompt. Enforces output
 // language regardless of which language the user wrote their prompt in.
-fn language_directive(lang: &str) -> String {
+pub(super) fn language_directive(lang: &str) -> String {
     // Native imperatives for the common Nordic codes — the model picks up
     // the target language faster from a directive written in that language
     // than from "Write in Norwegian." in English. Everything else falls back

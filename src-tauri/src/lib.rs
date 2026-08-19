@@ -386,6 +386,7 @@ where
             commands::recording_resume,
             commands::recording_state,
             commands::summarize_note,
+            commands::note_generate_title,
             commands::chat_send,
             commands::chat_cancel,
             commands::chat_history,
