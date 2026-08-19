@@ -8,6 +8,10 @@ Personal macOS meeting-notes app: freeform user notes plus recorded audio, trans
 A single meeting record: the user's typed notes, the audio transcript, and an AI-generated summary, together as one unit.
 _Avoid_: Meeting, recording, entry
 
+**Title**:
+A Note's name, as it shows in the notes list and above the body. Either **user-owned** — typed by the user, or carried in from an imported file's own name — or **generated**, written by Humla for a Note that had no name of its own: the `Recording 19 Aug 14:32` a menu-bar capture starts with, and the short phrase derived from the Note's first paragraphs once it has content. Only a generated Title is ever overwritten automatically; a user-owned one changes only when the user edits it or explicitly asks for a new one. The distinction is read off the Title's *shape* at the moment it matters — Humla stores no flag recording who wrote it, so a generated Title that happens to look human-written is treated as human-written.
+_Avoid_: Name, heading, subject, label
+
 **Folder**:
 A general-purpose, user-defined bucket a Note can optionally belong to (zero-or-one). Used purely for browsing/organizing however the user likes — by project, by time period, by meeting type — with no fixed meaning beyond "the user filed it here."
 _Avoid_: Category, tag, group
