@@ -25,6 +25,7 @@ use super::{DEFAULT_LANGUAGE, TITLE_FALLBACK_MODEL};
 use crate::db::{self, NotePatch};
 use crate::menubar::is_replaceable_title;
 use crate::openai;
+use crate::recording::TitleStatusPayload;
 use crate::AppState;
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -194,8 +195,9 @@ async fn try_generate_note_title(
         let lang = if n.language.trim().is_empty() { global } else { n.language.clone() };
         (p, resolve_auto(&lang, &n), n)
     };
-    let body_text = crate::html_text::html_to_text(&note.body);
-    if body_text.trim().is_empty() && note.transcript.trim().is_empty() {
+    if crate::html_text::html_to_text(&note.body).trim().is_empty()
+        && note.transcript.trim().is_empty()
+    {
         return Ok(None);
     }
     // Thinking on a five-word title is waste, whatever the user set for
@@ -204,12 +206,35 @@ async fn try_generate_note_title(
     if provider.base_url == openai::BASE && openai::is_reasoning_model(&provider.model) {
         provider.model = TITLE_FALLBACK_MODEL.to_string();
     }
+    // Everything cheap and every refusal is behind us: from here a model call
+    // is definitely happening, which is exactly what the Note view shimmers
+    // over. Bracketing any earlier would flash a placeholder on notes we then
+    // decline to title.
+    emit_title_status(app, note_id, true);
+    let written = write_generated_title(app, note_id, &provider, &language, &note, force).await;
+    emit_title_status(app, note_id, false);
+    written
+}
+
+/// Ask the model, clean the answer, and write it. Split out so
+/// [`try_generate_note_title`] can bracket exactly this with `title_status` —
+/// the `?`s in here are why: an early return must still clear the shimmer.
+async fn write_generated_title(
+    app: &AppHandle,
+    note_id: &str,
+    provider: &super::summary::ResolvedProvider,
+    language: &str,
+    note: &db::Note,
+    force: bool,
+) -> anyhow::Result<Option<String>> {
+    let state: State<AppState> = app.state();
+    let body_text = crate::html_text::html_to_text(&note.body);
     let raw = openai::summarize_with_base(
         &provider.base_url,
         &provider.api_key,
         &provider.model,
         provider.think,
-        &title_prompt(&language),
+        &title_prompt(language),
         &title_input(&body_text, &note.transcript),
         // No streaming into the summary panel: this call is not a summary and
         // must not touch its UI.
@@ -243,6 +268,13 @@ async fn try_generate_note_title(
     let _ = app.emit("notes_changed", ());
     eprintln!("[title] note {note_id}: titled {title:?}");
     Ok(Some(title))
+}
+
+fn emit_title_status(app: &AppHandle, note_id: &str, active: bool) {
+    let _ = app.emit("title_status", TitleStatusPayload {
+        note_id: note_id.to_string(),
+        active,
+    });
 }
 
 /// Title a Note from the frontend. Two callers, and `force` is the whole of the

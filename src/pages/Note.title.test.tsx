@@ -1,11 +1,11 @@
-import { beforeAll, describe, expect, it, vi } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { screen, waitFor } from "@testing-library/react";
 import { act } from "react";
 import userEvent from "@testing-library/user-event";
 import { renderApp } from "../test/app";
 import { makeNote } from "../test/fixtures";
 import { mockLayoutBox } from "../test/layout";
-import { useNotesStore } from "../lib/store";
+import { useNotesStore, useRecordingStore } from "../lib/store";
 import type { Note } from "../lib/ipc";
 
 // #90. The automatic titler is a BACKEND write: it lands in the notes store via
@@ -15,6 +15,11 @@ import type { Note } from "../lib/ipc";
 // most likely to be looking.
 
 beforeAll(() => mockLayoutBox());
+// The stores are module singletons, so a note left mid-titling by one test is
+// still mid-titling in the next.
+beforeEach(() => {
+  useRecordingStore.setState({ titling: {} });
+});
 
 const TIMESTAMP = "Recording 19 Aug 14:32";
 
@@ -95,5 +100,48 @@ describe("⋯ → Regenerate title", () => {
     expect(await screen.findByText("Couldn’t write a title")).toBeInTheDocument();
     expect(screen.getByText(/nothing usable, so the title is unchanged/i)).toBeInTheDocument();
     expect(titleBox()).toHaveValue(TIMESTAMP);
+  });
+});
+
+// The automatic path fires on notes nobody has open — but when one IS open, a
+// title box that just sits there for the length of a model call reads as
+// nothing happening. The backend brackets the call with `title_status`.
+describe("while a title is being written", () => {
+  it("stands a shimmer in for the title box", async () => {
+    const note = makeNote({ id: "n1", title: TIMESTAMP });
+    open(note);
+    await waitFor(() => expect(titleBox()).toHaveValue(TIMESTAMP));
+
+    act(() => useRecordingStore.getState().setTitling("n1", true));
+
+    const placeholder = await screen.findByRole("status", { name: /writing a title/i });
+    // Showing the old title faded would be showing the wrong answer — it is
+    // about to be replaced.
+    expect(screen.queryByPlaceholderText("New note")).toBeNull();
+    expect(placeholder.querySelector(".skeleton")).not.toBeNull();
+  });
+
+  it("gives the box back, with the new title in it, when the call lands", async () => {
+    const note = makeNote({ id: "n1", title: TIMESTAMP });
+    open(note);
+    await waitFor(() => expect(titleBox()).toHaveValue(TIMESTAMP));
+    act(() => useRecordingStore.getState().setTitling("n1", true));
+    await screen.findByRole("status", { name: /writing a title/i });
+
+    backendWroteTitle(note, "Kickoff with Hege");
+    act(() => useRecordingStore.getState().setTitling("n1", false));
+
+    await waitFor(() => expect(titleBox()).toHaveValue("Kickoff with Hege"));
+  });
+
+  it("leaves another note's title box alone", async () => {
+    const note = makeNote({ id: "n1", title: TIMESTAMP });
+    open(note);
+    await waitFor(() => expect(titleBox()).toHaveValue(TIMESTAMP));
+
+    act(() => useRecordingStore.getState().setTitling("some-other-note", true));
+
+    expect(titleBox()).toHaveValue(TIMESTAMP);
+    expect(screen.queryByRole("status", { name: /writing a title/i })).toBeNull();
   });
 });

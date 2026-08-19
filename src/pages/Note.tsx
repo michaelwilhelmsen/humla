@@ -124,6 +124,97 @@ async function runSummarize(noteId: string, onFailure?: () => void) {
  * get a title. */
 const TITLE_BODY_SETTLE_MS = 10_000;
 
+/** The note's title: an autosizing single-line box, or — while a title is being
+ * written for it (#90) — a shimmer standing in for it.
+ *
+ * Standing IN for the box rather than dimming it is the point. The text there
+ * is about to be replaced, so leaving it on screen faded shows the wrong answer
+ * while the right one loads. The wrapper carries `nd-title` and an invisible
+ * space so the line box is exactly the height the real title occupies and the
+ * meta row beneath it can't jump.
+ *
+ * Exported for the `pnpm mock` harness (see TranscriptEditor): the two states
+ * are a layout question, and jsdom can't answer one.
+ */
+export function NoteTitleBox({
+  title,
+  onChange,
+  readOnly,
+  writing,
+}: {
+  title: string;
+  onChange: (value: string) => void;
+  readOnly: boolean;
+  writing: boolean;
+}) {
+  const ref = useRef<HTMLTextAreaElement | null>(null);
+
+  // Auto-grow so long titles wrap onto a second line instead of horizontally
+  // clipping at the right edge of the page.
+  const fit = useCallback(() => {
+    const el = ref.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = el.scrollHeight + "px";
+  }, []);
+  useEffect(fit, [fit, title, writing]);
+
+  // Wrapping depends on the column's width, not only on the text, and the column
+  // widens when the context panel closes or is dragged. Watching React state
+  // won't do: the effect would run at commit, before the 300ms max-width
+  // transition has moved, and re-bake the pre-transition height — which is how a
+  // title that no longer wraps kept its two-line height and left a gap above the
+  // meta bar. Observe the textarea itself so we refit on every frame of the
+  // transition and every drag tick. The height writes are idempotent, so this
+  // settles after one extra callback rather than looping.
+  //
+  // `writing` is a dependency of both because the textarea UNMOUNTS behind the
+  // shimmer — without re-running, these would measure, and watch, a node that is
+  // no longer in the document once the real box comes back.
+  useEffect(() => {
+    const el = ref.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    let lastWidth = -1;
+    const ro = new ResizeObserver(() => {
+      const w = el.clientWidth;
+      if (w === lastWidth) return;
+      lastWidth = w;
+      fit();
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [fit, writing]);
+
+  if (writing) {
+    return (
+      <div className="nd-title mb-4 relative" role="status" aria-label="Writing a title">
+        <span className="invisible">&nbsp;</span>
+        <span className="skeleton absolute left-0 top-[0.2em] bottom-[0.2em] w-[55%]" />
+      </div>
+    );
+  }
+  return (
+    <textarea
+      ref={ref}
+      value={title}
+      onChange={(e) => onChange(e.target.value)}
+      readOnly={readOnly}
+      onKeyDown={(e) => {
+        // Block Enter so the title behaves like a single-line conceptual field —
+        // text still wraps when wider than the column, but the user can't
+        // accidentally introduce a literal newline.
+        if (e.key === "Enter") {
+          e.preventDefault();
+          (e.currentTarget as HTMLTextAreaElement).blur();
+        }
+      }}
+      placeholder="New note"
+      rows={1}
+      className="nd-bare nd-title block w-full mb-4 placeholder:text-[var(--color-text-muted)]/50 resize-none overflow-hidden focus:outline-none"
+    />
+  );
+}
+
 /** Regenerate a note's title on demand (#90), surfacing any failure as a toast.
  *
  * The automatic titler is silent — a user who never asked for a title must not
@@ -166,9 +257,6 @@ export function Note() {
   const [historyOpen, setHistoryOpen] = useState(false);
   const [revisions, setRevisions] = useState<NoteRevision[]>([]);
   const [restoreNonce, setRestoreNonce] = useState(0);
-  // A "Regenerate title" call is in flight (#90) — the title box goes read-only
-  // and dims while it runs.
-  const [titling, setTitling] = useState(false);
   // "Created by" attribution — resolves to a name only when the note was
   // authored by a teammate in the active workspace (null when it's yours,
   // local, or unresolvable). Called unconditionally before the early return.
@@ -323,7 +411,6 @@ export function Note() {
     return () => { cancelled = true; };
   }, [id, upsert]);
 
-  const titleRef = useRef<HTMLTextAreaElement | null>(null);
   // Resolved summary provider for *this* note: per-note override beats global.
   // Used to gate the live-reasoning panel — cloud OpenAI never streams
   // thinking content, so showing the dropdown there would be a permanent
@@ -339,6 +426,10 @@ export function Note() {
   // so summarising one note can't clobber another note's recording
   // state in the shared `recording_status` slot.
   const isSummarizing = useRecordingStore((s) => !!draft && !!s.summarizing[draft.id]);
+  // A title call is in flight for this note (#90) — from the post-stop chain or
+  // from ⋯ → Regenerate title; the backend brackets both with the same event,
+  // so there is nothing local to keep in step.
+  const isTitling = useRecordingStore((s) => !!draft && !!s.titling[draft.id]);
   const isThisNoteActive = !!draft && recPhase.noteId === draft.id;
   const isRecording = isThisNoteActive && recPhase.phase === "recording";
   const isPaused = isThisNoteActive && recPhase.phase === "paused";
@@ -483,38 +574,6 @@ export function Note() {
     const el = reasoningRef.current;
     if (el) el.scrollTop = el.scrollHeight;
   }, [thinkingStream]);
-
-  // Auto-grow the title textarea so long titles wrap onto a second line
-  // instead of horizontally clipping at the right edge of the page.
-  const fitTitle = useCallback(() => {
-    const el = titleRef.current;
-    if (!el) return;
-    el.style.height = "auto";
-    el.style.height = el.scrollHeight + "px";
-  }, []);
-  useEffect(fitTitle, [fitTitle, draft?.title]);
-
-  // Wrapping depends on the column's width, not only on the text, and the column
-  // widens when the context panel closes or is dragged. Watching React state
-  // won't do: the effect would run at commit, before the 300ms max-width
-  // transition has moved, and re-bake the pre-transition height — which is how a
-  // title that no longer wraps kept its two-line height and left a gap above the
-  // meta bar. Observe the textarea itself so we refit on every frame of the
-  // transition and every drag tick. The height writes are idempotent, so this
-  // settles after one extra callback rather than looping.
-  useEffect(() => {
-    const el = titleRef.current;
-    if (!el || typeof ResizeObserver === "undefined") return;
-    let lastWidth = -1;
-    const ro = new ResizeObserver(() => {
-      const w = el.clientWidth;
-      if (w === lastWidth) return;
-      lastWidth = w;
-      fitTitle();
-    });
-    ro.observe(el);
-    return () => ro.disconnect();
-  }, [fitTitle, draft?.id]);
 
   // Always pull summary updates from the store. Pull transcript updates only
   // while a recording or diarization is in flight — otherwise our debounced
@@ -738,11 +797,10 @@ export function Note() {
   const regenerateTitle = useCallback(() => {
     const cur = draftRef.current;
     if (!cur) return;
-    setTitling(true);
     void runGenerateTitle(cur.id, (title) => {
       delete pendingChanges.current.title;
       setDraft((d) => (d ? { ...d, title } : d));
-    }).finally(() => setTitling(false));
+    });
   }, []);
 
   // Empty-string-as-null for summary_provider. "" clears the override and
@@ -955,26 +1013,17 @@ export function Note() {
             workspaceId={noteWs.id}
           />
         )}
-        <textarea
-          ref={titleRef}
-          value={draft.title}
-          onChange={(e) => patch("title", e.target.value)}
-          readOnly={readOnly || titling}
-          onKeyDown={(e) => {
-            // Block Enter so the title behaves like a single-line conceptual
-            // field — text still wraps when wider than the column, but the
-            // user can't accidentally introduce a literal newline.
-            if (e.key === "Enter") {
-              e.preventDefault();
-              (e.currentTarget as HTMLTextAreaElement).blur();
-            }
-          }}
-          placeholder="New note"
-          rows={1}
-          className={cn(
-            "nd-bare nd-title block w-full mb-4 placeholder:text-[var(--color-text-muted)]/50 resize-none overflow-hidden focus:outline-none",
-            titling && "opacity-50 transition-opacity",
-          )}
+        {/* A title is being written for this note. Standing in for the box
+            rather than dimming it says the right thing — the text there is
+            about to be replaced, so showing it fading is showing the wrong
+            answer. The wrapper carries `nd-title` and an invisible space so the
+            line box is exactly the height the real title occupies, and the bar
+            can't move the meta row under it. */}
+        <NoteTitleBox
+          title={draft.title}
+          onChange={(v) => patch("title", v)}
+          readOnly={readOnly}
+          writing={isTitling}
         />
 
         <div className="mb-8 pb-4 border-b border-[var(--color-line)]">

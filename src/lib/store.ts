@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { ipc, onRecordingDiagnostic, onRecordingError, onRecordingStatus, onSummary, onSummaryStatus, onTranscript, onTranscriptReplaced, onNotesChanged, onSyncStatus, onSyncConflict, onLocalWhisperProgress, onLocalWhisperDownloadError, type Client, type Folder, type Note, type RecordingDiagnostic, type RecordingStatus } from "./ipc";
+import { ipc, onRecordingDiagnostic, onRecordingError, onRecordingStatus, onSummary, onSummaryStatus, onTitleStatus, onTranscript, onTranscriptReplaced, onNotesChanged, onSyncStatus, onSyncConflict, onLocalWhisperProgress, onLocalWhisperDownloadError, type Client, type Folder, type Note, type RecordingDiagnostic, type RecordingStatus } from "./ipc";
 import { useCloudStore } from "./cloud";
 
 type NotesState = {
@@ -110,6 +110,11 @@ type RecordingState = {
   // summary running for that note.
   summarizing: Record<string, boolean>;
   setSummarizing: (noteId: string, active: boolean) => void;
+  // Notes with a title call in flight (#90). Both the automatic path and the
+  // ⋯ menu's regenerate land here, so the Note view has one thing to read
+  // rather than a store flag and a local state that can disagree.
+  titling: Record<string, boolean>;
+  setTitling: (noteId: string, active: boolean) => void;
   // `sticky` errors skip the auto-dismiss timer — for failures that block the
   // user's next action (e.g. Record refused because setup is incomplete),
   // where vanishing after a few seconds reads as "the button did nothing".
@@ -155,6 +160,14 @@ export const useRecordingStore = create<RecordingState>((set, get) => ({
       if (active) next[noteId] = true;
       else delete next[noteId];
       return { summarizing: next };
+    }),
+  titling: {},
+  setTitling: (noteId, active) =>
+    set((s) => {
+      const next = { ...s.titling };
+      if (active) next[noteId] = true;
+      else delete next[noteId];
+      return { titling: next };
     }),
   errors: [],
   pushError: (e) => {
@@ -316,6 +329,9 @@ export function bindBackendListeners() {
     } else if (s.noteId) {
       recordingNoteId = s.noteId; // an active recording — remember which note
     }
+  });
+  onTitleStatus(({ noteId, active }) => {
+    useRecordingStore.getState().setTitling(noteId, active);
   });
   onSummaryStatus(({ noteId, active }) => {
     useRecordingStore.getState().setSummarizing(noteId, active);

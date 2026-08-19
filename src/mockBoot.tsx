@@ -23,7 +23,7 @@ import {
 import { CommandSnippet } from "./components/CommandSnippet";
 import { Segmented } from "./pages/settings/components/Segmented";
 import { Toggle } from "./pages/settings/components/Toggle";
-import { TranscriptEditor, TranscriptPlayer } from "./pages/Note";
+import { NoteTitleBox, TranscriptEditor, TranscriptPlayer } from "./pages/Note";
 import { IntegrationsSection } from "./pages/settings/tabs/Integrations";
 import { RecordingSection } from "./pages/settings/tabs/Recording";
 import { NewWorkspaceModal } from "./components/NewWorkspaceModal";
@@ -449,7 +449,48 @@ function ThemeSpecimen() {
   );
 }
 
+// ---- #90 axis: is a title being written for this note right now? -----------
+//
+// A layout question, which is why it's here: the shimmer stands IN for the
+// title box, so its line box has to be exactly the height the real title
+// occupies — otherwise the meta row under it jumps when the call lands. Both
+// cases render inside the note body's own column so the width is honest.
+function titleCase(writing: boolean, title: string): Scenario {
+  return {
+    wrap: (node) => (
+      <div className="flex-1 min-h-0 overflow-y-auto">
+        <div className="mx-auto w-full px-12 pt-3 pb-32 max-w-[640px]">{node}</div>
+      </div>
+    ),
+    render: () => (
+      <>
+        <NoteTitleBox title={title} onChange={() => {}} readOnly={false} writing={writing} />
+        {/* The meta row is the thing that must not move. */}
+        <div className="mb-8 pb-4 border-b border-[var(--color-line)]">
+          <div className="flex flex-wrap items-center gap-1 -mx-2">
+            <span className="nd-meta">19 Aug 2026</span>
+            <span className="nd-meta is-interactive">Kundemøter</span>
+          </div>
+        </div>
+        <p className="text-[var(--color-text-muted)]">
+          Body copy, so the column below the title has something in it.
+        </p>
+      </>
+    ),
+    ipc: {},
+  };
+}
+
 const CASES: Record<string, Scenario> = {
+  // --- #90: the automatic titler's two states. Compare `title-writing` against
+  // `title-idle` and `title-idle-long` — nothing below the title may shift.
+  "title-idle": titleCase(false, "Recording 19 Aug 14:32"),
+  "title-writing": titleCase(true, "Recording 19 Aug 14:32"),
+  "title-idle-long": titleCase(
+    false,
+    "Oppstartsmøte med Hege om lanseringsplanen og alt som gjenstår",
+  ),
+
   // --- #21: menu-bar mode. Off (the default), on, and with no shortcut set.
   menubar: menubarCase(false, "Command+Control+KeyR"),
   "menubar-on": menubarCase(true, "Command+Control+KeyR"),

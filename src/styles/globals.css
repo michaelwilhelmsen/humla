@@ -450,17 +450,28 @@ input::placeholder, textarea::placeholder {
   100% { background-position: -200% 0; }
 }
 
+/* A resting fill with a brighter sweep travelling across it.
+   NOT --color-pill for the base: that token is transparent by design, so the
+   old `pill → pill-hover → pill` gradient painted 5% ink at its midpoint and
+   nothing at all either side — a skeleton you could not see on any theme.
+   Both stops mix from --color-text, so this inverts with the theme for free. */
 .skeleton {
+  background-color: color-mix(in srgb, var(--color-text) 7%, transparent);
   background-image: linear-gradient(
     90deg,
-    var(--color-pill) 0%,
-    var(--color-pill-hover) 50%,
-    var(--color-pill) 100%
+    transparent 0%,
+    color-mix(in srgb, var(--color-text) 9%, transparent) 50%,
+    transparent 100%
   );
   background-size: 200% 100%;
   background-repeat: no-repeat;
   animation: shimmer 1.6s ease-in-out infinite;
   border-radius: 6px;
+}
+@media (prefers-reduced-motion: reduce) {
+  /* Still a placeholder, just a still one — the gradient reads as "pending"
+     without the travel. */
+  .skeleton { animation: none; }
 }
 
 @keyframes recording-pulse {

@@ -2387,6 +2387,17 @@ async fn run_post_stop_chain(
     // get a detected language. File import inherits this for free — it
     // drives the same chain.
     record_detected_language(&app, &note_id, &post_stop.chunks);
+    // Title the note NOW, concurrently with the diarize pass (#90).
+    //
+    // The transcript is already final and in the database: `recording_stop`
+    // drains every in-flight transcribe before it snapshots, and each one wrote
+    // through `db::append_transcript` on its way. What diarization adds is
+    // `Speaker N:` prefixes — which a title has no use for. Waiting for it cost
+    // the whole diarize pass, minutes on a long meeting, for nothing.
+    //
+    // After `record_detected_language`, though: that resolves `auto` to what was
+    // actually spoken, and the title's language directive reads it.
+    tauri::async_runtime::spawn(title::generate_note_title(app.clone(), note_id.clone()));
     if let Err(e) = diarize_and_apply(app.clone(), note_id.clone(), post_stop).await {
         eprintln!("diarize_and_apply: {e}");
         emit_error(
@@ -2449,16 +2460,6 @@ async fn run_post_stop_chain(
         let _ = tokio::fs::remove_dir_all(dir).await;
     }
     emit_status(&app, None, Phase::Idle);
-    // The content has settled: the transcript is final and written. Give the
-    // note a real title if it is still carrying one of ours (#90).
-    //
-    // AFTER Idle, not before. It is a network call to a provider that may be a
-    // local model cold-loading from disk, and holding the phase in Diarizing
-    // for that would stall the record button, the "saved to …" notification
-    // and the frontend's session upload behind a nicety. Backgrounding costs
-    // only that the menu-bar notification names the timestamp title; the
-    // sidebar catches up on the `notes_changed` the write emits.
-    tauri::async_runtime::spawn(title::generate_note_title(app.clone(), note_id));
 }
 
 /// Resolve the active transcription provider for `note_id`'s language and

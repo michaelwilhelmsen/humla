@@ -747,6 +747,9 @@ export type SummaryProvider = "openai" | "local";
 export type RecordingStatus = { noteId: string | null; phase: RecordingPhase };
 export type RecordingError = { noteId: string | null; message: string };
 export type SummaryStatus = { noteId: string; active: boolean };
+// A title call is in flight for this note (#90). Brackets the model call only,
+// so it never fires for a note the backend declines to title.
+export type TitleStatus = { noteId: string; active: boolean };
 export type RecordingDiagnostic = {
   noteId: string;
   micFrames: number;
@@ -778,6 +781,9 @@ export function onRecordingStatus(cb: (e: RecordingStatus) => void): Promise<Unl
 }
 export function onSummaryStatus(cb: (e: SummaryStatus) => void): Promise<UnlistenFn> {
   return listen<SummaryStatus>("summary_status", (e) => cb(e.payload));
+}
+export function onTitleStatus(cb: (e: TitleStatus) => void): Promise<UnlistenFn> {
+  return listen<TitleStatus>("title_status", (e) => cb(e.payload));
 }
 export function onRecordingError(cb: (e: RecordingError) => void): Promise<UnlistenFn> {
   return listen<RecordingError>("recording_error", (e) => cb(e.payload));

@@ -260,6 +260,17 @@ pub struct SummaryStatusPayload {
     pub active: bool,
 }
 
+/// Per-note title lifecycle (#90), on its own channel (`title_status`) for the
+/// same reason the summary one has its own: titling note B must not touch the
+/// state of note A. Brackets the model call only — an ineligible note never
+/// emits, because no call is made for it.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TitleStatusPayload {
+    pub note_id: String,
+    pub active: bool,
+}
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StreamDeltaPayload {
