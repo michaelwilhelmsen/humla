@@ -28,7 +28,7 @@ members = ["crates/cloud-sync"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["protocol-asset", "macos-private-api"] }
+tauri = { version = "2", features = ["protocol-asset", "macos-private-api", "tray-icon"] }
 tauri-plugin-shell = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -53,6 +53,14 @@ tauri-plugin-process = "2"
 # Native save panel for the note-export flow (issue #18). Frontend picks the
 # target path via the JS `save()` dialog; `export_note` writes to it.
 tauri-plugin-dialog = "2"
+# Menu-bar mode (#21). The global record hotkey registers through Carbon's
+# RegisterEventHotKey, which needs no Accessibility permission — that is the
+# whole reason this is a plugin call and not our own CGEventTap.
+tauri-plugin-global-shortcut = "2"
+# Headless recordings (tray / hotkey with the window closed) have no in-app
+# toast to land in, so their start failures and their "saved to <note>"
+# confirmation go to Notification Center instead.
+tauri-plugin-notification = "2"
 # OpenAI API key lives in macOS Keychain (apple-native backend, no D-Bus
 # / linux-keyutils transitive deps). Migration from the legacy SQLite
 # row is one-shot inside read_openai_api_key.

@@ -7,6 +7,7 @@ mod languages;
 mod presets;
 mod wav;
 mod recording;
+mod menubar;
 mod sessions;
 mod commands;
 mod stt;
@@ -98,6 +99,22 @@ where
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
+        // Menu-bar mode (#21). No shortcut is declared here — the accelerator
+        // lives in the database, which isn't open until `setup` runs, so
+        // `menubar::install` registers it from there.
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        .plugin(tauri_plugin_notification::init())
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                // With `close_to_tray` on, the close button hides the window and
+                // drops the Dock icon instead of ending the process, so a
+                // tray-started recording can outlive the window. Off (the
+                // default), this is inert and closing still quits.
+                if menubar::hide_on_close(window.app_handle()) {
+                    api.prevent_close();
+                }
+            }
+        })
         .setup(move |app| {
             // Point GGML at our prebuilt default.metallib BEFORE any
             // whisper.cpp init runs. whisper-rs 0.13 ships a vendored
@@ -144,7 +161,6 @@ where
                     }
                 }
             }
-
             let app_dir = app
                 .path()
                 .app_data_dir()
@@ -171,7 +187,6 @@ where
                 unify_locks: Arc::new(Mutex::new(std::collections::HashMap::new())),
                 chat_cancels: Arc::new(Mutex::new(std::collections::HashMap::new())),
             });
-
             let menu = build_menu(app.handle())?;
             app.set_menu(menu)?;
             app.on_menu_event(|app, event| {
@@ -179,7 +194,6 @@ where
                     let _ = app.emit("menu://check-for-updates", ());
                 }
             });
-
             // One-shot cleanup of pre-v0.8.0 streaming diarizer files
             // (pyannote_segmentation.mlmodelc + wespeaker_v2.mlmodelc).
             // Replaced by the community-1 offline set in v0.8.0 — same dir,
@@ -192,7 +206,6 @@ where
                 let conn = state.db.lock();
                 diarize::cleanup_legacy_streaming_models(app.handle(), &conn);
             }
-
             // One-shot migration of the legacy single-custom-prompt setting
             // into the summary_prompts table. Same flag-guarded shape as the
             // diarize cleanup above.
@@ -203,7 +216,6 @@ where
                     eprintln!("migrate_summary_prompts: {e}");
                 }
             }
-
             // v0.23 — collapse the legacy flat transcription settings keys
             // into the typed `transcribe_config` JSON and delete the orphan
             // rows. Same flag-guarded shape as the migrations above. Safe to
@@ -216,7 +228,6 @@ where
                     eprintln!("migrate_transcribe_config: {e}");
                 }
             }
-
             // v0.24 — wrap the v0.23 bare-ProviderConfig transcribe_config row
             // into the new TranscribeConfig { default, per_language } shape.
             // Idempotent via parse check; runs after migrate_transcribe_config
@@ -229,7 +240,6 @@ where
                     eprintln!("migrate_per_language_v4: {e}");
                 }
             }
-
             // v0.31 — grandfather existing installs past the new first-run
             // onboarding wizard. Marks `onboarding_completed=true` when the DB
             // has notes or a local Whisper model is present on disk, so nobody
@@ -245,7 +255,6 @@ where
                     eprintln!("migrate_grandfather_onboarding: {e}");
                 }
             }
-
             // One-time retrieval backfill (issue #47): index any Notes that
             // predate the chunk substrate so agentic chat can search them.
             // Off the main thread — a large library shouldn't delay launch.
@@ -268,6 +277,12 @@ where
                     //    search works day-one (issue #48). Best-effort + cached.
                     commands::embed_backfill(app_handle).await;
                 });
+            }
+            // Tray + global hotkey. Last in setup so a failure here can't stop
+            // the app from coming up — the menu bar is an extra surface, not a
+            // precondition for using Humla.
+            if let Err(e) = menubar::install(app.handle()) {
+                eprintln!("[menubar] install failed: {e}");
             }
 
             Ok(())
@@ -394,6 +409,8 @@ where
             commands::permissions_status,
             commands::permissions_request,
             commands::permissions_open_settings,
+            commands::record_hotkey_get,
+            commands::record_hotkey_set,
             app_relaunch,
         ])
         .build(tauri::generate_context!())
@@ -413,6 +430,17 @@ where
             // atexit entirely and lets the process terminate cleanly.
             if let tauri::RunEvent::Exit = event {
                 unsafe { libc::_exit(0) };
+            }
+            // Clicking Humla in Finder / Spotlight while it sits hidden in the
+            // menu bar reaches us as a reopen, not a second launch. Without
+            // this the app looks dead: LaunchServices activates the running
+            // process, which has no window and (as an accessory) no Dock icon
+            // to show for it.
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen { has_visible_windows, .. } = event {
+                if !has_visible_windows {
+                    menubar::show_main_window(_app_handle);
+                }
             }
         });
 }

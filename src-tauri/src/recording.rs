@@ -215,7 +215,7 @@ pub struct RecordingStatus {
     pub phase: Phase,
 }
 
-#[derive(Clone, Copy, Serialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Phase {
     Idle,

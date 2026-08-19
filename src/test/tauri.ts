@@ -5,7 +5,14 @@ type Handler = (args: unknown) => unknown;
 // Backend stand-in for component tests. Covers every command the app fires
 // at boot with an "empty but healthy" default so any component tree can
 // mount; individual tests override per-command via `handlers`.
-export function mockTauri(handlers: Record<string, Handler> = {}) {
+// `events: true` turns on the mock's own listen/emit bookkeeping, so a test can
+// `emit()` a backend event and have the app's real `listen()` handler run. Off
+// by default: without it `plugin:event|listen` is answered by the stub below,
+// which is all most tests need and avoids the extra machinery.
+export function mockTauri(
+  handlers: Record<string, Handler> = {},
+  options: { events?: boolean } = {},
+) {
   mockIPC(async (cmd, args) => {
     if (cmd in handlers) return handlers[cmd](args);
 
@@ -36,6 +43,8 @@ export function mockTauri(handlers: Record<string, Handler> = {}) {
         return [];
       case "recording_state":
         return "idle";
+      case "record_hotkey_get":
+        return "Command+Control+KeyR";
       case "note_timeline_repair":
         return { repaired: false, coversTranscript: true };
       case "stored_audio_stats":
@@ -67,5 +76,5 @@ export function mockTauri(handlers: Record<string, Handler> = {}) {
       default:
         return null;
     }
-  });
+  }, options.events ? { shouldMockEvents: true } : undefined);
 }

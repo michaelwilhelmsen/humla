@@ -18,7 +18,15 @@ export type EditableKey = Exclude<
   // `telemetry_enabled` is excluded for the same reason as theme/palette: it is
   // owned by its own self-contained row (which must distinguish UNSET from "false"),
   // not by the generic settings map, whose DEFAULTS would collapse that distinction.
-  "theme" | "palette" | "onboarding_completed" | "onboarding_step" | "telemetry_enabled"
+  // `record_hotkey` is excluded on the same grounds: it is written through
+  // `recordHotkeySet` (which registers it with the OS first and can fail), not
+  // through the generic settings map.
+  | "theme"
+  | "palette"
+  | "onboarding_completed"
+  | "onboarding_step"
+  | "telemetry_enabled"
+  | "record_hotkey"
 >;
 
 export type Provider = "openai" | "local" | "deepgram" | "groq";
@@ -31,6 +39,7 @@ export const DEFAULTS: Record<EditableKey, string> = {
   sortformer_silence_threshold: "0.5",
   sortformer_pred_threshold: "0.25",
   keep_audio: "false",
+  close_to_tray: "false",
   sync_audio: "true",
   custom_vocabulary: "",
   summary_model: "gpt-5.4-mini",

@@ -23,7 +23,9 @@ mod api_keys;
 mod assets;
 mod chat;
 mod clients;
-mod cloud;
+// `pub(crate)` so `crate::menubar` can resolve the active workspace when it
+// creates a note for a headless recording.
+pub(crate) mod cloud;
 mod export;
 // Live cloud-sync worker glue. Behind the `cloud` feature; `pub` so `run()` can
 // reach `cloud_worker::install`. Not a #[tauri::command] group, so no glob
@@ -33,6 +35,7 @@ pub mod cloud_worker;
 mod folders;
 mod local_llm;
 mod mcp;
+mod menubar;
 mod models;
 mod notes;
 mod permissions;
@@ -50,6 +53,7 @@ pub use export::*;
 pub use folders::*;
 pub use local_llm::*;
 pub use mcp::*;
+pub use menubar::*;
 pub use models::*;
 pub use notes::*;
 pub use permissions::*;
@@ -65,7 +69,7 @@ use api_keys::read_provider_api_key;
 use models::local_model_path;
 use transcription_config::read_transcribe_config;
 
-const DEFAULT_LANGUAGE: &str = "no";
+pub(crate) const DEFAULT_LANGUAGE: &str = "no";
 // Default diarization engine. community1 = FluidAudio's
 // OfflineDiarizerManager (the path we shipped through v0.11.0). Existing
 // installs keep this transparently. Users who hit the rapid-turn ceiling
@@ -2011,6 +2015,12 @@ pub async fn recording_start(
             if let Some(id) = &claimed_lock_id {
                 cloud::release_recording_lock(&app, id.clone()).await;
             }
+            // Back out of Phase::Starting. Every phase-driven surface latches
+            // the last one it saw — the recording bar, and (since #21) the tray
+            // icon and its Start/Stop items — so a start that gives up here
+            // without an Idle leaves all of them claiming a live capture, with
+            // no affordance to clear it short of a restart.
+            emit_status(&app, None, Phase::Idle);
             return Err(format!("spawn audio-capture: {e}"));
         }
     };
@@ -2137,7 +2147,9 @@ pub async fn recording_start(
             });
         }
         if was_active {
-            let _ = app_clone.emit("recording_status", RecordingStatus { note_id: None, phase: Phase::Idle });
+            // Through `emit_status`, not a bare emit: the sidecar dying is still
+            // a phase change, and the tray has to stop claiming a live capture.
+            emit_status(&app_clone, None, Phase::Idle);
             let _ = app_clone.emit("recording_error", ErrorPayload {
                 note_id: Some(note_id_clone.clone()),
                 message: "Recording stopped unexpectedly. Try again.".to_string(),
@@ -5659,11 +5671,15 @@ async fn transcribe_chunk(
     Ok(())
 }
 
-fn emit_status(app: &AppHandle, note_id: Option<&str>, phase: Phase) {
+pub(crate) fn emit_status(app: &AppHandle, note_id: Option<&str>, phase: Phase) {
     let _ = app.emit("recording_status", RecordingStatus {
         note_id: note_id.map(|s| s.to_string()),
         phase,
     });
+    // The tray's icon and its Start/Stop items are driven from here rather than
+    // from each call site: this is the one funnel every phase change already
+    // goes through, so the menu bar can't drift out of step with the pipeline.
+    crate::menubar::on_phase(app, phase);
 }
 
 fn emit_error(app: &AppHandle, note_id: Option<&str>, message: &str) {

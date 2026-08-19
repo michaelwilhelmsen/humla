@@ -128,6 +128,14 @@ export type SettingsKey =
   // without restarting the MCP client.
   | "mcp_enabled"
   | "silence_rms_threshold"
+  // Menu-bar mode (#21). `close_to_tray` off means the close button still
+  // quits; on, it hides the window and drops the Dock icon so a tray- or
+  // hotkey-started recording can outlive the window. `record_hotkey` holds the
+  // global accelerator ("" = off, absent = never set, so the default applies) —
+  // written through `recordHotkeySet`, never `setSetting`, because registering
+  // it with the OS can fail and that has to be reported.
+  | "close_to_tray"
+  | "record_hotkey"
   // Onboarding wizard (v0.31): completion flag + resume cursor. Both are
   // plain settings rows so the grandfathering migration and the frontend
   // takeover guard read the same source of truth.
@@ -323,6 +331,12 @@ export const ipc = {
    *  setting and on a once-per-install marker, so callers may call it freely and
    *  never need to know whether anything was sent. */
   telemetryEvent: (event: string) => invoke<void>("telemetry_event", { event }),
+  /** The global record accelerator in force (`""` = off). */
+  recordHotkeyGet: () => invoke<string>("record_hotkey_get"),
+  /** Register `accel` (`""` clears) and persist it. Rejects when the OS refuses
+   *  the combination — another app already owns it — leaving the previous one
+   *  in place. */
+  recordHotkeySet: (accel: string) => invoke<void>("record_hotkey_set", { accel }),
   appDataDir: () => invoke<string>("app_data_dir"),
   // CPU architecture of the running process ("aarch64", "x86_64", …).
   // Onboarding uses it to steer Intel Macs toward cloud transcription.
@@ -787,6 +801,15 @@ export function onDiarizeDownloadProgress(cb: (e: DiarizeDownloadProgress) => vo
 // feature + signed in + a workspace selected); inert otherwise.
 export function onNotesChanged(cb: () => void): Promise<UnlistenFn> {
   return listen("notes_changed", () => cb());
+}
+
+// The tray or the global hotkey fired while the window was on screen. The
+// backend deliberately doesn't decide what to do in that case: with a note
+// open the hotkey is that note's Record button, which only the frontend knows.
+// (With the window hidden the backend runs the headless path and this never
+// fires.) See `resolveHotkeyAction` and `src-tauri/src/menubar.rs`.
+export function onToggleRecord(cb: () => void): Promise<UnlistenFn> {
+  return listen("menubar://toggle-record", () => cb());
 }
 
 // Coarse sync state from the cloud worker, for the sidebar indicator.

@@ -25,6 +25,7 @@ import { Segmented } from "./pages/settings/components/Segmented";
 import { Toggle } from "./pages/settings/components/Toggle";
 import { TranscriptEditor, TranscriptPlayer } from "./pages/Note";
 import { IntegrationsSection } from "./pages/settings/tabs/Integrations";
+import { RecordingSection } from "./pages/settings/tabs/Recording";
 import { NewWorkspaceModal } from "./components/NewWorkspaceModal";
 import { DISCONNECTED, useCloudStore, type CloudStatus, type CloudWorkspace } from "./lib/cloud";
 import { DEFAULTS, type EditableKey } from "./pages/settings/types";
@@ -244,6 +245,34 @@ function IntegrationsHarness({ enabled }: { enabled: boolean }) {
   return <IntegrationsSection s={s} update={(_k, v) => setOn(v)} />;
 }
 
+// ---- #21 axis: menu-bar mode in the Recording section ----------------------
+// Same wrapper as the Integrations case, and for the same reason: the section
+// has to be judged inside SettingsLayout's content column, not stretched.
+// Both toggle states, because the close-to-tray copy swaps entirely — it names
+// which regime is in force rather than describing the switch.
+function menubarCase(closeToTray: boolean, hotkey: string): Scenario {
+  return {
+    wrap: (node) => (
+      <div className="flex-1 min-h-0 overflow-y-auto">
+        <div className="max-w-2xl mx-auto px-8 py-7">{node}</div>
+      </div>
+    ),
+    render: () => <MenubarHarness closeToTray={closeToTray} />,
+    ipc: {
+      record_hotkey_get: () => hotkey,
+      record_hotkey_set: () => null,
+      permissions_status: () => ({ microphone: "granted", screen: "granted" }),
+      stored_audio_stats: () => ({ notes: 0, files: 0, bytes: 0, noteIds: [] }),
+    },
+  };
+}
+
+function MenubarHarness({ closeToTray }: { closeToTray: boolean }) {
+  const [on, setOn] = useState(closeToTray ? "true" : "false");
+  const s = { ...DEFAULTS, close_to_tray: on } as Record<EditableKey, string>;
+  return <RecordingSection s={s} update={async (_k, v) => setOn(v)} />;
+}
+
 // ---- workspace-creation axis: the sheet's five stages ----------------------
 // Five separate scenarios rather than one clickable flow: the stages are DERIVED
 // from cloud status, so seeding the status is how you reach one — and each is a
@@ -421,6 +450,11 @@ function ThemeSpecimen() {
 }
 
 const CASES: Record<string, Scenario> = {
+  // --- #21: menu-bar mode. Off (the default), on, and with no shortcut set.
+  menubar: menubarCase(false, "Command+Control+KeyR"),
+  "menubar-on": menubarCase(true, "Command+Control+KeyR"),
+  "menubar-nohotkey": menubarCase(false, ""),
+
   // --- #172: the MCP switch, off (the default) and on (snippets revealed).
   "mcp-off": integrationsCase(false),
   "mcp-on": integrationsCase(true),

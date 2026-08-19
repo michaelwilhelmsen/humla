@@ -2,17 +2,19 @@ import { useEffect, useState } from "react";
 import { Permissions } from "../../../components/Permissions";
 import { ipc, type StoredAudioStats } from "../../../lib/ipc";
 import { formatBytes, s as plural } from "../components/format";
+import { HotkeyField } from "../components/HotkeyField";
 import { Row, Section } from "../components/Section";
 import { Toggle } from "../components/Toggle";
 import type { SettingsHook } from "../useSettings";
 
-// Recording section: capture permissions + audio retention. Menu-bar mode
-// and the global hotkey land here when that feature ships.
+// Recording section: capture permissions, audio retention, and menu-bar mode
+// (#21) — the triggers that start a recording from outside the window.
 export function RecordingSection({
   s,
   update,
 }: Pick<SettingsHook, "s" | "update">) {
   const keeping = s.keep_audio === "true";
+  const closeToTray = s.close_to_tray === "true";
   return (
     <>
       <Section title="Permissions">
@@ -43,6 +45,32 @@ export function RecordingSection({
           }
         />
         <StoredAudioCleanup />
+      </Section>
+
+      <Section title="Menu bar">
+        <Row
+          label="Keep running in the menu bar"
+          // Off by default, so closing the window still quits until the user
+          // opts in — and the copy states which of the two regimes is in force
+          // rather than describing the switch.
+          description={
+            closeToTray
+              ? "Closing the window hides Humla in the menu bar and drops its Dock icon. Quit from the menu-bar icon."
+              : "Closing the window quits Humla. The menu-bar icon is still there while it runs."
+          }
+          control={
+            <Toggle
+              label="Keep running in the menu bar"
+              checked={closeToTray}
+              onChange={(on) => update("close_to_tray", on ? "true" : "false")}
+            />
+          }
+        />
+        <Row
+          label="Record shortcut"
+          description="Starts and stops a recording from any app. With a note open it records that note; otherwise it starts a new one."
+          control={<HotkeyField />}
+        />
       </Section>
     </>
   );
