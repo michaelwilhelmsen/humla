@@ -1,0 +1,9 @@
+# Sign every debug build with the release Developer ID identity before running
+# it, so the macOS Keychain sees a stable designated requirement across
+# rebuilds and stops re-prompting for the login password on every `tauri dev`.
+# See scripts/dev-sign.sh.
+[target.aarch64-apple-darwin]
+runner = "../scripts/dev-sign.sh"
+
+[target.x86_64-apple-darwin]
+runner = "../scripts/dev-sign.sh"

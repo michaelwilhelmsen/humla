@@ -194,7 +194,7 @@ Two Swift Package binaries that run alongside the Tauri main process. Both bundl
 | `pnpm dev` | Vite dev server only (frontend) |
 | `pnpm mock` | Visual-check harness (`mock.html` + `src/mockBoot.tsx`): renders a real component against a mocked Tauri IPC in a plain browser, so layout/token bugs jsdom can't see are visible. Pick a scenario with `?case=<name>`, and a design with `?palette=<id>&theme=light\|dark` (the harness writes both attributes on `<html>` exactly as the app does; `?case=themes` is a specimen sheet of every token-driven surface, for judging a theme as a design). Dev-only — Vite builds `index.html` only, so it never ships. **A scenario wrapper must mirror the real container** (e.g. the onboarding canvas in `Onboarding.tsx`); a plain `<div>` wrapper left `StepShell`'s `max-w-lg` box hugging the left edge and looked exactly like a layout bug in the component under review |
 | `pnpm lint` | ESLint over `src/` — a **correctness** net, not a style pass (there's no formatter). `react-hooks/rules-of-hooks` is the reason it exists: a hook below an early return type-checks, passes every unit test of the components it renders, and then crashes the whole view with "Rendered more hooks than during the previous render". `exhaustive-deps` is a warning because several omissions here are deliberate and commented. Type-aware rules are off — `pnpm build` runs `tsc -b`. Expect 0 errors / ~5 warnings |
-| `pnpm tauri dev` | Tauri dev (assumes sidecars already built) |
+| `pnpm tauri dev` | Tauri dev (assumes sidecars already built). Each `cargo run` goes through `scripts/dev-sign.sh` first — see **Dev builds are code-signed too** below |
 | `./scripts/build-sidecar.sh` | Build + Developer ID sign the audio-capture Swift sidecar (skips if unchanged) |
 | `./scripts/build-diarize.sh` | Build + Developer ID sign the speaker-diarize Swift sidecar (skips if unchanged) |
 | `./scripts/build-mcp.sh` | Build + Developer ID sign the `humla-mcp` server binary into `src-tauri/binaries/`. No source-hash skip (cargo already does that); it writes a zero-byte placeholder first, because `humla-mcp` is a declared `externalBin` and tauri-build fails the very compile that produces it when the file is missing |
@@ -208,6 +208,14 @@ DMG output lands in `src-tauri/target/release/bundle/dmg/`.
 ## Distribution & signing
 
 Builds are signed with the **Developer ID Application: MICHAEL MEHLUM WILHELMSEN (NBUP88JQ35)** identity (configured in `src-tauri/tauri.conf.json` under `bundle.macOS.signingIdentity`). Both sidecars get the same Developer ID + hardened runtime; the audio-capture sidecar additionally uses `src-tauri/sidecar.entitlements` (mic input).
+
+### Dev builds are code-signed too
+
+`src-tauri/.cargo/config.toml` points cargo's `runner` at `scripts/dev-sign.sh`, so every `cargo run` — which is what `tauri dev` shells out to, and what its watcher re-runs on each rebuild — signs the fresh debug binary with the same Developer ID identity **and the same `identifier` (`no.humla.app`)** the release uses, before exec'ing it.
+
+This is not cosmetic. Cargo links debug binaries **ad-hoc**, whose designated requirement is `cdhash H"..."` — a hash of that one build. macOS stores Keychain ACL trust against the DR, so before this every rebuild produced a binary the Keychain had never seen: "Always Allow" bought exactly one launch, and `tauri dev` was an endless login-password prompt. Signing with a certificate swaps that for an identity-based DR (`identifier "no.humla.app" and anchor apple generic and ... subject.OU = NBUP88JQ35`) which is byte-identical across rebuilds, so one "Always Allow" per Keychain item sticks — and dev shares that trust with the installed app, since the DRs match.
+
+Costs ~0.5 s per launch. Fails soft: no signing identity on the machine (CI, a fresh clone) runs the binary unsigned exactly as before. Only the binary named `humla` is signed — the runner fires for `cargo test` too, and test harnesses have no reason to pay for it.
 
 ### Notarisation
 
