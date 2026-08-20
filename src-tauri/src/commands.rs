@@ -1761,6 +1761,9 @@ struct PostStopSnapshot {
     /// retained and its chunks were never transcribed, so the post-stop chain
     /// records the take as untranscribed and skips every step that needs text.
     deferred: bool,
+    /// How long the sidecar said this capture ran. Only consulted when the
+    /// take has no timeline to measure instead — see `finalize_session`.
+    captured_duration_ms: u64,
 }
 
 /// Copy the temp-dir full WAVs to a permanent location keyed by
@@ -1850,6 +1853,14 @@ async fn finalize_session(
     session_id: &str,
     started_at: &str,
     streams: Vec<String>,
+    // What the sidecar said this capture ran for, used only when the take has
+    // no timeline to measure instead (#146). A "Transcribe manually" take
+    // finalises before anything has been transcribed, so the timeline is
+    // absent and this is its only source of a length — and it has to be
+    // settled now, because the sync engine treats a session's `duration_ms` as
+    // immutable and derives its last-write-wins key from `started_at` on that
+    // basis (`cloud-sync`'s `push_session`).
+    captured_duration_ms: u64,
     // Whether this take's audio has already been through the provider (#146).
     // `No` only for a capture made with "Transcribe manually" on, which the
     // note's Transcribe action picks up later.
@@ -1859,7 +1870,12 @@ async fn finalize_session(
         return;
     };
     let recordings = sessions::recordings_dir(&app_dir, note_id);
-    let duration_ms = timeline_duration_ms(&sessions::session_write_dir(&recordings, session_id));
+    // The timeline wins where there is one: it measures content, and trailing
+    // silence isn't worth showing as part of a take's length.
+    let duration_ms = match timeline_duration_ms(&sessions::session_write_dir(&recordings, session_id)) {
+        0 => captured_duration_ms,
+        from_timeline => from_timeline,
+    };
     let session_id = session_id.to_string();
     let started_at = started_at.to_string();
     // Serialize the append (read-modify-write of sessions.json) against a
@@ -2559,6 +2575,7 @@ fn take_post_stop_snapshot(s: &mut crate::recording::LiveCapture) -> PostStopSna
     let sys_wav = s.sink.sys_full_wav_path.lock().clone();
     let chunks = s.sink.chunk_log.lock().clone();
     let deferred = !s.sink.transcribes_on_arrival();
+    let captured_duration_ms = *s.sink.captured_duration_ms.lock();
     let transcript_at_start = s.transcript_at_start.lock().clone();
     let session_id = s
         .session_id
@@ -2576,6 +2593,7 @@ fn take_post_stop_snapshot(s: &mut crate::recording::LiveCapture) -> PostStopSna
         session_id,
         session_started_at,
         deferred,
+        captured_duration_ms,
     }
 }
 
@@ -2607,6 +2625,7 @@ async fn run_post_stop_chain(
     let session_id = post_stop.session_id.clone();
     let session_started_at = post_stop.session_started_at.clone();
     let deferred = post_stop.deferred;
+    let post_stop_captured_duration = post_stop.captured_duration_ms;
     // A deferred take produced no chunks by design, so `session_streams` has
     // nothing to read. Take the streams from what the sidecar actually wrote
     // instead — the carousel tooltip and the manifest want the same answer
@@ -2649,6 +2668,7 @@ async fn run_post_stop_chain(
             &session_id,
             &session_started_at,
             streams,
+            post_stop.captured_duration_ms,
             sessions::Transcribed::No,
         )
         .await;
@@ -2719,6 +2739,7 @@ async fn run_post_stop_chain(
         &session_id,
         &session_started_at,
         streams,
+        post_stop_captured_duration,
         sessions::Transcribed::Yes,
     )
     .await;
@@ -2892,7 +2913,8 @@ async fn dispatch_sidecar_event(
             inflight.lock().push(h);
             false
         }
-        SidecarEvent::FullRecording { source, path, duration_ms: _ } => {
+        SidecarEvent::FullRecording { source, path, duration_ms } => {
+            sink.note_stream_duration(duration_ms);
             // Stash the path on this capture's sink; the diarization pass reads
             // it. Each source has its own slot so the post-stop pass can branch
             // (mic-only → diarize mic; both present → diarize both).
@@ -3301,7 +3323,14 @@ async fn transcribe_takes(
     // revision list. `Pending` needs none: it only adds takes that had no text.
     if scope == sessions::TranscribeScope::All {
         let conn = state.db.lock();
-        let _ = db::snapshot_revision(&conn, note_id);
+        // Loudly best-effort: this call IS the undo for a destructive run, so a
+        // silent failure would mean the user's corrected turns are replaced
+        // with nothing to go back to. Not fatal — refusing to transcribe
+        // because the history table wouldn't take a row would be worse — but
+        // never invisible.
+        if let Err(e) = db::snapshot_revision(&conn, note_id) {
+            eprintln!("transcribe: could not snapshot a revision for {note_id} before a re-transcribe; the run will not be undoable: {e}");
+        }
     }
     // The provider that runs now is the one configured now, which may not be
     // the one that was configured when the audio was captured. Check before
@@ -3319,6 +3348,10 @@ async fn transcribe_takes(
 
     let mut transcribed_chunks: Vec<ChunkRecord> = Vec::new();
     let mut failures: Vec<String> = Vec::new();
+    // Set when a take fails hard enough to abandon the rest of the run. Held
+    // rather than returned so the tail below still runs for the takes that did
+    // land — see the loop.
+    let mut fatal: Option<String> = None;
     for (entry, dir) in takes {
         // At least one of these exists — `takes_to_transcribe` filtered on it,
         // so a take whose audio was swept away by "Delete stored audio" never
@@ -3366,7 +3399,12 @@ async fn transcribe_takes(
         // timeline. That places a newly transcribed take at its own position in
         // the note even when a later take was already transcribed — which
         // `combine_with_snapshot`, appending to the end, could not.
-        rediarize_apply_to_chunks(
+        // A take that fails here stops the RUN, but must not discard what the
+        // takes before it already committed: each has written its
+        // `timeline.jsonl` and rebuilt the note's transcript from it, so the
+        // checkpoints and the asset push below still have to happen. Recorded
+        // and broken out of rather than `?`-ed straight to the caller.
+        if let Err(e) = rediarize_apply_to_chunks(
             app.clone(),
             note_id.to_string(),
             entry.id.clone(),
@@ -3379,15 +3417,20 @@ async fn transcribe_takes(
             DiarizePolicy::DEFERRED_TRANSCRIBE,
         )
         .await
-        .map_err(err)?;
-        mark_take_transcribed(app, note_id, &entry.id).await;
+        {
+            fatal = Some(format!("Recording {} failed to transcribe: {e}", entry.index));
+            break;
+        }
+        record_transcribed_take(app, note_id, &entry.id).await;
         session_changed_for_sync(app, note_id, &entry.id);
         transcribed_chunks.extend(chunks);
     }
 
     if transcribed_chunks.is_empty() {
-        // Nothing landed. With no failures either, every pending take had lost
-        // its audio — nothing was attempted, so there is nothing to report.
+        // Nothing landed, so there is nothing to checkpoint or push. With no
+        // failures either, every take had lost its audio — nothing was
+        // attempted, so there is nothing to report.
+        failures.extend(fatal);
         return if failures.is_empty() {
             Ok(())
         } else {
@@ -3425,35 +3468,74 @@ async fn transcribe_takes(
         Ok(false) => {}
         Err(e) => eprintln!("unify: failed, keeping per-take labels: {e}"),
     }
+
+    // Push the rewritten `timeline.jsonl` of every take this run touched.
+    //
+    // `session_changed_for_sync` above only enqueues the *metadata* record;
+    // the binary assets are a separate channel (see the per-session asset sync
+    // comment in `commands::cloud`), and for a finished recording the frontend
+    // fires it off the `recording_status` idle. This path deliberately never
+    // emits one — so without this, a teammate gets the note's text and never
+    // its speaker labels or word timings until repair-on-open happens to catch
+    // it. From the backend rather than the view, so no other caller of
+    // `transcribe_note` can skip it.
+    //
+    // Spawned: it waits for the sync worker to have pushed the records it
+    // needs, which can take longer than the user should watch a spinner for.
+    // A no-op for Personal notes.
+    #[cfg(feature = "cloud")]
+    {
+        let app = app.clone();
+        let note_id = note_id.to_string();
+        tauri::async_runtime::spawn(async move {
+            if let Err(e) = cloud::upload_note_sessions(&app, &note_id, false).await {
+                eprintln!("transcribe: session asset upload for {note_id}: {e}");
+            }
+        });
+    }
+    // Only now, with everything the successful takes earned committed and
+    // pushed, does a mid-run failure become the run's outcome.
+    if let Some(msg) = fatal {
+        return Err(msg);
+    }
     Ok(())
 }
 
-/// Flip one take's manifest entry to transcribed. Best-effort with a loud log.
+/// Record one take as transcribed. Best-effort with a loud log.
 ///
-/// The text is already committed by the time this runs, so a failure here
-/// leaves the note offering a Transcribe button for a take that already has
-/// its text. Pressing it re-replays the take and rewrites the same
-/// `timeline.jsonl` — the transcript is rebuilt from the timelines rather than
-/// appended to, so the words don't double — but it spends the whole
-/// transcription again for no change. Hence the log: worth noticing.
-async fn mark_take_transcribed(app: &AppHandle, note_id: &str, session_id: &str) {
+/// Deliberately does NOT touch `duration_ms`, though this is the moment the
+/// take first has a timeline to measure. The sync engine treats a session's
+/// scalar metadata as immutable and derives its last-write-wins key from
+/// `started_at` on exactly that basis (`cloud-sync`'s `push_session`: "index /
+/// started_at / duration / streams never change"), so a duration corrected
+/// here would re-push under a byte-identical key and converge only because the
+/// server happens to compare strictly. A deferred take's length comes from the
+/// sidecar at capture time instead — see `finalize_session`.
+///
+/// The text is already committed by the time this runs, so a failure leaves the
+/// note offering a Transcribe button for a take that already has its text.
+/// Pressing it replays the take and rewrites the same `timeline.jsonl` — the
+/// transcript is rebuilt from the timelines rather than appended to, so the
+/// words don't double — but it spends the whole transcription again for no
+/// change. Hence the log: worth noticing.
+async fn record_transcribed_take(app: &AppHandle, note_id: &str, session_id: &str) {
     let Ok(app_dir) = app.path().app_data_dir() else {
         return;
     };
     let recordings = sessions::recordings_dir(&app_dir, note_id);
     let session_id = session_id.to_string();
     // Same lock every other manifest read-modify-write takes, so a cloud pull
-    // reconciling mid-replay can't drop the flag we're about to write.
+    // reconciling mid-replay can't drop what we're about to write.
     let lock = app.state::<AppState>().manifest_lock.clone();
     let _manifest_guard = lock.lock().await;
     let res = tokio::task::spawn_blocking(move || {
-        sessions::mark_session_transcribed(&recordings, &session_id)
+        sessions::record_transcribed_take(&recordings, &session_id)
     })
     .await;
     match res.map_err(|e| e.to_string()).and_then(|r| r.map_err(|e| e.to_string())) {
         Ok(true) => {}
-        Ok(false) => eprintln!("transcribe: no manifest entry to mark for {note_id}"),
-        Err(e) => eprintln!("transcribe: mark transcribed {note_id}: {e}"),
+        Ok(false) => eprintln!("transcribe: no manifest entry to record for {note_id}"),
+        Err(e) => eprintln!("transcribe: record transcribed take {note_id}: {e}"),
     }
 }
 
@@ -9058,6 +9140,7 @@ mod import_tests {
             session_id: "s1".into(),
             session_started_at: String::new(),
             deferred: true,
+            captured_duration_ms: 0,
         };
         assert_eq!(retained_streams(&snapshot), vec!["mic", "sys"]);
         assert!(session_streams(&snapshot.chunks).is_empty());

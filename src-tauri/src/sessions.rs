@@ -362,15 +362,25 @@ pub fn append_session(
     Ok(index)
 }
 
-/// Flip one session's [`SessionEntry::transcribed`] to `true` (#146). Returns
-/// `false` when the note has no manifest entry with that id — the caller has
-/// nothing to correct, and writing a fresh entry here would invent a take.
+/// Record that one take has been transcribed (#146): flip
+/// [`SessionEntry::transcribed`] to `true`. Returns `false` when the note has
+/// no manifest entry with that id — the caller has nothing to correct, and
+/// writing a fresh entry here would invent a take.
 ///
-/// Deliberately *not* a general "set" with a bool: transcription is one-way.
-/// A take whose text is in the note can't be made untranscribed again without
-/// also unwinding the transcript, the timeline and the speaker numbering, and
-/// nothing in the product asks for that.
-pub fn mark_session_transcribed(recordings_dir: &Path, session_id: &str) -> std::io::Result<bool> {
+/// **`duration_ms` is deliberately untouched**, even though this is the moment
+/// the take first has a `timeline.jsonl` to measure. Every scalar on a session
+/// record is immutable once it finalises, and the sync engine relies on that:
+/// it derives the last-write-wins key from the session's own start time
+/// ("index / started_at / duration / streams never change"), so a duration
+/// corrected here would re-push under a byte-identical key and land only
+/// because the server compares strictly. A deferred take gets its length from
+/// the sidecar at capture time instead.
+///
+/// Deliberately no way to set `transcribed` back to `false`: transcription is
+/// one-way. A take whose text is in the note can't be made untranscribed again
+/// without also unwinding the transcript, the timeline and the speaker
+/// numbering, and nothing in the product asks for that.
+pub fn record_transcribed_take(recordings_dir: &Path, session_id: &str) -> std::io::Result<bool> {
     let Some(mut manifest) = read_manifest(recordings_dir) else {
         return Ok(false);
     };
@@ -1745,22 +1755,40 @@ mod tests {
     }
 
     #[test]
-    fn mark_transcribed_clears_one_take_and_leaves_the_others() {
+    fn record_transcribed_clears_one_take_and_leaves_the_others() {
         let tmp = TempDir::new().unwrap();
         let rec = recordings_dir(tmp.path(), "note1");
         append_session(&rec, "take-1", "", 0, vec![], Transcribed::No).unwrap();
         append_session(&rec, "take-2", "", 0, vec![], Transcribed::No).unwrap();
         touch(&session_dir(&rec, "take-1").join("mic.wav"));
         touch(&session_dir(&rec, "take-2").join("mic.wav"));
-        assert!(mark_session_transcribed(&rec, "take-1").unwrap());
+        assert!(record_transcribed_take(&rec, "take-1").unwrap());
         let ids: Vec<String> = takes_to_transcribe(&rec, TranscribeScope::Pending)
             .into_iter()
             .map(|(e, _)| e.id)
             .collect();
         assert_eq!(ids, vec!["take-2".to_string()]);
         // Idempotent, and honest about an id the manifest doesn't hold.
-        assert!(mark_session_transcribed(&rec, "take-1").unwrap());
-        assert!(!mark_session_transcribed(&rec, "nope").unwrap());
+        assert!(record_transcribed_take(&rec, "take-1").unwrap());
+        assert!(!record_transcribed_take(&rec, "nope").unwrap());
+    }
+
+    #[test]
+    fn transcribing_a_take_leaves_every_other_scalar_alone() {
+        // `duration_ms` in particular. The sync engine derives a session's
+        // last-write-wins key from its start time because these never change;
+        // mutating one here would re-push under a byte-identical key.
+        let tmp = TempDir::new().unwrap();
+        let rec = recordings_dir(tmp.path(), "note1");
+        append_session(&rec, "take-1", "2026-08-20T09:00:00Z", 42_000, vec!["mic".into()], Transcribed::No)
+            .unwrap();
+        assert!(record_transcribed_take(&rec, "take-1").unwrap());
+        let entry = read_manifest(&rec).unwrap().sessions.remove(0);
+        assert!(entry.transcribed);
+        assert_eq!(entry.duration_ms, 42_000);
+        assert_eq!(entry.started_at, "2026-08-20T09:00:00Z");
+        assert_eq!(entry.index, 1);
+        assert_eq!(entry.streams, vec!["mic"]);
     }
 
     #[test]
@@ -1795,14 +1823,14 @@ mod tests {
     }
 
     #[test]
-    fn mark_transcribed_reports_false_with_no_manifest() {
+    fn record_transcribed_reports_false_with_no_manifest() {
         // A legacy flat note has no manifest to correct. Inventing an entry
         // here would hide the flat take behind a manifest that doesn't
         // describe it.
         let tmp = TempDir::new().unwrap();
         let rec = recordings_dir(tmp.path(), "note1");
         touch(&rec.join("playback.wav"));
-        assert!(!mark_session_transcribed(&rec, LEGACY_SESSION_ID).unwrap());
+        assert!(!record_transcribed_take(&rec, LEGACY_SESSION_ID).unwrap());
         assert!(read_manifest(&rec).is_none());
     }
 

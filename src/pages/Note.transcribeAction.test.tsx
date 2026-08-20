@@ -206,15 +206,17 @@ describe("the transcript panel's re-transcribe control", () => {
     expect(retranscribeButton()).not.toBeInTheDocument();
   });
 
-  // A note whose take was never transcribed has no transcript to copy, but the
-  // control still belongs there — the panel is where the language and speaker
-  // count that the run uses are set.
-  it("shows without a transcript, where Copy cannot", async () => {
+  // It REPLACES a transcript, so on a note whose take was never transcribed it
+  // would duplicate the toolbar's Transcribe under a tooltip that isn't true.
+  // The toolbar owns that case; this control appears once there is text.
+  it("stays hidden on a note that has never been transcribed", async () => {
     await openTranscriptPanel([session({ canTranscribe: true, canRetranscribe: true })]);
-    expect(await screen.findByRole("button", { name: /^re-transcribe$/i })).toBeInTheDocument();
-    expect(
-      screen.queryByRole("button", { name: /^copy transcript$/i }),
-    ).not.toBeInTheDocument();
+    // The panel's own pending copy proves it rendered and is in the state
+    // under test — the control is absent by rule, not because nothing mounted.
+    await screen.findByText(/hasn't been transcribed yet/i);
+    expect(retranscribeButton()).not.toBeInTheDocument();
+    // And the toolbar's Transcribe is the affordance for it.
+    expect(screen.getByRole("button", { name: /^transcribe$/i })).toBeInTheDocument();
   });
 
   it("is disabled while a run is in flight on this note", async () => {

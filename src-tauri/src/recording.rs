@@ -203,6 +203,19 @@ pub struct CaptureSink {
     // denied, no system audio active for the whole recording, etc).
     pub mic_full_wav_path: Arc<Mutex<Option<PathBuf>>>,
     pub sys_full_wav_path: Arc<Mutex<Option<PathBuf>>>,
+    // Longest full-recording stream this capture wrote, in ms, as the sidecar
+    // reported it on shutdown. The manifest's `duration_ms` normally comes from
+    // the take's timeline (it reflects content, and trailing silence isn't
+    // worth showing), but a "Transcribe manually" take has no timeline at
+    // finalise — so this is where its length comes from (#146).
+    //
+    // It has to be settled at CAPTURE time, not filled in later: the sync
+    // engine derives a session's last-write-wins key from its start time on the
+    // stated grounds that "index / started_at / duration / streams never
+    // change" (`cloud-sync`'s `push_session`), so a duration corrected after
+    // the fact would re-push under a byte-identical key and converge only on
+    // the server comparing strictly.
+    pub captured_duration_ms: Arc<Mutex<u64>>,
     pub mode: SinkMode,
 }
 
@@ -220,6 +233,7 @@ impl CaptureSink {
             chunk_log: Arc::new(Mutex::new(Vec::new())),
             mic_full_wav_path: Arc::new(Mutex::new(None)),
             sys_full_wav_path: Arc::new(Mutex::new(None)),
+            captured_duration_ms: Arc::new(Mutex::new(0)),
             mode,
         }
     }
@@ -231,6 +245,15 @@ impl CaptureSink {
             ChunkSource::Mic => &self.mic_trail,
             ChunkSource::Sys => &self.sys_trail,
         }
+    }
+
+    /// Record how long one stream turned out to be. Kept as the max across
+    /// sources: the two streams of one take run for the same wall clock, and
+    /// either may be absent or shorter (a mic that joined late, a system stream
+    /// that never carried anything).
+    pub fn note_stream_duration(&self, duration_ms: u64) {
+        let mut slot = self.captured_duration_ms.lock();
+        *slot = (*slot).max(duration_ms);
     }
 
     /// The slot for one stream's full-recording WAV path.

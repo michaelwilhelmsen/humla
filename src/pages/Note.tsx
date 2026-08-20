@@ -134,15 +134,20 @@ async function runTranscribe(noteId: string, scope: "pending" | "all") {
   } catch (e) {
     useRecordingStore.getState().pushError({ noteId, message: String(e) });
   }
+  // No session-asset push here, deliberately: the run rewrites each take's
+  // `timeline.jsonl`, and `transcribe_takes` pushes them itself. Doing it from
+  // the view would leave every other caller of the command (the menu bar, a
+  // future surface) silently skipping it.
 }
 
 /** Context-panel width bounds, and the body column's floor.
  *
  * `BODY_MIN` is measured, not chosen: the note toolbar's irreducible width is
  * the traffic-light gutter a collapsed sidebar spends (116px) plus a chevron,
- * three icon-only action buttons and two icon buttons — about 391px once every
- * label has dropped (see `NoteToolbar`'s degradation steps and the
- * `?case=toolbar-*` sweeps). 400 clears that with a little slack.
+ * three icon-only action buttons and two icon buttons — 391px in the warm
+ * theme once every label has dropped (see `NoteToolbar`'s degradation steps,
+ * and `scripts/measure-toolbar.js` for how to re-measure). 420 clears that with
+ * ~30px spare for a future theme's wider controls.
  *
  * `PANEL_FLOOR` is below `PANEL_MIN` on purpose. On a window too narrow to give
  * both columns their nominal minimum, a panel a little under its comfortable
@@ -1470,14 +1475,17 @@ export function Note() {
                       but a pasted transcript is only useful elsewhere if it
                       says who spoke.
 
-                      Each control carries its own guard and the wrapper carries
-                      their union, so a note with neither doesn't get an empty
-                      flex box in the picker row. */}
-                  {(hasTranscript || (!readOnly && canRetranscribe)) && (
+                      Both need a transcript, so the wrapper carries that guard
+                      and a note without one gets no empty flex box in the
+                      picker row. Re-transcribe is gated on it with Copy, not
+                      only on `canRetranscribe`: this control REPLACES a
+                      transcript, so on a note whose take was never transcribed
+                      it would sit beside the toolbar's Transcribe doing the
+                      same work, under a tooltip that isn't true — and spend a
+                      revision snapshot of nothing. */}
+                  {hasTranscript && (
                     <div className="ml-auto flex items-center gap-0.5">
-                      {hasTranscript && (
-                        <CopyButton label="Transcript" getText={copyableTranscript} />
-                      )}
+                      <CopyButton label="Transcript" getText={copyableTranscript} />
                       {!readOnly && canRetranscribe && (
                         <button
                           type="button"
@@ -1850,6 +1858,10 @@ export function NoteToolbar({
               disabled={isTranscribing}
               className="no-drag nd-btn"
               title="Transcribe the recorded audio"
+              // The label is hidden below ACTION_LABEL's threshold, so the
+              // accessible name has to come from here — and has to track the
+              // state, or a run in flight reads as an idle button.
+              aria-label={isTranscribing ? "Transcribing…" : "Transcribe"}
             >
               <FileText size={15} strokeWidth={1.6} />
               <span className={ACTION_LABEL}>
