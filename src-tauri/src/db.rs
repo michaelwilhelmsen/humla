@@ -793,7 +793,7 @@ pub struct NoteRevision {
 /// against the latest snapshot and capped at the newest 30 per note. Called
 /// before an edit applies (so it captures the pre-edit state) and before a
 /// restore (so the restore is itself undoable).
-fn snapshot_revision(conn: &Connection, note_id: &str) -> Result<()> {
+pub fn snapshot_revision(conn: &Connection, note_id: &str) -> Result<()> {
     let cur: Option<(String, String, String, String)> = conn
         .query_row(
             "SELECT title, body, transcript, summary FROM notes WHERE id = ?1",

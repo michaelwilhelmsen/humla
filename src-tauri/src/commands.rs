@@ -986,6 +986,15 @@ pub struct NoteSession {
     /// `session_has_audio`: a take reduced to its mixed `playback.wav` still
     /// has audio on disk and still can't be replayed.
     pub can_transcribe: bool,
+    /// Whether pressing **Re-transcribe** would do anything for this take: its
+    /// raw streams are still on disk, whether or not it already has text.
+    ///
+    /// Implied by [`Self::can_transcribe`] and deliberately still its own
+    /// field: the two drive different controls, and having the note view derive
+    /// one from the other would put the "which takes does a run cover" rule in
+    /// two languages. `sessions::takes_to_transcribe` is the single answer both
+    /// of these mirror.
+    pub can_retranscribe: bool,
 }
 
 /// List a note's recording sessions (see [`NoteSession`]).
@@ -1003,6 +1012,7 @@ pub fn note_sessions(app: AppHandle, note_id: String) -> Result<Vec<NoteSession>
             streams: e.streams,
             has_playback: dir.join("playback.wav").exists(),
             can_transcribe: !e.transcribed && sessions::session_has_replayable_audio(&dir),
+            can_retranscribe: sessions::session_has_replayable_audio(&dir),
         })
         .collect();
     Ok(out)
@@ -3217,15 +3227,21 @@ async fn finish_import(app: &AppHandle, note_id: &str) {
 //     behind that no timeline accounts for (ADR-0004).
 // ---------------------------------------------------------------------------
 
-/// Transcribe every take on `note_id` that is still holding untranscribed
-/// audio, oldest first (#146). Mirrors `summarize_note`'s shape: a per-note
-/// status event brackets the work, and the note it belongs to is the only
-/// surface that changes.
+/// Run transcription over `note_id`'s takes, oldest first (#146). Mirrors
+/// `summarize_note`'s shape: a per-note status event brackets the work, and the
+/// note it belongs to is the only surface that changes.
+///
+/// `scope` picks which takes, and the two surfaces that call it are different
+/// actions rather than one with a flag: the toolbar's **Transcribe** finishes
+/// what a "Transcribe manually" capture left pending, while the Transcript
+/// panel's **Re-transcribe** replaces text the note already has — for a
+/// recording that came back off the wrong language or the wrong model.
 #[tauri::command]
 pub async fn transcribe_note(
     app: AppHandle,
     state: State<'_, AppState>,
     note_id: String,
+    scope: sessions::TranscribeScope,
 ) -> Result<(), String> {
     // Refuse only for *this* note: its post-stop chain is about to rewrite the
     // same transcript from the same timelines, and two writers would race for
@@ -3241,7 +3257,7 @@ pub async fn transcribe_note(
         return Err("Already transcribing this note.".into());
     }
     emit_transcribe_status(&app, &note_id, true);
-    let result = transcribe_pending_takes(&app, &note_id).await;
+    let result = transcribe_takes(&app, &note_id, scope).await;
     state.transcribing.lock().remove(&note_id);
     emit_transcribe_status(&app, &note_id, false);
     // No `emit_error` here: the command's rejection is what the caller toasts,
@@ -3262,17 +3278,31 @@ fn emit_transcribe_status(app: &AppHandle, note_id: &str, active: bool) {
     );
 }
 
-async fn transcribe_pending_takes(app: &AppHandle, note_id: &str) -> Result<(), String> {
+async fn transcribe_takes(
+    app: &AppHandle,
+    note_id: &str,
+    scope: sessions::TranscribeScope,
+) -> Result<(), String> {
     let app_dir = app.path().app_data_dir().map_err(err)?;
     let recordings = sessions::recordings_dir(&app_dir, note_id);
-    let pending = sessions::untranscribed_sessions(&recordings);
-    if pending.is_empty() {
+    let takes = sessions::takes_to_transcribe(&recordings, scope);
+    if takes.is_empty() {
         // Nothing to do — a stale button, or a second press that lost the race.
         // Not an error: there is no bad state to report.
         return Ok(());
     }
 
     let state: State<AppState> = app.state();
+    // Re-transcribing replaces text the note already has, and the rewrite path
+    // (`db::set_transcript`) keeps no history of its own — so a run that comes
+    // back worse than what it replaced, or that lands in the wrong language a
+    // second time, would have nothing to go back to. One snapshot before the
+    // first take makes the whole run undoable through the note's existing
+    // revision list. `Pending` needs none: it only adds takes that had no text.
+    if scope == sessions::TranscribeScope::All {
+        let conn = state.db.lock();
+        let _ = db::snapshot_revision(&conn, note_id);
+    }
     // The provider that runs now is the one configured now, which may not be
     // the one that was configured when the audio was captured. Check before
     // replaying an hour of it.
@@ -3289,23 +3319,14 @@ async fn transcribe_pending_takes(app: &AppHandle, note_id: &str) -> Result<(), 
 
     let mut transcribed_chunks: Vec<ChunkRecord> = Vec::new();
     let mut failures: Vec<String> = Vec::new();
-    for (entry, dir) in pending {
+    for (entry, dir) in takes {
+        // At least one of these exists — `takes_to_transcribe` filtered on it,
+        // so a take whose audio was swept away by "Delete stored audio" never
+        // reaches here and never produced a button either.
         let mic = dir.join("mic.wav");
         let sys = dir.join("sys.wav");
         let mic_wav = mic.exists().then_some(mic);
         let sys_wav = sys.exists().then_some(sys);
-        if mic_wav.is_none() && sys_wav.is_none() {
-            // The audio is gone — a "Delete stored audio" sweep, or a note
-            // pulled from a workspace that never carried the raw streams. There
-            // is nothing left to transcribe, ever, which is why `note_sessions`
-            // reports `canTranscribe: false` for it and the action doesn't
-            // offer this take in the first place.
-            eprintln!(
-                "transcribe: take {} has no retained audio, skipping",
-                entry.id
-            );
-            continue;
-        }
 
         // One sink for the whole take: its two streams share a chunk log (the
         // diarize pass has to see both to tell an in-person meeting from a

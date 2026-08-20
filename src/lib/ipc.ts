@@ -286,6 +286,11 @@ export type NoteSession = {
   // nothing renders a per-take pending badge (out of scope in #146) and an
   // exported field nothing reads is a surface to keep honest for nothing.
   canTranscribe: boolean;
+  // Whether pressing Re-transcribe would do anything: the raw streams are
+  // still on disk, whether or not this take already has text. Implied by
+  // `canTranscribe`, and still its own field so the "which takes does a run
+  // cover" rule lives only in `sessions::takes_to_transcribe`.
+  canRetranscribe: boolean;
 };
 
 // What a "delete stored audio for existing notes" sweep would remove (#24).
@@ -377,11 +382,18 @@ export const ipc = {
     invoke<NoteSession[]>("note_sessions", { noteId }),
   noteSessionPlaybackPath: (noteId: string, sessionId: string) =>
     invoke<string | null>("note_session_playback_path", { noteId, sessionId }),
-  // Deferred transcription (#146): replay every take on this note that is
-  // still holding untranscribed audio, oldest first. Progress arrives on
-  // `transcribe_status`, not `recording_status` — a recording on another note
-  // may be running the whole time.
-  transcribeNote: (noteId: string) => invoke<void>("transcribe_note", { noteId }),
+  // Deferred transcription (#146): replay this note's takes through the
+  // provider, oldest first. Progress arrives on `transcribe_status`, not
+  // `recording_status` — a recording on another note may be running the whole
+  // time.
+  //
+  // "pending" finishes what a "Transcribe manually" capture left waiting;
+  // "all" re-runs every take that still has its audio, replacing text the note
+  // already had (for a recording that came back off the wrong language or
+  // model). The backend snapshots a note revision before an "all" run, so it
+  // is undoable from the note's history.
+  transcribeNote: (noteId: string, scope: "pending" | "all") =>
+    invoke<void>("transcribe_note", { noteId, scope }),
   // Cloud audio sync: upload a finished recording to its workspace, or pull a
   // shared note's audio down for local playback.
   uploadNoteAudio: (noteId: string) => invoke<void>("cloud_upload_note_audio", { noteId }),

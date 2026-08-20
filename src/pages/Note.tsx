@@ -117,20 +117,42 @@ async function runSummarize(noteId: string, onFailure?: () => void) {
   }
 }
 
-/** Kick off a deferred transcription (#146), surfacing failures as a toast.
+/** Kick off a transcription run (#146), surfacing failures as a toast.
+ *
+ * `"pending"` finishes what a "Transcribe manually" capture left waiting;
+ * `"all"` re-runs every take that still has its audio, replacing text the note
+ * already had. Both go through here so neither can become an unhandled
+ * rejection — the command refuses outright while the note is recording, and a
+ * silent rejection there would look like a button that did nothing.
  *
  * Nothing local to track: the backend brackets the whole replay with
- * `transcribe_status`, and the button reads that. The catch is still needed —
- * the command refuses outright when the note is recording, and an unhandled
- * rejection there would look like a button that did nothing.
+ * `transcribe_status`, and both buttons read that.
  */
-async function runTranscribe(noteId: string) {
+async function runTranscribe(noteId: string, scope: "pending" | "all") {
   try {
-    await ipc.transcribeNote(noteId);
+    await ipc.transcribeNote(noteId, scope);
   } catch (e) {
     useRecordingStore.getState().pushError({ noteId, message: String(e) });
   }
 }
+
+/** Context-panel width bounds, and the body column's floor.
+ *
+ * `BODY_MIN` is measured, not chosen: the note toolbar's irreducible width is
+ * the traffic-light gutter a collapsed sidebar spends (116px) plus a chevron,
+ * three icon-only action buttons and two icon buttons — about 391px once every
+ * label has dropped (see `NoteToolbar`'s degradation steps and the
+ * `?case=toolbar-*` sweeps). 400 clears that with a little slack.
+ *
+ * `PANEL_FLOOR` is below `PANEL_MIN` on purpose. On a window too narrow to give
+ * both columns their nominal minimum, a panel a little under its comfortable
+ * width is a better answer than a body column that cannot hold its own toolbar
+ * — which is what the old flat 320–720 clamp produced, since it never looked at
+ * the window at all. */
+const PANEL_MIN = 320;
+const PANEL_FLOOR = 260;
+const PANEL_MAX = 720;
+const BODY_MIN = 420;
 
 /** How long the body has to sit still before #90's typed-note titler fires.
  *
@@ -342,8 +364,37 @@ export function Note() {
   const chatTargetKey = chatTarget ? targetKey(chatTarget) : null;
   const [panelWidth, setPanelWidth] = useState<number>(() => {
     const saved = typeof localStorage !== "undefined" ? Number(localStorage.getItem("humla.panelWidth")) : NaN;
-    return saved >= 320 && saved <= 720 ? saved : 440;
+    // `PANEL_FLOOR`, not `PANEL_MIN`: a width persisted from a cramped window
+    // is legitimately under the nominal minimum, and rejecting it would reset
+    // the panel to 440 on every reopen there.
+    return saved >= PANEL_FLOOR && saved <= PANEL_MAX ? saved : 440;
   });
+  // The width the two columns share, watched rather than derived: it is the
+  // window minus the nav card, and the nav card collapses. Drives the clamp
+  // that keeps the panel from squeezing the body column past what its toolbar
+  // can survive — see PANEL_MIN / BODY_MIN.
+  const columnsRef = useRef<HTMLDivElement | null>(null);
+  const [columnsWidth, setColumnsWidth] = useState(0);
+  useEffect(() => {
+    const el = columnsRef.current;
+    if (!el) return;
+    setColumnsWidth(el.clientWidth);
+    const ro = new ResizeObserver(([entry]) => setColumnsWidth(entry.contentRect.width));
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+  // How wide the panel may actually be right now. Before #146 the drag handler
+  // clamped to a flat 320–720 with no regard for the window, so on a
+  // minimum-size window the panel could be dragged over the whole view and
+  // leave the body column at zero — taking its toolbar with it. The floor is
+  // `PANEL_FLOOR`, not `PANEL_MIN`: on a window too narrow for both, a panel
+  // slightly under its nominal minimum is a better answer than a body column
+  // that can't hold its own toolbar.
+  const maxPanelWidth =
+    columnsWidth > 0
+      ? Math.max(PANEL_FLOOR, Math.min(PANEL_MAX, columnsWidth - BODY_MIN))
+      : PANEL_MAX;
+  const effectivePanelWidth = Math.min(panelWidth, maxPanelWidth);
   const [resizing, setResizing] = useState<boolean>(false);
   const saveTimer = useRef<number | null>(null);
   const devMode = useDeveloperMode();
@@ -456,6 +507,10 @@ export function Note() {
   // disk — so a take whose audio was swept away never offers an action that
   // can only fail.
   const pendingTranscription = sessions.some((sess) => sess.canTranscribe);
+  // Any take whose raw streams are still on disk can be re-run — for a
+  // recording that came back off the wrong language or the wrong model. Same
+  // backend answer as `canTranscribe`, one condition looser.
+  const canRetranscribe = sessions.some((sess) => sess.canRetranscribe);
   const isThisNoteActive = !!draft && recPhase.noteId === draft.id;
   const isRecording = isThisNoteActive && recPhase.phase === "recording";
   const isPaused = isThisNoteActive && recPhase.phase === "paused";
@@ -478,10 +533,13 @@ export function Note() {
   }, [isStarting, isRecording, isImporting]);
 
   // Drag-to-resize for the context panel. A handle on the panel's left edge
-  // adjusts its width (clamped 320–720); persisted to localStorage. The
-  // width transition is suppressed mid-drag so it tracks the cursor.
+  // adjusts its width (clamped to `maxPanelWidth`, which accounts for the
+  // window); persisted to localStorage. The width transition is suppressed
+  // mid-drag so it tracks the cursor.
   const panelWidthRef = useRef(panelWidth);
   panelWidthRef.current = panelWidth;
+  const maxPanelWidthRef = useRef(maxPanelWidth);
+  maxPanelWidthRef.current = maxPanelWidth;
   const resizeStartRef = useRef<{ x: number; w: number } | null>(null);
   const beginResize = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
@@ -493,7 +551,13 @@ export function Note() {
     const onMove = (e: MouseEvent) => {
       const s = resizeStartRef.current;
       if (!s) return;
-      setPanelWidth(Math.min(720, Math.max(320, s.w + (s.x - e.clientX))));
+      // The drag floor is `PANEL_MIN` wherever there's room for it — dragging
+      // below the nominal minimum on a wide window was never allowed and
+      // isn't now. `PANEL_FLOOR` is reachable only when the cap itself has
+      // been pushed under `PANEL_MIN` by a narrow window.
+      const cap = maxPanelWidthRef.current;
+      const floor = Math.min(PANEL_MIN, cap);
+      setPanelWidth(Math.min(cap, Math.max(floor, s.w + (s.x - e.clientX))));
     };
     const onUp = () => {
       setResizing(false);
@@ -976,7 +1040,7 @@ export function Note() {
   const wsInitial = noteWsName.slice(0, 1).toUpperCase();
 
   return (
-    <div className="h-full flex min-h-0">
+    <div ref={columnsRef} className="h-full flex min-h-0">
       {/* Body column — toolbar + scrollable writing area. The context
           panel is a sibling card to the right; closing it widens the body
           into a focus-writing mode. */}
@@ -1228,7 +1292,7 @@ export function Note() {
       </div>
 
       <aside
-        style={{ width: panelOpen ? panelWidth : 0 }}
+        style={{ width: panelOpen ? effectivePanelWidth : 0 }}
         className={cn(
           "shrink-0 flex flex-col overflow-hidden rounded-[var(--radius-card)] bg-[var(--color-surface)] shadow-[var(--shadow-card)] relative z-30",
           !resizing && "transition-[width,opacity] duration-300 ease-[cubic-bezier(0.4,0,0.2,1)]",
@@ -1397,16 +1461,48 @@ export function Note() {
                       upsert(next);
                     }}
                   />
-                  {/* Copies the raw stored string, labels and all — view mode
-                      drops the label text in favour of the coloured dot, but a
-                      pasted transcript is only useful elsewhere if it says who
-                      spoke. The guard is on the wrapper, not inside it: unlike
-                      the Summary group this holds one control, so an inner
-                      guard would leave an empty flex box on every note without
-                      a transcript. */}
-                  {hasTranscript && (
+                  {/* Copy + Re-transcribe, mirroring the Summary group's
+                      Copy + Regenerate pair — the two panels' actions should
+                      not read as different kinds of control.
+
+                      Copy takes the raw stored string, labels and all: view
+                      mode drops the label text in favour of the coloured dot,
+                      but a pasted transcript is only useful elsewhere if it
+                      says who spoke.
+
+                      Each control carries its own guard and the wrapper carries
+                      their union, so a note with neither doesn't get an empty
+                      flex box in the picker row. */}
+                  {(hasTranscript || (!readOnly && canRetranscribe)) && (
                     <div className="ml-auto flex items-center gap-0.5">
-                      <CopyButton label="Transcript" getText={copyableTranscript} />
+                      {hasTranscript && (
+                        <CopyButton label="Transcript" getText={copyableTranscript} />
+                      )}
+                      {!readOnly && canRetranscribe && (
+                        <button
+                          type="button"
+                          onClick={() => void runTranscribe(draft.id, "all")}
+                          disabled={isTranscribing || recActive}
+                          title={
+                            // Names what it replaces. The rewrite has no undo
+                            // of its own, so the backend snapshots a note
+                            // revision first — but a tooltip that said only
+                            // "re-transcribe" would leave the user to discover
+                            // that their corrected turns were gone.
+                            isTranscribing
+                              ? "Transcribing…"
+                              : "Re-transcribe from the saved audio, replacing this transcript. Uses the language and speaker count above."
+                          }
+                          aria-label="Re-transcribe"
+                          className="nd-btn-icon nd-btn-icon-sm"
+                        >
+                          <RefreshCw
+                            size={15}
+                            strokeWidth={1.6}
+                            className={isTranscribing ? "animate-spin" : undefined}
+                          />
+                        </button>
+                      )}
                     </div>
                   )}
                 </div>
@@ -1615,7 +1711,7 @@ function formatElapsed(s: number) {
 // context-panel toggle, and an overflow menu. Replaces the old cryptic
 // copy/refresh/more icon row. Record + Summarize appear only when idle
 // (not readOnly); during a recording the floating bar takes over.
-function NoteToolbar({
+export function NoteToolbar({
   noteId,
   backTo,
   backLabel,
@@ -1703,40 +1799,72 @@ function NoteToolbar({
     setMenuPos({ x: rect.right - 160, y: rect.bottom + 4 });
   }
 
+  // How the row degrades when the body column gets narrow.
+  //
+  // `@container`, not a viewport breakpoint: this row's width is the BODY
+  // COLUMN's, which shrinks as the user drags the context panel wider — so at a
+  // fixed window size the same toolbar has to survive anywhere from ~320px to
+  // full width. `.nd-btn` is `flex-shrink: 0; white-space: nowrap`
+  // (globals.css) and rightly so — a label compressed into two clipped lines
+  // would be worse than one that's hidden — so the row cannot absorb the
+  // squeeze by shrinking. It gives way in three steps instead: the back label's
+  // cap tightens, then the action labels drop and the buttons stand as their
+  // icons, then the back label goes entirely. `title` / `aria-label` carry
+  // every name a label stops showing.
+  //
+  // The thresholds are against the row's CONTENT box — `container-type:
+  // inline-size` excludes padding — which is what makes one set of numbers
+  // cover both sidebar states. A collapsed sidebar spends 104px of this row on
+  // clearing the macOS traffic lights (`pl-[116px]` below), and because that is
+  // padding it is already outside what the query compares. Getting this
+  // backwards buys a set of thresholds that fire ~100px too early.
+  //
+  // Measured, not guessed: `?case=toolbar-*` in the mock harness sweeps
+  // 300–900px in both themes and both sidebar states, and every band clears its
+  // content by ≥6px. The floor is 275px of content, which `BODY_MIN` keeps out
+  // of reach.
+  const BACK_LABEL = "truncate max-w-[180px] @max-[630px]:max-w-[90px] @max-[380px]:hidden";
+  const ACTION_LABEL = "@max-[570px]:hidden";
+
   return (
-    <div data-tauri-drag-region className={cn("relative z-30 h-12 shrink-0 flex items-center gap-2 pr-3", sidebarCollapsed ? "pl-[116px]" : "pl-3")}>
+    <div data-tauri-drag-region className={cn("@container relative z-30 h-12 shrink-0 flex items-center gap-2 pr-3", sidebarCollapsed ? "pl-[116px]" : "pl-3")}>
       <Link
         to={backTo}
         className="no-drag inline-flex items-center gap-1.5 pl-1.5 pr-2.5 py-1.5 rounded-[var(--radius)] text-[13px] text-[var(--color-text-muted)] hover:text-[var(--color-text)] hover:bg-[var(--color-pill-hover)] transition-colors"
       >
         <ChevronLeft size={15} strokeWidth={1.6} />
-        <span className="truncate max-w-[180px]">{backLabel}</span>
+        {/* First to give: a long folder name is the least load-bearing text in
+            the row, and the chevron alone still reads as "back". */}
+        <span className={BACK_LABEL}>{backLabel}</span>
       </Link>
       <div className="flex-1" />
       {!readOnly && !recActive && (
         <>
-          <button onClick={record} disabled={!canRecord} className="no-drag nd-btn" title="Record (⌘R)">
+          <button onClick={record} disabled={!canRecord} className="no-drag nd-btn" title="Record (⌘R)" aria-label="Record">
             <Circle size={10} fill="currentColor" strokeWidth={0} className="text-[var(--color-record)]" />
-            <span>Record</span>
+            <span className={ACTION_LABEL}>Record</span>
           </button>
           {(pendingTranscription || isTranscribing) && (
             <button
-              onClick={() => void runTranscribe(noteId)}
+              onClick={() => void runTranscribe(noteId, "pending")}
               disabled={isTranscribing}
               className="no-drag nd-btn"
               title="Transcribe the recorded audio"
             >
               <FileText size={15} strokeWidth={1.6} />
-              <span>{isTranscribing ? "Transcribing…" : "Transcribe"}</span>
+              <span className={ACTION_LABEL}>
+                {isTranscribing ? "Transcribing…" : "Transcribe"}
+              </span>
             </button>
           )}
           <button
             onClick={() => void runSummarize(noteId, onSummarizeFailed)}
             className="no-drag nd-btn nd-btn-primary"
             title="Summarize"
+            aria-label="Summarize"
           >
             <Sparkles size={15} strokeWidth={1.6} />
-            <span>Summarize</span>
+            <span className={ACTION_LABEL}>Summarize</span>
           </button>
         </>
       )}

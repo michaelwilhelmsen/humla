@@ -64,6 +64,7 @@ function session(over: Partial<NoteSession>): NoteSession {
     streams: ["mic"],
     hasPlayback: true,
     canTranscribe: false,
+    canRetranscribe: false,
     ...over,
   };
 }

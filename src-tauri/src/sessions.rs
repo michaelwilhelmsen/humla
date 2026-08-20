@@ -385,18 +385,46 @@ pub fn mark_session_transcribed(recordings_dir: &Path, session_id: &str) -> std:
     Ok(true)
 }
 
-/// A note's takes that still hold untranscribed audio, in recording order
-/// (#146). The order is the whole point: each take's timeline is written with a
-/// speaker-number offset taken from the takes *before* it, so transcribing them
-/// out of order would number the later ones off a still-empty predecessor.
+/// Which of a note's takes a Transcribe run covers (#146).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TranscribeScope {
+    /// Only takes still holding untranscribed audio — the note's **Transcribe**
+    /// action, for a meeting captured with "Transcribe manually" on.
+    Pending,
+    /// Every take whose audio is still on disk, transcribed or not — the
+    /// Transcript panel's **Re-transcribe**, for a recording that came back off
+    /// the wrong language or the wrong model. Destructive: it replaces text and
+    /// word timings the note already had, which is why the command snapshots a
+    /// revision first.
+    All,
+}
+
+/// The takes one Transcribe run covers, in recording order (#146).
 ///
-/// The legacy flat pseudo-session can never appear here (it reads back
-/// `transcribed: true`), so no caller has to special-case a session id that
-/// resolves to the note's whole recordings dir.
-pub fn untranscribed_sessions(recordings_dir: &Path) -> Vec<(SessionEntry, PathBuf)> {
+/// The order is the whole point: each take's timeline is written with a
+/// speaker-number offset taken from the takes *before* it, so running them out
+/// of order would number the later ones off a still-empty predecessor.
+///
+/// Both scopes require [`session_has_replayable_audio`] — a take without its
+/// raw streams can't be replayed under either, and filtering it here rather
+/// than skipping it mid-run is what keeps this in step with the
+/// `canTranscribe` / `canRetranscribe` the note view reads. `Pending` also
+/// can't reach the legacy flat pseudo-session, which reads back
+/// `transcribed: true`; `All` can, and that is deliberate — a note recorded
+/// before per-session storage is exactly the kind that may need its language
+/// corrected.
+pub fn takes_to_transcribe(
+    recordings_dir: &Path,
+    scope: TranscribeScope,
+) -> Vec<(SessionEntry, PathBuf)> {
     resolve_sessions(recordings_dir)
         .into_iter()
-        .filter(|(e, _)| !e.transcribed)
+        .filter(|(e, _)| match scope {
+            TranscribeScope::Pending => !e.transcribed,
+            TranscribeScope::All => true,
+        })
+        .filter(|(_, dir)| session_has_replayable_audio(dir))
         .collect()
 }
 
@@ -1670,7 +1698,7 @@ mod tests {
         let sessions = resolve_sessions(&rec);
         assert_eq!(sessions.len(), 1);
         assert!(sessions[0].0.transcribed);
-        assert!(untranscribed_sessions(&rec).is_empty());
+        assert!(takes_to_transcribe(&rec, TranscribeScope::Pending).is_empty());
     }
 
     #[test]
@@ -1678,8 +1706,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let rec = recordings_dir(tmp.path(), "note1");
         append_session(&rec, "uuid-a", "", 0, vec!["mic".into()], Transcribed::No).unwrap();
+        touch(&session_dir(&rec, "uuid-a").join("mic.wav"));
         // Survives the JSON round-trip, not just the in-memory struct.
-        let pending = untranscribed_sessions(&rec);
+        let pending = takes_to_transcribe(&rec, TranscribeScope::Pending);
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].0.id, "uuid-a");
         assert_eq!(pending[0].1, session_dir(&rec, "uuid-a"));
@@ -1691,14 +1720,28 @@ mod tests {
         // deferred pass has to walk them oldest-first.
         let tmp = TempDir::new().unwrap();
         let rec = recordings_dir(tmp.path(), "note1");
+        for id in ["take-1", "take-2", "take-3"] {
+            touch(&session_dir(&rec, id).join("mic.wav"));
+        }
         append_session(&rec, "take-1", "", 0, vec![], Transcribed::No).unwrap();
         append_session(&rec, "take-2", "", 0, vec![], Transcribed::Yes).unwrap();
         append_session(&rec, "take-3", "", 0, vec![], Transcribed::No).unwrap();
-        let ids: Vec<String> = untranscribed_sessions(&rec)
-            .into_iter()
-            .map(|(e, _)| e.id)
-            .collect();
-        assert_eq!(ids, vec!["take-1".to_string(), "take-3".to_string()]);
+        let ids = |scope| -> Vec<String> {
+            takes_to_transcribe(&rec, scope)
+                .into_iter()
+                .map(|(e, _)| e.id)
+                .collect()
+        };
+        assert_eq!(
+            ids(TranscribeScope::Pending),
+            vec!["take-1".to_string(), "take-3".to_string()]
+        );
+        // Re-transcribe covers every take that still has its audio, including
+        // the one that already has text — that is the point of it.
+        assert_eq!(
+            ids(TranscribeScope::All),
+            vec!["take-1".to_string(), "take-2".to_string(), "take-3".to_string()]
+        );
     }
 
     #[test]
@@ -1707,8 +1750,10 @@ mod tests {
         let rec = recordings_dir(tmp.path(), "note1");
         append_session(&rec, "take-1", "", 0, vec![], Transcribed::No).unwrap();
         append_session(&rec, "take-2", "", 0, vec![], Transcribed::No).unwrap();
+        touch(&session_dir(&rec, "take-1").join("mic.wav"));
+        touch(&session_dir(&rec, "take-2").join("mic.wav"));
         assert!(mark_session_transcribed(&rec, "take-1").unwrap());
-        let ids: Vec<String> = untranscribed_sessions(&rec)
+        let ids: Vec<String> = takes_to_transcribe(&rec, TranscribeScope::Pending)
             .into_iter()
             .map(|(e, _)| e.id)
             .collect();
@@ -1716,6 +1761,37 @@ mod tests {
         // Idempotent, and honest about an id the manifest doesn't hold.
         assert!(mark_session_transcribed(&rec, "take-1").unwrap());
         assert!(!mark_session_transcribed(&rec, "nope").unwrap());
+    }
+
+    #[test]
+    fn a_take_without_its_raw_streams_is_offered_under_neither_scope() {
+        // The take can't be replayed, so listing it would produce a run that
+        // does nothing. Filtered here rather than skipped mid-run, so this
+        // stays in step with the `canTranscribe` / `canRetranscribe` the note
+        // view reads.
+        let tmp = TempDir::new().unwrap();
+        let rec = recordings_dir(tmp.path(), "note1");
+        append_session(&rec, "take-1", "", 0, vec!["mic".into()], Transcribed::No).unwrap();
+        touch(&session_dir(&rec, "take-1").join("playback.wav"));
+        assert!(takes_to_transcribe(&rec, TranscribeScope::Pending).is_empty());
+        assert!(takes_to_transcribe(&rec, TranscribeScope::All).is_empty());
+    }
+
+    #[test]
+    fn re_transcribe_reaches_a_legacy_flat_note() {
+        // A note recorded before per-session storage is exactly the kind that
+        // may need its language corrected, and its take reads back as
+        // transcribed — so only `All` can reach it.
+        let tmp = TempDir::new().unwrap();
+        let rec = recordings_dir(tmp.path(), "note1");
+        touch(&rec.join("playback.wav"));
+        touch(&rec.join("mic.wav"));
+        assert!(takes_to_transcribe(&rec, TranscribeScope::Pending).is_empty());
+        let all = takes_to_transcribe(&rec, TranscribeScope::All);
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].0.id, LEGACY_SESSION_ID);
+        // Resolves to the flat dir, not a `__legacy__` subdir.
+        assert_eq!(all[0].1, rec);
     }
 
     #[test]
@@ -1728,16 +1804,6 @@ mod tests {
         touch(&rec.join("playback.wav"));
         assert!(!mark_session_transcribed(&rec, LEGACY_SESSION_ID).unwrap());
         assert!(read_manifest(&rec).is_none());
-    }
-
-    #[test]
-    fn legacy_flat_session_is_never_offered_for_transcription() {
-        let tmp = TempDir::new().unwrap();
-        let rec = recordings_dir(tmp.path(), "note1");
-        touch(&rec.join("playback.wav"));
-        touch(&rec.join("mic.wav"));
-        assert_eq!(resolve_sessions(&rec).len(), 1);
-        assert!(untranscribed_sessions(&rec).is_empty());
     }
 
     #[test]

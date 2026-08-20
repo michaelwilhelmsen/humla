@@ -10,6 +10,7 @@
 // review, so scenarios from past reviews stay runnable as the harness moves on
 // to the next step.
 import ReactDOM from "react-dom/client";
+import { MemoryRouter } from "react-router-dom";
 import { StrictMode, useState } from "react";
 import { mockIPC } from "@tauri-apps/api/mocks";
 import {
@@ -23,7 +24,7 @@ import {
 import { CommandSnippet } from "./components/CommandSnippet";
 import { Segmented } from "./pages/settings/components/Segmented";
 import { Toggle } from "./pages/settings/components/Toggle";
-import { NoteTitleBox, TranscriptEditor, TranscriptPlayer } from "./pages/Note";
+import { NoteTitleBox, NoteToolbar, TranscriptEditor, TranscriptPlayer } from "./pages/Note";
 import { IntegrationsSection } from "./pages/settings/tabs/Integrations";
 import { RecordingSection } from "./pages/settings/tabs/Recording";
 import { NewWorkspaceModal } from "./components/NewWorkspaceModal";
@@ -205,6 +206,7 @@ function TranscriptPlayerHarness({ disabled }: { disabled: boolean }) {
           durationMs: 12000,
           streams: ["mic"],
           canTranscribe: false,
+          canRetranscribe: false,
           hasPlayback: false,
         },
       ]}
@@ -216,6 +218,61 @@ function TranscriptPlayerHarness({ disabled }: { disabled: boolean }) {
       bottomAligned={false}
     />
   );
+}
+
+// ---- #146 axis: the note toolbar at the widths the body column really gets --
+// The toolbar sits in the BODY column, whose width is the window minus the
+// context panel (clamped 320–720) — so at the 720px minimum window it can be
+// under 400px wide, and the row carries a back link plus up to three `.nd-btn`s
+// and two icon buttons. `.nd-btn` is `flex-shrink: 0; white-space: nowrap`, so
+// the row cannot absorb the squeeze; it degrades by container query instead.
+// One scenario per width, because the whole question is where each step lands.
+//
+// `width` is the column, not the viewport: the `@container` is the toolbar's own
+// inline size, which is what the real one queries too.
+function toolbarCase(
+  width: number,
+  pending: boolean,
+  sidebarCollapsed = false,
+): Scenario {
+  return {
+    wrap: (node) => (
+      <div className="flex-1 min-h-0 flex flex-col items-center gap-3 py-6">
+        <p className="text-xs text-[var(--color-text-muted)]">
+          body column: {width}px
+          {sidebarCollapsed && " · sidebar collapsed (traffic-light gutter)"}
+        </p>
+        {/* The rounded card the body column is, so an overflowing row is
+            visible as a row that leaves its card. */}
+        <div
+          className="rounded-[var(--radius-card)] bg-[var(--color-surface)] overflow-hidden"
+          style={{ width }}
+        >
+          <MemoryRouter>{node}</MemoryRouter>
+        </div>
+      </div>
+    ),
+    render: () => (
+      <NoteToolbar
+        noteId="mock-note"
+        backTo="/"
+        backLabel="Kundemøter og oppfølging"
+        readOnly={false}
+        recActive={false}
+        canRecord
+        panelOpen
+        onTogglePanel={() => {}}
+        onSummarizeFailed={() => {}}
+        onRegenerateTitle={() => {}}
+        pendingTranscription={pending}
+        isTranscribing={false}
+        sidebarCollapsed={sidebarCollapsed}
+      />
+    ),
+    ipc: {
+      notes_list: () => [],
+    },
+  };
 }
 
 // Every settings-section scenario stands its section in the same scrollable
@@ -540,6 +597,23 @@ const CASES: Record<string, Scenario> = {
   menubar: menubarCase(false, "Command+Control+KeyR"),
   "menubar-on": menubarCase(true, "Command+Control+KeyR"),
   "menubar-nohotkey": menubarCase(false, ""),
+
+  // --- #146: the toolbar at the widths the body column really gets. The
+  // `-wide` pair is the comfortable case; each step down is a documented
+  // degradation, and `toolbar-380` is the 720px-window / 320px-panel floor.
+  "toolbar-wide": toolbarCase(760, true),
+  "toolbar-620": toolbarCase(620, true),
+  "toolbar-520": toolbarCase(520, true),
+  "toolbar-430": toolbarCase(430, true),
+  "toolbar-380": toolbarCase(380, true),
+  // Without a pending take there is no Transcribe button — the case that
+  // shipped before #146, for comparison.
+  "toolbar-380-notranscribe": toolbarCase(380, false),
+  // Collapsed sidebar: the same row minus 104px, spent on clearing the traffic
+  // lights. Its thresholds are shifted up by exactly that.
+  "toolbar-collapsed-760": toolbarCase(760, true, true),
+  "toolbar-collapsed-620": toolbarCase(620, true, true),
+  "toolbar-collapsed-430": toolbarCase(430, true, true),
 
   // --- #146: the deferred-transcription disclosure. `retention-off` must show
   // one row; the other two are the revealed toggle in both positions.

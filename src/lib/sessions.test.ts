@@ -32,6 +32,7 @@ function session(p: Partial<NoteSession>): NoteSession {
     streams: [],
     hasPlayback: true,
     canTranscribe: false,
+    canRetranscribe: false,
     ...p,
   };
 }

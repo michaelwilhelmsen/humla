@@ -29,6 +29,7 @@ function session(over: Partial<NoteSession>): NoteSession {
     streams: ["mic"],
     hasPlayback: true,
     canTranscribe: false,
+    canRetranscribe: false,
     ...over,
   };
 }
@@ -36,8 +37,9 @@ function session(over: Partial<NoteSession>): NoteSession {
 function open(
   sessions: NoteSession[],
   handlers: Record<string, (args: unknown) => unknown> = {},
+  noteOver: Partial<Note> = {},
 ) {
-  const note: Note = makeNote({ id: "n1", title: "Standup" });
+  const note: Note = makeNote({ id: "n1", title: "Standup", ...noteOver });
   renderApp("/note/n1", {
     notes_list: () => [note],
     notes_get: () => note,
@@ -46,6 +48,22 @@ function open(
     ...handlers,
   });
   return note;
+}
+
+/** Open the note and switch the context panel to its Transcript tab. */
+async function openTranscriptPanel(
+  sessions: NoteSession[],
+  handlers: Record<string, (args: unknown) => unknown> = {},
+  noteOver: Partial<Note> = {},
+) {
+  const note = open(sessions, handlers, noteOver);
+  const user = userEvent.setup();
+  await user.click(await screen.findByRole("button", { name: /transcript/i }));
+  return { note, user };
+}
+
+function retranscribeButton() {
+  return screen.queryByRole("button", { name: /^re-transcribe$/i });
 }
 
 function transcribeButton() {
@@ -82,7 +100,9 @@ describe("the note's Transcribe action", () => {
     const button = await screen.findByRole("button", { name: /^transcribe$/i });
 
     await userEvent.click(button);
-    expect(transcribe).toHaveBeenCalledWith({ noteId: "n1" });
+    // "pending" — the toolbar action finishes what a deferred capture left
+    // waiting; it must not re-run takes that already have their text.
+    expect(transcribe).toHaveBeenCalledWith({ noteId: "n1", scope: "pending" });
 
     // The backend brackets the replay with `transcribe_status`; the button
     // reads that rather than any local flag, so a replay started elsewhere
@@ -122,5 +142,91 @@ describe("the note's Transcribe action", () => {
           .errors.some((e) => /stop the recording first/.test(e.message)),
       ).toBe(true),
     );
+  });
+});
+
+// The Transcript panel's re-transcribe, mirroring the Summary panel's
+// regenerate: the take's audio is still on disk, so a recording that came back
+// off the wrong language or the wrong model can be re-run in place.
+describe("the transcript panel's re-transcribe control", () => {
+  const TRANSCRIPT = "Speaker 1: so where did we land\nSpeaker 2: friday";
+
+  it("re-runs every take that still has its audio, not just the pending ones", async () => {
+    const transcribe = vi.fn(() => null);
+    const { user } = await openTranscriptPanel(
+      // Already transcribed — this is the whole point of the control.
+      [session({ canTranscribe: false, canRetranscribe: true })],
+      { transcribe_note: transcribe },
+      { transcript: TRANSCRIPT },
+    );
+
+    await user.click(await screen.findByRole("button", { name: /^re-transcribe$/i }));
+
+    expect(transcribe).toHaveBeenCalledWith({ noteId: "n1", scope: "all" });
+  });
+
+  it("stays hidden when no take has its raw streams left", async () => {
+    await openTranscriptPanel(
+      [session({ canRetranscribe: false })],
+      {},
+      { transcript: TRANSCRIPT },
+    );
+    await screen.findByRole("button", { name: /^copy transcript$/i });
+    expect(retranscribeButton()).not.toBeInTheDocument();
+  });
+
+  // It replaces text the note already has, and a viewer's write would be
+  // rejected by the server anyway.
+  it("stays hidden on a read-only note", async () => {
+    // `readOnly` comes off cloud status, not the note row: a workspace whose
+    // plan isn't live locks its notes for everyone.
+    const ws = { id: "w1", name: "Acme", role: "member" as const, plan_status: "none" as const };
+    await openTranscriptPanel(
+      [session({ canRetranscribe: true })],
+      {
+        cloud_status: () => ({
+          configured: true,
+          logged_in: true,
+          base_url: "https://sync.humla.team",
+          user: { id: "u1", email: "m@example.no", name: "Michael", verified: true },
+          current_workspace: ws,
+          workspaces: [ws],
+          billing_enabled: true,
+          seat_price_cents: 500,
+          seat_currency: "usd",
+        }),
+        cloud_workspace_members: () => [
+          { id: "u1", email: "m@example.no", name: "Michael", role: "member" },
+        ],
+      },
+      { transcript: TRANSCRIPT, workspace_id: "w1" },
+    );
+    // Copy is still there — reading is what read-only allows.
+    await screen.findByRole("button", { name: /^copy transcript$/i });
+    expect(retranscribeButton()).not.toBeInTheDocument();
+  });
+
+  // A note whose take was never transcribed has no transcript to copy, but the
+  // control still belongs there — the panel is where the language and speaker
+  // count that the run uses are set.
+  it("shows without a transcript, where Copy cannot", async () => {
+    await openTranscriptPanel([session({ canTranscribe: true, canRetranscribe: true })]);
+    expect(await screen.findByRole("button", { name: /^re-transcribe$/i })).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /^copy transcript$/i }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("is disabled while a run is in flight on this note", async () => {
+    await openTranscriptPanel(
+      [session({ canRetranscribe: true })],
+      {},
+      { transcript: TRANSCRIPT },
+    );
+    await screen.findByRole("button", { name: /^re-transcribe$/i });
+
+    act(() => useRecordingStore.getState().setTranscribing("n1", true));
+
+    await waitFor(() => expect(retranscribeButton()).toBeDisabled());
   });
 });
