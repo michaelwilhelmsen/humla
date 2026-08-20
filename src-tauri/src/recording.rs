@@ -148,6 +148,130 @@ pub struct ChunkRecord {
     pub detected_language: Option<String>,
 }
 
+
+/// What happens to each chunk a capture produces — the one axis on which live
+/// recording, a "Transcribe manually" capture and a deferred replay differ.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SinkMode {
+    /// The live capture slot. Each finished chunk appends to `note.transcript`
+    /// and emits `transcript_replaced`, so the user watches the transcript
+    /// build — skipped once the slot no longer belongs to that note, since the
+    /// post-stop rewrite is about to land.
+    #[default]
+    Live,
+    /// A capture that never reaches a provider as it runs: the "Transcribe
+    /// manually" setting (#146). The audio is still chunked and written, and
+    /// the take's full streams are still retained — nothing is transcribed
+    /// until the note's Transcribe action asks for it.
+    Deferred,
+    /// A deferred replay of one already-recorded take's retained audio (#146).
+    /// Chunks accumulate in this sink's own log and the note's transcript is
+    /// left alone until the diarize pass rebuilds it from every session's
+    /// timeline (ADR-0004) — so a replay that dies half-way leaves no text
+    /// behind that no timeline accounts for.
+    ///
+    /// `source` re-tags every chunk the sidecar reports. Its `--import` mode
+    /// always writes through the mic writers, and a replay covers one retained
+    /// stream at a time, so the source is the caller's knowledge rather than
+    /// the sidecar's.
+    Replay { source: ChunkSource },
+}
+
+/// Where one capture's chunks go, and how they get there.
+///
+/// Live recording and a deferred replay run the *same* chunk pipeline. They
+/// differ only in whose rolling context a chunk decodes against, which log it
+/// lands in, and whether the note's transcript moves as it goes. Holding that
+/// in one shared value is what lets a deferred replay run without occupying
+/// the single live-capture slot — the thing that would otherwise block the
+/// user from starting a new recording while an hour of audio transcribes.
+#[derive(Clone)]
+pub struct CaptureSink {
+    // Per-source rolling context windows of the last ~150 committed words.
+    // Fed to Whisper's `initial_prompt` for every chunk so decoding stays
+    // anchored to its own stream rather than mixing the user's side with
+    // the remote side's vocabulary, which would harm proper-noun spelling
+    // and pull each Whisper invocation toward the wrong language.
+    pub mic_trail: Arc<Mutex<TranscriptTrail>>,
+    pub sys_trail: Arc<Mutex<TranscriptTrail>>,
+    // Per-chunk metadata. Read by the offline diarization pass to align
+    // FluidAudio's speaker segments back to the chunks the user saw stream in.
+    pub chunk_log: Arc<Mutex<Vec<ChunkRecord>>>,
+    // Paths to the per-source full-recording WAV files the sidecar wrote.
+    // Consumed by the diarization pass, then deleted alongside the temp dir.
+    // Either may be `None` if its source produced no audio (mic permission
+    // denied, no system audio active for the whole recording, etc).
+    pub mic_full_wav_path: Arc<Mutex<Option<PathBuf>>>,
+    pub sys_full_wav_path: Arc<Mutex<Option<PathBuf>>>,
+    pub mode: SinkMode,
+}
+
+impl Default for CaptureSink {
+    fn default() -> Self {
+        Self::new(SinkMode::default())
+    }
+}
+
+impl CaptureSink {
+    pub fn new(mode: SinkMode) -> Self {
+        Self {
+            mic_trail: Arc::new(Mutex::new(TranscriptTrail::default())),
+            sys_trail: Arc::new(Mutex::new(TranscriptTrail::default())),
+            chunk_log: Arc::new(Mutex::new(Vec::new())),
+            mic_full_wav_path: Arc::new(Mutex::new(None)),
+            sys_full_wav_path: Arc::new(Mutex::new(None)),
+            mode,
+        }
+    }
+
+    /// The rolling context for one stream. Per-source because the mic and
+    /// system streams are separate conversations.
+    pub fn trail(&self, source: ChunkSource) -> &Arc<Mutex<TranscriptTrail>> {
+        match source {
+            ChunkSource::Mic => &self.mic_trail,
+            ChunkSource::Sys => &self.sys_trail,
+        }
+    }
+
+    /// The slot for one stream's full-recording WAV path.
+    pub fn full_wav_slot(&self, source: ChunkSource) -> &Arc<Mutex<Option<PathBuf>>> {
+        match source {
+            ChunkSource::Mic => &self.mic_full_wav_path,
+            ChunkSource::Sys => &self.sys_full_wav_path,
+        }
+    }
+
+    /// Whether arriving chunks are transcribed at all.
+    pub fn transcribes_on_arrival(&self) -> bool {
+        !matches!(self.mode, SinkMode::Deferred)
+    }
+
+    /// Whether a finished chunk streams into `note.transcript`.
+    pub fn streams_to_note(&self) -> bool {
+        matches!(self.mode, SinkMode::Live)
+    }
+
+    /// The same sink re-pointed at another retained stream. Shares the chunk
+    /// log and both trails, so one take's two streams accumulate into a single
+    /// log for the diarize pass (which has to see both to tell an in-person
+    /// meeting from a call) while each keeps its own rolling context.
+    pub fn for_stream(&self, source: ChunkSource) -> Self {
+        Self {
+            mode: SinkMode::Replay { source },
+            ..self.clone()
+        }
+    }
+
+    /// The stream a chunk belongs to: what the caller knows for a replay,
+    /// otherwise what the sidecar reported.
+    pub fn resolve_source(&self, reported: ChunkSource) -> ChunkSource {
+        match self.mode {
+            SinkMode::Replay { source } => source,
+            _ => reported,
+        }
+    }
+}
+
 /// Live in-memory state for the *currently capturing* recording — child
 /// process handles, in-flight transcribe tasks, rolling context, and the
 /// id/timestamp allocated for the persisted session this capture will
@@ -173,23 +297,11 @@ pub struct LiveCapture {
     // Handle for the stdout reader task that spawns transcribes. Awaiting
     // it guarantees no further pushes to `inflight` are coming.
     pub reader: Option<JoinHandle<()>>,
-    // Per-source rolling context windows of the last ~150 committed words.
-    // Fed to Whisper's `initial_prompt` for every chunk so decoding stays
-    // anchored to its own stream rather than mixing the user's side with
-    // the remote side's vocabulary, which would harm proper-noun spelling
-    // and pull each Whisper invocation toward the wrong language.
-    pub mic_trail: Arc<Mutex<TranscriptTrail>>,
-    pub sys_trail: Arc<Mutex<TranscriptTrail>>,
-    // Per-chunk metadata. Read by the offline diarization pass on
-    // recording_stop to align FluidAudio's speaker segments back to the
-    // chunks the user saw stream in.
-    pub chunk_log: Arc<Mutex<Vec<ChunkRecord>>>,
-    // Paths to the per-source full-recording WAV files. Consumed by the
-    // offline diarization pass on stop, then deleted alongside the temp dir.
-    // Either may be `None` if its source produced no audio (mic permission
-    // denied, no system audio active for the whole recording, etc).
-    pub mic_full_wav_path: Arc<Mutex<Option<PathBuf>>>,
-    pub sys_full_wav_path: Arc<Mutex<Option<PathBuf>>>,
+    // This capture's chunk destination: rolling context, chunk log, full-WAV
+    // paths, and what happens to each chunk as it lands. Replaced (not
+    // cleared) at the start of every capture, so a straggler chunk from the
+    // previous one can't push into the next one's log.
+    pub sink: Arc<CaptureSink>,
     // Snapshot of the note's transcript at recording_start. Used by the
     // offline diarization step to prepend prior content to this session's
     // diarized output, so resuming a recording adds to the transcript
@@ -267,6 +379,18 @@ pub struct SummaryStatusPayload {
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TitleStatusPayload {
+    pub note_id: String,
+    pub active: bool,
+}
+
+/// Per-note deferred-transcription lifecycle (#146), on its own channel for
+/// the same reason `summary_status` has one: a replay on note A must not touch
+/// note B's state, and — unlike a live capture — it must not reach
+/// `recording_status` at all, since a recording may be running on another note
+/// the whole time.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TranscribeStatusPayload {
     pub note_id: String,
     pub active: bool,
 }
@@ -424,5 +548,87 @@ mod tests {
             SidecarEvent::Diagnostic { message } => assert_eq!(message, "device changed"),
             _ => panic!("expected Diagnostic variant"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // CaptureSink (#146)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn live_capture_transcribes_and_streams() {
+        let sink = CaptureSink::new(SinkMode::Live);
+        assert!(sink.transcribes_on_arrival());
+        assert!(sink.streams_to_note());
+    }
+
+    #[test]
+    fn a_deferred_capture_transcribes_nothing() {
+        // The whole point: chunks are written and never dispatched, so the Mac
+        // stays quiet for the length of the meeting.
+        let sink = CaptureSink::new(SinkMode::Deferred);
+        assert!(!sink.transcribes_on_arrival());
+        assert!(!sink.streams_to_note());
+    }
+
+    #[test]
+    fn a_replay_transcribes_without_touching_the_transcript() {
+        // Its text reaches the note once, from the timeline rebuild — so a
+        // replay that dies half-way leaves no text behind that no timeline
+        // accounts for (ADR-0004).
+        let sink = CaptureSink::new(SinkMode::Replay {
+            source: ChunkSource::Mic,
+        });
+        assert!(sink.transcribes_on_arrival());
+        assert!(!sink.streams_to_note());
+    }
+
+    #[test]
+    fn a_replay_overrides_the_source_the_sidecar_reported() {
+        // The sidecar's `--import` mode writes through its mic writers whatever
+        // it is fed, so a replay of a retained `sys.wav` would otherwise land
+        // every chunk on the mic side and make a call look in-person.
+        let sink = CaptureSink::new(SinkMode::Replay {
+            source: ChunkSource::Sys,
+        });
+        assert_eq!(sink.resolve_source(ChunkSource::Mic), ChunkSource::Sys);
+        // A live capture trusts the event — the two streams are real there.
+        let live = CaptureSink::new(SinkMode::Live);
+        assert_eq!(live.resolve_source(ChunkSource::Sys), ChunkSource::Sys);
+        assert_eq!(live.resolve_source(ChunkSource::Mic), ChunkSource::Mic);
+    }
+
+    #[test]
+    fn for_stream_shares_one_chunk_log_across_a_takes_two_streams() {
+        // Both retained streams of one take have to accumulate into a single
+        // log: the diarize pass reads mic-vs-sys presence to tell an in-person
+        // meeting from a call, and two separate logs would make every take
+        // look single-stream.
+        let base = CaptureSink::new(SinkMode::Replay {
+            source: ChunkSource::Mic,
+        });
+        let mic = base.for_stream(ChunkSource::Mic);
+        let sys = base.for_stream(ChunkSource::Sys);
+        mic.chunk_log.lock().push(ChunkRecord {
+            source: ChunkSource::Mic,
+            start_ms: 0,
+            text: "hei".into(),
+            words: vec![],
+            detected_language: None,
+        });
+        sys.chunk_log.lock().push(ChunkRecord {
+            source: ChunkSource::Sys,
+            start_ms: 10,
+            text: "hallo".into(),
+            words: vec![],
+            detected_language: None,
+        });
+        assert_eq!(base.chunk_log.lock().len(), 2);
+        // Trails stay per-source, though: each stream is its own conversation.
+        mic.trail(ChunkSource::Mic).lock().push("hei");
+        assert_eq!(sys.trail(ChunkSource::Sys).lock().as_prompt(), None);
+        assert_eq!(
+            base.trail(ChunkSource::Mic).lock().as_prompt(),
+            Some("hei".to_string())
+        );
     }
 }

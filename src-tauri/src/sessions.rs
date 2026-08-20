@@ -72,6 +72,39 @@ pub struct SessionEntry {
     /// Which streams produced content, e.g. `["mic"]` or `["mic","sys"]`.
     #[serde(default)]
     pub streams: Vec<String>,
+    /// Whether this take's audio has been through the transcription provider
+    /// yet (#146). `true` for every take recorded the ordinary way — the text
+    /// landed chunk by chunk as the meeting ran. `false` only for a take
+    /// captured with **Transcribe manually** on, which holds its retained
+    /// audio and waits for the note's Transcribe action.
+    ///
+    /// Defaults to `true`, which is what makes it safe to add to a manifest
+    /// that already exists: an entry written before this field did *was*
+    /// transcribed, and reading it back as untranscribed would offer to
+    /// re-transcribe (and so re-diarize, re-number and rewrite) every take on
+    /// every note in the library.
+    #[serde(default = "default_transcribed")]
+    pub transcribed: bool,
+}
+
+fn default_transcribed() -> bool {
+    true
+}
+
+/// Whether a take being appended to the manifest already has its text (#146).
+/// A named pair rather than a trailing `bool`, so `append_session(…, No)` reads
+/// as what it is at the call site — the rest of this change spends enums
+/// (`SinkMode`, `LabelFallback`) on exactly this kind of distinction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Transcribed {
+    Yes,
+    No,
+}
+
+impl Transcribed {
+    fn as_bool(self) -> bool {
+        matches!(self, Transcribed::Yes)
+    }
 }
 
 /// The ordered manifest persisted at `recordings/<note_id>/sessions.json`.
@@ -235,6 +268,9 @@ pub fn resolve_sessions(recordings_dir: &Path) -> Vec<(SessionEntry, PathBuf)> {
             started_at: String::new(),
             duration_ms: 0,
             streams: flat_streams(recordings_dir),
+            // A pre-feature flat note predates deferred transcription, so its
+            // one take is transcribed by construction.
+            transcribed: true,
         };
         return vec![(entry, recordings_dir.to_path_buf())];
     }
@@ -294,6 +330,7 @@ pub fn migrate_flat_if_needed(recordings_dir: &Path, legacy_id: &str) -> std::io
             started_at: String::new(),
             duration_ms: 0,
             streams,
+            transcribed: true,
         }],
     };
     write_manifest(recordings_dir, &manifest)?;
@@ -309,6 +346,7 @@ pub fn append_session(
     started_at: &str,
     duration_ms: u64,
     streams: Vec<String>,
+    transcribed: Transcribed,
 ) -> std::io::Result<u32> {
     let mut manifest = read_manifest(recordings_dir).unwrap_or_else(SessionsManifest::empty);
     let index = manifest.sessions.iter().map(|e| e.index).max().unwrap_or(0) + 1;
@@ -318,9 +356,48 @@ pub fn append_session(
         started_at: started_at.to_string(),
         duration_ms,
         streams,
+        transcribed: transcribed.as_bool(),
     });
     write_manifest(recordings_dir, &manifest)?;
     Ok(index)
+}
+
+/// Flip one session's [`SessionEntry::transcribed`] to `true` (#146). Returns
+/// `false` when the note has no manifest entry with that id — the caller has
+/// nothing to correct, and writing a fresh entry here would invent a take.
+///
+/// Deliberately *not* a general "set" with a bool: transcription is one-way.
+/// A take whose text is in the note can't be made untranscribed again without
+/// also unwinding the transcript, the timeline and the speaker numbering, and
+/// nothing in the product asks for that.
+pub fn mark_session_transcribed(recordings_dir: &Path, session_id: &str) -> std::io::Result<bool> {
+    let Some(mut manifest) = read_manifest(recordings_dir) else {
+        return Ok(false);
+    };
+    let Some(entry) = manifest.sessions.iter_mut().find(|e| e.id == session_id) else {
+        return Ok(false);
+    };
+    if entry.transcribed {
+        return Ok(true); // already there; don't rewrite the file for nothing
+    }
+    entry.transcribed = true;
+    write_manifest(recordings_dir, &manifest)?;
+    Ok(true)
+}
+
+/// A note's takes that still hold untranscribed audio, in recording order
+/// (#146). The order is the whole point: each take's timeline is written with a
+/// speaker-number offset taken from the takes *before* it, so transcribing them
+/// out of order would number the later ones off a still-empty predecessor.
+///
+/// The legacy flat pseudo-session can never appear here (it reads back
+/// `transcribed: true`), so no caller has to special-case a session id that
+/// resolves to the note's whole recordings dir.
+pub fn untranscribed_sessions(recordings_dir: &Path) -> Vec<(SessionEntry, PathBuf)> {
+    resolve_sessions(recordings_dir)
+        .into_iter()
+        .filter(|(e, _)| !e.transcribed)
+        .collect()
 }
 
 /// Number of sessions already recorded (manifest entries, or 1 for a legacy
@@ -530,6 +607,30 @@ pub fn retain_audio(keep_setting: Option<&str>) -> bool {
     }
 }
 
+/// The shipped default for `transcribe_manually`: off. Mirrored by the
+/// frontend's `settings/types.ts` default.
+const TRANSCRIBE_MANUALLY_DEFAULT: bool = false;
+
+/// Whether a recording starting *now* should skip live transcription and wait
+/// for the note's Transcribe action (#146).
+///
+/// **`keep_audio` is the outer gate, and stays so.** Deferring transcription
+/// means the meeting exists only as audio until the user asks for it, so on a
+/// device that stores no audio (#24) the setting could only ever destroy the
+/// recording. Rather than force-retaining behind the user's back — the class of
+/// exception #24 exists to remove, and which `retain_audio` names — the whole
+/// feature is inert while retention is off. Settings does the same thing
+/// visually: the toggle isn't shown until "Keep recorded audio" is on.
+pub fn defer_transcription(manual_setting: Option<&str>, keep_audio: bool) -> bool {
+    if !keep_audio {
+        return false;
+    }
+    match manual_setting {
+        Some(v) => v == "true",
+        None => TRANSCRIBE_MANUALLY_DEFAULT,
+    }
+}
+
 /// Which of a teammate's session assets this device should fetch (#24). The
 /// rule is *device-scoped*: a Mac with `keep_audio` off doesn't download
 /// someone else's recording either, so the setting describes the machine
@@ -647,6 +748,20 @@ pub fn stored_audio_totals(recordings_root: &Path) -> StoredAudioTotals {
 /// failing (a provider outage, a revoked key) looks identical to silence from
 /// here, and deleting a recording the user could still play or re-diarize is
 /// not a recoverable mistake.
+/// Whether this take still holds the audio a deferred transcription would
+/// *replay* (#146): one of the raw per-source streams.
+///
+/// Deliberately not [`session_has_audio`], which counts any `.wav` — including
+/// the mixed `playback.wav`. That is the right question for "is there a
+/// recording of this meeting on disk" (what #24's sweep answers) and the wrong
+/// one here: `transcribe_pending_takes` replays `mic.wav` / `sys.wav`, so a
+/// take reduced to its playback mix would offer a Transcribe button that
+/// silently does nothing. A mixdown is also not a substitute — the two streams
+/// are kept separate end-to-end precisely so each is diarized on its own.
+pub fn session_has_replayable_audio(session_dir: &Path) -> bool {
+    session_dir.join("mic.wav").exists() || session_dir.join("sys.wav").exists()
+}
+
 pub fn session_has_audio(session_dir: &Path) -> bool {
     !stored_audio_files(session_dir).is_empty()
 }
@@ -721,6 +836,12 @@ pub fn reconcile_manifest(
             by_id.remove(&r.client_id);
             continue;
         }
+        // `transcribed` is a *local* fact — whether this device has run this
+        // take's retained audio through a provider (#146) — and the server
+        // carries no field for it. Preserve whatever the local entry said, and
+        // treat a session arriving for the first time as transcribed: its text
+        // came down with the note, and this device holds no audio to replay.
+        let transcribed = by_id.get(&r.client_id).map_or(true, |e| e.transcribed);
         by_id.insert(
             r.client_id.clone(),
             SessionEntry {
@@ -729,6 +850,7 @@ pub fn reconcile_manifest(
                 started_at: ms_to_started_at(r.started_at_ms),
                 duration_ms: r.duration_ms,
                 streams: r.streams.clone(),
+                transcribed,
             },
         );
     }
@@ -796,13 +918,14 @@ mod tests {
             started_at: String::new(),
             duration_ms: 0,
             streams: Vec::new(),
+            transcribed: true,
         });
         write_manifest(&rec, &manifest).unwrap();
 
         let ids: Vec<String> = resolve_sessions(&rec).into_iter().map(|(e, _)| e.id).collect();
         assert_eq!(ids, vec!["repair", "take-1"]);
         // And the next real recording still numbers itself past both.
-        assert_eq!(append_session(&rec, "take-2", "", 0, vec![]).unwrap(), 2);
+        assert_eq!(append_session(&rec, "take-2", "", 0, vec![], Transcribed::Yes).unwrap(), 2);
     }
 
     #[test]
@@ -836,7 +959,7 @@ mod tests {
     fn uuid_write_dir_matches_read_dir() {
         let tmp = TempDir::new().unwrap();
         let rec = recordings_dir(tmp.path(), "note1");
-        append_session(&rec, "uuid-a", "", 0, vec!["mic".into()]).unwrap();
+        append_session(&rec, "uuid-a", "", 0, vec!["mic".into()], Transcribed::Yes).unwrap();
         let read_dir = resolve_session_dir(&rec, "uuid-a").unwrap();
         let write_dir = session_write_dir(&rec, "uuid-a");
         assert_eq!(write_dir, read_dir);
@@ -881,6 +1004,7 @@ mod tests {
             started_at: String::new(),
             duration_ms: 0,
             streams: vec![],
+            transcribed: true,
         });
         write_manifest(&rec, &m).unwrap();
 
@@ -906,8 +1030,8 @@ mod tests {
         // parses a whole file, and no stale temp lingers.
         let tmp = TempDir::new().unwrap();
         let rec = recordings_dir(tmp.path(), "note1");
-        append_session(&rec, "uuid-a", "", 0, vec![]).unwrap();
-        append_session(&rec, "uuid-b", "", 0, vec![]).unwrap();
+        append_session(&rec, "uuid-a", "", 0, vec![], Transcribed::Yes).unwrap();
+        append_session(&rec, "uuid-b", "", 0, vec![], Transcribed::Yes).unwrap();
         let back = read_manifest(&rec).unwrap();
         assert_eq!(back.sessions.len(), 2);
         assert!(!rec.join(format!("{MANIFEST_FILE}.tmp")).exists());
@@ -929,14 +1053,16 @@ mod tests {
     fn append_creates_manifest_and_indexes_sequentially() {
         let tmp = TempDir::new().unwrap();
         let rec = recordings_dir(tmp.path(), "note1");
-        let i1 = append_session(&rec, "uuid-a", "2026-07-09T10:00:00Z", 1000, vec!["mic".into()])
-            .unwrap();
+        let i1 =
+            append_session(&rec, "uuid-a", "2026-07-09T10:00:00Z", 1000, vec!["mic".into()], Transcribed::Yes)
+                .unwrap();
         let i2 = append_session(
             &rec,
             "uuid-b",
             "2026-07-09T11:00:00Z",
             2000,
             vec!["mic".into(), "sys".into()],
+            Transcribed::Yes,
         )
         .unwrap();
         assert_eq!(i1, 1);
@@ -964,6 +1090,7 @@ mod tests {
                     started_at: String::new(),
                     duration_ms: 0,
                     streams: vec![],
+                    transcribed: true,
                 },
                 SessionEntry {
                     id: "first".into(),
@@ -971,6 +1098,7 @@ mod tests {
                     started_at: String::new(),
                     duration_ms: 0,
                     streams: vec![],
+                    transcribed: true,
                 },
             ],
         };
@@ -987,7 +1115,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let rec = recordings_dir(tmp.path(), "note1");
         touch(&rec.join("playback.wav")); // stray flat file
-        append_session(&rec, "uuid-a", "", 0, vec!["mic".into()]).unwrap();
+        append_session(&rec, "uuid-a", "", 0, vec!["mic".into()], Transcribed::Yes).unwrap();
         let sessions = resolve_sessions(&rec);
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].0.id, "uuid-a");
@@ -1023,7 +1151,7 @@ mod tests {
     fn migrate_is_noop_when_manifest_present() {
         let tmp = TempDir::new().unwrap();
         let rec = recordings_dir(tmp.path(), "note1");
-        append_session(&rec, "uuid-a", "", 0, vec!["mic".into()]).unwrap();
+        append_session(&rec, "uuid-a", "", 0, vec!["mic".into()], Transcribed::Yes).unwrap();
         let migrated = migrate_flat_if_needed(&rec, "legacy-uuid").unwrap();
         assert!(!migrated);
         assert!(!session_dir(&rec, "legacy-uuid").exists());
@@ -1048,8 +1176,9 @@ mod tests {
         touch(&rec.join("timeline.jsonl"));
 
         migrate_flat_if_needed(&rec, "legacy-uuid").unwrap();
-        let idx = append_session(&rec, "uuid-2", "2026-07-09T12:00:00Z", 5000, vec!["mic".into()])
-            .unwrap();
+        let idx =
+            append_session(&rec, "uuid-2", "2026-07-09T12:00:00Z", 5000, vec!["mic".into()], Transcribed::Yes)
+                .unwrap();
         assert_eq!(idx, 2);
         let sessions = resolve_sessions(&rec);
         assert_eq!(sessions.len(), 2);
@@ -1065,8 +1194,8 @@ mod tests {
         // download target).
         assert_eq!(latest_session_dir(&rec), rec);
 
-        append_session(&rec, "uuid-a", "", 0, vec![]).unwrap();
-        append_session(&rec, "uuid-b", "", 0, vec![]).unwrap();
+        append_session(&rec, "uuid-a", "", 0, vec![], Transcribed::Yes).unwrap();
+        append_session(&rec, "uuid-b", "", 0, vec![], Transcribed::Yes).unwrap();
         assert_eq!(latest_session_dir(&rec), session_dir(&rec, "uuid-b"));
     }
 
@@ -1225,6 +1354,7 @@ mod tests {
             started_at: String::new(),
             duration_ms: 0,
             streams: vec![],
+            transcribed: true,
         });
         let after = reconcile_manifest(Some(existing), &[meta("remote", 2, false)]);
         let ids: Vec<&str> = after.sessions.iter().map(|e| e.id.as_str()).collect();
@@ -1241,6 +1371,7 @@ mod tests {
             started_at: String::new(),
             duration_ms: 0,
             streams: vec![],
+            transcribed: true,
         });
         let after = reconcile_manifest(Some(existing), &[meta("a", 1, false)]);
         assert_eq!(after.sessions.len(), 1);
@@ -1292,6 +1423,7 @@ mod tests {
             started_at: String::new(),
             duration_ms: 0,
             streams: vec![],
+            transcribed: true,
         });
         let after = reconcile_manifest(Some(existing), &[meta("safe", 2, false)]);
         let ids: Vec<&str> = after.sessions.iter().map(|e| e.id.as_str()).collect();
@@ -1309,6 +1441,7 @@ mod tests {
             started_at: String::new(),
             duration_ms: 0,
             streams: vec![],
+            transcribed: true,
         });
         manifest.sessions.push(SessionEntry {
             id: "550e8400-e29b-41d4-a716-446655440000".into(),
@@ -1316,6 +1449,7 @@ mod tests {
             started_at: String::new(),
             duration_ms: 0,
             streams: vec![],
+            transcribed: true,
         });
         write_manifest(&rec, &manifest).unwrap();
 
@@ -1337,6 +1471,7 @@ mod tests {
             started_at: String::new(),
             duration_ms: 0,
             streams: vec![],
+            transcribed: true,
         });
         write_manifest(&rec, &manifest).unwrap();
         // note_session_playback_path feeds a frontend id through here; a poisoned
@@ -1403,6 +1538,7 @@ mod tests {
                 started_at: String::new(),
                 duration_ms: 0,
                 streams: vec![],
+                transcribed: true,
             });
         }
         write_manifest(&rec, &manifest).unwrap();
@@ -1432,6 +1568,7 @@ mod tests {
             started_at: String::new(),
             duration_ms: 0,
             streams: vec![],
+            transcribed: true,
         });
         write_manifest(&rec, &manifest).unwrap();
         // Neither of these is reachable through resolve_sessions.
@@ -1510,5 +1647,154 @@ mod tests {
         assert!(rec.join("chunks.json").exists());
         // Idempotent: a second pass has nothing left to remove.
         assert_eq!(delete_stored_audio(&rec), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Deferred transcription (#146)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn manifest_written_before_the_field_reads_back_as_transcribed() {
+        // The upgrade case, and the one that matters most: every take in every
+        // existing library predates `transcribed`. Reading them back as
+        // untranscribed would offer to re-transcribe (and so re-diarize and
+        // re-number) the whole library.
+        let tmp = TempDir::new().unwrap();
+        let rec = recordings_dir(tmp.path(), "note1");
+        fs::create_dir_all(&rec).unwrap();
+        fs::write(
+            manifest_path(&rec),
+            r#"{"version":1,"sessions":[{"id":"uuid-a","index":1,"startedAt":"","durationMs":0,"streams":["mic"]}]}"#,
+        )
+        .unwrap();
+        let sessions = resolve_sessions(&rec);
+        assert_eq!(sessions.len(), 1);
+        assert!(sessions[0].0.transcribed);
+        assert!(untranscribed_sessions(&rec).is_empty());
+    }
+
+    #[test]
+    fn append_records_an_untranscribed_take_and_resolve_round_trips_it() {
+        let tmp = TempDir::new().unwrap();
+        let rec = recordings_dir(tmp.path(), "note1");
+        append_session(&rec, "uuid-a", "", 0, vec!["mic".into()], Transcribed::No).unwrap();
+        // Survives the JSON round-trip, not just the in-memory struct.
+        let pending = untranscribed_sessions(&rec);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].0.id, "uuid-a");
+        assert_eq!(pending[0].1, session_dir(&rec, "uuid-a"));
+    }
+
+    #[test]
+    fn untranscribed_sessions_come_back_in_recording_order() {
+        // Each take's timeline is numbered off the takes before it, so the
+        // deferred pass has to walk them oldest-first.
+        let tmp = TempDir::new().unwrap();
+        let rec = recordings_dir(tmp.path(), "note1");
+        append_session(&rec, "take-1", "", 0, vec![], Transcribed::No).unwrap();
+        append_session(&rec, "take-2", "", 0, vec![], Transcribed::Yes).unwrap();
+        append_session(&rec, "take-3", "", 0, vec![], Transcribed::No).unwrap();
+        let ids: Vec<String> = untranscribed_sessions(&rec)
+            .into_iter()
+            .map(|(e, _)| e.id)
+            .collect();
+        assert_eq!(ids, vec!["take-1".to_string(), "take-3".to_string()]);
+    }
+
+    #[test]
+    fn mark_transcribed_clears_one_take_and_leaves_the_others() {
+        let tmp = TempDir::new().unwrap();
+        let rec = recordings_dir(tmp.path(), "note1");
+        append_session(&rec, "take-1", "", 0, vec![], Transcribed::No).unwrap();
+        append_session(&rec, "take-2", "", 0, vec![], Transcribed::No).unwrap();
+        assert!(mark_session_transcribed(&rec, "take-1").unwrap());
+        let ids: Vec<String> = untranscribed_sessions(&rec)
+            .into_iter()
+            .map(|(e, _)| e.id)
+            .collect();
+        assert_eq!(ids, vec!["take-2".to_string()]);
+        // Idempotent, and honest about an id the manifest doesn't hold.
+        assert!(mark_session_transcribed(&rec, "take-1").unwrap());
+        assert!(!mark_session_transcribed(&rec, "nope").unwrap());
+    }
+
+    #[test]
+    fn mark_transcribed_reports_false_with_no_manifest() {
+        // A legacy flat note has no manifest to correct. Inventing an entry
+        // here would hide the flat take behind a manifest that doesn't
+        // describe it.
+        let tmp = TempDir::new().unwrap();
+        let rec = recordings_dir(tmp.path(), "note1");
+        touch(&rec.join("playback.wav"));
+        assert!(!mark_session_transcribed(&rec, LEGACY_SESSION_ID).unwrap());
+        assert!(read_manifest(&rec).is_none());
+    }
+
+    #[test]
+    fn legacy_flat_session_is_never_offered_for_transcription() {
+        let tmp = TempDir::new().unwrap();
+        let rec = recordings_dir(tmp.path(), "note1");
+        touch(&rec.join("playback.wav"));
+        touch(&rec.join("mic.wav"));
+        assert_eq!(resolve_sessions(&rec).len(), 1);
+        assert!(untranscribed_sessions(&rec).is_empty());
+    }
+
+    #[test]
+    fn reconcile_keeps_a_local_takes_untranscribed_flag() {
+        // The server has no field for it, so a cloud pull that rewrites the
+        // entry must not silently declare the take transcribed — the audio
+        // would stay on disk with no way left to ask for its text.
+        let mut existing = SessionsManifest::empty();
+        existing.sessions.push(SessionEntry {
+            id: "a".into(),
+            index: 1,
+            started_at: String::new(),
+            duration_ms: 0,
+            streams: vec![],
+            transcribed: false,
+        });
+        let after = reconcile_manifest(Some(existing), &[meta("a", 1, false)]);
+        assert_eq!(after.sessions.len(), 1);
+        assert!(!after.sessions[0].transcribed);
+    }
+
+    #[test]
+    fn reconcile_treats_a_newly_arriving_remote_session_as_transcribed() {
+        // A teammate's take: its text arrived with the note, and this device
+        // has no audio to replay even if it wanted to.
+        let after = reconcile_manifest(None, &[meta("remote", 1, false)]);
+        assert!(after.sessions[0].transcribed);
+    }
+
+    #[test]
+    fn defer_transcription_needs_both_the_setting_and_retention() {
+        // The feature is inert while `keep_audio` is off — deferring there
+        // would mean discarding the meeting (#24 stays the outer gate).
+        assert!(defer_transcription(Some("true"), true));
+        assert!(!defer_transcription(Some("true"), false));
+        assert!(!defer_transcription(Some("false"), true));
+        // Unset defaults off, whatever retention says.
+        assert!(!defer_transcription(None, true));
+        // Anything that isn't the literal "true" is off, matching how every
+        // other boolean setting is read.
+        assert!(!defer_transcription(Some("yes"), true));
+    }
+
+    #[test]
+    fn only_the_raw_streams_count_as_replayable() {
+        // #146: a take reduced to its mixed playback.wav can't be replayed —
+        // the deferred pass reads mic.wav / sys.wav, and the two streams are
+        // kept separate end-to-end so each is diarized on its own. Offering
+        // Transcribe for it would be a button that silently does nothing.
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("s1");
+        touch(&dir.join("playback.wav"));
+        touch(&dir.join("timeline.jsonl"));
+        assert!(session_has_audio(&dir), "playback.wav is still audio on disk");
+        assert!(!session_has_replayable_audio(&dir));
+
+        touch(&dir.join("sys.wav"));
+        assert!(session_has_replayable_audio(&dir));
     }
 }

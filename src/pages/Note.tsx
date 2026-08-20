@@ -117,6 +117,21 @@ async function runSummarize(noteId: string, onFailure?: () => void) {
   }
 }
 
+/** Kick off a deferred transcription (#146), surfacing failures as a toast.
+ *
+ * Nothing local to track: the backend brackets the whole replay with
+ * `transcribe_status`, and the button reads that. The catch is still needed —
+ * the command refuses outright when the note is recording, and an unhandled
+ * rejection there would look like a button that did nothing.
+ */
+async function runTranscribe(noteId: string) {
+  try {
+    await ipc.transcribeNote(noteId);
+  } catch (e) {
+    useRecordingStore.getState().pushError({ noteId, message: String(e) });
+  }
+}
+
 /** How long the body has to sit still before #90's typed-note titler fires.
  *
  * Long enough that it reads as "the user stopped writing", not "the user paused
@@ -430,6 +445,17 @@ export function Note() {
   // from ⋯ → Regenerate title; the backend brackets both with the same event,
   // so there is nothing local to keep in step.
   const isTitling = useRecordingStore((s) => !!draft && !!s.titling[draft.id]);
+  // A deferred transcription is replaying this note's retained audio (#146).
+  // Its own channel, like summary and title: a live recording on another note
+  // may be running the whole time, and this must not read as one.
+  const isTranscribing = useRecordingStore(
+    (s) => !!draft && !!s.transcribing[draft.id],
+  );
+  // Takes captured with "Transcribe manually" on that still hold their audio
+  // (#146). The backend decides both halves — untranscribed AND audio still on
+  // disk — so a take whose audio was swept away never offers an action that
+  // can only fail.
+  const pendingTranscription = sessions.some((sess) => sess.canTranscribe);
   const isThisNoteActive = !!draft && recPhase.noteId === draft.id;
   const isRecording = isThisNoteActive && recPhase.phase === "recording";
   const isPaused = isThisNoteActive && recPhase.phase === "paused";
@@ -757,7 +783,13 @@ export function Note() {
     // keepAudio is a dep so turning retention back on fetches a shared note's
     // audio right away (#24) rather than on the next open. The backend enforces
     // the rule; this only decides when to ask again.
-  }, [draft?.id, draft?.workspace_id, recPhase.phase, keepAudio]);
+    //
+    // isTranscribing is a dep for the same reason recPhase.phase is (#146): a
+    // deferred transcription writes this note's timeline and flips its take to
+    // transcribed, and it deliberately never touches the recording phase — so
+    // without this the reader would keep rendering the pre-transcription
+    // sessions until the user navigated away and back.
+  }, [draft?.id, draft?.workspace_id, recPhase.phase, keepAudio, isTranscribing]);
 
   // patch / patchProvider intentionally read from `draftRef.current`
   // rather than the `draft` closure so they can stay stable across
@@ -960,6 +992,8 @@ export function Note() {
           onTogglePanel={() => setPanelOpen((v) => !v)}
           onSummarizeFailed={clearSummaryStream}
           onRegenerateTitle={regenerateTitle}
+          pendingTranscription={pendingTranscription}
+          isTranscribing={isTranscribing}
           sidebarCollapsed={sidebarCollapsed}
         />
         <div className="flex-1 overflow-y-auto">
@@ -1491,12 +1525,20 @@ export function Note() {
                     )}
                     {isRecording && <SkeletonLines lines={2} className="mt-3 shrink-0" />}
                   </>
-                ) : recActive ? (
+                ) : recActive || isTranscribing ? (
                   <SkeletonLines lines={4} />
                 ) : (
                   <PanelEmpty
                     icon={<MessageSquare size={22} strokeWidth={1.5} />}
-                    text="No transcript yet. Start a recording from the toolbar to capture and transcribe audio."
+                    text={
+                      // #146: a note with recorded audio and no text is not the
+                      // same empty as a note with nothing recorded, and telling
+                      // the user to start a recording would be wrong advice —
+                      // the meeting is already on disk.
+                      pendingTranscription
+                        ? "This recording hasn't been transcribed yet. Use Transcribe in the toolbar to run it now."
+                        : "No transcript yet. Start a recording from the toolbar to capture and transcribe audio."
+                    }
                   />
                 )}
 
@@ -1584,6 +1626,8 @@ function NoteToolbar({
   onTogglePanel,
   onSummarizeFailed,
   onRegenerateTitle,
+  pendingTranscription,
+  isTranscribing,
   sidebarCollapsed,
 }: {
   noteId: string;
@@ -1594,6 +1638,11 @@ function NoteToolbar({
   canRecord: boolean;
   panelOpen: boolean;
   onTogglePanel: () => void;
+  // This note has a take captured with "Transcribe manually" on whose audio is
+  // still on disk (#146). The action's presence is the only signal in v1 —
+  // there is no per-take badge on the carousel.
+  pendingTranscription: boolean;
+  isTranscribing: boolean;
   // Summarize streams into the Summary panel, whose state lives in `Note` —
   // so a failure here has to reach up there to drop the partial response.
   onSummarizeFailed: () => void;
@@ -1670,6 +1719,17 @@ function NoteToolbar({
             <Circle size={10} fill="currentColor" strokeWidth={0} className="text-[var(--color-record)]" />
             <span>Record</span>
           </button>
+          {(pendingTranscription || isTranscribing) && (
+            <button
+              onClick={() => void runTranscribe(noteId)}
+              disabled={isTranscribing}
+              className="no-drag nd-btn"
+              title="Transcribe the recorded audio"
+            >
+              <FileText size={15} strokeWidth={1.6} />
+              <span>{isTranscribing ? "Transcribing…" : "Transcribe"}</span>
+            </button>
+          )}
           <button
             onClick={() => void runSummarize(noteId, onSummarizeFailed)}
             className="no-drag nd-btn nd-btn-primary"

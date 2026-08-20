@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { ipc, onRecordingDiagnostic, onRecordingError, onRecordingStatus, onSummary, onSummaryStatus, onTitleStatus, onTranscript, onTranscriptReplaced, onNotesChanged, onSyncStatus, onSyncConflict, onLocalWhisperProgress, onLocalWhisperDownloadError, type Client, type Folder, type Note, type RecordingDiagnostic, type RecordingStatus } from "./ipc";
+import { ipc, onRecordingDiagnostic, onRecordingError, onRecordingStatus, onSummary, onSummaryStatus, onTitleStatus, onTranscribeStatus, onTranscript, onTranscriptReplaced, onNotesChanged, onSyncStatus, onSyncConflict, onLocalWhisperProgress, onLocalWhisperDownloadError, type Client, type Folder, type Note, type RecordingDiagnostic, type RecordingStatus } from "./ipc";
 import { useCloudStore } from "./cloud";
 
 type NotesState = {
@@ -115,6 +115,13 @@ type RecordingState = {
   // rather than a store flag and a local state that can disagree.
   titling: Record<string, boolean>;
   setTitling: (noteId: string, active: boolean) => void;
+  // Notes with a deferred transcription replaying (#146). Its own map, not the
+  // recording `status`: the replay is per-note background work that may run
+  // while a *different* note records, so putting it on the shared channel
+  // would blank that recording's bar — the same failure the per-note summary
+  // channel exists to prevent.
+  transcribing: Record<string, boolean>;
+  setTranscribing: (noteId: string, active: boolean) => void;
   // `sticky` errors skip the auto-dismiss timer — for failures that block the
   // user's next action (e.g. Record refused because setup is incomplete),
   // where vanishing after a few seconds reads as "the button did nothing".
@@ -168,6 +175,14 @@ export const useRecordingStore = create<RecordingState>((set, get) => ({
       if (active) next[noteId] = true;
       else delete next[noteId];
       return { titling: next };
+    }),
+  transcribing: {},
+  setTranscribing: (noteId, active) =>
+    set((s) => {
+      const next = { ...s.transcribing };
+      if (active) next[noteId] = true;
+      else delete next[noteId];
+      return { transcribing: next };
     }),
   errors: [],
   pushError: (e) => {
@@ -335,6 +350,9 @@ export function bindBackendListeners() {
   });
   onSummaryStatus(({ noteId, active }) => {
     useRecordingStore.getState().setSummarizing(noteId, active);
+  });
+  onTranscribeStatus(({ noteId, active }) => {
+    useRecordingStore.getState().setTranscribing(noteId, active);
   });
   onRecordingError(({ noteId, message }) => useRecordingStore.getState().pushError({ noteId, message }));
   onRecordingDiagnostic((d) => {

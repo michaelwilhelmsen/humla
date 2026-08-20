@@ -39,6 +39,7 @@ export const DEFAULTS: Record<EditableKey, string> = {
   sortformer_silence_threshold: "0.5",
   sortformer_pred_threshold: "0.25",
   keep_audio: "false",
+  transcribe_manually: "false",
   close_to_tray: "false",
   sync_audio: "true",
   custom_vocabulary: "",

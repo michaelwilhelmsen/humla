@@ -70,6 +70,12 @@ pub struct AppState {
     /// duration of the turn and removes it after; `chat_cancel` sets it, and
     /// no-ops when the key is absent (nothing in flight to stop).
     pub chat_cancels: Arc<Mutex<std::collections::HashMap<String, Arc<chat::CancelFlag>>>>,
+    /// Notes with a deferred transcription in flight (#146). Per-note, and
+    /// deliberately *not* the single live-capture slot: replaying an hour of
+    /// retained audio must not block the user from starting a new recording,
+    /// on this note or another. Its only job is to keep a second Transcribe
+    /// press on the *same* note from replaying the same take twice.
+    pub transcribing: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -186,6 +192,7 @@ where
                 manifest_lock: Arc::new(tokio::sync::Mutex::new(())),
                 unify_locks: Arc::new(Mutex::new(std::collections::HashMap::new())),
                 chat_cancels: Arc::new(Mutex::new(std::collections::HashMap::new())),
+                transcribing: Arc::new(Mutex::new(std::collections::HashSet::new())),
             });
             let menu = build_menu(app.handle())?;
             app.set_menu(menu)?;
@@ -386,6 +393,7 @@ where
             commands::recording_resume,
             commands::recording_state,
             commands::summarize_note,
+            commands::transcribe_note,
             commands::note_generate_title,
             commands::chat_send,
             commands::chat_cancel,

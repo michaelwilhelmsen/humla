@@ -204,6 +204,7 @@ function TranscriptPlayerHarness({ disabled }: { disabled: boolean }) {
           startedAt: new Date().toISOString(),
           durationMs: 12000,
           streams: ["mic"],
+          canTranscribe: false,
           hasPlayback: false,
         },
       ]}
@@ -217,21 +218,26 @@ function TranscriptPlayerHarness({ disabled }: { disabled: boolean }) {
   );
 }
 
+// Every settings-section scenario stands its section in the same scrollable
+// column the dialog gives it. A shared wrap because a section judged in a
+// wider or narrower box than the real one is judged against the wrong layout.
+const settingsWrap: Scenario["wrap"] = (node) => (
+  <div className="flex-1 min-h-0 overflow-y-auto">
+    <div className="max-w-2xl mx-auto px-8 py-7">{node}</div>
+  </div>
+);
+
 // ---- #172 axis: the MCP integration section in Settings --------------------
 // What needs eyes here is the multi-line Codex snippet: CommandSnippet's block
 // mode wraps instead of truncating, and a config stanza next to a Copy button
 // is the one row in this section that isn't a plain control row.
 //
-// The wrapper mirrors SettingsLayout's content column (`max-w-2xl mx-auto px-8
-// py-7`) — the Section card fills its container, so a full-width wrapper would
-// stretch the snippets far past what they ever get in the real dialog.
+// `settingsWrap` mirrors SettingsLayout's content column — the Section card
+// fills its container, so a full-width wrapper would stretch the snippets far
+// past what they ever get in the real dialog.
 function integrationsCase(enabled: boolean): Scenario {
   return {
-    wrap: (node) => (
-      <div className="flex-1 min-h-0 overflow-y-auto">
-        <div className="max-w-2xl mx-auto px-8 py-7">{node}</div>
-      </div>
-    ),
+    wrap: settingsWrap,
     render: () => <IntegrationsHarness enabled={enabled} />,
     ipc: {
       mcp_server_path: () => "/Applications/Humla.app/Contents/MacOS/humla-mcp",
@@ -252,11 +258,7 @@ function IntegrationsHarness({ enabled }: { enabled: boolean }) {
 // which regime is in force rather than describing the switch.
 function menubarCase(closeToTray: boolean, hotkey: string): Scenario {
   return {
-    wrap: (node) => (
-      <div className="flex-1 min-h-0 overflow-y-auto">
-        <div className="max-w-2xl mx-auto px-8 py-7">{node}</div>
-      </div>
-    ),
+    wrap: settingsWrap,
     render: () => <MenubarHarness closeToTray={closeToTray} />,
     ipc: {
       record_hotkey_get: () => hotkey,
@@ -271,6 +273,49 @@ function MenubarHarness({ closeToTray }: { closeToTray: boolean }) {
   const [on, setOn] = useState(closeToTray ? "true" : "false");
   const s = { ...DEFAULTS, close_to_tray: on } as Record<EditableKey, string>;
   return <RecordingSection s={s} update={async (_k, v) => setOn(v)} />;
+}
+
+// ---- #146: audio retention and the "Transcribe manually" disclosure --------
+// Both toggles are LIVE here, because the thing to judge is the reveal: the
+// second row appears only once retention is on, and the section has to hold its
+// shape as it does. jsdom asserts the presence; only a real webview shows
+// whether the row lands where a row should.
+function retentionCase(keepAudio: boolean, manual: boolean): Scenario {
+  return {
+    wrap: settingsWrap,
+    render: () => <RetentionHarness keepAudio={keepAudio} manual={manual} />,
+    ipc: {
+      record_hotkey_get: () => "Command+Control+KeyR",
+      record_hotkey_set: () => null,
+      permissions_status: () => ({ microphone: "granted", screen: "granted" }),
+      stored_audio_stats: () => ({ notes: 0, files: 0, bytes: 0, noteIds: [] }),
+    },
+  };
+}
+
+function RetentionHarness({
+  keepAudio,
+  manual,
+}: {
+  keepAudio: boolean;
+  manual: boolean;
+}) {
+  const [keep, setKeep] = useState(keepAudio ? "true" : "false");
+  const [man, setMan] = useState(manual ? "true" : "false");
+  const s = {
+    ...DEFAULTS,
+    keep_audio: keep,
+    transcribe_manually: man,
+  } as Record<EditableKey, string>;
+  return (
+    <RecordingSection
+      s={s}
+      update={async (k, v) => {
+        if (k === "keep_audio") setKeep(v);
+        if (k === "transcribe_manually") setMan(v);
+      }}
+    />
+  );
 }
 
 // ---- workspace-creation axis: the sheet's five stages ----------------------
@@ -495,6 +540,12 @@ const CASES: Record<string, Scenario> = {
   menubar: menubarCase(false, "Command+Control+KeyR"),
   "menubar-on": menubarCase(true, "Command+Control+KeyR"),
   "menubar-nohotkey": menubarCase(false, ""),
+
+  // --- #146: the deferred-transcription disclosure. `retention-off` must show
+  // one row; the other two are the revealed toggle in both positions.
+  "retention-off": retentionCase(false, false),
+  "retention-on": retentionCase(true, false),
+  "retention-manual": retentionCase(true, true),
 
   // --- #172: the MCP switch, off (the default) and on (snippets revealed).
   "mcp-off": integrationsCase(false),

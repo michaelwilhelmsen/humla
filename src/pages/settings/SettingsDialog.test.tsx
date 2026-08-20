@@ -120,6 +120,49 @@ describe("settings dialog", () => {
     ).not.toBeInTheDocument();
   });
 
+  // #146: deferring transcription only makes sense when the audio survives the
+  // recording, so the toggle is *absent* until retention is on rather than
+  // present-and-disabled — a greyed switch invites the user to wonder why.
+  it("reveals Transcribe manually only once keep-audio is on", async () => {
+    const saved: Record<string, string> = {};
+    renderApp("/settings?tab=recording", {
+      settings_set: (args) => {
+        const { key, value } = args as { key: string; value: string };
+        saved[key] = value;
+        return null;
+      },
+    });
+    const dialog = await screen.findByRole("dialog", { name: /settings/i });
+    const keep = await within(dialog).findByRole("switch", {
+      name: /keep recorded audio/i,
+    });
+
+    expect(
+      within(dialog).queryByRole("switch", { name: /transcribe manually/i }),
+    ).not.toBeInTheDocument();
+
+    await userEvent.click(keep);
+
+    const manual = within(dialog).getByRole("switch", {
+      name: /transcribe manually/i,
+    });
+    // Off by default: turning retention on must not silently change how
+    // recordings are transcribed.
+    expect(manual).not.toBeChecked();
+    expect(saved.transcribe_manually).toBeUndefined();
+
+    await userEvent.click(manual);
+    expect(manual).toBeChecked();
+    expect(saved.transcribe_manually).toBe("true");
+
+    // Turning retention back off hides it again — and the backend gate means
+    // it is inert regardless of the stored value.
+    await userEvent.click(keep);
+    expect(
+      within(dialog).queryByRole("switch", { name: /transcribe manually/i }),
+    ).not.toBeInTheDocument();
+  });
+
   it("deletes stored audio for existing notes behind an inline confirm", async () => {
     let deleted = 0;
     renderApp("/settings?tab=recording", {

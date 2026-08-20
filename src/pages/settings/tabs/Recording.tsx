@@ -14,6 +14,7 @@ export function RecordingSection({
   update,
 }: Pick<SettingsHook, "s" | "update">) {
   const keeping = s.keep_audio === "true";
+  const manualTranscription = s.transcribe_manually === "true";
   const closeToTray = s.close_to_tray === "true";
   return (
     <>
@@ -44,6 +45,28 @@ export function RecordingSection({
             />
           }
         />
+        {/* Progressive disclosure, not a disabled control (#146): deferring
+            transcription only makes sense when the audio survives the
+            recording, so with retention off there is nothing here to explain
+            — and a greyed-out switch would invite the user to wonder why.
+            `keep_audio` also gates it in the backend
+            (`sessions::defer_transcription`), so turning retention off doesn't
+            silently leave a regime running that the UI no longer shows. */}
+        {keeping && (
+          <Row
+            label="Transcribe manually"
+            description="Skip transcription while recording and run it later with a Transcribe button instead. Lighter on your Mac."
+            control={
+              <Toggle
+                label="Transcribe manually"
+                checked={manualTranscription}
+                onChange={(on) =>
+                  update("transcribe_manually", on ? "true" : "false")
+                }
+              />
+            }
+          />
+        )}
         <StoredAudioCleanup />
       </Section>
 

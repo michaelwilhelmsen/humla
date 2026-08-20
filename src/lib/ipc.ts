@@ -104,6 +104,11 @@ export type SettingsKey =
   | "sortformer_silence_threshold"
   | "sortformer_pred_threshold"
   | "keep_audio"
+  // Skip transcription while recording and run it later from the note's
+  // Transcribe action (#146). Only ever in force while `keep_audio` is on —
+  // deferring on a device that stores no audio would discard the meeting — so
+  // Settings doesn't show it until retention is.
+  | "transcribe_manually"
   // Cloud/teams: upload a finished recording's audio to its workspace note
   // so teammates can play it back. Default on; only the string "false"
   // disables it on the upload path. Surfaced in the Account section.
@@ -274,6 +279,13 @@ export type NoteSession = {
   durationMs: number;
   streams: string[];
   hasPlayback: boolean;
+  // Whether pressing Transcribe would do anything for this take (#146):
+  // untranscribed AND still holding the raw streams a replay reads. The
+  // backend owns both halves so the UI never has to reason about retention
+  // rules — and there is deliberately no separate `transcribed` field, since
+  // nothing renders a per-take pending badge (out of scope in #146) and an
+  // exported field nothing reads is a surface to keep honest for nothing.
+  canTranscribe: boolean;
 };
 
 // What a "delete stored audio for existing notes" sweep would remove (#24).
@@ -365,6 +377,11 @@ export const ipc = {
     invoke<NoteSession[]>("note_sessions", { noteId }),
   noteSessionPlaybackPath: (noteId: string, sessionId: string) =>
     invoke<string | null>("note_session_playback_path", { noteId, sessionId }),
+  // Deferred transcription (#146): replay every take on this note that is
+  // still holding untranscribed audio, oldest first. Progress arrives on
+  // `transcribe_status`, not `recording_status` — a recording on another note
+  // may be running the whole time.
+  transcribeNote: (noteId: string) => invoke<void>("transcribe_note", { noteId }),
   // Cloud audio sync: upload a finished recording to its workspace, or pull a
   // shared note's audio down for local playback.
   uploadNoteAudio: (noteId: string) => invoke<void>("cloud_upload_note_audio", { noteId }),
@@ -750,6 +767,10 @@ export type SummaryStatus = { noteId: string; active: boolean };
 // A title call is in flight for this note (#90). Brackets the model call only,
 // so it never fires for a note the backend declines to title.
 export type TitleStatus = { noteId: string; active: boolean };
+// A deferred transcription is replaying this note's retained audio (#146).
+// Per-note, and never on `recording_status`: a live recording on a different
+// note may be in flight at the same time.
+export type TranscribeStatus = { noteId: string; active: boolean };
 export type RecordingDiagnostic = {
   noteId: string;
   micFrames: number;
@@ -784,6 +805,9 @@ export function onSummaryStatus(cb: (e: SummaryStatus) => void): Promise<Unliste
 }
 export function onTitleStatus(cb: (e: TitleStatus) => void): Promise<UnlistenFn> {
   return listen<TitleStatus>("title_status", (e) => cb(e.payload));
+}
+export function onTranscribeStatus(cb: (e: TranscribeStatus) => void): Promise<UnlistenFn> {
+  return listen<TranscribeStatus>("transcribe_status", (e) => cb(e.payload));
 }
 export function onRecordingError(cb: (e: RecordingError) => void): Promise<UnlistenFn> {
   return listen<RecordingError>("recording_error", (e) => cb(e.payload));
