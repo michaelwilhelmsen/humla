@@ -432,6 +432,19 @@ func resolveInputDeviceName() -> String? {
         ?? audioDeviceName(defaultInputDeviceID())
 }
 
+/// Best answer available when there is *no* tap — mic permission denied, the
+/// input format came back unusable, or a device change left the engine without
+/// one. The engine has no device to report in those states, but the HAL still
+/// names what macOS would use, and that is the device the user has to go and
+/// change. Naming it is the whole point of #174, and the tap failing to install
+/// is the closest sibling of the fault that motivated it.
+///
+/// Note this reads the system default WITHOUT touching `engine.inputNode` —
+/// which is what makes it safe on the paths where the engine is broken.
+func resolveDefaultInputDeviceName() -> String? {
+    audioDeviceName(defaultInputDeviceID())
+}
+
 /// Cache for the resolved name. The heartbeat fires on its own queue, and
 /// reaching into `AVAudioEngine` from there to re-resolve every 2s would both
 /// touch the engine off the main thread and re-query the HAL for a value that
@@ -528,6 +541,12 @@ do {
     engine.prepare()
     try engine.start()
 } catch {
+    // No tap was installed, so `installMicTap` never resolved a name — and this
+    // is exactly the shape of failure #174 is about (mic permission silently
+    // denied, no usable input device). The heartbeat keeps firing and the
+    // no-audio warning latches at 10s, so it should be able to say which device
+    // it isn't hearing here too.
+    inputDevice.set(resolveDefaultInputDeviceName())
     emitError("mic engine: \(error.localizedDescription)")
 }
 } // if !isImport
@@ -834,11 +853,11 @@ func reconfigureMicAfterDeviceChange() {
     input.removeTap(onBus: 0)
     let newFormat = input.inputFormat(forBus: 0)
     guard newFormat.sampleRate > 0, newFormat.channelCount > 0 else {
-        // The tap is off and no new one goes on, so there is no device to
-        // name. Clearing beats keeping the old name: the heartbeat would
-        // otherwise keep reporting a device that capture has stopped using,
-        // and the warning would tell the user to go check it.
-        inputDevice.set(nil)
+        // The tap is off and no new one goes on. Don't keep the old name — the
+        // heartbeat would report a device capture has stopped using — but don't
+        // clear it either: the system default is a *fresh* answer, and it names
+        // the device the user actually has to go and change.
+        inputDevice.set(resolveDefaultInputDeviceName())
         emitError("Audio device changed but the new microphone format is unavailable; mic capture did not resume.")
         return
     }

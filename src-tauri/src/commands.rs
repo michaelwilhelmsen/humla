@@ -2365,7 +2365,7 @@ pub async fn recording_start(
                         break;
                     }
                 }
-                Err(e) => eprintln!("bad sidecar line: {e} -- {line}"),
+                Err(e) => eprintln!("bad sidecar line: {e} -- {}", redact_sidecar_line(&line)),
             }
         }
         // Reader exited (sidecar closed its pipe). If the session is still
@@ -2961,19 +2961,119 @@ async fn dispatch_sidecar_event(
             // the fact the user needs and precisely the fact a log must not
             // keep, so the two strings deliberately differ.
             eprintln!("sidecar diagnostic: {message}");
-            let shown = match input_device {
-                // The sidecar's sentence ends in a full stop; splice the device
-                // in ahead of it rather than appending a second sentence.
-                Some(device) => format!("{} on {device}.", message.trim_end_matches('.')),
-                None => message,
-            };
             let _ = app.emit("recording_error", ErrorPayload {
                 note_id: Some(note_id.to_string()),
-                message: shown,
+                message: recovery_toast(message, input_device),
             });
             false
         }
     }
+}
+
+/// Longest device name we will render, in code points.
+///
+/// MIRRORED with `MAX_DEVICE_NAME` in `src/components/RecordingBar.tsx` — the
+/// warning pill and this toast must clamp a user-authored name the same way, or
+/// the same device reads differently in two places. Change both.
+const MAX_DEVICE_NAME: usize = 40;
+
+/// Clamp a user-authored input-device name for display (#174).
+///
+/// MIRRORS `noAudioWarning`'s clamp in `src/components/RecordingBar.tsx`:
+/// beyond [`MAX_DEVICE_NAME`] code points, take the first `MAX - 1`, drop a
+/// trailing space so it can't be stranded before the ellipsis, and append one.
+/// Rust's `chars()` and JS's `Array.from` both iterate code points, so the two
+/// agree character-for-character and share their test vectors.
+fn clamp_device_name(name: &str) -> String {
+    let chars: Vec<char> = name.chars().collect();
+    if chars.len() <= MAX_DEVICE_NAME {
+        return name.to_string();
+    }
+    let head: String = chars[..MAX_DEVICE_NAME - 1].iter().collect();
+    format!("{}…", head.trim_end())
+}
+
+/// Compose the user-facing device-change toast from the sidecar's device-free
+/// sentence and, when it reported one, the device it resumed on (#174).
+///
+/// Taking the two separately is the privacy guarantee, not a comment about one:
+/// the caller logs `message` to stderr and emits *this* to the UI, so a device
+/// name cannot reach the log by construction. The name is clamped exactly as the
+/// warning pill clamps it — see [`clamp_device_name`].
+fn recovery_toast(message: String, input_device: Option<String>) -> String {
+    match input_device {
+        Some(device) => format!(
+            "{} on {}.",
+            message.trim_end_matches('.'),
+            clamp_device_name(&device)
+        ),
+        None => message,
+    }
+}
+
+/// Stand-in for a redacted value in a logged sidecar line.
+const REDACTED_VALUE: &str = "\"<redacted>\"";
+
+/// Strip the input-device name out of a raw sidecar line before it is logged
+/// (#174).
+///
+/// The three `bad sidecar line` sites log the line verbatim, which is the right
+/// diagnostic — you need to see what the sidecar actually emitted — but a
+/// heartbeat carries a user-authored device name that routinely contains a real
+/// person's name, and #174's constraint is that it reaches no log. The field
+/// name is kept and only its value replaced: *which* fields were present is the
+/// half of that diagnostic worth having, and it's the half that isn't sensitive.
+///
+/// Deliberately string-level, not serde: this only ever runs on a line that
+/// already failed to parse, so there is no value to deserialize. Written to
+/// leave a line it doesn't understand alone rather than to mangle it.
+///
+/// One limit, and it is inherent rather than a shortcut: a value whose inner
+/// quotes are *not* escaped (`"Mike "Mic" Pro"`) is indistinguishable from a
+/// string that legitimately ended at the first inner quote, so a fragment can
+/// survive. No parser can do better on that input, and the sidecar cannot
+/// produce it — `JSONSerialization` always escapes.
+fn redact_sidecar_line(line: &str) -> String {
+    const KEY: &str = "\"input_device\"";
+    let Some(key_at) = line.find(KEY) else {
+        return line.to_string();
+    };
+    let after_key = key_at + KEY.len();
+    let rest = &line[after_key..];
+    let Some(colon_rel) = rest.find(':') else {
+        return line.to_string();
+    };
+    let value_rest = &rest[colon_rel + 1..];
+    let trimmed = value_rest.trim_start();
+    // Byte offset of the value itself. Every step lands on a char boundary: the
+    // key and colon are ASCII, and `trim_start` cuts whole characters.
+    let value_at = after_key + colon_rel + 1 + (value_rest.len() - trimmed.len());
+
+    if trimmed.starts_with('"') {
+        // A JSON string: find its closing quote, honouring backslash escapes so
+        // a name containing `\"` doesn't end it early.
+        let mut escaped = false;
+        for (i, ch) in trimmed.char_indices().skip(1) {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match ch {
+                '\\' => escaped = true,
+                '"' => {
+                    let end = value_at + i + ch.len_utf8();
+                    return format!("{}{REDACTED_VALUE}{}", &line[..value_at], &line[end..]);
+                }
+                _ => {}
+            }
+        }
+        // Unterminated — the rest of the line is inside the string, so drop it.
+        return format!("{}{REDACTED_VALUE}", &line[..value_at]);
+    }
+
+    // Not a string (`null`, or garbage): redact up to the next delimiter.
+    let end = value_at + trimmed.find([',', '}']).unwrap_or(trimmed.len());
+    format!("{}{REDACTED_VALUE}{}", &line[..value_at], &line[end..])
 }
 
 /// The title an import falls back to when the path had no usable stem. Named
@@ -3194,7 +3294,7 @@ pub async fn import_audio(
                         break;
                     }
                 }
-                Err(e) => eprintln!("bad sidecar line: {e} -- {line}"),
+                Err(e) => eprintln!("bad sidecar line: {e} -- {}", redact_sidecar_line(&line)),
             }
         }
         // Replay finished (Stopped, or the sidecar closed its pipe). Drive the
@@ -3624,7 +3724,7 @@ async fn replay_retained_stream(
                     break;
                 }
             }
-            Err(e) => eprintln!("bad sidecar line: {e} -- {line}"),
+            Err(e) => eprintln!("bad sidecar line: {e} -- {}", redact_sidecar_line(&line)),
         }
     }
     drain_inflight(&inflight).await;
@@ -9774,5 +9874,114 @@ mod unify_tests {
         .unwrap();
         assert_eq!(max_speaker_in_timeline(&path), 2);
         assert_eq!(max_speaker_in_timeline(&tmp.path().join("absent.jsonl")), 0);
+    }
+}
+
+#[cfg(test)]
+mod device_name_tests {
+    use super::*;
+
+    #[test]
+    fn a_long_device_name_is_clamped() {
+        // #174: device names are user-authored, so their length is not ours to
+        // trust. MIRRORS the TS rule in `noAudioWarning` (RecordingBar.tsx) —
+        // >40 code points becomes the first 39, trailing space trimmed, plus an
+        // ellipsis. This vector is pinned identically on the TS side; change
+        // both or they drift.
+        let name = format!("{} tail", "b".repeat(38));
+        assert_eq!(clamp_device_name(&name), format!("{}…", "b".repeat(38)));
+    }
+
+    #[test]
+    fn clamping_counts_code_points_not_bytes() {
+        // The granularity is what makes the mirror exact: Rust `chars()` and JS
+        // `Array.from` both walk code points, so an emoji at the boundary is
+        // kept whole on both sides. Counting bytes here would split it and emit
+        // invalid UTF-8; counting UTF-16 units on the TS side would emit U+FFFD.
+        // Same vector is pinned in RecordingBar.test.tsx.
+        let name = format!("{}🎧🎧🎧", "a".repeat(38));
+        assert_eq!(clamp_device_name(&name), format!("{}🎧…", "a".repeat(38)));
+    }
+
+    #[test]
+    fn a_recovery_toast_splices_the_device_before_the_full_stop() {
+        // The sidecar's sentence ends in a full stop; the device goes inside it
+        // rather than trailing after as a second fragment.
+        assert_eq!(
+            recovery_toast(
+                "Audio input device changed; microphone capture resumed.".into(),
+                Some("AirPods Pro".into()),
+            ),
+            "Audio input device changed; microphone capture resumed on AirPods Pro.",
+        );
+    }
+
+    #[test]
+    fn a_recovery_toast_without_a_device_is_the_message_unchanged() {
+        let msg = "Audio input device changed; microphone capture resumed.";
+        assert_eq!(recovery_toast(msg.into(), None), msg);
+    }
+
+    #[test]
+    fn a_recovery_toast_clamps_the_device_it_splices() {
+        // The toast and the warning pill clamp the same name the same way; an
+        // unclamped toast was the gap this closes.
+        let long = format!("{}🎧🎧🎧", "a".repeat(38));
+        let toast = recovery_toast("Resumed.".into(), Some(long));
+        assert!(toast.contains(&format!("{}🎧…", "a".repeat(38))), "not clamped: {toast}");
+    }
+
+    #[test]
+    fn a_malformed_line_is_logged_without_the_device_name() {
+        // #174's constraint says the name must not reach a log. The three
+        // "bad sidecar line" sites log the RAW line, so a heartbeat that fails
+        // to parse would put the name in stderr — the one channel the rest of
+        // this feature is careful to keep it out of. Keep the field, drop the
+        // value: which fields were present is the diagnostic worth having.
+        let line = r#"{"event":"heartbeat","mic_peak":0.0,"input_device":"Michael's AirPods Pro"}"#;
+        let out = redact_sidecar_line(line);
+        assert!(!out.contains("Michael"), "device name survived: {out}");
+        assert!(!out.contains("AirPods"), "device name survived: {out}");
+        assert!(out.contains("input_device"), "field name should survive: {out}");
+        assert!(out.contains("mic_peak"), "rest of the line should survive: {out}");
+    }
+
+    #[test]
+    fn a_line_with_no_device_is_left_alone() {
+        let line = r#"{"event":"heartbeat","mic_peak":0.5,"chunks":3}"#;
+        assert_eq!(redact_sidecar_line(line), line);
+    }
+
+    #[test]
+    fn an_escaped_quote_inside_the_name_does_not_end_it_early() {
+        // A device named `Mike "Mic" Pro` arrives with its inner quotes escaped,
+        // as `JSONSerialization` emits them. Ending the value at the first inner
+        // quote would leave the rest of the name in the log.
+        let line = r#"{"input_device":"Mike \"Mic\" Pro","chunks":1}"#;
+        let out = redact_sidecar_line(line);
+        assert!(!out.contains("Mic"), "name fragment survived: {out}");
+        assert!(out.contains(r#""chunks":1"#), "tail should survive: {out}");
+    }
+
+    #[test]
+    fn an_unterminated_name_takes_the_rest_of_the_line_with_it() {
+        // Truncated mid-write: everything after the opening quote is inside the
+        // string, so none of it can be shown.
+        let out = redact_sidecar_line(r#"{"input_device":"Michael's AirP"#);
+        assert!(!out.contains("Michael"), "name survived: {out}");
+        assert!(out.contains("input_device"), "field should survive: {out}");
+    }
+
+    #[test]
+    fn a_non_string_device_value_is_still_redacted() {
+        let out = redact_sidecar_line(r#"{"input_device":null,"chunks":2}"#);
+        assert!(!out.contains("null"), "value survived: {out}");
+        assert!(out.contains(r#""chunks":2"#), "tail should survive: {out}");
+    }
+
+    #[test]
+    fn a_short_device_name_is_returned_verbatim() {
+        assert_eq!(clamp_device_name("MacBook Pro-mikrofon"), "MacBook Pro-mikrofon");
+        assert_eq!(clamp_device_name(""), "");
     }
 }

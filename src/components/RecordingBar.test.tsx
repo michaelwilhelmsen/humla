@@ -41,6 +41,19 @@ describe("noAudioWarning", () => {
     expect(noAudioWarning(`${"b".repeat(38)} tail`)).not.toContain(" …");
   });
 
+  // MIRROR: these two vectors are pinned identically against Rust's
+  // `clamp_device_name` (src-tauri/src/commands.rs, `device_name_tests`), which
+  // clamps the same name for the device-change toast. The same device must not
+  // read differently in the warning pill and the toast. Change both.
+  it("clamps the mirrored vectors exactly as the Rust side does", () => {
+    expect(noAudioWarning(`${"b".repeat(38)} tail`)).toBe(
+      `No audio from ${"b".repeat(38)}… — check your input device in System Settings`,
+    );
+    expect(noAudioWarning(`${"a".repeat(38)}🎧🎧🎧`)).toBe(
+      `No audio from ${"a".repeat(38)}🎧… — check your input device in System Settings`,
+    );
+  });
+
   it("clamps a pathologically long name so the pill keeps its shape", () => {
     // Device names are user-authored, so the length is not ours to trust. The
     // pill wraps, so an unclamped name costs height rather than overflowing —
