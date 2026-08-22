@@ -2570,7 +2570,13 @@ function TurnTitle({
   return (
     <div data-turn-title className={cn("flex items-center gap-1.5 mb-0.5", className)}>
       <div className="relative w-3 shrink-0 self-stretch">{dot}</div>
-      <span className="text-[13px] font-semibold text-[var(--color-text)] truncate">{name}</span>
+      {/* `title` carries what the truncation stops showing — the panel is
+          dragged as narrow as `PANEL_FLOOR`, where a real full name is clipped
+          (measured: clipping starts around a 280px panel). Same rule the note
+          toolbar follows for the labels it drops. */}
+      <span className="text-[13px] font-semibold text-[var(--color-text)] truncate" title={name}>
+        {name}
+      </span>
       {meta && (
         <span className="text-[11px] text-[var(--color-text-disabled)] tabular-nums shrink-0">
           {meta}

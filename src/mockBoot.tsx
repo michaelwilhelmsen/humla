@@ -151,16 +151,23 @@ function TranscriptEditorHarness({ disabled }: { disabled: boolean }) {
 // The reader renders from the timeline, so editing must too. What needs eyes:
 // the hover pencil sitting beside the delete ×, and the open textarea keeping
 // the turn's place in the flow instead of jumping the page.
-function playerCase(disabled: boolean): Scenario {
+// `width` is the CONTEXT PANEL, which the user drags — `PANEL_FLOOR` (260) to
+// `PANEL_MAX` (720), per Note.tsx. This card was pinned at 420 for a long time,
+// which is how a turn's edit box shipped at a width that only looked right
+// there (#176): judge the reader at the bounds, not at one comfortable middle.
+function playerCase(disabled: boolean, width = 420, longNames = false): Scenario {
   return {
     wrap: (node) => (
       <div className="flex-1 min-h-0 flex justify-center px-6 py-8">
-        <div className="w-full max-w-[420px] rounded-[var(--radius-card)] bg-[var(--color-surface)] flex flex-col min-h-0 px-4 py-4">
+        <div
+          className="w-full rounded-[var(--radius-card)] bg-[var(--color-surface)] flex flex-col min-h-0 px-4 py-4"
+          style={{ maxWidth: width }}
+        >
           {node}
         </div>
       </div>
     ),
-    render: () => <TranscriptPlayerHarness disabled={disabled} />,
+    render: () => <TranscriptPlayerHarness disabled={disabled} longNames={longNames} />,
     ipc: {
       note_session_playback_path: () => null,
       note_timeline_set_chunk_text: () => null,
@@ -169,7 +176,13 @@ function playerCase(disabled: boolean): Scenario {
   };
 }
 
-function TranscriptPlayerHarness({ disabled }: { disabled: boolean }) {
+function TranscriptPlayerHarness({
+  disabled,
+  longNames = false,
+}: {
+  disabled: boolean;
+  longNames?: boolean;
+}) {
   const turn = (
     chunkIdx: number,
     label: string,
@@ -190,10 +203,10 @@ function TranscriptPlayerHarness({ disabled }: { disabled: boolean }) {
     chunkIdx,
   });
   const [timeline, setTimeline] = useState<TimelineEntry[]>([
-    turn(0, "Michael", "Skal vi ta gjennomgangen nå?", 0),
-    turn(1, "Hege", "Ja, jeg har notatene klare", 3000),
-    turn(2, "Hege", "og tallene fra forrige kvartal", 6000),
-    turn(3, "Michael", "Bra — da starter vi der.", 9000),
+    turn(0, longNames ? "Michael Mehlum Wilhelmsen" : "Michael", "Skal vi ta gjennomgangen nå?", 0),
+    turn(1, longNames ? "Hege Marie Tronshaugen-Lillevik" : "Hege", "Ja, jeg har notatene klare", 3000),
+    turn(2, longNames ? "Hege Marie Tronshaugen-Lillevik" : "Hege", "og tallene fra forrige kvartal", 6000),
+    turn(3, longNames ? "Michael Mehlum Wilhelmsen" : "Michael", "Bra — da starter vi der.", 9000),
   ]);
   return (
     <TranscriptPlayer
@@ -780,6 +793,13 @@ const CASES: Record<string, Scenario> = {
   player: playerCase(false),
   // Recording in flight — no edit or delete affordance on any turn.
   "player-recording": playerCase(true),
+  // --- #176: the turn title at the two ends of the panel's clamp, and with
+  // names long enough to make the title row's truncation do its job. The
+  // question at 260 is whether the title row and the open edit box still fit;
+  // at 720 it is whether the title still reads as a title.
+  "player-260": playerCase(false, 260),
+  "player-720": playerCase(false, 720),
+  "player-260-longnames": playerCase(false, 260, true),
 
   // --- The create-team-workspace sheet, one scenario per derived stage.
   "ws-connect": workspaceCase("connect"),
