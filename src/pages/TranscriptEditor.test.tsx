@@ -174,3 +174,36 @@ describe("TranscriptEditor header slot + mode announcement (#171)", () => {
     expect(screen.getByRole("textbox", { name: "Transcript" })).toBeTruthy();
   });
 });
+
+// #176. The timeline-backed reader titles each turn with its speaker; this one
+// — the reader a note falls to when it has no local timeline, which is mostly a
+// teammate's synced note — carried the same defect the title fixed: it stripped
+// the `Speaker 1: ` prefix off the line and put a coloured dot in its place, so
+// the name appeared nowhere at all. The two must not disagree about how a
+// transcript looks depending on which machine opens the note.
+describe("the styled fallback reader titles its turns (#176)", () => {
+  function renderView(value: string) {
+    return render(
+      <TranscriptEditor value={value} onChange={vi.fn()} disabled={false} bottomAligned={false} />,
+    );
+  }
+
+  it("names the speaker above the turn rather than dropping the prefix", () => {
+    renderView("Hege: jeg har notatene klare\nYou: bra");
+    expect(screen.getByText("Hege")).toBeInTheDocument();
+    expect(screen.getByText("You")).toBeInTheDocument();
+    // The name is a title, so it is no longer part of the spoken line.
+    expect(screen.getByText("jeg har notatene klare")).toBeInTheDocument();
+  });
+
+  it("titles a run of consecutive lines from one speaker once", () => {
+    renderView("Hege: første linje\nHege: andre linje\nYou: svar");
+    expect(screen.getAllByText("Hege")).toHaveLength(1);
+  });
+
+  it("leaves a line with no speaker prefix alone", () => {
+    const { container } = renderView("bare tekst uten etikett");
+    expect(screen.getByText("bare tekst uten etikett")).toBeInTheDocument();
+    expect(container.querySelector("[data-turn-title]")).toBeNull();
+  });
+});

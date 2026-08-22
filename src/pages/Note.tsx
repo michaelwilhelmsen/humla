@@ -2603,20 +2603,53 @@ const TranscriptView = memo(function TranscriptView({
           if (line.kind === "speaker") {
             const color = colors.get(line.trimmedLabel);
             if (color) {
+              // Same turn title as the timeline-backed reader (#176), and for
+              // the same reason: this view stripped the `Hege: ` prefix off the
+              // line and put a dot where it had been, so past four speakers two
+              // turns were the same colour with the name nowhere on either. The
+              // two readers must agree — which one a note gets depends on
+              // whether its timeline happens to be on this machine, and a
+              // teammate's note must not look like a different app.
+              //
+              // Titled at the START OF A RUN only. There are no session ids
+              // here, so the run is decided on the label alone — the same rule
+              // `split_label` and the Rust serializer use, and one line further
+              // than `groupTimeline`, which also splits on session.
+              const prev = lines[vrow.index - 1];
+              const startsRun =
+                !prev || prev.kind !== "speaker" || prev.trimmedLabel !== line.trimmedLabel;
               content = (
-                <div className="flex items-start gap-1">
-                  <div className="relative w-3 shrink-0 self-stretch">
-                    <span
-                      className="nd-speaker-dot"
-                      style={{ background: color }}
-                      title={line.trimmedLabel}
-                      aria-label={`Speaker: ${line.trimmedLabel}`}
-                    />
-                  </div>
-                  <div className="flex-1 whitespace-pre-wrap">
-                    {line.rest || " "}
-                  </div>
-                </div>
+                <>
+                  {startsRun && (
+                    <div
+                      data-turn-title
+                      // `pt-`, not `mt-`: the virtualizer measures each row off
+                      // its bounding box, which excludes margins — a margin
+                      // here would leave every row positioned short of where it
+                      // paints. Matches the 8px the other reader gets from its
+                      // per-turn `py-1`.
+                      className={
+                        "flex items-center gap-1.5 mb-0.5" +
+                        (vrow.index > 0 ? " pt-2" : "")
+                      }
+                    >
+                      <div className="relative w-3 shrink-0 self-stretch">
+                        <span
+                          className="nd-speaker-dot"
+                          style={{ background: color }}
+                          title={line.trimmedLabel}
+                          aria-label={`Speaker: ${line.trimmedLabel}`}
+                        />
+                      </div>
+                      {/* No timestamp beside the name, unlike the other reader:
+                          this one has plain text and no times to show. */}
+                      <span className="text-[13px] font-semibold text-[var(--color-text)] truncate">
+                        {line.trimmedLabel}
+                      </span>
+                    </div>
+                  )}
+                  <div className="whitespace-pre-wrap">{line.rest || " "}</div>
+                </>
               );
             } else {
               content = (
