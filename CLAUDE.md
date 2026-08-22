@@ -278,7 +278,7 @@ Convention: semver. Bug fix → patch (`0.24.0` → `0.24.1`). New feature → m
 The script:
 1. Refuses to run if the working tree is dirty or the version isn't bumped beyond the latest GitHub release.
 2. Builds the DMG (`pnpm dmg`), signs + notarises + staples + produces a `.sig` file via the Tauri updater key.
-3. Generates `latest.json` with version, signature, and the GitHub download URL.
+3. Resolves the artifacts **by version and by payload, never by newest-on-disk**, then generates `latest.json` with version, signature, and the GitHub download URL. The DMG is demanded by name (`Humla_<version>_*.dmg`, exactly one match); the updater tarball's name carries no version at all, so its `CFBundleShortVersionString` is read out of the payload and must equal the release version. This exists because tauri bundles app → DMG → updater tarball: a failure in the DMG step (v0.52.0 hit one — macOS refusing `bundle_dmg.sh` its Finder-automation prompt in a detached shell) leaves the app rebuilt and the **previous release's tarball still in place**, which the old `ls -t` picked up happily. That publishes the new version carrying the old payload, with a signature that verifies because it is the old payload's own — every install takes the update and moves silently backwards, and nothing about the release looks wrong. `SKIP_BUILD=1` reuses artifacts on disk and is the path this trap is reached through.
 4. Tags the commit `v<version>`, pushes the tag, creates a GitHub release, uploads `.dmg` + `.sig` + `latest.json` as assets.
 
 All existing Humla installs poll the updater endpoint at startup and prompt to install when a new version lands.

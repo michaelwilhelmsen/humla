@@ -71,10 +71,41 @@ else
   ./scripts/build-dmg.sh
 fi
 
-# 4. Locate artifacts.
-DMG=$(ls -t src-tauri/target/release/bundle/dmg/*.dmg | head -n1)
-TARBALL=$(ls -t src-tauri/target/release/bundle/macos/*.app.tar.gz | head -n1)
-SIG_FILE=$(ls -t src-tauri/target/release/bundle/macos/*.app.tar.gz.sig | head -n1)
+# 4. Locate artifacts — by VERSION and by payload, never by "newest on disk".
+#
+# This used to be three `ls -t | head -n1` calls, which is a trap that nearly
+# shipped during v0.52.0. Tauri bundles in the order app → DMG → updater
+# tarball, so a failure in the DMG step (that one was macOS refusing
+# `bundle_dmg.sh` its Finder automation prompt) leaves the app rebuilt but the
+# updater tarball still belonging to the PREVIOUS release. `ls -t` then picks
+# that stale tarball happily, and since `latest.json` takes its version from
+# these files' surroundings rather than from their contents, the release
+# publishes as the new version carrying the old payload — with a signature that
+# verifies, because it is the old payload's own signature. Every install would
+# have taken the update and quietly moved backwards. Nothing about the release
+# would have looked wrong.
+#
+# So: demand each artifact by name where the name carries the version, and read
+# the version out of the payload where it does not.
+
+# The DMG's filename carries the version; only the arch suffix varies
+# (aarch64 / x64), so glob that much and insist on exactly one match.
+shopt -s nullglob
+DMG_MATCHES=(src-tauri/target/release/bundle/dmg/Humla_"${VERSION}"_*.dmg)
+shopt -u nullglob
+if (( ${#DMG_MATCHES[@]} != 1 )); then
+  echo "error: expected exactly one DMG named for $VERSION, found ${#DMG_MATCHES[@]}" >&2
+  printf '  %s\n' "${DMG_MATCHES[@]:-(none)}" >&2
+  echo "  run ./scripts/build-dmg.sh, and delete any DMG from another version" >&2
+  exit 1
+fi
+DMG="${DMG_MATCHES[0]}"
+
+# The updater tarball's name carries NO version — `Humla.app.tar.gz`, release
+# after release — so its name proves nothing and its mtime is a guess. Read the
+# version out of the payload that is actually about to ship.
+TARBALL="src-tauri/target/release/bundle/macos/Humla.app.tar.gz"
+SIG_FILE="$TARBALL.sig"
 
 for f in "$DMG" "$TARBALL" "$SIG_FILE"; do
   if [[ ! -f "$f" ]]; then
@@ -82,6 +113,32 @@ for f in "$DMG" "$TARBALL" "$SIG_FILE"; do
     exit 1
   fi
 done
+
+TARBALL_VERSION=$(
+  tar -xOzf "$TARBALL" "Humla.app/Contents/Info.plist" 2>/dev/null \
+    | plutil -extract CFBundleShortVersionString raw -o - -- - 2>/dev/null
+) || true
+if [[ "$TARBALL_VERSION" != "$VERSION" ]]; then
+  echo "error: the updater payload is not $VERSION" >&2
+  echo "  $TARBALL says: ${TARBALL_VERSION:-(unreadable)}" >&2
+  echo "  this is the stale-tarball trap — a DMG-step failure leaves the previous" >&2
+  echo "  release's tarball in place. Rebuild rather than reuse:" >&2
+  echo "    rm -f $TARBALL $SIG_FILE && ./scripts/build-dmg.sh" >&2
+  exit 1
+fi
+
+# The signature is made from the tarball. One older than what it signs is
+# signing a payload that is no longer there, and every install rejects the
+# download.
+if [[ "$SIG_FILE" -ot "$TARBALL" ]]; then
+  echo "error: $SIG_FILE is older than the tarball it signs — rebuild" >&2
+  exit 1
+fi
+
+echo "artifacts for $VERSION:"
+echo "  $DMG"
+echo "  $TARBALL (payload reports $TARBALL_VERSION)"
+echo "  $SIG_FILE"
 
 PUB_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 DOWNLOAD_URL="https://github.com/michaelwilhelmsen/humla/releases/download/$TAG/$(basename "$TARBALL")"
