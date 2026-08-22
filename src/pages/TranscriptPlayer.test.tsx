@@ -416,3 +416,69 @@ describe("TranscriptPlayer per-turn editing (#170)", () => {
     expect(screen.queryByRole("textbox")).toBeNull();
   });
 });
+
+// #176. The reader used to identify a turn by a coloured dot and nothing else,
+// and `speakerColorMap` cycles four colours — so on a five-speaker meeting the
+// first and fifth speakers wore the same blue and no amount of squinting told
+// them apart. The name is the identity now; colour is the scanning aid it
+// should have been. Chosen from five prototyped shapes (branch
+// `prototype/176-transcript-turns`), where a title above the turn beat an
+// inline lead-in and a name column.
+describe("TranscriptPlayer turn titles (#176)", () => {
+  beforeEach(() => {
+    mockTauri({ note_session_playback_path: () => null });
+  });
+
+  it("names the speaker above the turn, not only inside the dot", async () => {
+    renderPlayer({
+      sessions: [session({ id: "s1", index: 1 })],
+      timeline: [
+        entry({ sessionId: "s1", label: "Hege", text: "Jeg har notatene klare", start_ms: 4000 }),
+        entry({ sessionId: "s1", label: "You", text: "Bra", start_ms: 9000 }),
+      ],
+      fallbackPlaybackUrl: null,
+    });
+    // The name as rendered text — `getByText`, not an accessible name off the
+    // dot, which is exactly what the old reader had and what was not enough.
+    expect(await screen.findByText("Hege")).toBeInTheDocument();
+    expect(screen.getByText("You")).toBeInTheDocument();
+  });
+
+  it("titles a run of consecutive turns once, not once per entry", async () => {
+    // Two entries, one speaker: a title per entry would spend a line saying
+    // what the line above already said.
+    renderPlayer({
+      sessions: [session({ id: "s1", index: 1 })],
+      timeline: [
+        entry({ sessionId: "s1", label: "Hege", text: "Ja, jeg har notatene klare", start_ms: 0, chunkIdx: 0 }),
+        entry({ sessionId: "s1", label: "Hege", text: "og tallene fra i går", start_ms: 3000, chunkIdx: 1 }),
+      ],
+      fallbackPlaybackUrl: null,
+    });
+    await screen.findByText(/notatene klare/);
+    expect(screen.getAllByText("Hege")).toHaveLength(1);
+  });
+
+  it("gives an unlabelled turn no title at all", async () => {
+    // A take whose diarize never ran is serialized with an empty label
+    // (#169). An empty title bar over it would be a header saying nothing.
+    const { container } = renderPlayer({
+      sessions: [session({ id: "s1", index: 1 })],
+      timeline: [entry({ sessionId: "s1", label: "", text: "ingen etikett her", start_ms: 0 })],
+      fallbackPlaybackUrl: null,
+    });
+    await screen.findByText("ingen etikett her");
+    expect(container.querySelector("[data-turn-title]")).toBeNull();
+  });
+
+  it("times the turn from the start of its own take", async () => {
+    // Timeline times are session-local (they are never rebased onto a
+    // note-wide clock), so the stamp reads against the take the turn is in.
+    renderPlayer({
+      sessions: [session({ id: "s2", index: 2 })],
+      timeline: [entry({ sessionId: "s2", sessionIndex: 1, label: "Hege", text: "sent i opptaket", start_ms: 754_000 })],
+      fallbackPlaybackUrl: null,
+    });
+    expect(await screen.findByText("12:34")).toBeInTheDocument();
+  });
+});

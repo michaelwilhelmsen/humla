@@ -41,6 +41,7 @@ import { shouldAdoptRemoteBody, shouldAdoptRemoteTitle, shouldRequestTitleForBod
 import { SpeakerLabels, speakerColorMap } from "../components/SpeakerLabels";
 import { RecordingSessions } from "../components/RecordingSessions";
 import {
+  formatDuration,
   groupTimeline,
   needsSessionPull,
   resolveActivePill,
@@ -3266,58 +3267,8 @@ export const TranscriptPlayer = memo(function TranscriptPlayer({
                 offset += g.wordCountByChunk[k];
               }
             }
-            return (
-              <div
-                key={vrow.key}
-                data-index={gi}
-                ref={virtualizer.measureElement}
-                style={{
-                  position: "absolute",
-                  top: 0,
-                  left: 0,
-                  width: "100%",
-                  transform: `translateY(${vrow.start}px)`,
-                }}
-              >
-              {sessions.length > 1 && g.firstInSession && (
-                <SessionDivider
-                  session={sessionById.get(g.sessionId)}
-                  index={g.sessionIndex}
-                />
-              )}
-              <div
-                data-idx={gi}
-                className={
-                  "group flex items-start gap-1 px-2 py-1 rounded transition-colors " +
-                  (isActive
-                    ? "bg-[var(--color-pill-hover)] text-[var(--color-text)]"
-                    : "hover:bg-[var(--color-pill-hover)]")
-                }
-              >
-                {g.label && color && (
-                  <div className="relative w-3 shrink-0 self-stretch">
-                    <button
-                      type="button"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        void cycleGroupLabel(g);
-                      }}
-                      disabled={!cyclable || disabled}
-                      title={
-                        cyclable
-                          ? `${g.label} — click to reassign`
-                          : g.label
-                      }
-                      className="nd-speaker-dot"
-                      style={{
-                        background: color,
-                        left: 0,
-                        top: "calc(0.5lh - 5px)",
-                      }}
-                      aria-label={`Speaker: ${g.label}`}
-                    />
-                  </div>
-                )}
+            const body = (
+              <>
                 {isEditingGroup ? (
                   // Per-turn edit (#170). One textarea over this turn's text,
                   // committing into the timeline. Enter commits — a turn is one
@@ -3379,6 +3330,12 @@ export const TranscriptPlayer = memo(function TranscriptPlayer({
                     {g.text}
                   </button>
                 )}
+              </>
+            );
+            // Pencil + delete, defined once and placed by whether the turn
+            // has a title to hang them on (#176).
+            const actions = (
+              <>
                 {!disabled && !isEditingGroup && (
                   <button
                     type="button"
@@ -3428,6 +3385,103 @@ export const TranscriptPlayer = memo(function TranscriptPlayer({
                   >
                     <X size={14} strokeWidth={1.5} />
                   </button>
+                )}
+              </>
+            );
+            return (
+              <div
+                key={vrow.key}
+                data-index={gi}
+                ref={virtualizer.measureElement}
+                style={{
+                  position: "absolute",
+                  top: 0,
+                  left: 0,
+                  width: "100%",
+                  transform: `translateY(${vrow.start}px)`,
+                }}
+              >
+              {sessions.length > 1 && g.firstInSession && (
+                <SessionDivider
+                  session={sessionById.get(g.sessionId)}
+                  index={g.sessionIndex}
+                />
+              )}
+              <div
+                data-idx={gi}
+                className={
+                  "group px-2 py-1 rounded transition-colors " +
+                  (isActive
+                    ? "bg-[var(--color-pill-hover)] text-[var(--color-text)]"
+                    : "hover:bg-[var(--color-pill-hover)]")
+                }
+              >
+                {/* The turn's title: who spoke, and when in their take (#176).
+                    The reader used to carry the name nowhere at all — only a
+                    coloured dot, and `speakerColorMap` cycles four colours, so
+                    the first and fifth speaker of a meeting wore the same blue
+                    and the turn was unattributable. The NAME is the identity
+                    now; the dot is the scanning aid, and still the control that
+                    reassigns the turn.
+
+                    The text below is NOT indented under the title: a turn runs
+                    the full width of a panel that can be 320px, and an indent
+                    would spend some of it re-stating an alignment the title
+                    already gives. Chosen from five prototyped shapes — branch
+                    `prototype/176-transcript-turns` holds the losing four.
+
+                    The row's actions live up here rather than beside the text
+                    for the same reason. An UNLABELLED turn therefore keeps the
+                    old inline layout (below): with no title there is no line
+                    for them to sit on, and a title bar holding nothing but two
+                    hover-revealed buttons would cost every turn of a
+                    never-diarized note a line of height to say nothing. */}
+                {g.label && color && (
+                  <div data-turn-title className="flex items-center gap-1.5 mb-0.5">
+                    <div className="relative w-3 shrink-0 self-stretch">
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          void cycleGroupLabel(g);
+                        }}
+                        disabled={!cyclable || disabled}
+                        title={
+                          cyclable
+                            ? `${g.label} — click to reassign`
+                            : g.label
+                        }
+                        className="nd-speaker-dot"
+                        style={{
+                          background: color,
+                          left: 0,
+                          top: "calc(0.5lh - 5px)",
+                        }}
+                        aria-label={`Speaker: ${g.label}`}
+                      />
+                    </div>
+                    <span className="text-[13px] font-semibold text-[var(--color-text)] truncate">
+                      {g.label}
+                    </span>
+                    {/* Local to the turn's own take — timeline times are never
+                        rebased onto a note-wide clock. */}
+                    <span className="text-[11px] text-[var(--color-text-disabled)] tabular-nums shrink-0">
+                      {formatDuration(g.startMs)}
+                    </span>
+                    <div className="flex-1" />
+                    {actions}
+                  </div>
+                )}
+                {/* A titled turn's text runs the full width under its
+                    title; an unlabelled one keeps the old inline row, actions
+                    and all. */}
+                {g.label && color ? (
+                  body
+                ) : (
+                  <div className="flex items-start gap-1">
+                    {body}
+                    {actions}
+                  </div>
                 )}
               </div>
               </div>
