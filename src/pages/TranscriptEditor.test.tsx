@@ -201,6 +201,12 @@ describe("the styled fallback reader titles its turns (#176)", () => {
     expect(screen.getAllByText("Hege")).toHaveLength(1);
   });
 
+  it("does not announce the speaker twice — the dot beside the name is decorative", () => {
+    renderView("Hege: jeg har notatene klare");
+    expect(screen.getByText("Hege")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Speaker: Hege")).toBeNull();
+  });
+
   it("leaves a line with no speaker prefix alone", () => {
     const { container } = renderView("bare tekst uten etikett");
     expect(screen.getByText("bare tekst uten etikett")).toBeInTheDocument();

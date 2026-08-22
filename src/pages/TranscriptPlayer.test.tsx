@@ -471,6 +471,36 @@ describe("TranscriptPlayer turn titles (#176)", () => {
     expect(container.querySelector("[data-turn-title]")).toBeNull();
   });
 
+  it("gives the edit textarea a width that does not depend on a flex parent", async () => {
+    // The title made the turn a block row, which left the textarea's `flex-1`
+    // inert and opened every labelled turn's editor at a browser-default ~20
+    // columns — 188px inside a 388px row, measured in the harness. jsdom has no
+    // layout to assert against, so what is pinned here is the contract that
+    // fixes it; `?case=player` is where the width itself is checked.
+    renderPlayer({
+      sessions: [session({ id: "s1", index: 1 })],
+      timeline: [entry({ sessionId: "s1", label: "Hege", text: "en linje", start_ms: 0 })],
+      fallbackPlaybackUrl: null,
+    });
+    fireEvent.mouseDown(await screen.findByLabelText("Edit this turn"));
+    expect(screen.getByRole("textbox")).toHaveClass("w-full");
+  });
+
+  it("names the dot for what it does, not for who spoke", async () => {
+    // The name is visible in the title now; repeating it as the dot's
+    // accessible name made a screen reader announce the speaker twice a turn.
+    renderPlayer({
+      sessions: [session({ id: "s1", index: 1 })],
+      timeline: [
+        entry({ sessionId: "s1", label: "Hege", text: "en", start_ms: 0, chunkIdx: 0 }),
+        entry({ sessionId: "s1", label: "You", text: "to", start_ms: 1000, chunkIdx: 1 }),
+      ],
+      fallbackPlaybackUrl: null,
+    });
+    expect(await screen.findByLabelText("Reassign Hege")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Speaker: Hege")).toBeNull();
+  });
+
   it("times the turn from the start of its own take", async () => {
     // Timeline times are session-local (they are never rebased onto a
     // note-wide clock), so the stamp reads against the take the turn is in.

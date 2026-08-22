@@ -2539,6 +2539,53 @@ function parseTranscriptLines(transcript: string): ParsedTranscriptLine[] {
   });
 }
 
+/** A turn's speaker, above the words they said (#176).
+ *
+ * Shared by BOTH readers — `TranscriptPlayer` over a timeline and
+ * `TranscriptView` over the text — because which one a note gets is not a
+ * property of the note but of whether its timeline is on this machine, and a
+ * teammate's note must not look like a different app. Written twice, the two
+ * would drift; written once, they cannot.
+ *
+ * What each reader still supplies for itself is what it actually has: the
+ * player's `dot` is a button that reassigns the turn and its `meta` is the
+ * turn's position in its own take, while the fallback has plain text, so its
+ * dot is inert and it has no time to show.
+ */
+function TurnTitle({
+  dot,
+  name,
+  meta,
+  trailing,
+  className,
+}: {
+  dot: React.ReactNode;
+  name: string;
+  /** Small print beside the name — the player's take-local timestamp. */
+  meta?: string;
+  /** Pushed to the far end: the player's per-turn edit + delete (#170). */
+  trailing?: React.ReactNode;
+  className?: string;
+}) {
+  return (
+    <div data-turn-title className={cn("flex items-center gap-1.5 mb-0.5", className)}>
+      <div className="relative w-3 shrink-0 self-stretch">{dot}</div>
+      <span className="text-[13px] font-semibold text-[var(--color-text)] truncate">{name}</span>
+      {meta && (
+        <span className="text-[11px] text-[var(--color-text-disabled)] tabular-nums shrink-0">
+          {meta}
+        </span>
+      )}
+      {trailing && (
+        <>
+          <div className="flex-1" />
+          {trailing}
+        </>
+      )}
+    </div>
+  );
+}
+
 const TranscriptView = memo(function TranscriptView({
   transcript,
   onClick,
@@ -2611,42 +2658,37 @@ const TranscriptView = memo(function TranscriptView({
               // whether its timeline happens to be on this machine, and a
               // teammate's note must not look like a different app.
               //
-              // Titled at the START OF A RUN only. There are no session ids
-              // here, so the run is decided on the label alone — the same rule
-              // `split_label` and the Rust serializer use, and one line further
-              // than `groupTimeline`, which also splits on session.
+              // Titled at the START OF A RUN only. `groupTimeline` does this
+              // for the other reader off the timeline, splitting on label AND
+              // session; there are no session ids in plain text, so here the
+              // run is the label alone — one line longer, by exactly that.
               const prev = lines[vrow.index - 1];
               const startsRun =
                 !prev || prev.kind !== "speaker" || prev.trimmedLabel !== line.trimmedLabel;
               content = (
                 <>
                   {startsRun && (
-                    <div
-                      data-turn-title
-                      // `pt-`, not `mt-`: the virtualizer measures each row off
-                      // its bounding box, which excludes margins — a margin
-                      // here would leave every row positioned short of where it
-                      // paints. Matches the 8px the other reader gets from its
-                      // per-turn `py-1`.
-                      className={
-                        "flex items-center gap-1.5 mb-0.5" +
-                        (vrow.index > 0 ? " pt-2" : "")
-                      }
-                    >
-                      <div className="relative w-3 shrink-0 self-stretch">
+                    <TurnTitle
+                      name={line.trimmedLabel}
+                      dot={
                         <span
                           className="nd-speaker-dot"
                           style={{ background: color }}
                           title={line.trimmedLabel}
-                          aria-label={`Speaker: ${line.trimmedLabel}`}
+                          // Decorative now that the name is beside it — a
+                          // labelled span here made a screen reader say the
+                          // speaker twice per turn. This dot is not a control
+                          // in this reader (the player's is).
+                          aria-hidden
                         />
-                      </div>
-                      {/* No timestamp beside the name, unlike the other reader:
-                          this one has plain text and no times to show. */}
-                      <span className="text-[13px] font-semibold text-[var(--color-text)] truncate">
-                        {line.trimmedLabel}
-                      </span>
-                    </div>
+                      }
+                      // `pt-`, not `mt-`: the virtualizer measures each row off
+                      // its bounding box, which excludes margins — a margin here
+                      // would leave every row positioned short of where it
+                      // paints. Matches the 8px the other reader gets from its
+                      // per-turn `py-1`.
+                      className={vrow.index > 0 ? "pt-2" : undefined}
+                    />
                   )}
                   <div className="whitespace-pre-wrap">{line.rest || " "}</div>
                 </>
@@ -3323,7 +3365,13 @@ export const TranscriptPlayer = memo(function TranscriptPlayer({
                     }}
                     rows={1}
                     aria-label="Edit this turn"
-                    className="flex-1 resize-none text-sm leading-relaxed bg-transparent"
+                    // `w-full` AND `flex-1`: a titled turn's body is a block
+                    // child of the row, where `flex-1` is inert and a textarea
+                    // falls back to its ~20-column intrinsic width (measured:
+                    // 188px inside a 388px row). An unlabelled turn still puts
+                    // it in a flex row, where `flex-1` governs. jsdom has no
+                    // layout, so only the harness can see this.
+                    className="w-full flex-1 resize-none text-sm leading-relaxed bg-transparent"
                   />
                 ) : g.words.length > 0 ? (
                   <div className="flex-1 nd-bare cursor-text leading-relaxed">
@@ -3358,7 +3406,9 @@ export const TranscriptPlayer = memo(function TranscriptPlayer({
                     type="button"
                     onClick={() => seekInSession(g.sessionId, g.startMs)}
                     title="Click to play from here"
-                    className="text-left flex-1 nd-bare cursor-text"
+                    // `w-full` for the same reason as the textarea above: a
+                    // button shrink-wraps its text outside a flex row.
+                    className="text-left w-full flex-1 nd-bare cursor-text"
                   >
                     {g.text}
                   </button>
@@ -3367,6 +3417,9 @@ export const TranscriptPlayer = memo(function TranscriptPlayer({
             );
             // Pencil + delete, defined once and placed by whether the turn
             // has a title to hang them on (#176).
+            // Whether this turn has a name to hang a title — and therefore a
+            // title line for its actions to sit on.
+            const titled = !!g.label && !!color;
             const actions = (
               <>
                 {!disabled && !isEditingGroup && (
@@ -3469,9 +3522,14 @@ export const TranscriptPlayer = memo(function TranscriptPlayer({
                     for them to sit on, and a title bar holding nothing but two
                     hover-revealed buttons would cost every turn of a
                     never-diarized note a line of height to say nothing. */}
-                {g.label && color && (
-                  <div data-turn-title className="flex items-center gap-1.5 mb-0.5">
-                    <div className="relative w-3 shrink-0 self-stretch">
+                {titled && (
+                  <TurnTitle
+                    name={g.label}
+                    // Local to the turn's own take — timeline times are never
+                    // rebased onto a note-wide clock.
+                    meta={formatDuration(g.startMs)}
+                    trailing={actions}
+                    dot={
                       <button
                         type="button"
                         onClick={(e) => {
@@ -3490,25 +3548,18 @@ export const TranscriptPlayer = memo(function TranscriptPlayer({
                           left: 0,
                           top: "calc(0.5lh - 5px)",
                         }}
-                        aria-label={`Speaker: ${g.label}`}
+                        // Named for what the control DOES, not for who spoke:
+                        // the name is visible beside it now, so repeating it
+                        // here read the speaker out twice per turn.
+                        aria-label={`Reassign ${g.label}`}
                       />
-                    </div>
-                    <span className="text-[13px] font-semibold text-[var(--color-text)] truncate">
-                      {g.label}
-                    </span>
-                    {/* Local to the turn's own take — timeline times are never
-                        rebased onto a note-wide clock. */}
-                    <span className="text-[11px] text-[var(--color-text-disabled)] tabular-nums shrink-0">
-                      {formatDuration(g.startMs)}
-                    </span>
-                    <div className="flex-1" />
-                    {actions}
-                  </div>
+                    }
+                  />
                 )}
                 {/* A titled turn's text runs the full width under its
                     title; an unlabelled one keeps the old inline row, actions
                     and all. */}
-                {g.label && color ? (
+                {titled ? (
                   body
                 ) : (
                   <div className="flex items-start gap-1">
