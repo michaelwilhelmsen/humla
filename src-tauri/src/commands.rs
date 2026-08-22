@@ -2939,7 +2939,7 @@ async fn dispatch_sidecar_event(
             emit_status(app, Some(note_id), Phase::Recording);
             false
         }
-        SidecarEvent::Heartbeat { mic_frames, sys_frames, chunks, mic_peak, sys_peak } => {
+        SidecarEvent::Heartbeat { mic_frames, sys_frames, chunks, mic_peak, sys_peak, input_device } => {
             let _ = app.emit("recording_diagnostic", DiagnosticPayload {
                 note_id: note_id.to_string(),
                 mic_frames,
@@ -2947,17 +2947,29 @@ async fn dispatch_sidecar_event(
                 chunks,
                 mic_peak,
                 sys_peak,
+                input_device,
             });
             false
         }
-        SidecarEvent::Diagnostic { message } => {
+        SidecarEvent::Diagnostic { message, input_device } => {
             // Non-fatal sidecar notice (e.g. mic capture recovered after a
             // device change). Reuse the recording_error channel — it's a
             // transient auto-dismissing toast on the frontend.
+            //
+            // Logged BEFORE the device is folded in: the name is display-only
+            // (#174) and stderr is not a display. "resumed on AirPods Pro" is
+            // the fact the user needs and precisely the fact a log must not
+            // keep, so the two strings deliberately differ.
             eprintln!("sidecar diagnostic: {message}");
+            let shown = match input_device {
+                // The sidecar's sentence ends in a full stop; splice the device
+                // in ahead of it rather than appending a second sentence.
+                Some(device) => format!("{} on {device}.", message.trim_end_matches('.')),
+                None => message,
+            };
             let _ = app.emit("recording_error", ErrorPayload {
                 note_id: Some(note_id.to_string()),
-                message,
+                message: shown,
             });
             false
         }

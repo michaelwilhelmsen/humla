@@ -22,6 +22,8 @@ import {
   Search,
 } from "lucide-react";
 import { CommandSnippet } from "./components/CommandSnippet";
+import { RecordingBar } from "./components/RecordingBar";
+import { useRecordingStore } from "./lib/store";
 import { Segmented } from "./pages/settings/components/Segmented";
 import { Toggle } from "./pages/settings/components/Toggle";
 import { NoteTitleBox, NoteToolbar, TranscriptEditor, TranscriptPlayer } from "./pages/Note";
@@ -583,6 +585,51 @@ function titleCase(writing: boolean, title: string): Scenario {
   };
 }
 
+// ---- #174 axis: whether the no-audio warning can name its input device ------
+//
+// The copy grew by a device name, so the question worth looking at is whether
+// it still fits — which jsdom, pinning every box to 0, cannot answer.
+//
+// The width to judge it at is `BODY_MIN` (420), NOT the window's 720px
+// `minWidth`: RecordingBar positions itself against the note page's body
+// column, and the sidebar and right panel both eat into that. 420 is the
+// narrowest that column is allowed to get.
+const BODY_MIN_PX = 420;
+
+function noAudioCase(device: string | null, width = BODY_MIN_PX): Scenario {
+  return {
+    wrap: (node) => (
+      <div
+        className="relative mx-auto h-[200px] border border-dashed border-[var(--color-line-visible)]"
+        style={{ width }}
+      >
+        {node}
+      </div>
+    ),
+    render: () => {
+      // The bar reads the store, not IPC. Seed the exact state the warning
+      // needs: this note recording, mic never heard, and past the ~10s latch.
+      useRecordingStore.setState({
+        status: { noteId: "n1", phase: "recording" },
+        micHeard: false,
+        activeSince: null,
+        activeAccumMs: 20_000,
+        diag: {
+          noteId: "n1",
+          micFrames: 224_000,
+          sysFrames: 224_000,
+          chunks: 0,
+          micPeak: 0,
+          sysPeak: 0,
+          inputDevice: device,
+        },
+      });
+      return <RecordingBar noteId="n1" />;
+    },
+    ipc: {},
+  };
+}
+
 const CASES: Record<string, Scenario> = {
   // --- #90: the automatic titler's two states. Compare `title-writing` against
   // `title-idle` and `title-idle-long` — nothing below the title may shift.
@@ -674,6 +721,16 @@ const CASES: Record<string, Scenario> = {
   "ws-name": workspaceCase("name"),
   "ws-trial": workspaceCase("trial"),
   "ws-invite": workspaceCase("invite"),
+
+  // --- #174: the no-audio warning naming the device it isn't hearing.
+  // A real (localized) device name, the fallback when the HAL won't name one,
+  // and the clamp doing its job on a pathological user-authored name.
+  noaudio: noAudioCase("MacBook Pro-mikrofon"),
+  "noaudio-unknown": noAudioCase(null),
+  "noaudio-long": noAudioCase("Michael's Extremely Long Audio Interface Name Mk II"),
+  // The same pill with the body column at a comfortable width, so the
+  // narrow-column layout can be compared against the roomy one.
+  "noaudio-wide": noAudioCase("MacBook Pro-mikrofon", 900),
 
   // --- Themes: the token-driven chrome on one page, so a theme can be judged
   // as a design rather than as a diff. Combine with ?palette= and ?theme=.

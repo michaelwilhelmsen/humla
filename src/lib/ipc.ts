@@ -790,6 +790,14 @@ export type RecordingDiagnostic = {
   chunks: number;
   micPeak: number;
   sysPeak: number;
+  // Display name of the input device the mic tap is actually on (#174), so the
+  // no-audio warning can name the device it isn't hearing. Null from a sidecar
+  // too old to report it, or when CoreAudio can't name the device.
+  //
+  // Display only. Device names are user-authored and routinely carry a real
+  // person's name — this must not be persisted, logged to a shareable file, or
+  // synced.
+  inputDevice: string | null;
 };
 // The teammate currently holding a shared note's recording lock.
 export type RecordingLockStatus = { holderId: string; holderName: string };

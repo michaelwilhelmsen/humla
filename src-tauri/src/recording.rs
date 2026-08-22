@@ -470,12 +470,29 @@ pub enum SidecarEvent {
         chunks: u64,
         mic_peak: f32,
         sys_peak: f32,
+        // Display name of the audio input device the mic tap is actually on
+        // (#174). `None` from a sidecar too old to report it, or when
+        // CoreAudio can't name the device — the no-audio warning falls back
+        // to its device-less copy rather than inventing a name.
+        //
+        // Deliberately not persisted anywhere: device names are user-authored
+        // and routinely contain a real person's name ("Michael's AirPods").
+        // This rides a transient event to a transient warning and stops there
+        // — it must not reach a diagnostics dump or anything synced.
+        #[serde(default)]
+        input_device: Option<String>,
     },
     // Non-fatal notice from the sidecar — e.g. it recovered mic capture after
     // an audio device change mid-recording. Surfaced to the user as a transient
     // toast (see the reader loop in commands.rs).
     Diagnostic {
         message: String,
+        // Device the sidecar resumed on, sent separately so `message` stays
+        // free of it: this arm logs `message` to stderr, and a device name is
+        // display-only (#174). The user-facing sentence is composed in the
+        // reader loop from the two parts.
+        #[serde(default)]
+        input_device: Option<String>,
     },
 }
 
@@ -488,6 +505,9 @@ pub struct DiagnosticPayload {
     pub chunks: u64,
     pub mic_peak: f32,
     pub sys_peak: f32,
+    // See `SidecarEvent::Heartbeat::input_device` — display only, never
+    // persisted (#174).
+    pub input_device: Option<String>,
 }
 
 #[cfg(test)]
@@ -568,8 +588,58 @@ mod tests {
         // drop the notice.
         let json = r#"{"event":"diagnostic","message":"device changed"}"#;
         match serde_json::from_str::<SidecarEvent>(json).unwrap() {
-            SidecarEvent::Diagnostic { message } => assert_eq!(message, "device changed"),
+            SidecarEvent::Diagnostic { message, input_device } => {
+                assert_eq!(message, "device changed");
+                assert_eq!(input_device, None);
+            }
             _ => panic!("expected Diagnostic variant"),
+        }
+    }
+
+    #[test]
+    fn a_recovery_diagnostic_keeps_its_device_out_of_the_message() {
+        // #174: the device name must not be interpolated into `message`, which
+        // the reader loop logs to stderr verbatim. It arrives as its own field
+        // and the user-facing sentence is composed from the two.
+        let json = r#"{"event":"diagnostic","message":"Audio input device changed; microphone capture resumed.","input_device":"Michael's AirPods Pro"}"#;
+        match serde_json::from_str::<SidecarEvent>(json).unwrap() {
+            SidecarEvent::Diagnostic { message, input_device } => {
+                assert!(!message.contains("AirPods"), "device leaked into the logged message");
+                assert_eq!(input_device.as_deref(), Some("Michael's AirPods Pro"));
+            }
+            _ => panic!("expected Diagnostic variant"),
+        }
+    }
+
+    #[test]
+    fn heartbeat_carries_the_input_device_name() {
+        // #174: the heartbeat names the input device the mic tap is actually
+        // on, so the no-audio warning can say *which* device it isn't
+        // hearing instead of "check your microphone".
+        let json = r#"{"event":"heartbeat","mic_frames":1,"sys_frames":2,"chunks":0,"mic_peak":0.0,"sys_peak":0.1,"input_device":"AirPods Pro"}"#;
+        match serde_json::from_str::<SidecarEvent>(json).unwrap() {
+            SidecarEvent::Heartbeat { input_device, .. } => {
+                assert_eq!(input_device.as_deref(), Some("AirPods Pro"));
+            }
+            _ => panic!("expected Heartbeat variant"),
+        }
+    }
+
+    #[test]
+    fn heartbeat_without_an_input_device_still_deserializes() {
+        // The sidecar binary is SHA-stamp cached and bundled separately from
+        // the Rust build, so a newer app genuinely can meet an older sidecar
+        // that emits no `input_device`. That must degrade to "unknown
+        // device" (the warning falls back to its old copy), never to a
+        // dropped heartbeat — the heartbeat also carries the level meters
+        // and the chunk counter that reveal this whole class of fault.
+        let json = r#"{"event":"heartbeat","mic_frames":1,"sys_frames":2,"chunks":0,"mic_peak":0.0,"sys_peak":0.1}"#;
+        match serde_json::from_str::<SidecarEvent>(json).unwrap() {
+            SidecarEvent::Heartbeat { input_device, mic_frames, .. } => {
+                assert_eq!(input_device, None);
+                assert_eq!(mic_frames, 1);
+            }
+            _ => panic!("expected Heartbeat variant"),
         }
     }
 

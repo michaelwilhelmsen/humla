@@ -9,6 +9,39 @@ import { cn } from "../lib/cn";
 // (see the store's activeAccumMs / activeSince bookkeeping).
 const NO_AUDIO_WARN_MS = 10_000;
 
+// Device names are user-authored and arbitrary, so a pathological one is
+// clamped rather than allowed to grow the warning without limit. 40 is measured
+// against the narrowest body column the layout allows (`BODY_MIN`, 420px) via
+// the harness's `?case=noaudio-long`: at the clamp the warning wraps to two
+// lines and still fits, so a longer name buys nothing but a taller pill.
+const MAX_DEVICE_NAME = 40;
+
+/**
+ * The no-audio warning's copy, which turns on whether the sidecar could name
+ * the input device (#174).
+ *
+ * The warning that motivated this was correct and useless in the same breath:
+ * a pair of headphones in another room held the macOS default input, and
+ * "check your microphone" misdirected toward the mic hardware in front of the
+ * user rather than the device selection somewhere else entirely. Naming the
+ * device is the whole fix — with no name we say strictly less, never a guess.
+ */
+export function noAudioWarning(device?: string | null): string {
+  const name = device?.trim();
+  if (!name) return "No audio detected — check your microphone";
+  // Clamp by code point, not by UTF-16 code unit: people put emoji in device
+  // names, and `slice` can cut a surrogate pair in half, which renders as a
+  // U+FFFD replacement glyph — a broken character inside a warning reads as a
+  // second bug. `trimEnd` so a name clamped mid-space doesn't strand one
+  // before the ellipsis.
+  const chars = Array.from(name);
+  const shown =
+    chars.length > MAX_DEVICE_NAME
+      ? `${chars.slice(0, MAX_DEVICE_NAME - 1).join("").trimEnd()}…`
+      : name;
+  return `No audio from ${shown} — check your input device in System Settings`;
+}
+
 // Floating recording controls. Record / Summarize live in the note toolbar
 // now; this bar surfaces only the in-flight states (starting / recording /
 // paused / stopping / diarizing / summarizing). A neutral status pill (mic/sys
@@ -67,6 +100,10 @@ export function RecordingBar({ noteId }: { noteId: string }) {
   const micHeard = useRecordingStore((s) => s.micHeard);
   const activeSince = useRecordingStore((s) => s.activeSince);
   const activeAccumMs = useRecordingStore((s) => s.activeAccumMs);
+  // The device the sidecar says the mic tap is on. Gated on the heartbeat
+  // belonging to THIS note, so a recording running on another note can't put
+  // its device name in this note's warning.
+  const inputDevice = diag && diag.noteId === noteId ? diag.inputDevice : null;
   const [showNoAudio, setShowNoAudio] = useState(false);
   useEffect(() => {
     // Only ever warn while THIS note is actively recording and the mic has
@@ -119,10 +156,24 @@ export function RecordingBar({ noteId }: { noteId: string }) {
     : "border-[var(--color-line-visible)] hover:bg-[var(--color-pill-hover)]";
 
   return (
-    <div className="absolute bottom-6 left-1/2 -translate-x-1/2 z-30 flex flex-col items-center gap-2.5">
+    // `inset-x-0` rather than `left-1/2 -translate-x-1/2`: centring by transform
+    // left the container shrink-to-fit, and a `shrink-0` child then overflowed
+    // it on both sides with nothing able to bound the pill (#174 — naming the
+    // device made the warning wider than a 420px `BODY_MIN` body column).
+    // Spanning the column and centring with `items-center` gives children a real
+    // width to wrap against. `pointer-events-none` keeps the now-full-width
+    // container from swallowing clicks meant for the note body beneath it; the
+    // pills put it back.
+    <div className="absolute bottom-6 inset-x-0 z-30 flex flex-col items-center gap-2.5 px-4 pointer-events-none">
       {showNoAudio && (
         <div
-          className="nd-recpill no-drag shrink-0 flex items-center gap-2 h-[34px] px-3.5 rounded-full border text-[12.5px] font-medium"
+          // Wraps rather than clips: with the device name in it (#174) this copy
+          // does not fit one line in a 420px body column, and the actionable
+          // half is the tail ("check your input device in System Settings") so
+          // truncating it would cost exactly the part worth reading. Hence
+          // `min-h` + `py` rather than a fixed `h-[34px]` — one line on a roomy
+          // column, two on a narrow one, never overflowing either.
+          className="nd-recpill no-drag pointer-events-auto max-w-full flex items-center gap-2 min-h-[34px] py-1.5 px-3.5 rounded-full border text-[12.5px] font-medium text-left"
           style={{
             borderColor: "var(--color-warning)",
             color: "var(--color-warning-text)",
@@ -130,12 +181,12 @@ export function RecordingBar({ noteId }: { noteId: string }) {
           }}
           role="alert"
         >
-          <MicOff size={14} strokeWidth={1.8} />
-          <span>No audio detected — check your microphone</span>
+          <MicOff size={14} strokeWidth={1.8} className="shrink-0" />
+          <span>{noAudioWarning(inputDevice)}</span>
         </div>
       )}
 
-      <div className="flex items-center gap-2.5">
+      <div className="flex items-center gap-2.5 pointer-events-auto">
       {showDiag && (
         <div className="nd-recpill shrink-0 whitespace-nowrap flex items-center gap-[13px] h-[38px] px-4 rounded-full border border-[var(--color-line-visible)] text-[13px] text-[var(--color-text-muted)] tabular-nums">
           <span className="inline-flex items-center gap-[8px]">

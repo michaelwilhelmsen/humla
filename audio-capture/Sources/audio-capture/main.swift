@@ -1,6 +1,7 @@
 import Foundation
 import AppKit
 import AVFoundation
+import CoreAudio
 import ScreenCaptureKit
 import CoreMedia
 import CoreGraphics
@@ -367,6 +368,91 @@ func recordSysStats(samples: [Float]) {
     stats.lock.unlock()
 }
 
+// MARK: - Input device name (#174)
+//
+// The no-audio warning used to say "check your microphone", which named the one
+// thing the user can't see. The failure that motivated this was a pair of
+// headphones connected in *another room* holding the macOS default input: the
+// frame counters climbed (the tap delivers samples whether or not anyone is
+// audible), so only `chunks` staying at 0 revealed the fault, and that reads as
+// "nobody has spoken yet" rather than as a broken device.
+//
+// WHICH DEVICE WE NAME: the one the tap is actually on, falling back to the
+// system default. The two agree in the normal case and diverge exactly when
+// something has gone wrong — and in that case the engine's device is both the
+// truthful answer and the more useful one. If the engine ever fails to follow a
+// default-input change (the fault `reconfigureMicAfterDeviceChange` below
+// exists to repair), naming the system default would name a device that is
+// already correct, and the warning would read as "your working mic is broken"
+// while Humla quietly recorded a dead one.
+//
+// PRIVACY: device names are user-authored and routinely contain a real person's
+// name ("Michael's AirPods Pro"). This value rides the heartbeat to a transient
+// warning and stops there — it must never reach a diagnostics dump, a log that
+// gets shared, or anything synced.
+
+/// Human-readable name of a CoreAudio device, or nil if the HAL won't name it.
+func audioDeviceName(_ id: AudioDeviceID) -> String? {
+    guard id != AudioDeviceID(kAudioObjectUnknown) else { return nil }
+    var address = AudioObjectPropertyAddress(
+        mSelector: kAudioObjectPropertyName,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+    )
+    var name: CFString? = nil
+    var size = UInt32(MemoryLayout<CFString?>.size)
+    let status = withUnsafeMutablePointer(to: &name) {
+        AudioObjectGetPropertyData(id, &address, 0, nil, &size, $0)
+    }
+    guard status == noErr, let resolved = name as String? else { return nil }
+    let trimmed = resolved.trimmingCharacters(in: .whitespacesAndNewlines)
+    return trimmed.isEmpty ? nil : trimmed
+}
+
+/// The device macOS currently considers the default input — what the engine
+/// follows, and what the user sees selected in System Settings.
+func defaultInputDeviceID() -> AudioDeviceID {
+    var address = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDefaultInputDevice,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+    )
+    var id = AudioDeviceID(kAudioObjectUnknown)
+    var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+    let status = AudioObjectGetPropertyData(
+        AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &id
+    )
+    return status == noErr ? id : AudioDeviceID(kAudioObjectUnknown)
+}
+
+/// Name of the device the mic tap is running against. Called on the main
+/// thread at tap-install time only — see `InputDevice` below.
+func resolveInputDeviceName() -> String? {
+    audioDeviceName(engine.inputNode.auAudioUnit.deviceID)
+        ?? audioDeviceName(defaultInputDeviceID())
+}
+
+/// Cache for the resolved name. The heartbeat fires on its own queue, and
+/// reaching into `AVAudioEngine` from there to re-resolve every 2s would both
+/// touch the engine off the main thread and re-query the HAL for a value that
+/// only changes when the tap is reinstalled. Resolved where that happens
+/// instead (`installMicTap`, always on the main thread) and read here.
+final class InputDevice {
+    private let lock = NSLock()
+    private var name: String?
+    func set(_ value: String?) {
+        lock.lock()
+        name = value
+        lock.unlock()
+    }
+    func get() -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return name
+    }
+}
+let inputDevice = InputDevice()
+
 // Wrap a Float32 sample array into an AVAudioPCMBuffer for the writers. The
 // writers expect mono Float32 at the target sample rate.
 func makeBuffer(_ samples: [Float]) -> AVAudioPCMBuffer? {
@@ -393,6 +479,9 @@ var micConverter: AVAudioConverter?
 // identical tap against whatever the current input format happens to be.
 func installMicTap(_ input: AVAudioInputNode, format inFormat: AVAudioFormat) {
     micConverter = AVAudioConverter(from: inFormat, to: targetFormat)
+    // Both callers are on the main thread (startup, and device-change
+    // recovery). Cached rather than re-resolved per heartbeat — see `InputDevice`.
+    inputDevice.set(resolveInputDeviceName())
     input.installTap(onBus: 0, bufferSize: 4096, format: inFormat) { buffer, _ in
         guard let conv = micConverter else { return }
         let ratio = targetSampleRate / inFormat.sampleRate
@@ -673,14 +762,19 @@ hbTimer.setEventHandler {
     stats.micPeak = 0
     stats.sysPeak = 0
     stats.lock.unlock()
-    emit([
+    var payload: [String: Any] = [
         "event": "heartbeat",
         "mic_frames": mF,
         "sys_frames": sF,
         "chunks": ch,
         "mic_peak": mp,
         "sys_peak": sp,
-    ])
+    ]
+    // Omitted rather than sent as null when the HAL won't name the device; the
+    // Rust side defaults the field and the warning falls back to its
+    // device-less copy.
+    if let device = inputDevice.get() { payload["input_device"] = device }
+    emit(payload)
 }
 if !isImport {
     hbTimer.resume()
@@ -740,6 +834,11 @@ func reconfigureMicAfterDeviceChange() {
     input.removeTap(onBus: 0)
     let newFormat = input.inputFormat(forBus: 0)
     guard newFormat.sampleRate > 0, newFormat.channelCount > 0 else {
+        // The tap is off and no new one goes on, so there is no device to
+        // name. Clearing beats keeping the old name: the heartbeat would
+        // otherwise keep reporting a device that capture has stopped using,
+        // and the warning would tell the user to go check it.
+        inputDevice.set(nil)
         emitError("Audio device changed but the new microphone format is unavailable; mic capture did not resume.")
         return
     }
@@ -756,7 +855,16 @@ func reconfigureMicAfterDeviceChange() {
             return
         }
     }
-    emit(["event": "diagnostic", "message": "Audio input device changed; microphone capture resumed on the new device."])
+    // The device rides its own field rather than being interpolated into
+    // `message`: the Rust side logs `message` verbatim to stderr, and a device
+    // name is display-only (it routinely contains a real person's name). The
+    // toast text is composed there from the two parts.
+    var payload: [String: Any] = [
+        "event": "diagnostic",
+        "message": "Audio input device changed; microphone capture resumed.",
+    ]
+    if let device = inputDevice.get() { payload["input_device"] = device }
+    emit(payload)
 }
 
 if !isImport {
