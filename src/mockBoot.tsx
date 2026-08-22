@@ -30,6 +30,7 @@ import { NoteTitleBox, NoteToolbar, TranscriptEditor, TranscriptPlayer } from ".
 import { IntegrationsSection } from "./pages/settings/tabs/Integrations";
 import { RecordingSection } from "./pages/settings/tabs/Recording";
 import { NewWorkspaceModal } from "./components/NewWorkspaceModal";
+import { TranscriptTurnsPrototype } from "./components/TranscriptTurns.prototype";
 import { DISCONNECTED, useCloudStore, type CloudStatus, type CloudWorkspace } from "./lib/cloud";
 import { DEFAULTS, type EditableKey } from "./pages/settings/types";
 import { SummaryStep } from "./pages/onboarding/steps/Summary";
@@ -787,6 +788,21 @@ const CASES: Record<string, Scenario> = {
   "ws-name": workspaceCase("name"),
   "ws-trial": workspaceCase("trial"),
   "ws-invite": workspaceCase("invite"),
+
+  // --- PROTOTYPE (#176, throwaway): four shapes for "who spoke", switchable
+  // with `?variant=A|B|C|D` from the floating bar. Stood in the same
+  // panel-sized card `?case=player` uses, since density is the whole question.
+  "transcript-turns": {
+    wrap: (node) => (
+      <div className="flex-1 min-h-0 flex justify-center px-6 py-8">
+        <div className="w-full max-w-[420px] rounded-[var(--radius-card)] bg-[var(--color-surface)] flex flex-col min-h-0 px-4 py-4">
+          {node}
+        </div>
+      </div>
+    ),
+    render: () => <TranscriptTurnsPrototype />,
+    ipc: {},
+  },
 
   // --- #177: the controls row against the column it centres in. `recbar-420`
   // is `BODY_MIN`; `recbar-default` is the width the shipped default window
