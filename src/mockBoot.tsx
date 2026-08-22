@@ -630,6 +630,72 @@ function noAudioCase(device: string | null, width = BODY_MIN_PX): Scenario {
   };
 }
 
+// ---- #177 axis: how wide the controls row is against the column it centres in
+//
+// The row is diagnostics pill + (optionally) a busy pill + the timer/controls
+// pill, every one of them `shrink-0 whitespace-nowrap` — so the row's width is
+// a constant and the column's is not. jsdom pins every box to 0, so whether
+// the row fits can only be asked here (and by `scripts/measure-recording-bar.js`,
+// which sweeps these widths).
+//
+// The widths that matter: 420 is `BODY_MIN`, the narrowest the body column is
+// nominally allowed to be, and 414 is what it actually gets in the SHIPPED
+// DEFAULT — 1100px window, sidebar open, panel at its clamped 406. The bar
+// overhung both before the degradation ladder went in.
+function recBarCase(
+  width: number,
+  opts: { summarizing?: boolean; paused?: boolean; long?: boolean } = {},
+): Scenario {
+  const { summarizing = false, paused = false, long = false } = opts;
+  return {
+    wrap: (node) => (
+      <div className="flex-1 flex flex-col items-center gap-3 py-6">
+        <p className="text-xs text-[var(--color-text-muted)]">
+          body column: {width}px
+          {summarizing && " · summarizing"}
+          {paused && " · paused"}
+          {long && " · long recording"}
+        </p>
+        {/* The body column, dashed so an overhanging row is visible as one that
+            leaves it. Deliberately NOT `overflow-hidden`: the real column has
+            no clip either, which is why the overhang paints over the nav card
+            on one side and under the context panel on the other. */}
+        <div
+          className="relative h-[220px] border border-dashed border-[var(--color-line-visible)]"
+          style={{ width }}
+        >
+          {node}
+        </div>
+      </div>
+    ),
+    render: () => {
+      // The bar reads the store, not IPC. `long` seeds the widest content each
+      // pill can honestly reach: a 90-minute capture (4-digit seconds, 3-digit
+      // chunk count) and a timer past the hour.
+      useRecordingStore.setState({
+        status: { noteId: "n1", phase: paused ? "paused" : "recording" },
+        summarizing: summarizing ? { n1: true } : {},
+        micHeard: true,
+        activeSince: null,
+        activeAccumMs: 0,
+        micLevel: 0.4,
+        sysLevel: 0.2,
+        diag: {
+          noteId: "n1",
+          micFrames: long ? 16000 * 5400 : 16000 * 14,
+          sysFrames: long ? 16000 * 5400 : 16000 * 14,
+          chunks: long ? 428 : 3,
+          micPeak: 0.4,
+          sysPeak: 0.2,
+          inputDevice: "MacBook Pro-mikrofon",
+        },
+      });
+      return <RecordingBar noteId="n1" />;
+    },
+    ipc: {},
+  };
+}
+
 const CASES: Record<string, Scenario> = {
   // --- #90: the automatic titler's two states. Compare `title-writing` against
   // `title-idle` and `title-idle-long` — nothing below the title may shift.
@@ -721,6 +787,20 @@ const CASES: Record<string, Scenario> = {
   "ws-name": workspaceCase("name"),
   "ws-trial": workspaceCase("trial"),
   "ws-invite": workspaceCase("invite"),
+
+  // --- #177: the controls row against the column it centres in. `recbar-420`
+  // is `BODY_MIN`; `recbar-default` is the width the shipped default window
+  // actually gives the column; the `-summary` pair adds the third pill that
+  // a summary running during a recording puts in the same row; `-long` is the
+  // widest honest content (90-minute capture, paused, hour-plus timer).
+  "recbar-wide": recBarCase(900),
+  "recbar-default": recBarCase(414),
+  "recbar-420": recBarCase(420),
+  "recbar-380": recBarCase(380),
+  "recbar-summary": recBarCase(414, { summarizing: true }),
+  "recbar-summary-380": recBarCase(380, { summarizing: true }),
+  "recbar-long": recBarCase(420, { paused: true, long: true }),
+  "recbar-long-summary": recBarCase(420, { paused: true, long: true, summarizing: true }),
 
   // --- #174: the no-audio warning naming the device it isn't hearing.
   // A real (localized) device name, the fallback when the HAL won't name one,

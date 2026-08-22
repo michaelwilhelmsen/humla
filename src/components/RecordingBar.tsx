@@ -42,6 +42,76 @@ export function noAudioWarning(device?: string | null): string {
   return `No audio from ${shown} — check your input device in System Settings`;
 }
 
+/**
+ * How the controls row gives way when the body column gets narrow (#177).
+ *
+ * Every pill in the row is `shrink-0 whitespace-nowrap` — correct individually,
+ * since each is a fixed-height pill that would overflow rather than grow if its
+ * text wrapped — so the row's width is a constant and the column's is not. The
+ * row measured 442px (warm) / 457px (graphite) against a body column allowed
+ * down to `BODY_MIN` (420) and sitting at 414 in the shipped default window, so
+ * it overhung: under the context panel on the right, over the nav card on the
+ * left, taking part of the stop button with it.
+ *
+ * So it degrades, the way `NoteToolbar` already does in the same view — and for
+ * the same reason. Four steps, ordered by how little each costs:
+ *
+ *   1. `detail` — the diagnostics pill's seconds and chunk count. The meters
+ *      stay: "is it hearing me" is why the pill exists, and #174 leaned on
+ *      exactly that. The numbers stay reachable in the pill's `title`.
+ *   2. `pausedWord` — the word PAUSED. A pause glyph beside a frozen timer
+ *      already says it.
+ *   3. `pill` — the diagnostics pill entirely. The controls are not optional;
+ *      this is.
+ *   4. `busyLabel` — "Summarizing…" down to its spinner, which only matters
+ *      when a summary runs during a recording and so shares the row with the
+ *      controls pill. The pill keeps its name (`role="status"` + `aria-label`).
+ *
+ * Two arrangements, because the thresholds depend on what else is in the row:
+ * `roomy` is diagnostics + controls, `tight` adds the busy pill a summary puts
+ * there. Every step fires earlier in `tight` — pinned as an ordering test,
+ * since that direction is the one that can only ever be a bug.
+ *
+ * The cost order above is what each step is worth, not a promise about the
+ * numbers: a step fires where the row needs the width it frees, so `tight`
+ * reaches for the diagnostics pill (151px) BEFORE the word PAUSED (~50px),
+ * because at 575px of content the row is 562px and no amount of PAUSED closes
+ * that. Cheapest-first only holds where the cheap step is enough — `roomy`,
+ * where it is, keeps PAUSED to 420 and the pill to 370.
+ *
+ * The numbers are the CONTAINER'S CONTENT BOX, which is the body column minus
+ * this bar's `px-4` (32px) — so `BODY_MIN`'s 420 column is 388 here. They are
+ * measured in the graphite theme (the wider of the two) against the widest
+ * honest content — a 90-minute capture, paused, with an hour-plus timer — by
+ * `scripts/measure-recording-bar.js` over the harness's `?case=recbar-*`. jsdom
+ * pins every box to 0, so it cannot answer this and no unit test tries to.
+ * Re-derive them with that script after any change to the row's contents or to
+ * a theme's control metrics.
+ */
+export const ROW_STEPS = {
+  // diagnostics + controls. Full row 583, compact 406, compact over a
+  // PAUSED-less controls pill 356.
+  roomy: {
+    detail: "@max-[600px]:hidden",
+    pausedWord: "@max-[420px]:hidden",
+    pill: "@max-[370px]:hidden",
+    busyLabel: "",
+  },
+  // diagnostics + busy + controls. Full row 739, compact 562, no diagnostics
+  // 411, bare spinner 259 — which clears the narrowest column the layout can
+  // produce.
+  tight: {
+    detail: "@max-[760px]:hidden",
+    pausedWord: "@max-[430px]:hidden",
+    pill: "@max-[575px]:hidden",
+    // `sr-only`, not `hidden`: the pill is a `role="status"` live region and
+    // `display: none` would leave it announcing nothing when a summary starts.
+    // Absolutely positioned, so it is out of flow and out of the flex gap —
+    // width-identical to hiding it, which the sweep confirms.
+    busyLabel: "@max-[430px]:sr-only",
+  },
+} as const;
+
 // Floating recording controls. Record / Summarize live in the note toolbar
 // now; this bar surfaces only the in-flight states (starting / recording /
 // paused / stopping / diarizing / summarizing). A neutral status pill (mic/sys
@@ -149,6 +219,17 @@ export function RecordingBar({ noteId }: { noteId: string }) {
   }
 
   const recording = phase === "recording";
+  const hasControls = recording || phase === "paused";
+  // Which arrangement the row is in (#177). Three pills only ever happen one
+  // way — a summary running while this note records — and the diagnostics pill
+  // shows only while it does, so this one choice covers every step.
+  const steps = isSummarizing && hasControls ? ROW_STEPS.tight : ROW_STEPS.roomy;
+  // What the diagnostics pill says once its numbers are hidden by step 1. The
+  // pill is the only place they survive from there, so it carries them whole.
+  const readout = diag
+    ? `mic ${(diag.micFrames / 16000).toFixed(0)}s · sys ${(diag.sysFrames / 16000).toFixed(0)}s` +
+      ` · ${diag.chunks} chunk${diag.chunks === 1 ? "" : "s"}`
+    : "";
   // The control pill's inner dividers + button hovers tint red while live,
   // neutral while paused — keeps the red reserved for the active state.
   const ctrlEdge = recording
@@ -164,7 +245,11 @@ export function RecordingBar({ noteId }: { noteId: string }) {
     // width to wrap against. `pointer-events-none` keeps the now-full-width
     // container from swallowing clicks meant for the note body beneath it; the
     // pills put it back.
-    <div className="absolute bottom-6 inset-x-0 z-30 flex flex-col items-center gap-2.5 px-4 pointer-events-none">
+    // `@container` (#177): the row degrades against the BODY COLUMN's width,
+    // which is this element's — the window's is the wrong question, since the
+    // column narrows as the user drags the context panel wider. Thresholds are
+    // this box's CONTENT width, so `px-4` is already outside them.
+    <div className="@container absolute bottom-6 inset-x-0 z-30 flex flex-col items-center gap-2.5 px-4 pointer-events-none">
       {showNoAudio && (
         <div
           // Wraps rather than clips: with the device name in it (#174) this copy
@@ -188,24 +273,45 @@ export function RecordingBar({ noteId }: { noteId: string }) {
 
       <div className="flex items-center gap-2.5 pointer-events-auto">
       {showDiag && (
-        <div className="nd-recpill shrink-0 whitespace-nowrap flex items-center gap-[13px] h-[38px] px-4 rounded-full border border-[var(--color-line-visible)] text-[13px] text-[var(--color-text-muted)] tabular-nums">
+        <div
+          className={cn(
+            "nd-recpill shrink-0 whitespace-nowrap flex items-center gap-[13px] h-[38px] px-4 rounded-full border border-[var(--color-line-visible)] text-[13px] text-[var(--color-text-muted)] tabular-nums",
+            steps.pill,
+          )}
+          title={readout}
+        >
+          {/* One text run per meter, not three flex items: the seconds hide
+              inside the label's own span (leading space included, so the
+              compact step reads "mic" and not "mic ") rather than becoming a
+              sibling the flex gap would then space differently. */}
           <span className="inline-flex items-center gap-[8px]">
-            <Meter level={micMeter} active={micActive} /> mic {(diag.micFrames / 16000).toFixed(0)}s
+            <Meter level={micMeter} active={micActive} />
+            <span>
+              mic<span className={steps.detail}> {(diag.micFrames / 16000).toFixed(0)}s</span>
+            </span>
           </span>
           <span className="inline-flex items-center gap-[8px]">
-            <Meter level={sysMeter} active={sysActive} /> sys {(diag.sysFrames / 16000).toFixed(0)}s
+            <Meter level={sysMeter} active={sysActive} />
+            <span>
+              sys<span className={steps.detail}> {(diag.sysFrames / 16000).toFixed(0)}s</span>
+            </span>
           </span>
-          <span className="text-[var(--color-text-disabled)]">· {diag.chunks} chunk{diag.chunks === 1 ? "" : "s"}</span>
+          <span className={cn("text-[var(--color-text-disabled)]", steps.detail)}>
+            · {diag.chunks} chunk{diag.chunks === 1 ? "" : "s"}
+          </span>
         </div>
       )}
 
+      {/* None of these four phases coexists with the controls pill, so their
+          labels never have to give — only `isSummarizing`, which can run over a
+          live recording, carries a threshold (`steps.busyLabel`). */}
       {phase === "starting" && <BusyPill label="Starting…" />}
       {phase === "importing" && <BusyPill label="Transcribing audio…" />}
       {phase === "stopping" && <BusyPill label="Stopping…" />}
       {phase === "diarizing" && <BusyPill label="Identifying speakers…" />}
-      {isSummarizing && <BusyPill label="Summarizing…" />}
+      {isSummarizing && <BusyPill label="Summarizing…" labelClass={steps.busyLabel} />}
 
-      {(phase === "recording" || phase === "paused") && (
+      {hasControls && (
         <div
           className={cn(
             "nd-recpill no-drag shrink-0 whitespace-nowrap flex items-stretch h-[38px] rounded-full overflow-hidden border",
@@ -223,7 +329,14 @@ export function RecordingBar({ noteId }: { noteId: string }) {
               : <Pause size={12} strokeWidth={1.8} />}
             <span>{formatTime(elapsed)}</span>
             {phase === "paused" && (
-              <span className="uppercase tracking-[0.08em] text-[10px] font-medium">Paused</span>
+              <span
+                className={cn(
+                  "uppercase tracking-[0.08em] text-[10px] font-medium",
+                  steps.pausedWord,
+                )}
+              >
+                Paused
+              </span>
             )}
           </div>
           <button
@@ -257,11 +370,20 @@ function formatTime(s: number) {
   return `${m}:${r.toString().padStart(2, "0")}`;
 }
 
-function BusyPill({ label }: { label: string }) {
+// `role="status"` + `aria-label` rather than the label text alone: at the
+// tightest step (#177) `labelClass` takes the text out of the layout and the
+// pill is a bare spinner, which without a name says only that something is
+// happening. The text itself stays in the accessibility tree (`sr-only`, not
+// `hidden`) so the live region has something to announce when it appears.
+function BusyPill({ label, labelClass }: { label: string; labelClass?: string }) {
   return (
-    <div className="nd-recpill no-drag shrink-0 flex items-center gap-2 h-[38px] px-4 rounded-full border border-[var(--color-line-visible)] text-[13px] font-medium text-[var(--color-text-muted)]">
+    <div
+      className="nd-recpill no-drag shrink-0 flex items-center gap-2 h-[38px] px-4 rounded-full border border-[var(--color-line-visible)] text-[13px] font-medium text-[var(--color-text-muted)]"
+      role="status"
+      aria-label={label}
+    >
       <span className="w-3 h-3 rounded-full border-2 border-current border-t-transparent animate-spin" />
-      <span>{label}</span>
+      <span className={labelClass}>{label}</span>
     </div>
   );
 }
