@@ -123,7 +123,7 @@ function VariantB() {
           {run.map((t) => (
             <div
               key={t.id}
-              className="pl-[15px] py-1 rounded transition-colors hover:bg-[var(--color-pill-hover)]"
+              className="py-1 rounded transition-colors hover:bg-[var(--color-pill-hover)]"
             >
               {t.text}
             </div>
