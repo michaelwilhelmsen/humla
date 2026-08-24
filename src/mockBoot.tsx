@@ -189,8 +189,8 @@ function TranscriptPlayerHarness({
     text: string,
     startMs: number,
   ): TimelineEntry => ({
-    start_ms: startMs,
-    end_ms: startMs + 3000,
+    startMs: startMs,
+    endMs: startMs + 3000,
     label,
     text,
     words: text.split(" ").map((w, i) => ({

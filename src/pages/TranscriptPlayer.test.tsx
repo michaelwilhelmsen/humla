@@ -43,8 +43,8 @@ beforeAll(() => {
 
 function entry(over: Partial<TimelineEntry>): TimelineEntry {
   return {
-    start_ms: 0,
-    end_ms: 1000,
+    startMs: 0,
+    endMs: 1000,
     label: "",
     text: "",
     words: [],
@@ -105,8 +105,8 @@ describe("TranscriptPlayer session seek (BUG A/B)", () => {
 
   it("seeks immediately when the target session resolves to the already-loaded url", async () => {
     const timeline = [
-      entry({ sessionId: "s1", sessionIndex: 0, text: "hello", start_ms: 0, end_ms: 1000, words: [{ text: "hello", start_ms: 0, end_ms: 1000 }] }),
-      entry({ sessionId: "s2", sessionIndex: 1, text: "world", start_ms: 0, end_ms: 1000, words: [{ text: "world", start_ms: 5000, end_ms: 6000 }] }),
+      entry({ sessionId: "s1", sessionIndex: 0, text: "hello", startMs: 0, endMs: 1000, words: [{ text: "hello", start_ms: 0, end_ms: 1000 }] }),
+      entry({ sessionId: "s2", sessionIndex: 1, text: "world", startMs: 0, endMs: 1000, words: [{ text: "world", start_ms: 5000, end_ms: 6000 }] }),
     ];
     const { container } = renderPlayer({
       sessions: [session({ id: "s1", index: 1 }), session({ id: "s2", index: 2 })],
@@ -240,8 +240,8 @@ describe("TranscriptPlayer per-turn editing (#170)", () => {
       sessionIndex: 0,
       label: "Michael",
       text: "so where did we",
-      start_ms: 0,
-      end_ms: 1000,
+      startMs: 0,
+      endMs: 1000,
       chunkIdx: 0,
       words: [{ text: "so", start_ms: 0, end_ms: 1000 }],
     }),
@@ -250,8 +250,8 @@ describe("TranscriptPlayer per-turn editing (#170)", () => {
       sessionIndex: 0,
       label: "Michael",
       text: "land on the freeze",
-      start_ms: 1000,
-      end_ms: 2000,
+      startMs: 1000,
+      endMs: 2000,
       chunkIdx: 1,
       words: [{ text: "land", start_ms: 1000, end_ms: 2000 }],
     }),
@@ -332,8 +332,8 @@ describe("TranscriptPlayer per-turn editing (#170)", () => {
           sessionIndex: 0,
           label: "Hege",
           text: "next Friday",
-          start_ms: 2000,
-          end_ms: 3000,
+          startMs: 2000,
+          endMs: 3000,
           chunkIdx: 2,
         }),
       ],
@@ -433,8 +433,8 @@ describe("TranscriptPlayer turn titles (#176)", () => {
     renderPlayer({
       sessions: [session({ id: "s1", index: 1 })],
       timeline: [
-        entry({ sessionId: "s1", label: "Hege", text: "Jeg har notatene klare", start_ms: 4000 }),
-        entry({ sessionId: "s1", label: "You", text: "Bra", start_ms: 9000 }),
+        entry({ sessionId: "s1", label: "Hege", text: "Jeg har notatene klare", startMs: 4000 }),
+        entry({ sessionId: "s1", label: "You", text: "Bra", startMs: 9000 }),
       ],
       fallbackPlaybackUrl: null,
     });
@@ -450,8 +450,8 @@ describe("TranscriptPlayer turn titles (#176)", () => {
     renderPlayer({
       sessions: [session({ id: "s1", index: 1 })],
       timeline: [
-        entry({ sessionId: "s1", label: "Hege", text: "Ja, jeg har notatene klare", start_ms: 0, chunkIdx: 0 }),
-        entry({ sessionId: "s1", label: "Hege", text: "og tallene fra i går", start_ms: 3000, chunkIdx: 1 }),
+        entry({ sessionId: "s1", label: "Hege", text: "Ja, jeg har notatene klare", startMs: 0, chunkIdx: 0 }),
+        entry({ sessionId: "s1", label: "Hege", text: "og tallene fra i går", startMs: 3000, chunkIdx: 1 }),
       ],
       fallbackPlaybackUrl: null,
     });
@@ -464,7 +464,7 @@ describe("TranscriptPlayer turn titles (#176)", () => {
     // (#169). An empty title bar over it would be a header saying nothing.
     const { container } = renderPlayer({
       sessions: [session({ id: "s1", index: 1 })],
-      timeline: [entry({ sessionId: "s1", label: "", text: "ingen etikett her", start_ms: 0 })],
+      timeline: [entry({ sessionId: "s1", label: "", text: "ingen etikett her", startMs: 0 })],
       fallbackPlaybackUrl: null,
     });
     await screen.findByText("ingen etikett her");
@@ -479,7 +479,7 @@ describe("TranscriptPlayer turn titles (#176)", () => {
     // fixes it; `?case=player` is where the width itself is checked.
     renderPlayer({
       sessions: [session({ id: "s1", index: 1 })],
-      timeline: [entry({ sessionId: "s1", label: "Hege", text: "en linje", start_ms: 0 })],
+      timeline: [entry({ sessionId: "s1", label: "Hege", text: "en linje", startMs: 0 })],
       fallbackPlaybackUrl: null,
     });
     fireEvent.mouseDown(await screen.findByLabelText("Edit this turn"));
@@ -492,8 +492,8 @@ describe("TranscriptPlayer turn titles (#176)", () => {
     renderPlayer({
       sessions: [session({ id: "s1", index: 1 })],
       timeline: [
-        entry({ sessionId: "s1", label: "Hege", text: "en", start_ms: 0, chunkIdx: 0 }),
-        entry({ sessionId: "s1", label: "You", text: "to", start_ms: 1000, chunkIdx: 1 }),
+        entry({ sessionId: "s1", label: "Hege", text: "en", startMs: 0, chunkIdx: 0 }),
+        entry({ sessionId: "s1", label: "You", text: "to", startMs: 1000, chunkIdx: 1 }),
       ],
       fallbackPlaybackUrl: null,
     });
@@ -506,7 +506,7 @@ describe("TranscriptPlayer turn titles (#176)", () => {
     // note-wide clock), so the stamp reads against the take the turn is in.
     renderPlayer({
       sessions: [session({ id: "s2", index: 2 })],
-      timeline: [entry({ sessionId: "s2", sessionIndex: 1, label: "Hege", text: "sent i opptaket", start_ms: 754_000 })],
+      timeline: [entry({ sessionId: "s2", sessionIndex: 1, label: "Hege", text: "sent i opptaket", startMs: 754_000 })],
       fallbackPlaybackUrl: null,
     });
     expect(await screen.findByText("12:34")).toBeInTheDocument();

@@ -677,7 +677,13 @@ export function Note() {
   // Diarization replaces the transcript wholesale, so we want the editor to
   // reflect that update immediately.
   const allowTranscriptSync =
-    isRecording || isPaused || isStarting || isStopping || isDiarizing || isImporting;
+    isRecording ||
+    isPaused ||
+    isStarting ||
+    isStopping ||
+    isDiarizing ||
+    isImporting ||
+    isTranscribing;
   useEffect(() => {
     if (!note || !draft || note.id !== draft.id) return;
     setDraft((d) => {
@@ -3000,13 +3006,13 @@ export const TranscriptPlayer = memo(function TranscriptPlayer({
         // this playhead. Skip before the sorted-break so an earlier
         // session's entries don't stop the scan prematurely.
         if (active !== null && e.sessionId !== active) continue;
-        if (e.start_ms > ms) break;
-        if (e.end_ms < ms) continue;
+        if (e.startMs > ms) break;
+        if (e.endMs < ms) continue;
         idxs.push(i);
         // Closest start_ms ≤ ms wins the scroll anchor — visually
         // matches what the user just heard begin.
-        if (e.start_ms > anchorStart) {
-          anchorStart = e.start_ms;
+        if (e.startMs > anchorStart) {
+          anchorStart = e.startMs;
           anchor = i;
         }
         const ws = e.words;

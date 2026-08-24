@@ -81,7 +81,7 @@ export function groupTimeline(timeline: TimelineEntry[]): TimelineGroup[] {
     const last = out[out.length - 1];
     if (last && last.label === label && last.sessionId === e.sessionId) {
       last.indices.push(i);
-      last.endMs = Math.max(last.endMs, e.end_ms);
+      last.endMs = Math.max(last.endMs, e.endMs);
       // Skip empty entries when joining: a per-turn edit (#170) writes the new
       // text into the run's lowest entry and empties the rest (their indices
       // must survive, since a chunk index IS a line position), so joining
@@ -98,8 +98,8 @@ export function groupTimeline(timeline: TimelineEntry[]): TimelineGroup[] {
         sessionIndex: e.sessionIndex,
         firstInSession,
         indices: [i],
-        startMs: e.start_ms,
-        endMs: e.end_ms,
+        startMs: e.startMs,
+        endMs: e.endMs,
         text: e.text,
         words: [...ws],
         wordCountByChunk: [ws.length],

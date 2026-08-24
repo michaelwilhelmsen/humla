@@ -11,8 +11,8 @@ import type { NoteSession, TimelineEntry } from "./ipc";
 
 function entry(p: Partial<TimelineEntry>): TimelineEntry {
   return {
-    start_ms: 0,
-    end_ms: 1000,
+    startMs: 0,
+    endMs: 1000,
     label: "",
     text: "",
     words: [],

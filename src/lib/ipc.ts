@@ -238,21 +238,26 @@ export type TimelineWord = {
   end_ms: number;
 };
 
-// One entry per VAD-bounded chunk. `start_ms` / `end_ms` are the
+// One entry per VAD-bounded chunk. `startMs` / `endMs` are the
 // chunk's bounds in the merged playback timeline; mic and sys chunks
 // can overlap, so the player highlights every chunk whose interval
 // brackets the current playhead. `words` (when populated) lets the
 // player highlight each word as audio passes through it.
+//
+// Unlike `TimelineWord` below, the backend's `TimelineEntry` carries
+// `#[serde(rename_all = "camelCase")]`, so these two bounds cross the wire
+// as `startMs`/`endMs` — matching `sessionId`/`sessionIndex`/`chunkIdx`
+// below, not the snake_case `TimelineWord` fields.
 export type TimelineEntry = {
-  start_ms: number;
-  end_ms: number;
+  startMs: number;
+  endMs: number;
   label: string;
   text: string;
   words: TimelineWord[];
   // Which recording session (#16) this entry belongs to, and its 0-based
   // index within that session's own timeline. `noteTimeline` concatenates
   // every session's timeline into one merged document so the reader never
-  // hides text; `start_ms` / `end_ms` / word times stay session-*local*, so
+  // hides text; `startMs` / `endMs` / word times stay session-*local*, so
   // the player only karaoke-matches the active session's entries against the
   // one playback.wav it has loaded.
   sessionId: string;

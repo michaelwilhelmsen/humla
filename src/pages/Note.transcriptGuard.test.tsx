@@ -19,8 +19,8 @@ const COVERED = "so where did we land on the freeze";
 
 function entry(p: Partial<TimelineEntry> = {}): TimelineEntry {
   return {
-    start_ms: 0,
-    end_ms: 1_000,
+    startMs: 0,
+    endMs: 1_000,
     label: "Speaker 1",
     text: COVERED,
     words: [],
