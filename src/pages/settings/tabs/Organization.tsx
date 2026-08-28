@@ -87,7 +87,10 @@ function BillingPanel({
     setBusy(true);
     setErr(null);
     try {
-      const url = kind === "checkout" ? await cloudApi.billingCheckout(ws.id) : await cloudApi.billingPortal(ws.id);
+      const url =
+        kind === "checkout"
+          ? await cloudApi.billingCheckout(ws.id, "settings_organization")
+          : await cloudApi.billingPortal(ws.id);
       await openExternal(url);
     } catch (e) {
       setErr(String(e));

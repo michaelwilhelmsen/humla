@@ -291,6 +291,36 @@ describe("Account section", () => {
     expect(portals[0]).toMatchObject({ workspaceId: "w1" });
   });
 
+  it("tags the checkout with the surface that started it", async () => {
+    // The server records `source` on the Stripe subscription so a trial start
+    // is attributable to the pane it came from. It ALLOWLISTS the value and
+    // drops anything else without failing the checkout — so a missing or
+    // misspelled source costs the datapoint and reports nothing. That is how
+    // the field, shipped server-side on 2026-07-30, sat unsent: every checkout
+    // still worked. This asserts the value leaves the app.
+    const checkouts: unknown[] = [];
+    const status = signedIn("owner");
+    status.current_workspace.plan_status = "none";
+    renderApp("/settings?tab=account", {
+      cloud_status: () => status,
+      cloud_workspace_members: () => MEMBERS,
+      cloud_billing_checkout: (args) => {
+        checkouts.push(args);
+        return "https://checkout.stripe.test/session";
+      },
+    });
+    const dialog = await screen.findByRole("dialog", { name: /settings/i });
+
+    await userEvent.click(
+      await within(dialog).findByRole("button", { name: /free trial/i }),
+    );
+    expect(checkouts).toHaveLength(1);
+    expect(checkouts[0]).toMatchObject({
+      workspaceId: "w1",
+      source: "settings_organization",
+    });
+  });
+
   it("signed-in user can toggle workspace audio upload (default on)", async () => {
     const sets: unknown[] = [];
     renderApp("/settings?tab=account", {

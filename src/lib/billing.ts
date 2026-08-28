@@ -11,7 +11,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { open as openExternal } from "@tauri-apps/plugin-shell";
-import { cloudApi, useCloudStore, type CloudWorkspace } from "./cloud";
+import { cloudApi, useCloudStore, type CheckoutSource, type CloudWorkspace } from "./cloud";
 
 export const CHECKOUT_POLL_MS = 3000;
 /** Soft ceiling on the poll. Past it we stop watching and say so CALMLY — the
@@ -74,8 +74,13 @@ export function billingCta(ws: CloudWorkspace): {
  * to derive "we're done" from the workspace's own `plan_status` rather than
  * from anything here, so a plan that goes live by some other route (a teammate,
  * a webhook landing late, the Portal) lands in the same place.
+ *
+ * `source` is REQUIRED: this hook is the funnel's only choke point, and every
+ * surface that reaches Stripe through it must say which one it is. Making it
+ * optional here is how attribution goes blank without anything breaking — the
+ * server drops an absent source silently, by design, so nothing would complain.
  */
-export function useCheckout(workspaceId: string | null) {
+export function useCheckout(workspaceId: string | null, source: CheckoutSource) {
   const refresh = useCloudStore((s) => s.refresh);
   const [state, setState] = useState<CheckoutState>("idle");
   const [busy, setBusy] = useState(false);
@@ -90,7 +95,7 @@ export function useCheckout(workspaceId: string | null) {
         const url =
           kind === "portal"
             ? await cloudApi.billingPortal(workspaceId)
-            : await cloudApi.billingCheckout(workspaceId);
+            : await cloudApi.billingCheckout(workspaceId, source);
         await openExternal(url);
         setState("waiting");
       } catch (e) {
@@ -99,7 +104,7 @@ export function useCheckout(workspaceId: string | null) {
         setBusy(false);
       }
     },
-    [workspaceId],
+    [workspaceId, source],
   );
 
   // Poll while waiting. Cancellation flag + interval teardown so this can't

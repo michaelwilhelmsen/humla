@@ -1,7 +1,9 @@
 import { useMemo, useState } from "react";
 import { save } from "@tauri-apps/plugin-dialog";
+import { X } from "lucide-react";
 import { ipc, type ExportFormat, type Note } from "../lib/ipc";
 import { useRecordingStore } from "../lib/store";
+import { useCloudStore } from "../lib/cloud";
 import { Modal } from "./settings/components/Modal";
 import { Segmented } from "./settings/components/Segmented";
 import { Toggle } from "./settings/components/Toggle";
@@ -63,14 +65,73 @@ function Check({
   );
 }
 
+// Contextual team hint. Manually exporting a note to hand it to someone is the
+// one moment where a team workspace is the literal answer to what the user is
+// already doing, which is why this is the only place the pitch appears outside
+// Settings. Shown only on Personal — someone already in a workspace does not
+// need telling — and gone for good on the first dismiss. It sits BELOW the
+// action row so it can never compete with Export, and says nothing about price:
+// the trial copy stays next to the button that starts one.
+//
+// The CTA hands straight to the create sheet rather than pointing at Settings.
+// A hint that answers "here is a thing that exists" with "now go find it
+// yourself" spends the one moment of intent it had; the sheet leads with the
+// same pitch Settings would have shown and carries on to a working workspace.
+const HINT_KEY = "humla.teamHint.exportDismissed";
+
+function TeamHint({ onLeave, onCreateTeam }: { onLeave: () => void; onCreateTeam: () => void }) {
+  const inWorkspace = useCloudStore((s) => s.status.current_workspace !== null);
+  const [dismissed, setDismissed] = useState(() => localStorage.getItem(HINT_KEY) === "1");
+
+  if (inWorkspace || dismissed) return null;
+
+  return (
+    <div className="flex items-start gap-2 pt-3 border-t border-[var(--color-line)]">
+      {/* Not `nd-meta`: that class is a nowrap meta-bar pill, and this is a
+          sentence that has to wrap once the window is narrow. */}
+      <p className="flex-1 text-xs leading-relaxed text-[var(--color-text-muted)]">
+        Exporting to share it? A team workspace syncs notes to teammates
+        automatically.{" "}
+        <button
+          onClick={() => {
+            // Closing first, and the sheet belongs to the PARENT: this modal is
+            // about to unmount, and a sheet rendered in here would go with it.
+            onLeave();
+            onCreateTeam();
+          }}
+          className="underline text-[var(--color-accent-text)] hover:no-underline"
+        >
+          Create one
+        </button>
+      </p>
+      <button
+        onClick={() => {
+          localStorage.setItem(HINT_KEY, "1");
+          setDismissed(true);
+        }}
+        title="Don't show this again"
+        aria-label="Dismiss team workspace hint"
+        className="shrink-0 text-[var(--color-text-muted)] hover:text-[var(--color-text)] transition-colors"
+      >
+        <X size={13} strokeWidth={1.5} />
+      </button>
+    </div>
+  );
+}
+
 export function ExportModal({
   note,
   open,
   onClose,
+  onCreateTeam,
 }: {
   note: Note;
   open: boolean;
   onClose: () => void;
+  /** The team hint's CTA. Required rather than optional: the alternative is a
+   *  hint that renders a link doing nothing, which is worse than no hint. The
+   *  sheet has to live in the parent — see TeamHint. */
+  onCreateTeam: () => void;
 }) {
   const pushError = useRecordingStore((s) => s.pushError);
 
@@ -181,6 +242,8 @@ export function ExportModal({
             {busy ? "Exporting…" : "Export…"}
           </Btn>
         </div>
+
+        <TeamHint onLeave={onClose} onCreateTeam={onCreateTeam} />
       </div>
     </Modal>
   );

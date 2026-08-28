@@ -127,6 +127,54 @@ describe("the create-workspace sheet", () => {
     expect(screen.getByRole("button", { name: /start free trial/i })).toBeInTheDocument();
   });
 
+  it("tells checkout which surface it came from", async () => {
+    // `source` rides onto the Stripe subscription so a trial start can be
+    // attributed. The server allowlists it and DROPS anything unrecognised
+    // rather than failing the checkout, so an absent value breaks nothing and
+    // reports nothing — which is exactly how it went unsent for a month.
+    const created = ws({ id: "w9", name: "Acme" });
+    const checkouts: unknown[] = [];
+    const view = open(status(), {
+      cloud_create_workspace: () => created,
+      cloud_billing_checkout: (args) => {
+        checkouts.push(args);
+        return "https://checkout.stripe.test/x";
+      },
+    });
+    view.setServer(status({ current_workspace: created, workspaces: [created] }));
+
+    await userEvent.type(await screen.findByLabelText(/workspace name/i), "Acme{Enter}");
+    await userEvent.click(await screen.findByRole("button", { name: /start free trial/i }));
+
+    await waitFor(() => expect(checkouts).toHaveLength(1));
+    expect(checkouts[0]).toMatchObject({ workspaceId: "w9", source: "new_workspace" });
+  });
+
+  it("separates a workspace rescued from a note's banner from one born here", async () => {
+    // Same sheet, different funnel: the banner opens it on a workspace that was
+    // stranded read-only, which is a different thing to have measured than the
+    // create flow.
+    const stranded = ws({ plan_status: "none" });
+    const checkouts: unknown[] = [];
+    mockTauri({
+      cloud_status: () => status({ current_workspace: stranded, workspaces: [stranded] }),
+      cloud_billing_checkout: (args) => {
+        checkouts.push(args);
+        return "https://checkout.stripe.test/x";
+      },
+    });
+    useCloudStore.setState({
+      status: status({ current_workspace: stranded, workspaces: [stranded] }),
+      ready: true,
+    });
+    render(<NewWorkspaceModal open onClose={() => {}} workspaceId="w1" source="note_banner" />);
+
+    await userEvent.click(await screen.findByRole("button", { name: /start free trial/i }));
+
+    await waitFor(() => expect(checkouts).toHaveLength(1));
+    expect(checkouts[0]).toMatchObject({ workspaceId: "w1", source: "note_banner" });
+  });
+
   it("starts on naming even for someone who already owns workspaces", async () => {
     // "Create team workspace" means a new one — the sheet must not resume the existing
     // workspace's flow just because one is selected.

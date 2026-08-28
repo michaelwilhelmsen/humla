@@ -1121,6 +1121,7 @@ export function Note() {
             open={billingOpen}
             onClose={() => setBillingOpen(false)}
             workspaceId={noteWs.id}
+            source="note_banner"
           />
         )}
         {/* A title is being written for this note. Standing in for the box
@@ -1767,6 +1768,11 @@ export function NoteToolbar({
   const note = useNotesStore((s) => s.notes.find((n) => n.id === noteId));
   const [menuPos, setMenuPos] = useState<{ x: number; y: number } | null>(null);
   const [exportOpen, setExportOpen] = useState(false);
+  // The export sheet's team hint opens this. Deliberately NOT the same instance
+  // as the read-only banner's in `Note` above: that one rescues the workspace a
+  // note already belongs to and only exists when there is one, while the hint
+  // only ever shows on Personal, where there is nothing to rescue.
+  const [teamHintOpen, setTeamHintOpen] = useState(false);
 
   async function record() {
     // Pre-flight: don't start a doomed recording when the pipeline isn't
@@ -1927,8 +1933,20 @@ export function NoteToolbar({
         </ContextMenu>
       )}
       {note && (
-        <ExportModal note={note} open={exportOpen} onClose={() => setExportOpen(false)} />
+        <ExportModal
+          note={note}
+          open={exportOpen}
+          onClose={() => setExportOpen(false)}
+          onCreateTeam={() => setTeamHintOpen(true)}
+        />
       )}
+      {/* Outside the ExportModal above on purpose: the hint closes that modal on
+          its way here, which would take a sheet rendered inside it along. */}
+      <NewWorkspaceModal
+        open={teamHintOpen}
+        onClose={() => setTeamHintOpen(false)}
+        source="team_hint_export"
+      />
     </div>
   );
 }

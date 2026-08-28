@@ -71,6 +71,28 @@ export type ChatAddon = {
   currency?: string | null;
 };
 
+/**
+ * Which in-app surface sent an owner to Stripe Checkout. Rides onto the
+ * subscription metadata (`metadata[source]`), so a trial start is attributable —
+ * Stripe on its own only records the session.
+ *
+ * A union, not a bare string, on purpose: the server ALLOWLISTS the value
+ * against /^[a-z0-9_]{1,40}$/ and silently drops anything else rather than
+ * failing the checkout, so a typo would cost the datapoint without any error to
+ * notice. Every member here must match that pattern.
+ */
+export type CheckoutSource =
+  | "onboarding"
+  | "settings_organization"
+  | "new_workspace"
+  | "note_banner"
+  /** The switcher's ambient "Add team" pill, and the export sheet's one-line
+   *  hint. Both are aimed at someone who has never gone looking, and both share
+   *  a sheet with a deliberate entrance — worth telling apart, because the whole
+   *  question a hint raises is whether it produces trials or just noise. */
+  | "team_hint_switcher"
+  | "team_hint_export";
+
 export const cloudApi = {
   status: () => invoke<CloudStatus>("cloud_status"),
   configure: (baseUrl: string) => invoke<void>("cloud_configure", { baseUrl }),
@@ -106,9 +128,12 @@ export const cloudApi = {
     invoke<void>("cloud_remove_member", { workspaceId, userId }),
   setMemberRole: (workspaceId: string, userId: string, role: CloudRole) =>
     invoke<void>("cloud_set_member_role", { workspaceId, userId, role }),
-  /** Start/resume Stripe Checkout for a workspace; returns a hosted URL to open. */
-  billingCheckout: (workspaceId: string) =>
-    invoke<string>("cloud_billing_checkout", { workspaceId }),
+  /** Start/resume Stripe Checkout for a workspace; returns a hosted URL to open.
+   *  `source` names the surface that sent the owner here — see CheckoutSource.
+   *  Required at this seam even though the route treats it as optional: it is
+   *  the only place the value can be lost, and losing it is invisible. */
+  billingCheckout: (workspaceId: string, source: CheckoutSource) =>
+    invoke<string>("cloud_billing_checkout", { workspaceId, source }),
   /** Open the Stripe Customer Portal for a subscribed workspace; returns a URL. */
   billingPortal: (workspaceId: string) =>
     invoke<string>("cloud_billing_portal", { workspaceId }),

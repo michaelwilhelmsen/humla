@@ -17,6 +17,7 @@ import {
   type CloudWorkspace,
 } from "../lib/cloud";
 import { billingCta, planIsLive, useCheckout } from "../lib/billing";
+import type { CheckoutSource } from "../lib/cloud";
 import { useNotesStore } from "../lib/store";
 import { Modal } from "../pages/settings/components/Modal";
 
@@ -49,6 +50,14 @@ type Props = {
    * the sheet opens on whatever that workspace still needs.
    */
   workspaceId?: string | null;
+  /**
+   * Which surface opened the sheet, for trial-start attribution. Defaults to
+   * the sheet's own job — creating a workspace — so the switcher and the
+   * Organization pane's "New workspace" need say nothing; the read-only
+   * banner passes its own, because a stranded workspace being rescued from a
+   * note is a different funnel than one being born here.
+   */
+  source?: CheckoutSource;
 };
 
 const inputCls =
@@ -424,18 +433,20 @@ function NameStage({
 function TrialStage({
   ws,
   justCreated,
+  source,
   onClose,
   onStartOver,
 }: {
   ws: CloudWorkspace;
   justCreated: boolean;
+  source: CheckoutSource;
   onClose: () => void;
   /** Offered only on a RESUMED sheet — abandoning the first workspace's checkout
    *  shouldn't mean the sheet can only ever return to it. */
   onStartOver?: () => void;
 }) {
   const status = useCloudStore((s) => s.status);
-  const { state, busy, error, start } = useCheckout(ws.id);
+  const { state, busy, error, start } = useCheckout(ws.id, source);
   const { kind, trial, label } = billingCta(ws);
   const pastDue = kind === "portal";
 
@@ -653,7 +664,12 @@ export function stageFor(
   return "invite";
 }
 
-export function NewWorkspaceModal({ open, onClose, workspaceId = null }: Props) {
+export function NewWorkspaceModal({
+  open,
+  onClose,
+  workspaceId = null,
+  source = "new_workspace",
+}: Props) {
   const status = useCloudStore((s) => s.status);
   const [created, setCreated] = useState<CloudWorkspace | null>(null);
 
@@ -706,6 +722,7 @@ export function NewWorkspaceModal({ open, onClose, workspaceId = null }: Props) 
         <TrialStage
           ws={ws}
           justCreated={justCreated}
+          source={source}
           onClose={onClose}
           // Only when this sheet is resuming its own creation — with an id passed
           // in (the note banner) there is nothing to start over from.

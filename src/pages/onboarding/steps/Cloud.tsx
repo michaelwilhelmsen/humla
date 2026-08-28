@@ -594,7 +594,7 @@ function TrialStage({ ws, ctx }: { ws: CloudWorkspace; ctx: StepContext }) {
   const firstSub = offersTrial(ws);
   const kind = checkoutKind(ws);
   const pastDue = kind === "portal";
-  const { state: checkout, busy, error, start } = useCheckout(ws.id);
+  const { state: checkout, busy, error, start } = useCheckout(ws.id, "onboarding");
 
   return (
     <div className="flex flex-col gap-3">

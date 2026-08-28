@@ -1,6 +1,12 @@
 import { useState } from "react";
 import { Check, ChevronsUpDown, Cloud, CloudOff, Plus, RefreshCw, User, Users } from "lucide-react";
-import { cloudApi, roleLabel, useCloudStore, type CloudRole } from "../lib/cloud";
+import {
+  cloudApi,
+  roleLabel,
+  useCloudStore,
+  type CheckoutSource,
+  type CloudRole,
+} from "../lib/cloud";
 import { useNotesStore } from "../lib/store";
 import type { SyncStatus } from "../lib/ipc";
 import { Menu, MenuContent, MenuItem, MenuLabel, MenuSeparator, MenuTrigger } from "./ui/Menu";
@@ -22,12 +28,48 @@ function SyncIndicator({ status }: { status: SyncStatus }) {
   );
 }
 
+const PILL_CLS =
+  "shrink-0 px-1 text-[9px] uppercase tracking-[0.08em] rounded border border-[var(--color-line)] text-[var(--color-text-muted)]";
+
 function RolePill({ role }: { role: CloudRole }) {
+  return <span className={PILL_CLS}>{roleLabel(role)}</span>;
+}
+
+// The only ambient hint that team workspaces exist. Someone who never opened
+// Settings and never clicked this switcher had no way to learn about them.
+//
+// It occupies the trigger row's pill slot, which is dead space on Personal —
+// and it disappears for good once there IS a workspace, because the slot
+// becomes the RolePill. So there is no dismiss state to persist and nothing to
+// nag: having a team is what removes the hint.
+//
+// Deliberately silent about price and the trial (that copy belongs next to the
+// button that starts one, not floating in the chrome), and it avoids "upgrade"
+// — Personal is a deliberate choice, not a lesser tier, and calling it lesser
+// cuts against the local-first pitch.
+function AddTeamPill({ onActivate }: { onActivate: () => void }) {
+  // This sits INSIDE the menu trigger, which opens the dropdown on
+  // pointerdown — so swallowing the click alone would still leave the menu
+  // hanging open behind the sheet.
+  const activate = (e: React.SyntheticEvent) => {
+    e.stopPropagation();
+    e.preventDefault();
+    onActivate();
+  };
   return (
     <span
-      className="shrink-0 px-1 text-[9px] uppercase tracking-[0.08em] rounded border border-[var(--color-line)] text-[var(--color-text-muted)]"
+      role="button"
+      tabIndex={0}
+      title="Sync notes across your team"
+      onPointerDown={(e) => e.stopPropagation()}
+      onClick={activate}
+      onKeyDown={(e) => {
+        if (e.key !== "Enter" && e.key !== " ") return;
+        activate(e);
+      }}
+      className={`${PILL_CLS} cursor-pointer hover:text-[var(--color-text)] hover:border-[var(--color-text-muted)] transition-colors`}
     >
-      {roleLabel(role)}
+      Add team
     </span>
   );
 }
@@ -44,6 +86,14 @@ export function WorkspaceSwitcher() {
   const refreshNotes = useNotesStore((s) => s.refresh);
   const [open, setOpen] = useState(false);
   const [creatingOpen, setCreatingOpen] = useState(false);
+  // Both entrances open the same sheet; only the attribution differs, and that
+  // difference is the entire point of an ambient hint — whether it converts.
+  const [creatingSource, setCreatingSource] = useState<CheckoutSource>("new_workspace");
+
+  function startCreating(source: CheckoutSource) {
+    setCreatingSource(source);
+    setCreatingOpen(true);
+  }
 
   const current = status.current_workspace;
   const label = current?.name ?? "Personal";
@@ -74,7 +124,11 @@ export function WorkspaceSwitcher() {
           </span>
           <span className="flex-1 min-w-0 text-left truncate">{label}</span>
           {current && syncStatus && <SyncIndicator status={syncStatus} />}
-          {current && <RolePill role={current.role} />}
+          {current ? (
+            <RolePill role={current.role} />
+          ) : (
+            <AddTeamPill onActivate={() => startCreating("team_hint_switcher")} />
+          )}
           <ChevronsUpDown size={14} strokeWidth={1.5} className="shrink-0 text-[var(--color-text-muted)]" />
         </MenuTrigger>
 
@@ -110,13 +164,17 @@ export function WorkspaceSwitcher() {
               a working one. The row used to be swapped for a bare text input that
               committed on blur — and, signed out, was replaced by a pointer to
               Settings. "Team" is what distinguishes this from a folder. */}
-          <MenuItem className="px-2" onSelect={() => setCreatingOpen(true)}>
+          <MenuItem className="px-2" onSelect={() => startCreating("new_workspace")}>
             <Plus size={14} strokeWidth={1.5} className="shrink-0" />
             <span>Create team workspace</span>
           </MenuItem>
         </MenuContent>
       </Menu>
-      <NewWorkspaceModal open={creatingOpen} onClose={() => setCreatingOpen(false)} />
+      <NewWorkspaceModal
+        open={creatingOpen}
+        onClose={() => setCreatingOpen(false)}
+        source={creatingSource}
+      />
     </>
   );
 }
