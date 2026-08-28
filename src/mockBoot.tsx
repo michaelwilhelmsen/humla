@@ -19,14 +19,18 @@ import {
   FileText as Files,
   Folder as FolderIcon,
   MessageCircle,
+  MessageSquare,
   Search,
 } from "lucide-react";
+import App from "./App";
+import { mockTauri } from "./test/tauri";
+import { makeNote } from "./test/fixtures";
 import { CommandSnippet } from "./components/CommandSnippet";
 import { RecordingBar } from "./components/RecordingBar";
 import { useRecordingStore } from "./lib/store";
 import { Segmented } from "./pages/settings/components/Segmented";
 import { Toggle } from "./pages/settings/components/Toggle";
-import { NoteTitleBox, NoteToolbar, TranscriptEditor, TranscriptPlayer } from "./pages/Note";
+import { NoteTitleBox, NoteToolbar, PanelEmpty, TranscriptEditor, TranscriptPlayer } from "./pages/Note";
 import { IntegrationsSection } from "./pages/settings/tabs/Integrations";
 import { RecordingSection } from "./pages/settings/tabs/Recording";
 import { NewWorkspaceModal } from "./components/NewWorkspaceModal";
@@ -61,6 +65,12 @@ type Scenario = {
   wrap?: (node: React.ReactNode) => React.ReactNode;
   render: (ctx: StepContext) => React.ReactNode;
   ipc: Record<string, Handler>;
+  /** Renders the whole app at this route instead of one component, against the
+      unit tests' own "empty but healthy" IPC defaults (`mockTauri`). For a
+      question a single component can't answer — a panel's controls sitting in
+      the panel, beside the pickers and the chrome they compete with. Costs a
+      much bigger IPC surface, so it is the exception, not the pattern. */
+  route?: string;
 };
 
 // ---- #147 axis: which Ollama models are installed --------------------------
@@ -233,6 +243,84 @@ function TranscriptPlayerHarness({
       bottomAligned={false}
     />
   );
+}
+
+// ---- #146 axis: the Transcript panel with nothing in it -------------------
+// A "Transcribe manually" capture leaves this pane reporting the gap, so the
+// control that closes it belongs here and not only in the toolbar. What needs
+// eyes: a bordered button under two lines of muted text, centred in a column
+// that is otherwise all disabled grey — and whether it still reads as an offer
+// at `PANEL_FLOOR`, where the sentence takes a line more.
+function panelEmptyCase(pending: boolean, width = 320): Scenario {
+  return {
+    wrap: (node) => (
+      <div className="flex-1 min-h-0 flex justify-center px-6 py-8">
+        <div
+          className="w-full rounded-[var(--radius-card)] bg-[var(--color-surface)] flex flex-col min-h-0 px-4 py-4"
+          style={{ maxWidth: width }}
+        >
+          {node}
+        </div>
+      </div>
+    ),
+    render: () => (
+      <PanelEmpty
+        icon={<MessageSquare size={22} strokeWidth={1.5} />}
+        text={
+          pending
+            ? "This recording hasn't been transcribed yet."
+            : "No transcript yet. Start a recording from the toolbar to capture and transcribe audio."
+        }
+        action={
+          pending ? (
+            <button type="button" className="nd-btn">
+              <Files size={15} strokeWidth={1.6} />
+              Transcribe
+            </button>
+          ) : undefined
+        }
+      />
+    ),
+    // Nothing here talks to the backend — the button is inert on purpose, so
+    // the scenario is only ever a question about the layout.
+    ipc: {},
+  };
+}
+
+// ---- #146 axis: the Transcribe action ON the panel that reports it missing --
+// The whole note, because the question is about a control's place among the
+// others: the empty state's button under two lines of muted text, and — once a
+// second take is pending on a note that already has text — the icon sitting
+// between Copy and Re-transcribe, in a row that also holds two pickers.
+function noteTranscribeCase(withText: boolean): Scenario {
+  const note = makeNote({
+    id: "n1",
+    title: "Kvartalsgjennomgang",
+    transcript: withText ? "Michael: Skal vi ta gjennomgangen nå?\nHege: Ja, jeg har notatene klare" : "",
+    language: "no",
+    expected_speakers: 2,
+  });
+  const take = (index: number, pending: boolean) => ({
+    id: `s${index}`,
+    index,
+    startedAt: new Date(1_755_000_000_000).toISOString(),
+    durationMs: 1_800_000,
+    streams: ["mic"],
+    hasPlayback: true,
+    canTranscribe: pending,
+    canRetranscribe: true,
+  });
+  return {
+    route: "/note/n1",
+    render: () => null, // unused — `route` renders the app
+    ipc: {
+      notes_list: () => [note],
+      notes_get: () => note,
+      note_timeline: () => [],
+      note_sessions: () =>
+        withText ? [take(1, false), take(2, true)] : [take(1, true)],
+    },
+  };
 }
 
 // ---- #146 axis: the note toolbar at the widths the body column really gets --
@@ -801,6 +889,17 @@ const CASES: Record<string, Scenario> = {
   "player-720": playerCase(false, 720),
   "player-260-longnames": playerCase(false, 260, true),
 
+  // --- #146: the Transcript panel's empty states, with and without the run
+  // that would fill it. The narrow one is the real test — the button has to
+  // still read as an offer once the sentence wraps.
+  "panel-pending": panelEmptyCase(true),
+  "panel-pending-260": panelEmptyCase(true, 260),
+  "panel-nothing": panelEmptyCase(false),
+  // The same two states in the real note, where the action has to hold its own
+  // beside the toolbar's copy of it and the panel's pickers.
+  "note-pending": noteTranscribeCase(false),
+  "note-pending-text": noteTranscribeCase(true),
+
   // --- The create-team-workspace sheet, one scenario per derived stage.
   "ws-connect": workspaceCase("connect"),
   "ws-auth": workspaceCase("auth"),
@@ -855,16 +954,41 @@ if (mode === "light" || mode === "dark") {
   document.documentElement.setAttribute("data-theme", mode);
 }
 
-mockIPC(async (cmd, args) => {
-  if (cmd in scenario.ipc) return scenario.ipc[cmd](args);
-  if (cmd === "settings_set") {
-    console.log("[mock] settings_set", args);
+if (scenario.route) {
+  // A whole-app scenario needs every command the boot path fires, which is the
+  // unit tests' problem too — so it borrows their answers rather than growing a
+  // second set here.
+  //
+  // `?palette=` / `?theme=` have to be answered as SETTINGS, not stamped on
+  // <html>: the real app hydrates both from `settings_get` on boot, so the
+  // attributes the harness wrote above are overwritten a tick later and the
+  // whole theme axis silently stops working for these scenarios. Answering the
+  // rows instead puts them through the app's own path, which is what a route
+  // scenario is for. `onboarding_completed` has to be carried through with
+  // them — a `settings_get` handler here replaces `mockTauri`'s entirely, and
+  // without it every note scenario opens on the wizard.
+  mockTauri({
+    ...scenario.ipc,
+    settings_get: (args) => {
+      const key = (args as { key?: string } | undefined)?.key;
+      if (key === "palette") return params.get("palette");
+      if (key === "theme") return mode;
+      if (key === "onboarding_completed") return "true";
+      return scenario.ipc.settings_get?.(args) ?? null;
+    },
+  });
+} else {
+  mockIPC(async (cmd, args) => {
+    if (cmd in scenario.ipc) return scenario.ipc[cmd](args);
+    if (cmd === "settings_set") {
+      console.log("[mock] settings_set", args);
+      return null;
+    }
+    if (cmd === "settings_get") return null;
+    if (cmd.startsWith("plugin:")) return undefined;
     return null;
-  }
-  if (cmd === "settings_get") return null;
-  if (cmd.startsWith("plugin:")) return undefined;
-  return null;
-});
+  });
+}
 
 const ctx = {
   stepId: scenario.step,
@@ -896,7 +1020,13 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
       <p className="pt-4 text-center text-xs text-[var(--color-text-muted)]">
         mock case: <code>{which}</code> — {Object.keys(CASES).join(" · ")}
       </p>
-      {(scenario.wrap ?? onboardingCanvas)(scenario.render(ctx))}
+      {scenario.route ? (
+        <MemoryRouter initialEntries={[scenario.route]}>
+          <App />
+        </MemoryRouter>
+      ) : (
+        (scenario.wrap ?? onboardingCanvas)(scenario.render(ctx))
+      )}
     </div>
   </StrictMode>,
 );

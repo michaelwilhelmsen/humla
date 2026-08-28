@@ -1494,6 +1494,28 @@ export function Note() {
                   {hasTranscript && (
                     <div className="ml-auto flex items-center gap-0.5">
                       <CopyButton label="Transcript" getText={copyableTranscript} />
+                      {/* A take still holding untranscribed audio on a note
+                          that already has text — the second take of a note
+                          recorded with "Transcribe manually" on, which is the
+                          ordinary shape once the setting is enabled. The empty
+                          state below carries this action when there is no
+                          text; here there is, so it belongs in the row, or the
+                          panel is once again reporting a gap it cannot close.
+
+                          Ordered by how much each changes: copy, then add the
+                          missing take, then replace every take's text. */}
+                      {!readOnly && pendingTranscription && (
+                        <button
+                          type="button"
+                          onClick={() => void runTranscribe(draft.id, "pending")}
+                          disabled={isTranscribing || recActive}
+                          title="Transcribe the take that hasn't been transcribed yet, leaving the rest of this transcript alone."
+                          aria-label="Transcribe"
+                          className="nd-btn-icon nd-btn-icon-sm"
+                        >
+                          <FileText size={15} strokeWidth={1.6} />
+                        </button>
+                      )}
                       {!readOnly && canRetranscribe && (
                         <button
                           type="button"
@@ -1648,8 +1670,35 @@ export function Note() {
                       // the user to start a recording would be wrong advice —
                       // the meeting is already on disk.
                       pendingTranscription
-                        ? "This recording hasn't been transcribed yet. Use Transcribe in the toolbar to run it now."
+                        ? "This recording hasn't been transcribed yet."
                         : "No transcript yet. Start a recording from the toolbar to capture and transcribe audio."
+                    }
+                    action={
+                      // The same action the toolbar carries, on the surface
+                      // that reports the gap — a user who opens the Transcript
+                      // tab to find out why it's empty shouldn't have to be
+                      // sent back to the toolbar. Same accessible name on both,
+                      // deliberately: it is one action, not two.
+                      //
+                      // No busy state: this empty state gives way to the
+                      // in-flight skeleton, so `isTranscribing` is never true
+                      // while the button is on screen. `recActive` can't be
+                      // either, for the same reason.
+                      pendingTranscription && !readOnly ? (
+                        <button
+                          type="button"
+                          onClick={() => void runTranscribe(draft.id, "pending")}
+                          className="nd-btn"
+                          // Same vocabulary as re-transcribe's tooltip: the
+                          // pickers above are what this run reads, and language
+                          // is the setting most worth a second look before a
+                          // deferred capture is finally sent to a provider.
+                          title="Transcribe the recorded audio. Uses the language and speaker count above."
+                        >
+                          <FileText size={15} strokeWidth={1.6} />
+                          Transcribe
+                        </button>
+                      ) : undefined
                     }
                   />
                 )}
@@ -1952,11 +2001,27 @@ export function NoteToolbar({
 }
 
 // Centered empty-state for a panel tab (no summary / no transcript yet).
-function PanelEmpty({ icon, text }: { icon: React.ReactNode; text: string }) {
+// `action` is for the case where the empty state can be resolved from here —
+// the pane that reports the gap offering the control that closes it, rather
+// than a sentence pointing at a button somewhere else.
+//
+// Exported for the `pnpm mock` harness: whether a button reads as an offer or
+// as clutter under two lines of grey text is a layout question, and jsdom can't
+// answer one.
+export function PanelEmpty({
+  icon,
+  text,
+  action,
+}: {
+  icon: React.ReactNode;
+  text: string;
+  action?: React.ReactNode;
+}) {
   return (
     <div className="flex flex-col items-center text-center gap-3 px-6 py-12 text-[var(--color-text-disabled)]">
       <span aria-hidden>{icon}</span>
       <p className="text-[13px] leading-relaxed max-w-[240px]">{text}</p>
+      {action}
     </div>
   );
 }

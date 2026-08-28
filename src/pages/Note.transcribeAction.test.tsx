@@ -1,5 +1,5 @@
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { screen, waitFor } from "@testing-library/react";
+import { screen, waitFor, within } from "@testing-library/react";
 import { act } from "react";
 import userEvent from "@testing-library/user-event";
 import { renderApp } from "../test/app";
@@ -215,8 +215,9 @@ describe("the transcript panel's re-transcribe control", () => {
     // under test — the control is absent by rule, not because nothing mounted.
     await screen.findByText(/hasn't been transcribed yet/i);
     expect(retranscribeButton()).not.toBeInTheDocument();
-    // And the toolbar's Transcribe is the affordance for it.
-    expect(screen.getByRole("button", { name: /^transcribe$/i })).toBeInTheDocument();
+    // Transcribe is the affordance for it, and it is offered on both surfaces
+    // — the toolbar's and the panel's own.
+    expect(screen.getAllByRole("button", { name: /^transcribe$/i })).toHaveLength(2);
   });
 
   it("is disabled while a run is in flight on this note", async () => {
@@ -230,5 +231,169 @@ describe("the transcript panel's re-transcribe control", () => {
     act(() => useRecordingStore.getState().setTranscribing("n1", true));
 
     await waitFor(() => expect(retranscribeButton()).toBeDisabled());
+  });
+});
+
+// The same action, offered where the user goes looking for the transcript.
+// A deferred capture leaves this panel saying "not transcribed yet" while the
+// only control that would fix that sat in the toolbar — which the copy had to
+// point at, and which reads as a different feature from the pane reporting the
+// problem.
+describe("the transcript panel's Transcribe action", () => {
+  /** The empty state's own box, so the toolbar's Transcribe can't answer for
+      the panel's — they share an accessible name, deliberately: it is one
+      action on two surfaces. */
+  function emptyState() {
+    return screen.getByText(/hasn't been transcribed yet/i).closest("div")!;
+  }
+
+  it("offers Transcribe beside the panel's own explanation", async () => {
+    await openTranscriptPanel([session({ canTranscribe: true })]);
+    await screen.findByText(/hasn't been transcribed yet/i);
+
+    expect(
+      within(emptyState()).getByRole("button", { name: /^transcribe$/i }),
+    ).toBeInTheDocument();
+  });
+
+  // Same scope as the toolbar's: finish what the deferred capture left
+  // waiting, never re-run a take that already has its text.
+  it("runs the pending takes", async () => {
+    const transcribe = vi.fn(() => null);
+    const { user } = await openTranscriptPanel([session({ canTranscribe: true })], {
+      transcribe_note: transcribe,
+    });
+    await screen.findByText(/hasn't been transcribed yet/i);
+
+    await user.click(within(emptyState()).getByRole("button", { name: /^transcribe$/i }));
+
+    expect(transcribe).toHaveBeenCalledWith({ noteId: "n1", scope: "pending" });
+  });
+
+  // The empty state gives way to the in-flight skeleton, so the button needs no
+  // busy state of its own — but it must not survive into a state where a second
+  // press would queue a second replay.
+  it("gives way to the skeleton once a run is in flight", async () => {
+    await openTranscriptPanel([session({ canTranscribe: true })]);
+    await screen.findByText(/hasn't been transcribed yet/i);
+
+    act(() => useRecordingStore.getState().setTranscribing("n1", true));
+
+    await waitFor(() =>
+      expect(screen.queryByText(/hasn't been transcribed yet/i)).not.toBeInTheDocument(),
+    );
+  });
+
+  // A note with nothing recorded has nothing to run: its empty state is advice
+  // to start a recording, and a button there could only fail.
+  it("stays absent when no take is pending", async () => {
+    await openTranscriptPanel([session({ canTranscribe: false })]);
+    await screen.findByText(/no transcript yet/i);
+
+    expect(transcribeButton()).not.toBeInTheDocument();
+  });
+
+  // Read-only hides it on both surfaces, so the copy must not point at a
+  // control that isn't there.
+  it("states the fact without offering the action on a read-only note", async () => {
+    const ws = { id: "w1", name: "Acme", role: "member" as const, plan_status: "none" as const };
+    await openTranscriptPanel(
+      [session({ canTranscribe: true })],
+      {
+        cloud_status: () => ({
+          configured: true,
+          logged_in: true,
+          base_url: "https://sync.humla.team",
+          user: { id: "u1", email: "m@example.no", name: "Michael", verified: true },
+          current_workspace: ws,
+          workspaces: [ws],
+          billing_enabled: true,
+          seat_price_cents: 500,
+          seat_currency: "usd",
+        }),
+        cloud_workspace_members: () => [
+          { id: "u1", email: "m@example.no", name: "Michael", role: "member" },
+        ],
+      },
+      { workspace_id: "w1" },
+    );
+
+    await screen.findByText(/hasn't been transcribed yet/i);
+    expect(transcribeButton()).not.toBeInTheDocument();
+  });
+});
+
+// A take pending on a note that ALREADY has text — the second take of a note
+// recorded with "Transcribe manually" on, which is the ordinary shape once the
+// setting is enabled. The empty state can't carry the action here, and without
+// this the panel goes back to being the surface that can't run the thing it is
+// reporting is missing.
+describe("the transcript panel with both text and a pending take", () => {
+  const TRANSCRIPT = "Speaker 1: so where did we land";
+
+  async function openMixed(handlers: Record<string, (args: unknown) => unknown> = {}) {
+    return openTranscriptPanel(
+      [
+        session({ id: "s1", index: 1, canTranscribe: false, canRetranscribe: true }),
+        session({ id: "s2", index: 2, canTranscribe: true, canRetranscribe: true }),
+      ],
+      handlers,
+      { transcript: TRANSCRIPT },
+    );
+  }
+
+  /** The panel's own action row, so the toolbar's Transcribe can't answer for
+      it — they share an accessible name, deliberately: one action, two
+      surfaces. */
+  function actionRow() {
+    return screen.getByRole("button", { name: /^copy transcript$/i }).closest("div")!;
+  }
+
+  it("offers Transcribe beside Copy and Re-transcribe", async () => {
+    await openMixed();
+    await screen.findByRole("button", { name: /^copy transcript$/i });
+
+    expect(
+      within(actionRow()).getByRole("button", { name: /^transcribe$/i }),
+    ).toBeInTheDocument();
+    expect(retranscribeButton()).toBeInTheDocument();
+  });
+
+  // The two are different runs, and the difference is the whole reason both
+  // are offered: Transcribe adds the take that has no text, Re-transcribe
+  // replaces every take's.
+  it("runs only the pending take, leaving the existing text alone", async () => {
+    const transcribe = vi.fn(() => null);
+    const { user } = await openMixed({ transcribe_note: transcribe });
+
+    await screen.findByRole("button", { name: /^copy transcript$/i });
+    await user.click(within(actionRow()).getByRole("button", { name: /^transcribe$/i }));
+
+    expect(transcribe).toHaveBeenCalledWith({ noteId: "n1", scope: "pending" });
+  });
+
+  it("is disabled while a run is in flight on this note", async () => {
+    await openMixed();
+    await screen.findByRole("button", { name: /^copy transcript$/i });
+
+    act(() => useRecordingStore.getState().setTranscribing("n1", true));
+
+    await waitFor(() =>
+      expect(within(actionRow()).getByRole("button", { name: /^transcribe$/i })).toBeDisabled(),
+    );
+  });
+
+  // Nothing pending: the row is Copy + Re-transcribe as before.
+  it("drops back to Copy and Re-transcribe once every take has text", async () => {
+    await openTranscriptPanel(
+      [session({ canTranscribe: false, canRetranscribe: true })],
+      {},
+      { transcript: TRANSCRIPT },
+    );
+    await screen.findByRole("button", { name: /^re-transcribe$/i });
+
+    expect(
+      within(actionRow()).queryByRole("button", { name: /^transcribe$/i }),
+    ).not.toBeInTheDocument();
   });
 });
