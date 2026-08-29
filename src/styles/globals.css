@@ -415,6 +415,129 @@ input::placeholder, textarea::placeholder {
   .nd-list { display: flex; flex-direction: column; gap: var(--row-gap); }
   .nd-row { min-height: var(--row-height); }
   .nd-row-lg { min-height: var(--row-height-lg); }
+
+  /* ---- the note grid ------------------------------------------------- */
+
+  /* A recessed ground for borderless cards to sit on. A card's edge is
+     entirely tone against what it sits on, and graphite declares
+     --color-canvas and --color-surface both as #ffffff. */
+  .nd-well {
+    --well: color-mix(in srgb, #000 4.5%, var(--color-canvas));
+    background: var(--well);
+    /* <main> sits in the layout's 6px gutter beside the rounded nav card. */
+    border-radius: var(--radius-card);
+  }
+
+  /* Floating chrome over a well: the grid scrolls underneath it, and the
+     content edge is a short fade rather than a divider. */
+  .nd-well-bar {
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    background: color-mix(in srgb, var(--well) 72%, transparent);
+    backdrop-filter: blur(20px) saturate(180%);
+    -webkit-backdrop-filter: blur(20px) saturate(180%);
+  }
+  .nd-well-bar::after {
+    content: "";
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: 100%;
+    height: 22px;
+    background: linear-gradient(var(--well), transparent);
+    pointer-events: none;
+  }
+  @media (prefers-reduced-transparency: reduce) {
+    .nd-well-bar { background: var(--well); backdrop-filter: none; -webkit-backdrop-filter: none; }
+  }
+
+  .nd-notegrid {
+    display: grid;
+    /* min() so the track floor collapses with the container: a bare
+       minmax(300px, 1fr) cannot shrink past its floor, and the grid overflows
+       sideways once the body column is narrower than one card. */
+    grid-template-columns: repeat(auto-fill, minmax(min(var(--card-min, 300px), 100%), 1fr));
+    gap: 14px;
+  }
+
+  /* One note. Borderless: depth comes from tone and shadow. */
+  .nd-notecard {
+    display: flex;
+    flex-direction: column;
+    padding: 20px;
+    border-radius: var(--radius-card);
+    background: var(--color-surface);
+    box-shadow: var(--shadow-card);
+    transition: transform 180ms cubic-bezier(0.22, 1, 0.36, 1), box-shadow 180ms ease-out,
+      background-color 140ms ease-out;
+    animation: nd-notecard-in 320ms cubic-bezier(0.22, 1, 0.36, 1) backwards;
+  }
+  .nd-notecard:hover {
+    transform: translateY(-2px);
+    box-shadow: var(--shadow-card), 0 12px 26px -18px rgba(0, 0, 0, 0.45);
+  }
+  /* Feedback on the press itself, not on release. The link fills the card, so
+     the press and the focus ring are matched from the surface. */
+  .nd-notecard:has(a:active) {
+    transform: scale(0.988);
+    transition-duration: 90ms;
+  }
+  .nd-notecard:has(:focus-visible) {
+    outline: 2px solid var(--color-accent-text);
+    outline-offset: 2px;
+  }
+
+  /* Selected. --color-accent-soft is tuned against the canvas, and graphite's
+     lands darker than the well, so the fill alone cannot carry this. */
+  .nd-notecard[data-selected="true"] {
+    background: var(--color-accent-soft);
+    box-shadow: 0 0 0 2px var(--color-accent-text);
+  }
+  .nd-notecard[data-selected="true"]:hover {
+    box-shadow: 0 0 0 2px var(--color-accent-text), 0 12px 26px -18px rgba(0, 0, 0, 0.45);
+  }
+
+  /* A short entrance stagger over the first row or two, written out because
+     CSS cannot count siblings into a delay. */
+  .nd-notegrid > :nth-child(2) { animation-delay: 20ms; }
+  .nd-notegrid > :nth-child(3) { animation-delay: 40ms; }
+  .nd-notegrid > :nth-child(4) { animation-delay: 60ms; }
+  .nd-notegrid > :nth-child(5) { animation-delay: 80ms; }
+  .nd-notegrid > :nth-child(6) { animation-delay: 100ms; }
+  .nd-notegrid > :nth-child(7) { animation-delay: 120ms; }
+  .nd-notegrid > :nth-child(8) { animation-delay: 140ms; }
+  .nd-notegrid > :nth-child(9) { animation-delay: 160ms; }
+  .nd-notegrid > :nth-child(10) { animation-delay: 180ms; }
+
+  @keyframes nd-notecard-in {
+    from { opacity: 0; transform: translateY(8px); }
+    to { opacity: 1; transform: none; }
+  }
+
+  /* The card asks tone and shadow to carry its edge, which is the thing this
+     preference asks us to stop doing. Give it a real border instead. */
+  @media (prefers-contrast: more) {
+    .nd-well { background: var(--color-canvas); }
+    .nd-notecard {
+      border: 1px solid var(--color-line-visible);
+      box-shadow: none;
+    }
+    .nd-notecard:hover { box-shadow: none; }
+    .nd-notecard[data-selected="true"] {
+      border-color: var(--color-accent-text);
+      box-shadow: 0 0 0 1px var(--color-accent-text);
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .nd-notecard {
+      animation-name: nd-notecard-fade;
+      transition: box-shadow 160ms ease, background-color 140ms ease;
+    }
+    .nd-notecard:hover, .nd-notecard:has(a:active) { transform: none; }
+    @keyframes nd-notecard-fade { from { opacity: 0; } to { opacity: 1; } }
+  }
 }
 
 /* No <select> rules live here any more: every picker in the app goes through

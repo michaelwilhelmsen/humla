@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { extractSpeakerLabels, renameSpeakerInTranscript } from "./speakers";
+import { extractSpeakerLabels, renameSpeakerInTranscript, stripSpeakerLabels } from "./speakers";
 
 describe("extractSpeakerLabels", () => {
   it("returns [] for an empty transcript", () => {
@@ -119,5 +119,19 @@ describe("renameSpeakerInTranscript", () => {
     expect(renameSpeakerInTranscript("Bob: hi", "Bob", "Speaker 1?")).toBe(
       "Speaker 1?: hi",
     );
+  });
+});
+
+describe("stripSpeakerLabels", () => {
+  it("removes the label prefix from every turn", () => {
+    expect(stripSpeakerLabels("Michael: Hei.\nHege: Hallo.")).toBe("Hei.\nHallo.");
+  });
+
+  it("keeps leading whitespace and leaves colons inside text alone", () => {
+    expect(stripSpeakerLabels("  Michael: se her: dette")).toBe("  se her: dette");
+  });
+
+  it("leaves a line with no label untouched", () => {
+    expect(stripSpeakerLabels("bare tekst uten prefiks")).toBe("bare tekst uten prefiks");
   });
 });

@@ -24,6 +24,11 @@ export function extractSpeakerLabels(transcript: string): string[] {
   return result;
 }
 
+// The transcript without its label prefixes — the words, not who said them.
+export function stripSpeakerLabels(transcript: string): string {
+  return transcript.replace(/^(\s*)[^:\n]{1,40}:\s/gm, "$1");
+}
+
 // Rewrite the transcript so every "<oldLabel>: " line start becomes
 // "<newLabel>: ". Anchored to line starts via a multi-line regex; bare
 // occurrences of the label inside text are left alone. Escapes regex

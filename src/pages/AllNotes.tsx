@@ -1,11 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { Plus } from "lucide-react";
-import { ipc, type Folder } from "../lib/ipc";
+import { ipc } from "../lib/ipc";
 import { useNotesStore, useRecordingStore } from "../lib/store";
 import { cn } from "../lib/cn";
-import { groupByDate, isRecorded, isSummarized } from "../lib/noteList";
-import { NoteListRow, type SelectIntent } from "../components/NoteListRow";
+import { indexById, isRecorded, isSummarized } from "../lib/noteList";
+import { NoteCard, type SelectIntent } from "../components/NoteCard";
 import { BulkActionBar } from "../components/BulkActionBar";
 import { Modal } from "./settings/components/Modal";
 
@@ -22,6 +22,7 @@ export function AllNotes() {
   const navigate = useNavigate();
   const notes = useNotesStore((s) => s.notes);
   const folders = useNotesStore((s) => s.folders);
+  const clients = useNotesStore((s) => s.clients);
   const upsert = useNotesStore((s) => s.upsertLocal);
   const removeLocal = useNotesStore((s) => s.removeLocal);
   const pushError = useRecordingStore((s) => s.pushError);
@@ -39,11 +40,8 @@ export function AllNotes() {
     () => [...notes].sort((a, b) => b.created_at - a.created_at),
     [notes],
   );
-  const folderById = useMemo(() => {
-    const map = new Map<string, Folder>();
-    for (const f of folders) map.set(f.id, f);
-    return map;
-  }, [folders]);
+  const folderById = useMemo(() => indexById(folders), [folders]);
+  const clientById = useMemo(() => indexById(clients), [clients]);
 
   const filtered = useMemo(
     () =>
@@ -57,13 +55,9 @@ export function AllNotes() {
       }),
     [sorted, filter],
   );
-  const groups = useMemo(() => groupByDate(filtered), [filtered]);
-  // Flat visual order of the currently-rendered rows — the source of truth for
-  // Shift-click range selection (matches what the eye sees across date groups).
-  const orderedIds = useMemo(
-    () => groups.flatMap((g) => g.items.map((n) => n.id)),
-    [groups],
-  );
+  // Visual order of the currently-rendered cards — the source of truth for
+  // Shift-click range selection.
+  const orderedIds = useMemo(() => filtered.map((n) => n.id), [filtered]);
   const total = sorted.length;
   const shown = filtered.length;
 
@@ -172,38 +166,38 @@ export function AllNotes() {
 
   return (
     <div className="h-full flex flex-col overflow-hidden">
-      {/* Title + filter chips stay pinned above the scrolling list. New note
-          + theme toggle live in the floating TopBar (top-right). */}
-      <div className="shrink-0">
-        <div className="max-w-[880px] mx-auto w-full px-8 pt-14">
-          <div className="flex items-center gap-3 px-2">
-            <h1 className="nd-heading truncate">All notes</h1>
-            <span className="text-[14px] text-[var(--color-text-disabled)] tabular-nums shrink-0">{total}</span>
-          </div>
-          {total > 0 && (
-            <div className="flex flex-wrap gap-1.5 px-2 pt-3 pb-1">
-              {FILTERS.map((f) => (
-                <button
-                  key={f.key}
-                  onClick={() => setFilter(f.key)}
-                  className={cn(
-                    "no-drag text-[12.5px] px-3 py-[5px] rounded-full border transition-colors",
-                    filter === f.key
-                      ? "bg-[var(--color-accent-soft)] text-[var(--color-accent-text)] border-transparent"
-                      : "text-[var(--color-text-muted)] border-[var(--color-line-visible)] hover:text-[var(--color-text)]",
-                  )}
-                >
-                  {f.label}
-                </button>
-              ))}
+      {/* One scrolling well: the grid runs under a translucent title bar. New
+          note + theme toggle live in the floating TopBar (top-right). */}
+      <div className="flex-1 overflow-y-auto nd-well flex flex-col">
+        <div className="nd-well-bar shrink-0">
+          <div className="max-w-[1180px] mx-auto w-full px-8 pt-14 pb-3">
+            <div className="flex items-center gap-3 px-1">
+              <h1 className="nd-heading truncate">All notes</h1>
+              <span className="text-[14px] text-[var(--color-text-disabled)] tabular-nums shrink-0">{total}</span>
             </div>
-          )}
+            {total > 0 && (
+              <div className="flex flex-wrap gap-1.5 px-1 pt-3">
+                {FILTERS.map((f) => (
+                  <button
+                    key={f.key}
+                    onClick={() => setFilter(f.key)}
+                    className={cn(
+                      "no-drag text-[12.5px] px-3 py-[5px] rounded-full transition-colors",
+                      filter === f.key
+                        ? "bg-[var(--color-accent-soft)] text-[var(--color-accent-text)]"
+                        : "text-[var(--color-text-muted)] hover:bg-[var(--color-pill-hover)]",
+                    )}
+                  >
+                    {f.label}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
         </div>
-      </div>
 
-      <div className="flex-1 overflow-y-auto">
         {total === 0 ? (
-          <div className="h-full flex flex-col items-center justify-center gap-4 text-center -mt-12 px-12">
+          <div className="flex-1 flex flex-col items-center justify-center gap-4 text-center px-12">
             <div className="text-[var(--color-text-muted)] flex items-center gap-2">
               <span>Press</span>
               <kbd
@@ -220,32 +214,25 @@ export function AllNotes() {
             </button>
           </div>
         ) : shown === 0 ? (
-          <div className="max-w-[880px] mx-auto w-full px-8 pt-16 text-center text-sm text-[var(--color-text-muted)]">
+          <div className="max-w-[1180px] mx-auto w-full px-8 pt-16 text-center text-sm text-[var(--color-text-muted)]">
             No notes match this filter.
           </div>
         ) : (
-          <div className="pb-20">
-            {groups.map((g) => (
-              <section key={g.label}>
-                <div className="sticky top-0 z-10 bg-[var(--color-canvas)]">
-                  <div className="max-w-[880px] mx-auto w-full px-8 pt-5 pb-1">
-                    <span className="block px-3 nd-label">{g.label}</span>
-                  </div>
-                </div>
-                <ul>
-                  {g.items.map((n) => (
-                    <NoteListRow
-                      key={n.id}
-                      note={n}
-                      folder={n.folder_id ? folderById.get(n.folder_id) : undefined}
-                      selected={selected.has(n.id)}
-                      selectionActive={selected.size > 0}
-                      onSelect={(e) => onSelectRow(n.id, e)}
-                    />
-                  ))}
-                </ul>
-              </section>
-            ))}
+          // The grid clears the title bar's fade before the first row.
+          <div className="max-w-[1180px] mx-auto w-full px-8 pt-6 pb-24">
+            <ul className="nd-notegrid">
+              {filtered.map((n) => (
+                <NoteCard
+                  key={n.id}
+                  note={n}
+                  folder={n.folder_id ? folderById.get(n.folder_id) : undefined}
+                  client={n.client_id ? clientById.get(n.client_id) : undefined}
+                  selected={selected.has(n.id)}
+                  selectionActive={selected.size > 0}
+                  onSelect={(e) => onSelectRow(n.id, e)}
+                />
+              ))}
+            </ul>
           </div>
         )}
       </div>

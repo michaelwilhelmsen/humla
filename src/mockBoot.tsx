@@ -40,6 +40,7 @@ import { SummaryStep } from "./pages/onboarding/steps/Summary";
 import { TranscriptionStep } from "./pages/onboarding/steps/Transcription";
 import { STEP_ORDER, type StepContext, type StepId } from "./pages/onboarding/types";
 import type { ProviderConfig, TimelineEntry } from "./lib/ipc";
+import { DEMO_CLIENTS, DEMO_FOLDERS, demoNotes } from "./test/noteLibrary";
 // Mirrors src/main.tsx — every theme's typeface, so a scenario reviewed under
 // `?palette=<id>` renders in that design's face rather than falling back.
 import "@fontsource/hanken-grotesk/400.css";
@@ -930,6 +931,38 @@ const CASES: Record<string, Scenario> = {
   // The same pill with the body column at a comfortable width, so the
   // narrow-column layout can be compared against the roomy one.
   "noaudio-wide": noAudioCase("MacBook Pro-mikrofon", 900),
+
+  // --- The note grid, whole-app at /all-notes against a populated library.
+  // Card density, excerpt length and the borderless card's separation from its
+  // ground are all things jsdom pins to zero.
+  notes: {
+    route: "/all-notes",
+    render: () => null, // unused — `route` renders the app
+    ipc: {
+      notes_list: () => demoNotes(),
+      folders_list: () => DEMO_FOLDERS,
+      clients_list: () => DEMO_CLIENTS,
+    },
+  },
+
+  // A library with nothing in it — the first screen a fresh install shows.
+  "notes-empty": {
+    route: "/all-notes",
+    render: () => null, // unused — `route` renders the app
+    ipc: { notes_list: () => [], folders_list: () => [], clients_list: () => [] },
+  },
+
+  // The same grid inside a folder, where the folder chip is deliberately absent
+  // from every card.
+  "notes-folder": {
+    route: "/folder/f1",
+    render: () => null, // unused — `route` renders the app
+    ipc: {
+      notes_list: () => demoNotes(),
+      folders_list: () => DEMO_FOLDERS,
+      clients_list: () => DEMO_CLIENTS,
+    },
+  },
 
   // --- Themes: the token-driven chrome on one page, so a theme can be judged
   // as a design rather than as a diff. Combine with ?palette= and ?theme=.
