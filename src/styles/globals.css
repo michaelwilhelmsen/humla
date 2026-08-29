@@ -418,23 +418,13 @@ input::placeholder, textarea::placeholder {
 
   /* ---- the note grid ------------------------------------------------- */
 
-  /* A recessed ground for borderless cards to sit on. A note card carries no
-     border, so its edge is entirely tone against what it sits on — and
-     graphite declares --color-canvas and --color-surface BOTH as #ffffff,
-     which leaves a white card on a white page with nothing but a shadow.
-     Darkening the ground is the one move that works in every theme and both
-     modes: in dark the surface is already the lighter of the pair, so pushing
-     the ground down widens the same gap. Depth is a local property, not a
-     contract token — a theme that wants a different recess overrides it
-     without every future theme having to declare one. */
+  /* A recessed ground for borderless cards to sit on. A card's edge is
+     entirely tone against what it sits on, and graphite declares
+     --color-canvas and --color-surface both as #ffffff. */
   .nd-well {
-    --well-depth: 4.5%;
-    --well: color-mix(in srgb, #000 var(--well-depth), var(--color-canvas));
+    --well: color-mix(in srgb, #000 4.5%, var(--color-canvas));
     background: var(--well);
-    /* Rounded because <main> sits in the layout's 6px gutter beside the nav
-       card: a recessed slab with square corners reads as a mistake next to it.
-       As a card it is the third inset surface, which is the design language
-       the nav and the context panel already speak. */
+    /* <main> sits in the layout's 6px gutter beside the rounded nav card. */
     border-radius: var(--radius-card);
   }
 
@@ -466,29 +456,26 @@ input::placeholder, textarea::placeholder {
     display: grid;
     /* min() so the track floor collapses with the container: a bare
        minmax(300px, 1fr) cannot shrink past its floor, and the grid overflows
-       sideways once the body column is narrower than one card — which it is at
-       the layout's own minimum width. */
+       sideways once the body column is narrower than one card. */
     grid-template-columns: repeat(auto-fill, minmax(min(var(--card-min, 300px), 100%), 1fr));
     gap: 14px;
   }
 
-  /* One note. Borderless by design — depth comes from tone and shadow. The
-     radius is a local property for the same reason --well-depth is. */
+  /* One note. Borderless: depth comes from tone and shadow. */
   .nd-notecard {
-    --notecard-radius: 18px;
     display: flex;
     flex-direction: column;
     padding: 20px;
-    border-radius: var(--notecard-radius);
+    border-radius: var(--radius-card);
     background: var(--color-surface);
-    box-shadow: 0 1px 2px rgba(40, 30, 10, 0.04), 0 10px 24px -18px rgba(40, 30, 10, 0.35);
+    box-shadow: var(--shadow-card);
     transition: transform 180ms cubic-bezier(0.22, 1, 0.36, 1), box-shadow 180ms ease-out,
       background-color 140ms ease-out;
     animation: nd-notecard-in 320ms cubic-bezier(0.22, 1, 0.36, 1) backwards;
   }
   .nd-notecard:hover {
     transform: translateY(-2px);
-    box-shadow: 0 2px 4px rgba(40, 30, 10, 0.05), 0 18px 34px -20px rgba(40, 30, 10, 0.45);
+    box-shadow: var(--shadow-card), 0 12px 26px -18px rgba(0, 0, 0, 0.45);
   }
   /* Feedback on the press itself, not on release. The link fills the card, so
      the press and the focus ring are matched from the surface. */
@@ -500,22 +487,19 @@ input::placeholder, textarea::placeholder {
     outline: 2px solid var(--color-accent-text);
     outline-offset: 2px;
   }
-  /* Selected. The fill alone cannot carry this: --color-accent-soft is tuned
-     against the canvas, and graphite's (#efefef) lands DARKER than the well, so
-     a picked card would recede rather than stand out. The accent ring is what
-     reads the same in every theme — and a ring is state, not the chrome the
-     resting card deliberately does without. */
+
+  /* Selected. --color-accent-soft is tuned against the canvas, and graphite's
+     lands darker than the well, so the fill alone cannot carry this. */
   .nd-notecard[data-selected="true"] {
     background: var(--color-accent-soft);
     box-shadow: 0 0 0 2px var(--color-accent-text);
   }
   .nd-notecard[data-selected="true"]:hover {
-    box-shadow: 0 0 0 2px var(--color-accent-text), 0 18px 34px -20px rgba(40, 30, 10, 0.45);
+    box-shadow: 0 0 0 2px var(--color-accent-text), 0 12px 26px -18px rgba(0, 0, 0, 0.45);
   }
 
   /* A short entrance stagger over the first row or two, written out because
-     CSS cannot count siblings into a delay. Cards past the tenth enter
-     together, which is what a long library wants anyway. */
+     CSS cannot count siblings into a delay. */
   .nd-notegrid > :nth-child(2) { animation-delay: 20ms; }
   .nd-notegrid > :nth-child(3) { animation-delay: 40ms; }
   .nd-notegrid > :nth-child(4) { animation-delay: 60ms; }
@@ -531,19 +515,19 @@ input::placeholder, textarea::placeholder {
     to { opacity: 1; transform: none; }
   }
 
-  @media (prefers-color-scheme: dark) {
-    :root:not([data-theme="light"]) .nd-notecard {
-      box-shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 12px 28px -18px rgba(0, 0, 0, 0.8);
+  /* The card asks tone and shadow to carry its edge, which is the thing this
+     preference asks us to stop doing. Give it a real border instead. */
+  @media (prefers-contrast: more) {
+    .nd-well { background: var(--color-canvas); }
+    .nd-notecard {
+      border: 1px solid var(--color-line-visible);
+      box-shadow: none;
     }
-    :root:not([data-theme="light"]) .nd-notecard:hover {
-      box-shadow: 0 2px 5px rgba(0, 0, 0, 0.35), 0 20px 36px -20px rgba(0, 0, 0, 0.9);
+    .nd-notecard:hover { box-shadow: none; }
+    .nd-notecard[data-selected="true"] {
+      border-color: var(--color-accent-text);
+      box-shadow: 0 0 0 1px var(--color-accent-text);
     }
-  }
-  :root[data-theme="dark"] .nd-notecard {
-    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 12px 28px -18px rgba(0, 0, 0, 0.8);
-  }
-  :root[data-theme="dark"] .nd-notecard:hover {
-    box-shadow: 0 2px 5px rgba(0, 0, 0, 0.35), 0 20px 36px -20px rgba(0, 0, 0, 0.9);
   }
 
   @media (prefers-reduced-motion: reduce) {

@@ -176,8 +176,8 @@ export function AllNotes() {
     <div className="h-full flex flex-col overflow-hidden">
       {/* One scrolling well: the grid runs under a translucent title bar. New
           note + theme toggle live in the floating TopBar (top-right). */}
-      <div className="flex-1 overflow-y-auto nd-well">
-        <div className="nd-well-bar">
+      <div className="flex-1 overflow-y-auto nd-well flex flex-col">
+        <div className="nd-well-bar shrink-0">
           <div className="max-w-[1180px] mx-auto w-full px-8 pt-14 pb-3">
             <div className="flex items-center gap-3 px-1">
               <h1 className="nd-heading truncate">All notes</h1>
@@ -205,7 +205,7 @@ export function AllNotes() {
         </div>
 
         {total === 0 ? (
-          <div className="h-full flex flex-col items-center justify-center gap-4 text-center -mt-24 px-12">
+          <div className="flex-1 flex flex-col items-center justify-center gap-4 text-center px-12">
             <div className="text-[var(--color-text-muted)] flex items-center gap-2">
               <span>Press</span>
               <kbd

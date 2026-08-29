@@ -9,9 +9,8 @@ import { cn } from "../lib/cn";
 // vs toggle); works for a modifier-click, the checkbox, and the keyboard toggle.
 export type SelectIntent = { shiftKey: boolean };
 
-// How far along the note is, said in one word beside a coloured dot. The dot
-// alone was tried and rejected — an unlabelled colour means nothing on a card
-// that carries no legend.
+// The card carries no legend, so the colour is named rather than left to
+// stand on its own.
 const STATE_LABEL: Record<NoteState, string> = {
   summarized: "Summarized",
   recorded: "Recorded",
@@ -26,26 +25,14 @@ const STATE_COLOR: Record<NoteState, string> = {
   empty: "var(--color-text-disabled)",
 };
 
-// One note in a grid view (All notes, Folder). Date, title and excerpt stacked,
-// with state, client and folder along the bottom. There are no date headings
-// above the grid, so the card carries its own full date.
+// One note in a grid view (All notes, Folder). Nothing above the grid says
+// when, so the card carries its own full date.
 //
-// Selection (issue #19) works exactly as it did on the old list row, and the
-// rules are the same: a modifier-click (Cmd to toggle, Shift for a range) is
-// intercepted and must NOT navigate, while a plain click follows the link.
-// Ctrl is deliberately excluded — on macOS ctrl-click is the OS secondary
-// click, so treating it as a selection modifier triple-fires.
-//
-// The checkbox is the visible affordance, in the card's top-right corner: it is
-// hidden at rest, fades in on hover, and stays shown for a selected card and —
-// once anything is selected (`selectionActive`) — for every card. It is a
-// sibling of the <Link>, never nested inside the anchor, so toggling it cannot
-// navigate.
-//
-// A11y: the checkbox is a real focusable control with an accessible name
-// (`Select <title>`), selection is exposed via `aria-selected` rather than
-// colour alone, and Space on a focused card toggles it (Shift+Space extends a
-// range) while Enter stays as the link's native navigate.
+// A modifier-click selects instead of navigating: Cmd toggles, Shift extends a
+// range. Ctrl is excluded — on macOS ctrl-click is the OS secondary click, so
+// treating it as a selection modifier triple-fires. The checkbox is a sibling
+// of the <Link>, never nested inside the anchor, so toggling it cannot
+// navigate; Space on a focused card toggles too, leaving Enter to the link.
 export function NoteCard({
   note,
   folder,
@@ -75,7 +62,7 @@ export function NoteCard({
 
   function handleClick(e: MouseEvent) {
     if (onSelect && (e.metaKey || e.shiftKey)) {
-      e.preventDefault(); // suppress navigation for modifier-clicks
+      e.preventDefault();
       onSelect({ shiftKey: e.shiftKey });
     }
   }
@@ -146,10 +133,9 @@ export function NoteCard({
       </Link>
 
       {onSelect && (
-        // Custom circular checkbox: the native input is a transparent overlay
-        // filling a ~26px hit target (bigger than the 18px visual); the ring and
-        // check are painted on top and are pointer-transparent so clicks reach
-        // the input.
+        // The native input is a transparent overlay filling a ~26px hit target;
+        // the ring and check are painted on top and are pointer-transparent so
+        // clicks reach it.
         <div
           className={cn(
             "absolute top-3.5 right-3.5 w-[26px] h-[26px] grid place-items-center transition-opacity duration-150",

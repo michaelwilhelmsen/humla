@@ -945,6 +945,13 @@ const CASES: Record<string, Scenario> = {
     },
   },
 
+  // A library with nothing in it — the first screen a fresh install shows.
+  "notes-empty": {
+    route: "/all-notes",
+    render: () => null, // unused — `route` renders the app
+    ipc: { notes_list: () => [], folders_list: () => [], clients_list: () => [] },
+  },
+
   // The same grid inside a folder, where the folder chip is deliberately absent
   // from every card.
   "notes-folder": {
