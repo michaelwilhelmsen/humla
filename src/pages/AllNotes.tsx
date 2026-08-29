@@ -1,10 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { Plus } from "lucide-react";
-import { ipc, type Client, type Folder } from "../lib/ipc";
+import { ipc } from "../lib/ipc";
 import { useNotesStore, useRecordingStore } from "../lib/store";
 import { cn } from "../lib/cn";
-import { isRecorded, isSummarized } from "../lib/noteList";
+import { indexById, isRecorded, isSummarized } from "../lib/noteList";
 import { NoteCard, type SelectIntent } from "../components/NoteCard";
 import { BulkActionBar } from "../components/BulkActionBar";
 import { Modal } from "./settings/components/Modal";
@@ -40,16 +40,8 @@ export function AllNotes() {
     () => [...notes].sort((a, b) => b.created_at - a.created_at),
     [notes],
   );
-  const folderById = useMemo(() => {
-    const map = new Map<string, Folder>();
-    for (const f of folders) map.set(f.id, f);
-    return map;
-  }, [folders]);
-  const clientById = useMemo(() => {
-    const map = new Map<string, Client>();
-    for (const c of clients) map.set(c.id, c);
-    return map;
-  }, [clients]);
+  const folderById = useMemo(() => indexById(folders), [folders]);
+  const clientById = useMemo(() => indexById(clients), [clients]);
 
   const filtered = useMemo(
     () =>

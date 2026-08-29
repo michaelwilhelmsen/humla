@@ -1,4 +1,5 @@
 import { type Note } from "./ipc";
+import { stripSpeakerLabels } from "./speakers";
 
 // Shared helpers for the note-list views (All notes, Folder).
 
@@ -36,12 +37,6 @@ export function htmlToText(html: string | null | undefined): string {
   const el = document.createElement("div");
   el.innerHTML = trimmed.replace(/<\/(p|div|li|h[1-6]|blockquote|tr)>/gi, "$& ");
   return el.textContent || "";
-}
-
-// The transcript without its `Speaker 3: ` line prefixes — the words, not who
-// said them. Mirrors the label rule in lib/speakers.ts.
-function stripSpeakerLabels(transcript: string): string {
-  return transcript.replace(/^[^:\n]{1,40}:\s/gm, "");
 }
 
 // The summary's opening line: its first real paragraph, or its first bullet
@@ -82,8 +77,8 @@ export function noteExcerpt(n: Note): string {
 export type NoteState = "summarized" | "recorded" | "notes" | "empty";
 
 export function noteState(n: Note): NoteState {
-  if (n.summary.trim()) return "summarized";
-  if (n.transcript.trim()) return "recorded";
+  if (isSummarized(n)) return "summarized";
+  if (isRecorded(n)) return "recorded";
   if (htmlToText(n.body).trim()) return "notes";
   return "empty";
 }
@@ -96,4 +91,9 @@ export function isRecorded(n: Note): boolean {
 
 export function isSummarized(n: Note): boolean {
   return n.summary.trim().length > 0;
+}
+
+// Index a list the note views look rows up in by id.
+export function indexById<T extends { id: string }>(items: T[]): Map<string, T> {
+  return new Map(items.map((item) => [item.id, item]));
 }

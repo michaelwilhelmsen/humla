@@ -1,8 +1,8 @@
 import { useMemo } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import { Folder as FolderIcon } from "lucide-react";
-import { type Client } from "../lib/ipc";
 import { useNotesStore } from "../lib/store";
+import { indexById } from "../lib/noteList";
 import { NoteCard } from "../components/NoteCard";
 
 export function Folder() {
@@ -20,11 +20,7 @@ export function Folder() {
         .sort((a, b) => b.created_at - a.created_at),
     [notes, id],
   );
-  const clientById = useMemo(() => {
-    const map = new Map<string, Client>();
-    for (const c of clients) map.set(c.id, c);
-    return map;
-  }, [clients]);
+  const clientById = useMemo(() => indexById(clients), [clients]);
 
   if (!folder) {
     return (

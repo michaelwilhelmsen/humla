@@ -11,18 +11,11 @@ export type SelectIntent = { shiftKey: boolean };
 
 // The card carries no legend, so the colour is named rather than left to
 // stand on its own.
-const STATE_LABEL: Record<NoteState, string> = {
-  summarized: "Summarized",
-  recorded: "Recorded",
-  notes: "Notes only",
-  empty: "Empty",
-};
-
-const STATE_COLOR: Record<NoteState, string> = {
-  summarized: "var(--color-accent-text)",
-  recorded: "var(--color-interactive)",
-  notes: "var(--color-text-muted)",
-  empty: "var(--color-text-disabled)",
+const STATE: Record<NoteState, { label: string; color: string }> = {
+  summarized: { label: "Summarized", color: "var(--color-accent-text)" },
+  recorded: { label: "Recorded", color: "var(--color-interactive)" },
+  notes: { label: "Notes only", color: "var(--color-text-muted)" },
+  empty: { label: "Empty", color: "var(--color-text-disabled)" },
 };
 
 // One note in a grid view (All notes, Folder). Nothing above the grid says
@@ -54,7 +47,7 @@ export function NoteCard({
 }) {
   const title = note.title.trim() || "Untitled";
   const excerpt = noteExcerpt(note);
-  const state = noteState(note);
+  const state = STATE[noteState(note)];
   const checkboxShown = selected || selectionActive;
   // The checkbox's toggle fires via onChange (which carries no modifier flags),
   // so we stash the click's shift state here for the onChange to read.
@@ -108,14 +101,14 @@ export function NoteCard({
         <div className="mt-auto pt-4 flex items-center gap-x-2.5 gap-y-1.5 flex-wrap text-[11.5px]">
           <span
             className="inline-flex items-center gap-1.5 whitespace-nowrap"
-            style={{ color: STATE_COLOR[state] }}
+            style={{ color: state.color }}
           >
             <span
               aria-hidden
               className="w-[6px] h-[6px] rounded-full shrink-0"
-              style={{ background: STATE_COLOR[state] }}
+              style={{ background: state.color }}
             />
-            {STATE_LABEL[state]}
+            {state.label}
           </span>
           {client && (
             <span className="inline-flex items-center gap-1.5 min-w-0 text-[var(--color-text-muted)]">
