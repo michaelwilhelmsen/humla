@@ -1,6 +1,6 @@
 [package]
 name = "humla"
-version = "0.53.0"
+version = "0.54.0"
 description = "Humla — personal meeting notes that hum along"
 authors = ["Michael Wilhelmsen"]
 edition = "2021"
