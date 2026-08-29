@@ -9,6 +9,13 @@ describe("htmlToText", () => {
     );
   });
 
+  it("separates hard breaks — Tiptap writes Shift+Enter as <br>", () => {
+    expect(htmlToText("<p>første linje<br>andre linje</p>").trim()).toBe(
+      "første linje andre linje",
+    );
+    expect(htmlToText("<p>a<br />b</p>").trim()).toBe("a b");
+  });
+
   it("keeps inline markup unspaced", () => {
     expect(htmlToText("<p>en <strong>viktig</strong> ting</p>").trim()).toBe(
       "en viktig ting",

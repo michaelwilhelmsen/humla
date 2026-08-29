@@ -35,7 +35,9 @@ export function htmlToText(html: string | null | undefined): string {
   const trimmed = html?.trim();
   if (!trimmed) return "";
   const el = document.createElement("div");
-  el.innerHTML = trimmed.replace(/<\/(p|div|li|h[1-6]|blockquote|tr)>/gi, "$& ");
+  el.innerHTML = trimmed
+    .replace(/<br\s*\/?>/gi, " ")
+    .replace(/<\/(p|div|li|h[1-6]|blockquote|tr)>/gi, "$& ");
   return el.textContent || "";
 }
 
