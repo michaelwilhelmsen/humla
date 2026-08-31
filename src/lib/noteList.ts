@@ -41,22 +41,45 @@ export function htmlToText(html: string | null | undefined): string {
   return el.textContent || "";
 }
 
-// The summary's opening line: its first real paragraph, or its first bullet
+// Floor under an excerpt candidate: anything shorter is a fragment
+// ("— Begge") that tells the card nothing.
+const EXCERPT_MIN_CHARS = 20;
+
+// Letters or digits. A line without them (---, ***, lone punctuation) is
+// structure, not content.
+const SUBSTANCE = /[\p{L}\p{N}]/u;
+
+// Model throat-clearing that introduces the summary instead of opening it.
+// The colon test is language-neutral; the phrase list covers what the models
+// emit in this library's languages (no + en).
+function isPreamble(text: string): boolean {
+  return text.endsWith(":") || /^(her (er|følger)|here('s| is))\b/i.test(text);
+}
+
+// The summary's opening: its first substantive paragraph, or its first bullet
 // when the whole summary is a list (which the terse presets often produce).
-// Markdown emphasis is stripped — the excerpt renders as plain text.
+// Horizontal rules, preamble lines and fragments are stepped over; the first
+// of them is kept as a last resort, since a weak summary line still beats
+// showing a summarized note's typed body or raw transcript. Markdown emphasis
+// is stripped — the excerpt renders as plain text.
 function summaryOpening(summary: string): string {
   let firstBullet = "";
+  let weak = "";
   for (const raw of summary.split("\n")) {
     const line = raw.trim();
     if (!line || line.startsWith("#")) continue;
-    const bullet = line.match(/^(?:[-*•]|\d+\.)\s+(.*)$/);
-    if (bullet) {
-      if (!firstBullet && bullet[1].trim()) firstBullet = bullet[1].trim();
-      continue;
+    const bullet = line.match(/^(?:[-*•—–]|\d+\.)\s+(.*)$/);
+    const text = clean(bullet ? bullet[1] : line);
+    if (!SUBSTANCE.test(text)) continue;
+    if (text.length < EXCERPT_MIN_CHARS || isPreamble(text)) {
+      if (!weak) weak = text;
+    } else if (bullet) {
+      if (!firstBullet) firstBullet = text;
+    } else {
+      return text;
     }
-    return clean(line);
   }
-  return clean(firstBullet);
+  return firstBullet || weak;
 }
 
 function clean(text: string): string {
@@ -65,13 +88,18 @@ function clean(text: string): string {
 
 // The card's excerpt. The summary goes first because it is the distilled
 // version of everything else on the note; a note with no summary falls back to
-// what the user typed, and a pure voice memo to what was said.
+// what the user typed, and a pure voice memo to what was said. A body below
+// the fragment floor yields to the transcript — which at least says what the
+// meeting was about — but is kept over showing nothing.
 export function noteExcerpt(n: Note): string {
   const summary = summaryOpening(n.summary);
   if (summary) return summary;
   const body = clean(htmlToText(n.body));
-  if (body) return body;
-  return clean(stripSpeakerLabels(n.transcript));
+  const bodyHasSubstance = SUBSTANCE.test(body);
+  if (bodyHasSubstance && body.length >= EXCERPT_MIN_CHARS) return body;
+  const transcript = clean(stripSpeakerLabels(n.transcript));
+  if (SUBSTANCE.test(transcript)) return transcript;
+  return bodyHasSubstance ? body : "";
 }
 
 // How far along a note is. Drives the card's state dot, and reads as the

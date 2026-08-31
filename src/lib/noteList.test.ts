@@ -57,6 +57,94 @@ describe("noteExcerpt", () => {
   it("is empty for an empty note", () => {
     expect(noteExcerpt(makeNote({ id: "a" }))).toBe("");
   });
+
+  it("steps over a horizontal rule at the top of the summary", () => {
+    const n = makeNote({
+      id: "a",
+      summary: "---\n\nMøtet handlet om ny prismodell for kommunene.",
+    });
+    expect(noteExcerpt(n)).toBe("Møtet handlet om ny prismodell for kommunene.");
+  });
+
+  it("falls through a noise-only summary to the body", () => {
+    const n = makeNote({
+      id: "a",
+      summary: "---",
+      body: "<p>Planla permisjonen: tre måneder fra mars, deretter delt.</p>",
+    });
+    expect(noteExcerpt(n)).toBe("Planla permisjonen: tre måneder fra mars, deretter delt.");
+  });
+
+  it("steps over a fragment line to the first real paragraph", () => {
+    const n = makeNote({
+      id: "a",
+      summary: "— Begge\n\nPetter og Michael ble enige om ny posisjonering mot helsesektoren.",
+    });
+    expect(noteExcerpt(n)).toBe(
+      "Petter og Michael ble enige om ny posisjonering mot helsesektoren.",
+    );
+  });
+
+  it("steps over model preamble to the first real bullet", () => {
+    const n = makeNote({
+      id: "a",
+      summary:
+        "Her er møtenotatene basert på dine notater og transkripsjonen:\n- Landet ny pris på lisensavtalen med kommunen",
+    });
+    expect(noteExcerpt(n)).toBe("Landet ny pris på lisensavtalen med kommunen");
+  });
+
+  it("steps over 'Her er …' preamble even without a trailing colon", () => {
+    const n = makeNote({
+      id: "a",
+      summary:
+        "Her er et sammendrag av møtet om Stund-appen.\n\nKommunen vil utvide piloten til tre nye avdelinger.",
+    });
+    expect(noteExcerpt(n)).toBe("Kommunen vil utvide piloten til tre nye avdelinger.");
+  });
+
+  it("keeps a weak summary line when the summary holds nothing stronger", () => {
+    const n = makeNote({
+      id: "a",
+      summary: "Her er et sammendrag av møtet mellom Michael og Aldring og Helse.",
+      body: "<p>notater som ikke skal vinne over sammendraget</p>",
+    });
+    expect(noteExcerpt(n)).toBe(
+      "Her er et sammendrag av møtet mellom Michael og Aldring og Helse.",
+    );
+  });
+
+  it("reads em-dash bullets as bullets", () => {
+    const n = makeNote({
+      id: "a",
+      summary: "— Begge parter\n— Enige om ny retning for hele produktlinjen",
+    });
+    expect(noteExcerpt(n)).toBe("Enige om ny retning for hele produktlinjen");
+  });
+
+  it("keeps a label-style opening that ends in content, not a colon", () => {
+    const n = makeNote({
+      id: "a",
+      summary: "Tema: Presentasjon og demo av Stund-appen for Stavanger kommune",
+    });
+    expect(noteExcerpt(n)).toBe(
+      "Tema: Presentasjon og demo av Stund-appen for Stavanger kommune",
+    );
+  });
+
+  it("prefers the transcript over a fragment body", () => {
+    const n = makeNote({
+      id: "a",
+      body: "<p>— Begge</p>",
+      transcript: "Michael: Vi bør flytte lanseringen til november.",
+    });
+    expect(noteExcerpt(n)).toBe("Vi bør flytte lanseringen til november.");
+  });
+
+  it("keeps a fragment body when there is nothing else", () => {
+    const n = makeNote({ id: "a", body: "<p>— Begge</p>" });
+    expect(noteExcerpt(n)).toBe("— Begge");
+  });
 });
 
 describe("noteState", () => {
