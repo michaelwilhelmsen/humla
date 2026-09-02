@@ -18,7 +18,7 @@ describe("ChatTab provider setting", () => {
     render(<ChatTab s={settings({ chat_provider: "openai" })} update={async () => {}} />);
     await userEvent.click(screen.getByRole("combobox", { name: /Cloud \(OpenAI\)/ }));
     const options = screen.getAllByRole("option").map((o) => o.textContent);
-    expect(options).toEqual(["Cloud (OpenAI)", "Local (Ollama)"]);
+    expect(options).toEqual(["Cloud (OpenAI)", "Local (any OpenAI-compatible server)"]);
     expect(screen.queryByRole("option", { name: /Groq/i })).toBeNull();
     expect(screen.queryByRole("option", { name: /Deepgram/i })).toBeNull();
   });
@@ -27,7 +27,7 @@ describe("ChatTab provider setting", () => {
     const update = vi.fn();
     render(<ChatTab s={settings({ chat_provider: "openai" })} update={update} />);
     await userEvent.click(screen.getByRole("combobox", { name: /Cloud \(OpenAI\)/ }));
-    await userEvent.click(screen.getByRole("option", { name: "Local (Ollama)" }));
+    await userEvent.click(screen.getByRole("option", { name: "Local (any OpenAI-compatible server)" }));
     expect(update).toHaveBeenCalledWith("chat_provider", "ollama");
   });
 });
@@ -109,6 +109,49 @@ describe("ChatTab readiness", () => {
     );
     await waitFor(() => expect(screen.getByText("Setup needed")).toBeInTheDocument());
     expect(screen.getByText(/is an embedding model/)).toBeInTheDocument();
+  });
+
+  // #179: chat works against any OpenAI-compatible server, so the advice must
+  // stop naming Ollama once the URL is off its port — `ollama pull` is not a
+  // command an mlx / LM Studio / vLLM user has.
+  it("a non-Ollama local server gets no ollama pull command", async () => {
+    mockTauri({ local_llm_list_models: () => ["mlx-community/Qwen3-8B"] });
+    render(
+      <ChatTab
+        s={settings({
+          chat_provider: "ollama",
+          chat_model: "mlx-community/Qwen3-8B",
+          local_llm_base_url: "http://127.0.0.1:8000/v1",
+        })}
+        update={async () => {}}
+      />,
+    );
+    await waitFor(() => expect(screen.getByText("Ready ✓")).toBeInTheDocument());
+    expect(screen.queryByRole("button", { name: /Copy Ollama pull command/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: /Copy embedding-model pull command/ })).toBeNull();
+    expect(screen.getByText(/keyword only/)).toBeInTheDocument();
+  });
+
+  it("a non-Ollama local server that is down names the URL, not Ollama", async () => {
+    mockTauri({
+      local_llm_list_models: () => {
+        throw new Error("connection refused");
+      },
+    });
+    render(
+      <ChatTab
+        s={settings({
+          chat_provider: "ollama",
+          chat_model: "mlx-community/Qwen3-8B",
+          local_llm_base_url: "http://127.0.0.1:8000/v1",
+        })}
+        update={async () => {}}
+      />,
+    );
+    await waitFor(() =>
+      expect(screen.getByText(/Couldn't reach the local server at http:\/\/127\.0\.0\.1:8000\/v1/)).toBeInTheDocument(),
+    );
+    expect(screen.queryByText(/install Ollama/)).toBeNull();
   });
 
   it("Ollama: auto-selects a chat model, never the embedding model, when none is set", async () => {

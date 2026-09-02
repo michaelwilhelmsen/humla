@@ -14,6 +14,7 @@ import {
   RECOMMENDED_OLLAMA_MODEL,
   isEmbeddingModel,
   isModelInstalled,
+  isOllamaUrl,
 } from "../../../lib/localModels";
 import { ipc } from "../../../lib/ipc";
 import type { SettingsHook } from "../useSettings";
@@ -35,12 +36,17 @@ export function ChatTab({ s, update }: Pick<SettingsHook, "s" | "update">) {
   let ready = false;
   let hint = "";
   if (isOllama) {
-    if (reachable === false) hint = "Start or install Ollama — it's detected automatically.";
+    if (reachable === false)
+      hint = isOllamaUrl(s.local_llm_base_url)
+        ? "Start or install Ollama — it's detected automatically."
+        : `Couldn't reach the local server at ${s.local_llm_base_url} — start it, or check the URL above.`;
     else if (!s.chat_model) hint = "Choose a chat model above.";
     else if (isEmbeddingModel(s.chat_model))
       hint = `“${s.chat_model}” is an embedding model — choose a chat model above.`;
     else if (installed && !installed.includes(s.chat_model))
-      hint = `“${s.chat_model}” isn't installed on the server — run ollama pull ${s.chat_model}.`;
+      hint = isOllamaUrl(s.local_llm_base_url)
+        ? `“${s.chat_model}” isn't installed on the server — run ollama pull ${s.chat_model}.`
+        : `“${s.chat_model}” isn't one of the models the local server lists — choose another above.`;
     else ready = true;
   } else {
     if (!key.hasKey) hint = "Add your OpenAI key above to use chat.";
@@ -63,7 +69,7 @@ export function ChatTab({ s, update }: Pick<SettingsHook, "s" | "update">) {
       </p>
       <Row
         label="Provider"
-        description="Ask questions grounded in your notes. Cloud (OpenAI) uses your key; Local (Ollama) runs fully offline. Independent of your transcription and summary providers."
+        description="Ask questions grounded in your notes. Cloud (OpenAI) uses your key; Local runs fully offline against Ollama or any OpenAI-compatible server. Independent of your transcription and summary providers."
         control={
           <Select
             value={s.chat_provider}
@@ -101,44 +107,58 @@ export function ChatTab({ s, update }: Pick<SettingsHook, "s" | "update">) {
             model={s.chat_model}
             onModelChange={(v) => update("chat_model", v)}
           />
-          <div className="py-3 space-y-2">
-            <p className="text-xs text-[var(--color-text-muted)]">
-              Runs fully offline. Don't have Ollama yet?{" "}
-              <button
-                type="button"
-                onClick={() => openExternal("https://ollama.com/download")}
-                className="underline hover:text-[var(--color-text)]"
-              >
-                Install Ollama
-              </button>
-              , then pull a tool-calling-capable model:
-            </p>
-            <CommandSnippet
-              command={`ollama pull ${s.chat_model || RECOMMENDED_OLLAMA_MODEL}`}
-              ariaLabel="Copy Ollama pull command"
-            />
-          </div>
-          {/* Embedding model for semantic retrieval (issue #48). Optional —
-              chat works keyword-only without it — so this never blocks the
-              readiness gate above; it's a soft recommendation. */}
-          <div className="py-3 space-y-2 border-t border-[var(--color-line)]">
-            {isModelInstalled(installed, EMBEDDING_OLLAMA_MODEL) ? (
-              <p className="text-xs text-[var(--color-success)]">
-                Semantic search ready ✓ — {EMBEDDING_OLLAMA_MODEL} is installed.
+          {isOllamaUrl(s.local_llm_base_url) ? (
+            <>
+            <div className="py-3 space-y-2">
+              <p className="text-xs text-[var(--color-text-muted)]">
+                Runs fully offline. Don't have Ollama yet?{" "}
+                <button
+                  type="button"
+                  onClick={() => openExternal("https://ollama.com/download")}
+                  className="underline hover:text-[var(--color-text)]"
+                >
+                  Install Ollama
+                </button>
+                , then pull a tool-calling-capable model:
               </p>
-            ) : (
-              <>
-                <p className="text-xs text-[var(--color-text-muted)]">
-                  For semantic search — finding answers by meaning, not just keywords — also pull
-                  the embedding model (~600 MB). Optional; chat works without it.
+              <CommandSnippet
+                command={`ollama pull ${s.chat_model || RECOMMENDED_OLLAMA_MODEL}`}
+                ariaLabel="Copy Ollama pull command"
+              />
+            </div>
+            {/* Embedding model for semantic retrieval (issue #48). Optional —
+                chat works keyword-only without it — so this never blocks the
+                readiness gate above; it's a soft recommendation. */}
+            <div className="py-3 space-y-2 border-t border-[var(--color-line)]">
+              {isModelInstalled(installed, EMBEDDING_OLLAMA_MODEL) ? (
+                <p className="text-xs text-[var(--color-success)]">
+                  Semantic search ready ✓ — {EMBEDDING_OLLAMA_MODEL} is installed.
                 </p>
-                <CommandSnippet
-                  command={`ollama pull ${EMBEDDING_OLLAMA_MODEL}`}
-                  ariaLabel="Copy embedding-model pull command"
-                />
-              </>
-            )}
-          </div>
+              ) : (
+                <>
+                  <p className="text-xs text-[var(--color-text-muted)]">
+                    For semantic search — finding answers by meaning, not just keywords — also pull
+                    the embedding model (~600 MB). Optional; chat works without it.
+                  </p>
+                  <CommandSnippet
+                    command={`ollama pull ${EMBEDDING_OLLAMA_MODEL}`}
+                    ariaLabel="Copy embedding-model pull command"
+                  />
+                </>
+              )}
+            </div>
+            </>
+          ) : (
+            // Off Ollama's port the runtime is LM Studio, llama-server, vLLM or
+            // mlx: chat runs on plain OpenAI-compat, but the embedder is still
+            // asked for `embeddinggemma` by name, so say what that costs rather
+            // than printing an `ollama pull` the user can't run (#179).
+            <p className="py-3 text-xs text-[var(--color-text-muted)]">
+              Runs fully offline against your own server. Semantic search needs an embedding model
+              named {EMBEDDING_OLLAMA_MODEL} on it; without one, chat searches your notes by
+              keyword only.
+            </p>
+          )}
         </>
       )}
 

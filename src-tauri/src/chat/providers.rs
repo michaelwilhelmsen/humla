@@ -143,8 +143,11 @@ impl ChatAdapter for OpenAiChatAdapter {
     }
 }
 
-/// Local Ollama, via its native `/api/chat`. Tool steps are buffered (spike
-/// #45); the final buffered answer is emitted as one text delta.
+/// Any local LLM server. Ollama is driven through its native `/api/chat` (tool
+/// steps are buffered — spike #45 — and the final answer is emitted as one text
+/// delta); every other runtime (LM Studio, llama-server, vLLM, mlx) speaks the
+/// same OpenAI-compat endpoint the cloud path uses. Which one is decided by the
+/// base URL, exactly as the summary path decides it (#179).
 pub struct OllamaChatAdapter;
 
 #[async_trait]
@@ -160,14 +163,26 @@ impl ChatAdapter for OllamaChatAdapter {
         tools: &[ToolSpec],
         on_event: &mut (dyn FnMut(ChatStreamEvent) + Send),
     ) -> Result<ChatStep> {
-        let native = crate::openai::ollama_native_url(ctx.base_url).ok_or_else(|| {
-            anyhow!(
-                "Chat on Ollama needs an Ollama server (…:11434). \
-                 Check the local server URL in Settings."
-            )
-        })?;
-        let wire_messages = lower_messages_ollama(messages);
         let wire_tools = lower_tools(tools);
+        let Some(native) = crate::openai::ollama_native_url(ctx.base_url) else {
+            // A local OpenAI-compat server. It has no key, but some runtimes
+            // still expect the header to exist, so send an empty bearer.
+            let wire_messages = lower_messages_openai(messages);
+            let (text, raw) = crate::openai::openai_chat_step(
+                ctx.base_url,
+                ctx.api_key.unwrap_or(""),
+                ctx.model,
+                &wire_messages,
+                &wire_tools,
+                |delta| {
+                    on_event(ChatStreamEvent::TextDelta(delta.to_string()));
+                    !ctx.cancel.is_cancelled()
+                },
+            )
+            .await?;
+            return Ok(emit_step(text, raw, on_event));
+        };
+        let wire_messages = lower_messages_ollama(messages);
         let (text, raw) = crate::openai::ollama_chat_step(
             &native,
             ctx.model,
@@ -308,5 +323,129 @@ impl ChatAdapter for FakeChatAdapter {
             on_event(ChatStreamEvent::TextDelta(text.clone()));
             Ok(ChatStep { text, tool_calls: Vec::new() })
         }
+    }
+}
+
+#[cfg(test)]
+mod local_compat_tests {
+    use super::*;
+    use crate::chat::adapter::CancelFlag;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// One-shot OpenAI-compat `/chat/completions` server: reads the request,
+    /// answers with an SSE stream carrying a single content delta. Returns its
+    /// port and the request body it saw.
+    async fn fake_compat_server() -> (u16, tokio::task::JoinHandle<String>) {
+        serve_sse(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi from mlx\"}}]}\n\n\
+             data: [DONE]\n\n",
+        )
+        .await
+    }
+
+    /// One-shot server answering with `body` as an event stream.
+    async fn serve_sse(body: &'static str) -> (u16, tokio::task::JoinHandle<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 65536];
+            let n = sock.read(&mut buf).await.unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+            sock.flush().await.unwrap();
+            req
+        });
+        (port, handle)
+    }
+
+    #[tokio::test]
+    async fn local_chat_falls_back_to_openai_compat_off_ollamas_port() {
+        let (port, server) = fake_compat_server().await;
+        let base = format!("http://127.0.0.1:{port}/v1");
+        let cancel = CancelFlag::new();
+        let ctx = ChatCtx {
+            model: "mlx-community/Qwen3-8B",
+            api_key: None,
+            base_url: &base,
+            think: false,
+            cancel: &cancel,
+        };
+        let mut seen = String::new();
+        let step = OllamaChatAdapter
+            .step(
+                ctx,
+                &[ChatTurn::new("user", "hello")],
+                &[],
+                &mut |ev| {
+                    if let ChatStreamEvent::TextDelta(d) = ev {
+                        seen.push_str(&d);
+                    }
+                },
+            )
+            .await
+            .expect("a non-Ollama local server must still chat");
+        assert_eq!(step.text, "hi from mlx");
+        assert_eq!(seen, "hi from mlx");
+        let req = server.await.unwrap();
+        assert!(req.starts_with("POST /v1/chat/completions"), "req was: {req}");
+    }
+
+    #[tokio::test]
+    async fn a_streamed_tool_call_from_a_local_compat_server_is_assembled() {
+        let (port, server) = serve_sse(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\
+             \"function\":{\"name\":\"search_notes\",\"arguments\":\"{\\\"query\\\":\"}}]}}]}\n\n\
+             data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\
+             \"function\":{\"arguments\":\"\\\"budget\\\"}\"}}]}}]}\n\n\
+             data: [DONE]\n\n",
+        )
+        .await;
+        let base = format!("http://127.0.0.1:{port}/v1");
+        let cancel = CancelFlag::new();
+        let ctx = ChatCtx {
+            model: "local-model",
+            api_key: None,
+            base_url: &base,
+            think: false,
+            cancel: &cancel,
+        };
+        let tools = [ToolSpec {
+            name: "search_notes".into(),
+            description: "search".into(),
+            parameters: json!({"type": "object", "properties": {}}),
+        }];
+        let mut calls = Vec::new();
+        let step = OllamaChatAdapter
+            .step(ctx, &[ChatTurn::new("user", "budget?")], &tools, &mut |ev| {
+                if let ChatStreamEvent::ToolCall(tc) = ev {
+                    calls.push(tc);
+                }
+            })
+            .await
+            .expect("tool calls must survive the compat path");
+        assert_eq!(step.tool_calls.len(), 1);
+        assert_eq!(step.tool_calls[0].name, "search_notes");
+        assert_eq!(step.tool_calls[0].arguments, "{\"query\":\"budget\"}");
+        assert_eq!(calls.len(), 1);
+        let req = server.await.unwrap();
+        assert!(req.contains("search_notes"), "tools were not offered: {req}");
+    }
+
+    #[tokio::test]
+    async fn ollamas_own_port_still_takes_the_native_api() {
+        let (port, server) = fake_compat_server().await;
+        // The native path only triggers on :11434, so fake that host:port in
+        // the URL and let the request itself say which endpoint was chosen.
+        let base = format!("http://127.0.0.1:{port}/v1");
+        let native = crate::openai::ollama_native_url("http://localhost:11434/v1");
+        assert_eq!(native.as_deref(), Some("http://localhost:11434/api"));
+        assert_eq!(crate::openai::ollama_native_url(&base), None);
+        server.abort();
     }
 }

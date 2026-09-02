@@ -1227,27 +1227,10 @@ where
         tools: if tools.is_empty() { None } else { Some(tools) },
         temperature: if is_reasoning_model(model) { None } else { Some(0.2) },
     };
-    let url = format!("{base_url}/chat/completions");
-    let r = summary_cloud_client()
-        .post(&url)
-        .bearer_auth(api_key)
-        .json(&req)
-        .send()
-        .await
-        .map_err(|e| {
-            if e.is_timeout() {
-                anyhow!("Timed out waiting for OpenAI. Try again.")
-            } else if e.is_connect() {
-                anyhow!("Couldn't reach OpenAI. Check your internet connection.")
-            } else {
-                anyhow!("Network error talking to OpenAI: {}", error_chain(&e))
-            }
-        })?;
-    let status = r.status();
-    if !status.is_success() {
-        let body = r.text().await.unwrap_or_default();
-        return Err(anyhow!("HTTP {status} from {base_url}: {body}"));
-    }
+    // `base_url` may be a local OpenAI-compat server, which needs the longer
+    // timeout and its own failure vocabulary — `Endpoint` owns both.
+    let ep = Endpoint::from_base(base_url);
+    let r = post_chat(&ep, api_key, &req, std::time::Instant::now()).await?;
 
     use futures_util::StreamExt;
     let mut byte_stream = r.bytes_stream();

@@ -74,7 +74,10 @@ export const SUMMARY_PROVIDERS = [
 // which chat retrieval will depend on, so they're never offered.
 export const CHAT_PROVIDERS = [
   { value: "openai", label: "Cloud (OpenAI)" },
-  { value: "ollama", label: "Local (Ollama)" },
+  // Ollama by name is the value, not the limit: chat drives Ollama's native
+  // API on :11434 and plain OpenAI-compat anywhere else, exactly as summaries
+  // do (#179). The label said "Local (Ollama)" and read as a restriction.
+  { value: "ollama", label: "Local (any OpenAI-compatible server)" },
 ];
 
 export const WHISPER_PRESETS = [

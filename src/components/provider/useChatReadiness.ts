@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { ipc } from "../../lib/ipc";
 import { DEFAULTS } from "../../pages/settings/types";
-import { isEmbeddingModel } from "../../lib/localModels";
+import { isEmbeddingModel, isOllamaUrl } from "../../lib/localModels";
 import { useOllamaProbe } from "./useOllamaProbe";
 import { useProviderKey } from "./useProviderKey";
 
@@ -49,12 +49,17 @@ export function useChatReadiness() {
   if (loading) {
     hint = "";
   } else if (isOllama) {
-    if (reachable === false) hint = "Start or install Ollama — it's detected automatically.";
+    if (reachable === false)
+      hint = isOllamaUrl(baseUrl)
+        ? "Start or install Ollama — it's detected automatically."
+        : `Couldn't reach the local server at ${baseUrl} — start it, or check the URL in Settings → Chat.`;
     else if (!model) hint = "Choose a chat model in Settings → Chat.";
     else if (isEmbeddingModel(model))
       hint = `“${model}” is an embedding model — pick a chat model in Settings → Chat.`;
     else if (installed && !installed.includes(model))
-      hint = `“${model}” isn't installed on the server — run ollama pull ${model}.`;
+      hint = isOllamaUrl(baseUrl)
+        ? `“${model}” isn't installed on the server — run ollama pull ${model}.`
+        : `“${model}” isn't one of the models the local server lists — pick another in Settings → Chat.`;
     else if (reachable === null) hint = "Checking the local server…";
     else ready = true;
   } else {

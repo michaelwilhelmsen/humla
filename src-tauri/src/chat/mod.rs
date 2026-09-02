@@ -1203,6 +1203,89 @@ mod tests {
         ChatCtx { cancel: flag, ..FAKE_CTX }
     }
 
+    /// A local OpenAI-compat server that is NOT Ollama (#179): serves two
+    /// `/chat/completions` requests in order — a streamed tool call, then the
+    /// final answer — so the whole loop (retrieval included) runs over the wire
+    /// the way an mlx / LM Studio / vLLM user's does.
+    async fn fake_compat_server(bodies: Vec<String>) -> (u16, tokio::task::JoinHandle<usize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = tokio::spawn(async move {
+            let mut served = 0usize;
+            for body in bodies {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 262_144];
+                let _ = sock.read(&mut buf).await.unwrap();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                sock.write_all(resp.as_bytes()).await.unwrap();
+                sock.flush().await.unwrap();
+                served += 1;
+            }
+            served
+        });
+        (port, handle)
+    }
+
+    #[tokio::test]
+    async fn a_local_openai_compat_server_runs_the_whole_loop_including_retrieval() {
+        let dir = tempfile::tempdir().unwrap();
+        let (dbh, _path) = temp_db(&dir);
+        let note_id = seed_note(&dbh, "Budget meeting", "We agreed the budget lands in March.");
+        let conv_id = conv(&dbh, &note_id);
+
+        let tool_call = format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"call_1\",\
+             \"function\":{{\"name\":\"search_notes\",\"arguments\":\"{}\"}}}}]}}}}]}}\n\n\
+             data: [DONE]\n\n",
+            "{\\\"query\\\":\\\"budget\\\"}"
+        );
+        let answer = "data: {\"choices\":[{\"delta\":{\"content\":\"The budget lands in March.\"}}]}\n\n\
+                      data: [DONE]\n\n"
+            .to_string();
+        let (port, server) = fake_compat_server(vec![tool_call, answer]).await;
+
+        let base = format!("http://127.0.0.1:{port}/v1");
+        let ctx = ChatCtx { base_url: &base, model: "mlx-community/Qwen3-8B", ..FAKE_CTX };
+        let mut events: Vec<ChatEvent> = Vec::new();
+        run_chat(
+            &dbh,
+            &OllamaChatAdapter,
+            ctx,
+            &conv_id,
+            "",
+            &ToolScope::All,
+            "",
+            None,
+            "When does the budget land?",
+            None,
+            |ev| events.push(ev),
+        )
+        .await
+        .expect("a non-Ollama local server must chat");
+
+        let streamed: String = events
+            .iter()
+            .filter_map(|e| match e {
+                ChatEvent::TextDelta { delta, .. } => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(streamed, "The budget lands in March.");
+        // The tool step ran on the wire, not just the answer.
+        assert_eq!(server.await.unwrap(), 2);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ChatEvent::ToolActivity { name, .. } if name == "search_notes")),
+            "retrieval never ran: {events:?}"
+        );
+    }
+
     #[tokio::test]
     async fn run_chat_persists_both_messages_and_streams_answer() {
         let dir = tempfile::tempdir().unwrap();
