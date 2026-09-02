@@ -32,6 +32,7 @@ import { Segmented } from "./pages/settings/components/Segmented";
 import { Toggle } from "./pages/settings/components/Toggle";
 import { NoteTitleBox, NoteToolbar, PanelEmpty, TranscriptEditor, TranscriptPlayer } from "./pages/Note";
 import { IntegrationsSection } from "./pages/settings/tabs/Integrations";
+import { ChatTab } from "./pages/settings/tabs/Chat";
 import { RecordingSection } from "./pages/settings/tabs/Recording";
 import { NewWorkspaceModal } from "./components/NewWorkspaceModal";
 import { DISCONNECTED, useCloudStore, type CloudStatus, type CloudWorkspace } from "./lib/cloud";
@@ -410,6 +411,67 @@ function IntegrationsHarness({ enabled }: { enabled: boolean }) {
   const [on, setOn] = useState(enabled ? "true" : "false");
   const s = { ...DEFAULTS, mcp_enabled: on } as Record<EditableKey, string>;
   return <IntegrationsSection s={s} update={(_k, v) => setOn(v)} />;
+}
+
+// ---- #179: the local chat provider, on Ollama and on a server that is not
+// Ollama. The second is the case the issue was filed about: no `ollama pull`
+// commands, and an embedder pointed at its own address. jsdom asserts the words
+// but not that two input rows and a status line sit right in the column.
+function chatCase(kind: "ollama" | "compat" | "compat-embedding"): Scenario {
+  let unembedded = 4;
+  const chatUrl = kind === "ollama" ? "http://localhost:11434/v1" : "http://127.0.0.1:8000/v1";
+  const model = kind === "ollama" ? "gemma4:12b-mlx" : "mlx-community/Qwen3-8B";
+  return {
+    wrap: settingsWrap,
+    render: () => (
+      <ChatHarness
+        chatUrl={chatUrl}
+        model={model}
+        embedUrl={kind === "compat-embedding" ? "http://localhost:11434/v1" : ""}
+      />
+    ),
+    ipc: {
+      local_llm_list_models: () => [model, "embeddinggemma"],
+      // A library part-way through: the embedder answers and four notes still
+      // have no vector under its name — the two facts #179 kept conflating.
+      // Stateful, so pressing Embed now leads somewhere.
+      chat_unembedded_note_count: () => unembedded,
+      chat_embed_missing: () => {
+        const n = unembedded;
+        unembedded = 0;
+        return n;
+      },
+      chat_stale_note_count: () => 0,
+      // Only the Ollama-side embedder answers; on the bare compat server the
+      // probe fails, which is the state that has to read as a soft warning
+      // rather than an error.
+      local_llm_embed_probe: (args) => {
+        const url = (args as { baseUrl: string }).baseUrl;
+        if (url.includes(":11434")) return 768;
+        throw new Error("HTTP 404 from http://127.0.0.1:8000/v1/embeddings: Not Found");
+      },
+      provider_key_get: () => null,
+    },
+  };
+}
+
+function ChatHarness({
+  chatUrl,
+  model,
+  embedUrl,
+}: {
+  chatUrl: string;
+  model: string;
+  embedUrl: string;
+}) {
+  const [s, setS] = useState({
+    ...DEFAULTS,
+    chat_provider: "ollama",
+    chat_model: model,
+    local_llm_base_url: chatUrl,
+    embed_base_url: embedUrl,
+  } as Record<EditableKey, string>);
+  return <ChatTab s={s} update={async (k, v) => setS((prev) => ({ ...prev, [k]: v }))} />;
 }
 
 // ---- #21 axis: menu-bar mode in the Recording section ----------------------
@@ -835,6 +897,12 @@ const CASES: Record<string, Scenario> = {
   "retention-off": retentionCase(false, false),
   "retention-on": retentionCase(true, false),
   "retention-manual": retentionCase(true, true),
+
+  // --- #179: local chat on Ollama, on a plain OpenAI-compat server, and on one
+  // whose embedder is pointed back at Ollama (the shape the issue needs).
+  "chat-ollama": chatCase("ollama"),
+  "chat-compat": chatCase("compat"),
+  "chat-compat-embedding": chatCase("compat-embedding"),
 
   // --- #172: the MCP switch, off (the default) and on (snippets revealed).
   "mcp-off": integrationsCase(false),

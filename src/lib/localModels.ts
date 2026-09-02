@@ -51,3 +51,12 @@ export function isEmbeddingModel(name: string): boolean {
 export function completionModels(installed: string[] | null | undefined): string[] {
   return (installed ?? []).filter((m) => !isEmbeddingModel(m));
 }
+
+/// Whether a local-server URL is Ollama's, for the purpose of what advice to
+/// print. Mirrors `ollama_native_url`'s `:11434` heuristic in
+/// src-tauri/src/openai.rs — change both: one picks the wire protocol, this one
+/// picks the words we say about it. Off that port the runtime is LM Studio,
+/// llama-server, vLLM or mlx, and `ollama pull` is not a command the user has.
+export function isOllamaUrl(baseUrl: string): boolean {
+  return baseUrl.includes(":11434");
+}

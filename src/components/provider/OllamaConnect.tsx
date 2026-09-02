@@ -1,6 +1,6 @@
 import { useEffect, useRef } from "react";
 import { Select } from "../ui/Select";
-import { completionModels } from "../../lib/localModels";
+import { completionModels, isOllamaUrl } from "../../lib/localModels";
 import { useOllamaProbe } from "./useOllamaProbe";
 
 // Local-LLM (Ollama / LM Studio / llama-server) connection surface for the
@@ -87,8 +87,14 @@ export function OllamaConnect({
           <div className="min-w-0">
             <div className="text-sm">Model</div>
             <p className="text-xs text-[var(--color-text-muted)] mt-0.5">
-              Installed on the server; pull new ones with{" "}
-              <code>ollama pull</code> and they appear here.
+              {isOllamaUrl(baseUrl) ? (
+                <>
+                  Installed on the server; pull new ones with <code>ollama pull</code> and they
+                  appear here.
+                </>
+              ) : (
+                <>Whatever the server lists. Load another one there and it appears here.</>
+              )}
             </p>
           </div>
           <div className="shrink-0">
@@ -108,8 +114,13 @@ export function OllamaConnect({
 
       {modelMissing && (
         <p className="text-xs text-[var(--color-warning)]">
-          "{model}" isn't installed on this server anymore — pick another
-          model or <code>ollama pull {model}</code>.
+          "{model}" isn't on this server anymore — pick another model
+          {isOllamaUrl(baseUrl) ? (
+            <>
+              {" "}or <code>ollama pull {model}</code>
+            </>
+          ) : null}
+          .
         </p>
       )}
     </div>

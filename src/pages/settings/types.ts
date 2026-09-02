@@ -50,6 +50,9 @@ export const DEFAULTS: Record<EditableKey, string> = {
   local_llm_think: "false",
   chat_provider: "openai",
   chat_model: "",
+  // Empty = follow the chat server, embeddinggemma (#179).
+  embed_base_url: "",
+  embed_model: "",
   developer_mode: "false",
   silence_rms_threshold: "0.005",
   mcp_enabled: "false",
@@ -74,7 +77,9 @@ export const SUMMARY_PROVIDERS = [
 // which chat retrieval will depend on, so they're never offered.
 export const CHAT_PROVIDERS = [
   { value: "openai", label: "Cloud (OpenAI)" },
-  { value: "ollama", label: "Local (Ollama)" },
+  // Ollama by name is the value, not the limit: chat drives Ollama's native API
+  // on :11434 and plain OpenAI-compat anywhere else, as summaries do (#179).
+  { value: "ollama", label: "Local (any OpenAI-compatible server)" },
 ];
 
 export const WHISPER_PRESETS = [

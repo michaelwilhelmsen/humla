@@ -51,7 +51,7 @@ import {
   type ChatTarget,
 } from "../lib/chatTarget";
 import { opensPromptPicker, promptsFor, type ChatPrompt } from "../lib/chatPrompts";
-import { RECOMMENDED_OLLAMA_MODEL } from "../lib/localModels";
+import { RECOMMENDED_OLLAMA_MODEL, isOllamaUrl } from "../lib/localModels";
 import { CommandSnippet } from "./CommandSnippet";
 import { cn } from "../lib/cn";
 import { htmlToText } from "../lib/noteList";
@@ -227,7 +227,14 @@ export function ChatPanel({
   // The ANCHOR, not the pane: null for a folder pane as well as a library-wide
   // one (#110), so nothing may read it alone to mean "the whole library".
   const noteId = targetNoteId(target);
-  const { loading: readinessLoading, ready, hint, provider, model } = useChatReadiness();
+  const {
+    loading: readinessLoading,
+    ready,
+    hint,
+    provider,
+    model,
+    baseUrl: chatBaseUrl,
+  } = useChatReadiness();
   const [messages, setMessages] = useState<ChatMessageDto[]>([]);
   // This Note's conversations (issue #61/#62), most-recent first from the
   // backend (local rows in Personal; server list merged in a workspace). Feeds
@@ -1057,14 +1064,17 @@ export function ChatPanel({
   // Personal chat gates on personal readiness; workspace chat never shows this
   // setup prompt (it runs on the workspace key, activated via the pane below).
   if (!inWorkspace && !readinessLoading && !ready) {
-    const isOllama = provider === "ollama";
+    // Ollama's own installer and pull command, only for a server that is
+    // Ollama — off its port the runtime is LM Studio, llama-server, vLLM or
+    // mlx, and `ollama pull` is not a command that user has (#179).
+    const showOllamaSetup = provider === "ollama" && isOllamaUrl(chatBaseUrl);
     return (
       <div className="flex-1 min-h-0 flex flex-col items-center justify-center gap-3 px-8 text-center">
         <Settings2 size={22} strokeWidth={1.5} className="text-[var(--color-text-disabled)]" />
         <p className="text-sm text-[var(--color-text-muted)]">
           {hint || "Set up an AI Chat provider in Settings → Chat to start chatting."}
         </p>
-        {isOllama && (
+        {showOllamaSetup && (
           <div className="w-full max-w-sm flex flex-col gap-2">
             <p className="text-xs text-[var(--color-text-disabled)]">
               Don't have Ollama yet?{" "}

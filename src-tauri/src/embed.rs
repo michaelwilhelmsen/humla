@@ -53,7 +53,7 @@ impl EmbeddingAdapter for HttpEmbeddingAdapter {
 /// degrades to keyword-only.
 pub struct EmbedConfig {
     pub provider: &'static str,
-    pub model: &'static str,
+    pub model: String,
     pub base_url: String,
     pub api_key: Option<String>,
 }
@@ -61,7 +61,7 @@ pub struct EmbedConfig {
 impl EmbedConfig {
     pub fn adapter(&self) -> HttpEmbeddingAdapter {
         HttpEmbeddingAdapter {
-            model: self.model.to_string(),
+            model: self.model.clone(),
             base_url: self.base_url.clone(),
             api_key: self.api_key.clone(),
         }

@@ -1607,6 +1607,43 @@ function seedLongNote(noteId = "n1") {
   useNotesStore.setState({ notes: [note], folders: [] });
 }
 
+// #179: the setup prompt the pane shows when chat isn't configured offered
+// "Install Ollama" and an `ollama pull` line to every local user — including the
+// ones whose server is mlx / LM Studio / vLLM, where neither is a thing they have.
+describe("ChatPanel setup prompt for a local provider (#179)", () => {
+  function renderUnready(baseUrl: string) {
+    mockTauri({
+      provider_key_get: () => null,
+      chat_history: () => history(),
+      local_llm_list_models: () => {
+        throw new Error("connection refused");
+      },
+      settings_get: (args) => {
+        const key = (args as { key?: string }).key;
+        if (key === "chat_provider") return "ollama";
+        if (key === "chat_model") return "some-model";
+        if (key === "local_llm_base_url") return baseUrl;
+        if (key === "onboarding_completed") return "true";
+        return null;
+      },
+    });
+    return renderPanel();
+  }
+
+  it("offers Ollama's installer and pull command on Ollama's own port", async () => {
+    renderUnready("http://localhost:11434/v1");
+    expect(await screen.findByText(/Don't have Ollama yet\?/)).toBeInTheDocument();
+  });
+
+  it("offers neither on a server that isn't Ollama", async () => {
+    renderUnready("http://127.0.0.1:8000/v1");
+    // The hint still lands — it just names the URL instead of Ollama.
+    await screen.findByText(/Couldn't reach the local server at http:\/\/127\.0\.0\.1:8000\/v1/);
+    expect(screen.queryByText(/Don't have Ollama yet\?/)).toBeNull();
+    expect(screen.queryByText(/ollama pull/)).toBeNull();
+  });
+});
+
 describe("ChatPanel composer chrome (#80)", () => {
   it("shows which model is about to answer", async () => {
     mockTauri({

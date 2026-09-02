@@ -21,21 +21,23 @@ use serde::Serialize;
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager, State};
 
-/// Derive the embedding config from the resolved chat provider (issue #48) —
-/// no user-facing embedding choice. Cloud chat embeds with OpenAI's
-/// `text-embedding-3-small`; local chat with `embeddinggemma` via the same
-/// Ollama server. Both speak the OpenAI-compatible `/v1/embeddings` shape.
+/// Derive the embedding config from the resolved chat provider (issue #48).
+/// Cloud chat embeds with `text-embedding-3-small` and offers no choice; local
+/// chat defaults to `embeddinggemma` on the chat server, and overrides both
+/// halves (#179), because only Ollama serves the embedder beside the chat
+/// model: mlx_lm.server has no `/v1/embeddings` route, llama-server needs its
+/// own process, and LM Studio names the model `text-embedding-embeddinggemma-…`.
 fn resolve_embed(resolved: &ResolvedChat) -> embed::EmbedConfig {
     match resolved.provider.as_str() {
         "ollama" => embed::EmbedConfig {
             provider: "ollama",
-            model: OLLAMA_EMBED_MODEL,
-            base_url: resolved.base_url.clone(),
+            model: resolved.embed.model.clone().unwrap_or_else(|| OLLAMA_EMBED_MODEL.to_string()),
+            base_url: resolved.embed.base_url.clone().unwrap_or_else(|| resolved.base_url.clone()),
             api_key: None,
         },
         _ => embed::EmbedConfig {
             provider: "openai",
-            model: OPENAI_EMBED_MODEL,
+            model: OPENAI_EMBED_MODEL.to_string(),
             base_url: resolved.base_url.clone(),
             api_key: resolved.api_key.clone(),
         },
@@ -149,6 +151,39 @@ pub async fn embed_backfill(app: AppHandle) {
         embed_note(&state.db, &adapter, &id).await;
     }
     eprintln!("[chat] embedding backfill complete");
+}
+
+/// How many live notes hold chunks with no vector under the embedder now in force.
+///
+/// The embedding index is keyed `(text_hash, model)` and search filters on the model,
+/// so naming a different embedder (#179) leaves every existing vector unreachable —
+/// silently, since retrieval degrades to keyword-only rather than failing. A probe
+/// that reports the embedder answering says nothing about whether the corpus is
+/// embedded under it, and those are the two halves a user reads as one.
+#[tauri::command]
+pub fn chat_unembedded_note_count(state: State<AppState>) -> Result<usize, String> {
+    let key = super::read_provider_api_key(&state, "openai").ok().flatten();
+    let conn = state.db.lock();
+    let Ok(resolved) = resolve_chat(&conn, key) else { return Ok(0) };
+    let model = resolve_embed(&resolved).model;
+    db::note_ids_needing_embedding(&conn, &model).map(|ids| ids.len()).map_err(super::err)
+}
+
+/// Embed what `chat_unembedded_note_count` counts, without waiting for the next
+/// launch. Same mechanism as the startup backfill — it already finds exactly the
+/// chunks missing vectors under the current model — so the two can't drift.
+#[tauri::command]
+pub async fn chat_embed_missing(app: AppHandle) -> Result<usize, String> {
+    let before = {
+        let state: State<AppState> = app.state();
+        let key = super::read_provider_api_key(&state, "openai").ok().flatten();
+        let conn = state.db.lock();
+        let Ok(resolved) = resolve_chat(&conn, key) else { return Ok(0) };
+        let model = resolve_embed(&resolved).model;
+        db::note_ids_needing_embedding(&conn, &model).map_err(super::err)?.len()
+    };
+    embed_backfill(app).await;
+    Ok(before)
 }
 
 /// How many notes a rebuild would repair (#122), so the UI can offer the action only
@@ -393,6 +428,15 @@ struct ResolvedChat {
     api_key: Option<String>,
     model: String,
     think: bool,
+    embed: EmbedOverride,
+}
+
+/// What the user has said about the local embedder, if anything. `None` on
+/// either half means "follow the chat provider".
+#[derive(Default)]
+struct EmbedOverride {
+    base_url: Option<String>,
+    model: Option<String>,
 }
 
 fn resolve_chat(
@@ -428,7 +472,11 @@ fn resolve_chat(
                      Settings → Chat."
                 );
             }
-            Ok(ResolvedChat { provider, base_url, api_key: None, model, think })
+            let embed = EmbedOverride {
+                base_url: setting("embed_base_url")?,
+                model: setting("embed_model")?,
+            };
+            Ok(ResolvedChat { provider, base_url, api_key: None, model, think, embed })
         }
         _ => {
             let api_key = openai_api_key.filter(|s| !s.is_empty()).ok_or_else(|| {
@@ -443,6 +491,7 @@ fn resolve_chat(
                 api_key: Some(api_key),
                 model,
                 think: false,
+                embed: EmbedOverride::default(),
             })
         }
     }
@@ -2786,6 +2835,80 @@ mod tests {
         assert!(res.is_err());
         let err = res.err().unwrap().to_string();
         assert!(err.contains("embedding model"), "clear guidance, not a raw 400: {err}");
+    }
+
+    // The local embedder has its own address and name (#179); blank means the
+    // chat server and embeddinggemma, which is what an Ollama library runs on.
+    #[test]
+    fn the_local_embedder_defaults_to_the_chat_server_and_is_overridable() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = db::open(&dir.path().join("embed.sqlite")).unwrap();
+        db::set_setting(&conn, "chat_provider", "ollama").unwrap();
+        db::set_setting(&conn, "chat_model", "gemma4:12b-mlx").unwrap();
+        db::set_setting(&conn, "local_llm_base_url", "http://127.0.0.1:8000/v1").unwrap();
+
+        let cfg = resolve_embed(&resolve_chat(&conn, None).unwrap());
+        assert_eq!(cfg.base_url, "http://127.0.0.1:8000/v1");
+        assert_eq!(cfg.model, OLLAMA_EMBED_MODEL);
+
+        // The shape #179 exists for: embeddings on Ollama, chat on mlx.
+        db::set_setting(&conn, "embed_base_url", "http://localhost:11434/v1").unwrap();
+        db::set_setting(&conn, "embed_model", "embeddinggemma:latest").unwrap();
+        let cfg = resolve_embed(&resolve_chat(&conn, None).unwrap());
+        assert_eq!(cfg.base_url, "http://localhost:11434/v1");
+        assert_eq!(cfg.model, "embeddinggemma:latest");
+        // The index is keyed by the model id, so an override must reach it —
+        // otherwise new vectors would land under the old model's key.
+        assert_eq!(cfg.adapter().model_id(), "embeddinggemma:latest");
+    }
+
+    #[test]
+    fn a_blank_embed_override_is_not_an_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = db::open(&dir.path().join("blank.sqlite")).unwrap();
+        db::set_setting(&conn, "chat_provider", "ollama").unwrap();
+        db::set_setting(&conn, "chat_model", "gemma4:12b-mlx").unwrap();
+        db::set_setting(&conn, "embed_base_url", "   ").unwrap();
+        db::set_setting(&conn, "embed_model", "").unwrap();
+        let cfg = resolve_embed(&resolve_chat(&conn, None).unwrap());
+        assert_eq!(cfg.base_url, DEFAULT_LOCAL_LLM_BASE_URL);
+        assert_eq!(cfg.model, OLLAMA_EMBED_MODEL);
+    }
+
+    #[test]
+    fn cloud_chat_ignores_the_local_embed_overrides() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = db::open(&dir.path().join("cloud.sqlite")).unwrap();
+        db::set_setting(&conn, "chat_provider", "openai").unwrap();
+        db::set_setting(&conn, "chat_model", "gpt-5.4").unwrap();
+        db::set_setting(&conn, "embed_base_url", "http://localhost:11434/v1").unwrap();
+        db::set_setting(&conn, "embed_model", "embeddinggemma").unwrap();
+        let cfg = resolve_embed(&resolve_chat(&conn, Some("sk-test".into())).unwrap());
+        assert_eq!(cfg.base_url, crate::openai::BASE);
+        assert_eq!(cfg.model, OPENAI_EMBED_MODEL);
+    }
+
+    // The half of #179 that a probe cannot see: the embedder answers, and the
+    // corpus still has no vectors under its name.
+    #[test]
+    fn renaming_the_embedder_leaves_the_whole_corpus_unembedded() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = db::open(&dir.path().join("count.sqlite")).unwrap();
+        let note = db::create_note(&conn, "en", "meeting", "").unwrap();
+        db::reindex_note(&conn, &note.id, "budget talk", "", "").unwrap();
+
+        let under = |model: &str| {
+            db::note_ids_needing_embedding(&conn, model).unwrap().len()
+        };
+        assert_eq!(under(OLLAMA_EMBED_MODEL), 1, "nothing embedded yet");
+
+        for (hash, _text) in db::note_texts_needing_embedding(&conn, &note.id, OLLAMA_EMBED_MODEL).unwrap() {
+            db::store_embedding(&conn, &hash, OLLAMA_EMBED_MODEL, &[0.1, 0.2]).unwrap();
+        }
+        assert_eq!(under(OLLAMA_EMBED_MODEL), 0);
+        // The same note, under the name a #179 user would type, is unembedded —
+        // which is what the settings row has to be able to say.
+        assert_eq!(under("embeddinggemma:latest"), 1);
     }
 
     /// A user turn (for tests that need a session to have messages).

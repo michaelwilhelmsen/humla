@@ -11,6 +11,38 @@ mod tools;
 
 pub use adapter::{CancelFlag, ChatAdapter, ChatCtx, ChatStreamEvent, ChatTurn, ToolSpec};
 pub use providers::{OllamaChatAdapter, OpenAiChatAdapter};
+
+/// A stand-in OpenAI-compat server, shared by every test here that needs one on
+/// the wire rather than behind a fake adapter.
+#[cfg(test)]
+pub mod test_server {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Answer each connection with the next `body` as an event stream, and hand
+    /// back the port plus every request read, in order.
+    pub async fn serve_sse(bodies: Vec<String>) -> (u16, tokio::task::JoinHandle<Vec<String>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            for body in bodies {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 262_144];
+                let n = sock.read(&mut buf).await.unwrap();
+                seen.push(String::from_utf8_lossy(&buf[..n]).to_string());
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                sock.write_all(resp.as_bytes()).await.unwrap();
+                sock.flush().await.unwrap();
+            }
+            seen
+        });
+        (port, handle)
+    }
+}
 pub use tools::{execute_tool, tool_specs, Citation, ToolScope};
 #[cfg(test)]
 pub use providers::{FakeChatAdapter, StallingChatAdapter};
@@ -1201,6 +1233,61 @@ mod tests {
     /// `FAKE_CTX` with a stop signal the test controls.
     fn cancellable_ctx(flag: &CancelFlag) -> ChatCtx<'_> {
         ChatCtx { cancel: flag, ..FAKE_CTX }
+    }
+
+    #[tokio::test]
+    async fn a_local_openai_compat_server_runs_the_whole_loop_including_retrieval() {
+        let dir = tempfile::tempdir().unwrap();
+        let (dbh, _path) = temp_db(&dir);
+        let note_id = seed_note(&dbh, "Budget meeting", "We agreed the budget lands in March.");
+        let conv_id = conv(&dbh, &note_id);
+
+        let tool_call = format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"call_1\",\
+             \"function\":{{\"name\":\"search_notes\",\"arguments\":\"{}\"}}}}]}}}}]}}\n\n\
+             data: [DONE]\n\n",
+            "{\\\"query\\\":\\\"budget\\\"}"
+        );
+        let answer = "data: {\"choices\":[{\"delta\":{\"content\":\"The budget lands in March.\"}}]}\n\n\
+                      data: [DONE]\n\n"
+            .to_string();
+        let (port, server) = super::test_server::serve_sse(vec![tool_call, answer]).await;
+
+        let base = format!("http://127.0.0.1:{port}/v1");
+        let ctx = ChatCtx { base_url: &base, model: "mlx-community/Qwen3-8B", ..FAKE_CTX };
+        let mut events: Vec<ChatEvent> = Vec::new();
+        run_chat(
+            &dbh,
+            &OllamaChatAdapter,
+            ctx,
+            &conv_id,
+            "",
+            &ToolScope::All,
+            "",
+            None,
+            "When does the budget land?",
+            None,
+            |ev| events.push(ev),
+        )
+        .await
+        .expect("a non-Ollama local server must chat");
+
+        let streamed: String = events
+            .iter()
+            .filter_map(|e| match e {
+                ChatEvent::TextDelta { delta, .. } => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(streamed, "The budget lands in March.");
+        // The tool step ran on the wire, not just the answer.
+        assert_eq!(server.await.unwrap().len(), 2);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ChatEvent::ToolActivity { name, .. } if name == "search_notes")),
+            "retrieval never ran: {events:?}"
+        );
     }
 
     #[tokio::test]

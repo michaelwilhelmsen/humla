@@ -1,17 +1,52 @@
 import { useEffect, useState } from "react";
 import { ipc } from "../../lib/ipc";
 import { DEFAULTS } from "../../pages/settings/types";
-import { isEmbeddingModel } from "../../lib/localModels";
+import { isEmbeddingModel, isOllamaUrl } from "../../lib/localModels";
 import { useOllamaProbe } from "./useOllamaProbe";
 import { useProviderKey } from "./useProviderKey";
 
-// Chat readiness for the Note's Chat tab. Mirrors the Settings → Chat tab's
-// readiness (issue #44): reports exactly what's still missing before a chat can
-// run, so the panel can show the same setup prompt instead of a dead input.
-//
-// Settings are read once on mount (they only change from the Settings dialog,
-// which isn't open while chatting). Both provider hooks run unconditionally
-// (rules of hooks); the Ollama probe parks itself when chat isn't on Ollama.
+/** What still stands between a local chat provider and a working chat, or `""`
+ *  when nothing does. Shared by the Settings tab and the Note pane so the two
+ *  can't answer the same question differently; `where` is the only thing that
+ *  varies, since one reader has the controls in front of them and the other
+ *  does not.
+ *
+ *  Off Ollama's port the runtime is LM Studio, llama-server, vLLM or mlx, so
+ *  the advice names the server the user actually runs (#179) — `ollama pull` is
+ *  not a command they have. */
+export function localChatHint({
+  reachable,
+  installed,
+  model,
+  baseUrl,
+  where,
+}: {
+  reachable: boolean | null;
+  installed: string[] | null;
+  model: string;
+  baseUrl: string;
+  where: "above" | "settings";
+}): string {
+  const at = where === "above" ? "above" : "in Settings → Chat";
+  if (reachable === false)
+    return isOllamaUrl(baseUrl)
+      ? "Start or install Ollama — it's detected automatically."
+      : `Couldn't reach the local server at ${baseUrl} — start it, or check the URL ${at}.`;
+  if (!model) return `Choose a chat model ${at}.`;
+  if (isEmbeddingModel(model)) return `“${model}” is an embedding model — pick a chat model ${at}.`;
+  if (installed && !installed.includes(model))
+    return isOllamaUrl(baseUrl)
+      ? `“${model}” isn't installed on the server — run ollama pull ${model}.`
+      : `“${model}” isn't one of the models the local server lists — pick another ${at}.`;
+  if (reachable === null) return "Checking the local server…";
+  return "";
+}
+
+// Chat readiness for the Note's Chat tab (issue #44): what's still missing
+// before a chat can run, so the panel shows a setup prompt instead of a dead
+// input. Settings are read once on mount — they only change from the Settings
+// dialog, which isn't open while chatting. Both provider hooks run
+// unconditionally (rules of hooks); the local probe parks itself on cloud chat.
 export function useChatReadiness() {
   const [loading, setLoading] = useState(true);
   const [provider, setProvider] = useState(DEFAULTS.chat_provider);
@@ -49,18 +84,12 @@ export function useChatReadiness() {
   if (loading) {
     hint = "";
   } else if (isOllama) {
-    if (reachable === false) hint = "Start or install Ollama — it's detected automatically.";
-    else if (!model) hint = "Choose a chat model in Settings → Chat.";
-    else if (isEmbeddingModel(model))
-      hint = `“${model}” is an embedding model — pick a chat model in Settings → Chat.`;
-    else if (installed && !installed.includes(model))
-      hint = `“${model}” isn't installed on the server — run ollama pull ${model}.`;
-    else if (reachable === null) hint = "Checking the local server…";
-    else ready = true;
+    hint = localChatHint({ reachable, installed, model, baseUrl, where: "settings" });
+    ready = hint === "";
   } else {
     if (!key.hasKey) hint = "Add your OpenAI key in Settings → Chat to use chat.";
     else ready = true;
   }
 
-  return { loading, ready, hint, provider, model };
+  return { loading, ready, hint, provider, model, baseUrl };
 }
