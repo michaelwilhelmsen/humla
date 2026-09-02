@@ -2,10 +2,7 @@ use anyhow::{anyhow, Result};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use parking_lot::Mutex;
-use whisper_rs::{
-    DtwMode, DtwModelPreset, DtwParameters, FullParams, SamplingStrategy, WhisperContext,
-    WhisperContextParameters,
-};
+use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
 use crate::wav;
 
@@ -223,28 +220,7 @@ fn ensure_loaded(
     // explicitly clear the slot first — enough on memory-tight machines
     // to push Metal into "failed to allocate context" territory.
     *guard = None;
-    let mut params = WhisperContextParameters::default();
-    params.use_gpu = use_gpu;
-    // DTW alignment for sharper word timestamps. Model-specific alignment
-    // heads beat the universal TopMost heuristic by ~50 ms median when the
-    // checkpoint matches an OpenAI release exactly; we fall back to TopMost
-    // for fine-tunes (NB Whisper Large is fine-tuned from large-v2 but the
-    // alignment heads can drift during fine-tuning) and unknown filenames.
-    // Detection is filename-only — fine for our packaged registry, less
-    // fine if a user drops in their own ggml file, hence the safe fallback.
-    params.dtw_parameters = DtwParameters {
-        mode: dtw_mode_for_model(model_path),
-        // whisper-rs default is 128 MB. DTW allocates a fresh ggml context
-        // per segment holding all intermediate tensors (cross-QK gather,
-        // norm, permute, median filter, mean) until the segment finishes.
-        // 128 MB occasionally tips over on dense speech with LargeV3Turbo's
-        // alignment-head count, triggering `ggml_abort: not enough space in
-        // the context's memory pool` → SIGABRT. Pool is allocated lazily
-        // per DTW pass and freed at end-of-segment, so this is a ceiling,
-        // not a constant cost.
-        dtw_mem_size: 1024 * 1024 * 384,
-        ..DtwParameters::default()
-    };
+    let params = context_params(use_gpu);
     let ctx = WhisperContext::new_with_params(
         model_path.to_str().ok_or_else(|| anyhow!("non-utf8 model path"))?,
         params,
@@ -263,47 +239,13 @@ pub fn unload(shared: &SharedContext) {
     *shared.lock() = None;
 }
 
-/// Pick the DTW alignment-heads preset that matches the ggml file at
-/// `model_path`. The mapping is filename-pattern → OpenAI checkpoint;
-/// anything that doesn't match (NB-Whisper, user-supplied fine-tunes,
-/// future ggml releases) falls back to `TopMost { n_top: 4 }`, which
-/// works on any whisper architecture but produces slightly looser word
-/// boundaries than a model-specific preset.
-fn dtw_mode_for_model(model_path: &Path) -> DtwMode<'static> {
-    let name = model_path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    // Order matters: "large-v3-turbo" must match before the broader
-    // "large-v3" check.
-    if name.contains("large-v3-turbo") {
-        DtwMode::ModelPreset { model_preset: DtwModelPreset::LargeV3Turbo }
-    } else if name.contains("large-v3") {
-        DtwMode::ModelPreset { model_preset: DtwModelPreset::LargeV3 }
-    } else if name.contains("large-v2") {
-        DtwMode::ModelPreset { model_preset: DtwModelPreset::LargeV2 }
-    } else if name.contains("large-v1") {
-        DtwMode::ModelPreset { model_preset: DtwModelPreset::LargeV1 }
-    } else if name.contains("medium.en") {
-        DtwMode::ModelPreset { model_preset: DtwModelPreset::MediumEn }
-    } else if name.contains("medium") {
-        DtwMode::ModelPreset { model_preset: DtwModelPreset::Medium }
-    } else if name.contains("small.en") {
-        DtwMode::ModelPreset { model_preset: DtwModelPreset::SmallEn }
-    } else if name.contains("small") {
-        DtwMode::ModelPreset { model_preset: DtwModelPreset::Small }
-    } else if name.contains("base.en") {
-        DtwMode::ModelPreset { model_preset: DtwModelPreset::BaseEn }
-    } else if name.contains("base") {
-        DtwMode::ModelPreset { model_preset: DtwModelPreset::Base }
-    } else if name.contains("tiny.en") {
-        DtwMode::ModelPreset { model_preset: DtwModelPreset::TinyEn }
-    } else if name.contains("tiny") {
-        DtwMode::ModelPreset { model_preset: DtwModelPreset::Tiny }
-    } else {
-        DtwMode::TopMost { n_top: 4 }
-    }
+fn context_params(use_gpu: bool) -> WhisperContextParameters<'static> {
+    let mut params = WhisperContextParameters::default();
+    params.use_gpu = use_gpu;
+    // DTW alignment must stay off: its output (`t_dtw`) is unread here, and
+    // whisper.cpp's `median_filter` aborts the process on a decode window
+    // shorter than 140 ms.
+    params
 }
 
 /// Load the model into memory + Metal context if it isn't already. Cheap
@@ -417,18 +359,7 @@ pub async fn transcribe_file_segments(
     preset: Preset,
     audio_path: &Path,
 ) -> Result<SegmentedTranscript> {
-    let mut samples = wav::read_f32_mono_16k(audio_path).await?;
-    // Workaround for an abort inside whisper.cpp's DTW token-timestamp pass.
-    // `whisper_exp_compute_token_level_timestamps_dtw` runs `median_filter`
-    // with a hard-coded width of 7 over `n_audio_tokens = n_frames/2`. When
-    // the final segment lands within ~140 ms of the audio end,
-    // `WHISPER_ASSERT(filter_width < n_audio_tokens)` fails and the whole
-    // process SIGABRTs from a tokio worker. Appending ~500 ms of silence
-    // pushes `seek_end` past the last real segment so the assertion holds;
-    // whisper has no problem with trailing silence and our existing
-    // hallucination / attribution-tail filters strip any "[BLANK_AUDIO]"
-    // output that occasionally surfaces.
-    samples.resize(samples.len() + 8000, 0.0);
+    let samples = wav::read_f32_mono_16k(audio_path).await?;
     let lang = if language == "auto" { None } else { Some(language.to_string()) };
     let prompt = initial_prompt.map(|s| s.to_string());
 
@@ -620,4 +551,166 @@ fn extract_words_for_segment(seg: &whisper_rs::WhisperSegment<'_>) -> Vec<Word> 
     // surface as their own entry, which is what we want for clicking.
     words.retain(|w| !w.text.trim().is_empty());
     words
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use whisper_rs::DtwMode;
+
+    #[test]
+    fn dtw_stays_off() {
+        assert!(matches!(context_params(true).dtw_parameters.mode, DtwMode::None));
+    }
+}
+
+/// Tests that run the real on-device model. Ignored by default: they need
+/// the turbo model downloaded and a GPU.
+///
+///   cargo test model_tests -- --ignored --nocapture
+///
+/// `real_chunks_dir_transcribes` also needs `HUMLA_WHISPER_WAVS=<dir>`;
+/// `HUMLA_WHISPER_LANG` overrides the fixture language (default `es`) and
+/// `HUMLA_WHISPER_QUIET=1` keeps transcript text out of the output.
+#[cfg(test)]
+mod model_tests {
+    use super::*;
+
+    fn installed_model() -> PathBuf {
+        let home = std::env::var("HOME").unwrap();
+        let model = PathBuf::from(format!(
+            "{home}/Library/Application Support/no.humla.app/models/{}",
+            default_model().filename
+        ));
+        assert!(model.exists(), "model not downloaded: {}", model.display());
+        model
+    }
+
+    fn fixture_language() -> String {
+        std::env::var("HUMLA_WHISPER_LANG").unwrap_or_else(|_| "es".into())
+    }
+
+    /// Mono 16 kHz WAV of `secs` of faint noise with a tone from `tone_from`
+    /// to the end, standing in for a word cut off by the chunk boundary.
+    async fn synth_tail_chunk(dir: &Path, name: &str, secs: f32, tone_from: f32) -> PathBuf {
+        let n = (secs * 16_000.0) as usize;
+        let mut seed: u32 = 1;
+        let samples: Vec<f32> = (0..n)
+            .map(|i| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let noise = ((seed >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 0.004;
+                let t = i as f32 / 16_000.0;
+                let tone = if t >= tone_from {
+                    0.4 * (2.0 * std::f32::consts::PI * 440.0 * t).sin()
+                } else {
+                    0.0
+                };
+                noise + tone
+            })
+            .collect();
+        let path = dir.join(name);
+        wav::write_pcm16_mono_16k(&path, &samples).await.unwrap();
+        path
+    }
+
+    /// The issue's minimal shape: a 1.0 s chunk whose last sound ends 50 ms
+    /// before the boundary.
+    #[tokio::test]
+    #[ignore]
+    async fn synthetic_tail_chunk_transcribes() {
+        let dir = tempfile::tempdir().unwrap();
+        let wav = synth_tail_chunk(dir.path(), "tail.wav", 1.0, 0.95).await;
+        let res = transcribe_file_segments(
+            new_shared(),
+            installed_model(),
+            true,
+            &fixture_language(),
+            None,
+            Preset::Quality,
+            &wav,
+        )
+        .await;
+        assert!(res.is_ok(), "{:?}", res.err());
+    }
+
+    /// Decode windows of 100–200 ms hold at most 10 audio tokens, under the
+    /// DTW median filter's width of 7; any segment decoded from one aborts the
+    /// process if DTW is on.
+    #[tokio::test]
+    #[ignore]
+    async fn tiny_decode_window_does_not_abort() {
+        let dir = tempfile::tempdir().unwrap();
+        let wav = synth_tail_chunk(dir.path(), "tone.wav", 5.0, 4.24).await;
+        let samples = wav::read_f32_mono_16k(&wav).await.unwrap();
+        let shared = new_shared();
+        let model = installed_model();
+        let lang = fixture_language();
+        let segments = tokio::task::spawn_blocking(move || {
+            let ctx = ensure_loaded(&shared, &model, true).unwrap();
+            let mut state = ctx.create_state().unwrap();
+            let mut total = 0;
+            for dur in [100, 120, 140, 160, 200] {
+                let mut params = FullParams::new(Preset::Quality.sampling());
+                params.set_print_progress(false);
+                params.set_print_realtime(false);
+                params.set_print_timestamps(false);
+                params.set_token_timestamps(true);
+                params.set_language(Some(&lang));
+                params.set_duration_ms(dur);
+                state.full(params, &samples).unwrap();
+                total += state.full_n_segments();
+            }
+            total
+        })
+        .await
+        .unwrap();
+        assert!(segments > 0, "no window produced a segment, so the DTW path was never exercised");
+    }
+
+    /// Every WAV in `HUMLA_WHISPER_WAVS` transcribes and reports how many
+    /// words carry timings.
+    #[tokio::test]
+    #[ignore]
+    async fn real_chunks_dir_transcribes() {
+        let dir = std::env::var("HUMLA_WHISPER_WAVS")
+            .expect("set HUMLA_WHISPER_WAVS to a directory of 16 kHz mono WAVs");
+        let quiet = std::env::var("HUMLA_WHISPER_QUIET").is_ok();
+        let lang = fixture_language();
+        let model = installed_model();
+        let shared = new_shared();
+        let mut paths: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().map_or(false, |e| e == "wav"))
+            .collect();
+        paths.sort();
+        assert!(!paths.is_empty(), "no WAVs in {dir}");
+        for p in paths {
+            let r = transcribe_file_segments(
+                shared.clone(), model.clone(), true, &lang, None, Preset::Quality, &p,
+            )
+            .await
+            .unwrap();
+            let words: usize = r.segments.iter().map(|s| s.words.len()).sum();
+            let timed = r
+                .segments
+                .iter()
+                .flat_map(|s| &s.words)
+                .filter(|w| w.end_ms > w.start_ms)
+                .count();
+            let text: Vec<&str> = if quiet {
+                vec![]
+            } else {
+                r.segments.iter().map(|s| s.text.as_str()).collect()
+            };
+            eprintln!(
+                "{}: {} seg, {} words ({} timed): {:?}",
+                p.file_name().unwrap().to_string_lossy(),
+                r.segments.len(),
+                words,
+                timed,
+                text
+            );
+        }
+    }
 }
