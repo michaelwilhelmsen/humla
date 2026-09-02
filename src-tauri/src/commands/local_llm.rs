@@ -13,3 +13,16 @@ use crate::openai;
 pub async fn local_llm_list_models(base_url: String) -> Result<Vec<String>, String> {
     openai::list_models(&base_url).await.map_err(err)
 }
+
+// Ask a local server for one embedding and report its dimensionality (#179).
+// The model listing can't answer this: mlx_lm.server lists a model and has no
+// `/v1/embeddings` route at all, and a name that isn't the loaded embedder is a
+// 400 the listing looks fine through. So probe with a real call and let the
+// server's own error be the message.
+#[tauri::command]
+pub async fn local_llm_embed_probe(base_url: String, model: String) -> Result<usize, String> {
+    let vectors = openai::openai_embed(&base_url, None, &model, &["humla".to_string()])
+        .await
+        .map_err(err)?;
+    vectors.first().map(|v| v.len()).ok_or_else(|| "the server returned no vector".to_string())
+}

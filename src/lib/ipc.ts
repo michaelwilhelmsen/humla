@@ -120,11 +120,18 @@ export type SettingsKey =
   | "local_llm_model"
   | "local_llm_think"
   // AI Chat provider (issue #44). Independent of the summary/STT provider.
-  // "openai" (cloud, shared OpenAI key) or "ollama" (local). The Ollama
+  // "openai" (cloud, shared OpenAI key) or "ollama" (local). The local
   // endpoint reuses `local_llm_base_url`; `chat_model` holds the active
-  // provider's model. Embedding model is auto-derived, not a setting.
+  // provider's model.
   | "chat_provider"
   | "chat_model"
+  // The local embedder for semantic retrieval (#179). Both empty by default,
+  // meaning "the chat server, embeddinggemma" — right for Ollama, and the only
+  // way to reach every other runtime, which either serves no `/v1/embeddings`
+  // at all (mlx_lm.server) or names the model differently (LM Studio).
+  // Cloud chat ignores both: its embedder is text-embedding-3-small.
+  | "embed_base_url"
+  | "embed_model"
   | "theme"
   | "palette"
   | "developer_mode"
@@ -525,6 +532,12 @@ export const ipc = {
 
   localLlmListModels: (baseUrl: string) =>
     invoke<string[]>("local_llm_list_models", { baseUrl }),
+
+  // Dimensionality of one real embedding, or the server's own error. The model
+  // listing can't answer this (#179): a server can list a model and serve no
+  // embeddings route.
+  localLlmEmbedProbe: (baseUrl: string, model: string) =>
+    invoke<number>("local_llm_embed_probe", { baseUrl, model }),
 
   recordingStart: (noteId: string) => invoke<void>("recording_start", { noteId }),
   recordingStop: () => invoke<void>("recording_stop"),

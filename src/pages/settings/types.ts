@@ -50,6 +50,9 @@ export const DEFAULTS: Record<EditableKey, string> = {
   local_llm_think: "false",
   chat_provider: "openai",
   chat_model: "",
+  // Empty = follow the chat server, embeddinggemma (#179).
+  embed_base_url: "",
+  embed_model: "",
   developer_mode: "false",
   silence_rms_threshold: "0.005",
   mcp_enabled: "false",

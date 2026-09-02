@@ -86,7 +86,7 @@ describe("OllamaConnect", () => {
     );
 
     expect(
-      await screen.findByText(/isn't installed on this server anymore/i),
+      await screen.findByText(/isn't on this server anymore/i),
     ).toBeInTheDocument();
   });
 });

@@ -79,22 +79,83 @@ describe("ChatTab readiness", () => {
     expect(writeText).toHaveBeenCalledWith("ollama pull qwen3.5:4b");
   });
 
-  // Embedding model (issue #48) — a soft, non-blocking recommendation.
-  it("Ollama: prompts to pull embeddinggemma when it's missing, without blocking readiness", async () => {
-    mockTauri({ local_llm_list_models: () => ["qwen3.5:4b"] }); // chat model present, no embedder
+  // Embedding model (#48, #179) — a soft, non-blocking recommendation, and a
+  // real probe rather than a guess off the chat server's model listing: a
+  // server can list a model and serve no /v1/embeddings route at all.
+  it("Ollama: a failing embedder says so and offers the pull, without blocking readiness", async () => {
+    mockTauri({ local_llm_list_models: () => ["qwen3.5:4b"] });
     render(<ChatTab s={settings({ chat_provider: "ollama", chat_model: "qwen3.5:4b" })} update={async () => {}} />);
     // Still Ready — semantic is optional and degrades to keyword-only.
     await waitFor(() => expect(screen.getByText("Ready ✓")).toBeInTheDocument());
-    expect(screen.getByText(/For semantic search/)).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByText(/keyword only/)).toBeInTheDocument());
     expect(screen.getByRole("button", { name: /Copy embedding-model pull command/ })).toBeInTheDocument();
   });
 
-  it("Ollama: shows semantic search ready once embeddinggemma is installed", async () => {
-    mockTauri({ local_llm_list_models: () => ["qwen3.5:4b", "embeddinggemma:latest"] });
+  it("Ollama: shows semantic search ready once the embedder answers", async () => {
+    mockTauri({
+      local_llm_list_models: () => ["qwen3.5:4b"],
+      local_llm_embed_probe: () => 768,
+    });
     render(<ChatTab s={settings({ chat_provider: "ollama", chat_model: "qwen3.5:4b" })} update={async () => {}} />);
     await waitFor(() => expect(screen.getByText(/Semantic search ready/)).toBeInTheDocument());
-    // Tag-insensitive match: "embeddinggemma:latest" satisfies "embeddinggemma".
+    expect(screen.getByText(/768 dimensions/)).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Copy embedding-model pull command/ })).toBeNull();
+  });
+
+  // The shape #179 exists for: the chat server can't embed, so the embedder is
+  // pointed at a second one. The probe must follow the override, not the chat URL.
+  it("the embedder is probed at its own URL and model", async () => {
+    const probed: Array<{ baseUrl: string; model: string }> = [];
+    mockTauri({
+      local_llm_list_models: () => ["mlx-community/Qwen3-8B"],
+      local_llm_embed_probe: (args) => {
+        probed.push(args as { baseUrl: string; model: string });
+        return 768;
+      },
+    });
+    render(
+      <ChatTab
+        s={settings({
+          chat_provider: "ollama",
+          chat_model: "mlx-community/Qwen3-8B",
+          local_llm_base_url: "http://127.0.0.1:8000/v1",
+          embed_base_url: "http://localhost:11434/v1",
+          embed_model: "embeddinggemma:latest",
+        })}
+        update={async () => {}}
+      />,
+    );
+    await waitFor(() => expect(probed.length).toBeGreaterThan(0));
+    expect(probed[0]).toEqual({
+      baseUrl: "http://localhost:11434/v1",
+      model: "embeddinggemma:latest",
+    });
+  });
+
+  it("blank embedder fields fall back to the chat server and embeddinggemma", async () => {
+    const probed: Array<{ baseUrl: string; model: string }> = [];
+    mockTauri({
+      local_llm_list_models: () => ["mlx-community/Qwen3-8B"],
+      local_llm_embed_probe: (args) => {
+        probed.push(args as { baseUrl: string; model: string });
+        return 768;
+      },
+    });
+    render(
+      <ChatTab
+        s={settings({
+          chat_provider: "ollama",
+          chat_model: "mlx-community/Qwen3-8B",
+          local_llm_base_url: "http://127.0.0.1:8000/v1",
+        })}
+        update={async () => {}}
+      />,
+    );
+    await waitFor(() => expect(probed.length).toBeGreaterThan(0));
+    expect(probed[0]).toEqual({
+      baseUrl: "http://127.0.0.1:8000/v1",
+      model: "embeddinggemma",
+    });
   });
 
   // Regression: an embedding model must never be usable as the chat model
@@ -128,8 +189,10 @@ describe("ChatTab readiness", () => {
     );
     await waitFor(() => expect(screen.getByText("Ready ✓")).toBeInTheDocument());
     expect(screen.queryByRole("button", { name: /Copy Ollama pull command/ })).toBeNull();
+    // The embedder failed (no server in tests) and its URL is not Ollama's, so
+    // the pull command is withheld — it is not a command this user has.
+    await waitFor(() => expect(screen.getByText(/keyword only/)).toBeInTheDocument());
     expect(screen.queryByRole("button", { name: /Copy embedding-model pull command/ })).toBeNull();
-    expect(screen.getByText(/keyword only/)).toBeInTheDocument();
   });
 
   it("a non-Ollama local server that is down names the URL, not Ollama", async () => {

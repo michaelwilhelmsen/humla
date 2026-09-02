@@ -21,21 +21,27 @@ use serde::Serialize;
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager, State};
 
-/// Derive the embedding config from the resolved chat provider (issue #48) —
-/// no user-facing embedding choice. Cloud chat embeds with OpenAI's
-/// `text-embedding-3-small`; local chat with `embeddinggemma` via the same
-/// Ollama server. Both speak the OpenAI-compatible `/v1/embeddings` shape.
+/// Derive the embedding config from the resolved chat provider (issue #48).
+/// Cloud chat embeds with OpenAI's `text-embedding-3-small` and offers no
+/// choice — the key and the endpoint are already settled by the chat provider.
+///
+/// Local chat defaults to `embeddinggemma` on the chat server, which is right
+/// for Ollama and wrong for everything else (#179): mlx_lm.server has no
+/// `/v1/embeddings` route at all, llama-server needs its own process, and
+/// LM Studio names the same model `text-embedding-embeddinggemma-…`. So both
+/// halves are overridable, and the common shape — Ollama embedding beside a
+/// different chat server — costs two settings rather than being impossible.
 fn resolve_embed(resolved: &ResolvedChat) -> embed::EmbedConfig {
     match resolved.provider.as_str() {
         "ollama" => embed::EmbedConfig {
             provider: "ollama",
-            model: OLLAMA_EMBED_MODEL,
-            base_url: resolved.base_url.clone(),
+            model: resolved.embed.model.clone().unwrap_or_else(|| OLLAMA_EMBED_MODEL.to_string()),
+            base_url: resolved.embed.base_url.clone().unwrap_or_else(|| resolved.base_url.clone()),
             api_key: None,
         },
         _ => embed::EmbedConfig {
             provider: "openai",
-            model: OPENAI_EMBED_MODEL,
+            model: OPENAI_EMBED_MODEL.to_string(),
             base_url: resolved.base_url.clone(),
             api_key: resolved.api_key.clone(),
         },
@@ -393,6 +399,15 @@ struct ResolvedChat {
     api_key: Option<String>,
     model: String,
     think: bool,
+    embed: EmbedOverride,
+}
+
+/// What the user has said about the local embedder, if anything. `None` on
+/// either half means "follow the chat provider" — the pre-#179 behaviour.
+#[derive(Default)]
+struct EmbedOverride {
+    base_url: Option<String>,
+    model: Option<String>,
 }
 
 fn resolve_chat(
@@ -428,7 +443,11 @@ fn resolve_chat(
                      Settings → Chat."
                 );
             }
-            Ok(ResolvedChat { provider, base_url, api_key: None, model, think })
+            let embed = EmbedOverride {
+                base_url: setting("embed_base_url")?,
+                model: setting("embed_model")?,
+            };
+            Ok(ResolvedChat { provider, base_url, api_key: None, model, think, embed })
         }
         _ => {
             let api_key = openai_api_key.filter(|s| !s.is_empty()).ok_or_else(|| {
@@ -443,6 +462,7 @@ fn resolve_chat(
                 api_key: Some(api_key),
                 model,
                 think: false,
+                embed: EmbedOverride::default(),
             })
         }
     }
@@ -2786,6 +2806,59 @@ mod tests {
         assert!(res.is_err());
         let err = res.err().unwrap().to_string();
         assert!(err.contains("embedding model"), "clear guidance, not a raw 400: {err}");
+    }
+
+    // #179: the local embedder gets its own address and name, because the chat
+    // server is often not the one that can embed — and the pre-#179 default
+    // (embeddinggemma on the chat server) has to survive untouched for the
+    // Ollama users it was right for.
+    #[test]
+    fn the_local_embedder_defaults_to_the_chat_server_and_is_overridable() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = db::open(&dir.path().join("embed.sqlite")).unwrap();
+        db::set_setting(&conn, "chat_provider", "ollama").unwrap();
+        db::set_setting(&conn, "chat_model", "gemma4:12b-mlx").unwrap();
+        db::set_setting(&conn, "local_llm_base_url", "http://127.0.0.1:8000/v1").unwrap();
+
+        let cfg = resolve_embed(&resolve_chat(&conn, None).unwrap());
+        assert_eq!(cfg.base_url, "http://127.0.0.1:8000/v1");
+        assert_eq!(cfg.model, OLLAMA_EMBED_MODEL);
+
+        // The shape #179 exists for: embeddings on Ollama, chat on mlx.
+        db::set_setting(&conn, "embed_base_url", "http://localhost:11434/v1").unwrap();
+        db::set_setting(&conn, "embed_model", "embeddinggemma:latest").unwrap();
+        let cfg = resolve_embed(&resolve_chat(&conn, None).unwrap());
+        assert_eq!(cfg.base_url, "http://localhost:11434/v1");
+        assert_eq!(cfg.model, "embeddinggemma:latest");
+        // The index is keyed by the model id, so an override must reach it —
+        // otherwise new vectors would land under the old model's key.
+        assert_eq!(cfg.adapter().model_id(), "embeddinggemma:latest");
+    }
+
+    #[test]
+    fn a_blank_embed_override_is_not_an_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = db::open(&dir.path().join("blank.sqlite")).unwrap();
+        db::set_setting(&conn, "chat_provider", "ollama").unwrap();
+        db::set_setting(&conn, "chat_model", "gemma4:12b-mlx").unwrap();
+        db::set_setting(&conn, "embed_base_url", "   ").unwrap();
+        db::set_setting(&conn, "embed_model", "").unwrap();
+        let cfg = resolve_embed(&resolve_chat(&conn, None).unwrap());
+        assert_eq!(cfg.base_url, DEFAULT_LOCAL_LLM_BASE_URL);
+        assert_eq!(cfg.model, OLLAMA_EMBED_MODEL);
+    }
+
+    #[test]
+    fn cloud_chat_ignores_the_local_embed_overrides() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = db::open(&dir.path().join("cloud.sqlite")).unwrap();
+        db::set_setting(&conn, "chat_provider", "openai").unwrap();
+        db::set_setting(&conn, "chat_model", "gpt-5.4").unwrap();
+        db::set_setting(&conn, "embed_base_url", "http://localhost:11434/v1").unwrap();
+        db::set_setting(&conn, "embed_model", "embeddinggemma").unwrap();
+        let cfg = resolve_embed(&resolve_chat(&conn, Some("sk-test".into())).unwrap());
+        assert_eq!(cfg.base_url, crate::openai::BASE);
+        assert_eq!(cfg.model, OPENAI_EMBED_MODEL);
     }
 
     /// A user turn (for tests that need a session to have messages).

@@ -67,6 +67,10 @@ export function mockTauri(
         };
       case "provider_key_get":
         return null;
+      // No embedding server in a test environment — the honest default is the
+      // failure a real machine without one gives (#179).
+      case "local_llm_embed_probe":
+        throw new Error("Couldn't reach http://localhost:11434/v1/embeddings");
       case "diarize_status":
         return { downloaded: false, sizeBytes: 0, path: "" };
       case "app_data_dir":
