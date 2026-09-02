@@ -416,6 +416,8 @@ where
             commands::chat_reindex_note,
             commands::chat_rebuild_index,
             commands::chat_stale_note_count,
+            commands::chat_unembedded_note_count,
+            commands::chat_embed_missing,
             commands::permissions_status,
             commands::permissions_request,
             commands::permissions_open_settings,

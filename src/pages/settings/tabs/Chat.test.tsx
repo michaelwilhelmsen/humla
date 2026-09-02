@@ -102,6 +102,40 @@ describe("ChatTab readiness", () => {
     expect(screen.queryByRole("button", { name: /Copy embedding-model pull command/ })).toBeNull();
   });
 
+  // #179: the probe says the embedder answers; the vectors are keyed by its name,
+  // so that is not the same fact as the corpus being findable through it.
+  it("a working embedder with an unembedded corpus says so, and can embed on the spot", async () => {
+    let unembedded = 4;
+    mockTauri({
+      local_llm_list_models: () => ["qwen3.5:4b"],
+      local_llm_embed_probe: () => 768,
+      chat_unembedded_note_count: () => unembedded,
+      chat_embed_missing: () => {
+        unembedded = 0;
+        return 4;
+      },
+    });
+    render(<ChatTab s={settings({ chat_provider: "ollama", chat_model: "qwen3.5:4b" })} update={async () => {}} />);
+    await waitFor(() => expect(screen.getByText(/Semantic search ready/)).toBeInTheDocument());
+    await waitFor(() =>
+      expect(screen.getByText(/4 notes have no embedding under embeddinggemma yet/)).toBeInTheDocument(),
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Embed now" }));
+    await waitFor(() => expect(screen.queryByText(/no embedding under/)).toBeNull());
+  });
+
+  it("an embedded corpus adds no line at all", async () => {
+    mockTauri({
+      local_llm_list_models: () => ["qwen3.5:4b"],
+      local_llm_embed_probe: () => 768,
+      chat_unembedded_note_count: () => 0,
+    });
+    render(<ChatTab s={settings({ chat_provider: "ollama", chat_model: "qwen3.5:4b" })} update={async () => {}} />);
+    await waitFor(() => expect(screen.getByText(/Semantic search ready/)).toBeInTheDocument());
+    expect(screen.queryByText(/no embedding under/)).toBeNull();
+    expect(screen.queryByRole("button", { name: "Embed now" })).toBeNull();
+  });
+
   // The shape #179 exists for: the chat server can't embed, so the embedder is
   // pointed at a second one. The probe must follow the override, not the chat URL.
   it("the embedder is probed at its own URL and model", async () => {

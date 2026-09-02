@@ -11,6 +11,38 @@ mod tools;
 
 pub use adapter::{CancelFlag, ChatAdapter, ChatCtx, ChatStreamEvent, ChatTurn, ToolSpec};
 pub use providers::{OllamaChatAdapter, OpenAiChatAdapter};
+
+/// A stand-in OpenAI-compat server, shared by every test here that needs one on
+/// the wire rather than behind a fake adapter.
+#[cfg(test)]
+pub mod test_server {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Answer each connection with the next `body` as an event stream, and hand
+    /// back the port plus every request read, in order.
+    pub async fn serve_sse(bodies: Vec<String>) -> (u16, tokio::task::JoinHandle<Vec<String>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            for body in bodies {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 262_144];
+                let n = sock.read(&mut buf).await.unwrap();
+                seen.push(String::from_utf8_lossy(&buf[..n]).to_string());
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                sock.write_all(resp.as_bytes()).await.unwrap();
+                sock.flush().await.unwrap();
+            }
+            seen
+        });
+        (port, handle)
+    }
+}
 pub use tools::{execute_tool, tool_specs, Citation, ToolScope};
 #[cfg(test)]
 pub use providers::{FakeChatAdapter, StallingChatAdapter};
@@ -1203,34 +1235,6 @@ mod tests {
         ChatCtx { cancel: flag, ..FAKE_CTX }
     }
 
-    /// A local OpenAI-compat server that is NOT Ollama (#179): serves two
-    /// `/chat/completions` requests in order — a streamed tool call, then the
-    /// final answer — so the whole loop (retrieval included) runs over the wire
-    /// the way an mlx / LM Studio / vLLM user's does.
-    async fn fake_compat_server(bodies: Vec<String>) -> (u16, tokio::task::JoinHandle<usize>) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let handle = tokio::spawn(async move {
-            let mut served = 0usize;
-            for body in bodies {
-                let (mut sock, _) = listener.accept().await.unwrap();
-                let mut buf = vec![0u8; 262_144];
-                let _ = sock.read(&mut buf).await.unwrap();
-                let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                sock.write_all(resp.as_bytes()).await.unwrap();
-                sock.flush().await.unwrap();
-                served += 1;
-            }
-            served
-        });
-        (port, handle)
-    }
-
     #[tokio::test]
     async fn a_local_openai_compat_server_runs_the_whole_loop_including_retrieval() {
         let dir = tempfile::tempdir().unwrap();
@@ -1247,7 +1251,7 @@ mod tests {
         let answer = "data: {\"choices\":[{\"delta\":{\"content\":\"The budget lands in March.\"}}]}\n\n\
                       data: [DONE]\n\n"
             .to_string();
-        let (port, server) = fake_compat_server(vec![tool_call, answer]).await;
+        let (port, server) = super::test_server::serve_sse(vec![tool_call, answer]).await;
 
         let base = format!("http://127.0.0.1:{port}/v1");
         let ctx = ChatCtx { base_url: &base, model: "mlx-community/Qwen3-8B", ..FAKE_CTX };
@@ -1277,7 +1281,7 @@ mod tests {
             .collect();
         assert_eq!(streamed, "The budget lands in March.");
         // The tool step ran on the wire, not just the answer.
-        assert_eq!(server.await.unwrap(), 2);
+        assert_eq!(server.await.unwrap().len(), 2);
         assert!(
             events
                 .iter()

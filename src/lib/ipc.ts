@@ -669,6 +669,10 @@ export const ipc = {
   chatRebuildIndex: () => invoke<number>("chat_rebuild_index"),
   /** How many notes a rebuild would repair — 0 when the index is current (#122). */
   chatStaleNoteCount: () => invoke<number>("chat_stale_note_count"),
+  /** How many notes have no vector under the embedder now in force (#179). */
+  chatUnembeddedNoteCount: () => invoke<number>("chat_unembedded_note_count"),
+  /** Embed those notes now; returns how many it set out to embed (#179). */
+  chatEmbedMissing: () => invoke<number>("chat_embed_missing"),
 
   permissionsStatus: () => invoke<PermissionsStatus>("permissions_status"),
   permissionsRequest: (kind: PermissionKind) => invoke<PermissionsStatus>("permissions_request", { kind }),

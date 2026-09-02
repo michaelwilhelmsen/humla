@@ -330,43 +330,15 @@ impl ChatAdapter for FakeChatAdapter {
 mod local_compat_tests {
     use super::*;
     use crate::chat::adapter::CancelFlag;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use crate::chat::test_server::serve_sse;
 
-    /// One-shot OpenAI-compat `/chat/completions` server: reads the request,
-    /// answers with an SSE stream carrying a single content delta. Returns its
-    /// port and the request body it saw.
-    async fn fake_compat_server() -> (u16, tokio::task::JoinHandle<String>) {
-        serve_sse(
-            "data: {\"choices\":[{\"delta\":{\"content\":\"hi from mlx\"}}]}\n\n\
-             data: [DONE]\n\n",
-        )
-        .await
-    }
-
-    /// One-shot server answering with `body` as an event stream.
-    async fn serve_sse(body: &'static str) -> (u16, tokio::task::JoinHandle<String>) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let handle = tokio::spawn(async move {
-            let (mut sock, _) = listener.accept().await.unwrap();
-            let mut buf = vec![0u8; 65536];
-            let n = sock.read(&mut buf).await.unwrap();
-            let req = String::from_utf8_lossy(&buf[..n]).to_string();
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            sock.write_all(resp.as_bytes()).await.unwrap();
-            sock.flush().await.unwrap();
-            req
-        });
-        (port, handle)
-    }
+    /// The single content delta most of these tests want back.
+    const ONE_DELTA: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"hi from mlx\"}}]}\n\n\
+                             data: [DONE]\n\n";
 
     #[tokio::test]
     async fn local_chat_falls_back_to_openai_compat_off_ollamas_port() {
-        let (port, server) = fake_compat_server().await;
+        let (port, server) = serve_sse(vec![ONE_DELTA.into()]).await;
         let base = format!("http://127.0.0.1:{port}/v1");
         let cancel = CancelFlag::new();
         let ctx = ChatCtx {
@@ -392,19 +364,20 @@ mod local_compat_tests {
             .expect("a non-Ollama local server must still chat");
         assert_eq!(step.text, "hi from mlx");
         assert_eq!(seen, "hi from mlx");
-        let req = server.await.unwrap();
+        let req = server.await.unwrap().remove(0);
         assert!(req.starts_with("POST /v1/chat/completions"), "req was: {req}");
     }
 
     #[tokio::test]
     async fn a_streamed_tool_call_from_a_local_compat_server_is_assembled() {
-        let (port, server) = serve_sse(
+        let (port, server) = serve_sse(vec![
             "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\
              \"function\":{\"name\":\"search_notes\",\"arguments\":\"{\\\"query\\\":\"}}]}}]}\n\n\
              data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\
              \"function\":{\"arguments\":\"\\\"budget\\\"}\"}}]}}]}\n\n\
-             data: [DONE]\n\n",
-        )
+             data: [DONE]\n\n"
+                .into(),
+        ])
         .await;
         let base = format!("http://127.0.0.1:{port}/v1");
         let cancel = CancelFlag::new();
@@ -433,19 +406,14 @@ mod local_compat_tests {
         assert_eq!(step.tool_calls[0].name, "search_notes");
         assert_eq!(step.tool_calls[0].arguments, "{\"query\":\"budget\"}");
         assert_eq!(calls.len(), 1);
-        let req = server.await.unwrap();
+        let req = server.await.unwrap().remove(0);
         assert!(req.contains("search_notes"), "tools were not offered: {req}");
     }
 
-    #[tokio::test]
-    async fn ollamas_own_port_still_takes_the_native_api() {
-        let (port, server) = fake_compat_server().await;
-        // The native path only triggers on :11434, so fake that host:port in
-        // the URL and let the request itself say which endpoint was chosen.
-        let base = format!("http://127.0.0.1:{port}/v1");
+    #[test]
+    fn ollamas_own_port_still_takes_the_native_api() {
         let native = crate::openai::ollama_native_url("http://localhost:11434/v1");
         assert_eq!(native.as_deref(), Some("http://localhost:11434/api"));
-        assert_eq!(crate::openai::ollama_native_url(&base), None);
-        server.abort();
+        assert_eq!(crate::openai::ollama_native_url("http://127.0.0.1:8000/v1"), None);
     }
 }

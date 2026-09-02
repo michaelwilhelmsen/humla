@@ -3,15 +3,11 @@ import { ipc } from "../../lib/ipc";
 
 // Whether the local embedder actually answers, by embedding one word (#179).
 //
-// Not the model listing, which is what this used to be inferred from: a server
-// can list a model and serve no `/v1/embeddings` route (mlx_lm.server), and a
-// name that isn't the loaded embedder is a 400 the listing looks fine through.
-// So the verdict is a real call, and the failure carries the server's own words
-// rather than advice about Ollama.
-//
-// One shot per (url, model), debounced — the user types into those fields, and
-// a probe can load a model into memory, so this must not poll the way the
-// reachability probe does.
+// A model listing cannot answer this: a server can list a model and serve no
+// `/v1/embeddings` route (mlx_lm.server), and a name that isn't the loaded
+// embedder is a 400 the listing looks fine through. One shot per (url, model),
+// debounced — the user types into those fields, and a probe can load a model
+// into memory, so this must not poll the way the reachability probe does.
 export function useEmbedProbe(
   baseUrl: string,
   model: string,

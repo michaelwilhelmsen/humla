@@ -418,6 +418,7 @@ function IntegrationsHarness({ enabled }: { enabled: boolean }) {
 // commands, and an embedder pointed at its own address. jsdom asserts the words
 // but not that two input rows and a status line sit right in the column.
 function chatCase(kind: "ollama" | "compat" | "compat-embedding"): Scenario {
+  let unembedded = 4;
   const chatUrl = kind === "ollama" ? "http://localhost:11434/v1" : "http://127.0.0.1:8000/v1";
   const model = kind === "ollama" ? "gemma4:12b-mlx" : "mlx-community/Qwen3-8B";
   return {
@@ -431,6 +432,16 @@ function chatCase(kind: "ollama" | "compat" | "compat-embedding"): Scenario {
     ),
     ipc: {
       local_llm_list_models: () => [model, "embeddinggemma"],
+      // A library part-way through: the embedder answers and four notes still
+      // have no vector under its name — the two facts #179 kept conflating.
+      // Stateful, so pressing Embed now leads somewhere.
+      chat_unembedded_note_count: () => unembedded,
+      chat_embed_missing: () => {
+        const n = unembedded;
+        unembedded = 0;
+        return n;
+      },
+      chat_stale_note_count: () => 0,
       // Only the Ollama-side embedder answers; on the bare compat server the
       // probe fails, which is the state that has to read as a soft warning
       // rather than an error.
