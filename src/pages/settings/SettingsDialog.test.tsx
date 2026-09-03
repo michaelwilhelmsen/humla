@@ -97,6 +97,30 @@ describe("settings dialog", () => {
     expect(saved.keep_audio).toBe("true");
   });
 
+  // #180: defaults on for a fresh install and for a library with no
+  // `keep_awake` row, and only an explicit off persists "false".
+  it("shows the keep-awake toggle on by default and persists turning it off", async () => {
+    const saved: Record<string, string> = {};
+    renderApp("/settings?tab=recording", {
+      settings_set: (args) => {
+        const { key, value } = args as { key: string; value: string };
+        saved[key] = value;
+        return null;
+      },
+    });
+    const dialog = await screen.findByRole("dialog", { name: /settings/i });
+
+    const toggle = await within(dialog).findByRole("switch", {
+      name: /keep mac awake while recording/i,
+    });
+    expect(toggle).toBeChecked();
+
+    await userEvent.click(toggle);
+
+    expect(toggle).not.toBeChecked();
+    expect(saved.keep_awake).toBe("false");
+  });
+
   // #24: the toggle's copy is the privacy promise, so it has to state which of
   // the two regimes is in force rather than describing the feature generically.
   it("states that nothing is stored while keep-audio is off", async () => {

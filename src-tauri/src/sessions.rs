@@ -669,6 +669,21 @@ pub fn defer_transcription(manual_setting: Option<&str>, keep_audio: bool) -> bo
     }
 }
 
+/// The shipped default for `keep_awake`: on. Mirrored by the frontend's
+/// `settings/types.ts` default.
+const KEEP_AWAKE_DEFAULT: bool = true;
+
+/// Whether a capture starting now should hold a system-sleep power assertion
+/// (#180). Only the literal `"false"` turns it off; any other stored value
+/// fails open, towards keeping the recording alive.
+pub fn keep_awake(setting: Option<&str>) -> bool {
+    match setting {
+        Some("false") => false,
+        Some(_) => true,
+        None => KEEP_AWAKE_DEFAULT,
+    }
+}
+
 /// Which of a teammate's session assets this device should fetch (#24). The
 /// rule is *device-scoped*: a Mac with `keep_audio` off doesn't download
 /// someone else's recording either, so the setting describes the machine
@@ -1542,6 +1557,15 @@ mod tests {
         // as a string and a garbled value must fail closed, not open.
         assert!(!retain_audio(Some("")));
         assert!(!retain_audio(Some("1")));
+    }
+
+    #[test]
+    fn keep_awake_defaults_on_and_only_false_turns_it_off() {
+        assert!(keep_awake(None));
+        assert!(keep_awake(Some("true")));
+        assert!(!keep_awake(Some("false")));
+        assert!(keep_awake(Some("")));
+        assert!(keep_awake(Some("0")));
     }
 
     #[test]

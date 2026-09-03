@@ -16,6 +16,7 @@ export function RecordingSection({
   const keeping = s.keep_audio === "true";
   const manualTranscription = s.transcribe_manually === "true";
   const closeToTray = s.close_to_tray === "true";
+  const keepAwake = s.keep_awake !== "false";
   return (
     <>
       <Section title="Permissions">
@@ -68,6 +69,20 @@ export function RecordingSection({
           />
         )}
         <StoredAudioCleanup />
+      </Section>
+
+      <Section title="Power">
+        <Row
+          label="Keep Mac awake while recording"
+          description="Stops your Mac from going to sleep during a recording. The display can still turn off, and a closed lid still sleeps."
+          control={
+            <Toggle
+              label="Keep Mac awake while recording"
+              checked={keepAwake}
+              onChange={(on) => update("keep_awake", on ? "true" : "false")}
+            />
+          }
+        />
       </Section>
 
       <Section title="Menu bar">
