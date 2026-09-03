@@ -5,6 +5,7 @@ import CoreAudio
 import ScreenCaptureKit
 import CoreMedia
 import CoreGraphics
+import IOKit.pwr_mgt
 
 // Hide the sidecar from the Dock and menu bar. ScreenCaptureKit and
 // AVAudioEngine pull in AppKit transitively, which by default registers the
@@ -100,6 +101,43 @@ let importPath: String? = {
     return args[i + 1]
 }()
 let isImport = importPath != nil
+
+// MARK: - Power assertion (#180)
+//
+// Idle system sleep only, never display sleep. Held by this process so the OS
+// releases it on any exit path, SIGKILL included. Taken once a stream actually
+// captures, so a denied mic doesn't hold the machine awake for nothing.
+let keepAwake = !isImport && args.contains("--keep-awake")
+let sleepAssertionLock = NSLock()
+var sleepAssertion: IOPMAssertionID = 0
+
+func holdSystemAwake() {
+    guard keepAwake else { return }
+    sleepAssertionLock.lock()
+    defer { sleepAssertionLock.unlock() }
+    if sleepAssertion != 0 { return }
+    var id: IOPMAssertionID = 0
+    let rc = IOPMAssertionCreateWithName(
+        kIOPMAssertionTypePreventUserIdleSystemSleep as CFString,
+        IOPMAssertionLevel(kIOPMAssertionLevelOn),
+        "Humla is recording a meeting" as CFString,
+        &id
+    )
+    if rc == kIOReturnSuccess {
+        sleepAssertion = id
+    } else {
+        FileHandle.standardError.write(Data("power: assertion failed (\(rc))\n".utf8))
+    }
+}
+
+func releaseSystemAwake() {
+    sleepAssertionLock.lock()
+    defer { sleepAssertionLock.unlock() }
+    if sleepAssertion != 0 {
+        IOPMAssertionRelease(sleepAssertion)
+        sleepAssertion = 0
+    }
+}
 
 // MARK: - JSON event emitter (stdout)
 
@@ -540,6 +578,7 @@ do {
     installMicTap(input, format: inFormat)
     engine.prepare()
     try engine.start()
+    holdSystemAwake()
 } catch {
     // No tap was installed, so `installMicTap` never resolved a name — and this
     // is exactly the shape of failure #174 is about (mic permission silently
@@ -752,6 +791,7 @@ func startSystemAudio() async {
         try stream.addStreamOutput(NoopVideoOutput(), type: .screen, sampleHandlerQueue: DispatchQueue(label: "sck.video"))
         try await stream.startCapture()
         scStream = stream
+        holdSystemAwake()
         FileHandle.standardError.write(Data("scstream: capture started successfully\n".utf8))
     } catch {
         emitError("screen capture: \(error.localizedDescription)")
@@ -946,6 +986,7 @@ let shutdown: () -> Void = {
         sysFullWriter.close()
         micWriter.close()
         sysWriter.close()
+        releaseSystemAwake()
         emit(["event": "stopped"])
         // Now best-effort SCK shutdown for cleanliness. If it stalls,
         // we've already emitted everything the parent needs and the

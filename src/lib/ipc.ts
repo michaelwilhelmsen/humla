@@ -109,6 +109,8 @@ export type SettingsKey =
   // deferring on a device that stores no audio would discard the meeting — so
   // Settings doesn't show it until retention is.
   | "transcribe_manually"
+  // Hold a system-sleep power assertion while a capture runs (#180).
+  | "keep_awake"
   // Cloud/teams: upload a finished recording's audio to its workspace note
   // so teammates can play it back. Default on; only the string "false"
   // disables it on the upload path. Surfaced in the Account section.

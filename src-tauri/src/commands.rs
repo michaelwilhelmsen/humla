@@ -1943,29 +1943,31 @@ fn timeline_duration_ms(session_dir: &std::path::Path) -> u64 {
         .unwrap_or(0)
 }
 
+fn raw_setting(app: &AppHandle, key: &str) -> Option<String> {
+    let state: State<AppState> = app.state();
+    let conn = state.db.lock();
+    db::get_setting(&conn, key).ok().flatten()
+}
+
 /// Read the device's `keep_audio` decision (#24). The single gate consulted by
 /// every path that would write, upload or download a WAV.
 pub(crate) fn keep_audio_enabled(app: &AppHandle) -> bool {
-    let state: State<AppState> = app.state();
-    let raw = {
-        let conn = state.db.lock();
-        db::get_setting(&conn, "keep_audio").ok().flatten()
-    };
-    sessions::retain_audio(raw.as_deref())
+    sessions::retain_audio(raw_setting(app, "keep_audio").as_deref())
+}
+
+/// Whether a capture starting now should keep the Mac from idle sleep (#180).
+/// Read once at `recording_start` and handed to the sidecar as a launch flag;
+/// flipping the setting mid-recording leaves the running capture alone.
+pub(crate) fn keep_awake_enabled(app: &AppHandle) -> bool {
+    sessions::keep_awake(raw_setting(app, "keep_awake").as_deref())
 }
 
 /// Whether a recording starting now should defer transcription (#146). Reads
 /// both halves of the decision — see [`sessions::defer_transcription`] for why
 /// `keep_audio` gates it.
 pub(crate) fn deferred_transcription_enabled(app: &AppHandle) -> bool {
-    let state: State<AppState> = app.state();
-    let (manual, keep) = {
-        let conn = state.db.lock();
-        (
-            db::get_setting(&conn, "transcribe_manually").ok().flatten(),
-            db::get_setting(&conn, "keep_audio").ok().flatten(),
-        )
-    };
+    let manual = raw_setting(app, "transcribe_manually");
+    let keep = raw_setting(app, "keep_audio");
     sessions::defer_transcription(manual.as_deref(), sessions::retain_audio(keep.as_deref()))
 }
 
@@ -2240,6 +2242,9 @@ pub async fn recording_start(
     let sidecar_path = sidecar_path(&app)?;
     let mut cmd = Command::new(&sidecar_path);
     cmd.arg("--out").arg(&temp_dir);
+    if keep_awake_enabled(&app) {
+        cmd.arg("--keep-awake");
+    }
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
     cmd.kill_on_drop(true);
