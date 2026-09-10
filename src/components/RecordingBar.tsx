@@ -216,17 +216,11 @@ export type IndicatorState = {
  * a note the user may not even be looking at. A capture that draws nothing —
  * idle, or the deferred stop above — lets the replay through rather than
  * blanking the row.
- *
- * `replayShownInPanel` is the same rule against the Transcript panel, which
- * draws the replay where the user pressed Transcribe: it drops the replay of
- * the scoped note only, so a live capture, a stop and a replay on some other
- * note all still have their surface.
  */
 export function indicatorState(
   status: RecordingStatus,
   transcribing: Record<string, ReplayRun>,
   scopeNoteId?: string,
-  replayShownInPanel?: boolean,
 ): IndicatorState | null {
   const capture = scopeNoteId === undefined || status.noteId === scopeNoteId ? status : null;
   if (capture) {
@@ -258,7 +252,6 @@ export function indicatorState(
         ? { noteId: scopeNoteId, run: transcribing[scopeNoteId] }
         : null;
   if (!replay) return null;
-  if (replayShownInPanel && replay.noteId === scopeNoteId) return null;
   return { noteId: replay.noteId, kind: "progress", ...replayProgress(replay.run), paused: false };
 }
 
@@ -303,7 +296,6 @@ export function CaptureIndicator({
   noteId,
   elapsed = 0,
   onOpen,
-  replayShownInPanel,
 }: {
   variant: "bar" | "compact";
   /** Scopes the `bar` variant to its own note: a capture running elsewhere is
@@ -311,14 +303,11 @@ export function CaptureIndicator({
   noteId?: string;
   elapsed?: number;
   onOpen?: () => void;
-  /** This note's replay is already on screen in the Transcript panel, so this
-      copy of it stands down (see `indicatorState`). */
-  replayShownInPanel?: boolean;
 }) {
   const global = useRecordingStore((s) => s.status);
   const transcribing = useRecordingStore((s) => s.transcribing);
   const labelId = useId();
-  const state = indicatorState(global, transcribing, noteId, replayShownInPanel);
+  const state = indicatorState(global, transcribing, noteId);
   const progress = state?.kind === "progress" ? state : null;
   const live = state?.kind === "live";
   if (variant === "bar") {
@@ -421,16 +410,7 @@ function ProgressTrack({
 // meters + chunk count), a red-outlined timer/controls pill, and — as the
 // onboarding safety net — a live mic level meter plus a "no audio detected"
 // warning if the mic stays silent for the first ~10s.
-export function RecordingBar({
-  noteId,
-  replayShownInPanel,
-}: {
-  noteId: string;
-  /** The Transcript panel is standing this note's replay already, so the bar
-      leaves that one to it — the live states are still the bar's, whichever
-      tab is open. */
-  replayShownInPanel?: boolean;
-}) {
+export function RecordingBar({ noteId }: { noteId: string }) {
   const status = useRecordingStore((s) => s.status);
   const isThisNote = status.noteId === noteId;
   const phase = isThisNote ? status.phase : "idle";
@@ -533,7 +513,7 @@ export function RecordingBar({
   // the stop's own pills, or a replay (#146). Which arrangement the row is in
   // (#177) turns on whether anything shares it with the busy pill a summary
   // puts there.
-  const indicator = indicatorState(status, transcribing, noteId, replayShownInPanel);
+  const indicator = indicatorState(status, transcribing, noteId);
   const steps =
     isSummarizing && (hasTimer || indicator?.kind === "progress")
       ? ROW_STEPS.tight
@@ -685,11 +665,7 @@ export function RecordingBar({
       {/* Where the pause and stop buttons were. The transcript's tail is
           landing into the panel beside this, so the row's remaining job is to
           say how much of it is still coming. */}
-      <CaptureIndicator
-        variant="bar"
-        noteId={noteId}
-        replayShownInPanel={replayShownInPanel}
-      />
+      <CaptureIndicator variant="bar" noteId={noteId} />
       </div>
     </div>
   );

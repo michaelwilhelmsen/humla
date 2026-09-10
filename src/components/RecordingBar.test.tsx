@@ -316,48 +316,33 @@ describe("the bar during a deferred transcription's replay (#146)", () => {
   });
 });
 
-// One indicator per screen. The Transcript panel draws the replay where the
-// user pressed Transcribe and watched an empty transcript, so that surface
-// wins while it is visible and the floating bar drops its copy — the same pill
-// rendered twice on one screen reads as a bug.
-describe("a replay the Transcript panel is already showing (#146)", () => {
+// One position for progress, whichever kind it is. A replay reports on the
+// recording bar and, off the note, on the app-wide pill — the same two places
+// a stop reports in. The Transcript panel draws no copy of its own: two pills
+// on one screen read as a bug, and a replay's text lands in a single write at
+// the end, so the panel has nothing to stream either way.
+describe("where a replay reports (#146)", () => {
   const RUN: ReplayRun = { startedAt: 1, doneMs: 45_000, totalMs: 180_000 };
   const IDLE: RecordingStatus = { noteId: null, phase: "idle" };
 
-  it("stands down where the panel has it, and not otherwise", () => {
-    expect(indicatorState(IDLE, { n1: RUN }, "n1")).not.toBeNull();
-    expect(indicatorState(IDLE, { n1: RUN }, "n1", true)).toBeNull();
-  });
-
-  it("keeps a live capture and a stop, which the panel never draws", () => {
-    for (const status of [
-      { noteId: "n1", phase: "recording" } as const,
-      { noteId: "n1", phase: "paused" } as const,
-      { noteId: "n1", phase: "starting" } as const,
-      { noteId: "n1", phase: "stopping", pending: 4, done: 1 } as const,
-      { noteId: "n1", phase: "diarizing" } as const,
-    ]) {
-      expect(indicatorState(status, { n1: RUN }, "n1", true)).not.toBeNull();
-    }
-  });
-
-  it("suppresses one note's replay, never another's", () => {
-    // The app-wide pill has no scope of its own, and a replay on a note the
-    // user is not looking at is exactly what it exists to report.
-    expect(indicatorState(IDLE, { n2: RUN }, undefined, true)?.noteId).toBe("n2");
-  });
-
-  it("is wired through the bar and not only through the rule", () => {
+  it("is on the bar of the note it belongs to", () => {
     useRecordingStore.setState({
       status: IDLE,
       summarizing: {},
       diag: null,
       transcribing: { n1: RUN },
     });
-    const { unmount } = render(<RecordingBar noteId="n1" />);
+    render(<RecordingBar noteId="n1" />);
     expect(screen.getByRole("progressbar", { name: "Transcribing…" })).toBeInTheDocument();
-    unmount();
-    render(<RecordingBar noteId="n1" replayShownInPanel />);
-    expect(screen.queryByRole("progressbar")).toBeNull();
+  });
+
+  it("is not on another note's bar", () => {
+    expect(indicatorState(IDLE, { n2: RUN }, "n1")).toBeNull();
+  });
+
+  it("yields the slot to a live capture on the same note", () => {
+    // The capture is what the user is doing now; the replay is background work.
+    const rec: RecordingStatus = { noteId: "n1", phase: "recording" };
+    expect(indicatorState(rec, { n1: RUN }, "n1")?.kind).toBe("live");
   });
 });

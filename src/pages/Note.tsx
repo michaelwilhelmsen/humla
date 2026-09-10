@@ -49,7 +49,7 @@ import {
   sessionTitle,
   type TimelineGroup,
 } from "../lib/sessions";
-import { CaptureIndicator, RecordingBar } from "../components/RecordingBar";
+import { RecordingBar } from "../components/RecordingBar";
 import { NewWorkspaceModal } from "../components/NewWorkspaceModal";
 import { ChatPanel, type ChatSessionControls } from "../components/ChatPanel";
 import { SelectablePopover } from "../components/SelectablePopover";
@@ -1064,12 +1064,6 @@ export function Note() {
   // chunks stay visible. After stop / on a saved note the user is
   // reading from the top, so flip back to top alignment.
   const transcriptLive = isRecording || isPaused || isStopping || isDiarizing || isImporting;
-  // Whether the Transcript tab is standing a replay's progress itself (#146) —
-  // the panel being visible, plus the state its own branch draws the indicator
-  // in. The floating bar drops that one rather than saying it twice, and only
-  // that one: a live capture and a stop are never drawn in the panel.
-  const replayShownInPanel =
-    panelOpen && activeTab === "transcript" && !hasTranscript && !recActive;
 
   const folder = draft.folder_id ? folders.find((f) => f.id === draft.folder_id) : null;
   const backTo = folder ? `/folder/${folder.id}` : "/";
@@ -1349,7 +1343,7 @@ export function Note() {
           </div>
         </div>
         {!readOnly && (
-          <RecordingBar noteId={draft.id} replayShownInPanel={replayShownInPanel} />
+          <RecordingBar noteId={draft.id} />
         )}
       </div>
 
@@ -1710,16 +1704,11 @@ export function Note() {
                     )}
                     {isRecording && <SkeletonLines lines={2} className="mt-3 shrink-0" />}
                   </>
-                ) : recActive ? (
+                ) : recActive || isTranscribing ? (
+                  // A replay commits its text in one write at the end (#146),
+                  // so there is nothing to stream in here. How far it has got
+                  // is on the recording bar, where a stop reports it too.
                   <SkeletonLines lines={4} />
-                ) : isTranscribing ? (
-                  // The same indicator the recording bar stands, in the panel
-                  // that is waiting for the text: a replay of a deferred
-                  // capture (#146) runs for minutes on local Whisper, and a
-                  // shimmer here says only that something is happening.
-                  <div className="flex justify-center pt-1">
-                    <CaptureIndicator variant="bar" noteId={draft.id} />
-                  </div>
                 ) : (
                   <PanelEmpty
                     icon={<MessageSquare size={22} strokeWidth={1.5} />}
