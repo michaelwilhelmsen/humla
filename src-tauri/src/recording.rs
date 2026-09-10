@@ -341,6 +341,49 @@ pub struct LiveCapture {
     // unlocked — a flaky network shouldn't block capture).
     pub lock_id: Option<String>,
     pub lock_heartbeat: Option<JoinHandle<()>>,
+    // Where the capture slot is in its stop sequence. See [`StopState`].
+    pub stop: StopState,
+}
+
+impl LiveCapture {
+    /// The refusal a caller trying to take the capture slot must return, or
+    /// `None` when the slot is takeable. The invariant it protects: a new
+    /// capture can never clear `chunk_log` before the previous stop has
+    /// snapshotted it.
+    pub fn stop_in_progress(&self) -> Option<&'static str> {
+        match self.stop {
+            StopState::None => None,
+            StopState::Draining | StopState::Finishing => Some(STOP_IN_PROGRESS),
+        }
+    }
+}
+
+/// Where the single capture slot is in its stop sequence.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum StopState {
+    /// No stop underway: the slot is either free or holding a live capture.
+    #[default]
+    None,
+    /// Stop was pressed and the in-flight transcribes are still landing.
+    /// `note_id` stays set through this window, so the tail of the transcript
+    /// appends and emits exactly as it did while recording.
+    Draining,
+    /// The `chunk_log` snapshot has been taken and the post-stop chain owns
+    /// `note.transcript` — it rewrites the whole string with speaker labels,
+    /// so a late append would land on top of that.
+    Finishing,
+}
+
+/// Refusal for `recording_start` / `import_audio` while a stop is in progress.
+/// Phrased for the toast the frontend already shows.
+pub const STOP_IN_PROGRESS: &str = "Finishing the previous recording — try again in a moment.";
+
+/// Should a chunk that just finished transcribing append to the note live?
+/// True while the capture runs and through the stop drain; false once the
+/// post-stop chain has snapshotted `chunk_log`, and false for a chunk whose
+/// note is no longer the one in the slot (the user started a new capture).
+pub fn appends_live(active_note: Option<&str>, stop: StopState, note_id: &str) -> bool {
+    active_note == Some(note_id) && stop != StopState::Finishing
 }
 
 #[derive(Clone, Serialize)]
@@ -348,6 +391,82 @@ pub struct LiveCapture {
 pub struct RecordingStatus {
     pub note_id: Option<String>,
     pub phase: Phase,
+    // Drain progress, present only during `Stopping` (#182): how many
+    // transcribes were in flight when stop was pressed, and how many of those
+    // have landed. Additive and skipped when absent, so every listener that
+    // only reads `{noteId, phase}` keeps working.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub done: Option<u32>,
+}
+
+/// Wall-clock cost of every step of one stop chain, in milliseconds (#182).
+/// Filled as the chain runs and merged into the take's diarize diagnostics
+/// JSON at the end, so a slow stop can be attributed to a step instead of
+/// guessed at. `diarize_mic_ms` / `diarize_sys_ms` are per sidecar invocation
+/// and absent when that stream wasn't diarized; `diagnostics_path` is the file
+/// the timings are merged into, not a duration.
+#[derive(Clone, Default, Serialize)]
+pub struct StopTimings {
+    pub sidecar_shutdown_ms: u64,
+    pub reader_wait_ms: u64,
+    pub drain_ms: u64,
+    pub drain_pending_chunks: u32,
+    pub keep_audio_ms: u64,
+    pub detect_language_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diarize_mic_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diarize_sys_ms: Option<u64>,
+    pub playback_assets_ms: u64,
+    pub finalize_session_ms: u64,
+    pub unify_ms: u64,
+    pub temp_cleanup_ms: u64,
+    pub total_ms: u64,
+    #[serde(skip)]
+    pub diagnostics_path: Option<PathBuf>,
+}
+
+impl StopTimings {
+    /// One-line stderr summary of the chain, printed on every stop.
+    pub fn summary(&self) -> String {
+        let opt = |v: Option<u64>| v.map(|v| v.to_string()).unwrap_or_else(|| "-".into());
+        format!(
+            "stop timings: total={}ms sidecar={} reader={} drain={} ({} pending) keep_audio={} detect_lang={} diarize_mic={} diarize_sys={} playback={} finalize={} unify={} cleanup={}",
+            self.total_ms,
+            self.sidecar_shutdown_ms,
+            self.reader_wait_ms,
+            self.drain_ms,
+            self.drain_pending_chunks,
+            self.keep_audio_ms,
+            self.detect_language_ms,
+            opt(self.diarize_mic_ms),
+            opt(self.diarize_sys_ms),
+            self.playback_assets_ms,
+            self.finalize_session_ms,
+            self.unify_ms,
+            self.temp_cleanup_ms,
+        )
+    }
+}
+
+/// Put a `timings` object into the take's diagnostics JSON, keeping every
+/// field already there. `existing` is the parsed file, or `None` when the
+/// chain wrote no diagnostics (no diarize model, no chunks) — in which case
+/// the timings stand alone in a fresh object.
+pub fn merge_timings(existing: Option<serde_json::Value>, timings: &StopTimings) -> serde_json::Value {
+    let mut root = match existing {
+        Some(serde_json::Value::Object(map)) => serde_json::Value::Object(map),
+        _ => serde_json::json!({ "created_at": chrono::Utc::now().timestamp_millis() }),
+    };
+    if let Some(map) = root.as_object_mut() {
+        map.insert(
+            "timings".to_string(),
+            serde_json::to_value(timings).unwrap_or(serde_json::Value::Null),
+        );
+    }
+    root
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
@@ -525,6 +644,133 @@ pub struct DiagnosticPayload {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn a_chunk() -> ChunkRecord {
+        ChunkRecord {
+            source: ChunkSource::Mic,
+            start_ms: 0,
+            text: "hello".into(),
+            words: Vec::new(),
+            detected_language: None,
+        }
+    }
+
+    #[test]
+    fn a_chunk_landing_during_the_drain_still_appends() {
+        // #182: the tail of the transcript arrives as it decodes. Stop-pressed
+        // keeps `note_id` set precisely so this stays true through the drain.
+        assert!(appends_live(Some("n1"), StopState::Draining, "n1"));
+        assert!(appends_live(Some("n1"), StopState::None, "n1"));
+    }
+
+    #[test]
+    fn a_chunk_landing_after_the_snapshot_does_not_append() {
+        // From the snapshot on, the post-stop chain rewrites the whole
+        // transcript with speaker labels — a late append would land on top.
+        assert!(!appends_live(None, StopState::Finishing, "n1"));
+        // Even with the id somehow still set, `Finishing` is the answer.
+        assert!(!appends_live(Some("n1"), StopState::Finishing, "n1"));
+        // A different capture holds the slot: not this note's business.
+        assert!(!appends_live(Some("n2"), StopState::None, "n1"));
+        assert!(!appends_live(None, StopState::None, "n1"));
+    }
+
+    #[test]
+    fn a_stop_in_progress_refuses_a_new_capture_without_touching_the_chunk_log() {
+        // The invariant #182 protects: a new capture can never clear
+        // `chunk_log` before the previous stop has snapshotted it. Both
+        // `recording_start` and `import_audio` therefore ask this *first* and
+        // return before they reset anything.
+        let mut cap = LiveCapture::default();
+        cap.note_id = Some("n1".to_string());
+        cap.sink.chunk_log.lock().push(a_chunk());
+        for stop in [StopState::Draining, StopState::Finishing] {
+            cap.stop = stop;
+            let refusal = cap.stop_in_progress();
+            assert_eq!(refusal, Some(STOP_IN_PROGRESS), "{stop:?} must refuse");
+            if refusal.is_none() {
+                cap.sink = Arc::new(CaptureSink::new(SinkMode::Live));
+            }
+            assert_eq!(cap.sink.chunk_log.lock().len(), 1, "{stop:?} lost the log");
+        }
+        cap.stop = StopState::None;
+        assert_eq!(cap.stop_in_progress(), None, "an idle slot is takeable");
+    }
+
+    #[test]
+    fn stopping_carries_its_progress_and_no_other_phase_does() {
+        let stopping = RecordingStatus {
+            note_id: Some("n1".to_string()),
+            phase: Phase::Stopping,
+            pending: Some(3),
+            done: Some(1),
+        };
+        let json = serde_json::to_string(&stopping).unwrap();
+        assert_eq!(json, r#"{"noteId":"n1","phase":"stopping","pending":3,"done":1}"#);
+
+        // Every other emit goes through `emit_status`, which passes None for
+        // both — the fields must vanish, so a listener reading `{noteId,
+        // phase}` sees exactly the payload it saw before #182.
+        let idle = RecordingStatus {
+            note_id: None,
+            phase: Phase::Idle,
+            pending: None,
+            done: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&idle).unwrap(),
+            r#"{"noteId":null,"phase":"idle"}"#
+        );
+    }
+
+    #[test]
+    fn timings_merge_into_the_diagnostics_json_without_displacing_it() {
+        let t = StopTimings {
+            sidecar_shutdown_ms: 120,
+            reader_wait_ms: 4,
+            drain_ms: 9_000,
+            drain_pending_chunks: 3,
+            keep_audio_ms: 40,
+            detect_language_ms: 1,
+            diarize_mic_ms: Some(21_000),
+            diarize_sys_ms: None,
+            playback_assets_ms: 300,
+            finalize_session_ms: 12,
+            unify_ms: 0,
+            temp_cleanup_ms: 7,
+            total_ms: 30_484,
+            diagnostics_path: Some(PathBuf::from("/tmp/community1-mic.json")),
+        };
+        let existing = serde_json::json!({ "engine": "community1", "mic_segments": [] });
+        let merged = merge_timings(Some(existing), &t);
+        assert_eq!(merged["engine"], "community1");
+        let timings = &merged["timings"];
+        for key in [
+            "sidecar_shutdown_ms",
+            "reader_wait_ms",
+            "drain_ms",
+            "drain_pending_chunks",
+            "keep_audio_ms",
+            "detect_language_ms",
+            "playback_assets_ms",
+            "finalize_session_ms",
+            "unify_ms",
+            "temp_cleanup_ms",
+            "total_ms",
+        ] {
+            assert!(timings[key].is_u64(), "{key} must be an integer millisecond count");
+        }
+        assert_eq!(timings["diarize_mic_ms"], 21_000);
+        // A stream that wasn't diarized says nothing rather than zero.
+        assert!(timings.get("diarize_sys_ms").is_none());
+        // The merge target is bookkeeping for the writer, not part of the dump.
+        assert!(timings.get("diagnostics_path").is_none());
+
+        // No diarize diagnostics were written (no model, no chunks): the
+        // timings still land, in an object of their own.
+        let alone = merge_timings(None, &t);
+        assert!(alone["timings"]["total_ms"].is_u64());
+    }
 
     #[test]
     fn trail_keeps_last_n_words() {

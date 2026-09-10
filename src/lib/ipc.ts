@@ -797,7 +797,16 @@ export type SummaryEvent = { noteId: string; summary: string };
 export type StreamDeltaEvent = { noteId: string; delta: string };
 export type RecordingPhase = "idle" | "starting" | "recording" | "paused" | "stopping" | "diarizing" | "importing";
 export type SummaryProvider = "openai" | "local";
-export type RecordingStatus = { noteId: string | null; phase: RecordingPhase };
+// `pending` / `done` ride along on `stopping` only (#182): how many chunk
+// transcriptions were still in flight when stop was pressed, and how many of
+// those have landed. Both absent in every other phase — the backend skips them
+// when unset — so a listener that reads `{noteId, phase}` is unaffected.
+export type RecordingStatus = {
+  noteId: string | null;
+  phase: RecordingPhase;
+  pending?: number;
+  done?: number;
+};
 export type RecordingError = { noteId: string | null; message: string };
 export type SummaryStatus = { noteId: string; active: boolean };
 // A title call is in flight for this note (#90). Brackets the model call only,
