@@ -25,17 +25,42 @@ describe("transcribe_status progress", () => {
     await emit("transcribe_status", {
       noteId: "replay-note",
       active: true,
+      phase: "transcribing",
       doneMs: 45_000,
       totalMs: 180_000,
       take: 2,
       takes: 3,
     });
     const run = useRecordingStore.getState().transcribing["replay-note"];
-    expect(run).toMatchObject({ doneMs: 45_000, totalMs: 180_000, take: 2, takes: 3 });
+    expect(run).toMatchObject({
+      phase: "transcribing",
+      doneMs: 45_000,
+      totalMs: 180_000,
+      take: 2,
+      takes: 3,
+    });
     // Set on the bracket and kept across every measure — it is what picks one
     // run when two notes replay at once.
     expect(run.startedAt).toBeGreaterThan(0);
 
+    expect(useRecordingStore.getState().status).toEqual(recording);
+    expect(useRecordingStore.getState().diarizing).toEqual({});
+
+    // The diarize half of the same take (#188). Its own channel still, and the
+    // position it reports is where the next take resumes.
+    await emit("transcribe_status", {
+      noteId: "replay-note",
+      active: true,
+      phase: "diarizing",
+      doneMs: 120_000,
+      totalMs: 180_000,
+      take: 2,
+      takes: 3,
+    });
+    expect(useRecordingStore.getState().transcribing["replay-note"]).toMatchObject({
+      phase: "diarizing",
+      doneMs: 120_000,
+    });
     expect(useRecordingStore.getState().status).toEqual(recording);
     expect(useRecordingStore.getState().diarizing).toEqual({});
 

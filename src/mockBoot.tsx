@@ -40,7 +40,7 @@ import { DEFAULTS, type EditableKey } from "./pages/settings/types";
 import { SummaryStep } from "./pages/onboarding/steps/Summary";
 import { TranscriptionStep } from "./pages/onboarding/steps/Transcription";
 import { STEP_ORDER, type StepContext, type StepId } from "./pages/onboarding/types";
-import type { ProviderConfig, RecordingStatus, TimelineEntry } from "./lib/ipc";
+import type { ProviderConfig, RecordingStatus, ReplayPhase, TimelineEntry } from "./lib/ipc";
 import { DEMO_CLIENTS, DEMO_FOLDERS, demoNotes } from "./test/noteLibrary";
 // Mirrors src/main.tsx — every theme's typeface, so a scenario reviewed under
 // `?palette=<id>` renders in that design's face rather than falling back.
@@ -825,8 +825,16 @@ function recBarCase(
     // no bar at all, so this scenario is a row that must be EMPTY.
     deferred?: boolean;
     // A replay of that capture's retained audio, which is what the row carries
-    // instead. `total: 0` is a run that hasn't reported its length yet.
-    replay?: { done: number; total: number; take?: number; takes?: number };
+    // instead. `total: 0` is a run that hasn't reported its length yet, and
+    // `phase: "diarizing"` is the second half of a take (#188) — indeterminate,
+    // and the widest label the pill carries.
+    replay?: {
+      done: number;
+      total: number;
+      take?: number;
+      takes?: number;
+      phase?: ReplayPhase;
+    };
   } = {},
 ): Scenario {
   const { summarizing = false, paused = false, long = false, pending, done, deferred, replay } = opts;
@@ -843,7 +851,7 @@ function recBarCase(
           {phase === "diarizing" && " · identifying speakers"}
           {deferred && " · deferred stop (no bar)"}
           {replay &&
-            ` · replaying ${replay.done}/${replay.total}ms` +
+            ` · ${replay.phase ?? "transcribing"} ${replay.done}/${replay.total}ms` +
               (replay.takes ? ` take ${replay.take ?? 1} of ${replay.takes}` : "")}
         </p>
         {/* The body column, dashed so an overhanging row is visible as one that
@@ -869,6 +877,7 @@ function recBarCase(
           ? {
               n1: {
                 startedAt: Date.now(),
+                phase: replay.phase ?? "transcribing",
                 doneMs: replay.done,
                 totalMs: replay.total,
                 take: replay.take,
@@ -1028,7 +1037,18 @@ const CASES: Record<string, Scenario> = {
   // user who never opens this tab.
   "note-replay": noteTranscribeCase(false, {
     startedAt: Date.now(),
+    phase: "transcribing",
     doneMs: 62_000,
+    totalMs: 180_000,
+    take: 2,
+    takes: 3,
+  }),
+  // #188: the same run in its diarize half. The panel is still shimmer —
+  // progress has one position — and the bar is what changed.
+  "note-replay-diarize": noteTranscribeCase(false, {
+    startedAt: Date.now(),
+    phase: "diarizing",
+    doneMs: 120_000,
     totalMs: 180_000,
     take: 2,
     takes: 3,
@@ -1089,6 +1109,26 @@ const CASES: Record<string, Scenario> = {
     replay: { done: 62_000, total: 180_000, take: 2, takes: 3 },
   }),
   "recbar-replay-unknown": recBarCase(414, { phase: "idle", replay: { done: 0, total: 0 } }),
+  // #188: the second half of a take. Full and indeterminate — the diarize
+  // sidecar emits no progress — with the take named the same way the
+  // transcribing label names it, which makes this the widest label in the row.
+  "recbar-diarize-replay": recBarCase(414, {
+    phase: "idle",
+    replay: { done: 180_000, total: 180_000, phase: "diarizing" },
+  }),
+  "recbar-diarize-replay-takes": recBarCase(420, {
+    phase: "idle",
+    replay: { done: 120_000, total: 180_000, take: 2, takes: 3, phase: "diarizing" },
+  }),
+  "recbar-diarize-replay-380": recBarCase(380, {
+    phase: "idle",
+    replay: { done: 120_000, total: 180_000, take: 2, takes: 3, phase: "diarizing" },
+  }),
+  "recbar-diarize-replay-summary": recBarCase(380, {
+    phase: "idle",
+    summarizing: true,
+    replay: { done: 120_000, total: 180_000, take: 2, takes: 3, phase: "diarizing" },
+  }),
   "recbar-replay-summary": recBarCase(380, {
     phase: "idle",
     summarizing: true,
@@ -1128,7 +1168,32 @@ const CASES: Record<string, Scenario> = {
   // the compact pill — this is the app's longest operation.
   "notes-replay": capturingLibraryCase(
     { noteId: null, phase: "idle" },
-    { n1: { startedAt: Date.now(), doneMs: 62_000, totalMs: 180_000, take: 2, takes: 3 } },
+    {
+      n1: {
+        startedAt: Date.now(),
+        phase: "transcribing",
+        doneMs: 62_000,
+        totalMs: 180_000,
+        take: 2,
+        takes: 3,
+      },
+    },
+  ),
+  // #188: the same run's diarize half, off the note. The compact pill has a
+  // screen edge to itself, so it keeps the take clause the bar's tightest step
+  // hides.
+  "notes-replay-diarize": capturingLibraryCase(
+    { noteId: null, phase: "idle" },
+    {
+      n1: {
+        startedAt: Date.now(),
+        phase: "diarizing",
+        doneMs: 120_000,
+        totalMs: 180_000,
+        take: 2,
+        takes: 3,
+      },
+    },
   ),
   // The same screen during a deferred stop: nothing to draw.
   "notes-deferred": capturingLibraryCase({

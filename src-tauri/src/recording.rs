@@ -232,10 +232,23 @@ pub struct TakeWork {
     pub duration_ms: u64,
 }
 
-/// What a replay reports: audio position against the run's total, plus which
-/// take of how many it is on.
+/// Which half of a take's work a replay is in (#188). A take is replayed
+/// through the provider and then diarized, and the diarize half has no measure
+/// of its own — the sidecar emits no progress — so the phase is what tells the
+/// bar to stop drawing the audio-position fraction rather than sit at 100%
+/// under a label that no longer describes the work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplayPhase {
+    Transcribing,
+    Diarizing,
+}
+
+/// What a replay reports: audio position against the run's total, which take of
+/// how many it is on, and which half of that take's work is running.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReplaySnapshot {
+    pub phase: ReplayPhase,
     pub done_ms: u64,
     pub total_ms: u64,
     pub take: u32,
@@ -250,6 +263,10 @@ pub struct ReplaySnapshot {
 /// never retreat — not at a mic→sys handover, and not on a chunk whose
 /// transcribe finished out of order. A bar that goes backwards reads as a fault
 /// in the transcription rather than in the measurement.
+///
+/// The phase moves with the run rather than being derived from the fraction: a
+/// take is fully replayed before its diarize starts, so "done_ms == total_ms"
+/// and "diarizing" would otherwise be the same reading (#188).
 pub struct ReplayProgress {
     takes: Vec<TakeWork>,
     total_ms: u64,
@@ -258,6 +275,7 @@ pub struct ReplayProgress {
     // Audio behind the stream being replayed.
     base_ms: u64,
     done_ms: u64,
+    phase: ReplayPhase,
 }
 
 impl ReplayProgress {
@@ -269,6 +287,7 @@ impl ReplayProgress {
             take: 0,
             base_ms: 0,
             done_ms: 0,
+            phase: ReplayPhase::Transcribing,
         }
     }
 
@@ -281,9 +300,17 @@ impl ReplayProgress {
     /// stream ended without reporting.
     pub fn begin_take(&mut self, index: usize) {
         self.take = index;
+        self.phase = ReplayPhase::Transcribing;
         let behind: u64 = self.takes.iter().take(index).map(Self::work).sum();
         self.base_ms = self.base_ms.max(behind).min(self.total_ms);
         self.done_ms = self.done_ms.max(self.base_ms);
+    }
+
+    /// This take's audio is through the provider and its diarize is starting.
+    /// Leaves the position alone: the fraction it reached is what the next
+    /// take resumes from, so it can't retreat across the boundary.
+    pub fn begin_diarize(&mut self) {
+        self.phase = ReplayPhase::Diarizing;
     }
 
     /// A chunk of the stream being replayed has been through the provider.
@@ -306,6 +333,7 @@ impl ReplayProgress {
     pub fn snapshot(&self) -> ReplaySnapshot {
         let takes = self.takes.len() as u32;
         ReplaySnapshot {
+            phase: self.phase,
             done_ms: self.done_ms,
             total_ms: self.total_ms,
             take: (self.take as u32 + 1).min(takes),
@@ -609,11 +637,60 @@ impl StopTimings {
     }
 }
 
+/// What one take of a replay cost (#188), split at the seam the user sees: the
+/// audio through the provider, then the diarize that writes the timeline,
+/// rebuilds the transcript and writes the playback assets.
+///
+/// `audio_ms` and `streams` are the take's own shape, so cost per minute of
+/// audio is derivable — the ratio between the two halves inverts against a
+/// live capture's stop, which did its Whisper work during the meeting.
+#[derive(Clone, Serialize)]
+pub struct ReplayTakeTimings {
+    /// The take's 1-based position in the note, as every other surface names it.
+    pub index: u32,
+    pub streams: u32,
+    pub audio_ms: u64,
+    pub transcribe_ms: u64,
+    pub diarize_ms: u64,
+}
+
+/// Wall-clock cost of one deferred-transcription run, per take (#188).
+#[derive(Clone, Default, Serialize)]
+pub struct ReplayTimings {
+    pub takes: Vec<ReplayTakeTimings>,
+    pub total_ms: u64,
+}
+
+impl ReplayTimings {
+    /// One-line stderr summary of the run, printed once however it ends.
+    pub fn summary(&self) -> String {
+        let takes: Vec<String> = self
+            .takes
+            .iter()
+            .map(|t| {
+                format!(
+                    "[{}: streams={} audio={} transcribe={} diarize={}]",
+                    t.index, t.streams, t.audio_ms, t.transcribe_ms, t.diarize_ms
+                )
+            })
+            .collect();
+        format!(
+            "replay timings: total={}ms takes={} {}",
+            self.total_ms,
+            self.takes.len(),
+            takes.join(" ")
+        )
+    }
+}
+
 /// Put a `timings` object into the take's diagnostics JSON, keeping every
 /// field already there. `existing` is the parsed file, or `None` when the
 /// chain wrote no diagnostics (no diarize model, no chunks) — in which case
 /// the timings stand alone in a fresh object.
-pub fn merge_timings(existing: Option<serde_json::Value>, timings: &StopTimings) -> serde_json::Value {
+pub fn merge_timings(
+    existing: Option<serde_json::Value>,
+    timings: &impl Serialize,
+) -> serde_json::Value {
     let mut root = match existing {
         Some(serde_json::Value::Object(map)) => serde_json::Value::Object(map),
         _ => serde_json::json!({ "created_at": chrono::Utc::now().timestamp_millis() }),
@@ -689,16 +766,22 @@ pub struct TitleStatusPayload {
 /// `recording_status` at all, since a recording may be running on another note
 /// the whole time.
 ///
-/// Progress rides the same event: audio position (`done_ms` / `total_ms`) and
-/// which take of how many, so the label and the fraction are separable and the
-/// client does one division. All four are absent on the brackets and on a run
-/// with nothing to report, which serializes exactly as it did before they
-/// existed.
+/// Progress rides the same event: which half of the take's work is running
+/// (`phase`, #188), the audio position (`done_ms` / `total_ms`) and which take
+/// of how many, so the label and the fraction are separable and the client does
+/// one division. All five are absent on the brackets and on a run with nothing
+/// to report, which serializes exactly as it did before they existed.
+///
+/// The position stays on a `diarizing` event: it is where the next take
+/// resumes, and the phase — not a missing measure — is what makes the bar
+/// indeterminate.
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TranscribeStatusPayload {
     pub note_id: String,
     pub active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase: Option<ReplayPhase>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub done_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -715,6 +798,7 @@ impl TranscribeStatusPayload {
         Self {
             note_id: note_id.to_string(),
             active,
+            phase: None,
             done_ms: None,
             total_ms: None,
             take: None,
@@ -726,6 +810,7 @@ impl TranscribeStatusPayload {
         Self {
             note_id: note_id.to_string(),
             active: true,
+            phase: Some(s.phase),
             done_ms: Some(s.done_ms),
             total_ms: Some(s.total_ms),
             take: Some(s.take),
@@ -982,8 +1067,11 @@ mod tests {
     }
 
     #[test]
-    fn a_transcribe_progress_event_carries_position_and_the_take_counter() {
+    fn a_transcribe_progress_event_carries_its_phase_position_and_take_counter() {
+        // Pinned whole, field by field: this is the only place the TS mirror in
+        // `ipc.ts` can be checked against what serde actually emits.
         let snapshot = ReplaySnapshot {
+            phase: ReplayPhase::Transcribing,
             done_ms: 45_000,
             total_ms: 180_000,
             take: 2,
@@ -991,7 +1079,18 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_string(&TranscribeStatusPayload::progress("n1", snapshot)).unwrap(),
-            r#"{"noteId":"n1","active":true,"doneMs":45000,"totalMs":180000,"take":2,"takes":3}"#
+            r#"{"noteId":"n1","active":true,"phase":"transcribing","doneMs":45000,"totalMs":180000,"take":2,"takes":3}"#
+        );
+        // The diarize half keeps the position — it is where the next take
+        // resumes — and the phase, not a missing measure, is what makes the
+        // bar indeterminate (#188).
+        assert_eq!(
+            serde_json::to_string(&TranscribeStatusPayload::progress(
+                "n1",
+                ReplaySnapshot { phase: ReplayPhase::Diarizing, ..snapshot }
+            ))
+            .unwrap(),
+            r#"{"noteId":"n1","active":true,"phase":"diarizing","doneMs":45000,"totalMs":180000,"take":2,"takes":3}"#
         );
     }
 
@@ -999,10 +1098,14 @@ mod tests {
         TakeWork { streams: 1, duration_ms }
     }
 
+    fn transcribing(done_ms: u64, total_ms: u64, take: u32, takes: u32) -> ReplaySnapshot {
+        ReplaySnapshot { phase: ReplayPhase::Transcribing, done_ms, total_ms, take, takes }
+    }
+
     #[test]
     fn a_single_stream_take_is_worth_its_own_duration() {
         let mut p = ReplayProgress::new(vec![one_stream(60_000)]);
-        assert_eq!(p.snapshot(), ReplaySnapshot { done_ms: 0, total_ms: 60_000, take: 1, takes: 1 });
+        assert_eq!(p.snapshot(), transcribing(0, 60_000, 1, 1));
         p.note_chunk(15_000);
         assert_eq!(p.snapshot().done_ms, 15_000);
         p.finish_stream();
@@ -1035,17 +1138,17 @@ mod tests {
             TakeWork { streams: 2, duration_ms: 30_000 },
             one_stream(10_000),
         ]);
-        assert_eq!(p.snapshot(), ReplaySnapshot { done_ms: 0, total_ms: 130_000, take: 1, takes: 3 });
+        assert_eq!(p.snapshot(), transcribing(0, 130_000, 1, 3));
         p.begin_take(0);
         p.finish_stream();
         p.begin_take(1);
-        assert_eq!(p.snapshot(), ReplaySnapshot { done_ms: 60_000, total_ms: 130_000, take: 2, takes: 3 });
+        assert_eq!(p.snapshot(), transcribing(60_000, 130_000, 2, 3));
         p.note_chunk(10_000);
         assert_eq!(p.snapshot().done_ms, 70_000);
         p.finish_stream();
         p.finish_stream();
         p.begin_take(2);
-        assert_eq!(p.snapshot(), ReplaySnapshot { done_ms: 120_000, total_ms: 130_000, take: 3, takes: 3 });
+        assert_eq!(p.snapshot(), transcribing(120_000, 130_000, 3, 3));
         p.finish_stream();
         assert_eq!(p.snapshot().done_ms, 130_000);
     }
@@ -1098,6 +1201,111 @@ mod tests {
         p.begin_take(1);
         p.note_chunk(30_000);
         assert_eq!(p.snapshot().done_ms, 30_000);
+    }
+
+    /// Every snapshot one run emits, in order. Mirrors `transcribe_takes`'
+    /// loop — per take: `begin_take`, one chunk per stream, `finish_stream`
+    /// per stream, then `begin_diarize` — so the sequence the client sees can
+    /// be asserted without an `AppHandle`. Change both together.
+    fn run_snapshots(plan: Vec<TakeWork>) -> Vec<ReplaySnapshot> {
+        let mut p = ReplayProgress::new(plan.clone());
+        let mut out = vec![p.snapshot()];
+        for (i, take) in plan.iter().enumerate() {
+            p.begin_take(i);
+            out.push(p.snapshot());
+            for _ in 0..take.streams {
+                p.note_chunk(take.duration_ms / 2);
+                out.push(p.snapshot());
+                p.finish_stream();
+                out.push(p.snapshot());
+            }
+            p.begin_diarize();
+            out.push(p.snapshot());
+        }
+        out
+    }
+
+    #[test]
+    fn a_multi_take_run_alternates_transcribing_and_diarizing() {
+        let seq = run_snapshots(vec![
+            TakeWork { streams: 2, duration_ms: 60_000 },
+            one_stream(30_000),
+        ]);
+        // One diarize per take, each after that take's own replay, and the run
+        // never ends on a transcribing phase.
+        let mut steps: Vec<(ReplayPhase, u32)> = Vec::new();
+        for s in &seq {
+            if steps.last() != Some(&(s.phase, s.take)) {
+                steps.push((s.phase, s.take));
+            }
+        }
+        assert_eq!(
+            steps,
+            vec![
+                (ReplayPhase::Transcribing, 1),
+                (ReplayPhase::Diarizing, 1),
+                (ReplayPhase::Transcribing, 2),
+                (ReplayPhase::Diarizing, 2),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_fraction_never_decreases_across_a_diarize_boundary() {
+        // The diarize half reports the position the replay reached, and the
+        // next take resumes from it — a bar that dropped back to the previous
+        // take's start would read as work being redone (#188).
+        let seq = run_snapshots(vec![
+            TakeWork { streams: 2, duration_ms: 60_000 },
+            one_stream(30_000),
+            TakeWork { streams: 2, duration_ms: 10_000 },
+        ]);
+        for pair in seq.windows(2) {
+            assert!(
+                pair[1].done_ms >= pair[0].done_ms,
+                "{} then {}",
+                pair[0].done_ms,
+                pair[1].done_ms
+            );
+        }
+        assert_eq!(seq.last().unwrap().done_ms, 170_000, "the whole run is spent");
+    }
+
+    #[test]
+    fn a_replay_run_reports_both_halves_of_every_take() {
+        let t = ReplayTimings {
+            takes: vec![
+                ReplayTakeTimings {
+                    index: 1,
+                    streams: 2,
+                    audio_ms: 1_054_000,
+                    transcribe_ms: 175_000,
+                    diarize_ms: 108_000,
+                },
+                ReplayTakeTimings {
+                    index: 2,
+                    streams: 1,
+                    audio_ms: 60_000,
+                    transcribe_ms: 9_000,
+                    diarize_ms: 4_000,
+                },
+            ],
+            total_ms: 296_000,
+        };
+        assert_eq!(
+            t.summary(),
+            "replay timings: total=296000ms takes=2 \
+             [1: streams=2 audio=1054000 transcribe=175000 diarize=108000] \
+             [2: streams=1 audio=60000 transcribe=9000 diarize=4000]"
+        );
+        // The file is the same shape as a stop's, so `merge_timings` is shared.
+        let merged = merge_timings(None, &t);
+        let takes = merged["timings"]["takes"].as_array().unwrap();
+        assert_eq!(takes.len(), 2);
+        for key in ["index", "streams", "audio_ms", "transcribe_ms", "diarize_ms"] {
+            assert!(takes[0][key].is_u64(), "{key} must be an integer");
+        }
+        assert!(merged["timings"]["total_ms"].is_u64());
     }
 
     #[test]

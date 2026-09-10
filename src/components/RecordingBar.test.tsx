@@ -125,9 +125,10 @@ describe("the recording bar's degradation ladder", () => {
     for (const key of ["detail", "pill", "pausedWord"] as const) {
       expect(px(ROW_STEPS.tight[key])).toBeGreaterThan(px(ROW_STEPS.roomy[key]));
     }
-    // The busy label and the stop's frozen timer are the two steps the roomy
-    // arrangement has no use for: with no third pill beside them, both fit.
-    for (const key of ["busyLabel", "stopTimer"] as const) {
+    // The busy label, the stop's frozen timer and a replay's take clause are
+    // the steps the roomy arrangement has no use for: with no third pill
+    // beside them, all three fit.
+    for (const key of ["busyLabel", "stopTimer", "takeCounter"] as const) {
       expect(ROW_STEPS.roomy[key]).toBe("");
       expect(px(ROW_STEPS.tight[key])).toBeGreaterThan(0);
     }
@@ -148,6 +149,11 @@ describe("the recording bar's degradation ladder", () => {
       expect(px(arrangement.detail)).toBeGreaterThan(px(arrangement.pill));
       expect(px(arrangement.detail)).toBeGreaterThan(px(arrangement.busyLabel));
       expect(px(arrangement.pill)).toBeGreaterThanOrEqual(px(arrangement.busyLabel));
+      // A replay's take clause goes before the busy pill's word, which is the
+      // one inversion of the cost order here (#188): at the widths where
+      // either would close the gap, the take clause is the only one of the two
+      // a sighted user can still read afterwards, from the pill's `title`.
+      expect(px(arrangement.takeCounter)).toBeGreaterThanOrEqual(px(arrangement.busyLabel));
     }
   });
 });
@@ -286,6 +292,40 @@ describe("the bar during a deferred transcription's replay (#146)", () => {
       expect(screen.getByRole("progressbar")).toHaveAttribute("aria-valuenow", "100");
       unmount();
     }
+  });
+
+  // #188. Each take is replayed and then diarized, and the diarize half was
+  // 1m48s of a 100% bar labelled "Transcribing…" on a 17m34s two-stream take.
+  it("goes indeterminate for the diarize half rather than sitting full", () => {
+    seedReplay({ phase: "diarizing", doneMs: 180_000, totalMs: 180_000 });
+    render(<RecordingBar noteId="n1" />);
+    const bar = screen.getByRole("progressbar", { name: "Identifying speakers…" });
+    expect(bar).not.toHaveAttribute("aria-valuenow");
+    expect(bar).toHaveAttribute("aria-busy", "true");
+  });
+
+  it("names the take in the diarize half the way the transcribing label does", () => {
+    seedReplay({ phase: "diarizing", doneMs: 120_000, totalMs: 180_000, take: 2, takes: 3 });
+    const { unmount } = render(<RecordingBar noteId="n1" />);
+    expect(
+      screen.getByRole("progressbar", { name: "Identifying speakers in take 2 of 3…" }),
+    ).toBeInTheDocument();
+    unmount();
+    seedReplay({ phase: "diarizing", doneMs: 120_000, totalMs: 180_000, take: 1, takes: 1 });
+    render(<RecordingBar noteId="n1" />);
+    expect(
+      screen.getByRole("progressbar", { name: "Identifying speakers…" }),
+    ).toBeInTheDocument();
+  });
+
+  it("comes back determinate — and no lower — when the next take replays", () => {
+    // The diarize event carries the position it reached, so the fraction the
+    // next take resumes from is the one the previous one ended on.
+    seedReplay({ phase: "transcribing", doneMs: 120_000, totalMs: 180_000, take: 3, takes: 3 });
+    render(<RecordingBar noteId="n1" />);
+    expect(
+      screen.getByRole("progressbar", { name: "Transcribing take 3 of 3…" }),
+    ).toHaveAttribute("aria-valuenow", "67");
   });
 
   it("says nothing about a replay running on another note", () => {
