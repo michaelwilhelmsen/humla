@@ -1,7 +1,8 @@
-import { describe, expect, it } from "vitest";
-import { render, screen } from "@testing-library/react";
-import { ROW_STEPS, RecordingBar, noAudioWarning } from "./RecordingBar";
-import { useRecordingStore } from "../lib/store";
+import { describe, expect, it, vi } from "vitest";
+import { act, render, screen } from "@testing-library/react";
+import { ROW_STEPS, RecordingBar, indicatorState, noAudioWarning } from "./RecordingBar";
+import { useRecordingStore, type ReplayRun } from "../lib/store";
+import type { RecordingStatus } from "../lib/ipc";
 
 // #174. The warning fired correctly and said nothing useful: a pair of
 // headphones in another room held the macOS default input, and "check your
@@ -124,10 +125,12 @@ describe("the recording bar's degradation ladder", () => {
     for (const key of ["detail", "pill", "pausedWord"] as const) {
       expect(px(ROW_STEPS.tight[key])).toBeGreaterThan(px(ROW_STEPS.roomy[key]));
     }
-    // The busy label is the one step the roomy arrangement has no use for:
-    // with no controls pill beside it, the label always fits.
-    expect(ROW_STEPS.roomy.busyLabel).toBe("");
-    expect(px(ROW_STEPS.tight.busyLabel)).toBeGreaterThan(0);
+    // The busy label and the stop's frozen timer are the two steps the roomy
+    // arrangement has no use for: with no third pill beside them, both fit.
+    for (const key of ["busyLabel", "stopTimer"] as const) {
+      expect(ROW_STEPS.roomy[key]).toBe("");
+      expect(px(ROW_STEPS.tight[key])).toBeGreaterThan(0);
+    }
   });
 
   it("reaches for the cheapest step first and the bare spinner last", () => {
@@ -146,5 +149,200 @@ describe("the recording bar's degradation ladder", () => {
       expect(px(arrangement.detail)).toBeGreaterThan(px(arrangement.busyLabel));
       expect(px(arrangement.pill)).toBeGreaterThanOrEqual(px(arrangement.busyLabel));
     }
+  });
+});
+
+// #182. The tail of the transcript appends live through the stop, so the row
+// reports a real fraction — and must never invent one for the diarize pass,
+// which reports no progress at all.
+describe("the bar after stop (#182)", () => {
+  function seedStop(patch: Partial<RecordingStatus> = {}) {
+    useRecordingStore.setState({
+      status: { noteId: "n1", phase: "stopping", ...patch },
+      summarizing: {},
+      diag: null,
+      micHeard: true,
+    });
+  }
+
+  it("reports the drain as the fraction of the chunks that have landed", () => {
+    seedStop({ pending: 4, done: 1 });
+    render(<RecordingBar noteId="n1" />);
+    const bar = screen.getByRole("progressbar", { name: "Finishing transcript…" });
+    expect(bar).toHaveAttribute("aria-valuenow", "25");
+    expect(bar).toHaveAttribute("aria-valuemax", "100");
+  });
+
+  it("reaches 100% when the last pending chunk lands", () => {
+    seedStop({ pending: 4, done: 4 });
+    render(<RecordingBar noteId="n1" />);
+    expect(screen.getByRole("progressbar")).toHaveAttribute("aria-valuenow", "100");
+  });
+
+  it("is full immediately when nothing was in flight at stop", () => {
+    // A stop with an empty drain must not read as 0% work done — there is no
+    // work. The backend emits `{pending: 0, done: 0}`; an older one emits
+    // neither field, and both mean the same thing here.
+    for (const patch of [{ pending: 0, done: 0 }, {}]) {
+      seedStop(patch);
+      const { unmount } = render(<RecordingBar noteId="n1" />);
+      expect(screen.getByRole("progressbar")).toHaveAttribute("aria-valuenow", "100");
+      unmount();
+    }
+  });
+
+  it("never shows a fraction while speakers are being identified", () => {
+    // The diarize sidecar emits no progress. A `progressbar` with no
+    // `aria-valuenow` is ARIA's own indeterminate, which is exactly the truth.
+    seedStop({ phase: "diarizing", pending: undefined, done: undefined });
+    render(<RecordingBar noteId="n1" />);
+    const bar = screen.getByRole("progressbar", { name: "Identifying speakers…" });
+    expect(bar).not.toHaveAttribute("aria-valuenow");
+    expect(bar).toHaveAttribute("aria-busy", "true");
+    expect(screen.getByText("Identifying speakers…")).toBeInTheDocument();
+  });
+
+  it("retires the old busy pills for the two phases it now covers", () => {
+    seedStop({ pending: 2, done: 0 });
+    render(<RecordingBar noteId="n1" />);
+    expect(screen.queryByRole("status", { name: "Stopping…" })).toBeNull();
+  });
+
+  it("keeps the elapsed reading through the drain, frozen where the stop left it", () => {
+    vi.useFakeTimers();
+    try {
+      useRecordingStore.setState({
+        status: { noteId: "n1", phase: "recording" },
+        summarizing: {},
+        diag: null,
+        micHeard: true,
+      });
+      render(<RecordingBar noteId="n1" />);
+      act(() => void vi.advanceTimersByTime(3_000));
+      expect(screen.getByText("0:03")).toBeInTheDocument();
+      act(() =>
+        useRecordingStore.setState({
+          status: { noteId: "n1", phase: "stopping", pending: 2, done: 0 },
+        }),
+      );
+      // The controls go — there is nothing left to pause or stop — but the
+      // length of the recording is already final and stays on screen.
+      expect(screen.queryByRole("button", { name: "Stop" })).toBeNull();
+      act(() => void vi.advanceTimersByTime(5_000));
+      expect(screen.getByText("0:03")).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("says nothing about a capture running on another note", () => {
+    seedStop({ noteId: "other", pending: 4, done: 1 });
+    render(<RecordingBar noteId="n1" />);
+    expect(screen.queryByRole("progressbar")).toBeNull();
+  });
+});
+
+// #146. Pressing Transcribe replays retained audio through local Whisper for
+// minutes at a stretch; the bar is where that says how far it has got. The
+// fraction is audio position over the whole run, which the backend has already
+// clamped and made monotonic — so what is pinned here is the arithmetic this
+// side does and the label it picks.
+describe("the bar during a deferred transcription's replay (#146)", () => {
+  function seedReplay(run: Partial<ReplayRun> = {}, noteId = "n1") {
+    useRecordingStore.setState({
+      status: { noteId: null, phase: "idle" },
+      summarizing: {},
+      diag: null,
+      transcribing: { [noteId]: { startedAt: 1, ...run } },
+    });
+  }
+
+  it("reports the run's audio position as the fraction", () => {
+    seedReplay({ doneMs: 45_000, totalMs: 180_000 });
+    render(<RecordingBar noteId="n1" />);
+    const bar = screen.getByRole("progressbar", { name: "Transcribing…" });
+    expect(bar).toHaveAttribute("aria-valuenow", "25");
+  });
+
+  it("names the take it is on, but only when there is more than one", () => {
+    seedReplay({ doneMs: 45_000, totalMs: 180_000, take: 2, takes: 3 });
+    const { unmount } = render(<RecordingBar noteId="n1" />);
+    expect(
+      screen.getByRole("progressbar", { name: "Transcribing take 2 of 3…" }),
+    ).toBeInTheDocument();
+    unmount();
+    // "take 1 of 1" is a number about nothing.
+    seedReplay({ doneMs: 45_000, totalMs: 180_000, take: 1, takes: 1 });
+    render(<RecordingBar noteId="n1" />);
+    expect(screen.getByRole("progressbar", { name: "Transcribing…" })).toBeInTheDocument();
+  });
+
+  it("is full rather than empty when the run hasn't reported its length", () => {
+    // Unknown is not zero, and a zero-width track beside a live label reads as
+    // stuck. Both shapes the backend can produce mean the same thing here.
+    for (const run of [{}, { doneMs: 0, totalMs: 0 }]) {
+      seedReplay(run);
+      const { unmount } = render(<RecordingBar noteId="n1" />);
+      expect(screen.getByRole("progressbar")).toHaveAttribute("aria-valuenow", "100");
+      unmount();
+    }
+  });
+
+  it("says nothing about a replay running on another note", () => {
+    seedReplay({ doneMs: 45_000, totalMs: 180_000 }, "other");
+    render(<RecordingBar noteId="n1" />);
+    expect(screen.queryByRole("progressbar")).toBeNull();
+  });
+
+  it("draws nothing at all for the stop of a capture that deferred its transcription", () => {
+    // That stop dispatched nothing and lands on idle in a few hundred
+    // milliseconds, so anything drawn for it appears and vanishes without ever
+    // measuring anything — the frozen timer included, since a timer flashing
+    // beside an empty row is the same glitch as the bar. `deferred` is the
+    // discriminator, NOT an empty drain: a live take with zero pending chunks
+    // is a real full bar and keeps its timer.
+    for (const phase of ["stopping", "diarizing"] as const) {
+      useRecordingStore.setState({
+        status: { noteId: "n1", phase, deferred: true },
+        summarizing: {},
+        diag: null,
+        transcribing: {},
+      });
+      const { unmount } = render(<RecordingBar noteId="n1" />);
+      expect(screen.queryByRole("progressbar")).toBeNull();
+      expect(screen.queryByText(/^\d+:\d{2}$/)).toBeNull();
+      unmount();
+    }
+  });
+});
+
+// One position for progress, whichever kind it is. A replay reports on the
+// recording bar and, off the note, on the app-wide pill — the same two places
+// a stop reports in. The Transcript panel draws no copy of its own: two pills
+// on one screen read as a bug, and a replay's text lands in a single write at
+// the end, so the panel has nothing to stream either way.
+describe("where a replay reports (#146)", () => {
+  const RUN: ReplayRun = { startedAt: 1, doneMs: 45_000, totalMs: 180_000 };
+  const IDLE: RecordingStatus = { noteId: null, phase: "idle" };
+
+  it("is on the bar of the note it belongs to", () => {
+    useRecordingStore.setState({
+      status: IDLE,
+      summarizing: {},
+      diag: null,
+      transcribing: { n1: RUN },
+    });
+    render(<RecordingBar noteId="n1" />);
+    expect(screen.getByRole("progressbar", { name: "Transcribing…" })).toBeInTheDocument();
+  });
+
+  it("is not on another note's bar", () => {
+    expect(indicatorState(IDLE, { n2: RUN }, "n1")).toBeNull();
+  });
+
+  it("yields the slot to a live capture on the same note", () => {
+    // The capture is what the user is doing now; the replay is background work.
+    const rec: RecordingStatus = { noteId: "n1", phase: "recording" };
+    expect(indicatorState(rec, { n1: RUN }, "n1")?.kind).toBe("live");
   });
 });

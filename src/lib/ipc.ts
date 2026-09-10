@@ -551,7 +551,10 @@ export const ipc = {
     invoke<Note>("import_audio", { path, language, expectedSpeakers }),
   recordingPause: () => invoke<void>("recording_pause"),
   recordingResume: () => invoke<void>("recording_resume"),
-  recordingState: () => invoke<"idle" | "recording">("recording_state"),
+  // `stopping` covers the whole post-stop chain, which holds the single
+  // capture slot until it lands on idle (#182) — so it is a third answer to
+  // "can a capture start", not a variant of either other one.
+  recordingState: () => invoke<"idle" | "recording" | "stopping">("recording_state"),
   summarizeNote: (noteId: string) => invoke<void>("summarize_note", { noteId }),
   // Regenerate a note's title from its content (#90). Resolves to the new title,
   // or null when the model gave back nothing usable — in which case the existing
@@ -797,7 +800,23 @@ export type SummaryEvent = { noteId: string; summary: string };
 export type StreamDeltaEvent = { noteId: string; delta: string };
 export type RecordingPhase = "idle" | "starting" | "recording" | "paused" | "stopping" | "diarizing" | "importing";
 export type SummaryProvider = "openai" | "local";
-export type RecordingStatus = { noteId: string | null; phase: RecordingPhase };
+// `pending` / `done` ride along on `stopping` only (#182): how many chunk
+// transcriptions were still in flight when stop was pressed, and how many of
+// those have landed. Both absent in every other phase — the backend skips them
+// when unset — so a listener that reads `{noteId, phase}` is unaffected.
+// `deferred` rides along on the `stopping` and `diarizing` of a capture that
+// ran with "Transcribe manually" on (#146). That stop has no chunks to drain
+// and no text to diarize, so it lands on idle in a few hundred milliseconds
+// and a progress bar drawn for it appears and vanishes. It carries no
+// `pending` / `done` either — nothing was dispatched. Absent for a live
+// capture, whose zero-pending stop is a real full bar.
+export type RecordingStatus = {
+  noteId: string | null;
+  phase: RecordingPhase;
+  pending?: number;
+  done?: number;
+  deferred?: boolean;
+};
 export type RecordingError = { noteId: string | null; message: string };
 export type SummaryStatus = { noteId: string; active: boolean };
 // A title call is in flight for this note (#90). Brackets the model call only,
@@ -806,7 +825,26 @@ export type TitleStatus = { noteId: string; active: boolean };
 // A deferred transcription is replaying this note's retained audio (#146).
 // Per-note, and never on `recording_status`: a live recording on a different
 // note may be in flight at the same time.
-export type TranscribeStatus = { noteId: string; active: boolean };
+// `doneMs` / `totalMs` are **audio position**, not chunks: a replay's chunk
+// count isn't known until it ends, while every take's duration is known before
+// it starts, and a take that retained both streams is replayed twice. Monotonic
+// and clamped to the total on the backend. `take` / `takes` are 1-based, so the
+// label and the fraction stay separable and this side does one division. All
+// four are absent on the brackets (`active` true/false) and on a run with
+// nothing to report.
+export type TranscribeStatus = {
+  noteId: string;
+  active: boolean;
+  doneMs?: number;
+  totalMs?: number;
+  take?: number;
+  takes?: number;
+};
+// A (re)diarize pass is running on this note — Re-diarize, or the
+// cross-session unify (#187). Per-note, and never on `recording_status`: that
+// channel describes the live capture and nothing else, so its `idle` would
+// blank a recording running on a different note.
+export type DiarizeStatus = { noteId: string; active: boolean };
 export type RecordingDiagnostic = {
   noteId: string;
   micFrames: number;
@@ -852,6 +890,9 @@ export function onTitleStatus(cb: (e: TitleStatus) => void): Promise<UnlistenFn>
 }
 export function onTranscribeStatus(cb: (e: TranscribeStatus) => void): Promise<UnlistenFn> {
   return listen<TranscribeStatus>("transcribe_status", (e) => cb(e.payload));
+}
+export function onDiarizeStatus(cb: (e: DiarizeStatus) => void): Promise<UnlistenFn> {
+  return listen<DiarizeStatus>("diarize_status", (e) => cb(e.payload));
 }
 export function onRecordingError(cb: (e: RecordingError) => void): Promise<UnlistenFn> {
   return listen<RecordingError>("recording_error", (e) => cb(e.payload));

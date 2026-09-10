@@ -1,7 +1,7 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { MicOff, Pause, Play, Square } from "lucide-react";
-import { ipc } from "../lib/ipc";
-import { useRecordingStore } from "../lib/store";
+import { ipc, type RecordingPhase, type RecordingStatus } from "../lib/ipc";
+import { useRecordingStore, type ReplayRun } from "../lib/store";
 import { cn } from "../lib/cn";
 
 // ~10s of active capture with the mic never rising above the audible floor
@@ -66,11 +66,18 @@ export function noAudioWarning(device?: string | null): string {
  *   4. `busyLabel` — "Summarizing…" down to its spinner, which only matters
  *      when a summary runs during a recording and so shares the row with the
  *      controls pill. The pill keeps its name (`role="status"` + `aria-label`).
+ *   5. `stopTimer` — the frozen elapsed reading, but only once stop has taken
+ *      the controls off it. While the capture runs that pill holds pause and
+ *      stop and is not optional; afterwards it is a number about a recording
+ *      that is already over, and the progress pill beside it is the one saying
+ *      what is still happening. That pill has no step of its own — its label
+ *      and 56px track clear the narrowest column the layout can produce.
  *
  * Two arrangements, because the thresholds depend on what else is in the row:
- * `roomy` is diagnostics + controls, `tight` adds the busy pill a summary puts
- * there. Every step fires earlier in `tight` — pinned as an ordering test,
- * since that direction is the one that can only ever be a bug.
+ * `roomy` is diagnostics or controls or the stop's own pills, `tight` adds the
+ * busy pill a summary puts there. Every step fires earlier in `tight` — pinned
+ * as an ordering test, since that direction is the one that can only ever be a
+ * bug.
  *
  * The cost order above is what each step is worth, not a promise about the
  * numbers: a step fires where the row needs the width it frees, so `tight`
@@ -90,16 +97,21 @@ export function noAudioWarning(device?: string | null): string {
  */
 export const ROW_STEPS = {
   // diagnostics + controls. Full row 583, compact 406, compact over a
-  // PAUSED-less controls pill 356.
+  // PAUSED-less controls pill 356. After stop the same arrangement is the
+  // frozen timer beside the progress pill (327) or the progress pill alone
+  // (237), both of which clear the narrowest column without a step.
   roomy: {
     detail: "@max-[600px]:hidden",
     pausedWord: "@max-[420px]:hidden",
     pill: "@max-[370px]:hidden",
     busyLabel: "",
+    stopTimer: "",
   },
   // diagnostics + busy + controls. Full row 739, compact 562, no diagnostics
   // 411, bare spinner 259 — which clears the narrowest column the layout can
-  // produce.
+  // produce. A summary running over a STOP is the same arrangement with the
+  // progress pill in place of the controls: 483 whole, 386 as a bare spinner,
+  // 286 once the frozen timer goes with it.
   tight: {
     detail: "@max-[760px]:hidden",
     pausedWord: "@max-[430px]:hidden",
@@ -109,8 +121,288 @@ export const ROW_STEPS = {
     // Absolutely positioned, so it is out of flow and out of the flex gap —
     // width-identical to hiding it, which the sweep confirms.
     busyLabel: "@max-[430px]:sr-only",
+    stopTimer: "@max-[500px]:hidden",
   },
 } as const;
+
+/**
+ * What the bar says once the capture itself is over (#182).
+ *
+ * `stopping` means the tail of the transcript is still arriving — the chunks
+ * that were mid-decode when stop was pressed now append live — so the fraction
+ * is a real one and reaches 1 exactly as the last of them lands. A stop with
+ * nothing in flight is full immediately rather than starting at zero and
+ * jumping. `diarizing` has no fraction to report at all: the diarize sidecar
+ * emits no progress, so the bar stays full and shimmers instead of inventing
+ * one.
+ *
+ * Null for every other phase — those are the busy pill's, not the bar's. Null
+ * too for a `deferred` stop (#146): that capture dispatched nothing and lands
+ * on idle in a few hundred milliseconds, so a bar drawn for it appears and
+ * vanishes without ever having measured anything.
+ */
+function captureProgress(
+  status: Pick<RecordingStatus, "phase" | "pending" | "done" | "deferred">,
+): { label: string; value: number | null } | null {
+  if (status.deferred) return null;
+  if (status.phase === "stopping") {
+    const pending = status.pending ?? 0;
+    const done = status.done ?? 0;
+    return {
+      label: "Finishing transcript…",
+      value: pending > 0 ? Math.min(1, done / pending) : 1,
+    };
+  }
+  if (status.phase === "diarizing") return { label: "Identifying speakers…", value: null };
+  return null;
+}
+
+/**
+ * What a deferred transcription's replay says while it runs (#146). The
+ * fraction is audio position over the whole run, which the backend has already
+ * made monotonic — so this side does one division and nothing else.
+ *
+ * A run whose total is absent or zero is drawn FULL, never empty: the fraction
+ * is unknown rather than zero, and an empty track beside a live label reads as
+ * stuck. The take counter appears only when there is more than one take, since
+ * "take 1 of 1" is a number about nothing.
+ */
+function replayProgress(run: ReplayRun): { label: string; value: number } {
+  const total = run.totalMs ?? 0;
+  const takes = run.takes ?? 1;
+  return {
+    label:
+      takes > 1 ? `Transcribing take ${run.take ?? 1} of ${takes}…` : "Transcribing…",
+    value: total > 0 ? Math.min(1, (run.doneMs ?? 0) / total) : 1,
+  };
+}
+
+/** The replay to show when several are in flight: `state.transcribing` is a
+    set server-side, so two notes can legitimately replay at once and the
+    indicator has one slot. The most recent is the one the user just asked
+    for. */
+function latestReplay(
+  transcribing: Record<string, ReplayRun>,
+): { noteId: string; run: ReplayRun } | null {
+  let latest: { noteId: string; run: ReplayRun } | null = null;
+  for (const [noteId, run] of Object.entries(transcribing)) {
+    if (!latest || run.startedAt > latest.run.startedAt) latest = { noteId, run };
+  }
+  return latest;
+}
+
+/** What the indicator is drawing, once the rule below has picked it. */
+export type IndicatorState = {
+  /** The note the state belongs to — where the compact variant navigates. */
+  noteId: string | null;
+  /** `progress` draws a labelled track, `live` the elapsed timer, `spinner` a
+      phase with no measure of its own. */
+  kind: "progress" | "live" | "spinner";
+  label: string;
+  value: number | null;
+  /** `live` only: a paused capture takes the pause glyph over the record dot. */
+  paused: boolean;
+};
+
+/**
+ * What the indicator is about right now, or null when it has nothing to say.
+ *
+ * One rule for both densities and for `Layout`'s "am I already on that note"
+ * check, which has to agree with it — a second copy there would draw a compact
+ * pill beside the note view's own bar the moment the two disagreed about a
+ * deferred stop.
+ *
+ * A live capture wins the slot over a replay: the replay is background work on
+ * a note the user may not even be looking at. A capture that draws nothing —
+ * idle, or the deferred stop above — lets the replay through rather than
+ * blanking the row.
+ */
+export function indicatorState(
+  status: RecordingStatus,
+  transcribing: Record<string, ReplayRun>,
+  scopeNoteId?: string,
+): IndicatorState | null {
+  const capture = scopeNoteId === undefined || status.noteId === scopeNoteId ? status : null;
+  if (capture) {
+    const progress = captureProgress(capture);
+    if (progress) return { noteId: capture.noteId, kind: "progress", ...progress, paused: false };
+    if (capture.phase === "recording" || capture.phase === "paused") {
+      return {
+        noteId: capture.noteId,
+        kind: "live",
+        label: "",
+        value: null,
+        paused: capture.phase === "paused",
+      };
+    }
+    if (capture.phase === "starting" || capture.phase === "importing") {
+      return {
+        noteId: capture.noteId,
+        kind: "spinner",
+        label: capture.phase === "starting" ? "Starting…" : "Transcribing audio…",
+        value: null,
+        paused: false,
+      };
+    }
+  }
+  const replay =
+    scopeNoteId === undefined
+      ? latestReplay(transcribing)
+      : transcribing[scopeNoteId]
+        ? { noteId: scopeNoteId, run: transcribing[scopeNoteId] }
+        : null;
+  if (!replay) return null;
+  return { noteId: replay.noteId, kind: "progress", ...replayProgress(replay.run), paused: false };
+}
+
+/**
+ * The capture's elapsed seconds, held by whatever is mounted for the whole
+ * recording rather than by the thing that displays it. Frozen rather than
+ * cleared through `stopping`: the recording's length is already final when
+ * stop is pressed.
+ */
+export function useCaptureElapsed(phase: RecordingPhase): number {
+  const [elapsed, setElapsed] = useState(0);
+  useEffect(() => {
+    if (phase === "paused" || phase === "stopping") return; // hold the reading
+    if (phase !== "recording") {
+      setElapsed(0);
+      return;
+    }
+    const start = Date.now() - elapsed * 1000;
+    const t = window.setInterval(() => setElapsed(Math.floor((Date.now() - start) / 1000)), 250);
+    return () => window.clearInterval(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [phase]);
+  return elapsed;
+}
+
+/**
+ * The one indicator for work that is no longer a live recording, in two
+ * densities (#182) — the stop's drain, the diarize pass, and a deferred
+ * transcription's replay (#146), which runs for minutes on local Whisper and
+ * is the longest thing the app does.
+ *
+ * `bar` is the note view's, standing where the pause/stop controls were: the
+ * transcript is arriving into the panel beside it, so the bar's job is to say
+ * how much of it is left. `compact` is the app-wide one the sidebar-less
+ * placement in `Layout` mounts, so the state follows the user off the note —
+ * it adds the elapsed timer while the capture is live and is a link back to
+ * the note it belongs to. Both densities carry the same labels and the same
+ * track.
+ */
+export function CaptureIndicator({
+  variant,
+  noteId,
+  elapsed = 0,
+  onOpen,
+}: {
+  variant: "bar" | "compact";
+  /** Scopes the `bar` variant to its own note: a capture running elsewhere is
+      not this note's business (the compact variant is app-wide and omits it). */
+  noteId?: string;
+  elapsed?: number;
+  onOpen?: () => void;
+}) {
+  const global = useRecordingStore((s) => s.status);
+  const transcribing = useRecordingStore((s) => s.transcribing);
+  const labelId = useId();
+  const state = indicatorState(global, transcribing, noteId);
+  const progress = state?.kind === "progress" ? state : null;
+  const live = state?.kind === "live";
+  if (variant === "bar") {
+    if (!progress) return null;
+    return (
+      <div className="nd-recpill no-drag shrink-0 whitespace-nowrap flex items-center gap-2.5 h-[38px] px-4 rounded-full border border-[var(--color-line-visible)]">
+        <span
+          id={labelId}
+          className="shrink-0 whitespace-nowrap text-[13px] font-medium text-[var(--color-text-muted)]"
+        >
+          {progress.label}
+        </span>
+        {/* 56px, not the wider track a settings panel can afford: the row it
+            sits in has to clear a body column allowed down to `BODY_MIN`, and
+            every pill in it is `shrink-0`, so the track's width is one of the
+            few numbers there that is ours to choose. */}
+        <ProgressTrack value={progress.value} labelId={labelId} className="w-[56px]" />
+      </div>
+    );
+  }
+  // Compact: only ever mounted off the recording's own note, so it says which
+  // state the capture is in and nothing about the controls, which are there.
+  if (!state) return null;
+  return (
+    <button
+      type="button"
+      onClick={onOpen}
+      // Named explicitly: the visible content is the state (a timer, or a
+      // label the progressbar inside already carries as its own name), and
+      // what this control DOES is go to the note.
+      aria-label="Open the recording"
+      className="no-drag nd-recpill fixed bottom-6 right-6 z-[60] flex items-center gap-2.5 h-[32px] pl-3 pr-3.5 rounded-full border border-[var(--color-line-visible)] text-[12.5px] font-medium text-[var(--color-text-muted)] hover:text-[var(--color-text)] transition-colors"
+      title="Open the recording"
+    >
+      {live ? (
+        <>
+          {state.paused ? (
+            <Pause size={11} strokeWidth={1.8} />
+          ) : (
+            <span className="rec-dot inline-block w-[8px] h-[8px] rounded-full bg-[var(--color-record)]" />
+          )}
+          <span className="tabular-nums text-[var(--color-text)]">{formatTime(elapsed)}</span>
+        </>
+      ) : progress ? (
+        <>
+          <span id={labelId} className="whitespace-nowrap">
+            {progress.label}
+          </span>
+          <ProgressTrack value={progress.value} labelId={labelId} className="w-[56px]" />
+        </>
+      ) : (
+        <>
+          <span className="w-3 h-3 rounded-full border-2 border-current border-t-transparent animate-spin" />
+          <span className="whitespace-nowrap">{state.label}</span>
+        </>
+      )}
+    </button>
+  );
+}
+
+/**
+ * The track itself. A `null` value is indeterminate in ARIA's own terms — a
+ * `progressbar` with no `aria-valuenow` — which is exactly what the diarize
+ * step is, so nothing here has to say "no percentage" twice.
+ */
+function ProgressTrack({
+  value,
+  labelId,
+  className,
+}: {
+  value: number | null;
+  labelId: string;
+  className?: string;
+}) {
+  const pct = value === null ? 100 : Math.round(value * 100);
+  return (
+    <div
+      role="progressbar"
+      aria-labelledby={labelId}
+      aria-valuemin={0}
+      aria-valuemax={100}
+      aria-valuenow={value === null ? undefined : pct}
+      aria-busy={value === null ? true : undefined}
+      className={cn("h-1 rounded-full bg-[var(--color-pill-hover)] overflow-hidden", className)}
+    >
+      <div
+        className={cn(
+          "h-full rounded-full bg-[var(--color-accent)] transition-[width] duration-200",
+          value === null && "nd-progress-indeterminate",
+        )}
+        style={{ width: `${pct}%` }}
+      />
+    </div>
+  );
+}
 
 // Floating recording controls. Record / Summarize live in the note toolbar
 // now; this bar surfaces only the in-flight states (starting / recording /
@@ -123,6 +415,7 @@ export function RecordingBar({ noteId }: { noteId: string }) {
   const isThisNote = status.noteId === noteId;
   const phase = isThisNote ? status.phase : "idle";
   const isSummarizing = useRecordingStore((s) => !!s.summarizing[noteId]);
+  const transcribing = useRecordingStore((s) => s.transcribing);
   const diag = useRecordingStore((s) => s.diag);
   const showDiag = (phase === "recording" || phase === "paused") && diag && diag.noteId === noteId;
 
@@ -192,18 +485,7 @@ export function RecordingBar({ noteId }: { noteId: string }) {
     return () => window.clearInterval(t);
   }, [phase, micHeard, activeSince, activeAccumMs]);
 
-  const [elapsed, setElapsed] = useState(0);
-  useEffect(() => {
-    if (phase !== "recording" && phase !== "paused") {
-      setElapsed(0);
-      return;
-    }
-    if (phase === "paused") return; // hold the timer while paused
-    const start = Date.now() - elapsed * 1000;
-    const t = window.setInterval(() => setElapsed(Math.floor((Date.now() - start) / 1000)), 250);
-    return () => window.clearInterval(t);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [phase]);
+  const elapsed = useCaptureElapsed(phase);
 
   async function pause() {
     try { await ipc.recordingPause(); }
@@ -220,10 +502,22 @@ export function RecordingBar({ noteId }: { noteId: string }) {
 
   const recording = phase === "recording";
   const hasControls = recording || phase === "paused";
-  // Which arrangement the row is in (#177). Three pills only ever happen one
-  // way — a summary running while this note records — and the diagnostics pill
-  // shows only while it does, so this one choice covers every step.
-  const steps = isSummarizing && hasControls ? ROW_STEPS.tight : ROW_STEPS.roomy;
+  // The timer outlives the controls (#182): stop takes the pause and stop
+  // buttons away, and the progress pill stands where they were, but the length
+  // of the recording is final and worth keeping on screen. Not for the stop of
+  // a capture that deferred its transcription (#146) — that one draws no pill
+  // and lands on idle in a few hundred milliseconds, so a timer alone there
+  // would flash and vanish, which is the glitch the pill was dropped to avoid.
+  const hasTimer = hasControls || (phase === "stopping" && !status.deferred);
+  // What the indicator beside the controls is showing, scoped to this note —
+  // the stop's own pills, or a replay (#146). Which arrangement the row is in
+  // (#177) turns on whether anything shares it with the busy pill a summary
+  // puts there.
+  const indicator = indicatorState(status, transcribing, noteId);
+  const steps =
+    isSummarizing && (hasTimer || indicator?.kind === "progress")
+      ? ROW_STEPS.tight
+      : ROW_STEPS.roomy;
   // What the diagnostics pill says once its numbers are hidden by step 1. The
   // pill is the only place they survive from there, so it carries them whole.
   const readout = diag
@@ -307,15 +601,14 @@ export function RecordingBar({ noteId }: { noteId: string }) {
           live recording, carries a threshold (`steps.busyLabel`). */}
       {phase === "starting" && <BusyPill label="Starting…" />}
       {phase === "importing" && <BusyPill label="Transcribing audio…" />}
-      {phase === "stopping" && <BusyPill label="Stopping…" />}
-      {phase === "diarizing" && <BusyPill label="Identifying speakers…" />}
       {isSummarizing && <BusyPill label="Summarizing…" labelClass={steps.busyLabel} />}
 
-      {hasControls && (
+      {hasTimer && (
         <div
           className={cn(
             "nd-recpill no-drag shrink-0 whitespace-nowrap flex items-stretch h-[38px] rounded-full overflow-hidden border",
-            recording ? "border-[var(--color-record)]" : "border-[var(--color-line-visible)]"
+            recording ? "border-[var(--color-record)]" : "border-[var(--color-line-visible)]",
+            !hasControls && steps.stopTimer,
           )}
         >
           <div
@@ -324,9 +617,14 @@ export function RecordingBar({ noteId }: { noteId: string }) {
               recording ? "text-[var(--color-record)]" : "text-[var(--color-text-muted)]"
             )}
           >
-            {recording
-              ? <span className="rec-dot inline-block w-[9px] h-[9px] rounded-full bg-[var(--color-record)]" />
-              : <Pause size={12} strokeWidth={1.8} />}
+            {/* No glyph once stop is pressed: a record dot would claim the
+                capture is still live and a pause glyph would claim it is
+                paused. */}
+            {recording ? (
+              <span className="rec-dot inline-block w-[9px] h-[9px] rounded-full bg-[var(--color-record)]" />
+            ) : phase === "paused" ? (
+              <Pause size={12} strokeWidth={1.8} />
+            ) : null}
             <span>{formatTime(elapsed)}</span>
             {phase === "paused" && (
               <span
@@ -339,6 +637,8 @@ export function RecordingBar({ noteId }: { noteId: string }) {
               </span>
             )}
           </div>
+          {hasControls && (
+          <>
           <button
             onClick={recording ? pause : resume}
             className={cn("no-drag grid place-items-center w-[46px] border-l text-[var(--color-text)] transition-colors", ctrlEdge)}
@@ -357,8 +657,15 @@ export function RecordingBar({ noteId }: { noteId: string }) {
           >
             <Square size={15} fill="currentColor" strokeWidth={0} />
           </button>
+          </>
+          )}
         </div>
       )}
+
+      {/* Where the pause and stop buttons were. The transcript's tail is
+          landing into the panel beside this, so the row's remaining job is to
+          say how much of it is still coming. */}
+      <CaptureIndicator variant="bar" noteId={noteId} />
       </div>
     </div>
   );

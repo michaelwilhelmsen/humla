@@ -216,7 +216,102 @@ pub struct CaptureSink {
     // the fact would re-push under a byte-identical key and converge only on
     // the server comparing strictly.
     pub captured_duration_ms: Arc<Mutex<u64>>,
+    // How far the replay this sink belongs to has got, when it is one (#146).
+    // `None` for a live capture and for a "Transcribe manually" one: neither
+    // measures its work in takes, and a live capture's progress is the
+    // transcript arriving on screen.
+    pub replay_progress: Option<Arc<Mutex<ReplayProgress>>>,
     pub mode: SinkMode,
+}
+
+/// One take's share of a replay's work. Each retained stream is its own pass
+/// over the same audio, so a take that kept both costs twice its duration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TakeWork {
+    pub streams: u32,
+    pub duration_ms: u64,
+}
+
+/// What a replay reports: audio position against the run's total, plus which
+/// take of how many it is on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReplaySnapshot {
+    pub done_ms: u64,
+    pub total_ms: u64,
+    pub take: u32,
+    pub takes: u32,
+}
+
+/// How far a deferred transcription has got (#146), weighted by **audio
+/// position** rather than chunks: a replay's chunk count isn't known until it
+/// ends, while every take's duration is known before it starts.
+///
+/// `done_ms` is a high-water mark clamped to the total, so the fraction can
+/// never retreat — not at a mic→sys handover, and not on a chunk whose
+/// transcribe finished out of order. A bar that goes backwards reads as a fault
+/// in the transcription rather than in the measurement.
+pub struct ReplayProgress {
+    takes: Vec<TakeWork>,
+    total_ms: u64,
+    // 0-based take being replayed.
+    take: usize,
+    // Audio behind the stream being replayed.
+    base_ms: u64,
+    done_ms: u64,
+}
+
+impl ReplayProgress {
+    pub fn new(takes: Vec<TakeWork>) -> Self {
+        let total_ms = takes.iter().map(Self::work).sum();
+        Self {
+            takes,
+            total_ms,
+            take: 0,
+            base_ms: 0,
+            done_ms: 0,
+        }
+    }
+
+    fn work(t: &TakeWork) -> u64 {
+        t.duration_ms.saturating_mul(t.streams as u64)
+    }
+
+    /// Move to take `index` (0-based), snapping the base to everything the
+    /// takes before it were worth. That makes a take boundary exact even if a
+    /// stream ended without reporting.
+    pub fn begin_take(&mut self, index: usize) {
+        self.take = index;
+        let behind: u64 = self.takes.iter().take(index).map(Self::work).sum();
+        self.base_ms = self.base_ms.max(behind).min(self.total_ms);
+        self.done_ms = self.done_ms.max(self.base_ms);
+    }
+
+    /// A chunk of the stream being replayed has been through the provider.
+    /// `start_ms` is its position in that stream, and it can claim no more than
+    /// the stream's own share of the total.
+    pub fn note_chunk(&mut self, start_ms: u64) {
+        let stream_ms = self.takes.get(self.take).map(|t| t.duration_ms).unwrap_or(0);
+        let cap = self.base_ms.saturating_add(stream_ms).min(self.total_ms);
+        let reached = self.base_ms.saturating_add(start_ms).min(cap);
+        self.done_ms = self.done_ms.max(reached);
+    }
+
+    /// One retained stream has been replayed end to end.
+    pub fn finish_stream(&mut self) {
+        let stream_ms = self.takes.get(self.take).map(|t| t.duration_ms).unwrap_or(0);
+        self.base_ms = self.base_ms.saturating_add(stream_ms).min(self.total_ms);
+        self.done_ms = self.done_ms.max(self.base_ms);
+    }
+
+    pub fn snapshot(&self) -> ReplaySnapshot {
+        let takes = self.takes.len() as u32;
+        ReplaySnapshot {
+            done_ms: self.done_ms,
+            total_ms: self.total_ms,
+            take: (self.take as u32 + 1).min(takes),
+            takes,
+        }
+    }
 }
 
 impl Default for CaptureSink {
@@ -234,8 +329,17 @@ impl CaptureSink {
             mic_full_wav_path: Arc::new(Mutex::new(None)),
             sys_full_wav_path: Arc::new(Mutex::new(None)),
             captured_duration_ms: Arc::new(Mutex::new(0)),
+            replay_progress: None,
             mode,
         }
+    }
+
+    /// Attach the run-wide progress a deferred replay reports on. Shared by
+    /// every stream of every take in one run, since the fraction is over the
+    /// whole run.
+    pub fn with_progress(mut self, progress: Arc<Mutex<ReplayProgress>>) -> Self {
+        self.replay_progress = Some(progress);
+        self
     }
 
     /// The rolling context for one stream. Per-source because the mic and
@@ -341,6 +445,63 @@ pub struct LiveCapture {
     // unlocked — a flaky network shouldn't block capture).
     pub lock_id: Option<String>,
     pub lock_heartbeat: Option<JoinHandle<()>>,
+    // Where the capture slot is in its stop sequence. See [`StopState`].
+    pub stop: StopState,
+}
+
+impl LiveCapture {
+    /// The refusal a caller trying to take the capture slot must return, or
+    /// `None` when the slot is takeable. The invariant it protects: a new
+    /// capture can never clear `chunk_log` before the previous stop has
+    /// snapshotted it.
+    pub fn stop_in_progress(&self) -> Option<&'static str> {
+        match self.stop {
+            StopState::None => None,
+            StopState::Draining | StopState::Finishing => Some(STOP_IN_PROGRESS),
+        }
+    }
+
+    /// Move the slot into its stop sequence and return the note it holds.
+    /// `note_id` deliberately stays set — the tail of the transcript keeps
+    /// appending live through the drain — so `Draining` is what refuses a new
+    /// capture until the post-stop chain releases the slot. Both the live stop
+    /// and the import completion path go through here.
+    pub fn begin_stop(&mut self) -> Result<String, &'static str> {
+        if let Some(msg) = self.stop_in_progress() {
+            return Err(msg);
+        }
+        let note_id = self.note_id.clone().ok_or("not recording")?;
+        self.stop = StopState::Draining;
+        Ok(note_id)
+    }
+}
+
+/// Where the single capture slot is in its stop sequence.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum StopState {
+    /// No stop underway: the slot is either free or holding a live capture.
+    #[default]
+    None,
+    /// Stop was pressed and the in-flight transcribes are still landing.
+    /// `note_id` stays set through this window, so the tail of the transcript
+    /// appends and emits exactly as it did while recording.
+    Draining,
+    /// The `chunk_log` snapshot has been taken and the post-stop chain owns
+    /// `note.transcript` — it rewrites the whole string with speaker labels,
+    /// so a late append would land on top of that.
+    Finishing,
+}
+
+/// Refusal for `recording_start` / `import_audio` while a stop is in progress.
+/// Phrased for the toast the frontend already shows.
+pub const STOP_IN_PROGRESS: &str = "Finishing the previous recording — try again in a moment.";
+
+/// Should a chunk that just finished transcribing append to the note live?
+/// True while the capture runs and through the stop drain; false once the
+/// post-stop chain has snapshotted `chunk_log`, and false for a chunk whose
+/// note is no longer the one in the slot (the user started a new capture).
+pub fn appends_live(active_note: Option<&str>, stop: StopState, note_id: &str) -> bool {
+    active_note == Some(note_id) && stop != StopState::Finishing
 }
 
 #[derive(Clone, Serialize)]
@@ -348,6 +509,122 @@ pub struct LiveCapture {
 pub struct RecordingStatus {
     pub note_id: Option<String>,
     pub phase: Phase,
+    // Drain progress, present only during `Stopping` (#182): how many
+    // transcribes were in flight when stop was pressed, and how many of those
+    // have landed. Additive and skipped when absent, so every listener that
+    // only reads `{noteId, phase}` keeps working.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub done: Option<u32>,
+    // This capture ran with "Transcribe manually" on (#146), so its stop has
+    // no chunks to drain and no text to diarize and lands on Idle in a few
+    // hundred milliseconds. Marked on `Stopping` and `Diarizing` so the
+    // recording bar can stand aside rather than flash a bar that means
+    // nothing. The phases still emit: the Idle is what makes the pending take
+    // visible, since the note view re-reads its sessions on every transition.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deferred: Option<bool>,
+}
+
+impl RecordingStatus {
+    /// A phase with nothing attached — every emit but a stop's.
+    pub fn plain(note_id: Option<&str>, phase: Phase) -> Self {
+        Self {
+            note_id: note_id.map(|s| s.to_string()),
+            phase,
+            pending: None,
+            done: None,
+            deferred: None,
+        }
+    }
+
+    /// `Stopping` with the drain's progress on it (#182).
+    pub fn stopping_progress(note_id: &str, pending: u32, done: u32) -> Self {
+        Self {
+            pending: Some(pending),
+            done: Some(done),
+            ..Self::plain(Some(note_id), Phase::Stopping)
+        }
+    }
+
+    /// A stop phase of a capture that never transcribed as it ran (#146).
+    /// Carries no drain counts: nothing was dispatched, so there is nothing
+    /// pending to count.
+    pub fn deferred_phase(note_id: &str, phase: Phase) -> Self {
+        Self {
+            deferred: Some(true),
+            ..Self::plain(Some(note_id), phase)
+        }
+    }
+}
+
+/// Wall-clock cost of every step of one stop chain, in milliseconds (#182).
+/// Filled as the chain runs and merged into the take's diarize diagnostics
+/// JSON at the end, so a slow stop can be attributed to a step instead of
+/// guessed at. `diarize_mic_ms` / `diarize_sys_ms` are per sidecar invocation
+/// and absent when that stream wasn't diarized; `diagnostics_path` is the file
+/// the timings are merged into, not a duration.
+#[derive(Clone, Default, Serialize)]
+pub struct StopTimings {
+    pub sidecar_shutdown_ms: u64,
+    pub reader_wait_ms: u64,
+    pub drain_ms: u64,
+    pub drain_pending_chunks: u32,
+    pub keep_audio_ms: u64,
+    pub detect_language_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diarize_mic_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diarize_sys_ms: Option<u64>,
+    pub playback_assets_ms: u64,
+    pub finalize_session_ms: u64,
+    pub unify_ms: u64,
+    pub temp_cleanup_ms: u64,
+    pub total_ms: u64,
+    #[serde(skip)]
+    pub diagnostics_path: Option<PathBuf>,
+}
+
+impl StopTimings {
+    /// One-line stderr summary of the chain, printed on every stop.
+    pub fn summary(&self) -> String {
+        let opt = |v: Option<u64>| v.map(|v| v.to_string()).unwrap_or_else(|| "-".into());
+        format!(
+            "stop timings: total={}ms sidecar={} reader={} drain={} ({} pending) keep_audio={} detect_lang={} diarize_mic={} diarize_sys={} playback={} finalize={} unify={} cleanup={}",
+            self.total_ms,
+            self.sidecar_shutdown_ms,
+            self.reader_wait_ms,
+            self.drain_ms,
+            self.drain_pending_chunks,
+            self.keep_audio_ms,
+            self.detect_language_ms,
+            opt(self.diarize_mic_ms),
+            opt(self.diarize_sys_ms),
+            self.playback_assets_ms,
+            self.finalize_session_ms,
+            self.unify_ms,
+            self.temp_cleanup_ms,
+        )
+    }
+}
+
+/// Put a `timings` object into the take's diagnostics JSON, keeping every
+/// field already there. `existing` is the parsed file, or `None` when the
+/// chain wrote no diagnostics (no diarize model, no chunks) — in which case
+/// the timings stand alone in a fresh object.
+pub fn merge_timings(existing: Option<serde_json::Value>, timings: &StopTimings) -> serde_json::Value {
+    let mut root = match existing {
+        Some(serde_json::Value::Object(map)) => serde_json::Value::Object(map),
+        _ => serde_json::json!({ "created_at": chrono::Utc::now().timestamp_millis() }),
+    };
+    if let Some(map) = root.as_object_mut() {
+        map.insert(
+            "timings".to_string(),
+            serde_json::to_value(timings).unwrap_or(serde_json::Value::Null),
+        );
+    }
+    root
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
@@ -411,9 +688,60 @@ pub struct TitleStatusPayload {
 /// note B's state, and — unlike a live capture — it must not reach
 /// `recording_status` at all, since a recording may be running on another note
 /// the whole time.
+///
+/// Progress rides the same event: audio position (`done_ms` / `total_ms`) and
+/// which take of how many, so the label and the fraction are separable and the
+/// client does one division. All four are absent on the brackets and on a run
+/// with nothing to report, which serializes exactly as it did before they
+/// existed.
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TranscribeStatusPayload {
+    pub note_id: String,
+    pub active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub done_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub take: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub takes: Option<u32>,
+}
+
+impl TranscribeStatusPayload {
+    /// The bracket around a run: active or not, nothing measured.
+    pub fn bracket(note_id: &str, active: bool) -> Self {
+        Self {
+            note_id: note_id.to_string(),
+            active,
+            done_ms: None,
+            total_ms: None,
+            take: None,
+            takes: None,
+        }
+    }
+
+    pub fn progress(note_id: &str, s: ReplaySnapshot) -> Self {
+        Self {
+            note_id: note_id.to_string(),
+            active: true,
+            done_ms: Some(s.done_ms),
+            total_ms: Some(s.total_ms),
+            take: Some(s.take),
+            takes: Some(s.takes),
+        }
+    }
+}
+
+/// Per-note (re)diarize lifecycle (#187), on its own channel because
+/// `recording_status` describes the live capture and nothing else. Re-diarize
+/// and the cross-session unify pass are user actions on an *arbitrary* note, so
+/// a recording may be running on another note throughout — an `Idle` from here
+/// would blank that recording's bar, timer, stop button and tray.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiarizeStatusPayload {
     pub note_id: String,
     pub active: bool,
 }
@@ -513,6 +841,313 @@ pub struct DiagnosticPayload {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn a_chunk() -> ChunkRecord {
+        ChunkRecord {
+            source: ChunkSource::Mic,
+            start_ms: 0,
+            text: "hello".into(),
+            words: Vec::new(),
+            detected_language: None,
+        }
+    }
+
+    #[test]
+    fn a_chunk_landing_during_the_drain_still_appends() {
+        // #182: the tail of the transcript arrives as it decodes. Stop-pressed
+        // keeps `note_id` set precisely so this stays true through the drain.
+        assert!(appends_live(Some("n1"), StopState::Draining, "n1"));
+        assert!(appends_live(Some("n1"), StopState::None, "n1"));
+    }
+
+    #[test]
+    fn a_chunk_landing_after_the_snapshot_does_not_append() {
+        // From the snapshot on, the post-stop chain rewrites the whole
+        // transcript with speaker labels — a late append would land on top.
+        assert!(!appends_live(None, StopState::Finishing, "n1"));
+        // Even with the id somehow still set, `Finishing` is the answer.
+        assert!(!appends_live(Some("n1"), StopState::Finishing, "n1"));
+        // A different capture holds the slot: not this note's business.
+        assert!(!appends_live(Some("n2"), StopState::None, "n1"));
+        assert!(!appends_live(None, StopState::None, "n1"));
+    }
+
+    #[test]
+    fn only_a_stop_in_progress_refuses_a_new_capture() {
+        let mut cap = LiveCapture::default();
+        cap.note_id = Some("n1".to_string());
+        assert_eq!(cap.stop_in_progress(), None, "a live slot is takeable");
+        cap.stop = StopState::Draining;
+        assert_eq!(cap.stop_in_progress(), Some(STOP_IN_PROGRESS));
+        cap.stop = StopState::Finishing;
+        assert_eq!(cap.stop_in_progress(), Some(STOP_IN_PROGRESS));
+        cap.stop = StopState::None;
+        assert_eq!(cap.stop_in_progress(), None);
+    }
+
+    #[test]
+    fn a_refused_caller_never_reaches_the_chunk_log() {
+        // The invariant #182 protects: a new capture can never clear
+        // `chunk_log` before the previous stop has snapshotted it. Both
+        // `recording_start` and `import_audio` ask *first* and return before
+        // they reset anything, which this stands in for.
+        let take_the_slot = |cap: &mut LiveCapture| -> Result<(), &'static str> {
+            if let Some(msg) = cap.stop_in_progress() {
+                return Err(msg);
+            }
+            cap.sink = Arc::new(CaptureSink::new(SinkMode::Live));
+            Ok(())
+        };
+        let mut cap = LiveCapture::default();
+        cap.note_id = Some("n1".to_string());
+        cap.sink.chunk_log.lock().push(a_chunk());
+        for stop in [StopState::Draining, StopState::Finishing] {
+            cap.stop = stop;
+            assert_eq!(take_the_slot(&mut cap), Err(STOP_IN_PROGRESS), "{stop:?} must refuse");
+            assert_eq!(cap.sink.chunk_log.lock().len(), 1, "{stop:?} lost the log");
+        }
+        // And the stand-in really does clear it once allowed to run, so the
+        // survival above is the refusal's doing.
+        cap.stop = StopState::None;
+        assert_eq!(take_the_slot(&mut cap), Ok(()));
+        assert!(cap.sink.chunk_log.lock().is_empty());
+    }
+
+    #[test]
+    fn an_import_drain_holds_the_slot_like_a_live_stop_does() {
+        // `finish_import` drains too, and its child and reader are already
+        // finished — so without the same lifecycle `recording_start`'s
+        // self-heal reads a zombie and takes over mid-drain.
+        let mut cap = LiveCapture::default();
+        cap.note_id = Some("n1".to_string());
+        assert_eq!(cap.begin_stop(), Ok("n1".to_string()));
+        assert_eq!(cap.stop, StopState::Draining);
+        assert_eq!(cap.note_id.as_deref(), Some("n1"), "the tail still appends");
+        assert_eq!(cap.stop_in_progress(), Some(STOP_IN_PROGRESS));
+        assert_eq!(cap.begin_stop(), Err(STOP_IN_PROGRESS), "no second stop");
+    }
+
+    #[test]
+    fn an_empty_slot_has_no_stop_to_begin() {
+        let mut cap = LiveCapture::default();
+        assert_eq!(cap.begin_stop(), Err("not recording"));
+        assert_eq!(cap.stop, StopState::None);
+    }
+
+    #[test]
+    fn stopping_carries_its_progress_and_no_other_phase_does() {
+        let json = serde_json::to_string(&RecordingStatus::stopping_progress("n1", 3, 1)).unwrap();
+        assert_eq!(json, r#"{"noteId":"n1","phase":"stopping","pending":3,"done":1}"#);
+
+        // Every other emit goes through `emit_status`, which passes None for
+        // both — the fields must vanish, so a listener reading `{noteId,
+        // phase}` gets a payload with nothing else in it.
+        assert_eq!(
+            serde_json::to_string(&RecordingStatus::plain(None, Phase::Idle)).unwrap(),
+            r#"{"noteId":null,"phase":"idle"}"#
+        );
+    }
+
+    #[test]
+    fn a_deferred_stop_is_marked_and_counts_nothing() {
+        // #146: a capture that never transcribed as it ran has no chunks to
+        // drain, so the drain's denominator must not be on the payload at all
+        // — a bar drawn from it would appear and vanish in ~300ms.
+        assert_eq!(
+            serde_json::to_string(&RecordingStatus::deferred_phase("n1", Phase::Stopping)).unwrap(),
+            r#"{"noteId":"n1","phase":"stopping","deferred":true}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&RecordingStatus::deferred_phase("n1", Phase::Diarizing))
+                .unwrap(),
+            r#"{"noteId":"n1","phase":"diarizing","deferred":true}"#
+        );
+        // And absent for a live one, whose full-bar zero-pending case is real.
+        assert_eq!(
+            serde_json::to_string(&RecordingStatus::stopping_progress("n1", 0, 0)).unwrap(),
+            r#"{"noteId":"n1","phase":"stopping","pending":0,"done":0}"#
+        );
+    }
+
+    #[test]
+    fn a_transcribe_bracket_serializes_as_it_did_before_progress_existed() {
+        assert_eq!(
+            serde_json::to_string(&TranscribeStatusPayload::bracket("n1", true)).unwrap(),
+            r#"{"noteId":"n1","active":true}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&TranscribeStatusPayload::bracket("n1", false)).unwrap(),
+            r#"{"noteId":"n1","active":false}"#
+        );
+    }
+
+    #[test]
+    fn a_transcribe_progress_event_carries_position_and_the_take_counter() {
+        let snapshot = ReplaySnapshot {
+            done_ms: 45_000,
+            total_ms: 180_000,
+            take: 2,
+            takes: 3,
+        };
+        assert_eq!(
+            serde_json::to_string(&TranscribeStatusPayload::progress("n1", snapshot)).unwrap(),
+            r#"{"noteId":"n1","active":true,"doneMs":45000,"totalMs":180000,"take":2,"takes":3}"#
+        );
+    }
+
+    fn one_stream(duration_ms: u64) -> TakeWork {
+        TakeWork { streams: 1, duration_ms }
+    }
+
+    #[test]
+    fn a_single_stream_take_is_worth_its_own_duration() {
+        let mut p = ReplayProgress::new(vec![one_stream(60_000)]);
+        assert_eq!(p.snapshot(), ReplaySnapshot { done_ms: 0, total_ms: 60_000, take: 1, takes: 1 });
+        p.note_chunk(15_000);
+        assert_eq!(p.snapshot().done_ms, 15_000);
+        p.finish_stream();
+        assert_eq!(p.snapshot().done_ms, 60_000, "a finished stream is fully done");
+    }
+
+    #[test]
+    fn a_two_stream_take_costs_twice_its_duration() {
+        // Each retained stream is its own pass over the same audio.
+        let mut p = ReplayProgress::new(vec![TakeWork { streams: 2, duration_ms: 60_000 }]);
+        assert_eq!(p.snapshot().total_ms, 120_000);
+        p.note_chunk(30_000);
+        assert_eq!(p.snapshot().done_ms, 30_000);
+        // The mic→sys handover: the second pass starts back at 0 in its own
+        // stream, and the fraction must not follow it there.
+        p.finish_stream();
+        assert_eq!(p.snapshot().done_ms, 60_000);
+        p.note_chunk(0);
+        assert_eq!(p.snapshot().done_ms, 60_000);
+        p.note_chunk(20_000);
+        assert_eq!(p.snapshot().done_ms, 80_000);
+        p.finish_stream();
+        assert_eq!(p.snapshot().done_ms, 120_000);
+    }
+
+    #[test]
+    fn several_takes_sum_and_number_themselves() {
+        let mut p = ReplayProgress::new(vec![
+            one_stream(60_000),
+            TakeWork { streams: 2, duration_ms: 30_000 },
+            one_stream(10_000),
+        ]);
+        assert_eq!(p.snapshot(), ReplaySnapshot { done_ms: 0, total_ms: 130_000, take: 1, takes: 3 });
+        p.begin_take(0);
+        p.finish_stream();
+        p.begin_take(1);
+        assert_eq!(p.snapshot(), ReplaySnapshot { done_ms: 60_000, total_ms: 130_000, take: 2, takes: 3 });
+        p.note_chunk(10_000);
+        assert_eq!(p.snapshot().done_ms, 70_000);
+        p.finish_stream();
+        p.finish_stream();
+        p.begin_take(2);
+        assert_eq!(p.snapshot(), ReplaySnapshot { done_ms: 120_000, total_ms: 130_000, take: 3, takes: 3 });
+        p.finish_stream();
+        assert_eq!(p.snapshot().done_ms, 130_000);
+    }
+
+    #[test]
+    fn a_take_boundary_is_exact_even_if_a_stream_never_reported() {
+        // `begin_take` snaps to everything the takes before it were worth, so a
+        // replay that ended without a `finish_stream` can't leave the fraction
+        // permanently short.
+        let mut p = ReplayProgress::new(vec![one_stream(60_000), one_stream(60_000)]);
+        p.begin_take(1);
+        assert_eq!(p.snapshot().done_ms, 60_000);
+    }
+
+    #[test]
+    fn progress_never_goes_backwards() {
+        let mut p = ReplayProgress::new(vec![one_stream(60_000)]);
+        p.note_chunk(30_000);
+        // Chunks land as their transcribes return, which is not guaranteed to
+        // be in order, and a duplicate is harmless.
+        p.note_chunk(12_000);
+        assert_eq!(p.snapshot().done_ms, 30_000);
+        p.note_chunk(30_000);
+        assert_eq!(p.snapshot().done_ms, 30_000);
+        p.begin_take(0);
+        assert_eq!(p.snapshot().done_ms, 30_000, "re-entering a take keeps its position");
+    }
+
+    #[test]
+    fn a_chunk_can_claim_no_more_than_its_own_stream() {
+        // A manifest duration is best-effort and can be 0 or short; a chunk
+        // beyond it must not eat the next take's share, and nothing may exceed
+        // the run's total.
+        let mut p = ReplayProgress::new(vec![one_stream(10_000), one_stream(10_000)]);
+        p.note_chunk(999_000);
+        assert_eq!(p.snapshot().done_ms, 10_000);
+        p.begin_take(1);
+        p.note_chunk(999_000);
+        assert_eq!(p.snapshot().done_ms, 20_000);
+    }
+
+    #[test]
+    fn a_take_of_unknown_length_advances_only_when_its_stream_ends() {
+        let mut p = ReplayProgress::new(vec![one_stream(0), one_stream(60_000)]);
+        assert_eq!(p.snapshot().total_ms, 60_000);
+        p.note_chunk(5_000);
+        assert_eq!(p.snapshot().done_ms, 0, "no share to spend");
+        p.finish_stream();
+        assert_eq!(p.snapshot().done_ms, 0);
+        p.begin_take(1);
+        p.note_chunk(30_000);
+        assert_eq!(p.snapshot().done_ms, 30_000);
+    }
+
+    #[test]
+    fn timings_merge_into_the_diagnostics_json_without_displacing_it() {
+        let t = StopTimings {
+            sidecar_shutdown_ms: 120,
+            reader_wait_ms: 4,
+            drain_ms: 9_000,
+            drain_pending_chunks: 3,
+            keep_audio_ms: 40,
+            detect_language_ms: 1,
+            diarize_mic_ms: Some(21_000),
+            diarize_sys_ms: None,
+            playback_assets_ms: 300,
+            finalize_session_ms: 12,
+            unify_ms: 0,
+            temp_cleanup_ms: 7,
+            total_ms: 30_484,
+            diagnostics_path: Some(PathBuf::from("/tmp/community1-mic.json")),
+        };
+        let existing = serde_json::json!({ "engine": "community1", "mic_segments": [] });
+        let merged = merge_timings(Some(existing), &t);
+        assert_eq!(merged["engine"], "community1");
+        let timings = &merged["timings"];
+        for key in [
+            "sidecar_shutdown_ms",
+            "reader_wait_ms",
+            "drain_ms",
+            "drain_pending_chunks",
+            "keep_audio_ms",
+            "detect_language_ms",
+            "playback_assets_ms",
+            "finalize_session_ms",
+            "unify_ms",
+            "temp_cleanup_ms",
+            "total_ms",
+        ] {
+            assert!(timings[key].is_u64(), "{key} must be an integer millisecond count");
+        }
+        assert_eq!(timings["diarize_mic_ms"], 21_000);
+        // A stream that wasn't diarized says nothing rather than zero.
+        assert!(timings.get("diarize_sys_ms").is_none());
+        // The merge target is bookkeeping for the writer, not part of the dump.
+        assert!(timings.get("diagnostics_path").is_none());
+
+        // No diarize diagnostics were written (no model, no chunks): the
+        // timings still land, in an object of their own.
+        let alone = merge_timings(None, &t);
+        assert!(alone["timings"]["total_ms"].is_u64());
+    }
 
     #[test]
     fn trail_keeps_last_n_words() {

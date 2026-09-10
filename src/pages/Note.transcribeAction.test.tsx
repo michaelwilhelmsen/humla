@@ -270,10 +270,10 @@ describe("the transcript panel's Transcribe action", () => {
     expect(transcribe).toHaveBeenCalledWith({ noteId: "n1", scope: "pending" });
   });
 
-  // The empty state gives way to the in-flight skeleton, so the button needs no
+  // The empty state gives way to the run's own progress, so the button needs no
   // busy state of its own — but it must not survive into a state where a second
   // press would queue a second replay.
-  it("gives way to the skeleton once a run is in flight", async () => {
+  it("gives way to the run's progress once one is in flight", async () => {
     await openTranscriptPanel([session({ canTranscribe: true })]);
     await screen.findByText(/hasn't been transcribed yet/i);
 
@@ -282,6 +282,32 @@ describe("the transcript panel's Transcribe action", () => {
     await waitFor(() =>
       expect(screen.queryByText(/hasn't been transcribed yet/i)).not.toBeInTheDocument(),
     );
+  });
+
+  // A replay runs for minutes on local Whisper, and its progress belongs where
+  // a stop already reports: the note's floating bar, and the app-wide pill once
+  // the user leaves. The panel draws no copy — two pills on one screen read as
+  // a bug, and the replay's text lands in one write at the end, so this panel
+  // has nothing to stream in the meantime.
+  it("reports how far the replay has got, on the bar and not in the panel", async () => {
+    await openTranscriptPanel([session({ canTranscribe: true })]);
+    await screen.findByText(/hasn't been transcribed yet/i);
+
+    act(() =>
+      useRecordingStore
+        .getState()
+        .setTranscribing("n1", true, { doneMs: 45_000, totalMs: 180_000, take: 2, takes: 3 }),
+    );
+
+    const bar = await screen.findByRole("progressbar", { name: "Transcribing take 2 of 3…" });
+    expect(bar).toHaveAttribute("aria-valuenow", "25");
+    // One position, one pill: the panel is on its Transcript tab and still
+    // leaves the reporting to the bar.
+    expect(screen.getAllByRole("progressbar")).toHaveLength(1);
+    const panel = screen
+      .getByRole("button", { name: /^copy transcript$|^summary$/i })
+      .closest("aside")!;
+    expect(panel.contains(bar)).toBe(false);
   });
 
   // A note with nothing recorded has nothing to run: its empty state is advice

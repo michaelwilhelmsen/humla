@@ -282,6 +282,22 @@ async function runGenerateTitle(noteId: string, onTitle: (title: string) => void
   }
 }
 
+// Why transcript editing is locked, in the words of the state it is in. The
+// post-stop chain rewrites the transcript wholesale, so the lock outlives the
+// recording by however long the tail and the diarize pass take.
+const LOCK_WHILE_RECORDING = "Editing is paused while recording";
+
+function transcriptLockCopy(state: {
+  stopping: boolean;
+  diarizing: boolean;
+  importing: boolean;
+}): string {
+  if (state.stopping) return "Editing is paused while the transcript finishes";
+  if (state.diarizing) return "Editing is paused while speakers are identified";
+  if (state.importing) return "Editing is paused while the audio is transcribed";
+  return LOCK_WHILE_RECORDING;
+}
+
 export function Note() {
   const { id } = useParams<{ id: string }>();
   const { sidebarCollapsed } = useOutletContext<LayoutOutletContext>();
@@ -517,12 +533,19 @@ export function Note() {
   // recording that came back off the wrong language or the wrong model. Same
   // backend answer as `canTranscribe`, one condition looser.
   const canRetranscribe = sessions.some((sess) => sess.canRetranscribe);
+  const isRediarizing = useRecordingStore(
+    (s) => !!draft && !!s.diarizing[draft.id],
+  );
   const isThisNoteActive = !!draft && recPhase.noteId === draft.id;
   const isRecording = isThisNoteActive && recPhase.phase === "recording";
   const isPaused = isThisNoteActive && recPhase.phase === "paused";
   const isStarting = isThisNoteActive && recPhase.phase === "starting";
   const isStopping = isThisNoteActive && recPhase.phase === "stopping";
-  const isDiarizing = isThisNoteActive && recPhase.phase === "diarizing";
+  // Diarization on THIS note: the post-stop chain of a capture that just
+  // finished (global phase), or a Re-diarize / unify the user pressed here
+  // (per-note channel, #187 — `recording_status` describes the live capture and
+  // nothing else, so a re-diarize can't be read off it).
+  const isDiarizing = (isThisNoteActive && recPhase.phase === "diarizing") || isRediarizing;
   // A file import replaying through the pipeline. Treated like a live capture
   // for UI purposes (transcript streams in, Record/Summarize hidden) but has no
   // pause/stop controls — the sidecar replays once and finishes on its own.
@@ -758,7 +781,9 @@ export function Note() {
   // depending only on draft.id would leave the player hidden until
   // the user navigates away and back. Stable recording_phase
   // transitions: stopping → diarizing → idle — by the time we land
-  // on idle, the bundle exists.
+  // on idle, the bundle exists. A re-diarize rewrites the timeline and
+  // playback.wav without touching that phase (#187), so it has to be here on
+  // its own flag, the way a deferred transcription already is.
   useEffect(() => {
     if (!draft) return;
     let cancelled = false;
@@ -865,7 +890,7 @@ export function Note() {
     // transcribed, and it deliberately never touches the recording phase — so
     // without this the reader would keep rendering the pre-transcription
     // sessions until the user navigated away and back.
-  }, [draft?.id, draft?.workspace_id, recPhase.phase, keepAudio, isTranscribing]);
+  }, [draft?.id, draft?.workspace_id, recPhase.phase, keepAudio, isTranscribing, isRediarizing]);
 
   // patch / patchProvider intentionally read from `draftRef.current`
   // rather than the `draft` closure so they can stay stable across
@@ -1044,6 +1069,22 @@ export function Note() {
   const backTo = folder ? `/folder/${folder.id}` : "/";
   const backLabel = folder ? folder.name : "Home";
   const otherActiveRecording = recPhase.noteId !== null && recPhase.noteId !== draft.id;
+  // Why Record is refused here, or null when it isn't. The backend holds the
+  // single capture slot until the previous stop has landed on idle (#182), so
+  // a stop that is still draining or diarizing disables this button for what
+  // can be minutes.
+  const recordBlock = lockedBy
+    ? `${lockedBy.holderName} is recording this note`
+    : !otherActiveRecording
+      ? null
+      : recPhase.phase === "stopping" || recPhase.phase === "diarizing"
+        ? "Finishing the previous recording"
+        : "Another note is recording";
+  const transcriptLockReason = transcriptLockCopy({
+    stopping: isStopping,
+    diarizing: isDiarizing,
+    importing: isImporting,
+  });
   const authorName = ownerName ?? myName ?? null;
   const authorInitial = (authorName ?? "?").slice(0, 1).toUpperCase();
   const noteWsName = draft.workspace_id
@@ -1063,7 +1104,7 @@ export function Note() {
           backLabel={backLabel}
           readOnly={readOnly}
           recActive={recActive}
-          canRecord={!otherActiveRecording && !lockedBy}
+          recordBlock={recordBlock}
           panelOpen={panelOpen}
           onTogglePanel={() => setPanelOpen((v) => !v)}
           onSummarizeFailed={clearSummaryStream}
@@ -1301,7 +1342,9 @@ export function Note() {
 
           </div>
         </div>
-        {!readOnly && <RecordingBar noteId={draft.id} />}
+        {!readOnly && (
+          <RecordingBar noteId={draft.id} />
+        )}
       </div>
 
       <aside
@@ -1629,6 +1672,7 @@ export function Note() {
                           transcript={draft.transcript}
                           onClick={() => {}}
                           disabled
+                          disabledReason={transcriptLockReason}
                           fill
                           bottomAligned={transcriptLive}
                         />
@@ -1653,6 +1697,7 @@ export function Note() {
                         value={draft.transcript}
                         onChange={onTranscriptChange}
                         disabled={readOnly || recActive}
+                        disabledReason={transcriptLockReason}
                         fill
                         bottomAligned={transcriptLive}
                       />
@@ -1660,6 +1705,9 @@ export function Note() {
                     {isRecording && <SkeletonLines lines={2} className="mt-3 shrink-0" />}
                   </>
                 ) : recActive || isTranscribing ? (
+                  // A replay commits its text in one write at the end (#146),
+                  // so there is nothing to stream in here. How far it has got
+                  // is on the recording bar, where a stop reports it too.
                   <SkeletonLines lines={4} />
                 ) : (
                   <PanelEmpty
@@ -1681,7 +1729,7 @@ export function Note() {
                       // deliberately: it is one action, not two.
                       //
                       // No busy state: this empty state gives way to the
-                      // in-flight skeleton, so `isTranscribing` is never true
+                      // in-flight indicator, so `isTranscribing` is never true
                       // while the button is on screen. `recActive` can't be
                       // either, for the same reason.
                       pendingTranscription && !readOnly ? (
@@ -1782,7 +1830,7 @@ export function NoteToolbar({
   backLabel,
   readOnly,
   recActive,
-  canRecord,
+  recordBlock,
   panelOpen,
   onTogglePanel,
   onSummarizeFailed,
@@ -1796,7 +1844,7 @@ export function NoteToolbar({
   backLabel: string;
   readOnly: boolean;
   recActive: boolean;
-  canRecord: boolean;
+  recordBlock: string | null;
   panelOpen: boolean;
   onTogglePanel: () => void;
   // This note has a take captured with "Transcribe manually" on whose audio is
@@ -1910,7 +1958,13 @@ export function NoteToolbar({
       <div className="flex-1" />
       {!readOnly && !recActive && (
         <>
-          <button onClick={record} disabled={!canRecord} className="no-drag nd-btn" title="Record (⌘R)" aria-label="Record">
+          <button
+            onClick={record}
+            disabled={!!recordBlock}
+            className="no-drag nd-btn"
+            title={recordBlock ?? "Record (⌘R)"}
+            aria-label="Record"
+          >
             <Circle size={10} fill="currentColor" strokeWidth={0} className="text-[var(--color-record)]" />
             <span className={ACTION_LABEL}>Record</span>
           </button>
@@ -2427,12 +2481,14 @@ export const TranscriptEditor = memo(function TranscriptEditor({
   value,
   onChange,
   disabled,
+  disabledReason,
   fill,
   bottomAligned,
 }: {
   value: string;
   onChange: (v: string) => void;
   disabled: boolean;
+  disabledReason?: string;
   fill?: boolean;
   bottomAligned: boolean;
 }) {
@@ -2579,6 +2635,7 @@ export const TranscriptEditor = memo(function TranscriptEditor({
             if (!disabled) setEditing(true);
           }}
           disabled={disabled}
+          disabledReason={disabledReason}
           fill={fill}
           bottomAligned={bottomAligned}
         />
@@ -2685,12 +2742,16 @@ const TranscriptView = memo(function TranscriptView({
   transcript,
   onClick,
   disabled,
+  // Named by the caller, because only the note knows which state the lock is
+  // for: a recording, the tail still landing, or the diarize pass.
+  disabledReason = LOCK_WHILE_RECORDING,
   fill,
   bottomAligned,
 }: {
   transcript: string;
   onClick: () => void;
   disabled: boolean;
+  disabledReason?: string;
   fill?: boolean;
   bottomAligned: boolean;
 }) {
@@ -2724,7 +2785,7 @@ const TranscriptView = memo(function TranscriptView({
     <div
       ref={scrollRef}
       onClick={onClick}
-      title={disabled ? "Editing is paused while recording" : "Click to edit"}
+      title={disabled ? disabledReason : "Click to edit"}
       className={
         "text-sm leading-relaxed text-[var(--color-text-muted)] overflow-y-auto " +
         (fill ? "flex-1 min-h-0 " : "") +
@@ -3724,6 +3785,9 @@ function DiagnosticsLinks({ noteId }: { noteId: string }) {
   const [diagFiles, setDiagFiles] = useState<string[]>([]);
   const [audioFiles, setAudioFiles] = useState<string[]>([]);
   const phase = useRecordingStore((s) => s.status.phase);
+  // A re-diarize writes a diagnostic dump too, and it no longer moves the
+  // global phase (#187) — so re-poll on its own per-note flag as well.
+  const rediarizing = useRecordingStore((s) => !!s.diarizing[noteId]);
 
   useEffect(() => {
     let cancelled = false;
@@ -3740,7 +3804,7 @@ function DiagnosticsLinks({ noteId }: { noteId: string }) {
     return () => {
       cancelled = true;
     };
-  }, [noteId, phase]);
+  }, [noteId, phase, rediarizing]);
 
   const hasDiag = diagFiles.length > 0;
   const hasAudio = audioFiles.length > 0;

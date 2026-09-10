@@ -1,13 +1,13 @@
-import { Outlet, useLocation } from "react-router-dom";
+import { Outlet, useLocation, useNavigate } from "react-router-dom";
 import { useEffect, useState } from "react";
 import { PanelLeft } from "lucide-react";
 import { Sidebar } from "./Sidebar";
 import { TopBar } from "./TopBar";
 import { Toaster } from "./Toaster";
 import { Updater } from "./Updater";
-import { PolishToast } from "./PolishToast";
+import { CaptureIndicator, indicatorState, useCaptureElapsed } from "./RecordingBar";
 import { ErrorBoundary } from "./ErrorBoundary";
-import { bindBackendListeners } from "../lib/store";
+import { bindBackendListeners, useRecordingStore } from "../lib/store";
 
 // Passed down to routed pages via <Outlet context>. The Note toolbar uses it
 // to inset its top-left content clear of the floating expand button + the
@@ -21,6 +21,7 @@ const NARROW_VIEWPORT_PX = 900;
 
 export function Layout() {
   const location = useLocation();
+  const navigate = useNavigate();
   // null means "no manual override — follow the auto-collapse rule".
   // A boolean means the user clicked the toggle and we honour it until
   // the route or viewport situation changes again.
@@ -52,6 +53,19 @@ export function Layout() {
   }, [shouldAutoCollapse]);
 
   const collapsed = manualCollapsed !== null ? manualCollapsed : shouldAutoCollapse;
+
+  // The capture indicator lives here rather than in the nav card because the
+  // card is REMOVED entirely below `NARROW_VIEWPORT_PX` — a sidebar home would
+  // vanish exactly when the window is small. Hidden on the note it is about,
+  // where the full bar is already saying the same thing — which is why the
+  // note comes from the indicator's own rule rather than from the recording
+  // status alone: a replay (#146) belongs to a note no capture names.
+  const recStatus = useRecordingStore((s) => s.status);
+  const transcribing = useRecordingStore((s) => s.transcribing);
+  const elapsed = useCaptureElapsed(recStatus.phase);
+  const subjectNoteId = indicatorState(recStatus, transcribing)?.noteId ?? null;
+  const onCaptureNote =
+    subjectNoteId !== null && location.pathname === `/note/${subjectNoteId}`;
 
   return (
     <div className="flex h-full p-1.5 gap-1.5 bg-[var(--color-canvas)]">
@@ -95,7 +109,13 @@ export function Layout() {
       </main>
       <Toaster />
       <Updater />
-      <PolishToast />
+      {!onCaptureNote && (
+        <CaptureIndicator
+          variant="compact"
+          elapsed={elapsed}
+          onOpen={() => subjectNoteId && navigate(`/note/${subjectNoteId}`)}
+        />
+      )}
     </div>
   );
 }

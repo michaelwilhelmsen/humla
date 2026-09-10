@@ -812,7 +812,17 @@ pub fn stored_audio_totals(recordings_root: &Path) -> StoredAudioTotals {
 /// silently does nothing. A mixdown is also not a substitute — the two streams
 /// are kept separate end-to-end precisely so each is diarized on its own.
 pub fn session_has_replayable_audio(session_dir: &Path) -> bool {
-    session_dir.join("mic.wav").exists() || session_dir.join("sys.wav").exists()
+    replayable_stream_count(session_dir) > 0
+}
+
+/// How many retained streams a deferred transcription would replay for this
+/// take. Each is a separate pass over the take's audio, which is what weights
+/// the run's progress (#146).
+pub fn replayable_stream_count(session_dir: &Path) -> u32 {
+    ["mic.wav", "sys.wav"]
+        .iter()
+        .filter(|f| session_dir.join(f).exists())
+        .count() as u32
 }
 
 pub fn session_has_audio(session_dir: &Path) -> bool {
@@ -1914,5 +1924,19 @@ mod tests {
 
         touch(&dir.join("sys.wav"));
         assert!(session_has_replayable_audio(&dir));
+    }
+
+    #[test]
+    fn each_retained_stream_is_a_pass_of_its_own() {
+        // What weights a deferred run's progress: the two streams are replayed
+        // one after the other, so a take that kept both costs twice its length.
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join("s1");
+        touch(&dir.join("playback.wav"));
+        assert_eq!(replayable_stream_count(&dir), 0);
+        touch(&dir.join("mic.wav"));
+        assert_eq!(replayable_stream_count(&dir), 1);
+        touch(&dir.join("sys.wav"));
+        assert_eq!(replayable_stream_count(&dir), 2);
     }
 }
