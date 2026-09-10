@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { ipc, onRecordingDiagnostic, onRecordingError, onRecordingStatus, onSummary, onSummaryStatus, onTitleStatus, onTranscribeStatus, onDiarizeStatus, onTranscript, onTranscriptReplaced, onNotesChanged, onSyncStatus, onSyncConflict, onLocalWhisperProgress, onLocalWhisperDownloadError, type Client, type Folder, type Note, type RecordingDiagnostic, type RecordingStatus, type ReplayPhase } from "./ipc";
+import { ipc, onRecordingDiagnostic, onRecordingError, onRecordingStatus, onSummary, onSummaryStatus, onTitleStatus, onTranscribeStatus, onDiarizeStatus, onTranscript, onTranscriptReplaced, onNotesChanged, onSyncStatus, onSyncConflict, onLocalWhisperProgress, onLocalWhisperDownloadError, type Client, type Folder, type Note, type RecordingDiagnostic, type RecordingStatus, type Step } from "./ipc";
 import { useCloudStore } from "./cloud";
 
 type NotesState = {
@@ -103,13 +103,15 @@ export type Flash = { id: number; message: string };
 
 /**
  * How far a deferred transcription's replay has got (#146), as `transcribe_status`
- * reports it: which half of the take is running (#188), audio position over the
- * whole run, and the 1-based take counter. Every field is optional — the
- * brackets around a run carry none of them, and a run with nothing to report is
- * exactly as active as one mid-way.
+ * reports it: which step of the take is running (#188, #189) and its discrete
+ * position, audio position over the whole run, and the 1-based take counter.
+ * Every field is optional — the brackets around a run carry none of them, and a
+ * run with nothing to report is exactly as active as one mid-way.
  */
 export type ReplayMeasure = {
-  phase?: ReplayPhase;
+  step?: Step;
+  index?: number;
+  count?: number;
   doneMs?: number;
   totalMs?: number;
   take?: number;
@@ -207,7 +209,15 @@ export const useRecordingStore = create<RecordingState>((set, get) => ({
       const next = { ...s.transcribing };
       if (active) {
         const prev = next[noteId];
-        next[noteId] = { ...prev, startedAt: prev?.startedAt ?? Date.now(), ...measure };
+        const startedAt = prev?.startedAt ?? Date.now();
+        // A measure naming a step REPLACES the run's measure; a bracket, which
+        // names none, leaves it alone. The fields a progress event omits are
+        // omitted because they don't apply to the step it names (#189) — a
+        // counter merged forward from the previous step would leave "1/2" on
+        // screen beside a step that counts nothing.
+        next[noteId] = measure?.step
+          ? { startedAt, ...measure }
+          : { ...prev, startedAt, ...measure };
       } else delete next[noteId];
       return { transcribing: next };
     }),

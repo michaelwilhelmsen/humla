@@ -40,7 +40,7 @@ import { DEFAULTS, type EditableKey } from "./pages/settings/types";
 import { SummaryStep } from "./pages/onboarding/steps/Summary";
 import { TranscriptionStep } from "./pages/onboarding/steps/Transcription";
 import { STEP_ORDER, type StepContext, type StepId } from "./pages/onboarding/types";
-import type { ProviderConfig, RecordingStatus, ReplayPhase, TimelineEntry } from "./lib/ipc";
+import type { ProviderConfig, RecordingStatus, Step, TimelineEntry } from "./lib/ipc";
 import { DEMO_CLIENTS, DEMO_FOLDERS, demoNotes } from "./test/noteLibrary";
 // Mirrors src/main.tsx — every theme's typeface, so a scenario reviewed under
 // `?palette=<id>` renders in that design's face rather than falling back.
@@ -821,6 +821,11 @@ function recBarCase(
     phase?: "recording" | "paused" | "stopping" | "diarizing" | "idle";
     pending?: number;
     done?: number;
+    // #189: which step of the post-stop chain the `diarizing` phase is in, and
+    // its discrete position where the step has units to count.
+    step?: Step;
+    index?: number;
+    count?: number;
     // A capture that ran with "Transcribe manually" on (#146): its stop draws
     // no bar at all, so this scenario is a row that must be EMPTY.
     deferred?: boolean;
@@ -833,11 +838,24 @@ function recBarCase(
       total: number;
       take?: number;
       takes?: number;
-      phase?: ReplayPhase;
+      step?: Step;
+      index?: number;
+      count?: number;
     };
   } = {},
 ): Scenario {
-  const { summarizing = false, paused = false, long = false, pending, done, deferred, replay } = opts;
+  const {
+    summarizing = false,
+    paused = false,
+    long = false,
+    pending,
+    done,
+    deferred,
+    replay,
+    step,
+    index,
+    count,
+  } = opts;
   const phase = opts.phase ?? (paused ? "paused" : "recording");
   return {
     wrap: (node) => (
@@ -848,11 +866,13 @@ function recBarCase(
           {paused && " · paused"}
           {long && " · long recording"}
           {phase === "stopping" && ` · stopping ${done ?? 0}/${pending ?? 0}`}
-          {phase === "diarizing" && " · identifying speakers"}
+          {phase === "diarizing" && ` · ${step ?? "identifying speakers"}`}
+          {count ? ` ${index ?? 1}/${count}` : ""}
           {deferred && " · deferred stop (no bar)"}
           {replay &&
-            ` · ${replay.phase ?? "transcribing"} ${replay.done}/${replay.total}ms` +
-              (replay.takes ? ` take ${replay.take ?? 1} of ${replay.takes}` : "")}
+            ` · ${replay.step ?? "transcribing"} ${replay.done}/${replay.total}ms` +
+              (replay.takes ? ` take ${replay.take ?? 1} of ${replay.takes}` : "") +
+              (replay.count ? ` stream ${replay.index ?? 1}/${replay.count}` : "")}
         </p>
         {/* The body column, dashed so an overhanging row is visible as one that
             leaves it. Deliberately NOT `overflow-hidden`: the real column has
@@ -871,17 +891,19 @@ function recBarCase(
       // pill can honestly reach: a 90-minute capture (4-digit seconds, 3-digit
       // chunk count) and a timer past the hour.
       useRecordingStore.setState({
-        status: { noteId: "n1", phase, pending, done, deferred },
+        status: { noteId: "n1", phase, pending, done, deferred, step, index, count },
         summarizing: summarizing ? { n1: true } : {},
         transcribing: replay
           ? {
               n1: {
                 startedAt: Date.now(),
-                phase: replay.phase ?? "transcribing",
+                step: replay.step ?? "transcribing",
                 doneMs: replay.done,
                 totalMs: replay.total,
                 take: replay.take,
                 takes: replay.takes,
+                index: replay.index,
+                count: replay.count,
               },
             }
           : {},
@@ -1037,7 +1059,7 @@ const CASES: Record<string, Scenario> = {
   // user who never opens this tab.
   "note-replay": noteTranscribeCase(false, {
     startedAt: Date.now(),
-    phase: "transcribing",
+    step: "transcribing",
     doneMs: 62_000,
     totalMs: 180_000,
     take: 2,
@@ -1047,7 +1069,7 @@ const CASES: Record<string, Scenario> = {
   // progress has one position — and the bar is what changed.
   "note-replay-diarize": noteTranscribeCase(false, {
     startedAt: Date.now(),
-    phase: "diarizing",
+    step: "diarizing",
     doneMs: 120_000,
     totalMs: 180_000,
     take: 2,
@@ -1114,20 +1136,20 @@ const CASES: Record<string, Scenario> = {
   // transcribing label names it, which makes this the widest label in the row.
   "recbar-diarize-replay": recBarCase(414, {
     phase: "idle",
-    replay: { done: 180_000, total: 180_000, phase: "diarizing" },
+    replay: { done: 180_000, total: 180_000, step: "diarizing" },
   }),
   "recbar-diarize-replay-takes": recBarCase(420, {
     phase: "idle",
-    replay: { done: 120_000, total: 180_000, take: 2, takes: 3, phase: "diarizing" },
+    replay: { done: 120_000, total: 180_000, take: 2, takes: 3, step: "diarizing" },
   }),
   "recbar-diarize-replay-380": recBarCase(380, {
     phase: "idle",
-    replay: { done: 120_000, total: 180_000, take: 2, takes: 3, phase: "diarizing" },
+    replay: { done: 120_000, total: 180_000, take: 2, takes: 3, step: "diarizing" },
   }),
   "recbar-diarize-replay-summary": recBarCase(380, {
     phase: "idle",
     summarizing: true,
-    replay: { done: 120_000, total: 180_000, take: 2, takes: 3, phase: "diarizing" },
+    replay: { done: 120_000, total: 180_000, take: 2, takes: 3, step: "diarizing" },
   }),
   "recbar-replay-summary": recBarCase(380, {
     phase: "idle",
@@ -1135,6 +1157,85 @@ const CASES: Record<string, Scenario> = {
     replay: { done: 62_000, total: 180_000, take: 2, takes: 3 },
   }),
   "recbar-deferred": recBarCase(414, { phase: "stopping", deferred: true }),
+
+  // --- #189: every step of the stop chain, named. The counted ones draw a
+  // determinate track at that coarse grain; the rest shimmer, because a
+  // diarize pass emits no progress and nothing may invent a percentage. The
+  // `-summary` variants are the tight three-pill arrangement, which is where
+  // any new label binds first — "Identifying speakers 2/2" is the widest of
+  // these, and #188's take clause is still wider than all of them.
+  "recbar-saving": recBarCase(414, {
+    phase: "diarizing",
+    step: "saving_audio",
+    index: 1,
+    count: 2,
+  }),
+  "recbar-saving-380": recBarCase(380, {
+    phase: "diarizing",
+    step: "saving_audio",
+    index: 1,
+    count: 2,
+  }),
+  "recbar-diarizing-2of2": recBarCase(414, {
+    phase: "diarizing",
+    step: "diarizing",
+    index: 2,
+    count: 2,
+  }),
+  "recbar-diarizing-2of2-summary": recBarCase(380, {
+    phase: "diarizing",
+    step: "diarizing",
+    index: 2,
+    count: 2,
+    summarizing: true,
+  }),
+  "recbar-playback": recBarCase(414, { phase: "diarizing", step: "writing_playback" }),
+  "recbar-playback-summary": recBarCase(380, {
+    phase: "diarizing",
+    step: "writing_playback",
+    summarizing: true,
+  }),
+  "recbar-unify": recBarCase(414, {
+    phase: "diarizing",
+    step: "matching_speakers",
+    index: 1,
+    count: 2,
+  }),
+  "recbar-unify-420": recBarCase(420, {
+    phase: "diarizing",
+    step: "matching_speakers",
+    index: 1,
+    count: 2,
+    long: true,
+  }),
+  "recbar-unify-summary": recBarCase(380, {
+    phase: "diarizing",
+    step: "matching_speakers",
+    index: 1,
+    count: 2,
+    summarizing: true,
+  }),
+  // The same steps on a replay, where the take clause takes the counter's
+  // slot: which take of the run beats which stream of the take.
+  "recbar-replay-playback": recBarCase(420, {
+    phase: "idle",
+    replay: { done: 120_000, total: 180_000, take: 2, takes: 3, step: "writing_playback" },
+  }),
+  "recbar-replay-unify": recBarCase(420, {
+    phase: "idle",
+    replay: { done: 180_000, total: 180_000, take: 3, takes: 3, step: "matching_speakers" },
+  }),
+  "recbar-replay-unify-summary": recBarCase(380, {
+    phase: "idle",
+    summarizing: true,
+    replay: { done: 180_000, total: 180_000, take: 3, takes: 3, step: "matching_speakers" },
+  }),
+  // A single-take replay has no take clause, so its steps show the stream
+  // counter instead — the one place a replay draws one.
+  "recbar-replay-streams": recBarCase(414, {
+    phase: "idle",
+    replay: { done: 180_000, total: 180_000, step: "diarizing", index: 1, count: 2 },
+  }),
 
   // --- #174: the no-audio warning naming the device it isn't hearing.
   // A real (localized) device name, the fallback when the HAL won't name one,
@@ -1171,7 +1272,7 @@ const CASES: Record<string, Scenario> = {
     {
       n1: {
         startedAt: Date.now(),
-        phase: "transcribing",
+        step: "transcribing",
         doneMs: 62_000,
         totalMs: 180_000,
         take: 2,
@@ -1187,10 +1288,34 @@ const CASES: Record<string, Scenario> = {
     {
       n1: {
         startedAt: Date.now(),
-        phase: "diarizing",
+        step: "diarizing",
         doneMs: 120_000,
         totalMs: 180_000,
         take: 2,
+        takes: 3,
+      },
+    },
+  ),
+  // #189: the unify pass, which is plausibly the longest step either chain
+  // runs and was invisible inside `Diarizing` until now — on the whole app,
+  // where a user who has left the note sees it at all.
+  "notes-unify": capturingLibraryCase({
+    noteId: "n1",
+    phase: "diarizing",
+    step: "matching_speakers",
+    index: 1,
+    count: 2,
+  }),
+  // And the same step of a replay, on the replay's own channel.
+  "notes-replay-unify": capturingLibraryCase(
+    { noteId: null, phase: "idle" },
+    {
+      n1: {
+        startedAt: Date.now(),
+        step: "matching_speakers",
+        doneMs: 180_000,
+        totalMs: 180_000,
+        take: 3,
         takes: 3,
       },
     },

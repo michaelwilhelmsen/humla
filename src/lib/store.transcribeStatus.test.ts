@@ -25,7 +25,7 @@ describe("transcribe_status progress", () => {
     await emit("transcribe_status", {
       noteId: "replay-note",
       active: true,
-      phase: "transcribing",
+      step: "transcribing",
       doneMs: 45_000,
       totalMs: 180_000,
       take: 2,
@@ -33,7 +33,7 @@ describe("transcribe_status progress", () => {
     });
     const run = useRecordingStore.getState().transcribing["replay-note"];
     expect(run).toMatchObject({
-      phase: "transcribing",
+      step: "transcribing",
       doneMs: 45_000,
       totalMs: 180_000,
       take: 2,
@@ -46,23 +46,48 @@ describe("transcribe_status progress", () => {
     expect(useRecordingStore.getState().status).toEqual(recording);
     expect(useRecordingStore.getState().diarizing).toEqual({});
 
-    // The diarize half of the same take (#188). Its own channel still, and the
+    // The diarize half of the same take (#188), named as one of the two
+    // passes a hybrid take costs (#189). Its own channel still, and the
     // position it reports is where the next take resumes.
     await emit("transcribe_status", {
       noteId: "replay-note",
       active: true,
-      phase: "diarizing",
+      step: "diarizing",
+      index: 1,
+      count: 2,
       doneMs: 120_000,
       totalMs: 180_000,
       take: 2,
       takes: 3,
     });
     expect(useRecordingStore.getState().transcribing["replay-note"]).toMatchObject({
-      phase: "diarizing",
+      step: "diarizing",
+      index: 1,
+      count: 2,
       doneMs: 120_000,
     });
     expect(useRecordingStore.getState().status).toEqual(recording);
     expect(useRecordingStore.getState().diarizing).toEqual({});
+
+    // The run's last step, which is note-wide rather than per take (#189).
+    await emit("transcribe_status", {
+      noteId: "replay-note",
+      active: true,
+      step: "matching_speakers",
+      doneMs: 180_000,
+      totalMs: 180_000,
+      take: 3,
+      takes: 3,
+    });
+    const unify = useRecordingStore.getState().transcribing["replay-note"];
+    expect(unify).toMatchObject({ step: "matching_speakers", doneMs: 180_000 });
+    // The previous step's counter does NOT survive into this one: a step that
+    // counts nothing must not wear "1/2" borrowed from the one before it.
+    expect(unify.index).toBeUndefined();
+    expect(unify.count).toBeUndefined();
+    // And the run is still the same run, so the pill doesn't change slots.
+    expect(unify.startedAt).toBe(run.startedAt);
+    expect(useRecordingStore.getState().status).toEqual(recording);
 
     await emit("transcribe_status", { noteId: "replay-note", active: false });
     expect(useRecordingStore.getState().transcribing).toEqual({});

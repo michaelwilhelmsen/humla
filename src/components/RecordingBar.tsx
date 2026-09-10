@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { MicOff, Pause, Play, Square } from "lucide-react";
-import { ipc, type RecordingPhase, type RecordingStatus } from "../lib/ipc";
+import { ipc, type RecordingPhase, type RecordingStatus, type Step } from "../lib/ipc";
 import { useRecordingStore, type ReplayRun } from "../lib/store";
 import { cn } from "../lib/cn";
 
@@ -71,10 +71,12 @@ export function noAudioWarning(device?: string | null): string {
  *      stop and is not optional; afterwards it is a number about a recording
  *      that is already over, and the progress pill beside it is the one saying
  *      what is still happening.
- *   6. `takeCounter` — a multi-take replay's " in take 2 of 3" (#188). The
- *      progress pill has no step beyond this one: what it is doing is the
- *      point of it, and a bar with no words cannot distinguish a drain from a
- *      diarize. Which take can go, because the phase is what changed.
+ *   6. `counter` — the progress pill's unit counter: a multi-take replay's
+ *      " in take 2 of 3" (#188), or a step's " 1/2" (#189). The pill has no
+ *      step beyond this one: what it is doing is the point of it, and a bar
+ *      with no words cannot distinguish a drain from a diarize. Which unit can
+ *      go, because the step is what changed — and the track keeps the same
+ *      fraction either way.
  *
  * Two arrangements, because the thresholds depend on what else is in the row:
  * `roomy` is diagnostics or controls or the stop's own pills, `tight` adds the
@@ -109,7 +111,7 @@ export const ROW_STEPS = {
     pill: "@max-[370px]:hidden",
     busyLabel: "",
     stopTimer: "",
-    takeCounter: "",
+    counter: "",
   },
   // diagnostics + busy + controls. Full row 739, compact 562, no diagnostics
   // 411, bare spinner 259 — which clears the narrowest column the layout can
@@ -129,18 +131,47 @@ export const ROW_STEPS = {
     // width-identical to hiding it, which the sweep confirms.
     busyLabel: "@max-[430px]:sr-only",
     stopTimer: "@max-[500px]:hidden",
-    // A multi-take replay's take clause (#188). `sr-only`, and out of flow,
-    // for the busy pill's reason.
+    // The progress pill's unit counter (#188, #189). `sr-only`, and out of
+    // flow, for the busy pill's reason.
     //
     // It fires BEFORE `busyLabel`, which is the one place in this ladder where
     // the more expensive step goes first. At these widths the row is the busy
     // pill and the progress pill and nothing else, and either step closes the
-    // gap — but the take clause is the only one of the two that a sighted user
-    // can still read once it is hidden, because the pill carries it in a
-    // `title` and a `role="status"` live region cannot.
-    takeCounter: "@max-[490px]:sr-only",
+    // gap — but the counter is the only one of the two that a sighted user can
+    // still read once it is hidden, because the pill carries it in a `title`
+    // and a `role="status"` live region cannot.
+    counter: "@max-[490px]:sr-only",
   },
 } as const;
+
+/**
+ * What each named step of a chain is called (#189). One map, because the stop
+ * and the replay draw from one `Step` vocabulary — a user who stops a
+ * recording and a user who presses Transcribe are watching the same work.
+ *
+ * Short on purpose: the row's tightest slack across the swept scenarios is
+ * 14px, and #188's take clause already needed a step of its own to hide.
+ */
+const STEP_LABELS: Record<Step, string> = {
+  transcribing: "Transcribing",
+  saving_audio: "Saving audio",
+  diarizing: "Identifying speakers",
+  writing_playback: "Writing playback",
+  matching_speakers: "Matching speakers",
+};
+
+/**
+ * A step's discrete position as the pill shows it, or "" when the step has
+ * nothing to count.
+ *
+ * The backend omits `index` / `count` below two units, so this is only ever
+ * hiding a malformed pair. Compact — `1/2`, not "stream 1 of 2" — because what
+ * the step IS is the point of the pill and the counter is the detail.
+ */
+function counterText(index?: number, count?: number): string {
+  if (!index || !count || count < 2) return "";
+  return ` ${Math.min(index, count)}/${count}`;
+}
 
 /**
  * What the bar says once the capture itself is over (#182).
@@ -149,9 +180,15 @@ export const ROW_STEPS = {
  * that were mid-decode when stop was pressed now append live — so the fraction
  * is a real one and reaches 1 exactly as the last of them lands. A stop with
  * nothing in flight is full immediately rather than starting at zero and
- * jumping. `diarizing` has no fraction to report at all: the diarize sidecar
- * emits no progress, so the bar stays full and shimmers instead of inventing
- * one.
+ * jumping.
+ *
+ * `diarizing` is the phase the whole post-stop chain reports inside, and the
+ * step named on it is what the label follows (#189). A step with units to
+ * count — two streams to copy, two to diarize, two to unify — is determinate
+ * at that coarse grain; one with a single unit reports no counter and stays
+ * full and shimmering, because a diarize pass emits no progress and nothing
+ * may invent a percentage. A `diarizing` carrying no step at all keeps the old
+ * copy: it is the moment before the chain has named its first step.
  *
  * Null for every other phase — those are the busy pill's, not the bar's. Null
  * too for a `deferred` stop (#146): that capture dispatched nothing and lands
@@ -159,20 +196,25 @@ export const ROW_STEPS = {
  * vanishes without ever having measured anything.
  */
 function captureProgress(
-  status: Pick<RecordingStatus, "phase" | "pending" | "done" | "deferred">,
-): { label: string; take: string; value: number | null } | null {
+  status: Pick<RecordingStatus, "phase" | "pending" | "done" | "deferred" | "step" | "index" | "count">,
+): { label: string; counter: string; value: number | null } | null {
   if (status.deferred) return null;
   if (status.phase === "stopping") {
     const pending = status.pending ?? 0;
     const done = status.done ?? 0;
     return {
       label: "Finishing transcript",
-      take: "",
+      counter: "",
       value: pending > 0 ? Math.min(1, done / pending) : 1,
     };
   }
   if (status.phase === "diarizing") {
-    return { label: "Identifying speakers", take: "", value: null };
+    const counter = counterText(status.index, status.count);
+    return {
+      label: status.step ? STEP_LABELS[status.step] : "Identifying speakers",
+      counter,
+      value: counter ? Math.min(1, (status.index ?? 0) / (status.count ?? 1)) : null,
+    };
   }
   return null;
 }
@@ -187,26 +229,32 @@ function captureProgress(
  * stuck. The take counter appears only when there is more than one take, since
  * "take 1 of 1" is a number about nothing.
  *
- * Each take is replayed and then diarized, and the diarize half is
- * indeterminate for exactly the reason a stop's is — the sidecar emits no
- * progress, so nothing may invent a percentage (#188). Its own audio position
- * arrives anyway and is where the next take resumes, hence `phase` and not the
- * fraction deciding which of the two the track is.
+ * Every step past the replay itself is indeterminate for exactly the reason a
+ * stop's diarize is — the sidecar emits no progress, so nothing may invent a
+ * percentage (#188). The run's audio position arrives anyway and is where the
+ * next take resumes, hence `step` and not the fraction deciding which the
+ * track is.
+ *
+ * The pill names ONE counter, the coarsest it has (#189): which take of the
+ * run beats which stream of the take, since a run's takes are what the user
+ * pressed Transcribe on. A single-take run has no take clause, so its steps
+ * show their stream counter instead.
  */
-function replayProgress(run: ReplayRun): { label: string; take: string; value: number | null } {
+function replayProgress(run: ReplayRun): { label: string; counter: string; value: number | null } {
   const takes = run.takes ?? 1;
   const take = takes > 1 ? ` take ${run.take ?? 1} of ${takes}` : "";
-  if (run.phase === "diarizing") {
+  const step = run.step ?? "transcribing";
+  if (step !== "transcribing") {
     return {
-      label: "Identifying speakers",
-      take: take && ` in${take}`,
+      label: STEP_LABELS[step],
+      counter: take ? ` in${take}` : counterText(run.index, run.count),
       value: null,
     };
   }
   const total = run.totalMs ?? 0;
   return {
-    label: "Transcribing",
-    take,
+    label: STEP_LABELS.transcribing,
+    counter: take,
     value: total > 0 ? Math.min(1, (run.doneMs ?? 0) / total) : 1,
   };
 }
@@ -233,13 +281,14 @@ export type IndicatorState = {
       phase with no measure of its own. */
   kind: "progress" | "live" | "spinner";
   /** What the pill says, without the trailing ellipsis every one of these
-      labels carries — the pill owns that, so the take clause can sit between
-      the words and it. */
+      labels carries — the pill owns that, so the counter can sit between the
+      words and it. */
   label: string;
-  /** A multi-take replay's take clause (#188), split off because the row's
-      narrowest step drops it from view: which take is the least of what the
-      pill says, and the phase is the most. Empty for everything else. */
-  take: string;
+  /** Which unit of how many the step is on — a replay's take clause (#188) or
+      a step's stream counter (#189) — split off because the row's narrowest
+      step drops it from view: which unit is the least of what the pill says,
+      and the step is the most. Empty where there is nothing to count. */
+  counter: string;
   value: number | null;
   /** `live` only: a paused capture takes the pause glyph over the record dot. */
   paused: boolean;
@@ -272,7 +321,7 @@ export function indicatorState(
         noteId: capture.noteId,
         kind: "live",
         label: "",
-        take: "",
+        counter: "",
         value: null,
         paused: capture.phase === "paused",
       };
@@ -282,7 +331,7 @@ export function indicatorState(
         noteId: capture.noteId,
         kind: "spinner",
         label: capture.phase === "starting" ? "Starting" : "Transcribing audio",
-        take: "",
+        counter: "",
         value: null,
         paused: false,
       };
@@ -338,7 +387,7 @@ export function CaptureIndicator({
   variant,
   noteId,
   elapsed = 0,
-  takeStep = "",
+  counterStep = "",
   onOpen,
 }: {
   variant: "bar" | "compact";
@@ -346,34 +395,34 @@ export function CaptureIndicator({
       not this note's business (the compact variant is app-wide and omits it). */
   noteId?: string;
   elapsed?: number;
-  /** `ROW_STEPS.takeCounter` for the arrangement the row is in — the `bar`
+  /** `ROW_STEPS.counter` for the arrangement the row is in — the `bar`
       variant sits in that row, and which arrangement it is is the row's
       knowledge, not this pill's. The compact variant has a screen edge to
       itself and passes nothing. */
-  takeStep?: string;
+  counterStep?: string;
   onOpen?: () => void;
 }) {
   const global = useRecordingStore((s) => s.status);
   const transcribing = useRecordingStore((s) => s.transcribing);
   const state = indicatorState(global, transcribing, noteId);
   const progress = state?.kind === "progress" ? state : null;
-  // Named from the whole label, not from the visible text: the take clause is
+  // Named from the whole label, not from the visible text: the counter is
   // hidden by a step at the narrowest widths (#188) and must stay in the name.
-  const name = progress ? `${progress.label}${progress.take}…` : "";
+  const name = progress ? `${progress.label}${progress.counter}…` : "";
   const live = state?.kind === "live";
   if (variant === "bar") {
     if (!progress) return null;
     return (
       <div
-        // Only where a step can hide part of it: the take clause survives in
-        // the tooltip the way the diagnostics pill's numbers do. A tooltip
+        // Only where a step can hide part of it: the counter survives in the
+        // tooltip the way the diagnostics pill's numbers do. A tooltip
         // repeating text that is fully visible is noise.
-        title={progress.take ? name : undefined}
+        title={progress.counter ? name : undefined}
         className="nd-recpill no-drag shrink-0 whitespace-nowrap flex items-center gap-2.5 h-[38px] px-4 rounded-full border border-[var(--color-line-visible)]"
       >
         <span className="shrink-0 whitespace-nowrap text-[13px] font-medium text-[var(--color-text-muted)]">
           {progress.label}
-          {progress.take && <span className={takeStep}>{progress.take}</span>}
+          {progress.counter && <span className={counterStep}>{progress.counter}</span>}
           …
         </span>
         {/* 56px, not the wider track a settings panel can afford: the row it
@@ -722,7 +771,7 @@ export function RecordingBar({ noteId }: { noteId: string }) {
       {/* Where the pause and stop buttons were. The transcript's tail is
           landing into the panel beside this, so the row's remaining job is to
           say how much of it is still coming. */}
-      <CaptureIndicator variant="bar" noteId={noteId} takeStep={steps.takeCounter} />
+      <CaptureIndicator variant="bar" noteId={noteId} counterStep={steps.counter} />
       </div>
     </div>
   );

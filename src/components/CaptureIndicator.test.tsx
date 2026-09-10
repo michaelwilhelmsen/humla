@@ -89,7 +89,7 @@ describe("the compact indicator during a replay (#146)", () => {
     open(
       "/all-notes",
       { noteId: null, phase: "idle" },
-      { n1: { ...RUN, phase: "diarizing", doneMs: 180_000 } },
+      { n1: { ...RUN, step: "diarizing", doneMs: 180_000 } },
     );
     const bar = await screen.findByRole("progressbar", { name: "Identifying speakers…" });
     expect(bar).not.toHaveAttribute("aria-valuenow");
@@ -100,7 +100,7 @@ describe("the compact indicator during a replay (#146)", () => {
     open(
       "/all-notes",
       { noteId: null, phase: "idle" },
-      { n1: { ...RUN, phase: "diarizing", take: 2, takes: 3 } },
+      { n1: { ...RUN, step: "diarizing", take: 2, takes: 3 } },
     );
     await screen.findByRole("progressbar", { name: "Identifying speakers in take 2 of 3…" });
   });
@@ -109,7 +109,7 @@ describe("the compact indicator during a replay (#146)", () => {
     open(
       "/all-notes",
       { noteId: null, phase: "idle" },
-      { n1: { ...RUN, phase: "transcribing", doneMs: 120_000, take: 3, takes: 3 } },
+      { n1: { ...RUN, step: "transcribing", doneMs: 120_000, take: 3, takes: 3 } },
     );
     const bar = await screen.findByRole("progressbar", { name: "Transcribing take 3 of 3…" });
     expect(bar).toHaveAttribute("aria-valuenow", "67");
@@ -151,5 +151,88 @@ describe("the compact indicator during a replay (#146)", () => {
     await screen.findByText(/weekly sync/i);
     expect(screen.queryByRole("progressbar")).toBeNull();
     expect(screen.queryByRole("button", { name: /open the recording/i })).toBeNull();
+  });
+});
+
+// #189. Every step of both chains has a name now, and the ones with real units
+// to count have a determinate track at that coarse grain.
+describe("the compact indicator on a named step (#189)", () => {
+  const RUN: ReplayRun = { startedAt: 1, doneMs: 180_000, totalMs: 180_000 };
+
+  it("names the audio copy, determinate over the streams it copies", async () => {
+    open("/all-notes", {
+      noteId: "n1",
+      phase: "diarizing",
+      step: "saving_audio",
+      index: 1,
+      count: 2,
+    });
+    const bar = await screen.findByRole("progressbar", { name: "Saving audio 1/2…" });
+    expect(bar).toHaveAttribute("aria-valuenow", "50");
+  });
+
+  it("counts the two diarize passes a hybrid capture runs", async () => {
+    open("/all-notes", {
+      noteId: "n1",
+      phase: "diarizing",
+      step: "diarizing",
+      index: 2,
+      count: 2,
+    });
+    const bar = await screen.findByRole("progressbar", { name: "Identifying speakers 2/2…" });
+    expect(bar).toHaveAttribute("aria-valuenow", "100");
+  });
+
+  it("stays indeterminate for a single pass, which counts nothing", async () => {
+    open("/all-notes", { noteId: "n1", phase: "diarizing", step: "diarizing" });
+    const bar = await screen.findByRole("progressbar", { name: "Identifying speakers…" });
+    expect(bar).not.toHaveAttribute("aria-valuenow");
+  });
+
+  it("names the playback write, which has nothing to count", async () => {
+    open("/all-notes", { noteId: "n1", phase: "diarizing", step: "writing_playback" });
+    const bar = await screen.findByRole("progressbar", { name: "Writing playback…" });
+    expect(bar).not.toHaveAttribute("aria-valuenow");
+  });
+
+  it("names the unify pass, which was invisible inside the diarize step", async () => {
+    open("/all-notes", {
+      noteId: "n1",
+      phase: "diarizing",
+      step: "matching_speakers",
+      index: 1,
+      count: 2,
+    });
+    const bar = await screen.findByRole("progressbar", { name: "Matching speakers 1/2…" });
+    expect(bar).toHaveAttribute("aria-valuenow", "50");
+  });
+
+  it("names the unify pass of a replay too, on the replay's own channel", async () => {
+    open("/all-notes", { noteId: null, phase: "idle" }, {
+      n1: { ...RUN, step: "matching_speakers", take: 3, takes: 3 },
+    });
+    // The take clause wins over a stream counter: which take of the run the
+    // user pressed Transcribe on is the coarser fact.
+    await screen.findByRole("progressbar", { name: "Matching speakers in take 3 of 3…" });
+  });
+
+  it("shows a single-take replay's stream counter, having no take clause", async () => {
+    open("/all-notes", { noteId: null, phase: "idle" }, {
+      n1: { ...RUN, step: "diarizing", index: 1, count: 2, take: 1, takes: 1 },
+    });
+    await screen.findByRole("progressbar", { name: "Identifying speakers 1/2…" });
+  });
+
+  it("keeps a deferred stop silent however many steps it would have named", async () => {
+    open("/all-notes", {
+      noteId: "n1",
+      phase: "diarizing",
+      deferred: true,
+      step: "saving_audio",
+      index: 1,
+      count: 2,
+    });
+    await screen.findByText(/weekly sync/i);
+    expect(screen.queryByRole("progressbar")).toBeNull();
   });
 });
