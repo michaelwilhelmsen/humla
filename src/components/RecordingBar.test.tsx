@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { act, render, screen } from "@testing-library/react";
-import { ROW_STEPS, RecordingBar, noAudioWarning } from "./RecordingBar";
+import { ROW_STEPS, RecordingBar, indicatorState, noAudioWarning } from "./RecordingBar";
 import { useRecordingStore, type ReplayRun } from "../lib/store";
 import type { RecordingStatus } from "../lib/ipc";
 
@@ -294,11 +294,13 @@ describe("the bar during a deferred transcription's replay (#146)", () => {
     expect(screen.queryByRole("progressbar")).toBeNull();
   });
 
-  it("draws no bar for the stop of a capture that deferred its transcription", () => {
+  it("draws nothing at all for the stop of a capture that deferred its transcription", () => {
     // That stop dispatched nothing and lands on idle in a few hundred
-    // milliseconds, so a bar drawn for it appears and vanishes without ever
-    // measuring anything. `deferred` is the discriminator, NOT an empty drain:
-    // a live take with zero pending chunks is a real full bar.
+    // milliseconds, so anything drawn for it appears and vanishes without ever
+    // measuring anything — the frozen timer included, since a timer flashing
+    // beside an empty row is the same glitch as the bar. `deferred` is the
+    // discriminator, NOT an empty drain: a live take with zero pending chunks
+    // is a real full bar and keeps its timer.
     for (const phase of ["stopping", "diarizing"] as const) {
       useRecordingStore.setState({
         status: { noteId: "n1", phase, deferred: true },
@@ -308,7 +310,54 @@ describe("the bar during a deferred transcription's replay (#146)", () => {
       });
       const { unmount } = render(<RecordingBar noteId="n1" />);
       expect(screen.queryByRole("progressbar")).toBeNull();
+      expect(screen.queryByText(/^\d+:\d{2}$/)).toBeNull();
       unmount();
     }
+  });
+});
+
+// One indicator per screen. The Transcript panel draws the replay where the
+// user pressed Transcribe and watched an empty transcript, so that surface
+// wins while it is visible and the floating bar drops its copy — the same pill
+// rendered twice on one screen reads as a bug.
+describe("a replay the Transcript panel is already showing (#146)", () => {
+  const RUN: ReplayRun = { startedAt: 1, doneMs: 45_000, totalMs: 180_000 };
+  const IDLE: RecordingStatus = { noteId: null, phase: "idle" };
+
+  it("stands down where the panel has it, and not otherwise", () => {
+    expect(indicatorState(IDLE, { n1: RUN }, "n1")).not.toBeNull();
+    expect(indicatorState(IDLE, { n1: RUN }, "n1", true)).toBeNull();
+  });
+
+  it("keeps a live capture and a stop, which the panel never draws", () => {
+    for (const status of [
+      { noteId: "n1", phase: "recording" } as const,
+      { noteId: "n1", phase: "paused" } as const,
+      { noteId: "n1", phase: "starting" } as const,
+      { noteId: "n1", phase: "stopping", pending: 4, done: 1 } as const,
+      { noteId: "n1", phase: "diarizing" } as const,
+    ]) {
+      expect(indicatorState(status, { n1: RUN }, "n1", true)).not.toBeNull();
+    }
+  });
+
+  it("suppresses one note's replay, never another's", () => {
+    // The app-wide pill has no scope of its own, and a replay on a note the
+    // user is not looking at is exactly what it exists to report.
+    expect(indicatorState(IDLE, { n2: RUN }, undefined, true)?.noteId).toBe("n2");
+  });
+
+  it("is wired through the bar and not only through the rule", () => {
+    useRecordingStore.setState({
+      status: IDLE,
+      summarizing: {},
+      diag: null,
+      transcribing: { n1: RUN },
+    });
+    const { unmount } = render(<RecordingBar noteId="n1" />);
+    expect(screen.getByRole("progressbar", { name: "Transcribing…" })).toBeInTheDocument();
+    unmount();
+    render(<RecordingBar noteId="n1" replayShownInPanel />);
+    expect(screen.queryByRole("progressbar")).toBeNull();
   });
 });

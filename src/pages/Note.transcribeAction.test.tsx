@@ -305,6 +305,28 @@ describe("the transcript panel's Transcribe action", () => {
       name: "Transcribing take 2 of 3…",
     });
     expect(bar).toHaveAttribute("aria-valuenow", "25");
+    // And it is the only one on screen: the same pill in the panel and in the
+    // floating bar reads as a bug, so while this tab shows it the bar doesn't.
+    expect(screen.getAllByRole("progressbar")).toHaveLength(1);
+  });
+
+  // The other half of the one-indicator rule: the panel wins only while it is
+  // the surface showing the run. Off the Transcript tab it shows nothing, so
+  // the floating bar is the whole answer again.
+  it("leaves the run to the floating bar on a tab that isn't showing it", async () => {
+    const { user } = await openTranscriptPanel([session({ canTranscribe: true })]);
+    await screen.findByText(/hasn't been transcribed yet/i);
+
+    act(() =>
+      useRecordingStore.getState().setTranscribing("n1", true, {
+        doneMs: 45_000,
+        totalMs: 180_000,
+      }),
+    );
+    await user.click(screen.getByRole("button", { name: /^summary$/i }));
+
+    const bar = await screen.findByRole("progressbar", { name: "Transcribing…" });
+    expect(bar).toHaveAttribute("aria-valuenow", "25");
   });
 
   // A note with nothing recorded has nothing to run: its empty state is advice

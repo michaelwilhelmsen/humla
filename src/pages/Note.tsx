@@ -1064,6 +1064,12 @@ export function Note() {
   // chunks stay visible. After stop / on a saved note the user is
   // reading from the top, so flip back to top alignment.
   const transcriptLive = isRecording || isPaused || isStopping || isDiarizing || isImporting;
+  // Whether the Transcript tab is standing a replay's progress itself (#146) —
+  // the panel being visible, plus the state its own branch draws the indicator
+  // in. The floating bar drops that one rather than saying it twice, and only
+  // that one: a live capture and a stop are never drawn in the panel.
+  const replayShownInPanel =
+    panelOpen && activeTab === "transcript" && !hasTranscript && !recActive;
 
   const folder = draft.folder_id ? folders.find((f) => f.id === draft.folder_id) : null;
   const backTo = folder ? `/folder/${folder.id}` : "/";
@@ -1342,7 +1348,9 @@ export function Note() {
 
           </div>
         </div>
-        {!readOnly && <RecordingBar noteId={draft.id} />}
+        {!readOnly && (
+          <RecordingBar noteId={draft.id} replayShownInPanel={replayShownInPanel} />
+        )}
       </div>
 
       <aside
