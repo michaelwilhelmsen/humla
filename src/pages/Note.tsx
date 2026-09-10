@@ -517,12 +517,19 @@ export function Note() {
   // recording that came back off the wrong language or the wrong model. Same
   // backend answer as `canTranscribe`, one condition looser.
   const canRetranscribe = sessions.some((sess) => sess.canRetranscribe);
+  const isRediarizing = useRecordingStore(
+    (s) => !!draft && !!s.diarizing[draft.id],
+  );
   const isThisNoteActive = !!draft && recPhase.noteId === draft.id;
   const isRecording = isThisNoteActive && recPhase.phase === "recording";
   const isPaused = isThisNoteActive && recPhase.phase === "paused";
   const isStarting = isThisNoteActive && recPhase.phase === "starting";
   const isStopping = isThisNoteActive && recPhase.phase === "stopping";
-  const isDiarizing = isThisNoteActive && recPhase.phase === "diarizing";
+  // Diarization on THIS note: the post-stop chain of a capture that just
+  // finished (global phase), or a Re-diarize / unify the user pressed here
+  // (per-note channel, #187 — `recording_status` describes the live capture and
+  // nothing else, so a re-diarize can't be read off it).
+  const isDiarizing = (isThisNoteActive && recPhase.phase === "diarizing") || isRediarizing;
   // A file import replaying through the pipeline. Treated like a live capture
   // for UI purposes (transcript streams in, Record/Summarize hidden) but has no
   // pause/stop controls — the sidecar replays once and finishes on its own.
@@ -758,7 +765,9 @@ export function Note() {
   // depending only on draft.id would leave the player hidden until
   // the user navigates away and back. Stable recording_phase
   // transitions: stopping → diarizing → idle — by the time we land
-  // on idle, the bundle exists.
+  // on idle, the bundle exists. A re-diarize rewrites the timeline and
+  // playback.wav without touching that phase (#187), so it has to be here on
+  // its own flag, the way a deferred transcription already is.
   useEffect(() => {
     if (!draft) return;
     let cancelled = false;
@@ -865,7 +874,7 @@ export function Note() {
     // transcribed, and it deliberately never touches the recording phase — so
     // without this the reader would keep rendering the pre-transcription
     // sessions until the user navigated away and back.
-  }, [draft?.id, draft?.workspace_id, recPhase.phase, keepAudio, isTranscribing]);
+  }, [draft?.id, draft?.workspace_id, recPhase.phase, keepAudio, isTranscribing, isRediarizing]);
 
   // patch / patchProvider intentionally read from `draftRef.current`
   // rather than the `draft` closure so they can stay stable across
@@ -3724,6 +3733,9 @@ function DiagnosticsLinks({ noteId }: { noteId: string }) {
   const [diagFiles, setDiagFiles] = useState<string[]>([]);
   const [audioFiles, setAudioFiles] = useState<string[]>([]);
   const phase = useRecordingStore((s) => s.status.phase);
+  // A re-diarize writes a diagnostic dump too, and it no longer moves the
+  // global phase (#187) — so re-poll on its own per-note flag as well.
+  const rediarizing = useRecordingStore((s) => !!s.diarizing[noteId]);
 
   useEffect(() => {
     let cancelled = false;
@@ -3740,7 +3752,7 @@ function DiagnosticsLinks({ noteId }: { noteId: string }) {
     return () => {
       cancelled = true;
     };
-  }, [noteId, phase]);
+  }, [noteId, phase, rediarizing]);
 
   const hasDiag = diagFiles.length > 0;
   const hasAudio = audioFiles.length > 0;

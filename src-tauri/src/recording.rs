@@ -418,6 +418,18 @@ pub struct TranscribeStatusPayload {
     pub active: bool,
 }
 
+/// Per-note (re)diarize lifecycle (#187), on its own channel because
+/// `recording_status` describes the live capture and nothing else. Re-diarize
+/// and the cross-session unify pass are user actions on an *arbitrary* note, so
+/// a recording may be running on another note throughout — an `Idle` from here
+/// would blank that recording's bar, timer, stop button and tray.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiarizeStatusPayload {
+    pub note_id: String,
+    pub active: bool,
+}
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StreamDeltaPayload {

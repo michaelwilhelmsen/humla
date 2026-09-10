@@ -807,6 +807,11 @@ export type TitleStatus = { noteId: string; active: boolean };
 // Per-note, and never on `recording_status`: a live recording on a different
 // note may be in flight at the same time.
 export type TranscribeStatus = { noteId: string; active: boolean };
+// A (re)diarize pass is running on this note — Re-diarize, or the
+// cross-session unify (#187). Per-note, and never on `recording_status`: that
+// channel describes the live capture and nothing else, so its `idle` would
+// blank a recording running on a different note.
+export type DiarizeStatus = { noteId: string; active: boolean };
 export type RecordingDiagnostic = {
   noteId: string;
   micFrames: number;
@@ -852,6 +857,9 @@ export function onTitleStatus(cb: (e: TitleStatus) => void): Promise<UnlistenFn>
 }
 export function onTranscribeStatus(cb: (e: TranscribeStatus) => void): Promise<UnlistenFn> {
   return listen<TranscribeStatus>("transcribe_status", (e) => cb(e.payload));
+}
+export function onDiarizeStatus(cb: (e: DiarizeStatus) => void): Promise<UnlistenFn> {
+  return listen<DiarizeStatus>("diarize_status", (e) => cb(e.payload));
 }
 export function onRecordingError(cb: (e: RecordingError) => void): Promise<UnlistenFn> {
   return listen<RecordingError>("recording_error", (e) => cb(e.payload));

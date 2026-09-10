@@ -166,19 +166,22 @@ pub async fn rediarize_note(app: AppHandle, note_id: String) -> Result<(), Strin
                 }
             }
         }
-        emit_status(&app, Some(&note_id), Phase::Diarizing);
+        // On the per-note channel, never the global phase: a recording may be
+        // running on another note throughout (#187).
+        let policy = DiarizePolicy::REDIARIZE;
+        policy.report_started(&app, &note_id);
         match unify_note_speakers(&app, &note_id).await {
             Ok(true) => {
-                emit_status(&app, None, Phase::Idle);
+                policy.report_finished(&app, &note_id);
                 return Ok(());
             }
             Ok(false) => {
                 // Not enough retained per-session audio to unify — fall
                 // through to the latest-take re-diarize.
-                emit_status(&app, None, Phase::Idle);
+                policy.report_finished(&app, &note_id);
             }
             Err(e) => {
-                emit_status(&app, None, Phase::Idle);
+                policy.report_finished(&app, &note_id);
                 return Err(format!("Speaker unification failed: {e}"));
             }
         }
@@ -354,48 +357,68 @@ pub(crate) enum LabelFallback {
     Unlabelled,
 }
 
+/// Which channel a (re)diarize pass announces itself on.
+///
+/// `recording_status` describes the one live capture and nothing else (#187):
+/// it is a single global slot that also drives the tray icon and its Start/Stop
+/// items, so a pass the user can start on an *arbitrary* note must stay off it —
+/// its `Idle` would blank a recording running on a different note.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProgressChannel {
+    /// The global `recording_status` phase (Diarizing → Idle). Only the live
+    /// capture's own post-stop chain, whose phase this genuinely is.
+    RecordingPhase,
+    /// The per-note `diarize_status` channel.
+    DiarizeStatus,
+    /// Nothing. Deferred transcription (#146) brackets the whole replay in its
+    /// own per-note `transcribe_status`, so the diarize inside it has nothing
+    /// to add.
+    Silent,
+}
+
 /// How a (re)diarize pass behaves for the surface that asked for it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DiarizePolicy {
     /// What to do when speaker labels can't be produced.
     fallback: LabelFallback,
-    /// Whether to drive the global `recording_status` phase (Diarizing → Idle).
-    ///
-    /// The user-pressed **Re-diarize** does: it is the only thing running, and
-    /// the phase is its spinner. A deferred transcription (#146) must not — it
-    /// is per-note work that may run while a *different* note records, and an
-    /// `Idle` from here would blank that recording's bar. Exactly the failure
-    /// the per-note `summary_status` channel was created to fix; deferred
-    /// transcription has its own `transcribe_status` for the same reason.
-    report_phase: bool,
+    /// Where the pass reports being in flight.
+    progress: ProgressChannel,
 }
 
 impl DiarizePolicy {
-    /// Hand the global phase back to Idle, for the surfaces that drive it.
-    /// A no-op under `report_phase: false` — see the field.
-    fn report_idle(self, app: &AppHandle) {
-        if self.report_phase {
-            emit_status(app, None, Phase::Idle);
+    /// Announce the pass on this policy's channel.
+    fn report_started(self, app: &AppHandle, note_id: &str) {
+        match self.progress {
+            ProgressChannel::RecordingPhase => emit_status(app, Some(note_id), Phase::Diarizing),
+            ProgressChannel::DiarizeStatus => emit_diarize_status(app, note_id, true),
+            ProgressChannel::Silent => {}
         }
     }
 
-    /// Announce the pass on the global phase, for the surfaces that drive it.
-    fn report_diarizing(self, app: &AppHandle, note_id: &str) {
-        if self.report_phase {
-            emit_status(app, Some(note_id), Phase::Diarizing);
+    /// Clear it again, on every exit path.
+    fn report_finished(self, app: &AppHandle, note_id: &str) {
+        match self.progress {
+            ProgressChannel::RecordingPhase => emit_status(app, None, Phase::Idle),
+            ProgressChannel::DiarizeStatus => emit_diarize_status(app, note_id, false),
+            ProgressChannel::Silent => {}
         }
     }
 
     /// The user pressed Re-diarize on a note that already reads correctly.
     pub(crate) const REDIARIZE: Self = Self {
         fallback: LabelFallback::Abort,
-        report_phase: true,
+        progress: ProgressChannel::DiarizeStatus,
     };
     /// A deferred transcription is putting this take's text into the note for
     /// the first time.
     pub(crate) const DEFERRED_TRANSCRIBE: Self = Self {
         fallback: LabelFallback::Unlabelled,
-        report_phase: false,
+        progress: ProgressChannel::Silent,
+    };
+    /// The post-stop chain of the capture that just finished.
+    pub(crate) const POST_STOP: Self = Self {
+        fallback: LabelFallback::Unlabelled,
+        progress: ProgressChannel::RecordingPhase,
     };
 }
 
@@ -417,13 +440,13 @@ async fn rediarize_apply_to_chunks(
     // running it here rather than trusting the chunk log.
     let chunks = drop_incidental_stream_hallucinations(chunks);
     if chunks.is_empty() {
-        policy.report_idle(&app);
+        policy.report_finished(&app, &note_id);
         return Err(anyhow::anyhow!("no usable chunks after dropping collapsed ones"));
     }
     let mic_chunks_present = chunks.iter().any(|c| c.source == ChunkSource::Mic);
     let sys_chunks_present = chunks.iter().any(|c| c.source == ChunkSource::Sys);
 
-    policy.report_diarizing(&app, &note_id);
+    policy.report_started(&app, &note_id);
 
     type Splitter = dyn Fn(&ChunkRecord) -> Vec<LabelledPiece> + Send;
     struct DiarizeStage {
@@ -493,7 +516,7 @@ async fn rediarize_apply_to_chunks(
             match outcome {
                 Err(why) if policy.fallback == LabelFallback::Unlabelled => unlabelled_stage(&why),
                 Err(why) => {
-                    policy.report_idle(&app);
+                    policy.report_finished(&app, &note_id);
                     return Err(anyhow::anyhow!(why));
                 }
                 Ok(segments) => {
@@ -533,7 +556,7 @@ async fn rediarize_apply_to_chunks(
             match outcome {
                 Err(why) if policy.fallback == LabelFallback::Unlabelled => unlabelled_stage(&why),
                 Err(why) => {
-                    policy.report_idle(&app);
+                    policy.report_finished(&app, &note_id);
                     return Err(anyhow::anyhow!(why));
                 }
                 Ok(segments) => {
@@ -614,7 +637,7 @@ async fn rediarize_apply_to_chunks(
             }
         }
         (false, false) => {
-            policy.report_idle(&app);
+            policy.report_finished(&app, &note_id);
             return Err(anyhow::anyhow!("no chunks recorded for either source"));
         }
         }
@@ -644,7 +667,7 @@ async fn rediarize_apply_to_chunks(
     let split_chunk = stage.splitter;
     let new_transcript = build_labelled_transcript(&chunks, split_chunk.as_ref());
     if new_transcript.trim().is_empty() {
-        policy.report_idle(&app);
+        policy.report_finished(&app, &note_id);
         return Err(anyhow::anyhow!("re-diarize produced empty transcript"));
     }
 
@@ -671,9 +694,15 @@ async fn rediarize_apply_to_chunks(
 
     // Through the shared commit, so re-diarize inherits its refusal to trade a
     // non-empty transcript for an empty projection rather than restating it.
-    let full_transcript = rebuild_note_transcript(&app, &note_id).map_err(|e| anyhow::anyhow!(e))?;
+    let full_transcript = match rebuild_note_transcript(&app, &note_id) {
+        Ok(t) => t,
+        Err(e) => {
+            policy.report_finished(&app, &note_id);
+            return Err(anyhow::anyhow!(e));
+        }
+    };
     if let Err(e) = commit_rebuilt_transcript(&app, &note_id, full_transcript) {
-        policy.report_idle(&app);
+        policy.report_finished(&app, &note_id);
         return Err(anyhow::anyhow!(e));
     }
     // Re-diarize rewrote this session's timeline.jsonl — re-push the metadata
@@ -681,7 +710,7 @@ async fn rediarize_apply_to_chunks(
     // asset after the command returns.
     session_changed_for_sync(&app, &note_id, &session_id);
 
-    policy.report_idle(&app);
+    policy.report_finished(&app, &note_id);
     Ok(())
 }
 
@@ -2705,7 +2734,7 @@ async fn run_post_stop_chain(
     // After `record_detected_language`, though: that resolves `auto` to what was
     // actually spoken, and the title's language directive reads it.
     tauri::async_runtime::spawn(title::generate_note_title(app.clone(), note_id.clone()));
-    if let Err(e) = diarize_and_apply(app.clone(), note_id.clone(), post_stop).await {
+    if let Err(e) = diarize_and_apply(app.clone(), note_id.clone(), post_stop, DiarizePolicy::POST_STOP).await {
         eprintln!("diarize_and_apply: {e}");
         emit_error(
             &app,
@@ -3766,6 +3795,7 @@ async fn diarize_and_apply(
     app: AppHandle,
     note_id: String,
     post_stop: PostStopSnapshot,
+    policy: DiarizePolicy,
 ) -> anyhow::Result<()> {
     // Per-session state arrives via `post_stop`, captured in
     // `recording_stop` once the reader thread finished writing to the
@@ -3818,7 +3848,7 @@ async fn diarize_and_apply(
     let sys_chunks_present = chunks.iter().any(|c| c.source == ChunkSource::Sys);
 
     if diarize_available {
-        emit_status(&app, Some(&note_id), Phase::Diarizing);
+        policy.report_started(&app, &note_id);
     }
 
     // Decide which WAV to diarize and how to label chunks. The label
@@ -6540,6 +6570,20 @@ pub(crate) fn emit_status(app: &AppHandle, note_id: Option<&str>, phase: Phase) 
     crate::menubar::on_phase(app, phase);
 }
 
+/// Per-note (re)diarize lifecycle (#187), on its own channel for the same
+/// reason `transcribe_status` has one: re-diarize and unify are user actions on
+/// an arbitrary note, so they must not reach `recording_status`, which describes
+/// the live capture and nothing else.
+fn emit_diarize_status(app: &AppHandle, note_id: &str, active: bool) {
+    let _ = app.emit(
+        "diarize_status",
+        crate::recording::DiarizeStatusPayload {
+            note_id: note_id.to_string(),
+            active,
+        },
+    );
+}
+
 fn emit_error(app: &AppHandle, note_id: Option<&str>, message: &str) {
     let _ = app.emit("recording_error", ErrorPayload {
         note_id: note_id.map(|s| s.to_string()),
@@ -7095,6 +7139,30 @@ mod unify_concurrency_tests {
         );
         drop(held);
         assert!(same.try_lock().is_ok(), "lock frees once the first pass ends");
+    }
+}
+
+#[cfg(test)]
+mod diarize_policy_tests {
+    use super::*;
+
+    #[test]
+    fn only_the_post_stop_chain_reports_on_the_recording_phase() {
+        // `recording_status` is a single global slot that also drives the tray,
+        // so anything a user can start on an arbitrary note must stay off it —
+        // its Idle would blank a recording running on a different note (#187).
+        assert_eq!(DiarizePolicy::POST_STOP.progress, ProgressChannel::RecordingPhase);
+        for policy in [DiarizePolicy::REDIARIZE, DiarizePolicy::DEFERRED_TRANSCRIBE] {
+            assert_ne!(policy.progress, ProgressChannel::RecordingPhase, "{policy:?}");
+        }
+    }
+
+    #[test]
+    fn rediarize_reports_per_note_and_deferred_transcribe_stays_quiet() {
+        // Re-diarize needs a busy state on its own note; a deferred
+        // transcription already has one on `transcribe_status`.
+        assert_eq!(DiarizePolicy::REDIARIZE.progress, ProgressChannel::DiarizeStatus);
+        assert_eq!(DiarizePolicy::DEFERRED_TRANSCRIBE.progress, ProgressChannel::Silent);
     }
 }
 
