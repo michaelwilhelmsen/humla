@@ -150,10 +150,9 @@ describe("the recording bar's degradation ladder", () => {
       expect(px(arrangement.detail)).toBeGreaterThan(px(arrangement.busyLabel));
       expect(px(arrangement.pill)).toBeGreaterThanOrEqual(px(arrangement.busyLabel));
       // The progress pill's unit counter goes before the busy pill's word,
-      // which is the one inversion of the cost order here (#188): at the
-      // widths where either would close the gap, the counter is the only one
-      // of the two a sighted user can still read afterwards, from the pill's
-      // `title`.
+      // the one inversion of the cost order here: at the widths where either
+      // would close the gap, only the counter survives somewhere a sighted
+      // user can still read it, in the pill's `title`.
       expect(px(arrangement.counter)).toBeGreaterThanOrEqual(px(arrangement.busyLabel));
     }
   });
@@ -295,8 +294,8 @@ describe("the bar during a deferred transcription's replay (#146)", () => {
     }
   });
 
-  // #188. Each take is replayed and then diarized, and the diarize half was
-  // 1m48s of a 100% bar labelled "Transcribing…" on a 17m34s two-stream take.
+  // Each take is replayed and then diarized, and the diarize half has no
+  // measure of its own.
   it("goes indeterminate for the diarize half rather than sitting full", () => {
     seedReplay({ step: "diarizing", doneMs: 180_000, totalMs: 180_000 });
     render(<RecordingBar noteId="n1" />);
@@ -317,6 +316,21 @@ describe("the bar during a deferred transcription's replay (#146)", () => {
     expect(
       screen.getByRole("progressbar", { name: "Identifying speakers…" }),
     ).toBeInTheDocument();
+  });
+
+  it("counts a step's streams in the label of a single-take run, off the track", () => {
+    // With one take there is no take clause, so the stream counter is what the
+    // pill has room to say — and it is discrete, so the track stays
+    // indeterminate at both ends of it.
+    for (const index of [1, 2]) {
+      seedReplay({ step: "diarizing", doneMs: 180_000, totalMs: 180_000, index, count: 2 });
+      const { unmount } = render(<RecordingBar noteId="n1" />);
+      const bar = screen.getByRole("progressbar", {
+        name: `Identifying speakers ${index}/2…`,
+      });
+      expect(bar).not.toHaveAttribute("aria-valuenow");
+      unmount();
+    }
   });
 
   it("comes back determinate — and no lower — when the next take replays", () => {
@@ -388,9 +402,9 @@ describe("where a replay reports (#146)", () => {
   });
 });
 
-// #189. Every step of the stop chain has a name now, and the counter it draws
-// is the same slice #188 hides at the narrowest widths.
-describe("the bar on a named step (#189)", () => {
+// Every step of the stop chain has a name, and its counter is the same slice
+// the narrowest step of the row hides.
+describe("the bar on a named step", () => {
   function seedStep(patch: Partial<RecordingStatus>) {
     useRecordingStore.setState({
       status: { noteId: "n1", phase: "diarizing", ...patch },
@@ -432,6 +446,22 @@ describe("the bar on a named step (#189)", () => {
     // The class the row's ladder toggles, so a hidden counter still reads out.
     expect(pill.querySelector(`.${CSS.escape(ROW_STEPS.tight.counter)}`)).toBeNull();
     expect(screen.getByText("1/2", { exact: false })).toBeInTheDocument();
+  });
+
+  it("keeps a counted step off the track, at both ends of the count", () => {
+    // Each step emits its counter BEFORE that unit's work, so a fraction off
+    // it would read 100% with the second stream not started and would retreat
+    // to 50% at the next step. The count belongs in the label.
+    for (const index of [1, 2]) {
+      seedStep({ step: "diarizing", index, count: 2 });
+      const { unmount } = render(<RecordingBar noteId="n1" />);
+      const bar = screen.getByRole("progressbar", {
+        name: `Identifying speakers ${index}/2…`,
+      });
+      expect(bar).not.toHaveAttribute("aria-valuenow");
+      expect(bar).toHaveAttribute("aria-busy", "true");
+      unmount();
+    }
   });
 
   it("titles nothing when the label is whole, so the tooltip is never noise", () => {

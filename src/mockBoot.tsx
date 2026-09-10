@@ -821,18 +821,18 @@ function recBarCase(
     phase?: "recording" | "paused" | "stopping" | "diarizing" | "idle";
     pending?: number;
     done?: number;
-    // #189: which step of the post-stop chain the `diarizing` phase is in, and
-    // its discrete position where the step has units to count.
+    // Which step of the post-stop chain the `diarizing` phase is in, and its
+    // discrete position where the step has units to count.
     step?: Step;
     index?: number;
     count?: number;
-    // A capture that ran with "Transcribe manually" on (#146): its stop draws
-    // no bar at all, so this scenario is a row that must be EMPTY.
+    // A capture that ran with "Transcribe manually" on: its stop draws no bar
+    // at all, so this scenario is a row that must be EMPTY.
     deferred?: boolean;
     // A replay of that capture's retained audio, which is what the row carries
     // instead. `total: 0` is a run that hasn't reported its length yet, and
-    // `phase: "diarizing"` is the second half of a take (#188) — indeterminate,
-    // and the widest label the pill carries.
+    // `phase: "diarizing"` is the second half of a take — indeterminate, and
+    // the widest label the pill carries.
     replay?: {
       done: number;
       total: number;
@@ -1065,8 +1065,8 @@ const CASES: Record<string, Scenario> = {
     take: 2,
     takes: 3,
   }),
-  // #188: the same run in its diarize half. The panel is still shimmer —
-  // progress has one position — and the bar is what changed.
+  // The same run in its diarize half. The panel is still shimmer — progress
+  // has one position — and the bar is what changed.
   "note-replay-diarize": noteTranscribeCase(false, {
     startedAt: Date.now(),
     step: "diarizing",
@@ -1131,9 +1131,9 @@ const CASES: Record<string, Scenario> = {
     replay: { done: 62_000, total: 180_000, take: 2, takes: 3 },
   }),
   "recbar-replay-unknown": recBarCase(414, { phase: "idle", replay: { done: 0, total: 0 } }),
-  // #188: the second half of a take. Full and indeterminate — the diarize
-  // sidecar emits no progress — with the take named the same way the
-  // transcribing label names it, which makes this the widest label in the row.
+  // The second half of a take. Full and indeterminate — the diarize sidecar
+  // emits no progress — with the take named the way the transcribing label
+  // names it, which makes this the widest label in the row.
   "recbar-diarize-replay": recBarCase(414, {
     phase: "idle",
     replay: { done: 180_000, total: 180_000, step: "diarizing" },
@@ -1158,12 +1158,11 @@ const CASES: Record<string, Scenario> = {
   }),
   "recbar-deferred": recBarCase(414, { phase: "stopping", deferred: true }),
 
-  // --- #189: every step of the stop chain, named. The counted ones draw a
-  // determinate track at that coarse grain; the rest shimmer, because a
-  // diarize pass emits no progress and nothing may invent a percentage. The
-  // `-summary` variants are the tight three-pill arrangement, which is where
-  // any new label binds first — "Identifying speakers 2/2" is the widest of
-  // these, and #188's take clause is still wider than all of them.
+  // --- Every step of the stop chain, named. All of them shimmer: a counted
+  // step puts its count in the label and leaves the track indeterminate. The
+  // `-summary` variants are the tight three-pill arrangement, where any new
+  // label binds first — "Identifying speakers 2/2" is the widest of these, and
+  // the replay's take clause is wider still.
   "recbar-saving": recBarCase(414, {
     phase: "diarizing",
     step: "saving_audio",
@@ -1280,9 +1279,8 @@ const CASES: Record<string, Scenario> = {
       },
     },
   ),
-  // #188: the same run's diarize half, off the note. The compact pill has a
-  // screen edge to itself, so it keeps the take clause the bar's tightest step
-  // hides.
+  // The same run's diarize half, off the note. The compact pill has a screen
+  // edge to itself, so it keeps the take clause the bar's tightest step hides.
   "notes-replay-diarize": capturingLibraryCase(
     { noteId: null, phase: "idle" },
     {
@@ -1296,9 +1294,8 @@ const CASES: Record<string, Scenario> = {
       },
     },
   ),
-  // #189: the unify pass, which is plausibly the longest step either chain
-  // runs and was invisible inside `Diarizing` until now — on the whole app,
-  // where a user who has left the note sees it at all.
+  // The unify pass, plausibly the longest step either chain runs, on the whole
+  // app — where a user who has left the note sees it at all.
   "notes-unify": capturingLibraryCase({
     noteId: "n1",
     phase: "diarizing",

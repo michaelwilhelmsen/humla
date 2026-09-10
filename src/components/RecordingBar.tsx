@@ -43,68 +43,45 @@ export function noAudioWarning(device?: string | null): string {
 }
 
 /**
- * How the controls row gives way when the body column gets narrow (#177).
+ * How the controls row gives way when the body column gets narrow.
  *
- * Every pill in the row is `shrink-0 whitespace-nowrap` — correct individually,
- * since each is a fixed-height pill that would overflow rather than grow if its
- * text wrapped — so the row's width is a constant and the column's is not. The
- * row measured 442px (warm) / 457px (graphite) against a body column allowed
- * down to `BODY_MIN` (420) and sitting at 414 in the shipped default window, so
- * it overhung: under the context panel on the right, over the nav card on the
- * left, taking part of the stop button with it.
- *
- * So it degrades, the way `NoteToolbar` already does in the same view — and for
- * the same reason. Four steps, ordered by how little each costs:
+ * Every pill in the row is `shrink-0 whitespace-nowrap` — each is a fixed-height
+ * pill that would overflow rather than grow if its text wrapped — so the row's
+ * width is a constant and the column's is not. It therefore degrades in steps,
+ * the way `NoteToolbar` already does in the same view, ordered by how little
+ * each costs:
  *
  *   1. `detail` — the diagnostics pill's seconds and chunk count. The meters
- *      stay: "is it hearing me" is why the pill exists, and #174 leaned on
- *      exactly that. The numbers stay reachable in the pill's `title`.
+ *      stay, and the numbers stay reachable in the pill's `title`.
  *   2. `pausedWord` — the word PAUSED. A pause glyph beside a frozen timer
  *      already says it.
- *   3. `pill` — the diagnostics pill entirely. The controls are not optional;
- *      this is.
- *   4. `busyLabel` — "Summarizing…" down to its spinner, which only matters
- *      when a summary runs during a recording and so shares the row with the
- *      controls pill. The pill keeps its name (`role="status"` + `aria-label`).
+ *   3. `pill` — the diagnostics pill entirely.
+ *   4. `busyLabel` — "Summarizing…" down to its spinner. The pill keeps its
+ *      name (`role="status"` + `aria-label`).
  *   5. `stopTimer` — the frozen elapsed reading, but only once stop has taken
- *      the controls off it. While the capture runs that pill holds pause and
- *      stop and is not optional; afterwards it is a number about a recording
- *      that is already over, and the progress pill beside it is the one saying
- *      what is still happening.
- *   6. `counter` — the progress pill's unit counter: a multi-take replay's
- *      " in take 2 of 3" (#188), or a step's " 1/2" (#189). The pill has no
- *      step beyond this one: what it is doing is the point of it, and a bar
- *      with no words cannot distinguish a drain from a diarize. Which unit can
- *      go, because the step is what changed — and the track keeps the same
- *      fraction either way.
+ *      the controls off that pill.
+ *   6. `counter` — the progress pill's unit counter: a replay's " in take 2 of
+ *      3", or a step's " 1/2". The pill has no step beyond this one — what it
+ *      is doing is the point of it.
  *
  * Two arrangements, because the thresholds depend on what else is in the row:
  * `roomy` is diagnostics or controls or the stop's own pills, `tight` adds the
- * busy pill a summary puts there. Every step fires earlier in `tight` — pinned
- * as an ordering test, since that direction is the one that can only ever be a
- * bug.
+ * busy pill a summary puts there. Every step fires earlier in `tight`, pinned
+ * as an ordering test since that direction is the only one that can be a bug.
  *
- * The cost order above is what each step is worth, not a promise about the
- * numbers: a step fires where the row needs the width it frees, so `tight`
- * reaches for the diagnostics pill (151px) BEFORE the word PAUSED (~50px),
- * because at 575px of content the row is 562px and no amount of PAUSED closes
- * that. Cheapest-first only holds where the cheap step is enough — `roomy`,
- * where it is, keeps PAUSED to 420 and the pill to 370.
+ * Cost order is what each step is worth, not a promise about the numbers: a
+ * step fires where the row needs the width it frees, so `tight` reaches for the
+ * diagnostics pill before the word PAUSED, which at that width closes nothing.
  *
- * The numbers are the CONTAINER'S CONTENT BOX, which is the body column minus
- * this bar's `px-4` (32px) — so `BODY_MIN`'s 420 column is 388 here. They are
- * measured in the graphite theme (the wider of the two) against the widest
- * honest content — a 90-minute capture, paused, with an hour-plus timer — by
- * `scripts/measure-recording-bar.js` over the harness's `?case=recbar-*`. jsdom
- * pins every box to 0, so it cannot answer this and no unit test tries to.
- * Re-derive them with that script after any change to the row's contents or to
+ * The thresholds are the CONTAINER'S CONTENT BOX — the body column minus this
+ * bar's `px-4` — measured in graphite (the wider theme) against the widest
+ * honest content by `scripts/measure-recording-bar.js` over the harness's
+ * `?case=recbar-*`. jsdom pins every box to 0, so no unit test can ask this;
+ * re-derive them with that script after any change to the row's contents or to
  * a theme's control metrics.
  */
 export const ROW_STEPS = {
-  // diagnostics + controls. Full row 583, compact 406, compact over a
-  // PAUSED-less controls pill 356. After stop the same arrangement is the
-  // frozen timer beside the progress pill (327) or the progress pill alone
-  // (237), both of which clear the narrowest column without a step.
+  // Diagnostics or controls, or the stop's own pills.
   roomy: {
     detail: "@max-[600px]:hidden",
     pausedWord: "@max-[420px]:hidden",
@@ -113,44 +90,28 @@ export const ROW_STEPS = {
     stopTimer: "",
     counter: "",
   },
-  // diagnostics + busy + controls. Full row 739, compact 562, no diagnostics
-  // 411, bare spinner 259 — which clears the narrowest column the layout can
-  // produce. A summary running over a STOP is the same arrangement with the
-  // progress pill in place of the controls: 483 whole, 386 as a bare spinner,
-  // 286 once the frozen timer goes with it. Over a multi-take replay's DIARIZE
-  // it is the widest of those pairings — 476 whole, since "Identifying
-  // speakers in take 2 of 3…" is 63px past the transcribing label — then 392
-  // without the take clause and 293 as a bare spinner too.
+  // The same, with the busy pill a running summary adds.
   tight: {
     detail: "@max-[760px]:hidden",
     pausedWord: "@max-[430px]:hidden",
     pill: "@max-[575px]:hidden",
     // `sr-only`, not `hidden`: the pill is a `role="status"` live region and
     // `display: none` would leave it announcing nothing when a summary starts.
-    // Absolutely positioned, so it is out of flow and out of the flex gap —
-    // width-identical to hiding it, which the sweep confirms.
+    // Absolutely positioned, so it is out of flow and out of the flex gap.
     busyLabel: "@max-[430px]:sr-only",
     stopTimer: "@max-[500px]:hidden",
-    // The progress pill's unit counter (#188, #189). `sr-only`, and out of
-    // flow, for the busy pill's reason.
-    //
-    // It fires BEFORE `busyLabel`, which is the one place in this ladder where
-    // the more expensive step goes first. At these widths the row is the busy
-    // pill and the progress pill and nothing else, and either step closes the
-    // gap — but the counter is the only one of the two that a sighted user can
-    // still read once it is hidden, because the pill carries it in a `title`
-    // and a `role="status"` live region cannot.
+    // `sr-only`, and out of flow, for the busy pill's reason. It fires before
+    // `busyLabel` because the pill carries the counter in a `title` a sighted
+    // user can still reach, which a `role="status"` live region cannot.
     counter: "@max-[490px]:sr-only",
   },
 } as const;
 
 /**
- * What each named step of a chain is called (#189). One map, because the stop
- * and the replay draw from one `Step` vocabulary — a user who stops a
- * recording and a user who presses Transcribe are watching the same work.
- *
- * Short on purpose: the row's tightest slack across the swept scenarios is
- * 14px, and #188's take clause already needed a step of its own to hide.
+ * What each named step of a chain is called. One map, because the stop and the
+ * replay draw from one `Step` vocabulary — a user who stops a recording and a
+ * user who presses Transcribe are watching the same work. Labels stay short:
+ * the row they sit in has only a few pixels of slack.
  */
 const STEP_LABELS: Record<Step, string> = {
   transcribing: "Transcribing",
@@ -161,20 +122,47 @@ const STEP_LABELS: Record<Step, string> = {
 };
 
 /**
- * A step's discrete position as the pill shows it, or "" when the step has
- * nothing to count.
+ * How a step that counts DISCRETE units is drawn: its position as text beside
+ * the label, and an indeterminate track.
  *
- * The backend omits `index` / `count` below two units, so this is only ever
- * hiding a malformed pair. Compact — `1/2`, not "stream 1 of 2" — because what
- * the step IS is the point of the pill and the counter is the detail.
+ * The track is determinate for exactly two things, both genuinely continuous —
+ * the stop's drain (chunks done over chunks pending) and the replay's audio
+ * position. A discrete counter is not one of them: each step emits its counter
+ * *before* that unit's work, so `index / count` reads 100% with the last unit
+ * not started and retreats to 50% at the next step. `(index - 1) / count`
+ * leaves the track at zero for the whole first unit, which reads as stuck.
+ *
+ * Returning both fields together is what keeps that from being re-decided per
+ * call site: a caller cannot pair a counter with a fraction.
+ *
+ * Compact — `1/2`, not "stream 1 of 2" — because what the step IS is the point
+ * of the pill. The backend omits `index` / `count` below two units, so the
+ * guard is only ever hiding a malformed pair.
  */
-function counterText(index?: number, count?: number): string {
-  if (!index || !count || count < 2) return "";
-  return ` ${Math.min(index, count)}/${count}`;
+function discreteCounter(index?: number, count?: number): { counter: string; value: null } {
+  if (!index || !count || count < 2) return { counter: "", value: null };
+  return { counter: ` ${Math.min(index, count)}/${count}`, value: null };
 }
 
+/** What drawing a stop's progress reads off a `recording_status`. Its own type
+    rather than a wide `Pick`: the flat optional fields are the wire format's
+    shape, not this function's contract. */
+type StopProgress = {
+  phase: RecordingPhase;
+  /** The drain: transcribes in flight when stop was pressed, and how many have
+      landed. */
+  pending?: number;
+  done?: number;
+  /** The capture ran with "Transcribe manually" on. */
+  deferred?: boolean;
+  /** The named step of the post-stop chain, and its discrete position. */
+  step?: Step;
+  index?: number;
+  count?: number;
+};
+
 /**
- * What the bar says once the capture itself is over (#182).
+ * What the bar says once the capture itself is over.
  *
  * `stopping` means the tail of the transcript is still arriving — the chunks
  * that were mid-decode when stop was pressed now append live — so the fraction
@@ -183,20 +171,18 @@ function counterText(index?: number, count?: number): string {
  * jumping.
  *
  * `diarizing` is the phase the whole post-stop chain reports inside, and the
- * step named on it is what the label follows (#189). A step with units to
- * count — two streams to copy, two to diarize, two to unify — is determinate
- * at that coarse grain; one with a single unit reports no counter and stays
- * full and shimmering, because a diarize pass emits no progress and nothing
- * may invent a percentage. A `diarizing` carrying no step at all keeps the old
- * copy: it is the moment before the chain has named its first step.
+ * step named on it is what the label follows. Its counter is discrete, so the
+ * track is indeterminate — see `discreteCounter`. A `diarizing` carrying no
+ * step at all keeps the old copy: it is the moment before the chain has named
+ * its first step.
  *
  * Null for every other phase — those are the busy pill's, not the bar's. Null
- * too for a `deferred` stop (#146): that capture dispatched nothing and lands
- * on idle in a few hundred milliseconds, so a bar drawn for it appears and
- * vanishes without ever having measured anything.
+ * too for a `deferred` stop: that capture dispatched nothing and lands on idle
+ * in a few hundred milliseconds, so a bar drawn for it appears and vanishes
+ * without ever having measured anything.
  */
 function captureProgress(
-  status: Pick<RecordingStatus, "phase" | "pending" | "done" | "deferred" | "step" | "index" | "count">,
+  status: StopProgress,
 ): { label: string; counter: string; value: number | null } | null {
   if (status.deferred) return null;
   if (status.phase === "stopping") {
@@ -209,46 +195,45 @@ function captureProgress(
     };
   }
   if (status.phase === "diarizing") {
-    const counter = counterText(status.index, status.count);
     return {
       label: status.step ? STEP_LABELS[status.step] : "Identifying speakers",
-      counter,
-      value: counter ? Math.min(1, (status.index ?? 0) / (status.count ?? 1)) : null,
+      ...discreteCounter(status.index, status.count),
     };
   }
   return null;
 }
 
 /**
- * What a deferred transcription's replay says while it runs (#146). The
- * fraction is audio position over the whole run, which the backend has already
- * made monotonic — so this side does one division and nothing else.
+ * What a deferred transcription's replay says while it runs. The fraction is
+ * audio position over the whole run, which the backend has already made
+ * monotonic — so this side does one division and nothing else.
  *
  * A run whose total is absent or zero is drawn FULL, never empty: the fraction
  * is unknown rather than zero, and an empty track beside a live label reads as
  * stuck. The take counter appears only when there is more than one take, since
  * "take 1 of 1" is a number about nothing.
  *
- * Every step past the replay itself is indeterminate for exactly the reason a
- * stop's diarize is — the sidecar emits no progress, so nothing may invent a
- * percentage (#188). The run's audio position arrives anyway and is where the
- * next take resumes, hence `step` and not the fraction deciding which the
- * track is.
+ * Only the replay itself has a continuous measure. Every step past it counts
+ * discrete units and so leaves the track indeterminate — see
+ * `discreteCounter`. The run's audio position keeps arriving through those
+ * steps, because it is where the next take resumes, which is why `step` and
+ * not the fraction decides which the track is.
  *
- * The pill names ONE counter, the coarsest it has (#189): which take of the
- * run beats which stream of the take, since a run's takes are what the user
- * pressed Transcribe on. A single-take run has no take clause, so its steps
- * show their stream counter instead.
+ * The pill names ONE counter, the coarsest it has: which take of the run beats
+ * which stream of the take, since a run's takes are what the user pressed
+ * Transcribe on. A single-take run has no take clause, so its steps show their
+ * stream counter instead.
  */
 function replayProgress(run: ReplayRun): { label: string; counter: string; value: number | null } {
   const takes = run.takes ?? 1;
   const take = takes > 1 ? ` take ${run.take ?? 1} of ${takes}` : "";
   const step = run.step ?? "transcribing";
   if (step !== "transcribing") {
+    const stream = discreteCounter(run.index, run.count);
     return {
       label: STEP_LABELS[step],
-      counter: take ? ` in${take}` : counterText(run.index, run.count),
-      value: null,
+      counter: take ? ` in${take}` : stream.counter,
+      value: stream.value,
     };
   }
   const total = run.totalMs ?? 0;
@@ -284,10 +269,9 @@ export type IndicatorState = {
       labels carries — the pill owns that, so the counter can sit between the
       words and it. */
   label: string;
-  /** Which unit of how many the step is on — a replay's take clause (#188) or
-      a step's stream counter (#189) — split off because the row's narrowest
-      step drops it from view: which unit is the least of what the pill says,
-      and the step is the most. Empty where there is nothing to count. */
+  /** Which unit of how many the step is on — a replay's take clause, or a
+      step's stream counter. Split off because the row's narrowest step drops it
+      from view. Empty where there is nothing to count. */
   counter: string;
   value: number | null;
   /** `live` only: a paused capture takes the pause glyph over the record dot. */
@@ -371,9 +355,9 @@ export function useCaptureElapsed(phase: RecordingPhase): number {
 
 /**
  * The one indicator for work that is no longer a live recording, in two
- * densities (#182) — the stop's drain, the diarize pass, and a deferred
- * transcription's replay (#146), which runs for minutes on local Whisper and
- * is the longest thing the app does.
+ * densities — the stop's drain, the diarize pass, and a deferred
+ * transcription's replay, which runs for minutes on local Whisper and is the
+ * longest thing the app does.
  *
  * `bar` is the note view's, standing where the pause/stop controls were: the
  * transcript is arriving into the panel beside it, so the bar's job is to say
@@ -406,8 +390,8 @@ export function CaptureIndicator({
   const transcribing = useRecordingStore((s) => s.transcribing);
   const state = indicatorState(global, transcribing, noteId);
   const progress = state?.kind === "progress" ? state : null;
-  // Named from the whole label, not from the visible text: the counter is
-  // hidden by a step at the narrowest widths (#188) and must stay in the name.
+  // Named from the whole label, not from the visible text: a step hides the
+  // counter at the narrowest widths and it must stay in the name.
   const name = progress ? `${progress.label}${progress.counter}…` : "";
   const live = state?.kind === "live";
   if (variant === "bar") {
@@ -425,10 +409,8 @@ export function CaptureIndicator({
           {progress.counter && <span className={counterStep}>{progress.counter}</span>}
           …
         </span>
-        {/* 56px, not the wider track a settings panel can afford: the row it
-            sits in has to clear a body column allowed down to `BODY_MIN`, and
-            every pill in it is `shrink-0`, so the track's width is one of the
-            few numbers there that is ours to choose. */}
+        {/* Narrow: the row has to clear a body column allowed down to
+            `BODY_MIN`, and every pill in it is `shrink-0`. */}
         <ProgressTrack value={progress.value} label={name} className="w-[56px]" />
       </div>
     );

@@ -11,11 +11,21 @@
 //
 // Usage: `pnpm mock`, open
 //   http://localhost:1420/mock.html?case=recbar-long&palette=graphite&theme=light
-// then paste this into the browser console. Repeat for `?case=recbar-long-summary`
-// (the three-pill row a summary running during a recording produces), for the
-// `?case=recbar-stopping-*` / `?case=recbar-diarizing*` arrangements the stop
-// chain produces (#182 — no controls, a frozen timer and a progress pill), and
-// for `palette=warm`. Graphite is the wider theme, so it is the one that binds.
+// then paste this into the browser console. Repeat for every `recbar-*` case, in
+// both palettes — graphite is the wider theme, so it is the one that binds:
+//
+//   - a live capture: `recbar-380` / `-420` / `-default` / `-wide` / `-long`,
+//     and the three-pill row a running summary adds (`-summary`,
+//     `-summary-380`, `-long-summary`)
+//   - the stop chain's steps, each with its `-summary` and narrow variants:
+//     `-stopping*`, `-saving*`, `-diarizing*`, `-playback*`, `-unify*`, and
+//     `-deferred`, whose row must be EMPTY
+//   - a deferred transcription's replay: `-replay*` (`-takes`, `-streams`,
+//     `-playback`, `-unify`, `-unknown`, `-380`, `-summary`) and its diarize
+//     half, `-diarize-replay*`
+//
+// The widest labels live in the three-pill arrangements — a replay's
+// "Identifying speakers in take 2 of 3…" is the widest of all of them.
 //
 // The timer is forced to its widest honest reading (`123:45`, an hour-plus
 // meeting) on every step, because the mock's clock starts at zero and two more
