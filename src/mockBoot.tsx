@@ -27,7 +27,7 @@ import { mockTauri } from "./test/tauri";
 import { makeNote } from "./test/fixtures";
 import { CommandSnippet } from "./components/CommandSnippet";
 import { RecordingBar } from "./components/RecordingBar";
-import { useRecordingStore } from "./lib/store";
+import { useRecordingStore, type ReplayRun } from "./lib/store";
 import { Segmented } from "./pages/settings/components/Segmented";
 import { Toggle } from "./pages/settings/components/Toggle";
 import { NoteTitleBox, NoteToolbar, PanelEmpty, TranscriptEditor, TranscriptPlayer } from "./pages/Note";
@@ -297,7 +297,7 @@ function panelEmptyCase(pending: boolean, width = 320): Scenario {
 // others: the empty state's button under two lines of muted text, and — once a
 // second take is pending on a note that already has text — the icon sitting
 // between Copy and Re-transcribe, in a row that also holds two pickers.
-function noteTranscribeCase(withText: boolean): Scenario {
+function noteTranscribeCase(withText: boolean, replay?: ReplayRun): Scenario {
   const note = makeNote({
     id: "n1",
     title: "Kvartalsgjennomgang",
@@ -325,6 +325,7 @@ function noteTranscribeCase(withText: boolean): Scenario {
       note_sessions: () =>
         withText ? [take(1, false), take(2, true)] : [take(1, true)],
     },
+    seed: replay ? () => useRecordingStore.setState({ transcribing: { n1: replay } }) : undefined,
   };
 }
 
@@ -817,12 +818,18 @@ function recBarCase(
     long?: boolean;
     // #182: the row after stop, where the controls are gone and the progress
     // pill stands where they were. `pending`/`done` are the drain's own count.
-    phase?: "recording" | "paused" | "stopping" | "diarizing";
+    phase?: "recording" | "paused" | "stopping" | "diarizing" | "idle";
     pending?: number;
     done?: number;
+    // A capture that ran with "Transcribe manually" on (#146): its stop draws
+    // no bar at all, so this scenario is a row that must be EMPTY.
+    deferred?: boolean;
+    // A replay of that capture's retained audio, which is what the row carries
+    // instead. `total: 0` is a run that hasn't reported its length yet.
+    replay?: { done: number; total: number; take?: number; takes?: number };
   } = {},
 ): Scenario {
-  const { summarizing = false, paused = false, long = false, pending, done } = opts;
+  const { summarizing = false, paused = false, long = false, pending, done, deferred, replay } = opts;
   const phase = opts.phase ?? (paused ? "paused" : "recording");
   return {
     wrap: (node) => (
@@ -834,6 +841,10 @@ function recBarCase(
           {long && " · long recording"}
           {phase === "stopping" && ` · stopping ${done ?? 0}/${pending ?? 0}`}
           {phase === "diarizing" && " · identifying speakers"}
+          {deferred && " · deferred stop (no bar)"}
+          {replay &&
+            ` · replaying ${replay.done}/${replay.total}ms` +
+              (replay.takes ? ` take ${replay.take ?? 1} of ${replay.takes}` : "")}
         </p>
         {/* The body column, dashed so an overhanging row is visible as one that
             leaves it. Deliberately NOT `overflow-hidden`: the real column has
@@ -852,8 +863,19 @@ function recBarCase(
       // pill can honestly reach: a 90-minute capture (4-digit seconds, 3-digit
       // chunk count) and a timer past the hour.
       useRecordingStore.setState({
-        status: { noteId: "n1", phase, pending, done },
+        status: { noteId: "n1", phase, pending, done, deferred },
         summarizing: summarizing ? { n1: true } : {},
+        transcribing: replay
+          ? {
+              n1: {
+                startedAt: Date.now(),
+                doneMs: replay.done,
+                totalMs: replay.total,
+                take: replay.take,
+                takes: replay.takes,
+              },
+            }
+          : {},
         micHeard: true,
         activeSince: null,
         activeAccumMs: 0,
@@ -877,7 +899,10 @@ function recBarCase(
 
 // The whole app on the note grid with a capture in some state (#182): the
 // compact indicator is the only thing on this screen that says so.
-function capturingLibraryCase(status: RecordingStatus): Scenario {
+function capturingLibraryCase(
+  status: RecordingStatus,
+  transcribing: Record<string, ReplayRun> = {},
+): Scenario {
   return {
     route: "/all-notes",
     render: () => null, // unused — `route` renders the app
@@ -886,7 +911,7 @@ function capturingLibraryCase(status: RecordingStatus): Scenario {
       folders_list: () => DEMO_FOLDERS,
       clients_list: () => DEMO_CLIENTS,
     },
-    seed: () => useRecordingStore.setState({ status }),
+    seed: () => useRecordingStore.setState({ status, transcribing }),
   };
 }
 
@@ -998,6 +1023,16 @@ const CASES: Record<string, Scenario> = {
   // beside the toolbar's copy of it and the panel's pickers.
   "note-pending": noteTranscribeCase(false),
   "note-pending-text": noteTranscribeCase(true),
+  // #146: the same note mid-replay. Two surfaces report the one run — the
+  // panel that is waiting for the text, and the note's own floating bar for a
+  // user who never opens this tab.
+  "note-replay": noteTranscribeCase(false, {
+    startedAt: Date.now(),
+    doneMs: 62_000,
+    totalMs: 180_000,
+    take: 2,
+    takes: 3,
+  }),
 
   // --- The create-team-workspace sheet, one scenario per derived stage.
   "ws-connect": workspaceCase("connect"),
@@ -1038,6 +1073,29 @@ const CASES: Record<string, Scenario> = {
   "recbar-diarizing": recBarCase(414, { phase: "diarizing" }),
   "recbar-diarizing-380": recBarCase(380, { phase: "diarizing", summarizing: true }),
 
+  // --- #146: the replay of a deferred capture, which is the app's longest
+  // operation and used to show nothing but a shimmer. The take counter is the
+  // widest label the pill can carry, and `-unknown` is a run whose total
+  // hasn't been reported yet — full, never a zero-width track. `-deferred` is
+  // the row that must draw NOTHING: that stop lands on idle in a few hundred
+  // milliseconds.
+  "recbar-replay": recBarCase(414, { phase: "idle", replay: { done: 62_000, total: 180_000 } }),
+  "recbar-replay-takes": recBarCase(420, {
+    phase: "idle",
+    replay: { done: 62_000, total: 180_000, take: 2, takes: 3 },
+  }),
+  "recbar-replay-380": recBarCase(380, {
+    phase: "idle",
+    replay: { done: 62_000, total: 180_000, take: 2, takes: 3 },
+  }),
+  "recbar-replay-unknown": recBarCase(414, { phase: "idle", replay: { done: 0, total: 0 } }),
+  "recbar-replay-summary": recBarCase(380, {
+    phase: "idle",
+    summarizing: true,
+    replay: { done: 62_000, total: 180_000, take: 2, takes: 3 },
+  }),
+  "recbar-deferred": recBarCase(414, { phase: "stopping", deferred: true }),
+
   // --- #174: the no-audio warning naming the device it isn't hearing.
   // A real (localized) device name, the fallback when the HAL won't name one,
   // and the clamp doing its job on a pathological user-authored name.
@@ -1066,6 +1124,18 @@ const CASES: Record<string, Scenario> = {
   "notes-stopping": capturingLibraryCase({ noteId: "n1", phase: "stopping", pending: 4, done: 1 }),
   "notes-diarizing": capturingLibraryCase({ noteId: "n1", phase: "diarizing" }),
   "notes-recording": capturingLibraryCase({ noteId: "n1", phase: "recording" }),
+  // #146: a replay follows the user off the note, which is the whole point of
+  // the compact pill — this is the app's longest operation.
+  "notes-replay": capturingLibraryCase(
+    { noteId: null, phase: "idle" },
+    { n1: { startedAt: Date.now(), doneMs: 62_000, totalMs: 180_000, take: 2, takes: 3 } },
+  ),
+  // The same screen during a deferred stop: nothing to draw.
+  "notes-deferred": capturingLibraryCase({
+    noteId: "n1",
+    phase: "stopping",
+    deferred: true,
+  }),
 
   // A library with nothing in it — the first screen a fresh install shows.
   "notes-empty": {

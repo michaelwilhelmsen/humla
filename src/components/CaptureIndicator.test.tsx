@@ -3,7 +3,7 @@ import { screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { renderApp } from "../test/app";
 import { makeNote } from "../test/fixtures";
-import { useRecordingStore } from "../lib/store";
+import { useRecordingStore, type ReplayRun } from "../lib/store";
 import type { RecordingStatus } from "../lib/ipc";
 
 // #182. The stop chain runs for minutes on a local-Whisper meeting, and the
@@ -12,12 +12,18 @@ import type { RecordingStatus } from "../lib/ipc";
 
 const NOTE = makeNote({ id: "n1", title: "Weekly sync" });
 
-function open(path: string, status: RecordingStatus) {
-  useRecordingStore.setState({ status });
+function open(
+  path: string,
+  status: RecordingStatus,
+  transcribing: Record<string, ReplayRun> = {},
+) {
+  useRecordingStore.setState({ status, transcribing });
   return renderApp(path, { notes_list: () => [NOTE], notes_get: () => NOTE });
 }
 
-afterEach(() => useRecordingStore.setState({ status: { noteId: null, phase: "idle" } }));
+afterEach(() =>
+  useRecordingStore.setState({ status: { noteId: null, phase: "idle" }, transcribing: {} }),
+);
 
 describe("the capture indicator off the note (#182)", () => {
   it("reports the drain from a screen that is not the recording's note", async () => {
@@ -57,5 +63,61 @@ describe("the capture indicator off the note (#182)", () => {
     await screen.findByText(/weekly sync/i);
     expect(screen.queryByRole("button", { name: /open the recording/i })).toBeNull();
     expect(screen.queryByRole("progressbar")).toBeNull();
+  });
+});
+
+// #146. Pressing Transcribe replays retained audio for minutes on local
+// Whisper — the longest thing the app does, and the one most likely to be
+// running while the user is somewhere else entirely.
+describe("the compact indicator during a replay (#146)", () => {
+  const RUN: ReplayRun = { startedAt: 1, doneMs: 45_000, totalMs: 180_000 };
+
+  it("follows the user off the note the replay belongs to", async () => {
+    open("/all-notes", { noteId: null, phase: "idle" }, { n1: RUN });
+    const bar = await screen.findByRole("progressbar", { name: "Transcribing…" });
+    expect(bar).toHaveAttribute("aria-valuenow", "25");
+  });
+
+  it("names the take when the run has more than one", async () => {
+    open("/all-notes", { noteId: null, phase: "idle" }, { n1: { ...RUN, take: 2, takes: 3 } });
+    await screen.findByRole("progressbar", { name: "Transcribing take 2 of 3…" });
+  });
+
+  it("navigates to the note being transcribed, not to a recording", async () => {
+    open("/all-notes", { noteId: null, phase: "idle" }, { n1: RUN });
+    await userEvent.click(await screen.findByRole("button", { name: /open the recording/i }));
+    await waitFor(() => expect(screen.getByTestId("location").textContent).toBe("/note/n1"));
+  });
+
+  it("shows one replay, the most recently started, rather than a stack of pills", async () => {
+    // `state.transcribing` is a set server-side: two notes can legitimately
+    // replay at once, and the compact indicator has one slot.
+    open(
+      "/all-notes",
+      { noteId: null, phase: "idle" },
+      { n1: { ...RUN, take: 1, takes: 2 }, n2: { ...RUN, startedAt: 9, take: 1, takes: 5 } },
+    );
+    await screen.findByRole("progressbar", { name: "Transcribing take 1 of 5…" });
+    expect(screen.getAllByRole("progressbar")).toHaveLength(1);
+  });
+
+  it("yields the slot to a live capture, which is the thing that can be lost", async () => {
+    open("/all-notes", { noteId: "n1", phase: "stopping", pending: 4, done: 3 }, { n2: RUN });
+    await screen.findByRole("progressbar", { name: "Finishing transcript…" });
+    expect(screen.getAllByRole("progressbar")).toHaveLength(1);
+  });
+
+  it("takes the slot back from a stop that draws nothing", async () => {
+    // A deferred stop on one note (#146) and a replay on another can overlap,
+    // and the stop has nothing to say — so it must not blank the row.
+    open("/all-notes", { noteId: "n1", phase: "stopping", deferred: true }, { n2: RUN });
+    await screen.findByRole("progressbar", { name: "Transcribing…" });
+  });
+
+  it("draws nothing at all for a deferred stop", async () => {
+    open("/all-notes", { noteId: "n1", phase: "stopping", deferred: true });
+    await screen.findByText(/weekly sync/i);
+    expect(screen.queryByRole("progressbar")).toBeNull();
+    expect(screen.queryByRole("button", { name: /open the recording/i })).toBeNull();
   });
 });

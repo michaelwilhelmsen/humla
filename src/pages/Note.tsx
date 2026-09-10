@@ -49,7 +49,7 @@ import {
   sessionTitle,
   type TimelineGroup,
 } from "../lib/sessions";
-import { RecordingBar } from "../components/RecordingBar";
+import { CaptureIndicator, RecordingBar } from "../components/RecordingBar";
 import { NewWorkspaceModal } from "../components/NewWorkspaceModal";
 import { ChatPanel, type ChatSessionControls } from "../components/ChatPanel";
 import { SelectablePopover } from "../components/SelectablePopover";
@@ -1702,8 +1702,16 @@ export function Note() {
                     )}
                     {isRecording && <SkeletonLines lines={2} className="mt-3 shrink-0" />}
                   </>
-                ) : recActive || isTranscribing ? (
+                ) : recActive ? (
                   <SkeletonLines lines={4} />
+                ) : isTranscribing ? (
+                  // The same indicator the recording bar stands, in the panel
+                  // that is waiting for the text: a replay of a deferred
+                  // capture (#146) runs for minutes on local Whisper, and a
+                  // shimmer here says only that something is happening.
+                  <div className="flex justify-center pt-1">
+                    <CaptureIndicator variant="bar" noteId={draft.id} />
+                  </div>
                 ) : (
                   <PanelEmpty
                     icon={<MessageSquare size={22} strokeWidth={1.5} />}
@@ -1724,7 +1732,7 @@ export function Note() {
                       // deliberately: it is one action, not two.
                       //
                       // No busy state: this empty state gives way to the
-                      // in-flight skeleton, so `isTranscribing` is never true
+                      // in-flight indicator, so `isTranscribing` is never true
                       // while the button is on screen. `recActive` can't be
                       // either, for the same reason.
                       pendingTranscription && !readOnly ? (

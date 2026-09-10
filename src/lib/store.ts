@@ -101,6 +101,23 @@ export const useNotesStore = create<NotesState>((set) => ({
 
 export type Flash = { id: number; message: string };
 
+/**
+ * How far a deferred transcription's replay has got (#146), as `transcribe_status`
+ * reports it: audio position over the whole run, plus the 1-based take counter.
+ * Every field is optional — the brackets around a run carry none of them, and a
+ * run with nothing to report is exactly as active as one mid-way.
+ */
+export type ReplayMeasure = {
+  doneMs?: number;
+  totalMs?: number;
+  take?: number;
+  takes?: number;
+};
+
+/** A replay in flight. `startedAt` is what picks one when two notes replay at
+    once — the compact indicator has a single slot. */
+export type ReplayRun = ReplayMeasure & { startedAt: number };
+
 type RecordingState = {
   status: RecordingStatus;
   setStatus: (s: RecordingStatus) => void;
@@ -120,8 +137,8 @@ type RecordingState = {
   // while a *different* note records, so putting it on the shared channel
   // would blank that recording's bar — the same failure the per-note summary
   // channel exists to prevent.
-  transcribing: Record<string, boolean>;
-  setTranscribing: (noteId: string, active: boolean) => void;
+  transcribing: Record<string, ReplayRun>;
+  setTranscribing: (noteId: string, active: boolean, measure?: ReplayMeasure) => void;
   // Notes with a (re)diarize pass running — Re-diarize or the cross-session
   // unify (#187). Its own map for the same reason: the user can press it on any
   // note while a *different* one records, and `status` describes that live
@@ -183,11 +200,13 @@ export const useRecordingStore = create<RecordingState>((set, get) => ({
       return { titling: next };
     }),
   transcribing: {},
-  setTranscribing: (noteId, active) =>
+  setTranscribing: (noteId, active, measure) =>
     set((s) => {
       const next = { ...s.transcribing };
-      if (active) next[noteId] = true;
-      else delete next[noteId];
+      if (active) {
+        const prev = next[noteId];
+        next[noteId] = { ...prev, startedAt: prev?.startedAt ?? Date.now(), ...measure };
+      } else delete next[noteId];
       return { transcribing: next };
     }),
   diarizing: {},
@@ -365,8 +384,11 @@ export function bindBackendListeners() {
   onSummaryStatus(({ noteId, active }) => {
     useRecordingStore.getState().setSummarizing(noteId, active);
   });
-  onTranscribeStatus(({ noteId, active }) => {
-    useRecordingStore.getState().setTranscribing(noteId, active);
+  // The rest, not four named fields: a bracket omits every measure, and
+  // spreading explicit `undefined`s over the run would erase what the last
+  // progress event reported.
+  onTranscribeStatus(({ noteId, active, ...measure }) => {
+    useRecordingStore.getState().setTranscribing(noteId, active, measure);
   });
   onDiarizeStatus(({ noteId, active }) => {
     useRecordingStore.getState().setDiarizing(noteId, active);

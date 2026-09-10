@@ -270,10 +270,10 @@ describe("the transcript panel's Transcribe action", () => {
     expect(transcribe).toHaveBeenCalledWith({ noteId: "n1", scope: "pending" });
   });
 
-  // The empty state gives way to the in-flight skeleton, so the button needs no
+  // The empty state gives way to the run's own progress, so the button needs no
   // busy state of its own — but it must not survive into a state where a second
   // press would queue a second replay.
-  it("gives way to the skeleton once a run is in flight", async () => {
+  it("gives way to the run's progress once one is in flight", async () => {
     await openTranscriptPanel([session({ canTranscribe: true })]);
     await screen.findByText(/hasn't been transcribed yet/i);
 
@@ -282,6 +282,29 @@ describe("the transcript panel's Transcribe action", () => {
     await waitFor(() =>
       expect(screen.queryByText(/hasn't been transcribed yet/i)).not.toBeInTheDocument(),
     );
+  });
+
+  // A replay runs for minutes on local Whisper, and this panel is where the
+  // user comes to find out why the transcript is still empty. A shimmer
+  // answers "something is happening" and nothing else.
+  it("reports how far the replay has got, in the panel waiting for the text", async () => {
+    await openTranscriptPanel([session({ canTranscribe: true })]);
+    await screen.findByText(/hasn't been transcribed yet/i);
+
+    act(() =>
+      useRecordingStore
+        .getState()
+        .setTranscribing("n1", true, { doneMs: 45_000, totalMs: 180_000, take: 2, takes: 3 }),
+    );
+
+    // Scoped to the panel: the note's floating bar reports the same run for a
+    // user who never opens this tab, and that one must not answer for this one.
+    const panel = screen.getByRole("button", { name: /^copy transcript$|^summary$/i })
+      .closest("aside")!;
+    const bar = await within(panel).findByRole("progressbar", {
+      name: "Transcribing take 2 of 3…",
+    });
+    expect(bar).toHaveAttribute("aria-valuenow", "25");
   });
 
   // A note with nothing recorded has nothing to run: its empty state is advice

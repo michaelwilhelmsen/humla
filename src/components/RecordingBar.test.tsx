@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { act, render, screen } from "@testing-library/react";
 import { ROW_STEPS, RecordingBar, noAudioWarning } from "./RecordingBar";
-import { useRecordingStore } from "../lib/store";
+import { useRecordingStore, type ReplayRun } from "../lib/store";
 import type { RecordingStatus } from "../lib/ipc";
 
 // #174. The warning fired correctly and said nothing useful: a pair of
@@ -239,5 +239,76 @@ describe("the bar after stop (#182)", () => {
     seedStop({ noteId: "other", pending: 4, done: 1 });
     render(<RecordingBar noteId="n1" />);
     expect(screen.queryByRole("progressbar")).toBeNull();
+  });
+});
+
+// #146. Pressing Transcribe replays retained audio through local Whisper for
+// minutes at a stretch; the bar is where that says how far it has got. The
+// fraction is audio position over the whole run, which the backend has already
+// clamped and made monotonic — so what is pinned here is the arithmetic this
+// side does and the label it picks.
+describe("the bar during a deferred transcription's replay (#146)", () => {
+  function seedReplay(run: Partial<ReplayRun> = {}, noteId = "n1") {
+    useRecordingStore.setState({
+      status: { noteId: null, phase: "idle" },
+      summarizing: {},
+      diag: null,
+      transcribing: { [noteId]: { startedAt: 1, ...run } },
+    });
+  }
+
+  it("reports the run's audio position as the fraction", () => {
+    seedReplay({ doneMs: 45_000, totalMs: 180_000 });
+    render(<RecordingBar noteId="n1" />);
+    const bar = screen.getByRole("progressbar", { name: "Transcribing…" });
+    expect(bar).toHaveAttribute("aria-valuenow", "25");
+  });
+
+  it("names the take it is on, but only when there is more than one", () => {
+    seedReplay({ doneMs: 45_000, totalMs: 180_000, take: 2, takes: 3 });
+    const { unmount } = render(<RecordingBar noteId="n1" />);
+    expect(
+      screen.getByRole("progressbar", { name: "Transcribing take 2 of 3…" }),
+    ).toBeInTheDocument();
+    unmount();
+    // "take 1 of 1" is a number about nothing.
+    seedReplay({ doneMs: 45_000, totalMs: 180_000, take: 1, takes: 1 });
+    render(<RecordingBar noteId="n1" />);
+    expect(screen.getByRole("progressbar", { name: "Transcribing…" })).toBeInTheDocument();
+  });
+
+  it("is full rather than empty when the run hasn't reported its length", () => {
+    // Unknown is not zero, and a zero-width track beside a live label reads as
+    // stuck. Both shapes the backend can produce mean the same thing here.
+    for (const run of [{}, { doneMs: 0, totalMs: 0 }]) {
+      seedReplay(run);
+      const { unmount } = render(<RecordingBar noteId="n1" />);
+      expect(screen.getByRole("progressbar")).toHaveAttribute("aria-valuenow", "100");
+      unmount();
+    }
+  });
+
+  it("says nothing about a replay running on another note", () => {
+    seedReplay({ doneMs: 45_000, totalMs: 180_000 }, "other");
+    render(<RecordingBar noteId="n1" />);
+    expect(screen.queryByRole("progressbar")).toBeNull();
+  });
+
+  it("draws no bar for the stop of a capture that deferred its transcription", () => {
+    // That stop dispatched nothing and lands on idle in a few hundred
+    // milliseconds, so a bar drawn for it appears and vanishes without ever
+    // measuring anything. `deferred` is the discriminator, NOT an empty drain:
+    // a live take with zero pending chunks is a real full bar.
+    for (const phase of ["stopping", "diarizing"] as const) {
+      useRecordingStore.setState({
+        status: { noteId: "n1", phase, deferred: true },
+        summarizing: {},
+        diag: null,
+        transcribing: {},
+      });
+      const { unmount } = render(<RecordingBar noteId="n1" />);
+      expect(screen.queryByRole("progressbar")).toBeNull();
+      unmount();
+    }
   });
 });
