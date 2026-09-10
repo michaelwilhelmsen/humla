@@ -57,9 +57,7 @@ export function Layout() {
   // The capture indicator lives here rather than in the nav card because the
   // card is REMOVED entirely below `NARROW_VIEWPORT_PX` — a sidebar home would
   // vanish exactly when the window is small. Hidden on the capture's own note,
-  // where the full bar is already saying the same thing. It replaces the
-  // diarize toast (#182): that toast said only "identifying speakers", which
-  // is the second half of a stop the user could otherwise see nothing of.
+  // where the full bar is already saying the same thing.
   const recStatus = useRecordingStore((s) => s.status);
   const elapsed = useCaptureElapsed(recStatus.phase);
   const onCaptureNote =

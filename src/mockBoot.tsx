@@ -40,7 +40,7 @@ import { DEFAULTS, type EditableKey } from "./pages/settings/types";
 import { SummaryStep } from "./pages/onboarding/steps/Summary";
 import { TranscriptionStep } from "./pages/onboarding/steps/Transcription";
 import { STEP_ORDER, type StepContext, type StepId } from "./pages/onboarding/types";
-import type { ProviderConfig, TimelineEntry } from "./lib/ipc";
+import type { ProviderConfig, RecordingStatus, TimelineEntry } from "./lib/ipc";
 import { DEMO_CLIENTS, DEMO_FOLDERS, demoNotes } from "./test/noteLibrary";
 // Mirrors src/main.tsx — every theme's typeface, so a scenario reviewed under
 // `?palette=<id>` renders in that design's face rather than falling back.
@@ -875,6 +875,21 @@ function recBarCase(
   };
 }
 
+// The whole app on the note grid with a capture in some state (#182): the
+// compact indicator is the only thing on this screen that says so.
+function capturingLibraryCase(status: RecordingStatus): Scenario {
+  return {
+    route: "/all-notes",
+    render: () => null, // unused — `route` renders the app
+    ipc: {
+      notes_list: () => demoNotes(),
+      folders_list: () => DEMO_FOLDERS,
+      clients_list: () => DEMO_CLIENTS,
+    },
+    seed: () => useRecordingStore.setState({ status }),
+  };
+}
+
 const CASES: Record<string, Scenario> = {
   // --- #90: the automatic titler's two states. Compare `title-writing` against
   // `title-idle` and `title-idle-long` — nothing below the title may shift.
@@ -1046,41 +1061,11 @@ const CASES: Record<string, Scenario> = {
     },
   },
 
-  // --- #182: the compact indicator, which is the whole point of the change —
-  // the app-wide grid is exactly the screen the old design showed nothing on.
-  "notes-stopping": {
-    route: "/all-notes",
-    render: () => null, // unused — `route` renders the app
-    ipc: {
-      notes_list: () => demoNotes(),
-      folders_list: () => DEMO_FOLDERS,
-      clients_list: () => DEMO_CLIENTS,
-    },
-    seed: () =>
-      useRecordingStore.setState({
-        status: { noteId: "n1", phase: "stopping", pending: 4, done: 1 },
-      }),
-  },
-  "notes-diarizing": {
-    route: "/all-notes",
-    render: () => null, // unused — `route` renders the app
-    ipc: {
-      notes_list: () => demoNotes(),
-      folders_list: () => DEMO_FOLDERS,
-      clients_list: () => DEMO_CLIENTS,
-    },
-    seed: () => useRecordingStore.setState({ status: { noteId: "n1", phase: "diarizing" } }),
-  },
-  "notes-recording": {
-    route: "/all-notes",
-    render: () => null, // unused — `route` renders the app
-    ipc: {
-      notes_list: () => demoNotes(),
-      folders_list: () => DEMO_FOLDERS,
-      clients_list: () => DEMO_CLIENTS,
-    },
-    seed: () => useRecordingStore.setState({ status: { noteId: "n1", phase: "recording" } }),
-  },
+  // --- #182: the compact indicator on the app-wide grid, the one screen with
+  // no note view of its own to carry a bar.
+  "notes-stopping": capturingLibraryCase({ noteId: "n1", phase: "stopping", pending: 4, done: 1 }),
+  "notes-diarizing": capturingLibraryCase({ noteId: "n1", phase: "diarizing" }),
+  "notes-recording": capturingLibraryCase({ noteId: "n1", phase: "recording" }),
 
   // A library with nothing in it — the first screen a fresh install shows.
   "notes-empty": {

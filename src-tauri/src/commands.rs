@@ -1779,30 +1779,41 @@ async fn timed_diarize(
     num_speakers: Option<i64>,
     engine: diarize::Engine,
     thresholds: diarize::Thresholds,
-    timings: &Option<Arc<parking_lot::Mutex<crate::recording::StopTimings>>>,
+    clock: Option<&StopClock>,
     source: ChunkSource,
 ) -> anyhow::Result<Vec<diarize::Segment>> {
     let t = std::time::Instant::now();
     let out = diarize_and_maybe_clean(app, wav, num_speakers, engine, thresholds).await;
-    if let Some(cell) = timings {
+    record_timing(clock, |x| {
         let ms = ms_since(t);
-        let mut cell = cell.lock();
         match source {
-            ChunkSource::Mic => cell.diarize_mic_ms = Some(ms),
-            ChunkSource::Sys => cell.diarize_sys_ms = Some(ms),
+            ChunkSource::Mic => x.diarize_mic_ms = Some(ms),
+            ChunkSource::Sys => x.diarize_sys_ms = Some(ms),
         }
-    }
+    });
     out
 }
 
-/// Remember the diagnostics file this run wrote, so the chain merges its
-/// timings into that same file instead of a sibling.
-fn record_diagnostics_path(
-    timings: &Option<Arc<parking_lot::Mutex<crate::recording::StopTimings>>>,
-    path: Option<PathBuf>,
+/// [`write_diagnostics_json`] for a stop chain: the file it wrote is remembered
+/// on the clock, so the chain's timings are merged into that same file instead
+/// of a sibling.
+async fn write_diagnostics_timed(
+    app: &AppHandle,
+    note_id: &str,
+    engine: diarize::Engine,
+    source: &str,
+    mic_segments: &[diarize::Segment],
+    sys_segments: &[diarize::Segment],
+    chunks: &[ChunkRecord],
+    thresholds: &diarize::Thresholds,
+    clock: Option<&StopClock>,
 ) {
-    if let (Some(cell), Some(path)) = (timings, path) {
-        cell.lock().diagnostics_path = Some(path);
+    let path = write_diagnostics_json(
+        app, note_id, engine, source, mic_segments, sys_segments, chunks, thresholds, None, None,
+    )
+    .await;
+    if let Some(path) = path {
+        record_timing(clock, |x| x.diagnostics_path = Some(path));
     }
 }
 
@@ -2177,6 +2188,12 @@ pub fn recording_resume(state: State<AppState>) -> Result<(), String> {
 #[tauri::command]
 pub fn recording_state(state: State<AppState>) -> Result<&'static str, String> {
     let s = state.recording.lock();
+    // A stop holds the slot until its chain lands on Idle (#182), and `note_id`
+    // stays set through the drain — so the stop state, not the id, is what says
+    // whether a capture can start.
+    if s.stop_in_progress().is_some() {
+        return Ok("stopping");
+    }
     Ok(if s.note_id.is_some() { "recording" } else { "idle" })
 }
 
@@ -2454,10 +2471,9 @@ pub async fn recording_start(
         // marked as recording for THIS note, that means the sidecar died
         // without us asking — i.e. a crash. Clean up and notify the UI so
         // the user isn't pinned in a stale "recording" state. A stop in
-        // progress is the other way this pipe closes, and `note_id` now stays
-        // set through its drain (#182), so the stop state is what tells the
-        // two apart — without it every normal stop would toast "Recording
-        // stopped unexpectedly" and blank the phase mid-drain.
+        // progress is the other way this pipe closes, and `note_id` stays set
+        // through its drain (#182), so the stop state is what tells the two
+        // apart.
         let state: tauri::State<AppState> = app_clone.state();
         let (was_active, lock_id, lock_heartbeat) = {
             let mut s = state.recording.lock();
@@ -2521,16 +2537,12 @@ pub async fn recording_stop(
     let stop_pressed = std::time::Instant::now();
     let (child, note_id, temp_dir, inflight, reader, lock_id, lock_heartbeat) = {
         let mut s = state.recording.lock();
-        if let Some(msg) = s.stop_in_progress() {
-            return Err(msg.into());
-        }
         // `note_id` deliberately stays set until the post-stop snapshot: it is
         // what lets a chunk finishing during the drain append to the note live
         // (#182). `StopState::Draining` is what makes a second capture refuse
         // in the meantime, and what tells the reader's EOF handler that this
         // shutdown was asked for rather than a sidecar crash.
-        let note_id = s.note_id.clone().ok_or("not recording")?;
-        s.stop = crate::recording::StopState::Draining;
+        let note_id = s.begin_stop().map_err(str::to_string)?;
         let child = s.child.take();
         let temp_dir = s.temp_dir.take();
         // The reader holds a clone of this same Arc, so chunks emitted during
@@ -2562,7 +2574,7 @@ pub async fn recording_stop(
     let pending_at_stop = inflight.lock().len() as u32;
     emit_stopping_progress(&app, &note_id, pending_at_stop, 0);
 
-    let mut timings = crate::recording::StopTimings::default();
+    let clock = StopClock::new(stop_pressed);
     let t_sidecar = std::time::Instant::now();
     if let Some(mut child) = child {
         // Send SIGTERM so the Swift sidecar runs its shutdown handler:
@@ -2586,7 +2598,7 @@ pub async fn recording_stop(
         }
     }
 
-    timings.sidecar_shutdown_ms = t_sidecar.elapsed().as_millis() as u64;
+    clock.record(|t| t.sidecar_shutdown_ms = ms_since(t_sidecar));
 
     // Wait for the stdout reader to finish first: it exits when the sidecar
     // closes the pipe, which is guaranteed now that `child.wait()` returned.
@@ -2595,7 +2607,7 @@ pub async fn recording_stop(
     if let Some(r) = reader {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), r).await;
     }
-    timings.reader_wait_ms = t_reader.elapsed().as_millis() as u64;
+    clock.record(|t| t.reader_wait_ms = ms_since(t_reader));
 
     // Drain in-flight transcribe tasks BEFORE snapshotting chunk_log.
     //
@@ -2622,8 +2634,10 @@ pub async fn recording_stop(
         emit_stopping_progress(&app, &note_id, pending, done);
     })
     .await;
-    timings.drain_ms = t_drain.elapsed().as_millis() as u64;
-    timings.drain_pending_chunks = pending;
+    clock.record(|t| {
+        t.drain_ms = ms_since(t_drain);
+        t.drain_pending_chunks = pending;
+    });
 
     // Snapshot every piece of session-derived state the post-stop chain
     // needs, NOW — *after* the drain so chunk_log includes every chunk
@@ -2647,7 +2661,7 @@ pub async fn recording_stop(
             note_for_post,
             temp_dir,
             post_stop,
-            StopClock::new(stop_pressed, timings),
+            clock,
         )
         .await;
     });
@@ -2666,9 +2680,12 @@ async fn drain_inflight(inflight: &Inflight) {
 }
 
 /// [`drain_inflight`] with a progress callback, called with the running count
-/// each time a handle lands — including one that failed or was skipped, so the
-/// count always reaches the pending total and the bar always fills.
+/// each time a handle lands — including one that failed or was skipped. The
+/// count always reaches the pending total, so the bar always fills: on the
+/// timeout the abandoned handles are counted in one final call, since the
+/// transcript is what it is at that point.
 async fn drain_inflight_reporting(inflight: &Inflight, mut on_done: impl FnMut(u32)) {
+    let pending = inflight.lock().len() as u32;
     let drain = async {
         let mut done: u32 = 0;
         loop {
@@ -2697,6 +2714,7 @@ async fn drain_inflight_reporting(inflight: &Inflight, mut on_done: impl FnMut(u
         for h in remaining {
             let _ = tokio::time::timeout(std::time::Duration::from_secs(2), h).await;
         }
+        on_done(pending);
     }
 }
 
@@ -2751,12 +2769,14 @@ async fn run_post_stop_chain(
     post_stop: PostStopSnapshot,
     clock: StopClock,
 ) {
-    // Drop-scoped so a panic anywhere in the chain still frees the capture
-    // slot — a wedged `Finishing` would refuse recording for the rest of the
-    // session. Each exit path below emits its own Idle; the guard only clears
-    // the backend's own state.
-    let _slot = SlotGuard { app: app.clone() };
-    post_stop_chain_inner(app.clone(), note_id.clone(), temp_dir, post_stop, &clock).await;
+    // The chain ends on Idle from one place, and that place is a `Drop`: a
+    // panic anywhere inside would otherwise leave the slot wedged in
+    // `Finishing` (refusing recording for the rest of the session) with the
+    // indicator and the tray pinned on "Identifying speakers…".
+    {
+        let _slot = SlotGuard { app: app.clone() };
+        post_stop_chain_inner(app.clone(), note_id.clone(), temp_dir, post_stop, &clock).await;
+    }
     let timings = clock.finish();
     eprintln!("{}", timings.summary());
     write_stop_timings(&app, &note_id, &timings).await;
@@ -2771,8 +2791,8 @@ struct StopClock {
 }
 
 impl StopClock {
-    fn new(started: std::time::Instant, timings: crate::recording::StopTimings) -> Self {
-        Self { started, timings: Arc::new(parking_lot::Mutex::new(timings)) }
+    fn new(started: std::time::Instant) -> Self {
+        Self { started, timings: Arc::new(parking_lot::Mutex::default()) }
     }
 
     fn record(&self, f: impl FnOnce(&mut crate::recording::StopTimings)) {
@@ -2787,11 +2807,22 @@ impl StopClock {
     }
 }
 
+/// [`StopClock::record`] for the steps a caller that isn't measuring a stop
+/// also drives — the diarize pass runs for re-diarize and for deferred
+/// transcription too.
+fn record_timing(clock: Option<&StopClock>, f: impl FnOnce(&mut crate::recording::StopTimings)) {
+    if let Some(clock) = clock {
+        clock.record(f);
+    }
+}
+
 fn ms_since(t: std::time::Instant) -> u64 {
     t.elapsed().as_millis() as u64
 }
 
-/// Frees the capture slot when the post-stop chain ends, however it ends.
+/// Frees the capture slot and lands the phase on Idle when the post-stop chain
+/// ends, however it ends. The slot is released before the event so a listener
+/// that answers Idle by recording again isn't refused.
 struct SlotGuard {
     app: AppHandle,
 }
@@ -2801,6 +2832,7 @@ impl Drop for SlotGuard {
         if let Some(state) = self.app.try_state::<AppState>() {
             state.recording.lock().stop = crate::recording::StopState::None;
         }
+        emit_status(&self.app, None, Phase::Idle);
     }
 }
 
@@ -2837,8 +2869,8 @@ async fn write_stop_timings(app: &AppHandle, note_id: &str, timings: &crate::rec
     }
 }
 
-/// The chain's body. Split out so the timings write and the slot release in
-/// [`run_post_stop_chain`] cover every one of its early returns.
+/// The chain's body. Split out so the slot release, the Idle and the timings
+/// write in [`run_post_stop_chain`] cover every one of its early returns.
 async fn post_stop_chain_inner(
     app: AppHandle,
     note_id: String,
@@ -2899,7 +2931,6 @@ async fn post_stop_chain_inner(
         if discard_empty_take(&app, &note_id, &session_id).await {
             // No audio either — an aborted press. Nothing worth a manifest row.
             clear_temp_dir(temp_dir, clock).await;
-            emit_status(&app, None, Phase::Idle);
             return;
         }
         let t_finalize = std::time::Instant::now();
@@ -2916,10 +2947,9 @@ async fn post_stop_chain_inner(
         clock.record(|t| t.finalize_session_ms = ms_since(t_finalize));
         session_changed_for_sync(&app, &note_id, &session_id);
         clear_temp_dir(temp_dir, clock).await;
-        // Idle is also what makes the pending take visible: the note view
-        // re-reads its sessions on every phase transition, so the Transcribe
-        // action appears without a reload.
-        emit_status(&app, None, Phase::Idle);
+        // The Idle the chain lands on is also what makes this pending take
+        // visible: the note view re-reads its sessions on every phase
+        // transition, so the Transcribe action appears without a reload.
         return;
     }
 
@@ -2947,7 +2977,7 @@ async fn post_stop_chain_inner(
         note_id.clone(),
         post_stop,
         DiarizePolicy::POST_STOP,
-        Some(clock.timings.clone()),
+        Some(clock),
     )
     .await
     {
@@ -2974,7 +3004,6 @@ async fn post_stop_chain_inner(
         // No manifest row, no unify pass over a take that isn't there, and no
         // sync pings for a session the server should never learn about.
         clear_temp_dir(temp_dir, clock).await;
-        emit_status(&app, None, Phase::Idle);
         return;
     }
 
@@ -3020,7 +3049,6 @@ async fn post_stop_chain_inner(
     // Now that every step that needs the WAVs has finished, drop the temp dir.
     // Best-effort: a leftover dir is harmless.
     clear_temp_dir(temp_dir, clock).await;
-    emit_status(&app, None, Phase::Idle);
 }
 
 /// Drop the capture's temp dir, timed. Best-effort — a leftover dir is
@@ -3578,10 +3606,14 @@ async fn finish_import(app: &AppHandle, note_id: &str) {
     let replay_started = std::time::Instant::now();
     let state: State<AppState> = app.state();
     // Bail if a newer capture already claimed the slot (shouldn't happen —
-    // import holds it until here).
+    // import holds it until here). Then take the same `Draining → Finishing`
+    // lifecycle the live stop takes: this path's child and reader are already
+    // finished, so without it `recording_start`'s self-heal reads a zombie,
+    // takes over, and replaces the sink — clearing `chunk_log` before the
+    // snapshot below (#182).
     let inflight = {
-        let s = state.recording.lock();
-        if s.note_id.as_deref() != Some(note_id) {
+        let mut s = state.recording.lock();
+        if s.note_id.as_deref() != Some(note_id) || s.begin_stop().is_err() {
             return;
         }
         s.inflight.clone()
@@ -3590,13 +3622,13 @@ async fn finish_import(app: &AppHandle, note_id: &str) {
     let pending = inflight.lock().len() as u32;
     let t_drain = std::time::Instant::now();
     drain_inflight(&inflight).await;
-    // An import has no sidecar shutdown or reader wait of its own — the
-    // sidecar exits when the file runs out — so those rows stay zero.
-    let timings = crate::recording::StopTimings {
-        drain_ms: t_drain.elapsed().as_millis() as u64,
-        drain_pending_chunks: pending,
-        ..Default::default()
-    };
+    // An import has no sidecar shutdown or reader wait of its own — the sidecar
+    // exits when the file runs out — so those rows stay zero.
+    let clock = StopClock::new(replay_started);
+    clock.record(|t| {
+        t.drain_ms = ms_since(t_drain);
+        t.drain_pending_chunks = pending;
+    });
 
     let (temp_dir, post_stop) = {
         let mut s = state.recording.lock();
@@ -3613,7 +3645,7 @@ async fn finish_import(app: &AppHandle, note_id: &str) {
         note_id.to_string(),
         temp_dir,
         post_stop,
-        StopClock::new(replay_started, timings),
+        clock,
     )
     .await;
 }
@@ -4039,10 +4071,10 @@ async fn diarize_and_apply(
     note_id: String,
     post_stop: PostStopSnapshot,
     policy: DiarizePolicy,
-    // The stop chain's timings collector (#182), so each diarize sidecar
-    // invocation is attributed to the stream it ran on. `None` for a caller
-    // that isn't measuring a stop.
-    timings: Option<Arc<parking_lot::Mutex<crate::recording::StopTimings>>>,
+    // The stop chain's clock (#182), so each diarize sidecar invocation is
+    // attributed to the stream it ran on. `None` for a caller that isn't
+    // measuring a stop.
+    clock: Option<&StopClock>,
 ) -> anyhow::Result<()> {
     // Per-session state arrives via `post_stop`, captured in
     // `recording_stop` once the reader thread finished writing to the
@@ -4145,7 +4177,7 @@ async fn diarize_and_apply(
                     );
                     single_speaker_fallback()
                 }
-                Some(wav) => match timed_diarize(&app, &wav, expected_speakers, engine, thresholds, &timings, ChunkSource::Mic).await {
+                Some(wav) => match timed_diarize(&app, &wav, expected_speakers, engine, thresholds, clock, ChunkSource::Mic).await {
                     Err(e) => {
                         eprintln!("diarize: mic diarize failed ({e}), falling back to single-speaker labels");
                         emit_error(
@@ -4165,8 +4197,7 @@ async fn diarize_and_apply(
                         single_speaker_fallback()
                     }
                     Ok(segments) => {
-                        let diag = write_diagnostics_json(&app, &note_id, engine, "mic", &segments, &[], &chunks, &thresholds, None, None).await;
-                        record_diagnostics_path(&timings, diag);
+                        write_diagnostics_timed(&app, &note_id, engine, "mic", &segments, &[], &chunks, &thresholds, clock).await;
                         let display_map = build_display_map(&chunks, &segments, ChunkSource::Mic);
                         Box::new(move |c: &ChunkRecord| split_by_segments(c, &segments, &display_map))
                     }
@@ -4189,7 +4220,7 @@ async fn diarize_and_apply(
                     );
                     single_speaker_fallback()
                 }
-                Some(wav) => match timed_diarize(&app, &wav, expected_speakers, engine, thresholds, &timings, ChunkSource::Sys).await {
+                Some(wav) => match timed_diarize(&app, &wav, expected_speakers, engine, thresholds, clock, ChunkSource::Sys).await {
                     Err(e) => {
                         eprintln!("diarize: sys diarize failed ({e}), falling back to single-speaker labels");
                         emit_error(
@@ -4209,8 +4240,7 @@ async fn diarize_and_apply(
                         single_speaker_fallback()
                     }
                     Ok(segments) => {
-                        let diag = write_diagnostics_json(&app, &note_id, engine, "sys", &[], &segments, &chunks, &thresholds, None, None).await;
-                        record_diagnostics_path(&timings, diag);
+                        write_diagnostics_timed(&app, &note_id, engine, "sys", &[], &segments, &chunks, &thresholds, clock).await;
                         let display_map = build_display_map(&chunks, &segments, ChunkSource::Sys);
                         Box::new(move |c: &ChunkRecord| split_by_segments(c, &segments, &display_map))
                     }
@@ -4243,7 +4273,7 @@ async fn diarize_and_apply(
                     );
                     Vec::new()
                 }
-                Some(wav) => timed_diarize(&app, &wav, sys_speaker_hint, engine, thresholds, &timings, ChunkSource::Sys)
+                Some(wav) => timed_diarize(&app, &wav, sys_speaker_hint, engine, thresholds, clock, ChunkSource::Sys)
                     .await
                     .unwrap_or_else(|e| {
                         eprintln!("diarize: sys diarize failed ({e})");
@@ -4261,7 +4291,7 @@ async fn diarize_and_apply(
                     eprintln!("diarize: hybrid but mic_full.wav missing, mic falls back to You");
                     Vec::new()
                 }
-                Some(wav) => timed_diarize(&app, &wav, mic_speaker_hint, engine, thresholds, &timings, ChunkSource::Mic)
+                Some(wav) => timed_diarize(&app, &wav, mic_speaker_hint, engine, thresholds, clock, ChunkSource::Mic)
                     .await
                     .unwrap_or_else(|e| {
                         eprintln!("diarize: hybrid mic diarize failed ({e}), mic falls back to You");
@@ -4275,8 +4305,7 @@ async fn diarize_and_apply(
                     "Diarization found no distinct speakers; speech grouped by audio source.",
                 );
             }
-            let diag = write_diagnostics_json(&app, &note_id, engine, "hybrid", &mic_segments, &sys_segments, &chunks, &thresholds, None, None).await;
-            record_diagnostics_path(&timings, diag);
+            write_diagnostics_timed(&app, &note_id, engine, "hybrid", &mic_segments, &sys_segments, &chunks, &thresholds, clock).await;
             let labels = build_hybrid_labels(&chunks, &mic_segments, &sys_segments);
             // A stream whose diarize produced nothing still needs a distinct
             // label. A `None` label makes `build_labelled_transcript` glue the
@@ -4346,9 +4375,7 @@ async fn diarize_and_apply(
         sys_wav.as_deref(),
     )
     .await;
-    if let Some(t) = &timings {
-        t.lock().playback_assets_ms = ms_since(t_playback);
-    }
+    record_timing(clock, |x| x.playback_assets_ms = ms_since(t_playback));
 
     // Free the full.wav files ahead of the temp-dir cleanup. Best-effort.
     if let Some(p) = mic_wav { diarize::cleanup_full_wav(&p).await; }
@@ -6814,16 +6841,7 @@ async fn transcribe_chunk(
 }
 
 pub(crate) fn emit_status(app: &AppHandle, note_id: Option<&str>, phase: Phase) {
-    let _ = app.emit("recording_status", RecordingStatus {
-        note_id: note_id.map(|s| s.to_string()),
-        phase,
-        pending: None,
-        done: None,
-    });
-    // The tray's icon and its Start/Stop items are driven from here rather than
-    // from each call site: this is the one funnel every phase change already
-    // goes through, so the menu bar can't drift out of step with the pipeline.
-    crate::menubar::on_phase(app, phase);
+    emit_phase(app, note_id, phase, None, None);
 }
 
 /// `Stopping` with the drain's progress attached (#182): `pending` is how many
@@ -6831,13 +6849,26 @@ pub(crate) fn emit_status(app: &AppHandle, note_id: Option<&str>, phase: Phase) 
 /// same phase as before — the counts are additive, so a listener that reads
 /// only `{noteId, phase}` sees exactly what it saw before.
 fn emit_stopping_progress(app: &AppHandle, note_id: &str, pending: u32, done: u32) {
+    emit_phase(app, Some(note_id), Phase::Stopping, Some(pending), Some(done));
+}
+
+fn emit_phase(
+    app: &AppHandle,
+    note_id: Option<&str>,
+    phase: Phase,
+    pending: Option<u32>,
+    done: Option<u32>,
+) {
     let _ = app.emit("recording_status", RecordingStatus {
-        note_id: Some(note_id.to_string()),
-        phase: Phase::Stopping,
-        pending: Some(pending),
-        done: Some(done),
+        note_id: note_id.map(|s| s.to_string()),
+        phase,
+        pending,
+        done,
     });
-    crate::menubar::on_phase(app, Phase::Stopping);
+    // The tray's icon and its Start/Stop items are driven from here rather than
+    // from each call site: this is the one funnel every phase change already
+    // goes through, so the menu bar can't drift out of step with the pipeline.
+    crate::menubar::on_phase(app, phase);
 }
 
 /// Per-note (re)diarize lifecycle (#187), on its own channel for the same

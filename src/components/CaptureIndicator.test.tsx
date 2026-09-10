@@ -6,11 +6,9 @@ import { makeNote } from "../test/fixtures";
 import { useRecordingStore } from "../lib/store";
 import type { RecordingStatus } from "../lib/ipc";
 
-// #182. The stop chain is minutes long on a local-Whisper meeting, and the only
-// thing that ever said so lived inside the recording note's own view — leaving
-// the note meant leaving every indicator behind, which is what made a stop feel
-// like it held the whole app. The compact indicator is the same bar in the one
-// place every screen can show it, and it replaces the diarize-only toast.
+// #182. The stop chain runs for minutes on a local-Whisper meeting, and the
+// note view's own bar is off screen the moment the user navigates away — so the
+// compact indicator is the one thing every other screen can say it with.
 
 const NOTE = makeNote({ id: "n1", title: "Weekly sync" });
 

@@ -551,7 +551,10 @@ export const ipc = {
     invoke<Note>("import_audio", { path, language, expectedSpeakers }),
   recordingPause: () => invoke<void>("recording_pause"),
   recordingResume: () => invoke<void>("recording_resume"),
-  recordingState: () => invoke<"idle" | "recording">("recording_state"),
+  // `stopping` covers the whole post-stop chain, which holds the single
+  // capture slot until it lands on idle (#182) — so it is a third answer to
+  // "can a capture start", not a variant of either other one.
+  recordingState: () => invoke<"idle" | "recording" | "stopping">("recording_state"),
   summarizeNote: (noteId: string) => invoke<void>("summarize_note", { noteId }),
   // Regenerate a note's title from its content (#90). Resolves to the new title,
   // or null when the model gave back nothing usable — in which case the existing

@@ -6,10 +6,9 @@ import { makeNote } from "../test/fixtures";
 import { useRecordingStore } from "../lib/store";
 import type { RecordingPhase } from "../lib/ipc";
 
-// #182. Both of these controls were already locked for the right reason and
-// said the wrong thing about it: Record on another note went inert with no
-// explanation for the minutes a stop can take, and the transcript's lock
-// claimed a recording was running long after one had stopped.
+// #182. Both controls stay locked well past the end of the capture — the stop
+// chain holds the slot through the drain and the diarize pass, and owns
+// `note.transcript` for all of it — so each state has to name what it waits on.
 
 const OTHER = makeNote({ id: "n1", title: "Weekly sync", transcript: "Speaker 1: hei" });
 

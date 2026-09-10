@@ -356,6 +356,20 @@ impl LiveCapture {
             StopState::Draining | StopState::Finishing => Some(STOP_IN_PROGRESS),
         }
     }
+
+    /// Move the slot into its stop sequence and return the note it holds.
+    /// `note_id` deliberately stays set — the tail of the transcript keeps
+    /// appending live through the drain — so `Draining` is what refuses a new
+    /// capture until the post-stop chain releases the slot. Both the live stop
+    /// and the import completion path go through here.
+    pub fn begin_stop(&mut self) -> Result<String, &'static str> {
+        if let Some(msg) = self.stop_in_progress() {
+            return Err(msg);
+        }
+        let note_id = self.note_id.clone().ok_or("not recording")?;
+        self.stop = StopState::Draining;
+        Ok(note_id)
+    }
 }
 
 /// Where the single capture slot is in its stop sequence.
@@ -676,25 +690,65 @@ mod tests {
     }
 
     #[test]
-    fn a_stop_in_progress_refuses_a_new_capture_without_touching_the_chunk_log() {
+    fn only_a_stop_in_progress_refuses_a_new_capture() {
+        let mut cap = LiveCapture::default();
+        cap.note_id = Some("n1".to_string());
+        assert_eq!(cap.stop_in_progress(), None, "a live slot is takeable");
+        cap.stop = StopState::Draining;
+        assert_eq!(cap.stop_in_progress(), Some(STOP_IN_PROGRESS));
+        cap.stop = StopState::Finishing;
+        assert_eq!(cap.stop_in_progress(), Some(STOP_IN_PROGRESS));
+        cap.stop = StopState::None;
+        assert_eq!(cap.stop_in_progress(), None);
+    }
+
+    #[test]
+    fn a_refused_caller_never_reaches_the_chunk_log() {
         // The invariant #182 protects: a new capture can never clear
         // `chunk_log` before the previous stop has snapshotted it. Both
-        // `recording_start` and `import_audio` therefore ask this *first* and
-        // return before they reset anything.
+        // `recording_start` and `import_audio` ask *first* and return before
+        // they reset anything, which this stands in for.
+        let take_the_slot = |cap: &mut LiveCapture| -> Result<(), &'static str> {
+            if let Some(msg) = cap.stop_in_progress() {
+                return Err(msg);
+            }
+            cap.sink = Arc::new(CaptureSink::new(SinkMode::Live));
+            Ok(())
+        };
         let mut cap = LiveCapture::default();
         cap.note_id = Some("n1".to_string());
         cap.sink.chunk_log.lock().push(a_chunk());
         for stop in [StopState::Draining, StopState::Finishing] {
             cap.stop = stop;
-            let refusal = cap.stop_in_progress();
-            assert_eq!(refusal, Some(STOP_IN_PROGRESS), "{stop:?} must refuse");
-            if refusal.is_none() {
-                cap.sink = Arc::new(CaptureSink::new(SinkMode::Live));
-            }
+            assert_eq!(take_the_slot(&mut cap), Err(STOP_IN_PROGRESS), "{stop:?} must refuse");
             assert_eq!(cap.sink.chunk_log.lock().len(), 1, "{stop:?} lost the log");
         }
+        // And the stand-in really does clear it once allowed to run, so the
+        // survival above is the refusal's doing.
         cap.stop = StopState::None;
-        assert_eq!(cap.stop_in_progress(), None, "an idle slot is takeable");
+        assert_eq!(take_the_slot(&mut cap), Ok(()));
+        assert!(cap.sink.chunk_log.lock().is_empty());
+    }
+
+    #[test]
+    fn an_import_drain_holds_the_slot_like_a_live_stop_does() {
+        // `finish_import` drains too, and its child and reader are already
+        // finished — so without the same lifecycle `recording_start`'s
+        // self-heal reads a zombie and takes over mid-drain.
+        let mut cap = LiveCapture::default();
+        cap.note_id = Some("n1".to_string());
+        assert_eq!(cap.begin_stop(), Ok("n1".to_string()));
+        assert_eq!(cap.stop, StopState::Draining);
+        assert_eq!(cap.note_id.as_deref(), Some("n1"), "the tail still appends");
+        assert_eq!(cap.stop_in_progress(), Some(STOP_IN_PROGRESS));
+        assert_eq!(cap.begin_stop(), Err(STOP_IN_PROGRESS), "no second stop");
+    }
+
+    #[test]
+    fn an_empty_slot_has_no_stop_to_begin() {
+        let mut cap = LiveCapture::default();
+        assert_eq!(cap.begin_stop(), Err("not recording"));
+        assert_eq!(cap.stop, StopState::None);
     }
 
     #[test]
@@ -710,7 +764,7 @@ mod tests {
 
         // Every other emit goes through `emit_status`, which passes None for
         // both — the fields must vanish, so a listener reading `{noteId,
-        // phase}` sees exactly the payload it saw before #182.
+        // phase}` gets a payload with nothing else in it.
         let idle = RecordingStatus {
             note_id: None,
             phase: Phase::Idle,

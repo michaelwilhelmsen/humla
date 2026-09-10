@@ -282,6 +282,22 @@ async function runGenerateTitle(noteId: string, onTitle: (title: string) => void
   }
 }
 
+// Why transcript editing is locked, in the words of the state it is in. The
+// post-stop chain rewrites the transcript wholesale, so the lock outlives the
+// recording by however long the tail and the diarize pass take.
+const LOCK_WHILE_RECORDING = "Editing is paused while recording";
+
+function transcriptLockCopy(state: {
+  stopping: boolean;
+  diarizing: boolean;
+  importing: boolean;
+}): string {
+  if (state.stopping) return "Editing is paused while the transcript finishes";
+  if (state.diarizing) return "Editing is paused while speakers are identified";
+  if (state.importing) return "Editing is paused while the audio is transcribed";
+  return LOCK_WHILE_RECORDING;
+}
+
 export function Note() {
   const { id } = useParams<{ id: string }>();
   const { sidebarCollapsed } = useOutletContext<LayoutOutletContext>();
@@ -1056,7 +1072,7 @@ export function Note() {
   // Why Record is refused here, or null when it isn't. The backend holds the
   // single capture slot until the previous stop has landed on idle (#182), so
   // a stop that is still draining or diarizing disables this button for what
-  // can be minutes — long enough that "disabled and silent" reads as a bug.
+  // can be minutes.
   const recordBlock = lockedBy
     ? `${lockedBy.holderName} is recording this note`
     : !otherActiveRecording
@@ -1064,17 +1080,11 @@ export function Note() {
       : recPhase.phase === "stopping" || recPhase.phase === "diarizing"
         ? "Finishing the previous recording"
         : "Another note is recording";
-  // Why transcript editing is locked, in the words of the state it is in. The
-  // post-stop chain rewrites the transcript wholesale, so the lock outlives
-  // the recording by however long the tail and the diarize pass take — and for
-  // most of that "while recording" was simply untrue.
-  const transcriptLockReason = isStopping
-    ? "Editing is paused while the transcript finishes"
-    : isDiarizing
-      ? "Editing is paused while speakers are identified"
-      : isImporting
-        ? "Editing is paused while the audio is transcribed"
-        : "Editing is paused while recording";
+  const transcriptLockReason = transcriptLockCopy({
+    stopping: isStopping,
+    diarizing: isDiarizing,
+    importing: isImporting,
+  });
   const authorName = ownerName ?? myName ?? null;
   const authorInitial = (authorName ?? "?").slice(0, 1).toUpperCase();
   const noteWsName = draft.workspace_id
@@ -2728,8 +2738,8 @@ const TranscriptView = memo(function TranscriptView({
   onClick,
   disabled,
   // Named by the caller, because only the note knows which state the lock is
-  // for: a recording, the tail still landing, or the diarize pass (#182).
-  disabledReason = "Editing is paused while recording",
+  // for: a recording, the tail still landing, or the diarize pass.
+  disabledReason = LOCK_WHILE_RECORDING,
   fill,
   bottomAligned,
 }: {

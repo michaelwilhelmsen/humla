@@ -125,10 +125,12 @@ describe("the recording bar's degradation ladder", () => {
     for (const key of ["detail", "pill", "pausedWord"] as const) {
       expect(px(ROW_STEPS.tight[key])).toBeGreaterThan(px(ROW_STEPS.roomy[key]));
     }
-    // The busy label is the one step the roomy arrangement has no use for:
-    // with no controls pill beside it, the label always fits.
-    expect(ROW_STEPS.roomy.busyLabel).toBe("");
-    expect(px(ROW_STEPS.tight.busyLabel)).toBeGreaterThan(0);
+    // The busy label and the stop's frozen timer are the two steps the roomy
+    // arrangement has no use for: with no third pill beside them, both fit.
+    for (const key of ["busyLabel", "stopTimer"] as const) {
+      expect(ROW_STEPS.roomy[key]).toBe("");
+      expect(px(ROW_STEPS.tight[key])).toBeGreaterThan(0);
+    }
   });
 
   it("reaches for the cheapest step first and the bare spinner last", () => {
@@ -150,10 +152,9 @@ describe("the recording bar's degradation ladder", () => {
   });
 });
 
-// #182. Stop used to be a wall: the transcript froze, the timer vanished and a
-// bare "Stopping…" said nothing about how long. The tail now appends live, so
-// the row can report a real fraction — and the one thing it must never do is
-// invent one for the diarize pass, which reports no progress at all.
+// #182. The tail of the transcript appends live through the stop, so the row
+// reports a real fraction — and must never invent one for the diarize pass,
+// which reports no progress at all.
 describe("the bar after stop (#182)", () => {
   function seedStop(patch: Partial<RecordingStatus> = {}) {
     useRecordingStore.setState({

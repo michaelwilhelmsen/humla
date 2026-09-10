@@ -67,13 +67,11 @@ export function noAudioWarning(device?: string | null): string {
  *      when a summary runs during a recording and so shares the row with the
  *      controls pill. The pill keeps its name (`role="status"` + `aria-label`).
  *   5. `stopTimer` — the frozen elapsed reading, but only once stop has taken
- *      the controls off it (#182). While the capture runs that pill holds pause
- *      and stop and is not optional; afterwards it is a number about a
- *      recording that is already over, and the progress pill beside it is the
- *      one saying what is still happening. The progress pill has no step of its
- *      own: a label and a 56px track clear the narrowest column the layout can
- *      produce, and a bar with no words on it says neither of the two things
- *      this one has to distinguish.
+ *      the controls off it. While the capture runs that pill holds pause and
+ *      stop and is not optional; afterwards it is a number about a recording
+ *      that is already over, and the progress pill beside it is the one saying
+ *      what is still happening. That pill has no step of its own — its label
+ *      and 56px track clear the narrowest column the layout can produce.
  *
  * Two arrangements, because the thresholds depend on what else is in the row:
  * `roomy` is diagnostics or controls or the stop's own pills, `tight` adds the
@@ -157,11 +155,9 @@ function captureProgress(
 
 /**
  * The capture's elapsed seconds, held by whatever is mounted for the whole
- * recording rather than by the thing that displays it.
- *
- * Frozen rather than cleared through `stopping` (#182): the recording's length
- * is already final when stop is pressed, and unmounting the timer there was
- * half of what made the stop read as the app dropping the thread.
+ * recording rather than by the thing that displays it. Frozen rather than
+ * cleared through `stopping`: the recording's length is already final when
+ * stop is pressed.
  */
 export function useCaptureElapsed(phase: RecordingPhase): number {
   const [elapsed, setElapsed] = useState(0);
@@ -188,8 +184,8 @@ export function useCaptureElapsed(phase: RecordingPhase): number {
  * how much of it is left. `compact` is the app-wide one the sidebar-less
  * placement in `Layout` mounts, so the state follows the user off the note —
  * it adds the elapsed timer while the capture is live and is a link back to
- * the note it belongs to. Same two labels and the same track in both, which is
- * the point: a second design for the second placement is how the two drift.
+ * the note it belongs to. Both densities carry the same two labels and the
+ * same track.
  */
 export function CaptureIndicator({
   variant,
@@ -514,7 +510,7 @@ export function RecordingBar({ noteId }: { noteId: string }) {
           >
             {/* No glyph once stop is pressed: a record dot would claim the
                 capture is still live and a pause glyph would claim it is
-                paused. The reading itself is the whole point there. */}
+                paused. */}
             {recording ? (
               <span className="rec-dot inline-block w-[9px] h-[9px] rounded-full bg-[var(--color-record)]" />
             ) : phase === "paused" ? (
