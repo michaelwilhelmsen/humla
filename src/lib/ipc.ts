@@ -830,11 +830,19 @@ export type TitleStatus = { noteId: string; active: boolean };
 // it starts, and a take that retained both streams is replayed twice. Monotonic
 // and clamped to the total on the backend. `take` / `takes` are 1-based, so the
 // label and the fraction stay separable and this side does one division. All
-// four are absent on the brackets (`active` true/false) and on a run with
+// five are absent on the brackets (`active` true/false) and on a run with
 // nothing to report.
+//
+// `phase` is which half of the take is running (#188): a take is replayed
+// through the provider and then diarized, and the diarize half has no measure
+// of its own, so `doneMs` sitting at the total is not what says it has moved
+// on. The position stays on a `diarizing` event — it is where the next take
+// resumes.
+export type ReplayPhase = "transcribing" | "diarizing";
 export type TranscribeStatus = {
   noteId: string;
   active: boolean;
+  phase?: ReplayPhase;
   doneMs?: number;
   totalMs?: number;
   take?: number;

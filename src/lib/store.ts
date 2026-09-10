@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { ipc, onRecordingDiagnostic, onRecordingError, onRecordingStatus, onSummary, onSummaryStatus, onTitleStatus, onTranscribeStatus, onDiarizeStatus, onTranscript, onTranscriptReplaced, onNotesChanged, onSyncStatus, onSyncConflict, onLocalWhisperProgress, onLocalWhisperDownloadError, type Client, type Folder, type Note, type RecordingDiagnostic, type RecordingStatus } from "./ipc";
+import { ipc, onRecordingDiagnostic, onRecordingError, onRecordingStatus, onSummary, onSummaryStatus, onTitleStatus, onTranscribeStatus, onDiarizeStatus, onTranscript, onTranscriptReplaced, onNotesChanged, onSyncStatus, onSyncConflict, onLocalWhisperProgress, onLocalWhisperDownloadError, type Client, type Folder, type Note, type RecordingDiagnostic, type RecordingStatus, type ReplayPhase } from "./ipc";
 import { useCloudStore } from "./cloud";
 
 type NotesState = {
@@ -103,11 +103,13 @@ export type Flash = { id: number; message: string };
 
 /**
  * How far a deferred transcription's replay has got (#146), as `transcribe_status`
- * reports it: audio position over the whole run, plus the 1-based take counter.
- * Every field is optional — the brackets around a run carry none of them, and a
- * run with nothing to report is exactly as active as one mid-way.
+ * reports it: which half of the take is running (#188), audio position over the
+ * whole run, and the 1-based take counter. Every field is optional — the
+ * brackets around a run carry none of them, and a run with nothing to report is
+ * exactly as active as one mid-way.
  */
 export type ReplayMeasure = {
+  phase?: ReplayPhase;
   doneMs?: number;
   totalMs?: number;
   take?: number;

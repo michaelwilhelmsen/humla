@@ -83,6 +83,38 @@ describe("the compact indicator during a replay (#146)", () => {
     await screen.findByRole("progressbar", { name: "Transcribing take 2 of 3…" });
   });
 
+  // #188. The second half of every take, which used to sit at 100% under
+  // "Transcribing…" for minutes.
+  it("goes indeterminate for the diarize half, the way a stop's does", async () => {
+    open(
+      "/all-notes",
+      { noteId: null, phase: "idle" },
+      { n1: { ...RUN, phase: "diarizing", doneMs: 180_000 } },
+    );
+    const bar = await screen.findByRole("progressbar", { name: "Identifying speakers…" });
+    expect(bar).not.toHaveAttribute("aria-valuenow");
+    expect(bar).toHaveAttribute("aria-busy", "true");
+  });
+
+  it("names the take in the diarize half too", async () => {
+    open(
+      "/all-notes",
+      { noteId: null, phase: "idle" },
+      { n1: { ...RUN, phase: "diarizing", take: 2, takes: 3 } },
+    );
+    await screen.findByRole("progressbar", { name: "Identifying speakers in take 2 of 3…" });
+  });
+
+  it("is determinate again when the next take starts replaying", async () => {
+    open(
+      "/all-notes",
+      { noteId: null, phase: "idle" },
+      { n1: { ...RUN, phase: "transcribing", doneMs: 120_000, take: 3, takes: 3 } },
+    );
+    const bar = await screen.findByRole("progressbar", { name: "Transcribing take 3 of 3…" });
+    expect(bar).toHaveAttribute("aria-valuenow", "67");
+  });
+
   it("navigates to the note being transcribed, not to a recording", async () => {
     open("/all-notes", { noteId: null, phase: "idle" }, { n1: RUN });
     await userEvent.click(await screen.findByRole("button", { name: /open the recording/i }));

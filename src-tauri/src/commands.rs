@@ -3,7 +3,7 @@ use crate::diarize;
 use crate::local_whisper;
 use crate::sessions;
 use crate::wav;
-use crate::recording::{CaptureSink, ChunkRecord, ChunkSource, DiagnosticPayload, ErrorPayload, Inflight, Phase, RecordingStatus, ReplayProgress, SidecarEvent, SinkMode, TakeWork, TranscriptPayload};
+use crate::recording::{CaptureSink, ChunkRecord, ChunkSource, DiagnosticPayload, ErrorPayload, Inflight, Phase, RecordingStatus, ReplayProgress, ReplayTakeTimings, ReplayTimings, SidecarEvent, SinkMode, TakeWork, TranscriptPayload};
 use crate::AppState;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -2883,6 +2883,36 @@ async fn write_stop_timings(app: &AppHandle, note_id: &str, timings: &crate::rec
     }
 }
 
+/// A replay run's timings, at `diagnostics/<note_id>/replay-timings.json`.
+///
+/// A sibling file rather than a merge into the take's diarize diagnostics,
+/// which [`write_stop_timings`] can do: that file is keyed `<engine>-<source>`,
+/// so every take of a multi-take run writes the same one and the last would be
+/// the only one measured. A stop chain has exactly one take, which is why it
+/// can merge. Best-effort: a write failure logs and nothing else.
+async fn write_replay_timings(app: &AppHandle, note_id: &str, timings: &ReplayTimings) {
+    let Ok(app_dir) = app.path().app_data_dir() else { return };
+    let dir = app_dir.join("diagnostics").join(note_id);
+    if let Err(e) = tokio::fs::create_dir_all(&dir).await {
+        eprintln!("replay timings: mkdir {}: {e}", dir.display());
+        return;
+    }
+    let path = dir.join("replay-timings.json");
+    let existing = tokio::fs::read_to_string(&path)
+        .await
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+    let merged = crate::recording::merge_timings(existing, timings);
+    match serde_json::to_string_pretty(&merged) {
+        Ok(json) => {
+            if let Err(e) = tokio::fs::write(&path, json).await {
+                eprintln!("replay timings: write {}: {e}", path.display());
+            }
+        }
+        Err(e) => eprintln!("replay timings: serialize: {e}"),
+    }
+}
+
 /// The chain's body. Split out so the slot release, the Idle and the timings
 /// write in [`run_post_stop_chain`] cover every one of its early returns.
 async fn post_stop_chain_inner(
@@ -3830,8 +3860,20 @@ async fn transcribe_takes(
     // rather than returned so the tail below still runs for the takes that did
     // land — see the loop.
     let mut fatal: Option<String> = None;
+    // What the run cost, per take and per half (#188). Filled as the loop runs
+    // and reported once below, so a take abandoned mid-run is still measured.
+    let run_started = std::time::Instant::now();
+    let mut timings = ReplayTimings::default();
     for (take_index, (entry, dir)) in takes.into_iter().enumerate() {
-        progress.lock().begin_take(take_index);
+        // Emitted, not just recorded: this is where the phase goes back to
+        // transcribing after the previous take's diarize (#188).
+        let snapshot = {
+            let mut p = progress.lock();
+            p.begin_take(take_index);
+            p.snapshot()
+        };
+        emit_transcribe_progress(app, note_id, snapshot);
+        let t_transcribe = std::time::Instant::now();
         // At least one of these exists — `takes_to_transcribe` filtered on it,
         // so a take whose audio was swept away by "Delete stored audio" never
         // reaches here and never produced a button either.
@@ -3860,8 +3902,16 @@ async fn transcribe_takes(
             progress.lock().finish_stream();
         }
         emit_transcribe_progress(app, note_id, progress.lock().snapshot());
+        let mut take_timings = ReplayTakeTimings {
+            index: entry.index,
+            streams: mic_wav.is_some() as u32 + sys_wav.is_some() as u32,
+            audio_ms: entry.duration_ms,
+            transcribe_ms: ms_since(t_transcribe),
+            diarize_ms: 0,
+        };
         let chunks = sink.chunk_log.lock().clone();
         if chunks.is_empty() {
+            timings.takes.push(take_timings);
             // Deliberately NOT marked transcribed. From here, silence and "every
             // chunk failed" (provider outage, revoked key) are indistinguishable,
             // and the second has to stay retryable — the audio is still on disk,
@@ -3887,7 +3937,18 @@ async fn transcribe_takes(
         // `timeline.jsonl` and rebuilt the note's transcript from it, so the
         // checkpoints and the asset push below still have to happen. Recorded
         // and broken out of rather than `?`-ed straight to the caller.
-        if let Err(e) = rediarize_apply_to_chunks(
+        //
+        // The policy stays `Silent`: only the live capture's own chain may
+        // write to `recording_status` (#187). This half's progress is announced
+        // here instead, on the run's own per-note channel (#188).
+        let snapshot = {
+            let mut p = progress.lock();
+            p.begin_diarize();
+            p.snapshot()
+        };
+        emit_transcribe_progress(app, note_id, snapshot);
+        let t_diarize = std::time::Instant::now();
+        let diarized = rediarize_apply_to_chunks(
             app.clone(),
             note_id.to_string(),
             entry.id.clone(),
@@ -3899,8 +3960,10 @@ async fn transcribe_takes(
             thresholds,
             DiarizePolicy::DEFERRED_TRANSCRIBE,
         )
-        .await
-        {
+        .await;
+        take_timings.diarize_ms = ms_since(t_diarize);
+        timings.takes.push(take_timings);
+        if let Err(e) = diarized {
             fatal = Some(format!("Recording {} failed to transcribe: {e}", entry.index));
             break;
         }
@@ -3908,6 +3971,14 @@ async fn transcribe_takes(
         session_changed_for_sync(app, note_id, &entry.id);
         transcribed_chunks.extend(chunks);
     }
+
+    // The run's own line, always — the two halves' costs are what the ratio
+    // between them is read off, and it inverts against a live capture's stop
+    // (which did its Whisper work during the meeting). Before the early return
+    // below, so a run where every take lost its audio is measured too.
+    timings.total_ms = ms_since(run_started);
+    eprintln!("{}", timings.summary());
+    write_replay_timings(app, note_id, &timings).await;
 
     if transcribed_chunks.is_empty() {
         // Nothing landed, so there is nothing to checkpoint or push. With no
