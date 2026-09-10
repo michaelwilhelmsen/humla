@@ -3,7 +3,7 @@ use crate::diarize;
 use crate::local_whisper;
 use crate::sessions;
 use crate::wav;
-use crate::recording::{CaptureSink, ChunkRecord, ChunkSource, DiagnosticPayload, ErrorPayload, Inflight, Phase, RecordingStatus, SidecarEvent, SinkMode, TranscriptPayload};
+use crate::recording::{CaptureSink, ChunkRecord, ChunkSource, DiagnosticPayload, ErrorPayload, Inflight, Phase, RecordingStatus, ReplayProgress, SidecarEvent, SinkMode, TakeWork, TranscriptPayload};
 use crate::AppState;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -2535,7 +2535,7 @@ pub async fn recording_stop(
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let stop_pressed = std::time::Instant::now();
-    let (child, note_id, temp_dir, inflight, reader, lock_id, lock_heartbeat) = {
+    let (child, note_id, temp_dir, inflight, reader, lock_id, lock_heartbeat, deferred) = {
         let mut s = state.recording.lock();
         // `note_id` deliberately stays set until the post-stop snapshot: it is
         // what lets a chunk finishing during the drain append to the note live
@@ -2552,7 +2552,11 @@ pub async fn recording_stop(
         let reader = s.reader.take();
         let lock_id = s.lock_id.take();
         let lock_heartbeat = s.lock_heartbeat.take();
-        (child, note_id, temp_dir, inflight, reader, lock_id, lock_heartbeat)
+        // Read here rather than off the post-stop snapshot: the phase this
+        // stop emits next has to carry it, and the snapshot is taken after the
+        // drain.
+        let deferred = !s.sink.transcribes_on_arrival();
+        (child, note_id, temp_dir, inflight, reader, lock_id, lock_heartbeat, deferred)
     };
 
     // Stop heartbeating and release the shared-note lock immediately, so a
@@ -2571,8 +2575,12 @@ pub async fn recording_stop(
     // Everything in flight at stop-pressed is the drain's denominator; the
     // reader may still push a last chunk or two before the sidecar closes its
     // pipe, so the count is re-taken (and re-emitted) after the reader exits.
-    let pending_at_stop = inflight.lock().len() as u32;
-    emit_stopping_progress(&app, &note_id, pending_at_stop, 0);
+    if deferred {
+        emit_deferred_phase(&app, &note_id, Phase::Stopping);
+    } else {
+        let pending_at_stop = inflight.lock().len() as u32;
+        emit_stopping_progress(&app, &note_id, pending_at_stop, 0);
+    }
 
     let clock = StopClock::new(stop_pressed);
     let t_sidecar = std::time::Instant::now();
@@ -2628,12 +2636,18 @@ pub async fn recording_stop(
     // seconds in the typical case — with the count of what's left, and each
     // chunk's text landing in the note as it completes (#182).
     let pending = inflight.lock().len() as u32;
-    emit_stopping_progress(&app, &note_id, pending, 0);
     let t_drain = std::time::Instant::now();
-    drain_inflight_reporting(&inflight, |done| {
-        emit_stopping_progress(&app, &note_id, pending, done);
-    })
-    .await;
+    if deferred {
+        // Nothing was dispatched, so there is nothing to drain and no count
+        // worth reporting.
+        drain_inflight(&inflight).await;
+    } else {
+        emit_stopping_progress(&app, &note_id, pending, 0);
+        drain_inflight_reporting(&inflight, |done| {
+            emit_stopping_progress(&app, &note_id, pending, done);
+        })
+        .await;
+    }
     clock.record(|t| {
         t.drain_ms = ms_since(t_drain);
         t.drain_pending_chunks = pending;
@@ -2878,7 +2892,11 @@ async fn post_stop_chain_inner(
     post_stop: PostStopSnapshot,
     clock: &StopClock,
 ) {
-    emit_status(&app, Some(&note_id), Phase::Diarizing);
+    if post_stop.deferred {
+        emit_deferred_phase(&app, &note_id, Phase::Diarizing);
+    } else {
+        emit_status(&app, Some(&note_id), Phase::Diarizing);
+    }
 
     // Make the note's storage session-shaped before writing this take. For a
     // pre-feature flat note, migrate its single take into a session subdir so
@@ -3183,12 +3201,25 @@ async fn dispatch_sidecar_event(
                 Some(sem) => sem.clone().acquire_owned().await.ok(),
                 None => None,
             };
+            // A replay reports on the chunk it has just *finished*, not the one
+            // the sidecar has just handed over: the reader runs at disk speed
+            // and is allowed IMPORT_BACKLOG_PERMITS ahead, which on a short
+            // take is the whole of it.
+            let progress = sink.replay_progress.clone();
             let h = tokio::spawn(async move {
                 let _permit = permit; // held until this transcribe returns
-                if let Err(e) =
+                let outcome =
                     transcribe_chunk(app2.clone(), note_id2.clone(), source, pb, start_ms, sink2)
-                        .await
-                {
+                        .await;
+                if let Some(progress) = progress {
+                    let snapshot = {
+                        let mut p = progress.lock();
+                        p.note_chunk(start_ms);
+                        p.snapshot()
+                    };
+                    emit_transcribe_progress(&app2, &note_id2, snapshot);
+                }
+                if let Err(e) = outcome {
                     let msg = format!("Transcription failed: {e}");
                     eprintln!("{msg}");
                     let _ = app2.emit("recording_error", ErrorPayload {
@@ -3714,10 +3745,21 @@ pub async fn transcribe_note(
 fn emit_transcribe_status(app: &AppHandle, note_id: &str, active: bool) {
     let _ = app.emit(
         "transcribe_status",
-        crate::recording::TranscribeStatusPayload {
-            note_id: note_id.to_string(),
-            active,
-        },
+        crate::recording::TranscribeStatusPayload::bracket(note_id, active),
+    );
+}
+
+/// How far the run has got, on the same per-note channel. Measured in audio
+/// position (see [`crate::recording::ReplayProgress`]) because a replay's chunk
+/// count isn't known until it ends. No rate limit: chunks are seconds apart.
+fn emit_transcribe_progress(
+    app: &AppHandle,
+    note_id: &str,
+    snapshot: crate::recording::ReplaySnapshot,
+) {
+    let _ = app.emit(
+        "transcribe_status",
+        crate::recording::TranscribeStatusPayload::progress(note_id, snapshot),
     );
 }
 
@@ -3767,13 +3809,29 @@ async fn transcribe_takes(
             .filter(|n| *n > 0)
     };
 
+    // The run's shape, settled before a single chunk decodes: each take's
+    // retained streams are replayed one after the other, so a take that kept
+    // both costs twice its duration. Every stream of every take reports into
+    // this one handle, since the fraction is over the whole run.
+    let progress = Arc::new(parking_lot::Mutex::new(ReplayProgress::new(
+        takes
+            .iter()
+            .map(|(entry, dir)| TakeWork {
+                streams: sessions::replayable_stream_count(dir),
+                duration_ms: entry.duration_ms,
+            })
+            .collect(),
+    )));
+    emit_transcribe_progress(app, note_id, progress.lock().snapshot());
+
     let mut transcribed_chunks: Vec<ChunkRecord> = Vec::new();
     let mut failures: Vec<String> = Vec::new();
     // Set when a take fails hard enough to abandon the rest of the run. Held
     // rather than returned so the tail below still runs for the takes that did
     // land — see the loop.
     let mut fatal: Option<String> = None;
-    for (entry, dir) in takes {
+    for (take_index, (entry, dir)) in takes.into_iter().enumerate() {
+        progress.lock().begin_take(take_index);
         // At least one of these exists — `takes_to_transcribe` filtered on it,
         // so a take whose audio was swept away by "Delete stored audio" never
         // reaches here and never produced a button either.
@@ -3789,15 +3847,19 @@ async fn transcribe_takes(
         // sequential keeps the machine's load where the user put it.
         let sink = CaptureSink::new(SinkMode::Replay {
             source: ChunkSource::Mic,
-        });
+        })
+        .with_progress(progress.clone());
         if let Some(path) = mic_wav.as_deref() {
             let stream = Arc::new(sink.for_stream(ChunkSource::Mic));
             replay_retained_stream(app, note_id, path, &stream).await?;
+            progress.lock().finish_stream();
         }
         if let Some(path) = sys_wav.as_deref() {
             let stream = Arc::new(sink.for_stream(ChunkSource::Sys));
             replay_retained_stream(app, note_id, path, &stream).await?;
+            progress.lock().finish_stream();
         }
+        emit_transcribe_progress(app, note_id, progress.lock().snapshot());
         let chunks = sink.chunk_log.lock().clone();
         if chunks.is_empty() {
             // Deliberately NOT marked transcribed. From here, silence and "every
@@ -6841,7 +6903,16 @@ async fn transcribe_chunk(
 }
 
 pub(crate) fn emit_status(app: &AppHandle, note_id: Option<&str>, phase: Phase) {
-    emit_phase(app, note_id, phase, None, None);
+    emit_phase(app, RecordingStatus::plain(note_id, phase));
+}
+
+/// A stop phase of a capture that never transcribed as it ran (#146). Marked
+/// rather than withheld: with no chunks to drain and no text to diarize the
+/// chain lands on Idle in a few hundred milliseconds, and the Idle is what
+/// makes the pending take visible. No drain counts either — there is nothing
+/// pending to count.
+fn emit_deferred_phase(app: &AppHandle, note_id: &str, phase: Phase) {
+    emit_phase(app, RecordingStatus::deferred_phase(note_id, phase));
 }
 
 /// `Stopping` with the drain's progress attached (#182): `pending` is how many
@@ -6849,22 +6920,12 @@ pub(crate) fn emit_status(app: &AppHandle, note_id: Option<&str>, phase: Phase) 
 /// same phase as before — the counts are additive, so a listener that reads
 /// only `{noteId, phase}` sees exactly what it saw before.
 fn emit_stopping_progress(app: &AppHandle, note_id: &str, pending: u32, done: u32) {
-    emit_phase(app, Some(note_id), Phase::Stopping, Some(pending), Some(done));
+    emit_phase(app, RecordingStatus::stopping_progress(note_id, pending, done));
 }
 
-fn emit_phase(
-    app: &AppHandle,
-    note_id: Option<&str>,
-    phase: Phase,
-    pending: Option<u32>,
-    done: Option<u32>,
-) {
-    let _ = app.emit("recording_status", RecordingStatus {
-        note_id: note_id.map(|s| s.to_string()),
-        phase,
-        pending,
-        done,
-    });
+fn emit_phase(app: &AppHandle, status: RecordingStatus) {
+    let phase = status.phase;
+    let _ = app.emit("recording_status", status);
     // The tray's icon and its Start/Stop items are driven from here rather than
     // from each call site: this is the one funnel every phase change already
     // goes through, so the menu bar can't drift out of step with the pipeline.

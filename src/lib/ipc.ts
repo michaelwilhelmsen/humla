@@ -804,11 +804,18 @@ export type SummaryProvider = "openai" | "local";
 // transcriptions were still in flight when stop was pressed, and how many of
 // those have landed. Both absent in every other phase — the backend skips them
 // when unset — so a listener that reads `{noteId, phase}` is unaffected.
+// `deferred` rides along on the `stopping` and `diarizing` of a capture that
+// ran with "Transcribe manually" on (#146). That stop has no chunks to drain
+// and no text to diarize, so it lands on idle in a few hundred milliseconds
+// and a progress bar drawn for it appears and vanishes. It carries no
+// `pending` / `done` either — nothing was dispatched. Absent for a live
+// capture, whose zero-pending stop is a real full bar.
 export type RecordingStatus = {
   noteId: string | null;
   phase: RecordingPhase;
   pending?: number;
   done?: number;
+  deferred?: boolean;
 };
 export type RecordingError = { noteId: string | null; message: string };
 export type SummaryStatus = { noteId: string; active: boolean };
@@ -818,7 +825,21 @@ export type TitleStatus = { noteId: string; active: boolean };
 // A deferred transcription is replaying this note's retained audio (#146).
 // Per-note, and never on `recording_status`: a live recording on a different
 // note may be in flight at the same time.
-export type TranscribeStatus = { noteId: string; active: boolean };
+// `doneMs` / `totalMs` are **audio position**, not chunks: a replay's chunk
+// count isn't known until it ends, while every take's duration is known before
+// it starts, and a take that retained both streams is replayed twice. Monotonic
+// and clamped to the total on the backend. `take` / `takes` are 1-based, so the
+// label and the fraction stay separable and this side does one division. All
+// four are absent on the brackets (`active` true/false) and on a run with
+// nothing to report.
+export type TranscribeStatus = {
+  noteId: string;
+  active: boolean;
+  doneMs?: number;
+  totalMs?: number;
+  take?: number;
+  takes?: number;
+};
 // A (re)diarize pass is running on this note — Re-diarize, or the
 // cross-session unify (#187). Per-note, and never on `recording_status`: that
 // channel describes the live capture and nothing else, so its `idle` would
