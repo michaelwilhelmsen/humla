@@ -812,12 +812,13 @@ export type SummaryProvider = "openai" | "local";
 // capture, whose zero-pending stop is a real full bar.
 //
 // `step` / `index` / `count` name which piece of the post-stop chain is
-// running (#189). They ride along on `diarizing`, which is the phase the whole
-// chain reports inside, and are absent on a step-less `diarizing` and on a
-// deferred stop. `index` / `count` are present only where the step has real
-// units to count — two streams to copy, two streams to diarize — and their
-// absence is what makes that step's track indeterminate. Never an invented
-// percentage.
+// running. They ride along on `diarizing`, the phase the whole chain reports
+// inside, and are absent on a step-less `diarizing` and on a deferred stop.
+// `index` / `count` are present only where the step has real units to count —
+// two streams to copy, two streams to diarize — and they are a COUNTER, not a
+// fraction: the client renders them as text and leaves the track
+// indeterminate. Each is emitted before its unit's work, so a fraction off
+// them would run ahead of what has happened.
 export type RecordingStatus = {
   noteId: string | null;
   phase: RecordingPhase;
@@ -844,11 +845,11 @@ export type TitleStatus = { noteId: string; active: boolean };
 // five are absent on the brackets (`active` true/false) and on a run with
 // nothing to report.
 //
-// `step` is which piece of the take's work is running (#188, widened by #189):
-// a take is replayed through the provider, then diarized, then written, and
-// none of those later steps has a measure of its own — so `doneMs` sitting at
-// the total is not what says it has moved on. The position stays on every
-// later step, because it is where the next take resumes.
+// `step` is which piece of the take's work is running: a take is replayed
+// through the provider, then diarized, then written, and none of those later
+// steps has a measure of its own — so `doneMs` sitting at the total is not what
+// says it has moved on. The position stays on every later step, because it is
+// where the next take resumes.
 //
 // One vocabulary for both chains, so the client maps one type. A stop names
 // `saving_audio` where a replay never does (its audio is already on disk); a

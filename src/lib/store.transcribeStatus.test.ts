@@ -46,9 +46,9 @@ describe("transcribe_status progress", () => {
     expect(useRecordingStore.getState().status).toEqual(recording);
     expect(useRecordingStore.getState().diarizing).toEqual({});
 
-    // The diarize half of the same take (#188), named as one of the two
-    // passes a hybrid take costs (#189). Its own channel still, and the
-    // position it reports is where the next take resumes.
+    // The diarize half of the same take, named as one of the two passes a
+    // hybrid take costs. Its own channel still, and the position it reports is
+    // where the next take resumes.
     await emit("transcribe_status", {
       noteId: "replay-note",
       active: true,
@@ -69,7 +69,7 @@ describe("transcribe_status progress", () => {
     expect(useRecordingStore.getState().status).toEqual(recording);
     expect(useRecordingStore.getState().diarizing).toEqual({});
 
-    // The run's last step, which is note-wide rather than per take (#189).
+    // The run's last step, which is note-wide rather than per take.
     await emit("transcribe_status", {
       noteId: "replay-note",
       active: true,

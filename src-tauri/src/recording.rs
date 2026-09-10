@@ -205,21 +205,18 @@ pub struct CaptureSink {
     pub sys_full_wav_path: Arc<Mutex<Option<PathBuf>>>,
     // Longest full-recording stream this capture wrote, in ms, as the sidecar
     // reported it on shutdown. The manifest's `duration_ms` normally comes from
-    // the take's timeline (it reflects content, and trailing silence isn't
-    // worth showing), but a "Transcribe manually" take has no timeline at
-    // finalise — so this is where its length comes from (#146).
+    // the take's timeline, but a "Transcribe manually" take has no timeline at
+    // finalise, so its length comes from here.
     //
-    // It has to be settled at CAPTURE time, not filled in later: the sync
-    // engine derives a session's last-write-wins key from its start time on the
-    // stated grounds that "index / started_at / duration / streams never
-    // change" (`cloud-sync`'s `push_session`), so a duration corrected after
-    // the fact would re-push under a byte-identical key and converge only on
-    // the server comparing strictly.
+    // Must be settled at capture time, never backfilled: `cloud-sync`'s
+    // `push_session` derives a session's last-write-wins key from its start
+    // time on the grounds that index / started_at / duration / streams never
+    // change, so a corrected duration re-pushes under a byte-identical key.
     pub captured_duration_ms: Arc<Mutex<u64>>,
-    // How far the replay this sink belongs to has got, when it is one (#146).
-    // `None` for a live capture and for a "Transcribe manually" one: neither
-    // measures its work in takes, and a live capture's progress is the
-    // transcript arriving on screen.
+    // How far the replay this sink belongs to has got, when it is one. `None`
+    // for a live capture and for a "Transcribe manually" one: neither measures
+    // its work in takes, and a live capture's progress is the transcript
+    // arriving on screen.
     pub replay_progress: Option<Arc<Mutex<ReplayProgress>>>,
     pub mode: SinkMode,
 }
@@ -232,26 +229,23 @@ pub struct TakeWork {
     pub duration_ms: u64,
 }
 
-/// One named piece of work inside a stop or a replay (#189). The two chains
-/// draw from the same vocabulary because they run most of the same steps — the
-/// replay's diarize half *is* the stop's — so the label and the counter come
-/// from one place and the client maps one type.
+/// One named piece of work inside a stop or a replay. Both chains draw from
+/// this one vocabulary because they run most of the same steps — the replay's
+/// diarize half *is* the stop's — so the client maps one type.
 ///
-/// A step exists here only if it can run long enough to be worth a name.
+/// A step belongs here only if it can run long enough to be worth a name: a
+/// label that flashes is worse than none, which rules out
 /// `record_detected_language`, `finalize_session`, the manifest writes and the
-/// temp-dir cleanup are all reliably sub-100 ms, and a label that flashes is
-/// worse than none.
-///
-/// [`Phase`] is not this: it is where the single capture slot is, and it stays
-/// the outer bracket a step is reported inside.
+/// temp-dir cleanup. [`Phase`] is not this — it is where the single capture
+/// slot is, and stays the outer bracket a step is reported inside.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Step {
     /// One take's audio through the provider. Replay only — a live capture
     /// transcribes as it records.
     Transcribing,
-    /// Copying the capture's retained per-source WAVs out of the temp dir.
-    /// ~33 MB per stream on a 17-minute take.
+    /// Copying the capture's retained per-source WAVs out of the temp dir —
+    /// tens of megabytes per stream.
     SavingAudio,
     /// One diarize sidecar pass per stream that carried speech. Two on a
     /// hybrid capture, run sequentially because the mic's speaker-count hint
@@ -259,19 +253,19 @@ pub enum Step {
     Diarizing,
     /// Mixing the streams into the take's `playback.wav`, sample by sample.
     WritingPlayback,
-    /// The cross-session unify pass (#17) — a second full diarize over every
-    /// take's concatenated audio, for any note with two or more takes.
-    /// Plausibly the longest single step either chain runs.
+    /// The cross-session unify pass — a second full diarize over every take's
+    /// concatenated audio, for any note with two or more takes, and so
+    /// plausibly the longest single step either chain runs.
     MatchingSpeakers,
 }
 
-/// A step's discrete position: which of how many units it is on.
+/// A step's discrete position: which of how many units it is on. Rendered as
+/// text beside the label; it never becomes the track's value, which stays
+/// indeterminate for a counted step.
 ///
-/// Below two units there is nothing to count — a single diarize pass emits no
-/// progress of its own, and "1 of 1" is a number about nothing — so `new`
-/// returns `None` and the step is reported without a counter, which is what
-/// makes its track indeterminate. `index` is clamped into `1..=count`, so a
-/// counter can never read past its own total.
+/// Below two units there is nothing to count, so `new` returns `None` and the
+/// step is reported bare. `index` is clamped into `1..=count`, so a counter can
+/// never read past its own total.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StepCounter {
     pub index: u32,
@@ -311,17 +305,28 @@ impl StepReport {
     }
 }
 
+/// One report per stream a step actually has, numbered off how many that is —
+/// never off a literal, so a stream that isn't there is not counted and a
+/// third source would be.
+///
+/// Below two streams [`StepCounter::new`] returns `None`, so a lone stream is
+/// named without a number.
+pub fn stream_reports(step: Step, streams: u32) -> Vec<StepReport> {
+    (1..=streams)
+        .map(|i| StepReport::counted(step, i, streams))
+        .collect()
+}
+
 /// The shape of one stop chain's work, settled by its post-stop snapshot
 /// before any of the chain runs.
 ///
-/// This and [`stop_steps`] / [`replay_steps`] are the executable statement of
-/// what each chain announces and in what order. Test-only, because the chains
-/// announce as they go rather than walking a list — so the pair has to be kept
-/// in step with the emitting code by hand.
+/// This and [`stop_steps`] / [`replay_steps`] state what each chain announces
+/// and in what order. Test-only: the chains announce as they go rather than
+/// walking a list, so the pair is kept in step with the emitting code by hand.
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StopShape {
-    /// The capture ran with "Transcribe manually" on (#146).
+    /// The capture ran with "Transcribe manually" on.
     pub deferred: bool,
     /// Full WAVs to copy out of the temp dir — zero when retention is off.
     pub retained_streams: u32,
@@ -356,39 +361,28 @@ pub struct ReplayShape {
     pub unified_streams: u32,
 }
 
-/// Every step announcement one stop chain makes, in order (#189).
+/// Every step announcement one stop chain makes, in order.
 ///
-/// Mirrors what `post_stop_chain_inner` and the diarize pass emit — change
-/// both together. A deferred stop announces nothing: it dispatched no chunks
-/// and lands on idle in a few hundred milliseconds, so a bar drawn for it
-/// appears and vanishes without having measured anything (#146).
+/// Mirrors what `post_stop_chain_inner` and the diarize pass emit — change both
+/// together. A deferred stop announces nothing: it dispatched no chunks and
+/// lands on idle in a few hundred milliseconds.
 #[cfg(test)]
 pub fn stop_steps(shape: StopShape) -> Vec<StepReport> {
     if shape.deferred {
         return Vec::new();
     }
-    let mut out = Vec::new();
-    for i in 1..=shape.retained_streams {
-        out.push(StepReport::counted(Step::SavingAudio, i, shape.retained_streams));
-    }
+    let mut out = stream_reports(Step::SavingAudio, shape.retained_streams);
     out.extend(take_steps(TakeShape {
         diarized_streams: shape.diarized_streams,
         writes_playback: shape.writes_playback,
     }));
-    for i in 1..=shape.unified_streams {
-        out.push(StepReport::counted(
-            Step::MatchingSpeakers,
-            i,
-            shape.unified_streams,
-        ));
-    }
+    out.extend(stream_reports(Step::MatchingSpeakers, shape.unified_streams));
     out
 }
 
-/// Every step announcement one replay makes, in order (#189). Mirrors
-/// `transcribe_takes` and the diarize pass — change both together.
-///
-/// No `SavingAudio`: a replay reads audio that is already on disk.
+/// Every step announcement one replay makes, in order. Mirrors
+/// `transcribe_takes` and the diarize pass — change both together. No
+/// `SavingAudio`: a replay reads audio that is already on disk.
 #[cfg(test)]
 pub fn replay_steps(shape: &ReplayShape) -> Vec<StepReport> {
     let mut out = Vec::new();
@@ -396,23 +390,14 @@ pub fn replay_steps(shape: &ReplayShape) -> Vec<StepReport> {
         out.push(StepReport::plain(Step::Transcribing));
         out.extend(take_steps(*take));
     }
-    for i in 1..=shape.unified_streams {
-        out.push(StepReport::counted(
-            Step::MatchingSpeakers,
-            i,
-            shape.unified_streams,
-        ));
-    }
+    out.extend(stream_reports(Step::MatchingSpeakers, shape.unified_streams));
     out
 }
 
 /// The diarize pass over one take, which both chains run and neither varies.
 #[cfg(test)]
 fn take_steps(take: TakeShape) -> Vec<StepReport> {
-    let mut out = Vec::new();
-    for i in 1..=take.diarized_streams {
-        out.push(StepReport::counted(Step::Diarizing, i, take.diarized_streams));
-    }
+    let mut out = stream_reports(Step::Diarizing, take.diarized_streams);
     if take.writes_playback {
         out.push(StepReport::plain(Step::WritingPlayback));
     }
@@ -431,18 +416,17 @@ pub struct ReplaySnapshot {
     pub takes: u32,
 }
 
-/// How far a deferred transcription has got (#146), weighted by **audio
-/// position** rather than chunks: a replay's chunk count isn't known until it
-/// ends, while every take's duration is known before it starts.
+/// How far a deferred transcription has got, weighted by **audio position**
+/// rather than chunks: a replay's chunk count isn't known until it ends, while
+/// every take's duration is known before it starts.
 ///
 /// `done_ms` is a high-water mark clamped to the total, so the fraction can
 /// never retreat — not at a mic→sys handover, and not on a chunk whose
-/// transcribe finished out of order. A bar that goes backwards reads as a fault
-/// in the transcription rather than in the measurement.
+/// transcribe finished out of order.
 ///
 /// The step moves with the run rather than being derived from the fraction: a
-/// take is fully replayed before its diarize starts, so "done_ms == total_ms"
-/// and "diarizing" would otherwise be the same reading (#188).
+/// take is fully replayed before its diarize starts, so `done_ms == total_ms`
+/// cannot tell the two apart.
 pub struct ReplayProgress {
     takes: Vec<TakeWork>,
     total_ms: u64,
@@ -735,10 +719,9 @@ pub struct RecordingStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deferred: Option<bool>,
     // Which named step of the post-stop chain is running, and its discrete
-    // position when the step has units to count (#189). Rides along on
-    // `Diarizing`, which is the phase the whole chain reports inside. Additive
-    // and absent everywhere else, including on a step-less `Diarizing` — which
-    // is what a caller that names no step still produces.
+    // position when the step has units to count. Rides along on `Diarizing`,
+    // the phase the whole chain reports inside. Additive and absent everywhere
+    // else, a step-less `Diarizing` included.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub step: Option<Step>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -762,8 +745,8 @@ impl RecordingStatus {
         }
     }
 
-    /// One named step of the post-stop chain (#189), on the `Diarizing` phase
-    /// the chain already reports inside.
+    /// One named step of the post-stop chain, on the `Diarizing` phase the
+    /// chain already reports inside.
     pub fn chain_step(note_id: &str, step: Step, counter: Option<StepCounter>) -> Self {
         Self {
             step: Some(step),
@@ -843,13 +826,10 @@ impl StopTimings {
     }
 }
 
-/// What one take of a replay cost (#188), split at the seam the user sees: the
-/// audio through the provider, then the diarize that writes the timeline,
-/// rebuilds the transcript and writes the playback assets.
-///
-/// `audio_ms` and `streams` are the take's own shape, so cost per minute of
-/// audio is derivable — the ratio between the two halves inverts against a
-/// live capture's stop, which did its Whisper work during the meeting.
+/// What one take of a replay cost, split at the seam the user sees: the audio
+/// through the provider, then the diarize that writes the timeline, rebuilds the
+/// transcript and writes the playback assets. `audio_ms` and `streams` are the
+/// take's own shape, so cost per minute of audio is derivable.
 #[derive(Clone, Serialize)]
 pub struct ReplayTakeTimings {
     /// The take's 1-based position in the note, as every other surface names it.
@@ -858,17 +838,17 @@ pub struct ReplayTakeTimings {
     pub audio_ms: u64,
     pub transcribe_ms: u64,
     pub diarize_ms: u64,
-    /// The mixed `playback.wav` write, which `diarize_ms` covers the rest of
-    /// (#189). Its own row because it is its own named step and mixes
-    /// sample-by-sample over the whole take.
+    /// The mixed `playback.wav` write, which `diarize_ms` covers the rest of.
+    /// Its own row because it is its own named step and mixes sample-by-sample
+    /// over the whole take.
     pub playback_ms: u64,
 }
 
-/// Wall-clock cost of one deferred-transcription run, per take (#188).
+/// Wall-clock cost of one deferred-transcription run, per take.
 #[derive(Clone, Default, Serialize)]
 pub struct ReplayTimings {
     pub takes: Vec<ReplayTakeTimings>,
-    /// The cross-session unify pass over the whole run (#189) — a second full
+    /// The cross-session unify pass over the whole run — a second full
     /// diarize, and the one step here that isn't per take.
     pub unify_ms: u64,
     pub total_ms: u64,
@@ -981,15 +961,14 @@ pub struct TitleStatusPayload {
 /// the whole time.
 ///
 /// Progress rides the same event: which [`Step`] of the take's work is running
-/// and its discrete position (#189), the audio position (`done_ms` /
-/// `total_ms`) and which take of how many, so the label and the fraction are
-/// separable and the client does one division. All of them are absent on the
-/// brackets and on a run with nothing to report, which serializes exactly as it
-/// did before they existed.
+/// and its discrete position, the audio position (`done_ms` / `total_ms`) and
+/// which take of how many, so the label and the fraction stay separable and the
+/// client does one division. All of them are absent on the brackets and on a run
+/// with nothing to report.
 ///
-/// The position stays on a step past `Transcribing`: it is where the next take
-/// resumes, and the step — not a missing measure — is what makes the bar
-/// indeterminate (#188).
+/// The position stays on a step past `Transcribing` — it is where the next take
+/// resumes — so the step, not a missing measure, is what makes the bar
+/// indeterminate.
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TranscribeStatusPayload {
@@ -1306,8 +1285,8 @@ mod tests {
             r#"{"noteId":"n1","active":true,"step":"transcribing","doneMs":45000,"totalMs":180000,"take":2,"takes":3}"#
         );
         // Every later step keeps the position — it is where the next take
-        // resumes — and the step, not a missing measure, is what makes the
-        // bar indeterminate (#188).
+        // resumes — so the step, not a missing measure, is what makes the bar
+        // indeterminate.
         assert_eq!(
             serde_json::to_string(&TranscribeStatusPayload::progress(
                 "n1",
@@ -1320,8 +1299,7 @@ mod tests {
             .unwrap(),
             r#"{"noteId":"n1","active":true,"step":"diarizing","index":1,"count":2,"doneMs":45000,"totalMs":180000,"take":2,"takes":3}"#
         );
-        // A step with one unit carries no counter at all, which is what makes
-        // its track indeterminate rather than a half-truth (#189).
+        // A step with one unit carries no counter at all.
         assert_eq!(
             serde_json::to_string(&TranscribeStatusPayload::progress(
                 "n1",
@@ -1338,9 +1316,8 @@ mod tests {
 
     #[test]
     fn a_named_step_rides_the_diarizing_phase_and_nothing_else_changes() {
-        // #189: additive. A listener reading `{noteId, phase}` sees the same
-        // payload it always did, and the step's counter is absent when the
-        // step has one unit.
+        // Additive: a listener reading `{noteId, phase}` sees the payload it
+        // always did, and the counter is absent when the step has one unit.
         assert_eq!(
             serde_json::to_string(&RecordingStatus::chain_step(
                 "n1",
@@ -1418,8 +1395,8 @@ mod tests {
 
     #[test]
     fn a_multi_take_stop_names_the_unify_pass_it_used_to_hide() {
-        // The whole of #189's first ask: a second full diarize over the
-        // concatenated audio, invisible inside `Diarizing` until now.
+        // A second full diarize over the concatenated audio, which the
+        // `Diarizing` step does not cover.
         let steps = stop_steps(StopShape {
             retained_streams: 2,
             diarized_streams: 2,
@@ -1456,7 +1433,7 @@ mod tests {
 
     #[test]
     fn a_deferred_stop_names_nothing() {
-        // #146: it dispatched no chunks and lands on idle in a few hundred
+        // It dispatched no chunks and lands on idle in a few hundred
         // milliseconds, so every label drawn for it would appear and vanish.
         assert!(stop_steps(StopShape {
             deferred: true,

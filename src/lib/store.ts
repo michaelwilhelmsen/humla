@@ -103,8 +103,8 @@ export type Flash = { id: number; message: string };
 
 /**
  * How far a deferred transcription's replay has got (#146), as `transcribe_status`
- * reports it: which step of the take is running (#188, #189) and its discrete
- * position, audio position over the whole run, and the 1-based take counter.
+ * reports it: which step of the take is running and its discrete position,
+ * audio position over the whole run, and the 1-based take counter.
  * Every field is optional — the brackets around a run carry none of them, and a
  * run with nothing to report is exactly as active as one mid-way.
  */
@@ -211,10 +211,9 @@ export const useRecordingStore = create<RecordingState>((set, get) => ({
         const prev = next[noteId];
         const startedAt = prev?.startedAt ?? Date.now();
         // A measure naming a step REPLACES the run's measure; a bracket, which
-        // names none, leaves it alone. The fields a progress event omits are
-        // omitted because they don't apply to the step it names (#189) — a
-        // counter merged forward from the previous step would leave "1/2" on
-        // screen beside a step that counts nothing.
+        // names none, leaves it alone. A progress event omits what doesn't
+        // apply to the step it names, so merging forward would leave the
+        // previous step's "1/2" beside a step that counts nothing.
         next[noteId] = measure?.step
           ? { startedAt, ...measure }
           : { ...prev, startedAt, ...measure };

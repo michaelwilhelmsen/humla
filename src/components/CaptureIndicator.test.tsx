@@ -83,8 +83,7 @@ describe("the compact indicator during a replay (#146)", () => {
     await screen.findByRole("progressbar", { name: "Transcribing take 2 of 3…" });
   });
 
-  // #188. The second half of every take, which used to sit at 100% under
-  // "Transcribing…" for minutes.
+  // The second half of every take, reported on the replay's own channel.
   it("goes indeterminate for the diarize half, the way a stop's does", async () => {
     open(
       "/all-notes",
@@ -154,12 +153,12 @@ describe("the compact indicator during a replay (#146)", () => {
   });
 });
 
-// #189. Every step of both chains has a name now, and the ones with real units
-// to count have a determinate track at that coarse grain.
-describe("the compact indicator on a named step (#189)", () => {
+// Every step of both chains has a name, and a step that counts discrete units
+// puts the count in the LABEL and leaves the track indeterminate.
+describe("the compact indicator on a named step", () => {
   const RUN: ReplayRun = { startedAt: 1, doneMs: 180_000, totalMs: 180_000 };
 
-  it("names the audio copy, determinate over the streams it copies", async () => {
+  it("names the audio copy and counts the streams in its label", async () => {
     open("/all-notes", {
       noteId: "n1",
       phase: "diarizing",
@@ -168,19 +167,27 @@ describe("the compact indicator on a named step (#189)", () => {
       count: 2,
     });
     const bar = await screen.findByRole("progressbar", { name: "Saving audio 1/2…" });
-    expect(bar).toHaveAttribute("aria-valuenow", "50");
+    expect(bar).not.toHaveAttribute("aria-valuenow");
   });
 
-  it("counts the two diarize passes a hybrid capture runs", async () => {
+  it("leaves the track indeterminate on a counted step, at either end of it", async () => {
+    // The counter is emitted BEFORE its unit's work, so a fraction off it
+    // would read 100% with the second stream not started, and would retreat to
+    // 50% at the next step's boundary.
     open("/all-notes", {
       noteId: "n1",
       phase: "diarizing",
       step: "diarizing",
-      index: 2,
+      index: 1,
       count: 2,
     });
-    const bar = await screen.findByRole("progressbar", { name: "Identifying speakers 2/2…" });
-    expect(bar).toHaveAttribute("aria-valuenow", "100");
+    const first = await screen.findByRole("progressbar", { name: "Identifying speakers 1/2…" });
+    expect(first).not.toHaveAttribute("aria-valuenow");
+    useRecordingStore.setState({
+      status: { noteId: "n1", phase: "diarizing", step: "diarizing", index: 2, count: 2 },
+    });
+    const last = await screen.findByRole("progressbar", { name: "Identifying speakers 2/2…" });
+    expect(last).not.toHaveAttribute("aria-valuenow");
   });
 
   it("stays indeterminate for a single pass, which counts nothing", async () => {
@@ -195,7 +202,7 @@ describe("the compact indicator on a named step (#189)", () => {
     expect(bar).not.toHaveAttribute("aria-valuenow");
   });
 
-  it("names the unify pass, which was invisible inside the diarize step", async () => {
+  it("names the unify pass, which the diarize step used to hide", async () => {
     open("/all-notes", {
       noteId: "n1",
       phase: "diarizing",
@@ -204,7 +211,7 @@ describe("the compact indicator on a named step (#189)", () => {
       count: 2,
     });
     const bar = await screen.findByRole("progressbar", { name: "Matching speakers 1/2…" });
-    expect(bar).toHaveAttribute("aria-valuenow", "50");
+    expect(bar).not.toHaveAttribute("aria-valuenow");
   });
 
   it("names the unify pass of a replay too, on the replay's own channel", async () => {

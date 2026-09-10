@@ -21,8 +21,12 @@ The real-world business relationship (a company, or a person where the person *i
 _Avoid_: Account, contact, customer
 
 **Session**:
-One recording taken into a Note. A Note can hold several — stopping and recording again adds a Session rather than replacing what came before — and each owns the assets for its own take: its Timeline, and its audio where retention is on. Session times are local to the take; they are never rebased onto a Note-wide clock.
-_Avoid_: Take, run, pass, segment
+The persisted, synced entity for one recording taken into a Note: its manifest row, its Timeline, and its audio where retention is on. A Note can hold several — stopping and recording again adds a Session rather than replacing what came before. Session times are local to the recording they came from; they are never rebased onto a Note-wide clock.
+_Avoid_: Run, pass, segment
+
+**Take**:
+One recording instance within a Note — the thing the user made by pressing Record and then Stop. The user-facing word for what a Session stores: "a Note recorded in three takes", "the take is still waiting to be transcribed". The two are one-to-one and not synonyms — Session names the record, Take names the recording it is a record of, so it is Sessions that sync and Takes that a user counts.
+_Avoid_: Run, pass, segment, clip
 
 **Timeline**:
 A Session's turns in order, each carrying its text, its Speaker label, its bounds and (where available) per-word times. **Canonical for a Note's content**: the Transcript is derived from the merged Timelines of every Session, so words enter a Note by being written to a Timeline, never by being written to the Transcript directly. Also what playback highlights against — but that is a use, not its definition. See `docs/adr/0004-the-timeline-is-canonical-for-a-notes-content.md`.
