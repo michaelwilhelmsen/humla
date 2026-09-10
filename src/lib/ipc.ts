@@ -810,12 +810,23 @@ export type SummaryProvider = "openai" | "local";
 // and a progress bar drawn for it appears and vanishes. It carries no
 // `pending` / `done` either — nothing was dispatched. Absent for a live
 // capture, whose zero-pending stop is a real full bar.
+//
+// `step` / `index` / `count` name which piece of the post-stop chain is
+// running (#189). They ride along on `diarizing`, which is the phase the whole
+// chain reports inside, and are absent on a step-less `diarizing` and on a
+// deferred stop. `index` / `count` are present only where the step has real
+// units to count — two streams to copy, two streams to diarize — and their
+// absence is what makes that step's track indeterminate. Never an invented
+// percentage.
 export type RecordingStatus = {
   noteId: string | null;
   phase: RecordingPhase;
   pending?: number;
   done?: number;
   deferred?: boolean;
+  step?: Step;
+  index?: number;
+  count?: number;
 };
 export type RecordingError = { noteId: string | null; message: string };
 export type SummaryStatus = { noteId: string; active: boolean };
@@ -833,16 +844,28 @@ export type TitleStatus = { noteId: string; active: boolean };
 // five are absent on the brackets (`active` true/false) and on a run with
 // nothing to report.
 //
-// `phase` is which half of the take is running (#188): a take is replayed
-// through the provider and then diarized, and the diarize half has no measure
-// of its own, so `doneMs` sitting at the total is not what says it has moved
-// on. The position stays on a `diarizing` event — it is where the next take
-// resumes.
-export type ReplayPhase = "transcribing" | "diarizing";
+// `step` is which piece of the take's work is running (#188, widened by #189):
+// a take is replayed through the provider, then diarized, then written, and
+// none of those later steps has a measure of its own — so `doneMs` sitting at
+// the total is not what says it has moved on. The position stays on every
+// later step, because it is where the next take resumes.
+//
+// One vocabulary for both chains, so the client maps one type. A stop names
+// `saving_audio` where a replay never does (its audio is already on disk); a
+// replay names `transcribing` where a stop never does (a live capture
+// transcribed as it recorded).
+export type Step =
+  | "transcribing"
+  | "saving_audio"
+  | "diarizing"
+  | "writing_playback"
+  | "matching_speakers";
 export type TranscribeStatus = {
   noteId: string;
   active: boolean;
-  phase?: ReplayPhase;
+  step?: Step;
+  index?: number;
+  count?: number;
   doneMs?: number;
   totalMs?: number;
   take?: number;

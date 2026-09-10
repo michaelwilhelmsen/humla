@@ -3,7 +3,7 @@ use crate::diarize;
 use crate::local_whisper;
 use crate::sessions;
 use crate::wav;
-use crate::recording::{CaptureSink, ChunkRecord, ChunkSource, DiagnosticPayload, ErrorPayload, Inflight, Phase, RecordingStatus, ReplayProgress, ReplayTakeTimings, ReplayTimings, SidecarEvent, SinkMode, TakeWork, TranscriptPayload};
+use crate::recording::{CaptureSink, ChunkRecord, ChunkSource, DiagnosticPayload, ErrorPayload, Inflight, Phase, RecordingStatus, ReplayProgress, ReplayTakeTimings, ReplayTimings, SidecarEvent, SinkMode, Step, StepReport, TakeWork, TranscriptPayload};
 use crate::AppState;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -170,7 +170,7 @@ pub async fn rediarize_note(app: AppHandle, note_id: String) -> Result<(), Strin
         // running on another note throughout (#187).
         let policy = DiarizePolicy::REDIARIZE;
         policy.report_started(&app, &note_id);
-        match unify_note_speakers(&app, &note_id).await {
+        match unify_note_speakers(&app, &note_id, &StepReporter::Silent).await {
             Ok(true) => {
                 policy.report_finished(&app, &note_id);
                 return Ok(());
@@ -243,8 +243,10 @@ pub async fn rediarize_note(app: AppHandle, note_id: String) -> Result<(), Strin
         engine,
         thresholds,
         DiarizePolicy::REDIARIZE,
+        &StepReporter::Silent,
     )
     .await
+    .map(|_| ())
     .map_err(err)
 }
 
@@ -376,6 +378,59 @@ pub(crate) enum ProgressChannel {
     Silent,
 }
 
+/// Where one chain announces its named steps (#189).
+///
+/// Passed in the way [`StopClock`] is, and for the same reason: the diarize
+/// pass and the unify pass are shared by the live stop, the user-pressed
+/// Re-diarize and a deferred replay, so the callee must not choose the channel.
+/// `recording_status` describes the live capture and nothing else (#187).
+#[derive(Clone)]
+pub(crate) enum StepReporter {
+    /// The live capture's own post-stop chain: the global `recording_status`
+    /// phase it already holds, with the step named on it.
+    RecordingPhase { app: AppHandle, note_id: String },
+    /// A deferred replay: its own per-note `transcribe_status`, where the run's
+    /// audio position and take counter ride along.
+    Replay {
+        app: AppHandle,
+        note_id: String,
+        progress: Arc<parking_lot::Mutex<ReplayProgress>>,
+    },
+    /// Nothing. The user-pressed Re-diarize brackets itself on `diarize_status`
+    /// with no measure, and a deferred stop draws no bar at all (#146).
+    Silent,
+}
+
+impl StepReporter {
+    fn report(&self, r: StepReport) {
+        match self {
+            Self::RecordingPhase { app, note_id } => {
+                let _ = app.emit(
+                    "recording_status",
+                    RecordingStatus::chain_step(note_id, r.step, r.counter),
+                );
+            }
+            Self::Replay { app, note_id, progress } => {
+                let snapshot = {
+                    let mut p = progress.lock();
+                    p.begin_step(r.step, r.counter);
+                    p.snapshot()
+                };
+                emit_transcribe_progress(app, note_id, snapshot);
+            }
+            Self::Silent => {}
+        }
+    }
+
+    fn step(&self, step: Step) {
+        self.report(StepReport::plain(step));
+    }
+
+    fn counted(&self, step: Step, index: u32, count: u32) {
+        self.report(StepReport::counted(step, index, count));
+    }
+}
+
 /// How a (re)diarize pass behaves for the surface that asked for it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DiarizePolicy {
@@ -433,7 +488,9 @@ async fn rediarize_apply_to_chunks(
     engine: diarize::Engine,
     thresholds: diarize::Thresholds,
     policy: DiarizePolicy,
-) -> anyhow::Result<()> {
+    // Where each of this pass's steps is named (#189), chosen by the caller.
+    steps: &StepReporter,
+) -> anyhow::Result<DiarizeCost> {
     // Before deciding the capture mode — a hallucinated chunk on an otherwise
     // silent stream would misclassify the whole recording. Also cleans up notes
     // recorded before the transcribe-time guard existed, which is the point of
@@ -494,6 +551,7 @@ async fn rediarize_apply_to_chunks(
             let outcome: Result<Vec<diarize::Segment>, String> = match mic_wav.clone() {
                 None => Err("mic chunks present but no saved mic.wav".to_string()),
                 Some(wav) => {
+                    steps.counted(Step::Diarizing, 1, 1);
                     match diarize_and_maybe_clean(&app, &wav, expected_speakers, engine, thresholds)
                         .await
                     {
@@ -537,6 +595,7 @@ async fn rediarize_apply_to_chunks(
             let outcome: Result<Vec<diarize::Segment>, String> = match sys_wav.clone() {
                 None => Err("sys chunks present but no saved sys.wav".to_string()),
                 Some(wav) => {
+                    steps.counted(Step::Diarizing, 1, 1);
                     match diarize_and_maybe_clean(&app, &wav, expected_speakers, engine, thresholds)
                         .await
                     {
@@ -585,6 +644,7 @@ async fn rediarize_apply_to_chunks(
             // and that ambiguity cost a debugging round.
             let sys_speaker_hint = hybrid_sys_hint(expected_speakers, &chunks);
             let sys_segments = if let Some(p) = sys_wav.as_ref() {
+                steps.counted(Step::Diarizing, 1, 2);
                 diarize_and_maybe_clean(&app, p, sys_speaker_hint, engine, thresholds)
                     .await
                     .unwrap_or_else(|e| {
@@ -600,6 +660,7 @@ async fn rediarize_apply_to_chunks(
                 distinct_speaker_count(&sys_segments)
             );
             let mic_segments = if let Some(p) = mic_wav.as_ref() {
+                steps.counted(Step::Diarizing, 2, 2);
                 diarize_and_maybe_clean(&app, p, mic_speaker_hint, engine, thresholds)
                     .await
                     .unwrap_or_else(|e| {
@@ -682,6 +743,8 @@ async fn rediarize_apply_to_chunks(
     // FIRST, then rebuild the full DB transcript from every session's timeline
     // (so earlier takes are preserved), matching the per-chunk edit path.
     let timeline = serialize_timeline(&chunks, split_chunk.as_ref(), label_offset);
+    steps.step(Step::WritingPlayback);
+    let t_playback = std::time::Instant::now();
     write_playback_assets(
         &app,
         &note_id,
@@ -691,6 +754,7 @@ async fn rediarize_apply_to_chunks(
         sys_wav.as_deref(),
     )
     .await;
+    let cost = DiarizeCost { playback_ms: ms_since(t_playback) };
 
     // Through the shared commit, so re-diarize inherits its refusal to trade a
     // non-empty transcript for an empty projection rather than restating it.
@@ -711,7 +775,15 @@ async fn rediarize_apply_to_chunks(
     session_changed_for_sync(&app, &note_id, &session_id);
 
     policy.report_finished(&app, &note_id);
-    Ok(())
+    Ok(cost)
+}
+
+/// What one diarize pass cost that its caller can't time from outside (#189).
+/// The playback write is its own named step and mixes sample-by-sample over
+/// the whole take, so a replay's per-take row reports it separately from the
+/// diarize it sits inside.
+pub(crate) struct DiarizeCost {
+    playback_ms: u64,
 }
 
 /// Speaker-number offset for a session being (re)built in isolation: the
@@ -2049,7 +2121,12 @@ pub(crate) fn deferred_transcription_enabled(app: &AppHandle) -> bool {
     sessions::defer_transcription(manual.as_deref(), sessions::retain_audio(keep.as_deref()))
 }
 
-async fn maybe_keep_audio(app: &AppHandle, note_id: &str, snapshot: &PostStopSnapshot) {
+async fn maybe_keep_audio(
+    app: &AppHandle,
+    note_id: &str,
+    snapshot: &PostStopSnapshot,
+    steps: &StepReporter,
+) {
     // No exceptions above the setting — not even #16's "second take force-
     // retains the sources so #17 can unify them". See `sessions::retain_audio`.
     if !keep_audio_enabled(app) {
@@ -2067,12 +2144,21 @@ async fn maybe_keep_audio(app: &AppHandle, note_id: &str, snapshot: &PostStopSna
         eprintln!("keep_audio: session dir unavailable");
         return;
     };
+    // A stream at a time, named as it goes (#189): each is ~33 MB on a
+    // 17-minute take, and "1 of 2" is the real fraction — the copies are two
+    // discrete units, not a percentage anyone could report honestly.
+    let count = mic_wav.is_some() as u32 + sys_wav.is_some() as u32;
+    let mut index = 0;
     if let Some(src) = mic_wav {
+        index += 1;
+        steps.counted(Step::SavingAudio, index, count);
         if let Err(e) = tokio::fs::copy(&src, target.join("mic.wav")).await {
             eprintln!("keep_audio: copy mic: {e}");
         }
     }
     if let Some(src) = sys_wav {
+        index += 1;
+        steps.counted(Step::SavingAudio, index, count);
         if let Err(e) = tokio::fs::copy(&src, target.join("sys.wav")).await {
             eprintln!("keep_audio: copy sys: {e}");
         }
@@ -2927,6 +3013,17 @@ async fn post_stop_chain_inner(
     } else {
         emit_status(&app, Some(&note_id), Phase::Diarizing);
     }
+    // A deferred stop names no step: it dispatched nothing, has no text to
+    // diarize and lands on idle in a few hundred milliseconds, so a labelled
+    // bar drawn for it appears and vanishes (#146).
+    let steps = if post_stop.deferred {
+        StepReporter::Silent
+    } else {
+        StepReporter::RecordingPhase {
+            app: app.clone(),
+            note_id: note_id.clone(),
+        }
+    };
 
     // Make the note's storage session-shaped before writing this take. For a
     // pre-feature flat note, migrate its single take into a session subdir so
@@ -2939,7 +3036,7 @@ async fn post_stop_chain_inner(
     // sources" exception is gone — #24 made the setting absolute, so a
     // multi-take note recorded with keep_audio off simply can't be unified.)
     let t_keep = std::time::Instant::now();
-    maybe_keep_audio(&app, &note_id, &post_stop).await;
+    maybe_keep_audio(&app, &note_id, &post_stop, &steps).await;
     clock.record(|t| t.keep_audio_ms = ms_since(t_keep));
 
     let session_id = post_stop.session_id.clone();
@@ -3026,6 +3123,7 @@ async fn post_stop_chain_inner(
         post_stop,
         DiarizePolicy::POST_STOP,
         Some(clock),
+        &steps,
     )
     .await
     {
@@ -3079,7 +3177,7 @@ async fn post_stop_chain_inner(
     // session copies, not the temp WAVs). No-op for single-session notes;
     // failures keep the per-take labels.
     let t_unify = std::time::Instant::now();
-    match unify_note_speakers(&app, &note_id).await {
+    match unify_note_speakers(&app, &note_id, &steps).await {
         Ok(true) => eprintln!("unify: cross-session speaker unification applied"),
         Ok(false) => {}
         Err(e) => eprintln!("unify: failed, keeping per-take labels: {e}"),
@@ -3853,6 +3951,15 @@ async fn transcribe_takes(
             .collect(),
     )));
     emit_transcribe_progress(app, note_id, progress.lock().snapshot());
+    // Every step this run names goes on its own per-note channel, never the
+    // global phase: a recording may be running on another note throughout
+    // (#187). The shared diarize and unify passes take this rather than
+    // choosing (#189).
+    let steps = StepReporter::Replay {
+        app: app.clone(),
+        note_id: note_id.to_string(),
+        progress: progress.clone(),
+    };
 
     let mut transcribed_chunks: Vec<ChunkRecord> = Vec::new();
     let mut failures: Vec<String> = Vec::new();
@@ -3908,6 +4015,7 @@ async fn transcribe_takes(
             audio_ms: entry.duration_ms,
             transcribe_ms: ms_since(t_transcribe),
             diarize_ms: 0,
+            playback_ms: 0,
         };
         let chunks = sink.chunk_log.lock().clone();
         if chunks.is_empty() {
@@ -3939,14 +4047,9 @@ async fn transcribe_takes(
         // and broken out of rather than `?`-ed straight to the caller.
         //
         // The policy stays `Silent`: only the live capture's own chain may
-        // write to `recording_status` (#187). This half's progress is announced
-        // here instead, on the run's own per-note channel (#188).
-        let snapshot = {
-            let mut p = progress.lock();
-            p.begin_diarize();
-            p.snapshot()
-        };
-        emit_transcribe_progress(app, note_id, snapshot);
+        // write to `recording_status` (#187). What this half is doing reaches
+        // the user through `steps` instead, on the run's own per-note channel
+        // (#188, #189).
         let t_diarize = std::time::Instant::now();
         let diarized = rediarize_apply_to_chunks(
             app.clone(),
@@ -3959,9 +4062,13 @@ async fn transcribe_takes(
             engine,
             thresholds,
             DiarizePolicy::DEFERRED_TRANSCRIBE,
+            &steps,
         )
         .await;
         take_timings.diarize_ms = ms_since(t_diarize);
+        if let Ok(cost) = &diarized {
+            take_timings.playback_ms = cost.playback_ms;
+        }
         timings.takes.push(take_timings);
         if let Err(e) = diarized {
             fatal = Some(format!("Recording {} failed to transcribe: {e}", entry.index));
@@ -3972,18 +4079,14 @@ async fn transcribe_takes(
         transcribed_chunks.extend(chunks);
     }
 
-    // The run's own line, always — the two halves' costs are what the ratio
-    // between them is read off, and it inverts against a live capture's stop
-    // (which did its Whisper work during the meeting). Before the early return
-    // below, so a run where every take lost its audio is measured too.
-    timings.total_ms = ms_since(run_started);
-    eprintln!("{}", timings.summary());
-    write_replay_timings(app, note_id, &timings).await;
-
     if transcribed_chunks.is_empty() {
         // Nothing landed, so there is nothing to checkpoint or push. With no
         // failures either, every take had lost its audio — nothing was
-        // attempted, so there is nothing to report.
+        // attempted, so there is nothing to report. Measured on the way out
+        // all the same: a run where every take lost its audio is a run.
+        timings.total_ms = ms_since(run_started);
+        eprintln!("{}", timings.summary());
+        write_replay_timings(app, note_id, &timings).await;
         failures.extend(fatal);
         return if failures.is_empty() {
             Ok(())
@@ -4017,11 +4120,20 @@ async fn transcribe_takes(
     // per take depending on which regime recorded them, which is not a
     // difference the setting is supposed to make. No-op for single-take notes;
     // a failure keeps the per-take labels.
-    match unify_note_speakers(app, note_id).await {
+    let t_unify = std::time::Instant::now();
+    match unify_note_speakers(app, note_id, &steps).await {
         Ok(true) => eprintln!("unify: cross-session speaker unification applied"),
         Ok(false) => {}
         Err(e) => eprintln!("unify: failed, keeping per-take labels: {e}"),
     }
+    timings.unify_ms = ms_since(t_unify);
+
+    // The run's own line, once however it ends — the halves' costs are what
+    // the ratio between them is read off, and it inverts against a live
+    // capture's stop (which did its Whisper work during the meeting).
+    timings.total_ms = ms_since(run_started);
+    eprintln!("{}", timings.summary());
+    write_replay_timings(app, note_id, &timings).await;
 
     // Push the rewritten `timeline.jsonl` of every take this run touched.
     //
@@ -4208,6 +4320,9 @@ async fn diarize_and_apply(
     // attributed to the stream it ran on. `None` for a caller that isn't
     // measuring a stop.
     clock: Option<&StopClock>,
+    // Where each of this pass's steps is named (#189). Passed in for the same
+    // reason the clock is: the pass is shared, and the channel is the caller's.
+    steps: &StepReporter,
 ) -> anyhow::Result<()> {
     // Per-session state arrives via `post_stop`, captured in
     // `recording_stop` once the reader thread finished writing to the
@@ -4310,7 +4425,10 @@ async fn diarize_and_apply(
                     );
                     single_speaker_fallback()
                 }
-                Some(wav) => match timed_diarize(&app, &wav, expected_speakers, engine, thresholds, clock, ChunkSource::Mic).await {
+                Some(wav) => match {
+                    steps.counted(Step::Diarizing, 1, 1);
+                    timed_diarize(&app, &wav, expected_speakers, engine, thresholds, clock, ChunkSource::Mic).await
+                } {
                     Err(e) => {
                         eprintln!("diarize: mic diarize failed ({e}), falling back to single-speaker labels");
                         emit_error(
@@ -4353,7 +4471,10 @@ async fn diarize_and_apply(
                     );
                     single_speaker_fallback()
                 }
-                Some(wav) => match timed_diarize(&app, &wav, expected_speakers, engine, thresholds, clock, ChunkSource::Sys).await {
+                Some(wav) => match {
+                    steps.counted(Step::Diarizing, 1, 1);
+                    timed_diarize(&app, &wav, expected_speakers, engine, thresholds, clock, ChunkSource::Sys).await
+                } {
                     Err(e) => {
                         eprintln!("diarize: sys diarize failed ({e}), falling back to single-speaker labels");
                         emit_error(
@@ -4406,17 +4527,23 @@ async fn diarize_and_apply(
                     );
                     Vec::new()
                 }
-                Some(wav) => timed_diarize(&app, &wav, sys_speaker_hint, engine, thresholds, clock, ChunkSource::Sys)
-                    .await
-                    .unwrap_or_else(|e| {
-                        eprintln!("diarize: sys diarize failed ({e})");
-                        emit_error(
-                            &app,
-                            Some(&note_id),
-                            &format!("Diarization failed for the remote side ({e}); remote speech grouped under one speaker."),
-                        );
-                        Vec::new()
-                    }),
+                Some(wav) => {
+                    // Two passes, sequentially and deliberately — the mic's
+                    // hint is the remainder of what the system stream
+                    // accounted for. "1 of 2" is a real discrete fraction.
+                    steps.counted(Step::Diarizing, 1, 2);
+                    timed_diarize(&app, &wav, sys_speaker_hint, engine, thresholds, clock, ChunkSource::Sys)
+                        .await
+                        .unwrap_or_else(|e| {
+                            eprintln!("diarize: sys diarize failed ({e})");
+                            emit_error(
+                                &app,
+                                Some(&note_id),
+                                &format!("Diarization failed for the remote side ({e}); remote speech grouped under one speaker."),
+                            );
+                            Vec::new()
+                        })
+                }
             };
             let mic_speaker_hint = mic_hint_after_sys(expected_speakers, &sys_segments);
             let mic_segments = match mic_wav.clone() {
@@ -4424,12 +4551,15 @@ async fn diarize_and_apply(
                     eprintln!("diarize: hybrid but mic_full.wav missing, mic falls back to You");
                     Vec::new()
                 }
-                Some(wav) => timed_diarize(&app, &wav, mic_speaker_hint, engine, thresholds, clock, ChunkSource::Mic)
-                    .await
-                    .unwrap_or_else(|e| {
-                        eprintln!("diarize: hybrid mic diarize failed ({e}), mic falls back to You");
-                        Vec::new()
-                    }),
+                Some(wav) => {
+                    steps.counted(Step::Diarizing, 2, 2);
+                    timed_diarize(&app, &wav, mic_speaker_hint, engine, thresholds, clock, ChunkSource::Mic)
+                        .await
+                        .unwrap_or_else(|e| {
+                            eprintln!("diarize: hybrid mic diarize failed ({e}), mic falls back to You");
+                            Vec::new()
+                        })
+                }
             };
             if mic_segments.is_empty() && sys_segments.is_empty() {
                 emit_error(
@@ -4498,6 +4628,7 @@ async fn diarize_and_apply(
     // timeline synchronously so the splitter doesn't have to be Send +
     // Sync to cross the awaits inside write_playback_assets.
     let timeline = serialize_timeline(&chunks, split_chunk.as_ref(), label_offset);
+    steps.step(Step::WritingPlayback);
     let t_playback = std::time::Instant::now();
     write_playback_assets(
         &app,
@@ -5730,6 +5861,11 @@ fn unify_note_lock(
 pub(crate) async fn unify_note_speakers(
     app: &AppHandle,
     note_id: &str,
+    // Where the pass names itself (#189). Passed in, never chosen here: this
+    // one function is reached from the live stop, the user-pressed Re-diarize
+    // and a deferred replay, and only the first of those owns
+    // `recording_status` (#187).
+    steps: &StepReporter,
 ) -> anyhow::Result<bool> {
     // Per-note re-entrancy guard: a second unify for this note waits for the
     // first to finish (then re-runs on its up-to-date timelines) rather than
@@ -5809,6 +5945,7 @@ pub(crate) async fn unify_note_speakers(
         expected_speakers,
         engine,
         thresholds,
+        steps,
     )
     .await;
     let _ = tokio::fs::remove_dir_all(&tmp).await;
@@ -5829,6 +5966,7 @@ async fn unify_apply(
     expected_speakers: Option<i64>,
     engine: diarize::Engine,
     thresholds: diarize::Thresholds,
+    steps: &StepReporter,
 ) -> anyhow::Result<bool> {
     // Per-stream concatenation in manifest order. Mic concat = every session
     // that captured mic (mic-only *and* hybrid — a hybrid take's mic is
@@ -5848,6 +5986,16 @@ async fn unify_apply(
         .collect();
     let mic_concat = tmp.join("mic-concat.wav");
     let sys_concat = tmp.join("sys-concat.wav");
+    // Named as it goes (#189). This pass is a second full diarize over every
+    // take's audio and was invisible inside `Diarizing` until now; its stream
+    // counter is the one real fraction it has, since a diarize run emits no
+    // progress of its own.
+    let stream_count = !mic_paths.is_empty() as u32 + !sys_paths.is_empty() as u32;
+    let mut stream_index = 0;
+    if !mic_paths.is_empty() {
+        stream_index += 1;
+        steps.counted(Step::MatchingSpeakers, stream_index, stream_count);
+    }
     let mic_offsets = concat_wavs(&mic_paths, &mic_concat).await?;
     let sys_offsets = concat_wavs(&sys_paths, &sys_concat).await?;
 
@@ -5866,6 +6014,10 @@ async fn unify_apply(
         Some(_) => diarize_and_maybe_clean(app, &mic_concat, mic_hint, engine, thresholds).await?,
         None => Vec::new(),
     };
+    if !sys_paths.is_empty() {
+        stream_index += 1;
+        steps.counted(Step::MatchingSpeakers, stream_index, stream_count);
+    }
     let sys_hint = if mic_paths.is_empty() {
         expected_speakers
     } else {

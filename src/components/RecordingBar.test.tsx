@@ -125,10 +125,10 @@ describe("the recording bar's degradation ladder", () => {
     for (const key of ["detail", "pill", "pausedWord"] as const) {
       expect(px(ROW_STEPS.tight[key])).toBeGreaterThan(px(ROW_STEPS.roomy[key]));
     }
-    // The busy label, the stop's frozen timer and a replay's take clause are
-    // the steps the roomy arrangement has no use for: with no third pill
-    // beside them, all three fit.
-    for (const key of ["busyLabel", "stopTimer", "takeCounter"] as const) {
+    // The busy label, the stop's frozen timer and the progress pill's unit
+    // counter are the steps the roomy arrangement has no use for: with no
+    // third pill beside them, all three fit.
+    for (const key of ["busyLabel", "stopTimer", "counter"] as const) {
       expect(ROW_STEPS.roomy[key]).toBe("");
       expect(px(ROW_STEPS.tight[key])).toBeGreaterThan(0);
     }
@@ -149,11 +149,12 @@ describe("the recording bar's degradation ladder", () => {
       expect(px(arrangement.detail)).toBeGreaterThan(px(arrangement.pill));
       expect(px(arrangement.detail)).toBeGreaterThan(px(arrangement.busyLabel));
       expect(px(arrangement.pill)).toBeGreaterThanOrEqual(px(arrangement.busyLabel));
-      // A replay's take clause goes before the busy pill's word, which is the
-      // one inversion of the cost order here (#188): at the widths where
-      // either would close the gap, the take clause is the only one of the two
-      // a sighted user can still read afterwards, from the pill's `title`.
-      expect(px(arrangement.takeCounter)).toBeGreaterThanOrEqual(px(arrangement.busyLabel));
+      // The progress pill's unit counter goes before the busy pill's word,
+      // which is the one inversion of the cost order here (#188): at the
+      // widths where either would close the gap, the counter is the only one
+      // of the two a sighted user can still read afterwards, from the pill's
+      // `title`.
+      expect(px(arrangement.counter)).toBeGreaterThanOrEqual(px(arrangement.busyLabel));
     }
   });
 });
@@ -297,7 +298,7 @@ describe("the bar during a deferred transcription's replay (#146)", () => {
   // #188. Each take is replayed and then diarized, and the diarize half was
   // 1m48s of a 100% bar labelled "Transcribing…" on a 17m34s two-stream take.
   it("goes indeterminate for the diarize half rather than sitting full", () => {
-    seedReplay({ phase: "diarizing", doneMs: 180_000, totalMs: 180_000 });
+    seedReplay({ step: "diarizing", doneMs: 180_000, totalMs: 180_000 });
     render(<RecordingBar noteId="n1" />);
     const bar = screen.getByRole("progressbar", { name: "Identifying speakers…" });
     expect(bar).not.toHaveAttribute("aria-valuenow");
@@ -305,13 +306,13 @@ describe("the bar during a deferred transcription's replay (#146)", () => {
   });
 
   it("names the take in the diarize half the way the transcribing label does", () => {
-    seedReplay({ phase: "diarizing", doneMs: 120_000, totalMs: 180_000, take: 2, takes: 3 });
+    seedReplay({ step: "diarizing", doneMs: 120_000, totalMs: 180_000, take: 2, takes: 3 });
     const { unmount } = render(<RecordingBar noteId="n1" />);
     expect(
       screen.getByRole("progressbar", { name: "Identifying speakers in take 2 of 3…" }),
     ).toBeInTheDocument();
     unmount();
-    seedReplay({ phase: "diarizing", doneMs: 120_000, totalMs: 180_000, take: 1, takes: 1 });
+    seedReplay({ step: "diarizing", doneMs: 120_000, totalMs: 180_000, take: 1, takes: 1 });
     render(<RecordingBar noteId="n1" />);
     expect(
       screen.getByRole("progressbar", { name: "Identifying speakers…" }),
@@ -321,7 +322,7 @@ describe("the bar during a deferred transcription's replay (#146)", () => {
   it("comes back determinate — and no lower — when the next take replays", () => {
     // The diarize event carries the position it reached, so the fraction the
     // next take resumes from is the one the previous one ended on.
-    seedReplay({ phase: "transcribing", doneMs: 120_000, totalMs: 180_000, take: 3, takes: 3 });
+    seedReplay({ step: "transcribing", doneMs: 120_000, totalMs: 180_000, take: 3, takes: 3 });
     render(<RecordingBar noteId="n1" />);
     expect(
       screen.getByRole("progressbar", { name: "Transcribing take 3 of 3…" }),
@@ -384,5 +385,58 @@ describe("where a replay reports (#146)", () => {
     // The capture is what the user is doing now; the replay is background work.
     const rec: RecordingStatus = { noteId: "n1", phase: "recording" };
     expect(indicatorState(rec, { n1: RUN }, "n1")?.kind).toBe("live");
+  });
+});
+
+// #189. Every step of the stop chain has a name now, and the counter it draws
+// is the same slice #188 hides at the narrowest widths.
+describe("the bar on a named step (#189)", () => {
+  function seedStep(patch: Partial<RecordingStatus>) {
+    useRecordingStore.setState({
+      status: { noteId: "n1", phase: "diarizing", ...patch },
+      summarizing: {},
+      diag: null,
+      transcribing: {},
+    });
+  }
+
+  it("says what the chain is doing rather than one word for all of it", () => {
+    for (const [step, label] of [
+      ["saving_audio", "Saving audio…"],
+      ["diarizing", "Identifying speakers…"],
+      ["writing_playback", "Writing playback…"],
+      ["matching_speakers", "Matching speakers…"],
+    ] as const) {
+      seedStep({ step });
+      const { unmount } = render(<RecordingBar noteId="n1" />);
+      expect(screen.getByRole("progressbar", { name: label })).toBeInTheDocument();
+      unmount();
+    }
+  });
+
+  it("keeps the old copy for a diarizing that has not named a step", () => {
+    // The moment before the chain's first step lands, and every build that
+    // reports no step at all.
+    seedStep({});
+    render(<RecordingBar noteId="n1" />);
+    expect(
+      screen.getByRole("progressbar", { name: "Identifying speakers…" }),
+    ).toBeInTheDocument();
+  });
+
+  it("draws the counter in the slice the narrowest step hides, and titles it", () => {
+    seedStep({ step: "matching_speakers", index: 1, count: 2 });
+    render(<RecordingBar noteId="n1" />);
+    const pill = screen.getByTitle("Matching speakers 1/2…");
+    expect(pill).toHaveTextContent("Matching speakers 1/2…");
+    // The class the row's ladder toggles, so a hidden counter still reads out.
+    expect(pill.querySelector(`.${CSS.escape(ROW_STEPS.tight.counter)}`)).toBeNull();
+    expect(screen.getByText("1/2", { exact: false })).toBeInTheDocument();
+  });
+
+  it("titles nothing when the label is whole, so the tooltip is never noise", () => {
+    seedStep({ step: "writing_playback" });
+    render(<RecordingBar noteId="n1" />);
+    expect(screen.queryByTitle("Writing playback…")).toBeNull();
   });
 });
