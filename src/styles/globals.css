@@ -597,6 +597,25 @@ input::placeholder, textarea::placeholder {
   .skeleton { animation: none; }
 }
 
+/* A full progress fill for work whose length can't be known — the diarize
+   sidecar reports no progress, so the bar stays full and shimmers rather than
+   inventing a fraction (#182). The highlight mixes from --color-on-accent
+   because it travels across the accent fill, not across the page. */
+.nd-progress-indeterminate {
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    color-mix(in srgb, var(--color-on-accent) 45%, transparent) 50%,
+    transparent 100%
+  );
+  background-size: 200% 100%;
+  background-repeat: no-repeat;
+  animation: shimmer 1.6s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .nd-progress-indeterminate { animation: none; }
+}
+
 @keyframes recording-pulse {
   0%, 100% { opacity: 1; transform: scale(1); }
   50%      { opacity: 0.6; transform: scale(1.15); }

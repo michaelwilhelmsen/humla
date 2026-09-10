@@ -1,13 +1,13 @@
-import { Outlet, useLocation } from "react-router-dom";
+import { Outlet, useLocation, useNavigate } from "react-router-dom";
 import { useEffect, useState } from "react";
 import { PanelLeft } from "lucide-react";
 import { Sidebar } from "./Sidebar";
 import { TopBar } from "./TopBar";
 import { Toaster } from "./Toaster";
 import { Updater } from "./Updater";
-import { PolishToast } from "./PolishToast";
+import { CaptureIndicator, useCaptureElapsed } from "./RecordingBar";
 import { ErrorBoundary } from "./ErrorBoundary";
-import { bindBackendListeners } from "../lib/store";
+import { bindBackendListeners, useRecordingStore } from "../lib/store";
 
 // Passed down to routed pages via <Outlet context>. The Note toolbar uses it
 // to inset its top-left content clear of the floating expand button + the
@@ -21,6 +21,7 @@ const NARROW_VIEWPORT_PX = 900;
 
 export function Layout() {
   const location = useLocation();
+  const navigate = useNavigate();
   // null means "no manual override — follow the auto-collapse rule".
   // A boolean means the user clicked the toggle and we honour it until
   // the route or viewport situation changes again.
@@ -52,6 +53,17 @@ export function Layout() {
   }, [shouldAutoCollapse]);
 
   const collapsed = manualCollapsed !== null ? manualCollapsed : shouldAutoCollapse;
+
+  // The capture indicator lives here rather than in the nav card because the
+  // card is REMOVED entirely below `NARROW_VIEWPORT_PX` — a sidebar home would
+  // vanish exactly when the window is small. Hidden on the capture's own note,
+  // where the full bar is already saying the same thing. It replaces the
+  // diarize toast (#182): that toast said only "identifying speakers", which
+  // is the second half of a stop the user could otherwise see nothing of.
+  const recStatus = useRecordingStore((s) => s.status);
+  const elapsed = useCaptureElapsed(recStatus.phase);
+  const onCaptureNote =
+    recStatus.noteId !== null && location.pathname === `/note/${recStatus.noteId}`;
 
   return (
     <div className="flex h-full p-1.5 gap-1.5 bg-[var(--color-canvas)]">
@@ -95,7 +107,13 @@ export function Layout() {
       </main>
       <Toaster />
       <Updater />
-      <PolishToast />
+      {!onCaptureNote && (
+        <CaptureIndicator
+          variant="compact"
+          elapsed={elapsed}
+          onOpen={() => recStatus.noteId && navigate(`/note/${recStatus.noteId}`)}
+        />
+      )}
     </div>
   );
 }

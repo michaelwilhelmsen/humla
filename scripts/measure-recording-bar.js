@@ -12,17 +12,21 @@
 // Usage: `pnpm mock`, open
 //   http://localhost:1420/mock.html?case=recbar-long&palette=graphite&theme=light
 // then paste this into the browser console. Repeat for `?case=recbar-long-summary`
-// (the three-pill row a summary running during a recording produces) and for
-// `palette=warm`. Graphite is the wider theme, so it is the one that binds.
+// (the three-pill row a summary running during a recording produces), for the
+// `?case=recbar-stopping-*` / `?case=recbar-diarizing*` arrangements the stop
+// chain produces (#182 — no controls, a frozen timer and a progress pill), and
+// for `palette=warm`. Graphite is the wider theme, so it is the one that binds.
 //
 // The timer is forced to its widest honest reading (`123:45`, an hour-plus
 // meeting) on every step, because the mock's clock starts at zero and two more
 // digits are two more digits the row has to hold.
 (() => {
   const pills = [...document.querySelectorAll(".nd-recpill")];
-  const controls = pills.find((p) => p.querySelector("button"));
-  if (!controls) throw new Error("no controls pill here — use ?case=recbar-long");
-  const row = controls.parentElement;
+  // The controls pill anchors the row while a capture runs; after stop it is
+  // gone, so fall back to any pill in the row.
+  const anchor = pills.find((p) => p.querySelector("button")) ?? pills[pills.length - 1];
+  if (!anchor) throw new Error("no recording pill here — use ?case=recbar-*");
+  const row = anchor.parentElement;
   const bar = row.parentElement;
   const column = bar.parentElement;
   const restore = column.style.width;
@@ -31,7 +35,7 @@
   const PADDING = 32;
 
   const widest = () => {
-    const t = [...controls.querySelectorAll("span")].find((s) =>
+    const t = [...row.querySelectorAll("span")].find((s) =>
       /^\d+:\d\d$/.test(s.textContent.trim()),
     );
     if (t) t.textContent = "123:45";

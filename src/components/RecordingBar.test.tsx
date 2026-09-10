@@ -1,7 +1,8 @@
-import { describe, expect, it } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { describe, expect, it, vi } from "vitest";
+import { act, render, screen } from "@testing-library/react";
 import { ROW_STEPS, RecordingBar, noAudioWarning } from "./RecordingBar";
 import { useRecordingStore } from "../lib/store";
+import type { RecordingStatus } from "../lib/ipc";
 
 // #174. The warning fired correctly and said nothing useful: a pair of
 // headphones in another room held the macOS default input, and "check your
@@ -146,5 +147,96 @@ describe("the recording bar's degradation ladder", () => {
       expect(px(arrangement.detail)).toBeGreaterThan(px(arrangement.busyLabel));
       expect(px(arrangement.pill)).toBeGreaterThanOrEqual(px(arrangement.busyLabel));
     }
+  });
+});
+
+// #182. Stop used to be a wall: the transcript froze, the timer vanished and a
+// bare "Stopping…" said nothing about how long. The tail now appends live, so
+// the row can report a real fraction — and the one thing it must never do is
+// invent one for the diarize pass, which reports no progress at all.
+describe("the bar after stop (#182)", () => {
+  function seedStop(patch: Partial<RecordingStatus> = {}) {
+    useRecordingStore.setState({
+      status: { noteId: "n1", phase: "stopping", ...patch },
+      summarizing: {},
+      diag: null,
+      micHeard: true,
+    });
+  }
+
+  it("reports the drain as the fraction of the chunks that have landed", () => {
+    seedStop({ pending: 4, done: 1 });
+    render(<RecordingBar noteId="n1" />);
+    const bar = screen.getByRole("progressbar", { name: "Finishing transcript…" });
+    expect(bar).toHaveAttribute("aria-valuenow", "25");
+    expect(bar).toHaveAttribute("aria-valuemax", "100");
+  });
+
+  it("reaches 100% when the last pending chunk lands", () => {
+    seedStop({ pending: 4, done: 4 });
+    render(<RecordingBar noteId="n1" />);
+    expect(screen.getByRole("progressbar")).toHaveAttribute("aria-valuenow", "100");
+  });
+
+  it("is full immediately when nothing was in flight at stop", () => {
+    // A stop with an empty drain must not read as 0% work done — there is no
+    // work. The backend emits `{pending: 0, done: 0}`; an older one emits
+    // neither field, and both mean the same thing here.
+    for (const patch of [{ pending: 0, done: 0 }, {}]) {
+      seedStop(patch);
+      const { unmount } = render(<RecordingBar noteId="n1" />);
+      expect(screen.getByRole("progressbar")).toHaveAttribute("aria-valuenow", "100");
+      unmount();
+    }
+  });
+
+  it("never shows a fraction while speakers are being identified", () => {
+    // The diarize sidecar emits no progress. A `progressbar` with no
+    // `aria-valuenow` is ARIA's own indeterminate, which is exactly the truth.
+    seedStop({ phase: "diarizing", pending: undefined, done: undefined });
+    render(<RecordingBar noteId="n1" />);
+    const bar = screen.getByRole("progressbar", { name: "Identifying speakers…" });
+    expect(bar).not.toHaveAttribute("aria-valuenow");
+    expect(bar).toHaveAttribute("aria-busy", "true");
+    expect(screen.getByText("Identifying speakers…")).toBeInTheDocument();
+  });
+
+  it("retires the old busy pills for the two phases it now covers", () => {
+    seedStop({ pending: 2, done: 0 });
+    render(<RecordingBar noteId="n1" />);
+    expect(screen.queryByRole("status", { name: "Stopping…" })).toBeNull();
+  });
+
+  it("keeps the elapsed reading through the drain, frozen where the stop left it", () => {
+    vi.useFakeTimers();
+    try {
+      useRecordingStore.setState({
+        status: { noteId: "n1", phase: "recording" },
+        summarizing: {},
+        diag: null,
+        micHeard: true,
+      });
+      render(<RecordingBar noteId="n1" />);
+      act(() => void vi.advanceTimersByTime(3_000));
+      expect(screen.getByText("0:03")).toBeInTheDocument();
+      act(() =>
+        useRecordingStore.setState({
+          status: { noteId: "n1", phase: "stopping", pending: 2, done: 0 },
+        }),
+      );
+      // The controls go — there is nothing left to pause or stop — but the
+      // length of the recording is already final and stays on screen.
+      expect(screen.queryByRole("button", { name: "Stop" })).toBeNull();
+      act(() => void vi.advanceTimersByTime(5_000));
+      expect(screen.getByText("0:03")).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("says nothing about a capture running on another note", () => {
+    seedStop({ noteId: "other", pending: 4, done: 1 });
+    render(<RecordingBar noteId="n1" />);
+    expect(screen.queryByRole("progressbar")).toBeNull();
   });
 });

@@ -73,6 +73,9 @@ type Scenario = {
       the panel, beside the pickers and the chrome they compete with. Costs a
       much bigger IPC surface, so it is the exception, not the pattern. */
   route?: string;
+  /** Store state to seed before the first render, for a scenario whose subject
+      is a transient the IPC defaults can't produce — a capture mid-stop, say. */
+  seed?: () => void;
 };
 
 // ---- #147 axis: which Ollama models are installed --------------------------
@@ -364,7 +367,7 @@ function toolbarCase(
         backLabel="Kundemøter og oppfølging"
         readOnly={false}
         recActive={false}
-        canRecord
+        recordBlock={null}
         panelOpen
         onTogglePanel={() => {}}
         onSummarizeFailed={() => {}}
@@ -808,9 +811,19 @@ function noAudioCase(device: string | null, width = BODY_MIN_PX): Scenario {
 // overhung both before the degradation ladder went in.
 function recBarCase(
   width: number,
-  opts: { summarizing?: boolean; paused?: boolean; long?: boolean } = {},
+  opts: {
+    summarizing?: boolean;
+    paused?: boolean;
+    long?: boolean;
+    // #182: the row after stop, where the controls are gone and the progress
+    // pill stands where they were. `pending`/`done` are the drain's own count.
+    phase?: "recording" | "paused" | "stopping" | "diarizing";
+    pending?: number;
+    done?: number;
+  } = {},
 ): Scenario {
-  const { summarizing = false, paused = false, long = false } = opts;
+  const { summarizing = false, paused = false, long = false, pending, done } = opts;
+  const phase = opts.phase ?? (paused ? "paused" : "recording");
   return {
     wrap: (node) => (
       <div className="flex-1 flex flex-col items-center gap-3 py-6">
@@ -819,6 +832,8 @@ function recBarCase(
           {summarizing && " · summarizing"}
           {paused && " · paused"}
           {long && " · long recording"}
+          {phase === "stopping" && ` · stopping ${done ?? 0}/${pending ?? 0}`}
+          {phase === "diarizing" && " · identifying speakers"}
         </p>
         {/* The body column, dashed so an overhanging row is visible as one that
             leaves it. Deliberately NOT `overflow-hidden`: the real column has
@@ -837,7 +852,7 @@ function recBarCase(
       // pill can honestly reach: a 90-minute capture (4-digit seconds, 3-digit
       // chunk count) and a timer past the hour.
       useRecordingStore.setState({
-        status: { noteId: "n1", phase: paused ? "paused" : "recording" },
+        status: { noteId: "n1", phase, pending, done },
         summarizing: summarizing ? { n1: true } : {},
         micHeard: true,
         activeSince: null,
@@ -990,6 +1005,24 @@ const CASES: Record<string, Scenario> = {
   "recbar-long": recBarCase(420, { paused: true, long: true }),
   "recbar-long-summary": recBarCase(420, { paused: true, long: true, summarizing: true }),
 
+  // --- #182: the row after stop. The controls are gone; the frozen timer and
+  // the progress pill that stands where they were have to fit the same column,
+  // and a summary can still be running over both.
+  "recbar-stopping": recBarCase(414, { phase: "stopping", pending: 4, done: 1 }),
+  "recbar-stopping-420": recBarCase(420, { phase: "stopping", long: true, pending: 12, done: 9 }),
+  "recbar-stopping-380": recBarCase(380, { phase: "stopping", long: true, pending: 12, done: 9 }),
+  // Zero pending: the bar is full immediately rather than starting at nothing.
+  "recbar-stopping-empty": recBarCase(414, { phase: "stopping", pending: 0, done: 0 }),
+  "recbar-stopping-summary": recBarCase(414, {
+    phase: "stopping",
+    long: true,
+    summarizing: true,
+    pending: 12,
+    done: 9,
+  }),
+  "recbar-diarizing": recBarCase(414, { phase: "diarizing" }),
+  "recbar-diarizing-380": recBarCase(380, { phase: "diarizing", summarizing: true }),
+
   // --- #174: the no-audio warning naming the device it isn't hearing.
   // A real (localized) device name, the fallback when the HAL won't name one,
   // and the clamp doing its job on a pathological user-authored name.
@@ -1011,6 +1044,42 @@ const CASES: Record<string, Scenario> = {
       folders_list: () => DEMO_FOLDERS,
       clients_list: () => DEMO_CLIENTS,
     },
+  },
+
+  // --- #182: the compact indicator, which is the whole point of the change —
+  // the app-wide grid is exactly the screen the old design showed nothing on.
+  "notes-stopping": {
+    route: "/all-notes",
+    render: () => null, // unused — `route` renders the app
+    ipc: {
+      notes_list: () => demoNotes(),
+      folders_list: () => DEMO_FOLDERS,
+      clients_list: () => DEMO_CLIENTS,
+    },
+    seed: () =>
+      useRecordingStore.setState({
+        status: { noteId: "n1", phase: "stopping", pending: 4, done: 1 },
+      }),
+  },
+  "notes-diarizing": {
+    route: "/all-notes",
+    render: () => null, // unused — `route` renders the app
+    ipc: {
+      notes_list: () => demoNotes(),
+      folders_list: () => DEMO_FOLDERS,
+      clients_list: () => DEMO_CLIENTS,
+    },
+    seed: () => useRecordingStore.setState({ status: { noteId: "n1", phase: "diarizing" } }),
+  },
+  "notes-recording": {
+    route: "/all-notes",
+    render: () => null, // unused — `route` renders the app
+    ipc: {
+      notes_list: () => demoNotes(),
+      folders_list: () => DEMO_FOLDERS,
+      clients_list: () => DEMO_CLIENTS,
+    },
+    seed: () => useRecordingStore.setState({ status: { noteId: "n1", phase: "recording" } }),
   },
 
   // A library with nothing in it — the first screen a fresh install shows.
@@ -1090,6 +1159,8 @@ if (scenario.route) {
     return null;
   });
 }
+
+scenario.seed?.();
 
 const ctx = {
   stepId: scenario.step,
