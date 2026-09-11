@@ -217,20 +217,17 @@ describe("the bar after stop (#182)", () => {
   it("keeps the elapsed reading through the drain, frozen where the stop left it", () => {
     vi.useFakeTimers();
     try {
-      useRecordingStore.setState({
-        status: { noteId: "n1", phase: "recording" },
-        summarizing: {},
-        diag: null,
-        micHeard: true,
-      });
+      // Driven the way the backend drives it: `syncAudioWatch` owns the
+      // capture's clock and runs before the status lands.
+      const go = (patch: RecordingStatus) => {
+        useRecordingStore.getState().syncAudioWatch(patch.phase, patch.noteId);
+        useRecordingStore.setState({ status: patch, summarizing: {}, diag: null, micHeard: true });
+      };
+      act(() => go({ noteId: "n1", phase: "recording" }));
       render(<RecordingBar noteId="n1" />);
       act(() => void vi.advanceTimersByTime(3_000));
       expect(screen.getByText("0:03")).toBeInTheDocument();
-      act(() =>
-        useRecordingStore.setState({
-          status: { noteId: "n1", phase: "stopping", pending: 2, done: 0 },
-        }),
-      );
+      act(() => go({ noteId: "n1", phase: "stopping", pending: 2, done: 0 }));
       // The controls go — there is nothing left to pause or stop — but the
       // length of the recording is already final and stays on screen.
       expect(screen.queryByRole("button", { name: "Stop" })).toBeNull();
@@ -245,6 +242,50 @@ describe("the bar after stop (#182)", () => {
     seedStop({ noteId: "other", pending: 4, done: 1 });
     render(<RecordingBar noteId="n1" />);
     expect(screen.queryByRole("progressbar")).toBeNull();
+  });
+});
+
+// The timer belongs to the capture, not to whatever is displaying it: the bar
+// unmounts with the note view while the compact pill in `Layout` does not, so a
+// reading counted from mount restarts every time the user leaves the note and
+// comes back — and the two copies disagree while both are up.
+describe("the elapsed reading across a remount", () => {
+  function live(msAgo: number) {
+    useRecordingStore.setState({
+      status: { noteId: "n1", phase: "recording" },
+      summarizing: {},
+      diag: null,
+      micHeard: true,
+      activeAccumMs: 0,
+      activeSince: Date.now() - msAgo,
+    });
+  }
+
+  it("reads the capture's own clock on a fresh mount", () => {
+    vi.useFakeTimers();
+    try {
+      live(65_000);
+      render(<RecordingBar noteId="n1" />);
+      expect(screen.getByText("1:05")).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not restart when the note view is left and reopened", () => {
+    vi.useFakeTimers();
+    try {
+      live(65_000);
+      const first = render(<RecordingBar noteId="n1" />);
+      act(() => void vi.advanceTimersByTime(4_000));
+      expect(screen.getByText("1:09")).toBeInTheDocument();
+      first.unmount();
+      act(() => void vi.advanceTimersByTime(6_000));
+      render(<RecordingBar noteId="n1" />);
+      expect(screen.getByText("1:15")).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

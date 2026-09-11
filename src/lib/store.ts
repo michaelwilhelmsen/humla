@@ -175,9 +175,11 @@ export type RecordingState = {
   // or null while paused/idle. Total active time = activeAccumMs + (now - activeSince).
   activeSince: number | null;
   activeAccumMs: number;
-  // Called from the status listener on every recording phase transition to keep
-  // the audio-warning bookkeeping in sync (reset on start, pause the clock on
-  // pause, resume it on resume, clear on stop).
+  // Called from the status listener on every recording phase transition: reset
+  // on start, bank the clock on pause, restart it on resume, freeze it through
+  // the stop, clear on idle. It is the capture's clock, not any one component's
+  // — the bar in the note view and the compact pill in `Layout` are mounted and
+  // unmounted independently and must read the same time.
   syncAudioWatch: (phase: RecordingStatus["phase"], noteId: string | null) => void;
 };
 
@@ -289,9 +291,17 @@ export const useRecordingStore = create<RecordingState>((set, get) => ({
           if (s.activeSince === null) return {};
           return { activeAccumMs: s.activeAccumMs + (now - s.activeSince), activeSince: null };
         }
+        case "stopping":
+        case "diarizing": {
+          // The meter and the watch are over, but the recording's length is
+          // final rather than gone: the bar keeps showing it through the stop
+          // (#182), so bank the last segment and freeze the clock.
+          const banked =
+            s.activeSince === null ? s.activeAccumMs : s.activeAccumMs + (now - s.activeSince);
+          return { micHeard: false, activeSince: null, activeAccumMs: banked, micLevel: 0, sysLevel: 0 };
+        }
         default: {
-          // stopping / diarizing / idle — recording is over. Clear the meter and
-          // the watch so nothing lingers into the next session.
+          // idle / importing — nothing may linger into the next session.
           return { micHeard: false, activeSince: null, activeAccumMs: 0, micLevel: 0, sysLevel: 0 };
         }
       }

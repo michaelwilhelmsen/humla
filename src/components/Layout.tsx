@@ -62,7 +62,7 @@ export function Layout() {
   // status alone: a replay (#146) belongs to a note no capture names.
   const recStatus = useRecordingStore((s) => s.status);
   const transcribing = useRecordingStore((s) => s.transcribing);
-  const elapsed = useCaptureElapsed(recStatus.phase);
+  const elapsed = useCaptureElapsed();
   const subjectNoteId = indicatorState(recStatus, transcribing)?.noteId ?? null;
   const onCaptureNote =
     subjectNoteId !== null && location.pathname === `/note/${subjectNoteId}`;

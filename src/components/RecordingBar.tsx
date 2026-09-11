@@ -319,25 +319,23 @@ export function indicatorState(
 }
 
 /**
- * The capture's elapsed seconds, held by whatever is mounted for the whole
- * recording rather than by the thing that displays it. Frozen rather than
- * cleared through `stopping`: the recording's length is already final when
- * stop is pressed.
+ * The capture's elapsed seconds, read off the store's clock rather than kept
+ * here. This hook is mounted twice and independently — in the bar, which
+ * unmounts with the note view, and in `Layout`, which does not — so a reading
+ * counted from mount restarts every time the user leaves the note and comes
+ * back, and the two copies disagree.
  */
-export function useCaptureElapsed(phase: RecordingPhase): number {
-  const [elapsed, setElapsed] = useState(0);
+export function useCaptureElapsed(): number {
+  const activeSince = useRecordingStore((s) => s.activeSince);
+  const activeAccumMs = useRecordingStore((s) => s.activeAccumMs);
+  const [, tick] = useState(0);
   useEffect(() => {
-    if (phase === "paused" || phase === "stopping") return; // hold the reading
-    if (phase !== "recording") {
-      setElapsed(0);
-      return;
-    }
-    const start = Date.now() - elapsed * 1000;
-    const t = window.setInterval(() => setElapsed(Math.floor((Date.now() - start) / 1000)), 250);
+    if (activeSince === null) return; // banked and frozen: nothing to advance
+    const t = window.setInterval(() => tick((n) => n + 1), 250);
     return () => window.clearInterval(t);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [phase]);
-  return elapsed;
+  }, [activeSince]);
+  const active = activeAccumMs + (activeSince !== null ? Date.now() - activeSince : 0);
+  return Math.floor(active / 1000);
 }
 
 /**
@@ -560,7 +558,7 @@ export function RecordingBar({ noteId }: { noteId: string }) {
     return () => window.clearInterval(t);
   }, [phase, micHeard, activeSince, activeAccumMs]);
 
-  const elapsed = useCaptureElapsed(phase);
+  const elapsed = useCaptureElapsed();
 
   async function pause() {
     try { await ipc.recordingPause(); }
