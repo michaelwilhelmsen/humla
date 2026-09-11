@@ -1,9 +1,12 @@
 import { type MouseEvent, type KeyboardEvent, useRef } from "react";
+import { useShallow } from "zustand/react/shallow";
 import { Link } from "react-router-dom";
 import { Building2, Check, Folder as FolderIcon } from "lucide-react";
 import { type Client, type Folder, type Note } from "../lib/ipc";
 import { formatNoteDate, noteExcerpt, noteState, type NoteState } from "../lib/noteList";
 import { cn } from "../lib/cn";
+import { noteActivity } from "../lib/noteActivity";
+import { useRecordingStore } from "../lib/store";
 
 // Selection intent reported to the parent. Only the shift flag matters (range
 // vs toggle); works for a modifier-click, the checkbox, and the keyboard toggle.
@@ -48,6 +51,10 @@ export function NoteCard({
   const title = note.title.trim() || "Untitled";
   const excerpt = noteExcerpt(note);
   const state = STATE[noteState(note)];
+  // `useShallow` because the helper builds a fresh object each call: without it
+  // every card re-renders on every store tick.
+  const activity = useRecordingStore(useShallow((s) => noteActivity(note.id, s)));
+  const shown = activity ?? state;
   const checkboxShown = selected || selectionActive;
   // The checkbox's toggle fires via onChange (which carries no modifier flags),
   // so we stash the click's shift state here for the onChange to read.
@@ -101,14 +108,17 @@ export function NoteCard({
         <div className="mt-auto pt-4 flex items-center gap-x-2.5 gap-y-1.5 flex-wrap text-[11.5px]">
           <span
             className="inline-flex items-center gap-1.5 whitespace-nowrap"
-            style={{ color: state.color }}
+            style={{ color: shown.color }}
           >
             <span
               aria-hidden
-              className="w-[6px] h-[6px] rounded-full shrink-0"
-              style={{ background: state.color }}
+              className={cn(
+                "w-[6px] h-[6px] rounded-full shrink-0",
+                activity?.animated && "rec-dot",
+              )}
+              style={{ background: shown.color }}
             />
-            {state.label}
+            {shown.label}
           </span>
           {client && (
             <span className="inline-flex items-center gap-1.5 min-w-0 text-[var(--color-text-muted)]">

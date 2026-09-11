@@ -369,3 +369,24 @@ describe("AllNotes bulk move", () => {
     expect(moveSpy).toHaveBeenCalledWith({ id: "n2", folderId: null });
   });
 });
+
+describe("AllNotes activity", () => {
+  it("shows the note's activity in place of its static state, and only that note's", () => {
+    mockTauri();
+    seed([makeNote("n1", "Alpha"), makeNote("n2", "Beta")]);
+    useRecordingStore.setState({ summarizing: { n1: true } });
+    renderAll();
+
+    const alpha = screen.getByRole("link", { name: /Alpha/ });
+    expect(alpha).toHaveTextContent("Summarizing…");
+    expect(alpha).not.toHaveTextContent("Empty");
+    // The dot is aria-hidden, so it is reached through the DOM rather than a role.
+    expect(alpha.querySelector(".rec-dot")).not.toBeNull();
+
+    const beta = screen.getByRole("link", { name: /Beta/ });
+    expect(beta).toHaveTextContent("Empty");
+    expect(beta.querySelector(".rec-dot")).toBeNull();
+
+    useRecordingStore.setState({ summarizing: {} });
+  });
+});

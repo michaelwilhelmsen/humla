@@ -624,6 +624,10 @@ input::placeholder, textarea::placeholder {
 .rec-dot {
   animation: recording-pulse 1.2s ease-in-out infinite;
 }
+@media (prefers-reduced-motion: reduce) {
+  /* The dot's colour is what says "live"; the pulse only draws the eye to it. */
+  .rec-dot { animation: none; }
+}
 
 /* Floating recording-bar pills (status · controls · busy). A soft drop
    shadow lifts them off the note body; in dark they step one rung up the

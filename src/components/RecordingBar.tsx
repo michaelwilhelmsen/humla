@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { MicOff, Pause, Play, Square } from "lucide-react";
 import { ipc, type RecordingPhase, type RecordingStatus, type Step } from "../lib/ipc";
 import { useRecordingStore, type ReplayRun } from "../lib/store";
+import { STEP_LABELS } from "../lib/recordingSteps";
 import { cn } from "../lib/cn";
 
 // ~10s of active capture with the mic never rising above the audible floor
@@ -106,20 +107,6 @@ export const ROW_STEPS = {
     counter: "@max-[490px]:sr-only",
   },
 } as const;
-
-/**
- * What each named step of a chain is called. One map, because the stop and the
- * replay draw from one `Step` vocabulary — a user who stops a recording and a
- * user who presses Transcribe are watching the same work. Labels stay short:
- * the row they sit in has only a few pixels of slack.
- */
-const STEP_LABELS: Record<Step, string> = {
-  transcribing: "Transcribing",
-  saving_audio: "Saving audio",
-  diarizing: "Identifying speakers",
-  writing_playback: "Writing playback",
-  matching_speakers: "Matching speakers",
-};
 
 /**
  * How a step that counts DISCRETE units is drawn: its position as text beside
