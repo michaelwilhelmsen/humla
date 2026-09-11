@@ -1066,8 +1066,8 @@ export function Note() {
   const transcriptLive = isRecording || isPaused || isStopping || isDiarizing || isImporting;
 
   const folder = draft.folder_id ? folders.find((f) => f.id === draft.folder_id) : null;
-  const backTo = folder ? `/folder/${folder.id}` : "/";
-  const backLabel = folder ? folder.name : "Home";
+  const backTo = folder ? `/folder/${folder.id}` : "/all-notes";
+  const backLabel = folder ? folder.name : "All notes";
   const otherActiveRecording = recPhase.noteId !== null && recPhase.noteId !== draft.id;
   // Why Record is refused here, or null when it isn't. The backend holds the
   // single capture slot until the previous stop has landed on idle (#182), so
