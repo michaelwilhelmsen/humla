@@ -122,7 +122,7 @@ export type ReplayMeasure = {
     once — the compact indicator has a single slot. */
 export type ReplayRun = ReplayMeasure & { startedAt: number };
 
-type RecordingState = {
+export type RecordingState = {
   status: RecordingStatus;
   setStatus: (s: RecordingStatus) => void;
   // Per-note "summary in flight" flags. Lives separately from `status` so

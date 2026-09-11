@@ -1331,6 +1331,36 @@ const CASES: Record<string, Scenario> = {
     ipc: { notes_list: () => [], folders_list: () => [], clients_list: () => [] },
   },
 
+  // #190: four notes of the same library under different kinds of activity at
+  // once, which is the only way to judge the state line against its neighbours.
+  "notes-activity": {
+    route: "/all-notes",
+    render: () => null, // unused — `route` renders the app
+    ipc: {
+      notes_list: () => demoNotes(),
+      folders_list: () => DEMO_FOLDERS,
+      clients_list: () => DEMO_CLIENTS,
+    },
+    seed: () =>
+      useRecordingStore.setState({
+        status: { noteId: "n1", phase: "recording" },
+        transcribing: { n3: { startedAt: Date.now(), step: "diarizing", take: 2, takes: 3 } },
+        summarizing: { n2: true },
+      }),
+  },
+
+  // The same, paused — the one activity whose dot is frozen.
+  "notes-activity-paused": {
+    route: "/all-notes",
+    render: () => null, // unused — `route` renders the app
+    ipc: {
+      notes_list: () => demoNotes(),
+      folders_list: () => DEMO_FOLDERS,
+      clients_list: () => DEMO_CLIENTS,
+    },
+    seed: () => useRecordingStore.setState({ status: { noteId: "n4", phase: "paused" } }),
+  },
+
   // The same grid inside a folder, where the folder chip is deliberately absent
   // from every card.
   "notes-folder": {
