@@ -389,4 +389,27 @@ describe("AllNotes activity", () => {
 
     useRecordingStore.setState({ summarizing: {} });
   });
+
+  it("puts the capture's clock beside a recording note's label, and only there", () => {
+    mockTauri();
+    seed([makeNote("n1", "Alpha"), makeNote("n2", "Beta")]);
+    useRecordingStore.setState({
+      status: { noteId: "n1", phase: "recording" },
+      activeSince: Date.now() - 65_000,
+      activeAccumMs: 0,
+      summarizing: { n2: true },
+    });
+    renderAll();
+
+    expect(screen.getByRole("link", { name: /Alpha/ })).toHaveTextContent(/Recording1:0[56]/);
+    // The date line carries a clock of its own, so the check is on the label.
+    expect(screen.getByRole("link", { name: /Beta/ })).toHaveTextContent(/Summarizing…$/);
+
+    useRecordingStore.setState({
+      status: { noteId: null, phase: "idle" },
+      activeSince: null,
+      activeAccumMs: 0,
+      summarizing: {},
+    });
+  });
 });

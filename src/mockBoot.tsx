@@ -1344,6 +1344,7 @@ const CASES: Record<string, Scenario> = {
     seed: () =>
       useRecordingStore.setState({
         status: { noteId: "n1", phase: "recording" },
+        activeSince: Date.now() - 754_000,
         transcribing: { n3: { startedAt: Date.now(), step: "diarizing", take: 2, takes: 3 } },
         summarizing: { n2: true },
       }),

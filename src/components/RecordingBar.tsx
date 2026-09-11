@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { formatTime, useCaptureElapsed } from "../lib/captureClock";
 import { MicOff, Pause, Play, Square } from "lucide-react";
 import { ipc, type RecordingPhase, type RecordingStatus, type Step } from "../lib/ipc";
 import { useRecordingStore, type ReplayRun } from "../lib/store";
@@ -316,26 +317,6 @@ export function indicatorState(
         : null;
   if (!replay) return null;
   return { noteId: replay.noteId, kind: "progress", ...replayProgress(replay.run), paused: false };
-}
-
-/**
- * The capture's elapsed seconds, read off the store's clock rather than kept
- * here. This hook is mounted twice and independently — in the bar, which
- * unmounts with the note view, and in `Layout`, which does not — so a reading
- * counted from mount restarts every time the user leaves the note and comes
- * back, and the two copies disagree.
- */
-export function useCaptureElapsed(): number {
-  const activeSince = useRecordingStore((s) => s.activeSince);
-  const activeAccumMs = useRecordingStore((s) => s.activeAccumMs);
-  const [, tick] = useState(0);
-  useEffect(() => {
-    if (activeSince === null) return; // banked and frozen: nothing to advance
-    const t = window.setInterval(() => tick((n) => n + 1), 250);
-    return () => window.clearInterval(t);
-  }, [activeSince]);
-  const active = activeAccumMs + (activeSince !== null ? Date.now() - activeSince : 0);
-  return Math.floor(active / 1000);
 }
 
 /**
@@ -742,12 +723,6 @@ export function RecordingBar({ noteId }: { noteId: string }) {
       </div>
     </div>
   );
-}
-
-function formatTime(s: number) {
-  const m = Math.floor(s / 60);
-  const r = s % 60;
-  return `${m}:${r.toString().padStart(2, "0")}`;
 }
 
 // `role="status"` + `aria-label` rather than the label text alone: at the

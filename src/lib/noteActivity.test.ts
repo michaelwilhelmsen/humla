@@ -9,6 +9,16 @@ function slices(over: Partial<ActivitySlices> = {}): ActivitySlices {
 }
 
 describe("noteActivity", () => {
+  it("times the live capture's phases and nothing else", () => {
+    const phase = (p: RecordingStatus["phase"]) =>
+      noteActivity("n1", slices({ status: { noteId: "n1", phase: p } }))?.timed;
+    expect(phase("recording")).toBe(true);
+    expect(phase("paused")).toBe(true);
+    expect(phase("stopping")).toBe(true);
+    expect(phase("importing")).toBe(false);
+    expect(noteActivity("n1", slices({ summarizing: { n1: true } }))?.timed).toBe(false);
+  });
+
   it("is null when nothing is happening", () => {
     expect(noteActivity("n1", slices())).toBeNull();
   });

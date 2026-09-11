@@ -5,7 +5,8 @@ import { Sidebar } from "./Sidebar";
 import { TopBar } from "./TopBar";
 import { Toaster } from "./Toaster";
 import { Updater } from "./Updater";
-import { CaptureIndicator, indicatorState, useCaptureElapsed } from "./RecordingBar";
+import { CaptureIndicator, indicatorState } from "./RecordingBar";
+import { useCaptureElapsed } from "../lib/captureClock";
 import { ErrorBoundary } from "./ErrorBoundary";
 import { bindBackendListeners, useRecordingStore } from "../lib/store";
 

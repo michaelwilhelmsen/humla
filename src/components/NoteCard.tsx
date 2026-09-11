@@ -7,6 +7,7 @@ import { formatNoteDate, noteExcerpt, noteState, type NoteState } from "../lib/n
 import { cn } from "../lib/cn";
 import { noteActivity } from "../lib/noteActivity";
 import { useRecordingStore } from "../lib/store";
+import { formatTime, useCaptureElapsed } from "../lib/captureClock";
 
 // Selection intent reported to the parent. Only the shift flag matters (range
 // vs toggle); works for a modifier-click, the checkbox, and the keyboard toggle.
@@ -29,6 +30,12 @@ const STATE: Record<NoteState, { label: string; color: string }> = {
 // treating it as a selection modifier triple-fires. The checkbox is a sibling
 // of the <Link>, never nested inside the anchor, so toggling it cannot
 // navigate; Space on a focused card toggles too, leaving Enter to the link.
+// Its own component so only the card whose capture this is pays the tick.
+function LiveElapsed() {
+  const elapsed = useCaptureElapsed();
+  return <span className="tabular-nums opacity-80">{formatTime(elapsed)}</span>;
+}
+
 export function NoteCard({
   note,
   folder,
@@ -119,6 +126,7 @@ export function NoteCard({
               style={{ background: shown.color }}
             />
             {shown.label}
+            {activity?.timed && <LiveElapsed />}
           </span>
           {client && (
             <span className="inline-flex items-center gap-1.5 min-w-0 text-[var(--color-text-muted)]">
