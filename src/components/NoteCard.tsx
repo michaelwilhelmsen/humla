@@ -1,7 +1,7 @@
 import { type MouseEvent, type KeyboardEvent, useRef } from "react";
 import { useShallow } from "zustand/react/shallow";
 import { Link } from "react-router-dom";
-import { Building2, Check, Folder as FolderIcon } from "lucide-react";
+import { Building2, Check, Folder as FolderIcon, Lock } from "lucide-react";
 import { type Client, type Folder, type Note } from "../lib/ipc";
 import { formatNoteDate, noteExcerpt, noteState, type NoteState } from "../lib/noteList";
 import { cn } from "../lib/cn";
@@ -128,6 +128,17 @@ export function NoteCard({
             {shown.label}
             {activity?.timed && <LiveElapsed />}
           </span>
+          {note.private && note.workspace_id && (
+            // Only inside a workspace: every Personal note is private, so the
+            // glyph would say nothing there and appear on every card (#191).
+            <span
+              className="inline-flex items-center gap-1.5 min-w-0 text-[var(--color-text-muted)]"
+              title="Private — only you can read this note"
+            >
+              <Lock size={12} strokeWidth={1.7} aria-hidden className="shrink-0 opacity-70" />
+              <span>Private</span>
+            </span>
+          )}
           {client && (
             <span className="inline-flex items-center gap-1.5 min-w-0 text-[var(--color-text-muted)]">
               <Building2 size={12} strokeWidth={1.7} aria-hidden className="shrink-0 opacity-70" />

@@ -99,6 +99,15 @@ impl CloudSync {
             to: to.to_string(),
         });
     }
+    /// A note became private to its author (#191). Two things have to happen and
+    /// only one of them is a push: the note itself goes up carrying `private`, and
+    /// a revocation row tells every OTHER member to drop the copy they already
+    /// pulled. Without the second one they keep it forever — a record that leaves
+    /// your view produces no pull event at all, so there is nothing to notice.
+    pub fn enqueue_note_withdrawn(&self, id: &str) {
+        let _ = self.tx.send(Op::Note { id: id.to_string(), delete: false });
+        let _ = self.tx.send(Op::NoteWithdraw { id: id.to_string() });
+    }
     /// A recording session's metadata was created or changed (#16). Pushes the
     /// `note_sessions` record; the parent note must be synced first (it is —
     /// the note upsert is enqueued ahead of this and drains in seq order).
@@ -126,6 +135,7 @@ enum Op {
     Prompt { id: String, delete: bool },
     NoteMove { id: String, from: String, to: String },
     Session { note_id: String, session_id: String, delete: bool },
+    NoteWithdraw { id: String },
 }
 
 /// Build the sync engine. Returns the handle plus the worker future; the
@@ -277,6 +287,22 @@ impl Worker {
                 }
                 Ok(())
             }
+            Op::NoteWithdraw { id } => {
+                // Its own entity, so it never coalesces with the note upsert that
+                // rides beside it: the two are different facts and the revocation
+                // must survive a later edit superseding the push.
+                let workspace = {
+                    let conn = self.db.lock();
+                    conn.query_row(
+                        "SELECT workspace_id FROM notes WHERE id = ?1",
+                        rusqlite::params![id],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .optional()?
+                    .unwrap_or_default()
+                };
+                self.enqueue_row("revocation", &id, "upsert", &workspace)
+            }
             Op::Session { note_id, session_id, delete } => {
                 // A session row keys on the parent note's workspace. On delete
                 // the note may already be gone locally, so fall back to the
@@ -378,6 +404,7 @@ impl Worker {
                 ("client", "delete") => self.push_delete("clients", &entity_id, &workspace).await,
                 ("prompt", "upsert") => self.push_prompt(&entity_id, &workspace).await,
                 ("prompt", "delete") => self.push_delete("summary_prompts", &entity_id, &workspace).await,
+                ("revocation", "upsert") => self.push_revocation(&entity_id, &workspace).await,
                 ("session", "upsert") => {
                     let (note_id, session_id) = split_session_entity_id(&entity_id);
                     self.push_session(&note_id, &session_id, &workspace).await
@@ -496,6 +523,9 @@ impl Worker {
             // `client_id` field above — hence the stutter.) Empty = untagged.
             "client_client_id": note.client_id.unwrap_or_default(),
             "expected_speakers": note.expected_speakers.unwrap_or(0),
+            // Visibility inside the workspace (#191). The server rule keys on this
+            // plus `owner`; a member who is not the author can't change it.
+            "private": note.private,
             "created_at": note.created_at,
             "client_updated_at": client_updated_at,
             "deleted": false,
@@ -676,6 +706,101 @@ impl Worker {
         self.pb_ok(resp).await.map(|_| ())
     }
 
+    /// Withdraw a note from everyone but its author (#191).
+    ///
+    /// A plain POST, with no find-then-patch: a revocation is a fact about a
+    /// moment, not a row with a current value, and a second withdrawal has to
+    /// advance `updated` or a client sitting past the last cursor never sees it.
+    /// The server refuses one for a note the caller doesn't own.
+    ///
+    /// Skipped if the note is no longer private by the time the outbox drains —
+    /// the user flipped it back, and telling teammates to delete a note they can
+    /// see again would be a deletion with nothing to undo it.
+    async fn push_revocation(&self, uuid: &str, workspace: &str) -> Result<()> {
+        {
+            let conn = self.db.lock();
+            let still: Option<bool> = conn
+                .query_row(
+                    "SELECT private FROM notes WHERE id = ?1 AND workspace_id = ?2",
+                    rusqlite::params![uuid, workspace],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if still != Some(true) {
+                return Ok(());
+            }
+        }
+        let auth = self.ensure_auth().await?;
+        let resp = self
+            .http
+            .post(format!("{}/api/collections/note_revocations/records", self.config.base_url))
+            .bearer_auth(&auth.token)
+            .json(&json!({ "note_client_id": uuid, "workspace": workspace }))
+            .send()
+            .await?;
+        self.pb_ok(resp).await.map(|_| ())
+    }
+
+    /// Apply one pulled revocation: drop a local copy of a note that is now its
+    /// author's alone.
+    ///
+    /// Four conditions, all of them narrowing, because this is the one pull path
+    /// that destroys rather than converges. The note must be in the workspace this
+    /// revocation came from; it must carry an `owner` (a note that never synced has
+    /// none, and is ours by construction); that owner must not be us — the author
+    /// keeps their own note, and they are the only one who sees this row and still
+    /// holds the note; and the note we hold must not be NEWER than the withdrawal.
+    ///
+    /// That last one is what a re-share needs. Each collection carries its own pull
+    /// cursor, so a member who was away for both halves of withdraw-then-re-share
+    /// pulls the note back (visible again) and then, from a cursor that never saw
+    /// it, the old revocation — which without this guard deletes a note that is
+    /// shared with them, permanently, since its `updated` is already behind their
+    /// notes cursor. The two timestamps come from different clocks (the note's from
+    /// the author's Mac, `at` from the server), which is tolerable here: the gap
+    /// being compared is a person deciding to share something again, not
+    /// milliseconds.
+    fn apply_remote_revocation(&self, v: &serde_json::Value, me: &str) -> Result<()> {
+        let r: RemoteRevocation = serde_json::from_value(v.clone())?;
+        if !is_safe_id(&r.note_client_id) {
+            eprintln!("cloud-sync: skipping revocation with unsafe note_client_id");
+            return Ok(());
+        }
+        {
+            let conn = self.db.lock();
+            let local: Option<(String, i64)> = conn
+                .query_row(
+                    "SELECT owner, updated_at FROM notes WHERE id = ?1 AND workspace_id = ?2",
+                    rusqlite::params![r.note_client_id, self.config.workspace_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let Some((owner, updated_at)) = local else { return Ok(()) };
+            if owner.is_empty() || owner == me {
+                return Ok(());
+            }
+            if r.at > 0 && updated_at > r.at {
+                return Ok(());
+            }
+            // Hard, not a tombstone: it was never this device's note to restore, and
+            // a Trash entry would leave the transcript readable. Takes the derived
+            // index with it for the same reason `db::purge_note` does (ADR-0002) —
+            // the chunks hold the transcript text, speaker names included.
+            conn.execute("DELETE FROM note_chunks WHERE note_id = ?1", rusqlite::params![r.note_client_id])?;
+            conn.execute("DELETE FROM note_revisions WHERE note_id = ?1", rusqlite::params![r.note_client_id])?;
+            conn.execute("DELETE FROM note_chunks_fts WHERE note_id = ?1", rusqlite::params![r.note_client_id])?;
+            conn.execute("DELETE FROM notes WHERE id = ?1", rusqlite::params![r.note_client_id])?;
+        }
+        // Audio and timelines the note left on this disk go with it.
+        let dir = self.config.recordings_dir.join(&r.note_client_id);
+        if let Err(e) = std::fs::remove_dir_all(&dir) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                eprintln!("cloud-sync: could not remove withdrawn note's assets: {e}");
+            }
+        }
+        Ok(())
+    }
+
     /// Create the record, or PATCH it if one with this `client_id` already
     /// exists in the given workspace.
     async fn upsert_record(
@@ -766,6 +891,15 @@ impl Worker {
         changed |= self
             .pull_collection("summary_prompts", "prompts_cursor", &auth.token, |v| {
                 self.apply_remote_prompt_json(v)
+            })
+            .await?;
+        // LAST, deliberately (#191): a revocation must land after the notes pull
+        // that may carry the same note back as re-shared. Applied in the other
+        // order, a re-share would be deleted again by a revocation from the
+        // withdrawal before it.
+        changed |= self
+            .pull_collection("note_revocations", "revocations_cursor", &auth.token, |v| {
+                self.apply_remote_revocation(v, &auth.user_id)
             })
             .await?;
         if changed {
@@ -991,13 +1125,14 @@ impl Worker {
         conn.execute(
             "INSERT INTO notes
                 (id, title, body, transcript, summary, audio_path, summary_preset,
-                 folder_id, client_id, language, summary_provider, expected_speakers, owner, workspace_id, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?14, ?8, '', ?9, ?12, ?13, ?10, ?11)
+                 folder_id, client_id, language, summary_provider, expected_speakers, owner, workspace_id, created_at, updated_at, private)
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?14, ?8, '', ?9, ?12, ?13, ?10, ?11, ?15)
              ON CONFLICT(id) DO UPDATE SET
                 title=excluded.title, body=excluded.body, transcript=excluded.transcript,
                 summary=excluded.summary, summary_preset=excluded.summary_preset,
                 folder_id=excluded.folder_id, client_id=excluded.client_id, language=excluded.language,
                 expected_speakers=excluded.expected_speakers, owner=excluded.owner,
+                private=excluded.private,
                 updated_at=excluded.updated_at, deleted_at=NULL
              WHERE excluded.updated_at >= notes.updated_at",
             rusqlite::params![
@@ -1015,6 +1150,7 @@ impl Worker {
                 n.owner,
                 self.config.workspace_id,
                 client,
+                n.private,
             ],
         )?;
         drop(conn); // release before firing the callback
@@ -1150,7 +1286,7 @@ impl Worker {
         let conn = self.db.lock();
         conn.query_row(
             "SELECT title, body, transcript, summary, language, summary_preset,
-                    folder_id, expected_speakers, created_at, updated_at, owner, client_id
+                    folder_id, expected_speakers, created_at, updated_at, owner, client_id, private
              FROM notes WHERE id = ?1",
             rusqlite::params![uuid],
             |r| {
@@ -1167,6 +1303,7 @@ impl Worker {
                     updated_at: r.get(9)?,
                     owner: r.get(10)?,
                     client_id: r.get(11)?,
+                    private: r.get(12)?,
                 })
             },
         )
@@ -1240,6 +1377,7 @@ struct NoteRow {
     created_at: i64,
     updated_at: i64,
     owner: String,
+    private: bool,
 }
 
 struct FolderRow {
@@ -1273,8 +1411,18 @@ struct RemoteNote {
     client_client_id: String,
     expected_speakers: i64,
     owner: String,
+    private: bool,
     created_at: i64,
     client_updated_at: i64,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct RemoteRevocation {
+    note_client_id: String,
+    /// Server-stamped epoch-ms. 0 when absent, which disables the freshness
+    /// guard rather than deleting on a missing field.
+    at: i64,
 }
 
 #[derive(Deserialize, Default)]
@@ -1674,8 +1822,12 @@ mod it {
                 language TEXT NOT NULL DEFAULT '', summary_provider TEXT NOT NULL DEFAULT '',
                 expected_speakers INTEGER, owner TEXT NOT NULL DEFAULT '',
                 workspace_id TEXT NOT NULL DEFAULT '', deleted_at INTEGER, client_id TEXT,
+                private INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
             );
+            CREATE TABLE note_chunks (id TEXT PRIMARY KEY, note_id TEXT NOT NULL, text TEXT NOT NULL);
+            CREATE TABLE note_revisions (id TEXT PRIMARY KEY, note_id TEXT NOT NULL, transcript TEXT NOT NULL DEFAULT '');
+            CREATE VIRTUAL TABLE note_chunks_fts USING fts5(text, chunk_id UNINDEXED, note_id UNINDEXED);
             CREATE TABLE folders (
                 id TEXT PRIMARY KEY, name TEXT NOT NULL,
                 workspace_id TEXT NOT NULL DEFAULT '',
@@ -1726,7 +1878,100 @@ mod it {
         }
     }
 
-    /// Outbox coalescing (no network): repeated edits to the same record collapse
+    /// #191 — a revocation drops a teammate's local copy of a note that is now its
+    /// author's alone. This is the one pull path that DESTROYS rather than
+    /// converges, so each of its three guards is pinned: the author keeps their own
+    /// note, a never-synced note (no owner) is never touched, and the derived index
+    /// goes with the row — the chunks hold the transcript text, speaker names
+    /// included (ADR-0002).
+    #[test]
+    fn a_revocation_removes_someone_elses_note_and_its_index() {
+        let db = test_db();
+        let dir = std::env::temp_dir().join(format!("humla-revoke-{}", now_ms()));
+        let mut cfg = offline_config("wsR");
+        cfg.recordings_dir = dir.clone();
+        let w = worker(db.clone(), cfg);
+        {
+            let conn = db.lock();
+            conn.execute(
+                "INSERT INTO notes (id, owner, workspace_id, private, created_at, updated_at)
+                 VALUES ('theirs', 'u-bob', 'wsR', 1, 1, 1), ('mine', 'u-me', 'wsR', 1, 1, 1),
+                        ('local', '', 'wsR', 0, 1, 1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO note_chunks (id, note_id, text) VALUES ('c1', 'theirs', 'Ingrid: the price')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO note_revisions (id, note_id, transcript) VALUES ('r1', 'theirs', 'Ingrid: the price')",
+                [],
+            )
+            .unwrap();
+        }
+        std::fs::create_dir_all(dir.join("theirs")).unwrap();
+        std::fs::write(dir.join("theirs").join("playback.wav"), b"audio").unwrap();
+
+        for id in ["theirs", "mine", "local"] {
+            w.apply_remote_revocation(&json!({ "note_client_id": id, "at": 100 }), "u-me").unwrap();
+        }
+
+        let live = |id: &str| scalar(&db, "SELECT id FROM notes WHERE id = ?1", id).is_some();
+        assert!(!live("theirs"), "a teammate's withdrawn note goes");
+        assert!(live("mine"), "the author keeps their own note");
+        assert!(live("local"), "a note that never synced has no owner and is ours");
+        assert!(
+            scalar(&db, "SELECT id FROM note_chunks WHERE note_id = ?1", "theirs").is_none(),
+            "the derived index goes with it"
+        );
+        assert!(
+            scalar(&db, "SELECT id FROM note_revisions WHERE note_id = ?1", "theirs").is_none(),
+            "and the version history, which holds the same transcript"
+        );
+        assert!(!dir.join("theirs").exists(), "and so does the audio on this disk");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A note withdrawn and then RE-SHARED must survive. Each collection has its
+    /// own pull cursor, so a member away for both halves pulls the note back and
+    /// then the older revocation — which without the freshness guard deletes a note
+    /// that is shared with them, permanently: its `updated` is already behind their
+    /// notes cursor, so it never arrives again.
+    #[test]
+    fn a_reshared_note_survives_the_revocation_that_preceded_it() {
+        let db = test_db();
+        let w = worker(db.clone(), offline_config("wsR"));
+        {
+            let conn = db.lock();
+            conn.execute(
+                "INSERT INTO notes (id, owner, workspace_id, private, created_at, updated_at)
+                 VALUES ('n1', 'u-bob', 'wsR', 0, 1, 5_000)",
+                [],
+            )
+            .unwrap();
+        }
+        // Withdrawn at 4_000; the copy we hold was re-shared at 5_000.
+        w.apply_remote_revocation(&json!({ "note_client_id": "n1", "at": 4_000 }), "u-me").unwrap();
+        assert!(scalar(&db, "SELECT id FROM notes WHERE id = ?1", "n1").is_some());
+
+        // A withdrawal AFTER the copy we hold still takes it.
+        w.apply_remote_revocation(&json!({ "note_client_id": "n1", "at": 6_000 }), "u-me").unwrap();
+        assert!(scalar(&db, "SELECT id FROM notes WHERE id = ?1", "n1").is_none());
+    }
+
+    /// A revocation for a note this device has never seen is a no-op, not an error:
+    /// the pull cursor hands every member every revocation in the workspace.
+    #[test]
+    fn a_revocation_for_an_unknown_note_is_harmless() {
+        let db = test_db();
+        let w = worker(db.clone(), offline_config("wsR"));
+        w.apply_remote_revocation(&json!({ "note_client_id": "never-seen", "at": 1 }), "u-me").unwrap();
+        w.apply_remote_revocation(&json!({ "note_client_id": "../../etc/passwd", "at": 1 }), "u-me").unwrap();
+    }
+
+    /// Outbox coalescing (no network): repeated edits to the same record collapse    /// Outbox coalescing (no network): repeated edits to the same record collapse
     /// to a single pending op, the latest op wins, and the per-row workspace is
     /// captured from the note. Guards the P1 churn/head-of-line fixes.
     #[test]

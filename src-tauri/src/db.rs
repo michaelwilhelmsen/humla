@@ -54,6 +54,16 @@ pub struct Note {
     // workspace by this field.
     #[serde(default)]
     pub workspace_id: String,
+    // Readable only by `owner`, inside the workspace it already belongs to
+    // (#191). Meaningless on a Personal note, which is private by definition —
+    // the flag is kept across a move rather than cleared, so a note moved out
+    // and back finds its own answer waiting.
+    //
+    // Unlike `speakers` and `detected_language` this is NOT derived: it is a
+    // record of something the user decided, it syncs, and it moves
+    // `updated_at` so it wins last-write-wins against a stale copy.
+    #[serde(default)]
+    pub private: bool,
     // Soft-delete timestamp (ms). NULL = live; set = in Trash (recoverable).
     // Deleting a note sets this instead of dropping the row, so an accidental
     // delete can be restored; a remote tombstone also lands here.
@@ -290,6 +300,12 @@ pub fn open(path: &Path) -> Result<Connection> {
         "ALTER TABLE notes ADD COLUMN workspace_id TEXT NOT NULL DEFAULT ''",
         [],
     );
+    // Visibility inside a workspace (#191). Default 0 = shared, so every existing
+    // note keeps the only behaviour there has ever been.
+    let _ = conn.execute(
+        "ALTER TABLE notes ADD COLUMN private INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
     let _ = conn.execute(
         "ALTER TABLE folders ADD COLUMN workspace_id TEXT NOT NULL DEFAULT ''",
         [],
@@ -413,7 +429,7 @@ pub fn now_ms() -> i64 {
 // note would clobber a local tag.
 // Appended-only: `map_note` reads by position, so new columns go on the end
 // to keep every existing index stable.
-const NOTE_COLS: &str = "id, title, body, transcript, summary, audio_path, summary_preset, folder_id, language, summary_provider, expected_speakers, created_at, updated_at, owner, workspace_id, deleted_at, client_id, detected_language";
+const NOTE_COLS: &str = "id, title, body, transcript, summary, audio_path, summary_preset, folder_id, language, summary_provider, expected_speakers, created_at, updated_at, owner, workspace_id, deleted_at, client_id, detected_language, private";
 
 /// List live notes in the active workspace (`""` = Personal / local-only).
 /// Excludes trashed notes (`deleted_at` set). Scoping by workspace keeps one
@@ -468,6 +484,20 @@ pub fn move_note(conn: &Connection, id: &str, folder_id: Option<&str>) -> Result
     conn.execute(
         "UPDATE notes SET folder_id = ?1, updated_at = ?2 WHERE id = ?3",
         params![folder_id, now, id],
+    )?;
+    Ok(())
+}
+
+/// Set a note's visibility inside its workspace (#191).
+///
+/// Bumps `updated_at`, unlike `set_note_workspace` beside it and unlike the
+/// derived writes (`set_detected_language`, the speaker cache): this is a real
+/// decision by the user, and it has to win last-write-wins against a copy of the
+/// note on another device that has not heard about it yet.
+pub fn set_note_private(conn: &Connection, id: &str, private: bool) -> Result<()> {
+    conn.execute(
+        "UPDATE notes SET private = ?1, updated_at = ?2 WHERE id = ?3",
+        params![private, now_ms(), id],
     )?;
     Ok(())
 }
@@ -3057,12 +3087,32 @@ fn map_note(row: &rusqlite::Row) -> rusqlite::Result<Note> {
         deleted_at: row.get(15)?,
         client_id: row.get(16)?,
         detected_language: row.get(17)?,
+        private: row.get(18)?,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #191 — a note is shared until someone says otherwise, and saying so is a
+    /// real edit: it bumps `updated_at`, unlike the derived writes beside it,
+    /// because it has to beat a stale copy on another device.
+    #[test]
+    fn private_defaults_to_shared_and_a_change_is_a_real_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("private.sqlite")).unwrap();
+        let note = create_note(&conn, "en", "meeting", "wsA").unwrap();
+        assert!(!note.private);
+
+        set_note_private(&conn, &note.id, true).unwrap();
+        let after = get_note(&conn, &note.id).unwrap();
+        assert!(after.private);
+        assert!(after.updated_at >= note.updated_at);
+
+        set_note_private(&conn, &note.id, false).unwrap();
+        assert!(!get_note(&conn, &note.id).unwrap().private);
+    }
 
     /// Issue #167 — the detected recording language round-trips and starts
     /// NULL.

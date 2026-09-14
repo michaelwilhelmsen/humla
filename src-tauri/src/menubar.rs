@@ -657,6 +657,11 @@ fn create_headless_note(app: &AppHandle) -> Result<(String, String), String> {
             &db::NotePatch { title: Some(title.clone()), ..Default::default() },
         )
         .map_err(|e| format!("{e}"))?;
+        // The menu-bar recorder gets the same sticky visibility as the note view
+        // (#191): a run of private 1:1s stays private whichever surface starts it.
+        if crate::commands::notes::default_private(&conn, &workspace) {
+            db::set_note_private(&conn, &note.id, true).map_err(|e| format!("{e}"))?;
+        }
         note.id
     }; // drop the db guard before pinging sync (see the SyncObserver contract)
     state.sync.note_upserted(&id);

@@ -24,6 +24,7 @@ function makeNote(over: Partial<Note> = {}): Note {
     updated_at: 0,
     owner: "",
     workspace_id: "",
+    private: false,
     ...over,
   };
 }

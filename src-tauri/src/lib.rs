@@ -304,6 +304,7 @@ where
             commands::notes_delete,
             commands::notes_move,
             commands::notes_set_workspace,
+            commands::notes_set_private,
             commands::notes_list_trash,
             commands::notes_restore,
             commands::notes_purge,

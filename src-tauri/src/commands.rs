@@ -37,7 +37,7 @@ mod local_llm;
 mod mcp;
 mod menubar;
 mod models;
-mod notes;
+pub(crate) mod notes;
 mod permissions;
 mod settings;
 mod summary;

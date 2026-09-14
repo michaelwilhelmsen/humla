@@ -25,6 +25,7 @@ function makeNote(id: string, title: string): Note {
     updated_at: Date.now(),
     owner: "",
     workspace_id: "",
+    private: false,
   };
 }
 

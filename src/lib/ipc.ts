@@ -47,6 +47,11 @@ export type Note = {
   // local-only (private to this device). Non-empty = shared with that
   // workspace's members. Note lists are scoped to the active workspace.
   workspace_id: string;
+  // Readable only by `owner`, inside the workspace it already belongs to (#191).
+  // Meaningless on a Personal note, which is private by definition. A shared note
+  // flipped private is WITHDRAWN from teammates: their local copy is deleted on
+  // their next pull, not merely hidden.
+  private: boolean;
   // Soft-delete timestamp (ms) when the note is in the Trash; null/absent = live.
   deleted_at?: number | null;
   // Optional Client tag (issue #43). null = untagged. Independent of folder_id.
@@ -331,6 +336,10 @@ export const ipc = {
   // Reassign a note to a workspace ("" = Personal/local-only).
   setNoteWorkspace: (id: string, workspaceId: string) =>
     invoke<void>("notes_set_workspace", { id, workspaceId }),
+  // Visibility inside the workspace (#191). Also banks the choice as that
+  // workspace's default for the next note.
+  setNotePrivate: (id: string, isPrivate: boolean) =>
+    invoke<void>("notes_set_private", { id, private: isPrivate }),
   // Trash (soft-delete) — list / restore / permanently delete.
   listTrashedNotes: () => invoke<Note[]>("notes_list_trash"),
   restoreNote: (id: string) => invoke<Note>("notes_restore", { id }),

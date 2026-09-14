@@ -34,6 +34,32 @@ pub fn notes_get(state: State<AppState>, id: String) -> Result<Note, String> {
     db::get_note(&conn, &id).map_err(err)
 }
 
+/// Where the sticky visibility default is stored, per workspace (#191).
+///
+/// Per workspace and not globally: "private" is the honest answer in a client's
+/// shared workspace and the wrong one in your own, and a single global setting
+/// would carry one workspace's habit into the next.
+pub(crate) fn visibility_default_key(workspace: &str) -> String {
+    format!("note_private_default:{workspace}")
+}
+
+/// Whether a new note in `workspace` starts private.
+///
+/// Shared unless the user's last explicit choice in THIS workspace was private —
+/// today's behaviour for anyone who never touches the chip, and a habit that
+/// carries for anyone who does. Personal notes are private by definition and the
+/// flag means nothing there, so the question is never asked.
+pub(crate) fn default_private(conn: &rusqlite::Connection, workspace: &str) -> bool {
+    if workspace.is_empty() {
+        return false;
+    }
+    db::get_setting(conn, &visibility_default_key(workspace))
+        .ok()
+        .flatten()
+        .as_deref()
+        == Some("1")
+}
+
 #[tauri::command]
 pub fn notes_create(state: State<AppState>) -> Result<Note, String> {
     // New notes inherit the user's defaults for language + summary preset.
@@ -51,7 +77,14 @@ pub fn notes_create(state: State<AppState>) -> Result<Note, String> {
         // Stamp the note with the active workspace so it syncs there (and only
         // shows there). Personal ("") notes stay local.
         let workspace = super::cloud::active_workspace(&conn);
-        db::create_note(&conn, &default_language, &default_preset, &workspace).map_err(err)?
+        let note =
+            db::create_note(&conn, &default_language, &default_preset, &workspace).map_err(err)?;
+        if default_private(&conn, &workspace) {
+            db::set_note_private(&conn, &note.id, true).map_err(err)?;
+            db::get_note(&conn, &note.id).map_err(err)?
+        } else {
+            note
+        }
     }; // drop the db guard before pinging sync (see SyncObserver contract)
     state.sync.note_upserted(&note.id);
     Ok(note)
@@ -196,6 +229,50 @@ pub fn notes_set_workspace(
     Ok(())
 }
 
+/// Set a note's visibility inside its workspace (#191).
+///
+/// Two things happen on the way to private and only one of them is the note
+/// itself: teammates who already synced it hold a complete copy, and a record
+/// that leaves their view produces no pull event — so the sync layer is told
+/// about the TRANSITION, not just the new value.
+///
+/// Also remembers the choice as this workspace's default for the next note.
+#[tauri::command]
+pub fn notes_set_private(
+    state: State<AppState>,
+    id: String,
+    private: bool,
+) -> Result<(), String> {
+    let workspace = {
+        let conn = state.db.lock();
+        let note = db::get_note(&conn, &id).map_err(err)?;
+        if note.private == private {
+            return Ok(());
+        }
+        // A Personal note is private already and has no workspace to be private
+        // from; letting the flag be set there would only bank a default that the
+        // next Personal note ignores.
+        if note.workspace_id.is_empty() {
+            return Err("A note outside a workspace is already private.".into());
+        }
+        db::set_note_private(&conn, &id, private).map_err(err)?;
+        db::set_setting(
+            &conn,
+            &visibility_default_key(&note.workspace_id),
+            if private { "1" } else { "0" },
+        )
+        .map_err(err)?;
+        note.workspace_id
+    };
+    debug_assert!(!workspace.is_empty());
+    if private {
+        state.sync.note_withdrawn(&id);
+    } else {
+        state.sync.note_upserted(&id);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::purge_note_assets;
@@ -216,6 +293,26 @@ mod tests {
         assert!(!dir.exists(), "recordings/<note_id> should be gone after purge");
         // A sibling note's assets must be untouched.
         assert!(base.path().join("recordings").exists());
+    }
+
+    /// #191 — visibility is sticky per workspace, and shared until the user says
+    /// otherwise. The default has to stay "shared" for anyone who never touches
+    /// the chip, in a workspace they have never expressed an opinion about.
+    #[test]
+    fn visibility_default_is_shared_until_chosen_and_is_per_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("visibility.sqlite")).unwrap();
+        assert!(!super::default_private(&conn, "wsA"));
+
+        crate::db::set_setting(&conn, &super::visibility_default_key("wsA"), "1").unwrap();
+        assert!(super::default_private(&conn, "wsA"));
+        // A habit in one workspace is not a habit in the next.
+        assert!(!super::default_private(&conn, "wsB"));
+        // Personal has no workspace to be private from, so it never asks.
+        assert!(!super::default_private(&conn, ""));
+
+        crate::db::set_setting(&conn, &super::visibility_default_key("wsA"), "0").unwrap();
+        assert!(!super::default_private(&conn, "wsA"));
     }
 
     #[test]

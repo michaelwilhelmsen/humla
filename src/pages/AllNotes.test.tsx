@@ -28,6 +28,7 @@ function makeNote(id: string, title: string): Note {
     updated_at: Date.now(),
     owner: "",
     workspace_id: "",
+    private: false,
   };
 }
 
@@ -411,5 +412,25 @@ describe("AllNotes activity", () => {
       activeAccumMs: 0,
       summarizing: {},
     });
+  });
+});
+
+// #191 — a private note says so on its card, and only inside a workspace: every
+// Personal note is private, so the glyph there would appear on every card and
+// distinguish nothing.
+describe("a private note's card", () => {
+  it("carries a lock in a workspace and nothing on Personal", async () => {
+    mockTauri();
+    seed([
+      { ...makeNote("n1", "Alpha"), workspace_id: "ws1", private: true },
+      { ...makeNote("n2", "Beta"), workspace_id: "ws1" },
+      { ...makeNote("n3", "Gamma"), private: true },
+    ]);
+    renderAll();
+
+    const card = (title: string) => screen.getByRole("link", { name: new RegExp(title) });
+    expect(card("Alpha").textContent).toContain("Private");
+    expect(card("Beta").textContent).not.toContain("Private");
+    expect(card("Gamma").textContent).not.toContain("Private");
   });
 });

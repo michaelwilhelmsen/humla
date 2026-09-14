@@ -18,6 +18,7 @@ import {
   FileText,
   Folder,
   Languages,
+  Lock,
   MessageCircle,
   MessageSquare,
   MoreHorizontal,
@@ -56,6 +57,7 @@ import { SelectablePopover } from "../components/SelectablePopover";
 import {
   Menu,
   MenuContent,
+  MenuItem,
   MenuRadioGroup,
   MenuRadioItem,
   MenuSeparator,
@@ -1226,6 +1228,19 @@ export function Note() {
               </span>
             )
           )}
+          {draft.workspace_id && (
+            <VisibilityPicker
+              value={draft.private}
+              disabled={readOnly}
+              onChange={async (isPrivate) => {
+                if (!draft || readOnly || isPrivate === draft.private) return;
+                const next = { ...draft, private: isPrivate };
+                setDraft(next);
+                await ipc.setNotePrivate(draft.id, isPrivate);
+                upsert(next);
+              }}
+            />
+          )}
           <span className="nd-meta">
             <Calendar size={14} strokeWidth={1.7} />
             {dateChip}
@@ -2135,6 +2150,56 @@ function CtlSelect({
             </Fragment>
           ))}
         </MenuRadioGroup>
+      </MenuContent>
+    </Menu>
+  );
+}
+
+/** Visibility inside a workspace (#191).
+ *
+ *  Rendered only for a note that HAS a workspace. A Personal note is private by
+ *  definition, and a chip saying so there would be a second word for the thing
+ *  the workspace chip beside it already says.
+ *
+ *  The private row carries its consequence on a second line, because this is not
+ *  a hide: a teammate who already synced the note loses their copy. Saying that
+ *  where the choice is made beats a dialog after it.
+ */
+function VisibilityPicker({
+  value,
+  disabled,
+  onChange,
+}: {
+  value: boolean;
+  disabled?: boolean;
+  onChange: (isPrivate: boolean) => void;
+}) {
+  const label = value ? "Private" : "Shared";
+  return (
+    <Menu>
+      <MenuTrigger
+        className="nd-meta is-interactive"
+        disabled={disabled}
+        title={value ? "Only you can read this note" : "Everyone in the workspace can read this note"}
+        aria-label="Visibility"
+      >
+        {value ? <Lock size={14} strokeWidth={1.7} /> : <Users size={14} strokeWidth={1.7} />}
+        <span>{label}</span>
+      </MenuTrigger>
+      <MenuContent aria-label="Visibility">
+        <MenuItem onSelect={() => onChange(false)}>
+          <Users size={14} strokeWidth={1.7} />
+          <span>Shared</span>
+        </MenuItem>
+        <MenuItem onSelect={() => onChange(true)}>
+          <Lock size={14} strokeWidth={1.7} />
+          <span className="flex flex-col items-start">
+            <span>Private</span>
+            <span className="nd-meta p-0 text-[var(--color-text-muted)]">
+              Removed from your teammates&apos; copies
+            </span>
+          </span>
+        </MenuItem>
       </MenuContent>
     </Menu>
   );

@@ -35,6 +35,12 @@ pub trait SyncObserver: Send + Sync {
     /// keyed on `(workspace, client_id)`.
     fn note_moved(&self, _id: &str, _from_workspace: &str, _to_workspace: &str) {}
 
+    /// A note became private to its author (#191). Distinct from
+    /// `note_upserted`, which carries the new value but not the *transition*:
+    /// the sync layer has to tell the workspace's other members to drop the copy
+    /// they already hold, and only the moment of the flip says to do that.
+    fn note_withdrawn(&self, _id: &str) {}
+
     /// A folder was created or renamed. `id` is the folder id.
     fn folder_upserted(&self, _id: &str) {}
 
