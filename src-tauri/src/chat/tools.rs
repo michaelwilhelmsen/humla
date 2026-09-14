@@ -833,6 +833,24 @@ mod tests {
             assert_eq!(spec.parameters["type"], "object");
         }
     }
+    /// #191 — a private note is private from TEAMMATES, never from its author.
+    /// Local retrieval reads this device's own SQLite, where a teammate's private
+    /// note can't be (it is deleted on the revocation, and never pulled after
+    /// that) — so the only thing this could get wrong is hiding your own notes
+    /// from your own chat. Pinned rather than assumed, because "filter on private"
+    /// is the obvious next edit someone makes here.
+    #[test]
+    fn your_own_private_note_is_still_yours_to_search() {
+        let conn = open();
+        let id = seed(&conn, "Performance review", "we discussed the raise");
+        db::set_note_private(&conn, &id, true).unwrap();
+
+        let out = exec(&conn, "", &ToolScope::All, TOOL_SEARCH, &json!({ "query": "raise" }));
+        assert!(out.model_text.contains("Performance review"), "{}", out.model_text);
+        let got = exec(&conn, "", &ToolScope::All, TOOL_GET, &json!({ "note_id": id }));
+        assert!(got.model_text.contains("we discussed the raise"));
+    }
+
 
     #[test]
     fn search_returns_hits_and_citations() {

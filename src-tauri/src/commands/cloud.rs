@@ -1933,7 +1933,8 @@ pub async fn cloud_download_note_sessions(app: tauri::AppHandle, note_id: String
 // other: each pushes a whole-note last-write-wins record carrying only its own
 // transcript, so one stream wins and the other is scattered into conflict
 // copies. We prevent it server-side with a `note_locks` collection whose `note`
-// field carries a UNIQUE index — the atomic mutex. The first claimant's INSERT
+// field carries a UNIQUE index — the atomic mutex. A note only one person can
+// open takes none at all (`needs_recording_lock`). The first claimant's INSERT
 // wins; a concurrent second INSERT is rejected by the index. A crashed
 // recorder's lock is reaped via the delete rule (`expires < @now`), so nothing
 // stays locked forever. See `docs/cloud/note-locks.md` for the exact schema.
@@ -1995,6 +1996,20 @@ fn display_name(s: &Session) -> String {
     } else {
         "a teammate".to_string()
     }
+}
+
+/// Whether a note needs the mutex at all — it does only when someone else could
+/// be recording it.
+///
+/// A Personal note has no second device to coordinate with, and a private note
+/// has no second person: it is readable by its author alone, so no teammate can
+/// open it, let alone record it. Not taking the lock is also what keeps the row
+/// from existing — `note_locks.note` is a plain text client_id with no relation
+/// for a rule to walk, so a lock on a private note would be listable by every
+/// member, naming a holder and an id they cannot resolve. The lock is the leak,
+/// so the fix is not to take one (#191).
+pub(crate) fn needs_recording_lock(workspace: &str, private: bool) -> bool {
+    !workspace.is_empty() && !private
 }
 
 /// POST a fresh lock. `Err(Conflict)` means the unique index rejected it (note
@@ -2060,12 +2075,12 @@ async fn get_lock(base: &str, token: &str, note: &str) -> Result<Option<Existing
 /// failure resolves to `Skipped` so a flaky network can't stop a recording.
 pub(crate) async fn claim_recording_lock(app: &tauri::AppHandle, note_id: &str) -> LockClaim {
     let state = app.state::<AppState>();
-    let workspace = {
+    let (workspace, private) = {
         let conn = state.db.lock();
-        db::get_note(&conn, note_id).map(|n| n.workspace_id).unwrap_or_default()
+        db::get_note(&conn, note_id).map(|n| (n.workspace_id, n.private)).unwrap_or_default()
     };
-    if workspace.is_empty() {
-        return LockClaim::Skipped; // Personal note — no coordination needed
+    if !needs_recording_lock(&workspace, private) {
+        return LockClaim::Skipped;
     }
     if read_base_url(&state).is_none() {
         return LockClaim::Skipped; // cloud not configured
@@ -2235,6 +2250,17 @@ pub fn cloud_pending_note_ids(state: State<'_, AppState>) -> Result<Vec<String>,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #191 — the mutex exists for contention between members, and a private note
+    /// has no second person. Not taking the lock is also what keeps its row out of
+    /// a collection every member can list.
+    #[test]
+    fn a_note_only_one_person_can_open_takes_no_recording_lock() {
+        assert!(needs_recording_lock("ws1", false), "a shared note still coordinates");
+        assert!(!needs_recording_lock("ws1", true), "a private note has no second recorder");
+        assert!(!needs_recording_lock("", false), "Personal has no second device");
+        assert!(!needs_recording_lock("", true));
+    }
 
     #[test]
     fn parse_chat_addon_maps_available_absent_and_malformed() {

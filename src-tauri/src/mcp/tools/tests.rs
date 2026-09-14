@@ -1038,3 +1038,24 @@ fn a_cut_transcript_says_it_is_not_the_end() {
     let out = exec(&conn, TOOL_TRANSCRIPT, &json!({ ARG_NOTE_ID: id }));
     assert!(out.model_text.contains("not the end of the text"), "a silent cut invites a wrong \"that was all\"");
 }
+
+/// #191 — a private note is private from TEAMMATES, never from its author. The
+/// MCP server opens this device's own SQLite, where a teammate's private note
+/// cannot be, so the only thing this could get wrong is hiding your own notes
+/// from your own editor. Pinned rather than assumed: "filter on private" is the
+/// obvious next edit someone makes to a retrieval path once the column exists.
+#[test]
+fn your_own_private_note_is_still_yours_to_read() {
+    let conn = open();
+    let id = seed_in(&conn, "ws1", "Performance review", "we discussed the raise");
+    db::set_note_private(&conn, &id, true).unwrap();
+
+    let found = execute(&conn, "ws1", TOOL_SEARCH, &json!({ ARG_QUERY: "raise" }), NOW);
+    assert!(found.model_text.contains("Performance review"), "{}", found.model_text);
+    let read = execute(&conn, "ws1", TOOL_GET, &json!({ ARG_NOTE_ID: id }), NOW);
+    assert!(read.model_text.contains("Performance review"), "{}", read.model_text);
+    let said = execute(&conn, "ws1", TOOL_TRANSCRIPT, &json!({ ARG_NOTE_ID: id }), NOW);
+    assert!(said.model_text.contains("we discussed the raise"));
+    let listed = execute(&conn, "ws1", TOOL_LIST, &json!({}), NOW);
+    assert!(listed.model_text.contains("Performance review"));
+}
