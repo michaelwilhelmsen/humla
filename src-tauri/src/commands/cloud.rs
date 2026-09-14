@@ -184,6 +184,11 @@ pub(crate) fn active_workspace(conn: &rusqlite::Connection) -> String {
     db::get_setting(conn, SETTING_WORKSPACE).ok().flatten().unwrap_or_default()
 }
 
+/// The signed-in user's PocketBase id, or empty when no session is cached.
+pub(crate) fn current_user_id() -> String {
+    SESSION.lock().unwrap().as_ref().map(|s| s.user_id.clone()).unwrap_or_default()
+}
+
 // ---- credentials (Keychain) ------------------------------------------------
 
 fn cred_entry() -> Result<keyring::Entry, String> {

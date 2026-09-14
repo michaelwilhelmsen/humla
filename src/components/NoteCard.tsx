@@ -131,10 +131,7 @@ export function NoteCard({
           {note.private && note.workspace_id && (
             // Only inside a workspace: every Personal note is private, so the
             // glyph would say nothing there and appear on every card (#191).
-            <span
-              className="inline-flex items-center gap-1.5 min-w-0 text-[var(--color-text-muted)]"
-              title="Private — only you can read this note"
-            >
+            <span className="inline-flex items-center gap-1.5 min-w-0 text-[var(--color-text-muted)]">
               <Lock size={12} strokeWidth={1.7} aria-hidden className="shrink-0 opacity-70" />
               <span>Private</span>
             </span>

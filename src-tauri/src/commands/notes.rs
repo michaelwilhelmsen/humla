@@ -229,6 +229,17 @@ pub fn notes_set_workspace(
     Ok(())
 }
 
+/// Whether `me` may change the visibility of a note owned by `owner`.
+///
+/// Only the author, and a workspace owner is not an exception — anything else
+/// makes the word a lie. An empty `owner` is a note that has never synced, which
+/// is this device's own; an unknown `me` (no cached session) can only act on one
+/// of those. Mirrored by the client, which hides the control rather than offering
+/// one that fails.
+pub(crate) fn may_change_visibility(owner: &str, me: &str) -> bool {
+    owner.is_empty() || (!me.is_empty() && owner == me)
+}
+
 /// Set a note's visibility inside its workspace (#191).
 ///
 /// Two things happen on the way to private and only one of them is the note
@@ -243,28 +254,36 @@ pub fn notes_set_private(
     id: String,
     private: bool,
 ) -> Result<(), String> {
-    let workspace = {
+    {
         let conn = state.db.lock();
         let note = db::get_note(&conn, &id).map_err(err)?;
-        if note.private == private {
-            return Ok(());
-        }
         // A Personal note is private already and has no workspace to be private
         // from; letting the flag be set there would only bank a default that the
         // next Personal note ignores.
         if note.workspace_id.is_empty() {
             return Err("A note outside a workspace is already private.".into());
         }
-        db::set_note_private(&conn, &id, private).map_err(err)?;
+        // The server refuses a non-author's write too; refusing here keeps the local
+        // row from disagreeing with it until the next pull, and keeps a revocation
+        // the server will reject out of the outbox, where it would retry forever.
+        if !may_change_visibility(&note.owner, &super::cloud::current_user_id()) {
+            return Err("Only the note's author can change who can read it.".into());
+        }
+        // Banked BEFORE the no-op check: the default follows what the user CHOSE,
+        // and choosing the answer a note already has is still choosing it. Behind
+        // the check, picking Shared on an already-shared note recorded nothing and
+        // the next note stayed private.
         db::set_setting(
             &conn,
             &visibility_default_key(&note.workspace_id),
             if private { "1" } else { "0" },
         )
         .map_err(err)?;
-        note.workspace_id
-    };
-    debug_assert!(!workspace.is_empty());
+        if note.private == private {
+            return Ok(());
+        }
+        db::set_note_private(&conn, &id, private).map_err(err)?;
+    }
     if private {
         state.sync.note_withdrawn(&id);
     } else {
@@ -313,6 +332,18 @@ mod tests {
 
         crate::db::set_setting(&conn, &super::visibility_default_key("wsA"), "0").unwrap();
         assert!(!super::default_private(&conn, "wsA"));
+    }
+
+    /// #191 — the author decides, and a workspace owner is not an exception.
+    #[test]
+    fn only_the_author_may_change_a_notes_visibility() {
+        assert!(super::may_change_visibility("u-me", "u-me"));
+        assert!(!super::may_change_visibility("u-bob", "u-me"), "not even as workspace owner");
+        // Never synced → no owner → this device's own note.
+        assert!(super::may_change_visibility("", "u-me"));
+        assert!(super::may_change_visibility("", ""));
+        // A synced note with no cached session can't be proven ours.
+        assert!(!super::may_change_visibility("u-me", ""));
     }
 
     #[test]

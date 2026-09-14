@@ -37,12 +37,15 @@ function openNote(note: ReturnType<typeof makeNote>, workspace: string | null, e
 }
 
 describe("a note's visibility inside a workspace", () => {
-  it("reads Shared, and offers Private with what it costs", async () => {
+  it("reads Shared, and offers Private", async () => {
     openNote(makeNote({ id: "n1", title: "Weekly sync", workspace_id: "ws1" }), "ws1");
 
     await userEvent.click(await screen.findByRole("button", { name: "Visibility" }));
-    expect(await screen.findByText("Private")).toBeInTheDocument();
-    expect(screen.getByText(/removed from your teammates/i)).toBeInTheDocument();
+    expect(await screen.findByRole("menuitemradio", { name: "Private" })).toBeInTheDocument();
+    expect(screen.getByRole("menuitemradio", { name: "Shared" })).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
   });
 
   it("flipping to private calls through with the note and the new value", async () => {
@@ -52,10 +55,24 @@ describe("a note's visibility inside a workspace", () => {
     });
 
     await userEvent.click(await screen.findByRole("button", { name: "Visibility" }));
-    await userEvent.click(await screen.findByText("Private"));
+    await userEvent.click(await screen.findByRole("menuitemradio", { name: "Private" }));
 
     expect(setPrivate).toHaveBeenCalledWith({ id: "n1", private: true });
     expect(await screen.findByRole("button", { name: "Visibility" })).toHaveTextContent("Private");
+  });
+
+  // Not the reader's call on someone else's note — not even a workspace owner's,
+  // or the word means nothing. The server refuses the write either way; the chip
+  // is absent so the surface agrees with it instead of offering a control that
+  // fails.
+  it("is absent on a teammate's note, whatever the reader's role", async () => {
+    openNote(
+      makeNote({ id: "n1", title: "Their 1:1", workspace_id: "ws1", owner: "u-bob" }),
+      "ws1",
+    );
+
+    expect(await screen.findByText("Their 1:1")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Visibility" })).toBeNull();
   });
 
   // A Personal note is private by definition; a second word for it beside the

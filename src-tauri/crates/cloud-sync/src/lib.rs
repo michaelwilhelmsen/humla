@@ -1971,7 +1971,7 @@ mod it {
         w.apply_remote_revocation(&json!({ "note_client_id": "../../etc/passwd", "at": 1 }), "u-me").unwrap();
     }
 
-    /// Outbox coalescing (no network): repeated edits to the same record collapse    /// Outbox coalescing (no network): repeated edits to the same record collapse
+    /// Outbox coalescing (no network): repeated edits to the same record collapse
     /// to a single pending op, the latest op wins, and the per-row workspace is
     /// captured from the note. Guards the P1 churn/head-of-line fixes.
     #[test]

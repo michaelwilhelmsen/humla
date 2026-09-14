@@ -57,7 +57,6 @@ import { SelectablePopover } from "../components/SelectablePopover";
 import {
   Menu,
   MenuContent,
-  MenuItem,
   MenuRadioGroup,
   MenuRadioItem,
   MenuSeparator,
@@ -1088,6 +1087,8 @@ export function Note() {
     importing: isImporting,
   });
   const authorName = ownerName ?? myName ?? null;
+  // A note with no owner has never synced, so it is this device's own.
+  const isMine = !draft?.owner || draft.owner === myUserId;
   const authorInitial = (authorName ?? "?").slice(0, 1).toUpperCase();
   const noteWsName = draft.workspace_id
     ? (noteWs?.name ?? sharedWorkspace ?? "Workspace")
@@ -1228,7 +1229,7 @@ export function Note() {
               </span>
             )
           )}
-          {draft.workspace_id && (
+          {draft.workspace_id && isMine && (
             <VisibilityPicker
               value={draft.private}
               disabled={readOnly}
@@ -2157,13 +2158,11 @@ function CtlSelect({
 
 /** Visibility inside a workspace (#191).
  *
- *  Rendered only for a note that HAS a workspace. A Personal note is private by
- *  definition, and a chip saying so there would be a second word for the thing
- *  the workspace chip beside it already says.
- *
- *  The private row carries its consequence on a second line, because this is not
- *  a hide: a teammate who already synced the note loses their copy. Saying that
- *  where the choice is made beats a dialog after it.
+ *  Rendered only for a note that has a workspace AND that the reader wrote. A
+ *  Personal note is private by definition, and on someone else's note this is not
+ *  the reader's call to make — not even a workspace owner's, or the word means
+ *  nothing. The server refuses the write either way; this is the surface agreeing
+ *  with it rather than offering a control that fails.
  */
 function VisibilityPicker({
   value,
@@ -2174,7 +2173,6 @@ function VisibilityPicker({
   disabled?: boolean;
   onChange: (isPrivate: boolean) => void;
 }) {
-  const label = value ? "Private" : "Shared";
   return (
     <Menu>
       <MenuTrigger
@@ -2184,22 +2182,16 @@ function VisibilityPicker({
         aria-label="Visibility"
       >
         {value ? <Lock size={14} strokeWidth={1.7} /> : <Users size={14} strokeWidth={1.7} />}
-        <span>{label}</span>
+        <span>{value ? "Private" : "Shared"}</span>
       </MenuTrigger>
       <MenuContent aria-label="Visibility">
-        <MenuItem onSelect={() => onChange(false)}>
-          <Users size={14} strokeWidth={1.7} />
-          <span>Shared</span>
-        </MenuItem>
-        <MenuItem onSelect={() => onChange(true)}>
-          <Lock size={14} strokeWidth={1.7} />
-          <span className="flex flex-col items-start">
-            <span>Private</span>
-            <span className="nd-meta p-0 text-[var(--color-text-muted)]">
-              Removed from your teammates&apos; copies
-            </span>
-          </span>
-        </MenuItem>
+        <MenuRadioGroup
+          value={value ? "private" : "shared"}
+          onValueChange={(v) => onChange(v === "private")}
+        >
+          <MenuRadioItem value="shared">Shared</MenuRadioItem>
+          <MenuRadioItem value="private">Private</MenuRadioItem>
+        </MenuRadioGroup>
       </MenuContent>
     </Menu>
   );
