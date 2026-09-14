@@ -972,10 +972,16 @@ pub fn purge_note(conn: &Connection, id: &str) -> Result<()> {
     // destroyed rather than hidden. The cloud indexer already did this on a
     // tombstone; this is local catching up.
     //
+    // The version history is the same claim one table over: a revision holds the
+    // note's own title, body, summary and transcript, so up to 30 copies of the
+    // erased text would otherwise outlive it — keyed to an id nothing resolves any
+    // more, unreachable by any UI, and never cleaned up.
+    //
     // `chunk_embeddings` is deliberately left alone — keyed `(text_hash, model)`
     // with no note linkage, so it is shared by any notes with identical text and
     // cannot be deleted per note. It stores a vector, not text, so it holds no name.
     remove_note_chunks(conn, id)?;
+    conn.execute("DELETE FROM note_revisions WHERE note_id = ?1", params![id])?;
     conn.execute("DELETE FROM notes WHERE id = ?1", params![id])?;
     Ok(())
 }
@@ -4249,6 +4255,33 @@ mod tests {
         assert_eq!(count(&doomed), 0, "purge must clear the chunk rows, not orphan them");
         assert_eq!(fts_count(&doomed), 0, "and the FTS rows with them");
         assert!(count(&keeper) > 0, "another note's chunks are untouched");
+    }
+
+    /// The version history is the same claim as the chunks, one table over: a
+    /// revision holds the note's own title, body, summary and TRANSCRIPT, speaker
+    /// names and all. Purge is the point of no return, so leaving up to 30 copies
+    /// of the erased text behind — unreachable by any UI, keyed to a note id
+    /// nothing resolves any more, and never cleaned up — makes "delete forever" a
+    /// claim the database does not support.
+    #[test]
+    fn purging_a_note_takes_its_version_history_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("t.sqlite")).unwrap();
+        let doomed = create_note(&conn, "en", "meeting", "").unwrap().id;
+        let keeper = create_note(&conn, "en", "meeting", "").unwrap().id;
+        for id in [&doomed, &keeper] {
+            update_note(&conn, id, &NotePatch {
+                transcript: Some("Hege: the confidential part".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        }
+        assert_eq!(list_note_revisions(&conn, &doomed).unwrap().len(), 1, "recorded to begin with");
+
+        purge_note(&conn, &doomed).unwrap();
+
+        assert!(list_note_revisions(&conn, &doomed).unwrap().is_empty());
+        assert_eq!(list_note_revisions(&conn, &keeper).unwrap().len(), 1, "another note's history is untouched");
     }
 
     /// Soft delete is the opposite case and must NOT clear anything — a Trash
