@@ -122,7 +122,7 @@ function AppRoutes() {
             <Layout> so it's also a full-window takeover. */}
         <Route path="/onboarding" element={<OnboardingRoute />} />
         <Route element={<Layout />}>
-          <Route path="/" element={<Home />} />
+          <Route path="/" element={<Home key={location.key} />} />
           <Route path="/all-notes" element={<AllNotes />} />
           {/* Library-level destination, same tier as "All notes" (#95). */}
           <Route path="/chat" element={<Chat />} />

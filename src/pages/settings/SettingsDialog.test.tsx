@@ -1,9 +1,26 @@
 import { describe, it, expect } from "vitest";
 import { fireEvent, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { latestReleases } from "../../content/releases";
 import { renderApp, openSettingsFromSidebar } from "../../test/app";
 
 describe("settings dialog", () => {
+  it("dismisses release notes before opening Settings with the keyboard shortcut", async () => {
+    const title = latestReleases[0].title;
+    renderApp("/");
+    await userEvent.click(await screen.findByRole("button", { name: (name) => name.includes(title) }));
+    expect(screen.getByRole("dialog", { name: title })).toBeInTheDocument();
+
+    fireEvent.keyDown(window, { key: ",", metaKey: true });
+
+    const settings = await screen.findByRole("dialog", { name: "Settings" });
+    expect(screen.queryByRole("dialog", { name: title })).not.toBeInTheDocument();
+    expect(settings).toContainElement(document.activeElement as HTMLElement);
+    await userEvent.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(screen.getByTestId("location")).toHaveTextContent(/^\/$/);
+  });
+
   it("opens over the current view instead of replacing it", async () => {
     renderApp("/");
     // Home is up once the onboarding flag resolves.

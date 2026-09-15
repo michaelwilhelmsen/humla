@@ -22,7 +22,7 @@ export function SettingsLayout({ sections }: { sections: SettingsSection[] }) {
 
   return (
     <div className="h-full flex">
-      <aside className="w-56 shrink-0 border-r border-[var(--color-line)] py-8 pl-6 pr-3">
+      <aside className="w-56 shrink-0 bg-[var(--color-sidebar-bg)] p-6">
         {/* No search field until the cross-section filter actually works —
             a dead search box promises more than the dialog delivers. */}
         <h1 className="text-2xl font-light tracking-[-0.02em] mb-6 px-3">

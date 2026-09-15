@@ -51,6 +51,8 @@ if [[ "$VERSION_PKG" != "$VERSION_CONF" || "$VERSION_PKG" != "$VERSION_CARGO" ]]
   exit 1
 fi
 
+node scripts/check-release-notes.mjs "$VERSION_PKG"
+
 VERSION="$VERSION_PKG"
 TAG="v$VERSION"
 echo "release: $TAG"

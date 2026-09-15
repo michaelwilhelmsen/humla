@@ -44,7 +44,7 @@ export function SettingsDialog({ onClose }: { onClose: () => void }) {
       <div
         ref={panelRef}
         tabIndex={-1}
-        className="relative z-10 w-[min(56rem,calc(100vw-3rem))] h-[min(42rem,calc(100vh-4rem))] overflow-hidden rounded-[var(--radius-card)] bg-[var(--color-canvas)] border border-[var(--color-line-visible)] shadow-xl outline-none"
+        className="relative z-10 w-[min(56rem,calc(100vw-3rem))] h-[min(42rem,calc(100vh-4rem))] overflow-hidden rounded-[var(--radius-card)] bg-[var(--color-canvas)] shadow-xl outline-none"
       >
         <button
           type="button"

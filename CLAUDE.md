@@ -275,6 +275,8 @@ Common failure causes: nested binary missing hardened runtime, missing entitleme
 
 Run `pnpm release` to ship a new version. The script builds a notarised + stapled DMG, signs an updater manifest, creates a GitHub release, and uploads all assets so existing installs see the update.
 
+**Required for every release:** update `src/content/releases.ts` with an entry matching the new version, a release date, user-facing title, summary, detailed paragraphs, and highlights. Include verified related issues from `michaelwilhelmsen/humla` only, with titles and status. Add or update the optional feature illustration when the change is visible, and check the home list and popup in light and dark mode. Keep previous entries; Home shows the latest three. `pnpm release` blocks publishing when the current version has no complete changelog entry.
+
 **Before each release, bump the version number in three places** (they must match exactly, or auto-update will misbehave):
 
 1. `package.json` → `"version": "X.Y.Z"`

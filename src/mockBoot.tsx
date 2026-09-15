@@ -954,6 +954,11 @@ const MOCK_WORKSPACE = {
 };
 
 const CASES: Record<string, Scenario> = {
+  home: {
+    route: "/",
+    render: () => null,
+    ipc: { notes_list: () => demoNotes(), folders_list: () => DEMO_FOLDERS },
+  },
   // --- #90: the automatic titler's two states. Compare `title-writing` against
   // `title-idle` and `title-idle-long` — nothing below the title may shift.
   "title-idle": titleCase(false, "Recording 19 Aug 14:32"),
@@ -1498,7 +1503,7 @@ const onboardingCanvas = (node: React.ReactNode) => (
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <StrictMode>
     <div className="relative h-screen w-full flex flex-col bg-[var(--color-canvas)]">
-      <p className="pt-4 text-center text-xs text-[var(--color-text-muted)]">
+      <p hidden={which === "home"} className="pt-4 text-center text-xs text-[var(--color-text-muted)]">
         mock case: <code>{which}</code> — {Object.keys(CASES).join(" · ")}
       </p>
       {scenario.route ? (
