@@ -1137,6 +1137,36 @@ pub fn note_sessions(app: AppHandle, note_id: String) -> Result<Vec<NoteSession>
     Ok(out)
 }
 
+/// Note ids holding retained audio that has never been transcribed (#146).
+///
+/// One sweep of the recordings root rather than a `note_sessions` call per
+/// note, so the library views can tell a note that was captured from one that
+/// was captured *and* transcribed. The predicate is
+/// [`sessions::takes_to_transcribe`] under `Pending` — the same answer the note
+/// view's Transcribe button reads, so a note can never be filtered as awaiting
+/// transcription while its own view offers nothing to run.
+#[tauri::command]
+pub fn notes_awaiting_transcription(app: AppHandle) -> Result<Vec<String>, String> {
+    let app_dir = app.path().app_data_dir().map_err(err)?;
+    let Ok(entries) = std::fs::read_dir(app_dir.join("recordings")) else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let Some(note_id) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if !sessions::takes_to_transcribe(&dir, sessions::TranscribeScope::Pending).is_empty() {
+            out.push(note_id);
+        }
+    }
+    Ok(out)
+}
+
 /// Path to a specific session's `playback.wav`, or `None` when absent. The
 /// frontend feeds this through `convertFileSrc` into the `<audio>` element
 /// when the user switches the carousel to that session.

@@ -6,6 +6,7 @@ import { AllNotes } from "./AllNotes";
 import { LocationProbe } from "../test/app";
 import { mockTauri } from "../test/tauri";
 import { useNotesStore, useRecordingStore } from "../lib/store";
+import { useCloudStore } from "../lib/cloud";
 import type { Folder, Note } from "../lib/ipc";
 
 // Notes all created "now" so they land in the same "Today" group and render in
@@ -432,5 +433,104 @@ describe("a private note's card", () => {
     expect(card("Alpha").textContent).toContain("Private");
     expect(card("Beta").textContent).not.toContain("Private");
     expect(card("Gamma").textContent).not.toContain("Private");
+  });
+});
+
+describe("AllNotes filters", () => {
+  // Each picker is a menu: open the trigger by its accessible name, pick a row.
+  async function pick(control: string, option: string) {
+    await userEvent.click(screen.getByRole("button", { name: control }));
+    await userEvent.click(screen.getByRole("menuitemradio", { name: option }));
+  }
+
+  const titles = () =>
+    screen.getAllByRole("link").map((a) => a.textContent ?? "");
+
+  it("narrows by status, and the count says how much is hidden", async () => {
+    mockTauri();
+    seed([
+      { ...makeNote("n1", "Alpha"), summary: "s" },
+      { ...makeNote("n2", "Beta"), transcript: "t" },
+      makeNote("n3", "Gamma"),
+    ]);
+    renderAll();
+
+    await pick("Status", "Summarized");
+    expect(titles().join(" ")).toContain("Alpha");
+    expect(titles().join(" ")).not.toContain("Beta");
+    expect(screen.getByText("1 of 3")).toBeTruthy();
+
+    await pick("Status", "Transcribed");
+    expect(titles().join(" ")).toContain("Beta");
+    expect(titles().join(" ")).not.toContain("Alpha");
+  });
+
+  // The one status the note row can't answer on its own (#146).
+  it("treats a note holding untranscribed audio as recorded", async () => {
+    mockTauri({ notes_awaiting_transcription: () => ["n2"] });
+    seed([makeNote("n1", "Alpha"), makeNote("n2", "Beta")]);
+    renderAll();
+
+    await waitFor(() => expect(screen.getByRole("link", { name: /Beta/ }).textContent).toContain("Recorded"));
+    await pick("Status", "Recorded");
+    expect(titles().join(" ")).toContain("Beta");
+    expect(titles().join(" ")).not.toContain("Alpha");
+  });
+
+  it("narrows by client, including the untagged notes", async () => {
+    mockTauri();
+    useNotesStore.setState({
+      clients: [{ id: "c1", name: "Acme", created_at: 0, updated_at: 0 }],
+    });
+    seed([{ ...makeNote("n1", "Alpha"), client_id: "c1" }, makeNote("n2", "Beta")]);
+    renderAll();
+
+    await pick("Client", "Acme");
+    expect(titles().join(" ")).toContain("Alpha");
+    expect(titles().join(" ")).not.toContain("Beta");
+
+    await pick("Client", "No client");
+    expect(titles().join(" ")).toContain("Beta");
+    expect(titles().join(" ")).not.toContain("Alpha");
+  });
+
+  // Personal has one author, so an owner picker there offers a single name
+  // that changes nothing.
+  it("offers the owner axis only in a workspace with more than one member", async () => {
+    mockTauri();
+    seed([makeNote("n1", "Alpha")]);
+    renderAll();
+    expect(screen.queryByRole("button", { name: "Created by" })).toBeNull();
+  });
+
+  it("counts an unsynced note as the signed-in user's own", async () => {
+    mockTauri();
+    useCloudStore.setState({
+      members: {
+        "u-me": { id: "u-me", email: "me@x", name: "Me", role: "owner" },
+        "u-anna": { id: "u-anna", email: "anna@x", name: "Anna", role: "member" },
+      },
+      status: { ...useCloudStore.getState().status, user: { id: "u-me", email: "me@x", name: "Me", verified: true } },
+    });
+    seed([
+      { ...makeNote("n1", "Alpha"), owner: "" },
+      { ...makeNote("n2", "Beta"), owner: "u-anna" },
+    ]);
+    renderAll();
+
+    await pick("Created by", "Me");
+    expect(titles().join(" ")).toContain("Alpha");
+    expect(titles().join(" ")).not.toContain("Beta");
+  });
+
+  it("clears every axis at once", async () => {
+    mockTauri();
+    seed([{ ...makeNote("n1", "Alpha"), summary: "s" }, makeNote("n2", "Beta")]);
+    renderAll();
+
+    await pick("Status", "Summarized");
+    expect(titles()).toHaveLength(1);
+    await userEvent.click(screen.getByRole("button", { name: /Clear/ }));
+    expect(titles()).toHaveLength(2);
   });
 });

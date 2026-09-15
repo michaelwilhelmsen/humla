@@ -1,6 +1,15 @@
 import { describe, it, expect } from "vitest";
-import { htmlToText, noteExcerpt, noteState } from "./noteList";
+import {
+  filterActive,
+  htmlToText,
+  matchesFilter,
+  noteExcerpt,
+  noteState,
+  NO_FILTER,
+  UNASSIGNED,
+} from "./noteList";
 import { makeNote } from "../test/fixtures";
+import type { Note } from "./ipc";
 
 describe("htmlToText", () => {
   it("separates block elements so paragraphs don't run together", () => {
@@ -150,12 +159,71 @@ describe("noteExcerpt", () => {
 describe("noteState", () => {
   it("reports the furthest stage the note has reached", () => {
     expect(noteState(makeNote({ id: "a", summary: "s", transcript: "t" }))).toBe("summarized");
-    expect(noteState(makeNote({ id: "a", transcript: "t", body: "<p>b</p>" }))).toBe("recorded");
+    expect(noteState(makeNote({ id: "a", transcript: "t", body: "<p>b</p>" }))).toBe("transcribed");
     expect(noteState(makeNote({ id: "a", body: "<p>b</p>" }))).toBe("notes");
     expect(noteState(makeNote({ id: "a" }))).toBe("empty");
   });
 
   it("does not count an empty HTML body as typed notes", () => {
     expect(noteState(makeNote({ id: "a", body: "<p></p>" }))).toBe("empty");
+  });
+
+  // A deferred take (#146) has audio and no text. Without the flag it is
+  // indistinguishable from a note nobody ever recorded.
+  it("calls a note with untranscribed audio recorded, over its typed notes", () => {
+    expect(noteState(makeNote({ id: "a" }), true)).toBe("recorded");
+    expect(noteState(makeNote({ id: "a", body: "<p>b</p>" }), true)).toBe("recorded");
+    // Text supersedes it: the take was replayed, the audio is no longer waiting.
+    expect(noteState(makeNote({ id: "a", transcript: "t" }), true)).toBe("transcribed");
+  });
+});
+
+describe("matchesFilter", () => {
+  const note = (over: Partial<Note>) => makeNote({ id: "a", ...over });
+
+  it("passes everything when no axis is set", () => {
+    expect(filterActive(NO_FILTER)).toBe(false);
+    expect(matchesFilter(note({}), NO_FILTER)).toBe(true);
+  });
+
+  it("narrows to one state", () => {
+    const f = { ...NO_FILTER, state: "summarized" as const };
+    expect(matchesFilter(note({ summary: "s" }), f)).toBe(true);
+    expect(matchesFilter(note({ transcript: "t" }), f)).toBe(false);
+  });
+
+  it("reads the awaiting flag through the state axis", () => {
+    const f = { ...NO_FILTER, state: "recorded" as const };
+    expect(matchesFilter(note({}), f, { awaiting: true })).toBe(true);
+    expect(matchesFilter(note({}), f)).toBe(false);
+  });
+
+  it("narrows to one client or to the untagged ones", () => {
+    expect(matchesFilter(note({ client_id: "c1" }), { ...NO_FILTER, client: "c1" })).toBe(true);
+    expect(matchesFilter(note({ client_id: "c2" }), { ...NO_FILTER, client: "c1" })).toBe(false);
+    expect(matchesFilter(note({}), { ...NO_FILTER, client: UNASSIGNED })).toBe(true);
+    expect(matchesFilter(note({ client_id: "c1" }), { ...NO_FILTER, client: UNASSIGNED })).toBe(false);
+  });
+
+  it("narrows to one folder or to the loose notes", () => {
+    expect(matchesFilter(note({ folder_id: "f1" }), { ...NO_FILTER, folder: "f1" })).toBe(true);
+    expect(matchesFilter(note({}), { ...NO_FILTER, folder: UNASSIGNED })).toBe(true);
+    expect(matchesFilter(note({ folder_id: "f1" }), { ...NO_FILTER, folder: UNASSIGNED })).toBe(false);
+  });
+
+  it("counts an unsynced note as the signed-in user's own", () => {
+    const mine = { ...NO_FILTER, owner: "u-me" };
+    expect(matchesFilter(note({ owner: "" }), mine, { myId: "u-me" })).toBe(true);
+    expect(matchesFilter(note({ owner: "u-anna" }), mine, { myId: "u-me" })).toBe(false);
+    // Someone else's pin never absorbs an ownerless note.
+    expect(matchesFilter(note({ owner: "" }), { ...NO_FILTER, owner: "u-anna" }, { myId: "u-me" })).toBe(
+      false,
+    );
+  });
+
+  it("requires every set axis", () => {
+    const f = { ...NO_FILTER, state: "notes" as const, client: "c1" };
+    expect(matchesFilter(note({ body: "<p>b</p>", client_id: "c1" }), f)).toBe(true);
+    expect(matchesFilter(note({ body: "<p>b</p>", client_id: "c2" }), f)).toBe(false);
   });
 });

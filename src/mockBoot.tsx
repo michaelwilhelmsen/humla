@@ -946,6 +946,13 @@ function capturingLibraryCase(
   };
 }
 
+const MOCK_WORKSPACE = {
+  id: "w1",
+  name: "Humla",
+  role: "owner" as const,
+  plan_status: "active" as const,
+};
+
 const CASES: Record<string, Scenario> = {
   // --- #90: the automatic titler's two states. Compare `title-writing` against
   // `title-idle` and `title-idle-long` — nothing below the title may shift.
@@ -1256,6 +1263,34 @@ const CASES: Record<string, Scenario> = {
       notes_list: () => demoNotes(),
       folders_list: () => DEMO_FOLDERS,
       clients_list: () => DEMO_CLIENTS,
+    },
+  },
+
+  // The filter row at its widest: a workspace (so the owner axis appears), a
+  // client list, folders, and one note whose audio is still waiting to be
+  // transcribed. Every axis renders, which is the only way to see whether four
+  // pickers plus Clear still read as one row.
+  "notes-filters": {
+    route: "/all-notes",
+    render: () => null, // unused — `route` renders the app
+    ipc: {
+      notes_list: () => demoNotes(),
+      folders_list: () => DEMO_FOLDERS,
+      clients_list: () => DEMO_CLIENTS,
+      notes_awaiting_transcription: () => ["n3"],
+      // Through cloud_status rather than a store seed: the app refreshes the
+      // cloud store on boot, which would overwrite anything seeded ahead of it.
+      cloud_status: () => ({
+        ...DISCONNECTED,
+        logged_in: true,
+        user: { id: "u-me", email: "michael@humla.no", name: "Michael", verified: true },
+        current_workspace: MOCK_WORKSPACE,
+        workspaces: [MOCK_WORKSPACE],
+      }),
+      cloud_workspace_members: () => [
+        { id: "u-me", email: "michael@humla.no", name: "Michael", role: "owner" },
+        { id: "u-hege", email: "hege@humla.no", name: "Hege Nordvik", role: "member" },
+      ],
     },
   },
 

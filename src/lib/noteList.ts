@@ -102,25 +102,79 @@ export function noteExcerpt(n: Note): string {
   return bodyHasSubstance ? body : "";
 }
 
-// How far along a note is. Drives the card's state dot, and reads as the
-// answer to "is there anything in here yet?".
-export type NoteState = "summarized" | "recorded" | "notes" | "empty";
+// How far along a note is. Drives the card's state dot and the All-notes
+// status filter, and reads as the answer to "is there anything in here yet?".
+//
+// A ladder, not a set of flags: each rung supersedes the one below, so a note
+// lands in exactly one state and the filter chips partition the library.
+export type NoteState = "summarized" | "transcribed" | "recorded" | "notes" | "empty";
 
-export function noteState(n: Note): NoteState {
-  if (isSummarized(n)) return "summarized";
-  if (isRecorded(n)) return "recorded";
+// `awaitingTranscription` is the one fact the note row can't answer: a take
+// captured with **Transcribe manually** on (#146) holds its audio and has no
+// text, which is indistinguishable here from a note nobody ever recorded. It
+// comes from `ipc.notesAwaitingTranscription`.
+export function noteState(n: Note, awaitingTranscription = false): NoteState {
+  if (n.summary.trim()) return "summarized";
+  if (n.transcript.trim()) return "transcribed";
+  if (awaitingTranscription) return "recorded";
   if (htmlToText(n.body).trim()) return "notes";
   return "empty";
 }
 
-// A note counts as "recorded" once it has any transcript text; "summarized"
-// once a summary has been generated. Used by the All-notes filter chips.
-export function isRecorded(n: Note): boolean {
-  return n.transcript.trim().length > 0;
+export const NOTE_STATE_LABEL: Record<NoteState, string> = {
+  summarized: "Summarized",
+  transcribed: "Transcribed",
+  recorded: "Recorded",
+  notes: "Notes only",
+  empty: "Empty",
+};
+
+// Filter state for the note views. `null` on an axis means "don't filter on
+// it"; [`UNASSIGNED`] narrows to the notes carrying nothing on that axis.
+export type NoteFilter = {
+  state: NoteState | null;
+  client: string | null;
+  folder: string | null;
+  /** A workspace member's user id. Meaningless outside a workspace. */
+  owner: string | null;
+};
+
+// Client and folder ids are uuids, so no real id can collide with this. Not
+// `__none__` — that is `SelectablePopover`'s own sentinel for its "clear this"
+// row, and an item carrying it comes back out of the picker as null.
+export const UNASSIGNED = "__unassigned__";
+
+export const NO_FILTER: NoteFilter = { state: null, client: null, folder: null, owner: null };
+
+export function filterActive(f: NoteFilter): boolean {
+  return f.state !== null || f.client !== null || f.folder !== null || f.owner !== null;
 }
 
-export function isSummarized(n: Note): boolean {
-  return n.summary.trim().length > 0;
+export function matchesFilter(
+  n: Note,
+  f: NoteFilter,
+  ctx: {
+    /** This note holds audio waiting to be transcribed. */
+    awaiting?: boolean;
+    /** The signed-in user's id, for the owner axis. */
+    myId?: string | null;
+  } = {},
+): boolean {
+  if (f.state !== null && noteState(n, ctx.awaiting) !== f.state) return false;
+  if (f.client !== null) {
+    if (f.client === UNASSIGNED ? !!n.client_id : n.client_id !== f.client) return false;
+  }
+  if (f.folder !== null) {
+    if (f.folder === UNASSIGNED ? !!n.folder_id : n.folder_id !== f.folder) return false;
+  }
+  if (f.owner !== null) {
+    // A note recorded on this device before it ever synced carries no owner.
+    // It is still the signed-in user's, so "Created by me" has to claim it —
+    // otherwise the filter silently hides your own newest meetings.
+    const mine = ctx.myId != null && f.owner === ctx.myId;
+    if (!(n.owner === f.owner || (mine && !n.owner))) return false;
+  }
+  return true;
 }
 
 // Index a list the note views look rows up in by id.

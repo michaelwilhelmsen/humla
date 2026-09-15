@@ -3,20 +3,12 @@ import { useNavigate } from "react-router-dom";
 import { Plus } from "lucide-react";
 import { ipc } from "../lib/ipc";
 import { useNotesStore, useRecordingStore } from "../lib/store";
-import { cn } from "../lib/cn";
-import { indexById, isRecorded, isSummarized } from "../lib/noteList";
+import { indexById, matchesFilter, NO_FILTER, type NoteFilter } from "../lib/noteList";
 import { NoteCard, type SelectIntent } from "../components/NoteCard";
+import { NoteFilters } from "../components/NoteFilters";
+import { useCloudStore } from "../lib/cloud";
 import { BulkActionBar } from "../components/BulkActionBar";
 import { Modal } from "./settings/components/Modal";
-
-type FilterKey = "all" | "recorded" | "summarized" | "no-folder";
-
-const FILTERS: { key: FilterKey; label: string }[] = [
-  { key: "all", label: "All" },
-  { key: "recorded", label: "Recorded" },
-  { key: "summarized", label: "Summarized" },
-  { key: "no-folder", label: "No folder" },
-];
 
 export function AllNotes() {
   const navigate = useNavigate();
@@ -26,7 +18,26 @@ export function AllNotes() {
   const upsert = useNotesStore((s) => s.upsertLocal);
   const removeLocal = useNotesStore((s) => s.removeLocal);
   const pushError = useRecordingStore((s) => s.pushError);
-  const [filter, setFilter] = useState<FilterKey>("all");
+  const [filter, setFilter] = useState<NoteFilter>(NO_FILTER);
+  const myId = useCloudStore((s) => s.status.user?.id ?? null);
+
+  // Which notes hold audio that was captured and never transcribed (#146) —
+  // the one thing the "Recorded" status can't be read off the note row. Loaded
+  // once per visit: it only changes when a capture stops or a Transcribe run
+  // finishes, neither of which can happen while this view is the one on screen.
+  const [awaiting, setAwaiting] = useState<Set<string>>(new Set());
+  useEffect(() => {
+    let live = true;
+    ipc
+      .notesAwaitingTranscription()
+      .then((ids) => {
+        if (live) setAwaiting(new Set(ids));
+      })
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
+  }, []);
 
   // Multi-select (issue #19). `selected` holds note ids; `anchorRef` is the
   // range anchor for Shift-click. `busy` guards the bulk delete/move while
@@ -45,15 +56,10 @@ export function AllNotes() {
 
   const filtered = useMemo(
     () =>
-      sorted.filter((n) => {
-        switch (filter) {
-          case "recorded": return isRecorded(n);
-          case "summarized": return isSummarized(n);
-          case "no-folder": return !n.folder_id;
-          default: return true;
-        }
-      }),
-    [sorted, filter],
+      sorted.filter((n) =>
+        matchesFilter(n, filter, { awaiting: awaiting.has(n.id), myId }),
+      ),
+    [sorted, filter, awaiting, myId],
   );
   // Visual order of the currently-rendered cards — the source of truth for
   // Shift-click range selection.
@@ -173,24 +179,20 @@ export function AllNotes() {
           <div className="max-w-[1180px] mx-auto w-full px-8 pt-14 pb-3">
             <div className="flex items-center gap-3 px-1">
               <h1 className="nd-heading truncate">All notes</h1>
-              <span className="text-[14px] text-[var(--color-text-disabled)] tabular-nums shrink-0">{total}</span>
+              {/* The count follows the filter: with one on, the total behind
+                  it is what says how much is being hidden. */}
+              <span className="text-[14px] text-[var(--color-text-disabled)] tabular-nums shrink-0">
+                {shown === total ? total : `${shown} of ${total}`}
+              </span>
             </div>
             {total > 0 && (
-              <div className="flex flex-wrap gap-1.5 px-1 pt-3">
-                {FILTERS.map((f) => (
-                  <button
-                    key={f.key}
-                    onClick={() => setFilter(f.key)}
-                    className={cn(
-                      "no-drag text-[12.5px] px-3 py-[5px] rounded-full transition-colors",
-                      filter === f.key
-                        ? "bg-[var(--color-accent-soft)] text-[var(--color-accent-text)]"
-                        : "text-[var(--color-text-muted)] hover:bg-[var(--color-pill-hover)]",
-                    )}
-                  >
-                    {f.label}
-                  </button>
-                ))}
+              <div className="px-1 pt-2">
+                <NoteFilters
+                  value={filter}
+                  onChange={setFilter}
+                  clients={clients}
+                  folders={folders}
+                />
               </div>
             )}
           </div>
@@ -215,7 +217,7 @@ export function AllNotes() {
           </div>
         ) : shown === 0 ? (
           <div className="max-w-[1180px] mx-auto w-full px-8 pt-16 text-center text-sm text-[var(--color-text-muted)]">
-            No notes match this filter.
+            No notes match these filters.
           </div>
         ) : (
           // The grid clears the title bar's fade before the first row.
@@ -227,6 +229,7 @@ export function AllNotes() {
                   note={n}
                   folder={n.folder_id ? folderById.get(n.folder_id) : undefined}
                   client={n.client_id ? clientById.get(n.client_id) : undefined}
+                  awaitingTranscription={awaiting.has(n.id)}
                   selected={selected.has(n.id)}
                   selectionActive={selected.size > 0}
                   onSelect={(e) => onSelectRow(n.id, e)}

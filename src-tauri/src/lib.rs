@@ -361,6 +361,7 @@ where
             commands::note_diagnostics_files,
             commands::note_playback_path,
             commands::note_sessions,
+            commands::notes_awaiting_transcription,
             commands::note_session_playback_path,
             commands::note_timeline,
             commands::note_timeline_repair,

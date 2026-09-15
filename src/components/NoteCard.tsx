@@ -3,7 +3,7 @@ import { useShallow } from "zustand/react/shallow";
 import { Link } from "react-router-dom";
 import { Building2, Check, Folder as FolderIcon, Lock } from "lucide-react";
 import { type Client, type Folder, type Note } from "../lib/ipc";
-import { formatNoteDate, noteExcerpt, noteState, type NoteState } from "../lib/noteList";
+import { formatNoteDate, noteExcerpt, noteState, NOTE_STATE_LABEL, type NoteState } from "../lib/noteList";
 import { cn } from "../lib/cn";
 import { noteActivity } from "../lib/noteActivity";
 import { useRecordingStore } from "../lib/store";
@@ -15,11 +15,15 @@ export type SelectIntent = { shiftKey: boolean };
 
 // The card carries no legend, so the colour is named rather than left to
 // stand on its own.
-const STATE: Record<NoteState, { label: string; color: string }> = {
-  summarized: { label: "Summarized", color: "var(--color-accent-text)" },
-  recorded: { label: "Recorded", color: "var(--color-interactive)" },
-  notes: { label: "Notes only", color: "var(--color-text-muted)" },
-  empty: { label: "Empty", color: "var(--color-text-disabled)" },
+// Recorded is the one state that names work left to do — a take whose audio is
+// still waiting for the Transcribe button — so it takes the warning colour
+// rather than another shade of "done".
+const STATE_COLOR: Record<NoteState, string> = {
+  summarized: "var(--color-accent-text)",
+  transcribed: "var(--color-interactive)",
+  recorded: "var(--color-warning)",
+  notes: "var(--color-text-muted)",
+  empty: "var(--color-text-disabled)",
 };
 
 // One note in a grid view (All notes, Folder). Nothing above the grid says
@@ -41,6 +45,7 @@ export function NoteCard({
   folder,
   client,
   showFolder = true,
+  awaitingTranscription = false,
   selected = false,
   selectionActive = false,
   onSelect,
@@ -50,6 +55,8 @@ export function NoteCard({
   client?: Client;
   /** False inside a folder view, where the note's folder is the view itself. */
   showFolder?: boolean;
+  /** This note holds retained audio nobody has transcribed yet (#146). */
+  awaitingTranscription?: boolean;
   selected?: boolean;
   /** True when any note in the view is selected. Forces every checkbox visible. */
   selectionActive?: boolean;
@@ -57,7 +64,8 @@ export function NoteCard({
 }) {
   const title = note.title.trim() || "Untitled";
   const excerpt = noteExcerpt(note);
-  const state = STATE[noteState(note)];
+  const key = noteState(note, awaitingTranscription);
+  const state = { label: NOTE_STATE_LABEL[key], color: STATE_COLOR[key] };
   // `useShallow` because the helper builds a fresh object each call: without it
   // every card re-renders on every store tick.
   const activity = useRecordingStore(useShallow((s) => noteActivity(note.id, s)));
