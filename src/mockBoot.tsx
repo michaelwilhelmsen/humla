@@ -1398,7 +1398,7 @@ const CASES: Record<string, Scenario> = {
   },
 
   // The same grid inside a folder, where the folder chip is deliberately absent
-  // from every card.
+  // from every card and the filter row carries no unfiled toggle.
   "notes-folder": {
     route: "/folder/f1",
     render: () => null, // unused — `route` renders the app
@@ -1406,6 +1406,7 @@ const CASES: Record<string, Scenario> = {
       notes_list: () => demoNotes(),
       folders_list: () => DEMO_FOLDERS,
       clients_list: () => DEMO_CLIENTS,
+      notes_with_recordings: () => ["n1", "n2", "n3", "n4"],
     },
   },
 

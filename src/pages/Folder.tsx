@@ -1,9 +1,11 @@
-import { useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import { Folder as FolderIcon } from "lucide-react";
 import { useNotesStore } from "../lib/store";
-import { indexById } from "../lib/noteList";
+import { indexById, matchesFilter, NO_FILTER, type NoteFilter } from "../lib/noteList";
 import { NoteCard } from "../components/NoteCard";
+import { NoteFilters } from "../components/NoteFilters";
+import { useCloudStore } from "../lib/cloud";
 
 export function Folder() {
   const { id } = useParams<{ id: string }>();
@@ -12,6 +14,12 @@ export function Folder() {
   const notes = useNotesStore((s) => s.notes);
   const clients = useNotesStore((s) => s.clients);
   const recorded = useNotesStore((s) => s.recordedNoteIds);
+  const myId = useCloudStore((s) => s.status.user?.id ?? null);
+  const [filter, setFilter] = useState<NoteFilter>(NO_FILTER);
+
+  // A filter narrowing one folder says nothing about the next one, and carried
+  // across it reads as an empty folder rather than as a filter.
+  useEffect(() => setFilter(NO_FILTER), [id]);
 
   const folder = useMemo(() => folders.find((f) => f.id === id), [folders, id]);
   const folderNotes = useMemo(
@@ -22,6 +30,13 @@ export function Folder() {
     [notes, id],
   );
   const clientById = useMemo(() => indexById(clients), [clients]);
+  const filtered = useMemo(
+    () =>
+      folderNotes.filter((n) =>
+        matchesFilter(n, filter, { recorded: recorded.has(n.id), myId }),
+      ),
+    [folderNotes, filter, recorded, myId],
+  );
 
   if (!folder) {
     return (
@@ -35,6 +50,7 @@ export function Folder() {
   }
 
   const count = folderNotes.length;
+  const shown = filtered.length;
 
   return (
     <div className="h-full flex flex-col overflow-hidden">
@@ -48,8 +64,21 @@ export function Folder() {
                 <FolderIcon size={16} strokeWidth={1.7} />
               </span>
               <h1 className="nd-heading truncate">{folder.name}</h1>
-              <span className="text-[14px] text-[var(--color-text-disabled)] tabular-nums shrink-0">{count}</span>
+              <span className="text-[14px] text-[var(--color-text-disabled)] tabular-nums shrink-0">
+                {shown === count ? count : `${shown} of ${count}`}
+              </span>
             </div>
+            {count > 0 && (
+              <div className="px-1 pt-2">
+                {/* No unfiled toggle: every note here is filed, in this folder. */}
+                <NoteFilters
+                  value={filter}
+                  onChange={setFilter}
+                  clients={clients}
+                  showUnfiled={false}
+                />
+              </div>
+            )}
           </div>
         </div>
 
@@ -57,10 +86,14 @@ export function Folder() {
           <div className="max-w-[1180px] mx-auto w-full px-8 pt-16 text-center text-sm text-[var(--color-text-muted)]">
             No notes in this folder yet.
           </div>
+        ) : shown === 0 ? (
+          <div className="max-w-[1180px] mx-auto w-full px-8 pt-16 text-center text-sm text-[var(--color-text-muted)]">
+            No notes match these filters.
+          </div>
         ) : (
           <div className="max-w-[1180px] mx-auto w-full px-8 pt-6 pb-24">
             <ul className="nd-notegrid">
-              {folderNotes.map((n) => (
+              {filtered.map((n) => (
                 // The folder is the view, so a folder chip on every card would
                 // say the same thing as the heading.
                 <NoteCard

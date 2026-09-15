@@ -22,13 +22,14 @@ export function NoteFilters({
   value,
   onChange,
   clients,
-  hasFolders,
+  showUnfiled,
 }: {
   value: NoteFilter;
   onChange: (next: NoteFilter) => void;
   clients: Client[];
-  /** False when the library has no folders, where every note is unfiled. */
-  hasFolders: boolean;
+  /** False where the toggle can't narrow anything: a library with no folders,
+   *  and a folder view, whose every note is filed here. */
+  showUnfiled: boolean;
 }) {
   // `useShallow` because `Object.values` builds a fresh array each call.
   const members = useCloudStore(useShallow((s) => Object.values(s.members)));
@@ -78,7 +79,7 @@ export function NoteFilters({
       )}
       {/* A toggle, not a picker: the sidebar already navigates to a folder, so
           the only reach a folder axis adds here is the notes filed nowhere. */}
-      {hasFolders && (
+      {showUnfiled && (
       <button
         type="button"
         aria-pressed={unfiled}

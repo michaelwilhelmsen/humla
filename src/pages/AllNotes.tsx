@@ -174,7 +174,7 @@ export function AllNotes() {
                   value={filter}
                   onChange={setFilter}
                   clients={clients}
-                  hasFolders={folders.length > 0}
+                  showUnfiled={folders.length > 0}
                 />
               </div>
             )}
