@@ -20,24 +20,7 @@ export function AllNotes() {
   const pushError = useRecordingStore((s) => s.pushError);
   const [filter, setFilter] = useState<NoteFilter>(NO_FILTER);
   const myId = useCloudStore((s) => s.status.user?.id ?? null);
-
-  // Which notes hold audio that was captured and never transcribed (#146) —
-  // the one thing the "Recorded" status can't be read off the note row. Loaded
-  // once per visit: it only changes when a capture stops or a Transcribe run
-  // finishes, neither of which can happen while this view is the one on screen.
-  const [awaiting, setAwaiting] = useState<Set<string>>(new Set());
-  useEffect(() => {
-    let live = true;
-    ipc
-      .notesAwaitingTranscription()
-      .then((ids) => {
-        if (live) setAwaiting(new Set(ids));
-      })
-      .catch(() => {});
-    return () => {
-      live = false;
-    };
-  }, []);
+  const recorded = useNotesStore((s) => s.recordedNoteIds);
 
   // Multi-select (issue #19). `selected` holds note ids; `anchorRef` is the
   // range anchor for Shift-click. `busy` guards the bulk delete/move while
@@ -57,9 +40,9 @@ export function AllNotes() {
   const filtered = useMemo(
     () =>
       sorted.filter((n) =>
-        matchesFilter(n, filter, { awaiting: awaiting.has(n.id), myId }),
+        matchesFilter(n, filter, { recorded: recorded.has(n.id), myId }),
       ),
-    [sorted, filter, awaiting, myId],
+    [sorted, filter, recorded, myId],
   );
   // Visual order of the currently-rendered cards — the source of truth for
   // Shift-click range selection.
@@ -191,7 +174,7 @@ export function AllNotes() {
                   value={filter}
                   onChange={setFilter}
                   clients={clients}
-                  folders={folders}
+                  hasFolders={folders.length > 0}
                 />
               </div>
             )}
@@ -229,7 +212,7 @@ export function AllNotes() {
                   note={n}
                   folder={n.folder_id ? folderById.get(n.folder_id) : undefined}
                   client={n.client_id ? clientById.get(n.client_id) : undefined}
-                  awaitingTranscription={awaiting.has(n.id)}
+                  recorded={recorded.has(n.id)}
                   selected={selected.has(n.id)}
                   selectionActive={selected.size > 0}
                   onSelect={(e) => onSelectRow(n.id, e)}

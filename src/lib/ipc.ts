@@ -405,10 +405,10 @@ export const ipc = {
     invoke<NoteSession[]>("note_sessions", { noteId }),
   noteSessionPlaybackPath: (noteId: string, sessionId: string) =>
     invoke<string | null>("note_session_playback_path", { noteId, sessionId }),
-  // Which notes hold audio that has never been transcribed (#146). One sweep
-  // for the whole library, so the note views can tell "recorded" from
-  // "transcribed" without a per-note `noteSessions` call.
-  notesAwaitingTranscription: () => invoke<string[]>("notes_awaiting_transcription"),
+  // Which notes hold at least one recording session. One sweep for the whole
+  // library, so the note views can tell a recorded note from a typed one
+  // without a per-note `noteSessions` call.
+  notesWithRecordings: () => invoke<string[]>("notes_with_recordings"),
   // Deferred transcription (#146): replay this note's takes through the
   // provider, oldest first. Progress arrives on `transcribe_status`, not
   // `recording_status` — a recording on another note may be running the whole

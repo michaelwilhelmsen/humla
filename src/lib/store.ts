@@ -6,6 +6,11 @@ type NotesState = {
   notes: Note[];
   folders: Folder[];
   clients: Client[];
+  /** Ids of notes holding at least one recording session — the half of a
+   *  note's state that its row cannot answer, since a take captured with
+   *  **Transcribe manually** on has no text. Both grid views draw the card's
+   *  state dot from it. */
+  recordedNoteIds: Set<string>;
   /** Whether `refresh` has completed at least once (issue #95).
    *
    *  Without this, `notes.length === 0` means either "the library is empty" or
@@ -16,6 +21,7 @@ type NotesState = {
   refresh: () => Promise<void>;
   refreshFolders: () => Promise<void>;
   refreshClients: () => Promise<void>;
+  refreshRecorded: () => Promise<void>;
   upsertLocal: (note: Note) => void;
   upsertFolder: (folder: Folder) => void;
   removeFolder: (id: string) => void;
@@ -31,6 +37,7 @@ export const useNotesStore = create<NotesState>((set) => ({
   notes: [],
   folders: [],
   clients: [],
+  recordedNoteIds: new Set(),
   loaded: false,
   refresh: async () => {
     const [notes, folders, clients] = await Promise.all([
@@ -39,6 +46,7 @@ export const useNotesStore = create<NotesState>((set) => ({
       ipc.listClients(),
     ]);
     set({ notes, folders, clients, loaded: true });
+    void useNotesStore.getState().refreshRecorded();
   },
   refreshFolders: async () => {
     const folders = await ipc.listFolders();
@@ -47,6 +55,15 @@ export const useNotesStore = create<NotesState>((set) => ({
   refreshClients: async () => {
     const clients = await ipc.listClients();
     set({ clients });
+  },
+  refreshRecorded: async () => {
+    try {
+      set({ recordedNoteIds: new Set(await ipc.notesWithRecordings()) });
+    } catch (e) {
+      // A card reading one rung low is not worth a toast, but it is worth a
+      // line: the sweep failing is the only way this set goes stale.
+      console.error("notes_with_recordings failed", e);
+    }
   },
   upsertFolder: (folder) =>
     set((s) => {
@@ -365,6 +382,10 @@ export function bindBackendListeners() {
     useRecordingStore.getState().setStatus(s);
     if (s.phase === "idle") {
       useRecordingStore.getState().setDiag(null);
+      // A take that landed is a note that is now recorded, and the grid views
+      // may be the ones on screen — the tray and the compact indicator both
+      // stop a capture from outside a note.
+      void useNotesStore.getState().refreshRecorded();
       // A recording just finished — if it was a shared (workspace) note, upload
       // its audio for teammates. The command waits for the post-stop pipeline to
       // write playback.wav, so fire-and-forget here.
@@ -410,6 +431,7 @@ export function bindBackendListeners() {
   // progress event reported.
   onTranscribeStatus(({ noteId, active, ...measure }) => {
     useRecordingStore.getState().setTranscribing(noteId, active, measure);
+    if (!active) void useNotesStore.getState().refreshRecorded();
   });
   onDiarizeStatus(({ noteId, active }) => {
     useRecordingStore.getState().setDiarizing(noteId, active);

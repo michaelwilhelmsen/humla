@@ -37,7 +37,7 @@ export function mockTauri(
       case "note_audio_files":
       case "note_diagnostics_files":
       case "note_sessions":
-      case "notes_awaiting_transcription":
+      case "notes_with_recordings":
       case "note_timeline":
       case "speaker_label_stats":
       case "cloud_speaker_roster":

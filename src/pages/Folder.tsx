@@ -11,6 +11,7 @@ export function Folder() {
   const folders = useNotesStore((s) => s.folders);
   const notes = useNotesStore((s) => s.notes);
   const clients = useNotesStore((s) => s.clients);
+  const recorded = useNotesStore((s) => s.recordedNoteIds);
 
   const folder = useMemo(() => folders.find((f) => f.id === id), [folders, id]);
   const folderNotes = useMemo(
@@ -66,6 +67,7 @@ export function Folder() {
                   key={n.id}
                   note={n}
                   client={n.client_id ? clientById.get(n.client_id) : undefined}
+                  recorded={recorded.has(n.id)}
                   showFolder={false}
                 />
               ))}

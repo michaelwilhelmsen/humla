@@ -314,6 +314,16 @@ input::placeholder, textarea::placeholder {
 .nd-meta.is-filled { background: var(--color-surface-2); }
 .nd-meta.is-filled:hover { background: var(--color-surface-raised); color: var(--color-text); }
 
+/* Selected variant, for a chip that is narrowing what the view shows. Accent
+   fill over `surface-2`: a filter that is hiding notes must not read as the
+   resting state, which a step on the elevation ladder alone doesn't manage. */
+.nd-meta.is-selected,
+.nd-meta.is-selected:hover {
+  background: var(--color-accent-soft);
+  color: var(--color-accent-text);
+}
+.nd-meta.is-selected > svg { color: var(--color-accent-text); opacity: 1; }
+
 /* Theme-driven chrome lives in @layer components, NOT unlayered like
    .nd-btn above: these are component defaults a caller is expected to nudge
    with a Tailwind utility (a row that needs `pr-1` for its trailing icon

@@ -1277,7 +1277,7 @@ const CASES: Record<string, Scenario> = {
       notes_list: () => demoNotes(),
       folders_list: () => DEMO_FOLDERS,
       clients_list: () => DEMO_CLIENTS,
-      notes_awaiting_transcription: () => ["n3"],
+      notes_with_recordings: () => ["n1", "n2", "n3", "n4"],
       // Through cloud_status rather than a store seed: the app refreshes the
       // cloud store on boot, which would overwrite anything seeded ahead of it.
       cloud_status: () => ({

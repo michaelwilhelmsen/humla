@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
+import { act, render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import { AllNotes } from "./AllNotes";
@@ -49,7 +49,7 @@ function renderAll() {
 const loc = () => screen.getByTestId("location").textContent;
 
 beforeEach(() => {
-  useNotesStore.setState({ notes: [], folders: [] });
+  useNotesStore.setState({ notes: [], folders: [], clients: [], recordedNoteIds: new Set() });
   useRecordingStore.setState({ errors: [] });
 });
 
@@ -449,7 +449,7 @@ describe("AllNotes filters", () => {
   it("narrows by status, and the count says how much is hidden", async () => {
     mockTauri();
     seed([
-      { ...makeNote("n1", "Alpha"), summary: "s" },
+      { ...makeNote("n1", "Alpha"), summary: "s", transcript: "t" },
       { ...makeNote("n2", "Beta"), transcript: "t" },
       makeNote("n3", "Gamma"),
     ]);
@@ -460,18 +460,24 @@ describe("AllNotes filters", () => {
     expect(titles().join(" ")).not.toContain("Beta");
     expect(screen.getByText("1 of 3")).toBeTruthy();
 
+    // Transcribed holds both: the axis asks what a note has, not where it
+    // stopped, so summarizing one doesn't take it out of the transcripts.
     await pick("Status", "Transcribed");
+    expect(titles().join(" ")).toContain("Alpha");
     expect(titles().join(" ")).toContain("Beta");
-    expect(titles().join(" ")).not.toContain("Alpha");
+    expect(titles().join(" ")).not.toContain("Gamma");
   });
 
   // The one status the note row can't answer on its own (#146).
-  it("treats a note holding untranscribed audio as recorded", async () => {
-    mockTauri({ notes_awaiting_transcription: () => ["n2"] });
+  it("treats a note whose audio has no text yet as recorded", async () => {
+    mockTauri({ notes_with_recordings: () => ["n2"] });
     seed([makeNote("n1", "Alpha"), makeNote("n2", "Beta")]);
+    await act(async () => {
+      await useNotesStore.getState().refreshRecorded();
+    });
     renderAll();
 
-    await waitFor(() => expect(screen.getByRole("link", { name: /Beta/ }).textContent).toContain("Recorded"));
+    expect(screen.getByRole("link", { name: /Beta/ }).textContent).toContain("Recorded");
     await pick("Status", "Recorded");
     expect(titles().join(" ")).toContain("Beta");
     expect(titles().join(" ")).not.toContain("Alpha");
@@ -521,6 +527,19 @@ describe("AllNotes filters", () => {
     await pick("Created by", "Me");
     expect(titles().join(" ")).toContain("Alpha");
     expect(titles().join(" ")).not.toContain("Beta");
+  });
+
+  it("keeps the folder axis to the notes filed nowhere", async () => {
+    mockTauri();
+    seed(
+      [{ ...makeNote("n1", "Alpha"), folder_id: "f1" }, makeNote("n2", "Beta")],
+      [{ id: "f1", name: "Work", created_at: 0, updated_at: 0 }],
+    );
+    renderAll();
+
+    await userEvent.click(screen.getByRole("button", { name: /No folder/ }));
+    expect(titles().join(" ")).toContain("Beta");
+    expect(titles().join(" ")).not.toContain("Alpha");
   });
 
   it("clears every axis at once", async () => {

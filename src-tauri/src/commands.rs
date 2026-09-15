@@ -1137,18 +1137,17 @@ pub fn note_sessions(app: AppHandle, note_id: String) -> Result<Vec<NoteSession>
     Ok(out)
 }
 
-/// Note ids holding retained audio that has never been transcribed (#146).
+/// Note ids that hold at least one recording session.
 ///
 /// One sweep of the recordings root rather than a `note_sessions` call per
-/// note, so the library views can tell a note that was captured from one that
-/// was captured *and* transcribed. The predicate is
-/// [`sessions::takes_to_transcribe`] under `Pending` — the same answer the note
-/// view's Transcribe button reads, so a note can never be filtered as awaiting
-/// transcription while its own view offers nothing to run.
+/// note, so the library views can tell a note somebody recorded from one
+/// somebody typed. A manifest entry answers this, not the audio beside it: a
+/// take swept by "Delete stored audio" was still recorded, and a take captured
+/// with **Transcribe manually** on has no text to be recognised by.
 #[tauri::command]
-pub fn notes_awaiting_transcription(app: AppHandle) -> Result<Vec<String>, String> {
+pub fn notes_with_recordings(app: AppHandle) -> Result<Vec<String>, String> {
     let app_dir = app.path().app_data_dir().map_err(err)?;
-    let Ok(entries) = std::fs::read_dir(app_dir.join("recordings")) else {
+    let Ok(entries) = std::fs::read_dir(sessions::recordings_root(&app_dir)) else {
         return Ok(Vec::new());
     };
     let mut out = Vec::new();
@@ -1160,7 +1159,7 @@ pub fn notes_awaiting_transcription(app: AppHandle) -> Result<Vec<String>, Strin
         let Some(note_id) = entry.file_name().to_str().map(str::to_string) else {
             continue;
         };
-        if !sessions::takes_to_transcribe(&dir, sessions::TranscribeScope::Pending).is_empty() {
+        if !sessions::resolve_sessions(&dir).is_empty() {
             out.push(note_id);
         }
     }

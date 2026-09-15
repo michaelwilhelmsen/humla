@@ -15,9 +15,8 @@ export type SelectIntent = { shiftKey: boolean };
 
 // The card carries no legend, so the colour is named rather than left to
 // stand on its own.
-// Recorded is the one state that names work left to do — a take whose audio is
-// still waiting for the Transcribe button — so it takes the warning colour
-// rather than another shade of "done".
+// Recorded is the one state naming work left to do — audio with no text yet —
+// so it takes the warning colour.
 const STATE_COLOR: Record<NoteState, string> = {
   summarized: "var(--color-accent-text)",
   transcribed: "var(--color-interactive)",
@@ -45,7 +44,7 @@ export function NoteCard({
   folder,
   client,
   showFolder = true,
-  awaitingTranscription = false,
+  recorded = false,
   selected = false,
   selectionActive = false,
   onSelect,
@@ -55,8 +54,8 @@ export function NoteCard({
   client?: Client;
   /** False inside a folder view, where the note's folder is the view itself. */
   showFolder?: boolean;
-  /** This note holds retained audio nobody has transcribed yet (#146). */
-  awaitingTranscription?: boolean;
+  /** This note holds at least one recording session. */
+  recorded?: boolean;
   selected?: boolean;
   /** True when any note in the view is selected. Forces every checkbox visible. */
   selectionActive?: boolean;
@@ -64,7 +63,7 @@ export function NoteCard({
 }) {
   const title = note.title.trim() || "Untitled";
   const excerpt = noteExcerpt(note);
-  const key = noteState(note, awaitingTranscription);
+  const key = noteState(note, recorded);
   const state = { label: NOTE_STATE_LABEL[key], color: STATE_COLOR[key] };
   // `useShallow` because the helper builds a fresh object each call: without it
   // every card re-renders on every store tick.

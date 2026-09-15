@@ -168,12 +168,11 @@ describe("noteState", () => {
     expect(noteState(makeNote({ id: "a", body: "<p></p>" }))).toBe("empty");
   });
 
-  // A deferred take (#146) has audio and no text. Without the flag it is
-  // indistinguishable from a note nobody ever recorded.
-  it("calls a note with untranscribed audio recorded, over its typed notes", () => {
+  // A take captured with Transcribe manually on has audio and no text. Without
+  // the flag it is indistinguishable from a note nobody ever recorded.
+  it("calls a recording with no text yet recorded, over its typed notes", () => {
     expect(noteState(makeNote({ id: "a" }), true)).toBe("recorded");
     expect(noteState(makeNote({ id: "a", body: "<p>b</p>" }), true)).toBe("recorded");
-    // Text supersedes it: the take was replayed, the audio is no longer waiting.
     expect(noteState(makeNote({ id: "a", transcript: "t" }), true)).toBe("transcribed");
   });
 });
@@ -192,10 +191,28 @@ describe("matchesFilter", () => {
     expect(matchesFilter(note({ transcript: "t" }), f)).toBe(false);
   });
 
-  it("reads the awaiting flag through the state axis", () => {
+  // The status axis asks what a note HAS, so its rungs overlap. Read as the
+  // card's exclusive ladder instead, Recorded would match nothing at all on
+  // the default settings, where a take transcribes as it records.
+  it("counts a summarized meeting as recorded and as transcribed", () => {
+    const n = note({ summary: "s", transcript: "t" });
+    expect(matchesFilter(n, { ...NO_FILTER, state: "recorded" })).toBe(true);
+    expect(matchesFilter(n, { ...NO_FILTER, state: "transcribed" })).toBe(true);
+    expect(matchesFilter(n, { ...NO_FILTER, state: "summarized" })).toBe(true);
+  });
+
+  it("counts a note whose audio has no text yet as recorded", () => {
     const f = { ...NO_FILTER, state: "recorded" as const };
-    expect(matchesFilter(note({}), f, { awaiting: true })).toBe(true);
+    expect(matchesFilter(note({}), f, { recorded: true })).toBe(true);
     expect(matchesFilter(note({}), f)).toBe(false);
+  });
+
+  // Empty is the one rung that stays exclusive — it is the absence of
+  // everything the others test for.
+  it("keeps a recording out of Empty", () => {
+    const f = { ...NO_FILTER, state: "empty" as const };
+    expect(matchesFilter(note({}), f)).toBe(true);
+    expect(matchesFilter(note({}), f, { recorded: true })).toBe(false);
   });
 
   it("narrows to one client or to the untagged ones", () => {
@@ -205,8 +222,7 @@ describe("matchesFilter", () => {
     expect(matchesFilter(note({ client_id: "c1" }), { ...NO_FILTER, client: UNASSIGNED })).toBe(false);
   });
 
-  it("narrows to one folder or to the loose notes", () => {
-    expect(matchesFilter(note({ folder_id: "f1" }), { ...NO_FILTER, folder: "f1" })).toBe(true);
+  it("narrows to the notes filed nowhere", () => {
     expect(matchesFilter(note({}), { ...NO_FILTER, folder: UNASSIGNED })).toBe(true);
     expect(matchesFilter(note({ folder_id: "f1" }), { ...NO_FILTER, folder: UNASSIGNED })).toBe(false);
   });

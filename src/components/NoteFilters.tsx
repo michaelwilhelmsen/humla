@@ -1,24 +1,20 @@
-import { Building2, CircleDot, Folder as FolderIcon, User, X } from "lucide-react";
+import { Building2, CircleDot, FolderOpen, User, X } from "lucide-react";
 import { useShallow } from "zustand/react/shallow";
-import { type Client, type Folder } from "../lib/ipc";
+import { type Client } from "../lib/ipc";
 import { useCloudStore } from "../lib/cloud";
 import {
-  NOTE_STATE_LABEL,
+  NOTE_FILTER_LABEL,
+  NO_FILTER,
   UNASSIGNED,
   filterActive,
   type NoteFilter,
   type NoteState,
 } from "../lib/noteList";
+import { cn } from "../lib/cn";
 import { SelectablePopover, type PopoverItem } from "./SelectablePopover";
 
-// The filter bar above the note grid: one picker per axis a library is
-// actually searched along — how far a note has got, whose client it is, who
-// recorded it, which folder it sits in.
-//
-// Each axis is its own picker rather than a row of chips because the axes are
-// independent and two of them (Client, Folder) are unbounded lists. The
-// picker's "All …" row is the SelectablePopover none row, so clearing one axis
-// is the same gesture as clearing any other.
+// The filter bar above the note grid: how far a note has got, whose client it
+// is, who recorded it, and whether it is filed anywhere.
 
 const STATES: NoteState[] = ["empty", "notes", "recorded", "transcribed", "summarized"];
 
@@ -26,19 +22,21 @@ export function NoteFilters({
   value,
   onChange,
   clients,
-  folders,
+  hasFolders,
 }: {
   value: NoteFilter;
   onChange: (next: NoteFilter) => void;
   clients: Client[];
-  folders: Folder[];
+  /** False when the library has no folders, where every note is unfiled. */
+  hasFolders: boolean;
 }) {
-  // Owner is a workspace question: a Personal library has one author, so the
-  // picker would offer a single name that changes nothing.
   // `useShallow` because `Object.values` builds a fresh array each call.
   const members = useCloudStore(useShallow((s) => Object.values(s.members)));
   const myId = useCloudStore((s) => s.status.user?.id ?? null);
+  // A Personal library has one author, so the picker would offer a single name
+  // that changes nothing.
   const showOwner = members.length > 1;
+  const unfiled = value.folder === UNASSIGNED;
 
   return (
     <div className="flex flex-wrap items-center gap-1 -mx-2">
@@ -46,7 +44,7 @@ export function NoteFilters({
         ariaLabel="Status"
         icon={<CircleDot size={14} strokeWidth={1.6} />}
         allLabel="Any status"
-        items={STATES.map((s) => ({ id: s, label: NOTE_STATE_LABEL[s] }))}
+        items={STATES.map((s) => ({ id: s, label: NOTE_FILTER_LABEL[s] }))}
         active={value.state}
         onSelect={(state) => onChange({ ...value, state: state as NoteState | null })}
       />
@@ -68,35 +66,34 @@ export function NoteFilters({
           ariaLabel="Created by"
           icon={<User size={14} strokeWidth={1.6} />}
           allLabel="Anyone"
+          // `owner` is who RECORDED a note, not who attended it — the same
+          // wording the chat pin carries, so the two read as one idea.
           items={members.map((m) => ({
             id: m.id,
-            // "Created by me", not "My notes" — `owner` is who RECORDED the
-            // note, not who attended it. Same wording as the chat pin (#103),
-            // for the same reason: the false negative stays visible.
             label: m.id === myId ? "Me" : m.name || m.email,
           }))}
           active={value.owner}
           onSelect={(owner) => onChange({ ...value, owner })}
         />
       )}
-      {folders.length > 0 && (
-        <FilterPicker
-          ariaLabel="Folder"
-          icon={<FolderIcon size={14} strokeWidth={1.6} />}
-          allLabel="Any folder"
-          items={[
-            { id: UNASSIGNED, label: "No folder" },
-            ...folders.map((f) => ({ id: f.id, label: f.name })),
-          ]}
-          active={value.folder}
-          onSelect={(folder) => onChange({ ...value, folder })}
-        />
+      {/* A toggle, not a picker: the sidebar already navigates to a folder, so
+          the only reach a folder axis adds here is the notes filed nowhere. */}
+      {hasFolders && (
+      <button
+        type="button"
+        aria-pressed={unfiled}
+        className={cn("nd-meta is-interactive no-drag", unfiled && "is-selected")}
+        onClick={() => onChange({ ...value, folder: unfiled ? null : UNASSIGNED })}
+      >
+        <FolderOpen size={14} strokeWidth={1.6} />
+        No folder
+      </button>
       )}
       {filterActive(value) && (
         <button
           type="button"
           className="nd-meta is-interactive no-drag"
-          onClick={() => onChange({ state: null, client: null, folder: null, owner: null })}
+          onClick={() => onChange(NO_FILTER)}
         >
           <X size={14} strokeWidth={1.8} />
           Clear
@@ -127,16 +124,7 @@ function FilterPicker({
     <SelectablePopover
       ariaLabel={ariaLabel}
       trigger={
-        <span
-          className="nd-meta is-interactive no-drag"
-          // An active filter is hiding notes, so it must not read as the
-          // resting state. The fill carries that, not the label.
-          style={
-            active !== null
-              ? { background: "var(--color-accent-soft)", color: "var(--color-accent-text)" }
-              : undefined
-          }
-        >
+        <span className={cn("nd-meta is-interactive no-drag", active !== null && "is-selected")}>
           {icon}
           <span className="truncate" style={{ maxWidth: 150 }}>{label}</span>
         </span>
