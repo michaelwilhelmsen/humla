@@ -12,6 +12,7 @@ use crate::db::{self, Note, NotePatch};
 use crate::languages;
 use crate::openai;
 use crate::presets::{self, DEFAULT_SUMMARY_PRESET};
+use crate::providers::ProviderId;
 use crate::recording::{StreamDeltaPayload, SummaryPayload, SummaryStatusPayload};
 use crate::AppState;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -31,7 +32,8 @@ pub(super) struct ResolvedProvider {
 
 // Decide whether this note's summary call should hit cloud OpenAI or a
 // local OpenAI-compatible server. Note-level override beats the global
-// setting; default is openai.
+// setting; default is openai. An id the registry doesn't know, or one that
+// can't summarise, is an error — never a silent OpenAI call.
 //
 // For local: reads `local_llm_base_url` and `local_llm_model` from settings.
 // `api_key` is forwarded as-is — local servers typically ignore it but
@@ -55,8 +57,11 @@ pub(super) fn resolve_provider(
         note.id, note_override, provider
     );
 
-    match provider.as_str() {
-        "local" => {
+    let id = ProviderId::parse(&provider)
+        .filter(|p| p.capabilities().summarize)
+        .ok_or_else(|| anyhow::anyhow!("unknown summary provider “{provider}” — pick one in Settings"))?;
+    match id {
+        ProviderId::Local => {
             let base_url = db::get_setting(conn, "local_llm_base_url")?
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
@@ -78,7 +83,7 @@ pub(super) fn resolve_provider(
                 think,
             })
         }
-        _ => {
+        ProviderId::OpenAi => {
             let api_key = openai_api_key
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| anyhow::anyhow!("OpenAI API key not set"))?;
@@ -92,6 +97,7 @@ pub(super) fn resolve_provider(
                 think: false,
             })
         }
+        ProviderId::Deepgram | ProviderId::Groq => unreachable!("filtered on the summarize capability"),
     }
 }
 
@@ -404,6 +410,28 @@ mod tests {
     // Issue #167 — `auto` resolves to what was actually spoken, so the
     // summary takes the hard-directive path instead of inferring the target
     // from a Norwegian-labelled prompt.
+    #[test]
+    fn an_unknown_summary_provider_is_an_error_not_openai() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = db::open(&dir.path().join("t.sqlite")).unwrap();
+        db::set_setting(&conn, "summary_provider", "anthropic").unwrap();
+        let note = db::create_note(&conn, "no", "meeting", "").unwrap();
+        let err = resolve_provider(&conn, &note, Some("sk-test".into()))
+            .err()
+            .expect("unknown id must not resolve")
+            .to_string();
+        assert!(err.contains("anthropic"), "{err}");
+    }
+
+    #[test]
+    fn a_transcribe_only_provider_cannot_summarise() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = db::open(&dir.path().join("t.sqlite")).unwrap();
+        db::set_setting(&conn, "summary_provider", "deepgram").unwrap();
+        let note = db::create_note(&conn, "no", "meeting", "").unwrap();
+        assert!(resolve_provider(&conn, &note, Some("sk-test".into())).is_err());
+    }
+
     #[test]
     fn auto_resolves_to_the_detected_language() {
         let (_dir, conn) = temp_conn();

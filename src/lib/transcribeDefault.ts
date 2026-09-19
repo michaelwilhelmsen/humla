@@ -13,14 +13,13 @@
 //
 // — so the rule lives here once rather than being spelled out at each of them.
 
-import { ipc, type ProviderConfig, type TranscribeProvider } from "./ipc";
+import { ipc, type ProviderConfig } from "./ipc";
+import { isKeyProvider, type KeyProvider } from "./providers";
 
 /** The providers whose credentials live in the Keychain — all but `local`. */
-export type CloudTranscribeProvider = "openai" | "deepgram" | "groq";
+export type CloudTranscribeProvider = KeyProvider;
 
-export function isCloudProvider(p: TranscribeProvider): p is CloudTranscribeProvider {
-  return p === "openai" || p === "deepgram" || p === "groq";
-}
+export const isCloudProvider = isKeyProvider;
 
 /**
  * The cloud provider this default represents an actual choice of, or null —

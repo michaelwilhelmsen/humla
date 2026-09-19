@@ -4,6 +4,7 @@
 //! `transcribe_config`. On first read, if the key is missing, we synthesise
 //! it from the legacy keys (see `from_legacy_settings`).
 
+use crate::providers::ProviderId;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -21,13 +22,17 @@ pub enum ProviderConfig {
 }
 
 impl ProviderConfig {
-    pub fn provider_id(&self) -> &'static str {
+    pub fn provider(&self) -> ProviderId {
         match self {
-            ProviderConfig::OpenAi(_) => "openai",
-            ProviderConfig::Local(_) => "local",
-            ProviderConfig::Deepgram(_) => "deepgram",
-            ProviderConfig::Groq(_) => "groq",
+            ProviderConfig::OpenAi(_) => ProviderId::OpenAi,
+            ProviderConfig::Local(_) => ProviderId::Local,
+            ProviderConfig::Deepgram(_) => ProviderId::Deepgram,
+            ProviderConfig::Groq(_) => ProviderId::Groq,
         }
+    }
+
+    pub fn provider_id(&self) -> &'static str {
+        self.provider().as_str()
     }
 
     pub fn model(&self) -> &str {

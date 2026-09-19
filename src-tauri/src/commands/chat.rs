@@ -19,6 +19,7 @@ use parking_lot::Mutex;
 use rusqlite::Connection;
 use serde::Serialize;
 use std::sync::Arc;
+use crate::providers::ProviderId;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 /// Derive the embedding config from the resolved chat provider (issue #48).
@@ -28,8 +29,8 @@ use tauri::{AppHandle, Emitter, Manager, State};
 /// model: mlx_lm.server has no `/v1/embeddings` route, llama-server needs its
 /// own process, and LM Studio names the model `text-embedding-embeddinggemma-…`.
 fn resolve_embed(resolved: &ResolvedChat) -> embed::EmbedConfig {
-    match resolved.provider.as_str() {
-        "ollama" => embed::EmbedConfig {
+    match resolved.provider {
+        ProviderId::Local => embed::EmbedConfig {
             provider: "ollama",
             model: resolved.embed.model.clone().unwrap_or_else(|| OLLAMA_EMBED_MODEL.to_string()),
             base_url: resolved.embed.base_url.clone().unwrap_or_else(|| resolved.base_url.clone()),
@@ -420,10 +421,11 @@ fn is_embedding_model(model: &str) -> bool {
         || m.starts_with("paraphrase-")
 }
 
-// Resolved chat provider for a single call. Only "openai" (cloud, shared key)
-// and "ollama" (local) are valid — see issue #44.
+// Resolved chat provider for a single call. The `chat_provider` setting
+// stores the local one as `ollama` (issue #44); `ProviderId::parse` owns
+// that alias.
 struct ResolvedChat {
-    provider: String,
+    provider: ProviderId,
     base_url: String,
     api_key: Option<String>,
     model: String,
@@ -452,9 +454,12 @@ fn resolve_chat(
 
     let provider = setting("chat_provider")?.unwrap_or_else(|| "openai".into());
     let model_setting = setting("chat_model")?;
+    let id = ProviderId::parse(&provider)
+        .filter(|p| p.capabilities().chat)
+        .ok_or_else(|| anyhow::anyhow!("unknown chat provider “{provider}” — pick one in Settings → Chat."))?;
 
-    match provider.as_str() {
-        "ollama" => {
+    match id {
+        ProviderId::Local => {
             let base_url =
                 setting("local_llm_base_url")?.unwrap_or_else(|| DEFAULT_LOCAL_LLM_BASE_URL.to_string());
             let think = db::get_setting(conn, "local_llm_think")?
@@ -476,9 +481,9 @@ fn resolve_chat(
                 base_url: setting("embed_base_url")?,
                 model: setting("embed_model")?,
             };
-            Ok(ResolvedChat { provider, base_url, api_key: None, model, think, embed })
+            Ok(ResolvedChat { provider: id, base_url, api_key: None, model, think, embed })
         }
-        _ => {
+        ProviderId::OpenAi => {
             let api_key = openai_api_key.filter(|s| !s.is_empty()).ok_or_else(|| {
                 anyhow::anyhow!("OpenAI API key not set — add one in Settings → Chat.")
             })?;
@@ -486,7 +491,7 @@ fn resolve_chat(
             // back to the default chat-class model rather than erroring.
             let model = model_setting.unwrap_or_else(|| DEFAULT_SUMMARY_MODEL.to_string());
             Ok(ResolvedChat {
-                provider,
+                provider: id,
                 base_url: openai::BASE.into(),
                 api_key: Some(api_key),
                 model,
@@ -494,6 +499,7 @@ fn resolve_chat(
                 embed: EmbedOverride::default(),
             })
         }
+        ProviderId::Deepgram | ProviderId::Groq => unreachable!("filtered on the chat capability"),
     }
 }
 
@@ -1682,7 +1688,7 @@ pub async fn chat_send(
         embed_note(&state.db, &embedder, anchor).await;
     }
 
-    let adapter = chat::build_chat_adapter(&resolved.provider);
+    let adapter = chat::build_chat_adapter(resolved.provider);
     let conv_for_sink = conversation_id.clone();
     let app_for_sink = app.clone();
     let sink = move |ev: ChatEvent| match ev {
@@ -2823,6 +2829,24 @@ mod tests {
         for m in ["gemma4:12b-mlx", "qwen3.5:4b", "llama3.2:3b", "gpt-5.4-mini"] {
             assert!(!is_embedding_model(m), "expected chat-capable: {m}");
         }
+    }
+
+    #[test]
+    fn resolve_chat_rejects_an_unknown_provider_instead_of_calling_openai() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = db::open(&dir.path().join("t.sqlite")).unwrap();
+        db::set_setting(&conn, "chat_provider", "anthropic").unwrap();
+        let err = resolve_chat(&conn, Some("sk-test".into())).err().unwrap().to_string();
+        assert!(err.contains("anthropic"), "{err}");
+    }
+
+    #[test]
+    fn resolve_chat_reads_ollama_as_the_stored_local_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = db::open(&dir.path().join("t.sqlite")).unwrap();
+        db::set_setting(&conn, "chat_provider", "ollama").unwrap();
+        db::set_setting(&conn, "chat_model", "gemma4:12b-mlx").unwrap();
+        assert_eq!(resolve_chat(&conn, None).unwrap().provider, ProviderId::Local);
     }
 
     #[test]

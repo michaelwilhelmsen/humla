@@ -55,6 +55,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use crate::db;
+use crate::providers::ProviderId;
 
 type Db = Arc<Mutex<Connection>>;
 
@@ -491,12 +492,15 @@ pub fn assemble_prompt(
 
 // ── Provider factory ────────────────────────────────────────────────────────
 
-/// Build the adapter for the configured chat provider. Only "openai" and
-/// "ollama" are valid (see #44); anything else falls back to OpenAI.
-pub fn build_chat_adapter(provider: &str) -> Box<dyn ChatAdapter> {
+/// Build the adapter for a provider `resolve_chat` has already checked can
+/// chat.
+pub fn build_chat_adapter(provider: ProviderId) -> Box<dyn ChatAdapter> {
     match provider {
-        "ollama" => Box::new(OllamaChatAdapter),
-        _ => Box::new(OpenAiChatAdapter),
+        ProviderId::Local => Box::new(OllamaChatAdapter),
+        ProviderId::OpenAi => Box::new(OpenAiChatAdapter),
+        ProviderId::Deepgram | ProviderId::Groq => {
+            unreachable!("resolve_chat filters on the chat capability")
+        }
     }
 }
 

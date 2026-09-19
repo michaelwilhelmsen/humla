@@ -9,6 +9,7 @@
 use super::err;
 use crate::db;
 use crate::openai;
+use crate::providers::ProviderId;
 use crate::AppState;
 use tauri::State;
 
@@ -128,13 +129,7 @@ pub struct TestResult {
 /// Rejecting unknown ids prevents the frontend from probing arbitrary
 /// Keychain accounts via the Tauri bridge.
 fn canonical_provider_id(s: &str) -> Option<&'static str> {
-    match s {
-        "openai" => Some("openai"),
-        "deepgram" => Some("deepgram"),
-        "groq" => Some("groq"),
-        "local" => Some("local"),
-        _ => None,
-    }
+    ProviderId::parse(s).map(ProviderId::as_str)
 }
 
 #[tauri::command]
@@ -168,24 +163,12 @@ pub async fn provider_key_test(
     let key = read_provider_api_key(&state, id)?
         .ok_or_else(|| "No API key stored".to_string())?;
 
-    let (url, auth_header) = match id {
-        "openai" => (
-            format!("{}/models", openai::BASE),
-            format!("Bearer {key}"),
-        ),
-        "deepgram" => (
-            "https://api.deepgram.com/v1/projects".to_string(),
-            format!("Token {key}"),
-        ),
-        "groq" => (
-            "https://api.groq.com/openai/v1/models".to_string(),
-            format!("Bearer {key}"),
-        ),
-        _ => return Err(format!("provider {id} doesn't support test")),
-    };
+    let test = ProviderId::parse(id)
+        .and_then(|p| p.spec().key_test)
+        .ok_or_else(|| format!("provider {id} doesn't support test"))?;
     let r = openai::client()
-        .get(url)
-        .header("Authorization", auth_header)
+        .get(test.url)
+        .header("Authorization", test.auth.header_value(&key))
         .send()
         .await
         .map_err(|e| format!("network: {e}"))?;

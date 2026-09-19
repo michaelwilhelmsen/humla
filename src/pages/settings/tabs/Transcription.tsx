@@ -8,6 +8,7 @@ import { Row, Section } from "../components/Section";
 import { RenameYouRow } from "../components/RenameYouRow";
 import { Select } from "../../../components/ui/Select";
 import { ProviderKeyCard, type KeyProvider } from "../../../components/provider/ProviderKeyCard";
+import { KEY_PROVIDERS } from "../../../lib/providers";
 import { LANGUAGES, languageOptionLabel } from "../../../lib/languages";
 import { inputClass } from "../types";
 import type { SettingsHook } from "../useSettings";
@@ -15,7 +16,6 @@ import type { SettingsHook } from "../useSettings";
 // The selected cloud provider's key card renders right under the picker;
 // the others sit in Advanced so keys for override-only providers stay
 // reachable. Copy comes from the card's per-provider defaults.
-const KEY_PROVIDERS: KeyProvider[] = ["openai", "deepgram", "groq"];
 
 // Engine choice row: label + description left, pick-radio right, the
 // download/status manager underneath. The radio is presence-gated — an

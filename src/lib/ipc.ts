@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import type { Provider, SummaryProvider } from "./providers";
 import type { SpeakerLabelStat } from "./speakerSuggest";
 import { targetFolderId, targetNoteId, type ChatTarget } from "./chatTarget";
 
@@ -166,7 +167,7 @@ export type SettingsKey =
   // disclosure, so the user is always told before anything is sent.
   | "telemetry_enabled";
 
-export type TranscribeProvider = "openai" | "local" | "deepgram" | "groq";
+export type TranscribeProvider = Provider;
 
 // Mirror of the Rust `crate::stt::ProviderConfig` tagged union. The four
 // variants match the four supported STT providers; `local` carries the
@@ -812,7 +813,7 @@ export type TranscriptEvent = { noteId: string; text: string };
 export type SummaryEvent = { noteId: string; summary: string };
 export type StreamDeltaEvent = { noteId: string; delta: string };
 export type RecordingPhase = "idle" | "starting" | "recording" | "paused" | "stopping" | "diarizing" | "importing";
-export type SummaryProvider = "openai" | "local";
+export type { SummaryProvider };
 // `pending` / `done` ride along on `stopping` only (#182): how many chunk
 // transcriptions were still in flight when stop was pressed, and how many of
 // those have landed. Both absent in every other phase — the backend skips them

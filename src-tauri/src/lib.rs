@@ -11,6 +11,7 @@ mod menubar;
 mod sessions;
 mod commands;
 mod stt;
+mod providers;
 mod chat;
 mod embed;
 // Public so the `humla-mcp` binary (#172) can drive it. Everything below it —

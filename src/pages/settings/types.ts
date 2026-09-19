@@ -29,7 +29,7 @@ export type EditableKey = Exclude<
   | "record_hotkey"
 >;
 
-export type Provider = "openai" | "local" | "deepgram" | "groq";
+export type { Provider } from "../../lib/providers";
 
 export const DEFAULTS: Record<EditableKey, string> = {
   language: "no",

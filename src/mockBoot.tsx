@@ -34,6 +34,8 @@ import { NoteTitleBox, NoteToolbar, PanelEmpty, TranscriptEditor, TranscriptPlay
 import { IntegrationsSection } from "./pages/settings/tabs/Integrations";
 import { ChatTab } from "./pages/settings/tabs/Chat";
 import { RecordingSection } from "./pages/settings/tabs/Recording";
+import { TranscriptionTab } from "./pages/settings/tabs/Transcription";
+import { useSettings } from "./pages/settings/useSettings";
 import { NewWorkspaceModal } from "./components/NewWorkspaceModal";
 import { DISCONNECTED, useCloudStore, type CloudStatus, type CloudWorkspace } from "./lib/cloud";
 import { DEFAULTS, type EditableKey } from "./pages/settings/types";
@@ -545,6 +547,29 @@ function RetentionHarness({
   );
 }
 
+// ---- #192 axis: the key cards Settings → Transcription derives from the
+// provider registry. The default's own card sits under the picker; the other
+// Keychain providers are listed under Advanced.
+function transcriptionKeysCase(def: ProviderConfig): Scenario {
+  return {
+    wrap: settingsWrap,
+    render: () => <TranscriptionKeysHarness />,
+    ipc: {
+      get_transcribe_config: () => ({ default: def, per_language: {} }),
+      provider_key_get: (args) =>
+        (args as { provider: string }).provider === def.provider ? "stored" : null,
+      provider_key_test: () => ({ ok: true, status: 200, error: null }),
+      local_whisper_models: () => [],
+      diarize_status: () => ({ downloaded: false, sizeBytes: 0, path: "" }),
+    },
+  };
+}
+
+function TranscriptionKeysHarness() {
+  const h = useSettings();
+  return <TranscriptionTab {...h} />;
+}
+
 // ---- workspace-creation axis: the sheet's five stages ----------------------
 // Five separate scenarios rather than one clickable flow: the stages are DERIVED
 // from cloud status, so seeding the status is how you reach one — and each is a
@@ -995,6 +1020,10 @@ const CASES: Record<string, Scenario> = {
   "retention-off": retentionCase(false, false),
   "retention-on": retentionCase(true, false),
   "retention-manual": retentionCase(true, true),
+
+  // --- #192: the key cards derive from the provider registry.
+  "keys-openai": transcriptionKeysCase({ provider: "openai", model: "whisper-1" }),
+  "keys-deepgram": transcriptionKeysCase({ provider: "deepgram", model: "nova-3" }),
 
   // --- #179: local chat on Ollama, on a plain OpenAI-compat server, and on one
   // whose embedder is pointed back at Ollama (the shape the issue needs).
