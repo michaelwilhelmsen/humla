@@ -3295,12 +3295,7 @@ async fn ensure_provider_ready(
         other => {
             let provider_id = other.provider_id();
             if read_provider_api_key(state, provider_id)?.is_none() {
-                let label = match provider_id {
-                    "openai" => "OpenAI",
-                    "deepgram" => "Deepgram",
-                    "groq" => "Groq",
-                    _ => "the selected provider",
-                };
+                let label = other.provider().label();
                 Some(format!("{label} API key not set. Add one in Settings → API keys."))
             } else {
                 None

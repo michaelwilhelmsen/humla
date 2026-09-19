@@ -48,6 +48,7 @@ import {
   chosenCloudProvider,
   type CloudTranscribeProvider,
 } from "../../../lib/transcribeDefault";
+import { KEY_PROVIDERS } from "../../../lib/providers";
 import { useDownloadStore } from "../../../lib/store";
 import { useProviderKey } from "../../../components/provider/useProviderKey";
 import type { StepContext } from "../types";
@@ -84,14 +85,18 @@ function cloudConfig(provider: CloudTranscribeProvider): ProviderConfig {
   }
 }
 
-const CLOUD_PROVIDERS: { value: CloudTranscribeProvider; label: string }[] = [
-  { value: "openai", label: "OpenAI" },
-  { value: "deepgram", label: "Deepgram" },
-  { value: "groq", label: "Groq (Whisper Large v3 Turbo)" },
-];
+// Per-provider copy for the picker; the list itself comes from the registry,
+// so a new Keychain provider is a compile error here until it has a row.
+const CLOUD_COPY: Record<CloudTranscribeProvider, { label: string; placeholder: string }> = {
+  openai: { label: "OpenAI", placeholder: "sk-…" },
+  deepgram: { label: "Deepgram", placeholder: "Deepgram API key" },
+  groq: { label: "Groq (Whisper Large v3 Turbo)", placeholder: "gsk_…" },
+};
+
+const CLOUD_PROVIDERS = KEY_PROVIDERS.map((value) => ({ value, label: CLOUD_COPY[value].label }));
 
 function keyPlaceholder(p: CloudTranscribeProvider): string {
-  return p === "openai" ? "sk-…" : p === "deepgram" ? "Deepgram API key" : "gsk_…";
+  return CLOUD_COPY[p].placeholder;
 }
 
 type Selection = "local" | "cloud" | null;

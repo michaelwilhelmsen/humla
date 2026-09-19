@@ -492,14 +492,12 @@ pub fn assemble_prompt(
 
 // ── Provider factory ────────────────────────────────────────────────────────
 
-/// Build the adapter for a provider `resolve_chat` has already checked can
-/// chat.
-pub fn build_chat_adapter(provider: ProviderId) -> Box<dyn ChatAdapter> {
+pub fn build_chat_adapter(provider: ProviderId) -> Result<Box<dyn ChatAdapter>> {
     match provider {
-        ProviderId::Local => Box::new(OllamaChatAdapter),
-        ProviderId::OpenAi => Box::new(OpenAiChatAdapter),
+        ProviderId::Local => Ok(Box::new(OllamaChatAdapter)),
+        ProviderId::OpenAi => Ok(Box::new(OpenAiChatAdapter)),
         ProviderId::Deepgram | ProviderId::Groq => {
-            unreachable!("resolve_chat filters on the chat capability")
+            anyhow::bail!("{provider} is a transcription provider and can't chat")
         }
     }
 }

@@ -421,9 +421,7 @@ fn is_embedding_model(model: &str) -> bool {
         || m.starts_with("paraphrase-")
 }
 
-// Resolved chat provider for a single call. The `chat_provider` setting
-// stores the local one as `ollama` (issue #44); `ProviderId::parse` owns
-// that alias.
+// Resolved chat provider for a single call.
 struct ResolvedChat {
     provider: ProviderId,
     base_url: String,
@@ -1688,7 +1686,7 @@ pub async fn chat_send(
         embed_note(&state.db, &embedder, anchor).await;
     }
 
-    let adapter = chat::build_chat_adapter(resolved.provider);
+    let adapter = chat::build_chat_adapter(resolved.provider).map_err(|e| e.to_string())?;
     let conv_for_sink = conversation_id.clone();
     let app_for_sink = app.clone();
     let sink = move |ev: ChatEvent| match ev {

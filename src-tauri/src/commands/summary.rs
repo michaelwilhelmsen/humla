@@ -32,8 +32,7 @@ pub(super) struct ResolvedProvider {
 
 // Decide whether this note's summary call should hit cloud OpenAI or a
 // local OpenAI-compatible server. Note-level override beats the global
-// setting; default is openai. An id the registry doesn't know, or one that
-// can't summarise, is an error — never a silent OpenAI call.
+// setting; default is openai.
 //
 // For local: reads `local_llm_base_url` and `local_llm_model` from settings.
 // `api_key` is forwarded as-is — local servers typically ignore it but
@@ -48,6 +47,8 @@ pub(super) fn resolve_provider(
         db::get_setting(conn, "summary_provider")
             .ok()
             .flatten()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "openai".into())
     } else {
         note_override.to_string()
@@ -421,6 +422,16 @@ mod tests {
             .expect("unknown id must not resolve")
             .to_string();
         assert!(err.contains("anthropic"), "{err}");
+    }
+
+    #[test]
+    fn a_blank_summary_provider_row_still_means_openai() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = db::open(&dir.path().join("t.sqlite")).unwrap();
+        db::set_setting(&conn, "summary_provider", "  ").unwrap();
+        let note = db::create_note(&conn, "no", "meeting", "").unwrap();
+        let p = resolve_provider(&conn, &note, Some("sk-test".into())).unwrap();
+        assert_eq!(p.base_url, openai::BASE);
     }
 
     #[test]

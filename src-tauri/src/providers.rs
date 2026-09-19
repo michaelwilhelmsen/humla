@@ -1,10 +1,6 @@
-//! The one list of providers Humla knows. Every decision keyed by a provider
-//! id — which Keychain account holds its key, how that key is tested, which
-//! jobs it can do — is a lookup here, so adding a provider is one row and a
-//! stored id nobody recognises is an error rather than a fall-through.
-//!
-//! `src/lib/providers.ts` mirrors `REGISTRY`; `providers.test.ts` reads this
-//! file and fails when the two drift.
+//! The one list of providers Humla knows: Keychain account, key test and
+//! capabilities per id. `src/lib/providers.ts` mirrors `REGISTRY` and
+//! `providers.test.ts` reads this file to keep the two aligned.
 
 use std::fmt;
 
@@ -43,16 +39,16 @@ pub struct KeyTest {
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Capabilities {
-    pub transcribe: bool,
     pub summarize: bool,
     pub chat: bool,
-    pub embed: bool,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ProviderSpec {
     pub id: ProviderId,
     pub id_str: &'static str,
+    /// Display name for user-facing copy.
+    pub label: &'static str,
     /// Keychain account under `KEYCHAIN_SERVICE`; `None` for a provider that
     /// takes no key.
     pub keychain_account: Option<&'static str>,
@@ -64,39 +60,43 @@ pub const REGISTRY: &[ProviderSpec] = &[
     ProviderSpec {
         id: ProviderId::OpenAi,
         id_str: "openai",
+        label: "OpenAI",
         keychain_account: Some("openai_api_key"),
         key_test: Some(KeyTest {
             url: "https://api.openai.com/v1/models",
             auth: AuthScheme::Bearer,
         }),
-        capabilities: Capabilities { transcribe: true, summarize: true, chat: true, embed: true },
+        capabilities: Capabilities { summarize: true, chat: true },
     },
     ProviderSpec {
         id: ProviderId::Deepgram,
         id_str: "deepgram",
+        label: "Deepgram",
         keychain_account: Some("deepgram_api_key"),
         key_test: Some(KeyTest {
             url: "https://api.deepgram.com/v1/projects",
             auth: AuthScheme::Token,
         }),
-        capabilities: Capabilities { transcribe: true, summarize: false, chat: false, embed: false },
+        capabilities: Capabilities { summarize: false, chat: false },
     },
     ProviderSpec {
         id: ProviderId::Groq,
         id_str: "groq",
+        label: "Groq",
         keychain_account: Some("groq_api_key"),
         key_test: Some(KeyTest {
             url: "https://api.groq.com/openai/v1/models",
             auth: AuthScheme::Bearer,
         }),
-        capabilities: Capabilities { transcribe: true, summarize: false, chat: false, embed: false },
+        capabilities: Capabilities { summarize: false, chat: false },
     },
     ProviderSpec {
         id: ProviderId::Local,
         id_str: "local",
+        label: "Local",
         keychain_account: None,
         key_test: None,
-        capabilities: Capabilities { transcribe: true, summarize: true, chat: true, embed: true },
+        capabilities: Capabilities { summarize: true, chat: true },
     },
 ];
 
@@ -106,7 +106,6 @@ const LOCAL_ALIASES: &[&str] = &["ollama"];
 
 impl ProviderId {
     pub fn parse(s: &str) -> Option<Self> {
-        let s = s.trim();
         if let Some(spec) = REGISTRY.iter().find(|p| p.id_str == s) {
             return Some(spec.id);
         }
@@ -134,6 +133,10 @@ impl ProviderId {
     pub fn capabilities(self) -> Capabilities {
         self.spec().capabilities
     }
+
+    pub fn label(self) -> &'static str {
+        self.spec().label
+    }
 }
 
 impl fmt::Display for ProviderId {
@@ -156,10 +159,10 @@ mod tests {
     }
 
     #[test]
-    fn unknown_and_padded_ids() {
+    fn unknown_ids_are_none_and_nothing_is_trimmed() {
         assert_eq!(ProviderId::parse("nonsense"), None);
         assert_eq!(ProviderId::parse(""), None);
-        assert_eq!(ProviderId::parse(" groq "), Some(ProviderId::Groq));
+        assert_eq!(ProviderId::parse(" groq "), None);
     }
 
     #[test]
