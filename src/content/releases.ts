@@ -11,6 +11,24 @@ export type Release = {
 
 export const releases: Release[] = [
   {
+    version: "0.63.0",
+    date: "2026-09-20",
+    title: "Claude joins the lineup",
+    summary: "Summaries and chat with Anthropic, using your own API key.",
+    paragraphs: [
+      "You can now pick Anthropic as the provider for AI summaries and for chat over your notes. Add your Claude API key once under Settings, choose a model, and summaries stream into the panel just as they do with OpenAI.",
+      "Model pickers are live for both cloud providers: Humla asks the API for the models your key can use, so new releases show up without waiting for an app update. Chat on Anthropic searches your notes by keyword, since Claude has no embeddings endpoint.",
+    ],
+    highlights: [
+      "Choose Anthropic for summaries, per note or as the default.",
+      "Chat over your notes with Claude, tools and citations included.",
+      "OpenAI and Anthropic model lists come straight from your account.",
+    ],
+    issues: [
+      { title: "Anthropic API as a summary (and chat) provider", reference: "#183", status: "Closed", url: "https://github.com/michaelwilhelmsen/humla/issues/183" },
+    ],
+  },
+  {
     version: "0.62.0",
     date: "2026-09-15",
     title: "A home for what’s new",
