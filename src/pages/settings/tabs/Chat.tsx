@@ -26,6 +26,15 @@ import type { SettingsHook } from "../useSettings";
 // prompt saying exactly what's still missing. The embedding model is
 // auto-derived (text-embedding-3-small / embeddinggemma) and not surfaced here;
 // its setup lands with semantic retrieval.
+/** Whether a stored chat model id belongs to the given provider. Local ids are
+ *  arbitrary strings, so nothing is claimed about them. */
+export function modelSuitsProvider(model: string, provider: string): boolean {
+  if (!model) return true;
+  if (provider === "anthropic") return model.startsWith("claude-");
+  if (provider === "openai") return !model.startsWith("claude-");
+  return true;
+}
+
 export function ChatTab({ s, update }: Pick<SettingsHook, "s" | "update">) {
   const isOllama = s.chat_provider === "ollama";
   const isAnthropic = s.chat_provider === "anthropic";
@@ -88,7 +97,14 @@ export function ChatTab({ s, update }: Pick<SettingsHook, "s" | "update">) {
         control={
           <Select
             value={s.chat_provider}
-            onChange={(v) => update("chat_provider", v)}
+            onChange={(v) => {
+              void update("chat_provider", v);
+              // One `chat_model` serves every provider, so a switch can leave
+              // a Claude id on OpenAI or the reverse. Clear it rather than
+              // carry it: "" is the state the tab already draws as
+              // "Choose a model…".
+              if (!modelSuitsProvider(s.chat_model, v)) void update("chat_model", "");
+            }}
             options={CHAT_PROVIDERS}
           />
         }

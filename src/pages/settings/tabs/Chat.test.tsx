@@ -36,6 +36,39 @@ describe("ChatTab provider setting", () => {
   });
 });
 
+describe("ChatTab provider switch", () => {
+  // One `chat_model` serves every provider, so a switch used to leave "gpt-5.5"
+  // standing in the Anthropic picker.
+  it("clears a model that belongs to the provider being left", async () => {
+    const update = vi.fn();
+    render(
+      <ChatTab s={settings({ chat_provider: "openai", chat_model: "gpt-5.5" })} update={update} />,
+    );
+    await userEvent.click(screen.getByRole("combobox", { name: /Cloud \(OpenAI\)/ }));
+    await userEvent.click(screen.getByRole("option", { name: "Cloud (Anthropic)" }));
+    expect(update).toHaveBeenCalledWith("chat_provider", "anthropic");
+    expect(update).toHaveBeenCalledWith("chat_model", "");
+  });
+
+  it("keeps a model the new provider owns", async () => {
+    const update = vi.fn();
+    render(
+      <ChatTab
+        s={settings({ chat_provider: "openai", chat_model: "claude-opus-5" })}
+        update={update}
+      />,
+    );
+    await userEvent.click(screen.getByRole("combobox", { name: /Cloud \(OpenAI\)/ }));
+    await userEvent.click(screen.getByRole("option", { name: "Cloud (Anthropic)" }));
+    expect(update).not.toHaveBeenCalledWith("chat_model", "");
+  });
+
+  it("shows Choose a model… once the model is cleared", async () => {
+    render(<ChatTab s={settings({ chat_provider: "anthropic", chat_model: "" })} update={async () => {}} />);
+    expect(await screen.findByRole("combobox", { name: "Choose a model…" })).toBeInTheDocument();
+  });
+});
+
 describe("ChatTab OpenAI model list", () => {
   it("offers the live listing when there is one", async () => {
     mockTauri({ provider_key_get: () => "stored", openai_list_models: () => ["gpt-9-turbo"] });

@@ -448,6 +448,23 @@ fn is_embedding_model(model: &str) -> bool {
         || m.starts_with("paraphrase-")
 }
 
+/// Whether a stored `chat_model` belongs to the provider now in force. One
+/// setting serves every provider, so switching leaves the last one's id behind;
+/// a foreign id is read as unset rather than sent. Local ids are arbitrary
+/// strings and nothing is claimed about them.
+fn suits_provider(model: &str, provider: ProviderId) -> bool {
+    let is_claude = model.starts_with("claude-");
+    let ok = match provider {
+        ProviderId::Anthropic => is_claude,
+        ProviderId::OpenAi => !is_claude,
+        _ => true,
+    };
+    if !ok {
+        eprintln!("[chat] stored chat_model “{model}” isn't a {provider} model — using the default");
+    }
+    ok
+}
+
 // Resolved chat provider for a single call.
 struct ResolvedChat {
     provider: ProviderId,
@@ -513,8 +530,12 @@ fn resolve_chat(
                 anyhow::anyhow!("OpenAI API key not set — add one in Settings → Chat.")
             })?;
             // A fresh install may have a key but no explicit model yet; fall
-            // back to the default chat-class model rather than erroring.
-            let model = model_setting.unwrap_or_else(|| DEFAULT_SUMMARY_MODEL.to_string());
+            // back to the default chat-class model rather than erroring. So
+            // does a model left behind by another provider — `chat_model` is
+            // one setting shared by all of them.
+            let model = model_setting
+                .filter(|m| suits_provider(m, id))
+                .unwrap_or_else(|| DEFAULT_SUMMARY_MODEL.to_string());
             Ok(ResolvedChat {
                 provider: id,
                 base_url: openai::BASE.into(),
@@ -528,7 +549,9 @@ fn resolve_chat(
             let api_key = api_key.filter(|s| !s.is_empty()).ok_or_else(|| {
                 anyhow::anyhow!("Anthropic API key not set — add one in Settings → Chat.")
             })?;
-            let model = model_setting.unwrap_or_else(|| crate::anthropic::DEFAULT_MODEL.to_string());
+            let model = model_setting
+                .filter(|m| suits_provider(m, id))
+                .unwrap_or_else(|| crate::anthropic::DEFAULT_MODEL.to_string());
             Ok(ResolvedChat {
                 provider: id,
                 base_url: crate::anthropic::BASE.into(),
@@ -2949,6 +2972,36 @@ mod tests {
         assert_eq!(resolved.base_url, crate::anthropic::BASE);
         assert_eq!(resolved.model, crate::anthropic::DEFAULT_MODEL);
         assert!(resolve_embed(&resolved).is_none());
+    }
+
+    // One `chat_model` serves every provider, so switching leaves the last
+    // one's id behind. The backend must not send it on.
+    #[test]
+    fn a_foreign_chat_model_falls_back_to_the_providers_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = db::open(&dir.path().join("foreign.sqlite")).unwrap();
+
+        db::set_setting(&conn, "chat_provider", "anthropic").unwrap();
+        db::set_setting(&conn, "chat_model", "gpt-5.5").unwrap();
+        let r = resolve_chat(&conn, Some("sk-ant-test".into())).unwrap();
+        assert_eq!(r.model, crate::anthropic::DEFAULT_MODEL);
+
+        db::set_setting(&conn, "chat_provider", "openai").unwrap();
+        db::set_setting(&conn, "chat_model", "claude-sonnet-5").unwrap();
+        let r = resolve_chat(&conn, Some("sk-test".into())).unwrap();
+        assert_eq!(r.model, DEFAULT_SUMMARY_MODEL);
+    }
+
+    #[test]
+    fn a_models_own_provider_keeps_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = db::open(&dir.path().join("own.sqlite")).unwrap();
+        db::set_setting(&conn, "chat_provider", "anthropic").unwrap();
+        db::set_setting(&conn, "chat_model", "claude-opus-5").unwrap();
+        assert_eq!(resolve_chat(&conn, Some("k".into())).unwrap().model, "claude-opus-5");
+        db::set_setting(&conn, "chat_provider", "openai").unwrap();
+        db::set_setting(&conn, "chat_model", "gpt-5.5").unwrap();
+        assert_eq!(resolve_chat(&conn, Some("k".into())).unwrap().model, "gpt-5.5");
     }
 
     #[test]
