@@ -2065,12 +2065,12 @@ describe("ChatPanel conversation pins (#115)", () => {
   });
 
   it("pins a Client, shows it as a removable token, and writes it through", async () => {
-    const calls: { client: string | null }[] = [];
+    const calls: { kind: string; value: string | null }[] = [];
     mockTauri({
       provider_key_get: () => "sk-test",
       chat_history: () => history(),
-      chat_set_client_filter: (a) => {
-        calls.push(a as { client: string | null });
+      chat_set_pin: (a) => {
+        calls.push(a as { kind: string; value: string | null });
         return null;
       },
     });
@@ -2089,21 +2089,42 @@ describe("ChatPanel conversation pins (#115)", () => {
 
     const strip = await screen.findByTestId("chat-pin-strip");
     expect(strip).toHaveTextContent("Acme");
-    await waitFor(() => expect(calls.at(-1)?.client).toBe("c-acme"));
+    await waitFor(() => expect(calls.at(-1)).toMatchObject({ kind: "client", value: "c-acme" }));
 
     // And the token's × clears it, in one click — the property that decided the
     // shape over a collapsing "2 filters" chip.
     await userEvent.click(screen.getByRole("button", { name: "Remove filter: Acme" }));
     expect(screen.queryByTestId("chat-pin-strip")).toBeNull();
-    await waitFor(() => expect(calls.at(-1)?.client).toBeNull());
+    await waitFor(() => expect(calls.at(-1)).toMatchObject({ kind: "client", value: null }));
+  });
+
+  it("hides the Client token under note breadth, where retrieval drops the pin", async () => {
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () => history(),
+      chat_get_breadth: () => "note",
+      chat_get_pin: (a) => ((a as { kind: string }).kind === "client" ? "c-acme" : "Hege"),
+    });
+    useNotesStore.setState({
+      clients: [{ id: "c-acme", name: "Acme", created_at: 0, updated_at: 0 }],
+    });
+    renderPanel();
+    // The pin is stored and comes back when the breadth widens, but while it is
+    // dropped a token would claim a narrowing the search isn't doing. The speaker
+    // pin IS applied here, so its token stays.
+    const strip = await screen.findByTestId("chat-pin-strip");
+    expect(strip).toHaveTextContent("Hege");
+    expect(strip).not.toHaveTextContent("Acme");
   });
 
   it("names a Client that no longer exists instead of showing an id or reading as off", async () => {
     mockTauri({
       provider_key_get: () => "sk-test",
       chat_history: () => history(),
+      // Widened, or the token would be hidden for the other reason.
+      chat_get_breadth: () => "all",
       // A pin whose Client was deleted since: the id resolves to no name.
-      chat_get_client_filter: () => "c-gone",
+      chat_get_pin: (a) => ((a as { kind: string }).kind === "client" ? "c-gone" : ""),
       clients_list: () => [],
     });
     renderPanel();
@@ -2136,7 +2157,7 @@ describe("ChatPanel conversation pins (#115)", () => {
       provider_key_get: () => "sk-test",
       chat_history: () => history(),
       chat_get_breadth: () => "note",
-      chat_get_speaker_filter: () => "Hege",
+      chat_get_pin: (a) => ((a as { kind: string }).kind === "speaker" ? "Hege" : ""),
     });
     renderPanel();
     expect(await screen.findByTestId("chat-pin-strip")).toHaveTextContent("Hege");

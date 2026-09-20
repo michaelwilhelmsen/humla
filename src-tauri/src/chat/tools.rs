@@ -74,9 +74,8 @@ pub enum ToolScope {
 /// The conversation-level pins the user set, as opposed to the filters the model
 /// chooses per call. Both narrow the same two fields, and the pin always wins.
 ///
-/// Orthogonal to [`ToolScope`] rather than folded into it: breadth answers what is
-/// in reach and heals against the anchor note; these answer whose and who spoke,
-/// and have no anchor to heal against.
+/// Breadth answers what is in reach and heals against the anchor note; these
+/// answer whose and who spoke, and have no anchor to heal against.
 ///
 /// Applied to search and listing, not to `get_note`: a note id only reaches the
 /// model through a search or listing that was already pinned, so clamping the read
@@ -91,19 +90,14 @@ pub struct Pins {
 
 /// Whether the Client pin applies under this breadth.
 ///
-/// Dropped under `note`: one note is in scope, so it can only take the anchor
-/// away. The speaker pin is not dropped — it narrows to the passages that person
-/// spoke in. Mirrors `resolveScope` in `humla-cloud/chat-service/src/tools.ts`.
+/// Dropped under `note`, where one note is in scope and it could only take the
+/// anchor away. The single owner of that rule: `resolve_filter` reads it, so does
+/// the prompt's disclosure, and the client's own picker mirrors it. Mirrors
+/// `resolveScope` in `humla-cloud/chat-service/src/tools.ts`.
 pub fn client_pin_applies(scope: &ToolScope) -> bool {
     !matches!(scope, ToolScope::Note(_))
 }
 
-impl Pins {
-    /// True when nothing is pinned.
-    pub fn is_empty(&self) -> bool {
-        self.client.is_none() && self.speaker.is_none()
-    }
-}
 
 /// The three retrieval tool names, in one place so specs + dispatch agree.
 pub const TOOL_SEARCH: &str = "search_notes";
@@ -308,7 +302,7 @@ fn validate_window(scope: &ToolScope, args: &Value, now_ms: i64) -> Result<(), S
 /// scope, so a window has nothing to narrow and can only take it away: a model
 /// passing `within_days: 7` while the user has an older note open would get zero
 /// hits searching the very note on screen.
-fn resolve_filter<'a>(
+pub(super) fn resolve_filter<'a>(
     scope: &'a ToolScope,
     pins: &'a Pins,
     args: &'a Value,
@@ -319,7 +313,9 @@ fn resolve_filter<'a>(
     let until_ms = window_until(args, now_ms);
     // A pin beats the model's own argument for the same field (see `Pins`).
     let speaker = pins.speaker.as_deref().or_else(|| str_arg(args, ARG_SPEAKER));
-    let client_id = pins.client.as_deref().or_else(|| str_arg(args, "client_id"));
+    let client_id = client_pin_applies(scope)
+        .then(|| pins.client.as_deref().or_else(|| str_arg(args, "client_id")))
+        .flatten();
     // The app user's own speech lives under two labels across a library: the literal
     // `You` the diarizer writes for mic chunks on remote calls, and their real name
     // wherever they renamed it. So asking for either finds both — filtering for one
@@ -335,13 +331,9 @@ fn resolve_filter<'a>(
         _ => None,
     });
     match scope {
-        // `speaker` survives even here, unlike the date window: with one note in
-        // scope a window can only take it away, but a speaker still narrows
-        // MEANINGFULLY — to the passages of this note that person spoke in, which is
-        // exactly "what did she say in this meeting".
-        // The Client pin is dropped here, like the date window: with one note in
-        // scope it can only take the anchor away. The speaker pin survives — it
-        // narrows to the passages that person spoke in.
+        // `speaker` survives here, unlike the date window and the client: with one
+        // note in scope those can only take it away, where a speaker narrows to the
+        // passages of this note that person spoke in.
         ToolScope::Note(id) => NoteFilter {
             note_id: Some(id),
             speaker,

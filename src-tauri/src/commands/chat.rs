@@ -17,7 +17,7 @@ use crate::AppState;
 pub(crate) const SETTING_DISPLAY_NAME: &str = "user_display_name";
 use parking_lot::Mutex;
 use rusqlite::Connection;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use crate::providers::ProviderId;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -877,10 +877,46 @@ fn resolve_for_write(
     Ok(Some(resolve_or_create(conn, tenant, target, explicit, DraftSettings::default())?))
 }
 
-/// A stored filter column as an optional value: empty (and blank) is "no pin",
-/// never a pin on nothing. One owner for that normalisation, since every pin
-/// column is written by a setter that already refuses blanks and read by paths
-/// that must not depend on that having happened.
+/// The three conversation-level retrieval pins, as one value.
+///
+/// They are written, mirrored, carried per turn and reported to the client
+/// together, so passing them as three loose strings meant every signature that
+/// touched one touched all three — and a transposed pair of same-typed arguments
+/// would have compiled.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationPins {
+    /// A PB user id, or "" for off.
+    pub owner: String,
+    /// A Client id, or "" for off.
+    pub client: String,
+    /// A transcript label, or "" for off. Not an id, and never will be (ADR-0002).
+    pub speaker: String,
+}
+
+impl ConversationPins {
+    fn of(c: &db::Conversation) -> Self {
+        Self {
+            owner: c.owner_filter.clone(),
+            client: c.client_filter.clone(),
+            speaker: c.speaker_filter.clone(),
+        }
+    }
+}
+
+/// The same three pins as they arrive from the server: `None` is "the row does
+/// not carry this field" (an older server), which is not the same as "" and must
+/// not stamp an empty pin over an inherited one.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ServerPins<'a> {
+    pub owner: Option<&'a str>,
+    pub client: Option<&'a str>,
+    pub speaker: Option<&'a str>,
+}
+
+/// A pin value as an optional: empty (and blank) is "no pin", never a pin on
+/// nothing. The one owner of that normalisation, so no read path depends on a
+/// setter having refused the blank first.
 fn non_empty(s: &str) -> Option<String> {
     let t = s.trim();
     (!t.is_empty()).then(|| t.to_string())
@@ -957,7 +993,7 @@ fn validated_draft(
     }
     // An empty string is "no pin", not a pin on nobody — normalise it away rather
     // than storing it, so the created row reads the same as one that never had one.
-    let owner_filter = owner_filter.filter(|o| !o.trim().is_empty());
+    let owner_filter = owner_filter.as_deref().and_then(non_empty);
     if owner_filter.is_some() {
         let personal = {
             let conn = state.db.lock();
@@ -974,8 +1010,8 @@ fn validated_draft(
     Ok(DraftSettings {
         breadth,
         owner_filter,
-        client_filter: client_filter.filter(|c| !c.trim().is_empty()),
-        speaker_filter: speaker_filter.filter(|s| !s.trim().is_empty()),
+        client_filter: client_filter.as_deref().and_then(non_empty),
+        speaker_filter: speaker_filter.as_deref().and_then(non_empty),
     })
 }
 
@@ -1003,14 +1039,12 @@ fn resolve_or_create(
     let breadth = draft.breadth.unwrap_or_else(|| inherited_breadth(conn, tenant, target));
     let conv = db::create_conversation(conn, tenant, target.scope(), target.scope_id(), &breadth)
         .map_err(|e| e.to_string())?;
-    // Written after creation rather than widening the INSERT, like the authorship
-    // pin below: pins are rare and `create_conversation` is on every path.
-    if let Some(client) = draft.client_filter.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
-        db::set_conversation_client_filter(conn, &conv.id, Some(client))
+    if let Some(client) = draft.client_filter.as_deref().and_then(non_empty) {
+        db::set_conversation_client_filter(conn, &conv.id, Some(&client))
             .map_err(|e| e.to_string())?;
     }
-    if let Some(speaker) = draft.speaker_filter.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        db::set_conversation_speaker_filter(conn, &conv.id, Some(speaker))
+    if let Some(speaker) = draft.speaker_filter.as_deref().and_then(non_empty) {
+        db::set_conversation_speaker_filter(conn, &conv.id, Some(&speaker))
             .map_err(|e| e.to_string())?;
     }
     let reread = |conn: &rusqlite::Connection| {
@@ -1327,7 +1361,7 @@ pub fn chat_set_owner_filter(
     owner: Option<String>,
 ) -> Result<(), String> {
     let target = ChatTarget::from_ids(note_id, folder_id)?;
-    let owner = owner.map(|o| o.trim().to_string()).filter(|o| !o.is_empty());
+    let owner = owner.as_deref().and_then(non_empty);
     let state: State<AppState> = app.state();
     let conn = state.db.lock();
     let ctx = ChatContext::load(&conn);
@@ -1348,48 +1382,36 @@ pub fn chat_set_owner_filter(
         .map_err(|e| e.to_string())
 }
 
-/// Pin (or clear) the conversation's Client filter.
+/// Which pin a `chat_set_pin` / `chat_get_pin` call is about.
 ///
-/// Unlike `chat_set_owner_filter` this is allowed in Personal: a Personal library
-/// has Clients, and the local path applies the pin. Same for the speaker below.
-#[tauri::command]
-pub fn chat_set_client_filter(
-    app: AppHandle,
-    note_id: Option<String>,
-    folder_id: Option<String>,
-    conversation_id: Option<String>,
-    client: Option<String>,
-) -> Result<(), String> {
-    let target = ChatTarget::from_ids(note_id, folder_id)?;
-    let client = client.map(|c| c.trim().to_string()).filter(|c| !c.is_empty());
-    let state: State<AppState> = app.state();
-    let conn = state.db.lock();
-    let ctx = ChatContext::load(&conn);
-    // A draft holds its pin in the pane until the first turn creates the row
-    // (#120) — the same reason the other two setters return early here.
-    let Some(conversation) =
-        resolve_for_write(&conn, ctx.tenant(), &target, conversation_id.as_deref())?
-    else {
-        return Ok(());
-    };
-    db::set_conversation_client_filter(&conn, &conversation.id, client.as_deref())
-        .map_err(|e| e.to_string())
+/// One pair of commands rather than a pair per pin: the resolve-or-return-early
+/// dance is the whole body, and copying it per pin is how one copy comes to
+/// disagree with the others about drafts or tenancy.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PinKind {
+    Client,
+    Speaker,
 }
 
-/// Pin (or clear) the conversation's speaker filter.
+/// Pin (or clear) the conversation's Client or speaker filter.
 ///
-/// A transcript label, not an id (ADR-0002): two spellings of one person are two
-/// pins, and nothing reconciles them at read time.
+/// Unlike `chat_set_owner_filter` these are allowed in Personal: a Personal
+/// library has Clients and speakers, and the local path applies both.
+///
+/// A draft holds its pin in the pane until the first turn creates the row (#120),
+/// which is why a missing conversation returns early rather than creating one.
 #[tauri::command]
-pub fn chat_set_speaker_filter(
+pub fn chat_set_pin(
     app: AppHandle,
     note_id: Option<String>,
     folder_id: Option<String>,
     conversation_id: Option<String>,
-    speaker: Option<String>,
+    kind: PinKind,
+    value: Option<String>,
 ) -> Result<(), String> {
     let target = ChatTarget::from_ids(note_id, folder_id)?;
-    let speaker = speaker.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let value = value.as_deref().and_then(non_empty);
     let state: State<AppState> = app.state();
     let conn = state.db.lock();
     let ctx = ChatContext::load(&conn);
@@ -1398,18 +1420,22 @@ pub fn chat_set_speaker_filter(
     else {
         return Ok(());
     };
-    db::set_conversation_speaker_filter(&conn, &conversation.id, speaker.as_deref())
-        .map_err(|e| e.to_string())
+    let write = match kind {
+        PinKind::Client => db::set_conversation_client_filter,
+        PinKind::Speaker => db::set_conversation_speaker_filter,
+    };
+    write(&conn, &conversation.id, value.as_deref()).map_err(|e| e.to_string())
 }
 
-/// Read the persisted Client pin. `""` = off, and so is no session yet: a pin is
-/// only ever something the user set, so there is nothing to inherit.
+/// Read a persisted pin. `""` = off, and so is no session yet: a pin is only ever
+/// something the user set, so there is nothing to inherit.
 #[tauri::command]
-pub fn chat_get_client_filter(
+pub fn chat_get_pin(
     app: AppHandle,
     note_id: Option<String>,
     folder_id: Option<String>,
     conversation_id: Option<String>,
+    kind: PinKind,
 ) -> Result<String, String> {
     let target = ChatTarget::from_ids(note_id, folder_id)?;
     let state: State<AppState> = app.state();
@@ -1417,26 +1443,10 @@ pub fn chat_get_client_filter(
     let ctx = ChatContext::load(&conn);
     Ok(
         resolve_for_read(&conn, ctx.tenant(), &target, conversation_id.as_deref())?
-            .map(|c| c.client_filter)
-            .unwrap_or_default(),
-    )
-}
-
-/// Read the persisted speaker pin. `""` = off.
-#[tauri::command]
-pub fn chat_get_speaker_filter(
-    app: AppHandle,
-    note_id: Option<String>,
-    folder_id: Option<String>,
-    conversation_id: Option<String>,
-) -> Result<String, String> {
-    let target = ChatTarget::from_ids(note_id, folder_id)?;
-    let state: State<AppState> = app.state();
-    let conn = state.db.lock();
-    let ctx = ChatContext::load(&conn);
-    Ok(
-        resolve_for_read(&conn, ctx.tenant(), &target, conversation_id.as_deref())?
-            .map(|c| c.speaker_filter)
+            .map(|c| match kind {
+                PinKind::Client => c.client_filter,
+                PinKind::Speaker => c.speaker_filter,
+            })
             .unwrap_or_default(),
     )
 }
@@ -2033,9 +2043,7 @@ async fn chat_send_cloud(
         title,
         conversation,
         breadth,
-        owner_filter,
-        client_filter,
-        speaker_filter,
+        pins,
         client_display,
         folder_display,
     ) = {
@@ -2057,15 +2065,12 @@ async fn chat_send_cloud(
         // The pinned authorship filter (#103), read from the same row as breadth
         // and binding the same way: it's the user's stated intent, so it applies
         // whatever the model asks for.
-        let owner_filter = conversation.owner_filter.clone();
+        let pins = ConversationPins::of(&conversation);
         // The Client pin's display name is resolved here as the folder's is: the
         // scope carries an id the model has never seen, so losing the name costs
         // the disclosure. The speaker pin is its own name.
-        let client_filter = conversation.client_filter.clone();
-        let speaker_filter = conversation.speaker_filter.clone();
-        let client_display = (!client_filter.trim().is_empty())
-            .then(|| db::client_name(&conn, &client_filter).ok().flatten())
-            .flatten();
+        let client_display = non_empty(&pins.client)
+            .and_then(|id| db::client_name(&conn, &id).ok().flatten());
         // The folder's display NAME for #113's breadth disclosure — the server has to
         // say `the folder "K2 pilot"`, and the scope carries only an id the user has
         // never seen. Resolved here beside the folder id it names; `None` degrades to
@@ -2090,9 +2095,7 @@ async fn chat_send_cloud(
             note.as_ref().map(|n| n.title.clone()).unwrap_or_default(),
             conversation,
             breadth,
-            owner_filter,
-            client_filter,
-            speaker_filter,
+            pins,
             client_display,
             folder_display,
         )
@@ -2109,11 +2112,11 @@ async fn chat_send_cloud(
             folder_id: folder_id.as_deref(),
             // The name is display-only, resolved by the caller from the workspace
             // roster; the id is what the server filters on.
-            owner: (!owner_filter.trim().is_empty())
-                .then(|| (owner_filter.as_str(), owner_name.as_deref().unwrap_or(""))),
-            client: (!client_filter.trim().is_empty())
-                .then(|| (client_filter.as_str(), client_display.as_deref().unwrap_or(""))),
-            speaker: (!speaker_filter.trim().is_empty()).then_some(speaker_filter.as_str()),
+            owner: (!pins.owner.trim().is_empty())
+                .then(|| (pins.owner.as_str(), owner_name.as_deref().unwrap_or(""))),
+            client: (!pins.client.trim().is_empty())
+                .then(|| (pins.client.as_str(), client_display.as_deref().unwrap_or(""))),
+            speaker: (!pins.speaker.trim().is_empty()).then_some(pins.speaker.as_str()),
             // Display names for #113's disclosure. `title` IS the anchor note's title
             // here (the server derives a conversation title from it), so it doubles as
             // the note-breadth name rather than being resolved twice.
@@ -2444,11 +2447,10 @@ fn ensure_workspace_handle(
     target: &ChatTarget,
     remote_id: &str,
     breadth: &str,
-    owner_filter: Option<&str>,
-    // Mirrored on the same terms: adopted at handle creation, never written over
-    // an existing local row.
-    client_filter: Option<&str>,
-    speaker_filter: Option<&str>,
+    // Adopted at handle creation, never written over an existing local row. A
+    // field absent from the server's row is `None`, which is NOT the same as ""
+    // and must not stamp an empty pin over an inherited one.
+    pins: ServerPins<'_>,
 ) -> Result<db::Conversation, String> {
     // An EXISTING handle is returned untouched — the local row is the source of
     // truth for both breadth and the pin, and this reconciliation runs on every
@@ -2473,9 +2475,9 @@ fn ensure_workspace_handle(
         db::create_conversation(conn, workspace, target.scope(), target.scope_id(), breadth)
             .map_err(|e| e.to_string())?;
     db::set_conversation_remote_id(conn, &handle.id, remote_id).map_err(|e| e.to_string())?;
-    let pin = owner_filter.unwrap_or_default();
-    let client = client_filter.unwrap_or_default();
-    let speaker = speaker_filter.unwrap_or_default();
+    let pin = pins.owner.unwrap_or_default();
+    let client = pins.client.unwrap_or_default();
+    let speaker = pins.speaker.unwrap_or_default();
     if !pin.is_empty() {
         db::set_conversation_owner_filter(conn, &handle.id, Some(pin)).map_err(|e| e.to_string())?;
     }
@@ -2535,9 +2537,7 @@ fn cloud_conversation_meta(
             target,
             remote_id,
             breadth,
-            owner_filter,
-            client_filter,
-            speaker_filter,
+            ServerPins { owner: owner_filter, client: client_filter, speaker: speaker_filter },
         )?
     };
     Ok(ConversationMeta {

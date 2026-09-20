@@ -28,6 +28,7 @@ import {
   onChatTextDelta,
   type ChatCitation,
   type ChatMessageDto,
+  type ChatPinKind,
   type ChatScope,
   type ChatIndexState,
   ChatUsage,
@@ -543,8 +544,8 @@ export function ChatPanel({
           ipc.chatHistory(target, id),
           ipc.chatGetBreadth(target, id),
           ipc.chatGetOwnerFilter(target, id).catch(() => ""),
-          ipc.chatGetClientFilter(target, id).catch(() => ""),
-          ipc.chatGetSpeakerFilter(target, id).catch(() => ""),
+          ipc.chatGetPin(target, "client", id).catch(() => ""),
+          ipc.chatGetPin(target, "speaker", id).catch(() => ""),
         ]);
         if (gen !== switchGenRef.current) return;
         setMessages(h?.messages ?? []);
@@ -682,7 +683,11 @@ export function ChatPanel({
           },
         ]
       : []),
-    ...(clientFilter
+    // Gated on the breadth, not just on the value: retrieval drops a Client pin
+    // under `note`, so a token there would read as pinned while the search ran
+    // past it — the invisible widening this whole control exists to prevent. The
+    // pin stays stored, and the token returns when the breadth widens.
+    ...(clientFilter && showClientPin
       ? [
           {
             key: "client",
@@ -693,7 +698,7 @@ export function ChatPanel({
               ? `Only notes for ${pinnedClientName} are searched.`
               : "This conversation is pinned to a Client that no longer exists, so searches return nothing. Remove the filter to search again.",
             icon: <Building2 size={12} strokeWidth={1.7} aria-hidden="true" />,
-            clear: () => pinClient(null),
+            clear: () => setPin("client", null),
           },
         ]
       : []),
@@ -706,7 +711,7 @@ export function ChatPanel({
             // (ADR-0002), so the wording promises no more than exact matching.
             title: `Only passages where "${speakerFilter}" is the speaker are searched. Names are matched as written in each transcript.`,
             icon: <MessageSquareQuote size={12} strokeWidth={1.7} aria-hidden="true" />,
-            clear: () => pinSpeaker(null),
+            clear: () => setPin("speaker", null),
           },
         ]
       : []),
@@ -823,22 +828,19 @@ export function ChatPanel({
       });
     // Off is the safe fallback: a token wrongly reading "on" would claim a
     // narrowing the turn isn't doing.
-    ipc
-      .chatGetClientFilter(target)
-      .then((c) => {
-        if (!cancelled && gen === switchGenRef.current) setClientFilter(c ?? "");
-      })
-      .catch(() => {
-        if (!cancelled && gen === switchGenRef.current) setClientFilter("");
-      });
-    ipc
-      .chatGetSpeakerFilter(target)
-      .then((sp) => {
-        if (!cancelled && gen === switchGenRef.current) setSpeakerFilter(sp ?? "");
-      })
-      .catch(() => {
-        if (!cancelled && gen === switchGenRef.current) setSpeakerFilter("");
-      });
+    for (const [kind, set] of [
+      ["client", setClientFilter],
+      ["speaker", setSpeakerFilter],
+    ] as const) {
+      ipc
+        .chatGetPin(target, kind)
+        .then((v) => {
+          if (!cancelled && gen === switchGenRef.current) set(v ?? "");
+        })
+        .catch(() => {
+          if (!cancelled && gen === switchGenRef.current) set("");
+        });
+    }
     void reloadConversationList(gen);
     void refreshActivation(gen);
     return () => {
@@ -886,16 +888,10 @@ export function ChatPanel({
 
   // Optimistic and draft-aware like the breadth write above: a drafting pane has
   // no row to write to, so `send` carries the value in instead.
-  function pinClient(next: string | null) {
-    setClientFilter(next ?? "");
+  function setPin(kind: ChatPinKind, next: string | null) {
+    (kind === "client" ? setClientFilter : setSpeakerFilter)(next ?? "");
     if (!conversationId && !targetResumesOnOpen(target)) return;
-    void ipc.chatSetClientFilter(target, conversationId, next).catch((e) => setError(String(e)));
-  }
-
-  function pinSpeaker(next: string | null) {
-    setSpeakerFilter(next ?? "");
-    if (!conversationId && !targetResumesOnOpen(target)) return;
-    void ipc.chatSetSpeakerFilter(target, conversationId, next).catch((e) => setError(String(e)));
+    void ipc.chatSetPin(target, conversationId, kind, next).catch((e) => setError(String(e)));
   }
 
   // Owner activated chat from the pane (#76): the entry reports fresh metadata →
@@ -1471,11 +1467,7 @@ export function ChatPanel({
         {/* Composer control row: breadth picker bottom-left, workspace turn
             allowance bottom-right (#69). The meter shows only in a metered
             workspace — `usage` is null in personal context and on any
-            unavailable/error/unmetered outcome, so nothing renders then.
-            Skipped entirely when every one of its children would be absent, which
-            on `/chat` in Personal is all of them: an empty flex row still costs
-            the container's gap, and that showed up as an unexplained band under
-            the composer that looked like space reserved for something. */}
+            unavailable/error/unmetered outcome, so nothing renders then. */}
         {/* Active pins sit above the control row, not in it: three filled chips
             inline overflow the 320px panel floor, and a row that is mostly
             accent-soft stops reading as "something is narrowing every answer". */}
@@ -1523,8 +1515,8 @@ export function ChatPanel({
               clients={clients}
               clientFilter={clientFilter}
               speakerFilter={speakerFilter}
-              onClient={pinClient}
-              onSpeaker={pinSpeaker}
+              onClient={(id) => setPin("client", id)}
+              onSpeaker={(label) => setPin("speaker", label)}
             />
             {/* Which model is about to answer (#80) — previously invisible
                 without opening Settings. Muted, not disabled: --color-text-
@@ -1953,9 +1945,7 @@ function PinPicker({
 function PinField({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <div className="flex flex-col gap-1">
-      <span className="text-[11px] uppercase tracking-wide text-[var(--color-text-muted)]">
-        {label}
-      </span>
+      <span className="nd-label">{label}</span>
       {children}
     </div>
   );

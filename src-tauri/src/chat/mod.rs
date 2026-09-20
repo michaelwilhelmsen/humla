@@ -405,9 +405,8 @@ fn pin_disclosure(pins: PinNames<'_>) -> Option<String> {
 
 /// The pin NAMES for disclosure — resolved strings, not the ids `Pins` carries.
 ///
-/// A separate type from [`Pins`] on purpose: that one is a filter input the
-/// retrieval acts on, this one is prompt text. Conflating them is how an id ends
-/// up in a sentence addressed to a model that has never seen one.
+/// [`Pins`] is the filter input the retrieval acts on; this is prompt text, and
+/// carries names where that carries ids.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PinNames<'a> {
     pub client: Option<&'a str>,
@@ -1162,10 +1161,6 @@ mod tests {
         assert!(both.contains("You are talking to Michael"), "and the asker line survives it");
     }
 
-    /// A blank or whitespace name must NOT produce a disclosure, because the
-    /// sentence would read "restricted to the folder ''" — worse than silence, and
-    /// the model cannot tell it is a bug rather than a real narrowing.
-    #[test]
     /// A pinned Client or speaker is disclosed; an unpinned conversation stays
     /// silent, which is what makes the disclosure mean something.
     #[test]
@@ -1202,20 +1197,48 @@ mod tests {
         assert_eq!(both.matches("cannot widen").count(), 1, "one sentence, not two:\n{both}");
     }
 
+    /// A pin that isn't in force must not be announced: the Client pin is dropped
+    /// under `note` breadth, so disclosing it there would say the conversation is
+    /// confined to a client it is in fact searching past. Reachable by pinning at
+    /// `all` and then narrowing.
+    ///
+    /// Asserted through `resolve_filter` and the prompt together, not through the
+    /// predicate they share — either one drifting off it is the regression.
+    #[test]
+    fn a_client_pin_dropped_by_the_breadth_is_neither_applied_nor_disclosed() {
+        let pins = Pins { client: Some("c-acme".into()), speaker: None };
+        let args = serde_json::json!({});
+        for (scope, applies) in [
+            (ToolScope::Note("n1".into()), false),
+            (ToolScope::All, true),
+            (ToolScope::Folder("f1".into()), true),
+        ] {
+            let filter = tools::resolve_filter(&scope, &pins, &args, NOW, None);
+            assert_eq!(
+                filter.client_id.is_some(),
+                applies,
+                "retrieval disagrees with the rule for {scope:?}"
+            );
+            let prompt = system_prompt_with_context(
+                NOW,
+                None,
+                None,
+                PinNames {
+                    client: client_pin_applies(&scope).then_some("Acme"),
+                    speaker: None,
+                },
+            );
+            assert_eq!(
+                prompt.contains("Acme"),
+                applies,
+                "the prompt disagrees with the rule for {scope:?}"
+            );
+        }
+    }
+
     /// A pin whose name can't be resolved — a Client deleted since it was set —
     /// discloses nothing for that clause rather than naming an id the model has
     /// never seen. Same rule as a nameless folder reach.
-    /// A pin that isn't in force must not be announced. The Client pin is dropped
-    /// under `note` breadth, so disclosing it there would tell the model it is
-    /// confined to a client it is in fact searching past — the inverse of the lie
-    /// the disclosure exists to prevent, and reachable by pinning at `all` and
-    /// then narrowing the breadth.
-    #[test]
-    fn a_client_pin_dropped_by_the_breadth_is_not_disclosed() {
-        assert!(!client_pin_applies(&ToolScope::Note("n1".into())));
-        assert!(client_pin_applies(&ToolScope::All));
-        assert!(client_pin_applies(&ToolScope::Folder("f1".into())));
-    }
 
     #[test]
     fn an_unresolvable_pin_name_discloses_nothing() {

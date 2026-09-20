@@ -1001,8 +1001,12 @@ function chatPinsCase(pinned: boolean): Scenario {
       provider_key_get: () => "sk-test",
       chat_history: () => ({ conversationId: "c1", messages: [] }),
       chat_get_breadth: () => "all",
-      chat_get_client_filter: () => (pinned ? "c-acme" : ""),
-      chat_get_speaker_filter: () => (pinned ? "Hege Tronshaugen" : ""),
+      chat_get_pin: (a) =>
+        pinned
+          ? (a as { kind: string }).kind === "client"
+            ? "c-acme"
+            : "Hege Tronshaugen"
+          : "",
       chat_list_conversations: () => [],
       notes_list: () => demoNotes(),
       clients_list: () => DEMO_CLIENTS,

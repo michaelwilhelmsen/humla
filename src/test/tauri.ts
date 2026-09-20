@@ -53,8 +53,7 @@ export function mockTauri(
       case "chat_get_breadth":
         return "note";
       case "chat_get_owner_filter":
-      case "chat_get_client_filter":
-      case "chat_get_speaker_filter":
+      case "chat_get_pin":
         return "";
       case "permissions_status":
         return { microphone: "granted", screen: "granted" };
