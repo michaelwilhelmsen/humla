@@ -10,6 +10,7 @@ use super::read_provider_api_key;
 use super::{DEFAULT_LANGUAGE, DEFAULT_LOCAL_LLM_BASE_URL, DEFAULT_SUMMARY_MODEL};
 use crate::db::{self, Note, NotePatch};
 use crate::languages;
+use crate::anthropic;
 use crate::openai;
 use crate::presets::{self, DEFAULT_SUMMARY_PRESET};
 use crate::providers::ProviderId;
@@ -21,6 +22,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 // local OpenAI-compatible server (Ollama, LM Studio, llama-server, vLLM)
 // flow through this same shape — the only difference is `base_url`.
 pub(super) struct ResolvedProvider {
+    pub(super) provider: ProviderId,
     pub(super) base_url: String,
     pub(super) api_key: String,
     pub(super) model: String,
@@ -30,6 +32,54 @@ pub(super) struct ResolvedProvider {
     pub(super) think: bool,
 }
 
+/// Which client a resolved provider is called through. One answer, so a caller
+/// can't pair an Anthropic key with the OpenAI-compatible path.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(super) enum Dispatch {
+    Anthropic,
+    OpenAiCompatible,
+}
+
+impl ResolvedProvider {
+    pub(super) fn dispatch(&self) -> Dispatch {
+        match self.provider {
+            ProviderId::Anthropic => Dispatch::Anthropic,
+            _ => Dispatch::OpenAiCompatible,
+        }
+    }
+
+    /// Run one completion against this provider. Every caller — the summary,
+    /// the automatic title — goes through here.
+    pub(super) async fn complete<F>(
+        &self,
+        system_prompt: &str,
+        user_message: &str,
+        on_chunk: F,
+    ) -> anyhow::Result<String>
+    where
+        F: FnMut(openai::StreamChunk) + Send,
+    {
+        match self.dispatch() {
+            Dispatch::Anthropic => {
+                anthropic::summarize(&self.api_key, &self.model, system_prompt, user_message, on_chunk)
+                    .await
+            }
+            Dispatch::OpenAiCompatible => {
+                openai::summarize_with_base(
+                    &self.base_url,
+                    &self.api_key,
+                    &self.model,
+                    self.think,
+                    system_prompt,
+                    user_message,
+                    on_chunk,
+                )
+                .await
+            }
+        }
+    }
+}
+
 // Decide whether this note's summary call should hit cloud OpenAI or a
 // local OpenAI-compatible server. Note-level override beats the global
 // setting; default is openai.
@@ -37,11 +87,12 @@ pub(super) struct ResolvedProvider {
 // For local: reads `local_llm_base_url` and `local_llm_model` from settings.
 // `api_key` is forwarded as-is — local servers typically ignore it but
 // Ollama requires a non-empty bearer string, so we send a sentinel.
-pub(super) fn resolve_provider(
+/// Which provider this note's summary goes to, before any key is read — so the
+/// caller fetches one Keychain slot and only the one in force.
+pub(super) fn summary_provider_id(
     conn: &rusqlite::Connection,
     note: &Note,
-    openai_api_key: Option<String>,
-) -> anyhow::Result<ResolvedProvider> {
+) -> anyhow::Result<ProviderId> {
     let note_override = note.summary_provider.trim();
     let provider = if note_override.is_empty() {
         db::get_setting(conn, "summary_provider")
@@ -58,9 +109,17 @@ pub(super) fn resolve_provider(
         note.id, note_override, provider
     );
 
-    let id = ProviderId::parse(&provider)
+    ProviderId::parse(&provider)
         .filter(|p| p.capabilities().summarize)
-        .ok_or_else(|| anyhow::anyhow!("unknown summary provider “{provider}” — pick one in Settings"))?;
+        .ok_or_else(|| anyhow::anyhow!("unknown summary provider “{provider}” — pick one in Settings"))
+}
+
+pub(super) fn resolve_provider(
+    conn: &rusqlite::Connection,
+    note: &Note,
+    api_key: Option<String>,
+) -> anyhow::Result<ResolvedProvider> {
+    let id = summary_provider_id(conn, note)?;
     match id {
         ProviderId::Local => {
             let base_url = db::get_setting(conn, "local_llm_base_url")?
@@ -78,6 +137,7 @@ pub(super) fn resolve_provider(
                 .unwrap_or(false);
             eprintln!("[llm] resolved local: url={base_url} model={model} think={think}");
             Ok(ResolvedProvider {
+                provider: id,
                 base_url,
                 api_key: "humla-local".into(),
                 model,
@@ -85,14 +145,32 @@ pub(super) fn resolve_provider(
             })
         }
         ProviderId::OpenAi => {
-            let api_key = openai_api_key
+            let api_key = api_key
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| anyhow::anyhow!("OpenAI API key not set"))?;
             let model = db::get_setting(conn, "summary_model")?
                 .unwrap_or_else(|| DEFAULT_SUMMARY_MODEL.to_string());
             eprintln!("[llm] resolved openai: model={model}");
             Ok(ResolvedProvider {
+                provider: id,
                 base_url: openai::BASE.into(),
+                api_key,
+                model,
+                think: false,
+            })
+        }
+        ProviderId::Anthropic => {
+            let api_key = api_key
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("Anthropic API key not set"))?;
+            let model = db::get_setting(conn, "anthropic_model")?
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| anthropic::DEFAULT_MODEL.to_string());
+            eprintln!("[llm] resolved anthropic: model={model}");
+            Ok(ResolvedProvider {
+                provider: id,
+                base_url: anthropic::BASE.into(),
                 api_key,
                 model,
                 think: false,
@@ -179,14 +257,23 @@ pub(super) fn resolve_auto(language: &str, note: &Note) -> String {
 
 async fn run_summary(app: AppHandle, note_id: String) -> anyhow::Result<()> {
     let state: State<AppState> = app.state();
-    // Read the API key out of band — keychain lookup shouldn't sit
-    // inside the DB lock that resolve_provider takes.
-    let openai_api_key = read_provider_api_key(&state, "openai")
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    // Which provider first, then that provider's key: reading every slot would
+    // prompt the Keychain for a provider this summary never calls.
+    let provider_id = {
+        let conn = state.db.lock();
+        let n = db::get_note(&conn, &note_id)?;
+        summary_provider_id(&conn, &n)?
+    };
+    let api_key = match provider_id.keychain_account() {
+        Some(_) => {
+            read_provider_api_key(&state, provider_id.as_str()).map_err(|e| anyhow::anyhow!("{e}"))?
+        }
+        None => None,
+    };
     let (provider, language, note) = {
         let conn = state.db.lock();
         let n = db::get_note(&conn, &note_id)?;
-        let p_resolved = resolve_provider(&conn, &n, openai_api_key)?;
+        let p_resolved = resolve_provider(&conn, &n, api_key)?;
         let global_lang = db::get_setting(&conn, "language")?
             .unwrap_or_else(|| DEFAULT_LANGUAGE.to_string());
         // Same fallback rule as transcription: note language wins, empty
@@ -232,35 +319,21 @@ async fn run_summary(app: AppHandle, note_id: String) -> anyhow::Result<()> {
     // it's stuck.
     let app_for_stream = app.clone();
     let note_for_stream = note_id.clone();
-    let summary = openai::summarize_with_base(
-        &provider.base_url,
-        &provider.api_key,
-        &provider.model,
-        provider.think,
-        &full_prompt,
-        &user_message,
-        move |chunk| match chunk {
-            openai::StreamChunk::Thinking(t) => {
-                let _ = app_for_stream.emit(
-                    "summary_thinking_delta",
-                    StreamDeltaPayload {
-                        note_id: note_for_stream.clone(),
-                        delta: t.to_string(),
-                    },
-                );
-            }
-            openai::StreamChunk::Content(c) => {
-                let _ = app_for_stream.emit(
-                    "summary_content_delta",
-                    StreamDeltaPayload {
-                        note_id: note_for_stream.clone(),
-                        delta: c.to_string(),
-                    },
-                );
-            }
-        },
-    )
-    .await?;
+    let on_chunk = move |chunk: openai::StreamChunk| match chunk {
+        openai::StreamChunk::Thinking(t) => {
+            let _ = app_for_stream.emit(
+                "summary_thinking_delta",
+                StreamDeltaPayload { note_id: note_for_stream.clone(), delta: t.to_string() },
+            );
+        }
+        openai::StreamChunk::Content(c) => {
+            let _ = app_for_stream.emit(
+                "summary_content_delta",
+                StreamDeltaPayload { note_id: note_for_stream.clone(), delta: c.to_string() },
+            );
+        }
+    };
+    let summary = provider.complete(&full_prompt, &user_message, on_chunk).await?;
     let state: State<AppState> = app.state();
     {
         let conn = state.db.lock();
@@ -415,13 +488,65 @@ mod tests {
     fn an_unknown_summary_provider_is_an_error_not_openai() {
         let dir = tempfile::tempdir().unwrap();
         let conn = db::open(&dir.path().join("t.sqlite")).unwrap();
-        db::set_setting(&conn, "summary_provider", "anthropic").unwrap();
+        db::set_setting(&conn, "summary_provider", "mistral").unwrap();
         let note = db::create_note(&conn, "no", "meeting", "").unwrap();
         let err = resolve_provider(&conn, &note, Some("sk-test".into()))
             .err()
             .expect("unknown id must not resolve")
             .to_string();
-        assert!(err.contains("anthropic"), "{err}");
+        assert!(err.contains("mistral"), "{err}");
+    }
+
+    #[test]
+    fn each_provider_has_exactly_one_client() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = db::open(&dir.path().join("dispatch.sqlite")).unwrap();
+        let note = db::create_note(&conn, "no", "meeting", "").unwrap();
+        for (id, want) in [
+            ("openai", Dispatch::OpenAiCompatible),
+            ("anthropic", Dispatch::Anthropic),
+        ] {
+            db::set_setting(&conn, "summary_provider", id).unwrap();
+            let p = resolve_provider(&conn, &note, Some("k".into())).unwrap();
+            assert_eq!(p.dispatch(), want, "{id}");
+        }
+        db::set_setting(&conn, "summary_provider", "local").unwrap();
+        db::set_setting(&conn, "local_llm_model", "gemma4:12b-mlx").unwrap();
+        let p = resolve_provider(&conn, &note, None).unwrap();
+        assert_eq!(p.dispatch(), Dispatch::OpenAiCompatible);
+    }
+
+    #[test]
+    fn anthropic_resolves_to_the_messages_api_and_its_default_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = db::open(&dir.path().join("t.sqlite")).unwrap();
+        db::set_setting(&conn, "summary_provider", "anthropic").unwrap();
+        let note = db::create_note(&conn, "no", "meeting", "").unwrap();
+        let p = resolve_provider(&conn, &note, Some("sk-ant-test".into())).unwrap();
+        assert_eq!(p.provider, ProviderId::Anthropic);
+        assert_eq!(p.base_url, anthropic::BASE);
+        assert_eq!(p.model, anthropic::DEFAULT_MODEL);
+    }
+
+    #[test]
+    fn the_anthropic_model_setting_wins_over_the_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = db::open(&dir.path().join("t.sqlite")).unwrap();
+        db::set_setting(&conn, "summary_provider", "anthropic").unwrap();
+        db::set_setting(&conn, "anthropic_model", "claude-opus-5").unwrap();
+        let note = db::create_note(&conn, "no", "meeting", "").unwrap();
+        let p = resolve_provider(&conn, &note, Some("sk-ant-test".into())).unwrap();
+        assert_eq!(p.model, "claude-opus-5");
+    }
+
+    #[test]
+    fn anthropic_without_a_key_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = db::open(&dir.path().join("t.sqlite")).unwrap();
+        db::set_setting(&conn, "summary_provider", "anthropic").unwrap();
+        let note = db::create_note(&conn, "no", "meeting", "").unwrap();
+        let err = resolve_provider(&conn, &note, None).err().unwrap().to_string();
+        assert!(err.contains("Anthropic API key"), "{err}");
     }
 
     #[test]

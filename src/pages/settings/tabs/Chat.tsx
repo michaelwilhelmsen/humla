@@ -7,9 +7,10 @@ import { OllamaConnect } from "../../../components/provider/OllamaConnect";
 import { ProviderKeyCard } from "../../../components/provider/ProviderKeyCard";
 import { CommandSnippet } from "../../../components/CommandSnippet";
 import { useOllamaProbe } from "../../../components/provider/useOllamaProbe";
-import { localChatHint } from "../../../components/provider/useChatReadiness";
+import { cloudChatHint, localChatHint } from "../../../components/provider/useChatReadiness";
 import { useEmbedProbe } from "../../../components/provider/useEmbedProbe";
 import { useProviderKey } from "../../../components/provider/useProviderKey";
+import { useAnthropicModels } from "../../../components/provider/useAnthropicModels";
 import { CHAT_PROVIDERS, SUMMARY_MODELS } from "../types";
 import {
   EMBEDDING_OLLAMA_MODEL,
@@ -27,9 +28,14 @@ import type { SettingsHook } from "../useSettings";
 // its setup lands with semantic retrieval.
 export function ChatTab({ s, update }: Pick<SettingsHook, "s" | "update">) {
   const isOllama = s.chat_provider === "ollama";
-  // Both hooks run unconditionally (rules of hooks); the probe parks itself
-  // when chat isn't on Ollama.
-  const key = useProviderKey("openai");
+  const isAnthropic = s.chat_provider === "anthropic";
+  // Every hook runs unconditionally (rules of hooks); the probe parks itself
+  // when chat isn't on Ollama, and the listing when no Anthropic key is stored.
+  const key = useProviderKey("openai", { enabled: !isOllama && !isAnthropic });
+  const anthropicKey = useProviderKey("anthropic", { enabled: isAnthropic });
+  const anthropicModels = useAnthropicModels(anthropicKey.hasKey, s.chat_model, {
+    enabled: isAnthropic,
+  });
   const { reachable, installed } = useOllamaProbe(s.local_llm_base_url, { enabled: isOllama });
   // The embedder's own address and name (#179), each empty meaning "follow the
   // chat server / embeddinggemma" — mirrored by `resolve_embed` in
@@ -52,9 +58,13 @@ export function ChatTab({ s, update }: Pick<SettingsHook, "s" | "update">) {
     });
     ready = hint === "";
   } else {
-    if (!key.hasKey) hint = "Add your OpenAI key above to use chat.";
-    else if (!s.chat_model) hint = "Choose a chat model above.";
-    else ready = true;
+    hint = cloudChatHint({
+      hasKey: isAnthropic ? anthropicKey.hasKey : key.hasKey,
+      model: s.chat_model,
+      providerLabel: isAnthropic ? "Anthropic" : "OpenAI",
+      where: "above",
+    });
+    ready = hint === "";
   }
 
   // Show the stored value even when it isn't a known option (e.g. an empty
@@ -82,7 +92,34 @@ export function ChatTab({ s, update }: Pick<SettingsHook, "s" | "update">) {
         }
       />
 
-      {!isOllama && (
+      {isAnthropic && (
+        <>
+          <Row
+            label="Model"
+            description="Claude models. Tool-calling is handled automatically."
+            control={
+              <Select
+                value={s.chat_model}
+                onChange={(v) => update("chat_model", v)}
+                options={
+                  s.chat_model === ""
+                    ? [{ value: "", label: "Choose a model…" }, ...anthropicModels]
+                    : anthropicModels
+                }
+              />
+            }
+          />
+          <ProviderKeyCard provider="anthropic" description="Used for chat over your notes." />
+          {/* Anthropic serves no embeddings endpoint, so retrieval here is the
+              keyword half only. */}
+          <p className="text-xs text-[var(--color-text-muted)] py-3">
+            Anthropic has no embedding model, so chat searches your notes by keyword rather than
+            by meaning. Cloud (OpenAI) or a local server give semantic search as well.
+          </p>
+        </>
+      )}
+
+      {!isOllama && !isAnthropic && (
         <>
           <Row
             label="Model"

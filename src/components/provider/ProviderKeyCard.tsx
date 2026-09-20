@@ -15,6 +15,11 @@ const DEFAULT_COPY: Record<
       "Cloud transcription (whisper-1, gpt-4o-transcribe) and cloud summaries.",
     placeholder: "sk-…",
   },
+  anthropic: {
+    label: "Anthropic",
+    description: "Claude summaries and chat.",
+    placeholder: "sk-ant-…",
+  },
   deepgram: {
     label: "Deepgram",
     description: "Nova-3 and Nova-2 cloud transcription.",

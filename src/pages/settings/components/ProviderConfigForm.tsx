@@ -8,6 +8,7 @@ import {
   WHISPER_PRESETS,
   type Provider,
 } from "../types";
+import type { TranscribeProvider } from "../../../lib/providers";
 import { Row } from "./Section";
 import { Select } from "../../../components/ui/Select";
 import { Toggle } from "./Toggle";
@@ -22,7 +23,7 @@ type LocalModelSummary = {
 
 // Model-row description per provider: each picker explains what it selects
 // and how it relates to the provider chosen above (design-review amendment).
-const MODEL_DESCRIPTIONS: Record<Provider, string> = {
+const MODEL_DESCRIPTIONS: Record<TranscribeProvider, string> = {
   openai:
     "whisper-1 is the safe default; gpt-4o-transcribe-diarize labels speakers but treats language as a hint and ignores vocabulary biasing.",
   deepgram:

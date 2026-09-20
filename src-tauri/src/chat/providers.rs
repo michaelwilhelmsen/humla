@@ -89,6 +89,85 @@ fn lower_messages_ollama(messages: &[ChatTurn]) -> Vec<Value> {
         .collect()
 }
 
+/// Lower a tool spec to Anthropic's envelope: no `type: "function"` wrapper,
+/// and the schema is keyed `input_schema`.
+fn lower_tools_anthropic(tools: &[ToolSpec]) -> Vec<Value> {
+    tools
+        .iter()
+        .map(|t| {
+            json!({
+                "name": t.name,
+                "description": t.description,
+                "input_schema": t.parameters,
+            })
+        })
+        .collect()
+}
+
+/// Lower the conversation to Anthropic's Messages shape: the system prompt
+/// leaves the turn list entirely, tool calls become `tool_use` blocks on the
+/// assistant turn, and their results become `tool_result` blocks in a **user**
+/// turn. Roles must alternate, so adjacent same-role turns are merged — which
+/// is also what puts a run of tool results into one user message. A turn with
+/// no blocks at all is dropped, since an empty content array is rejected; the
+/// caller refuses a request that leaves nothing behind.
+fn lower_messages_anthropic(messages: &[ChatTurn]) -> (String, Vec<Value>) {
+    let mut system: Vec<&str> = Vec::new();
+    let mut turns: Vec<(&'static str, Vec<Value>)> = Vec::new();
+
+    for m in messages {
+        if m.role == "system" {
+            if !m.text.trim().is_empty() {
+                system.push(&m.text);
+            }
+            continue;
+        }
+        let (role, blocks): (&'static str, Vec<Value>) = if m.role == "tool" {
+            (
+                "user",
+                vec![json!({
+                    "type": "tool_result",
+                    "tool_use_id": m.tool_call_id.clone().unwrap_or_default(),
+                    "content": m.text,
+                })],
+            )
+        } else if m.role == "assistant" {
+            let mut blocks = Vec::new();
+            if !m.text.is_empty() {
+                blocks.push(json!({ "type": "text", "text": m.text }));
+            }
+            for tc in &m.tool_calls {
+                blocks.push(json!({
+                    "type": "tool_use",
+                    "id": tc.id,
+                    "name": tc.name,
+                    "input": serde_json::from_str::<Value>(&tc.arguments).unwrap_or_else(|_| json!({})),
+                }));
+            }
+            ("assistant", blocks)
+        } else {
+            let mut blocks = Vec::new();
+            if !m.text.is_empty() {
+                blocks.push(json!({ "type": "text", "text": m.text }));
+            }
+            ("user", blocks)
+        };
+        if blocks.is_empty() {
+            continue;
+        }
+        match turns.last_mut() {
+            Some((last_role, last_blocks)) if *last_role == role => last_blocks.extend(blocks),
+            _ => turns.push((role, blocks)),
+        }
+    }
+
+    let wire = turns
+        .into_iter()
+        .map(|(role, blocks)| json!({ "role": role, "content": blocks }))
+        .collect();
+    (system.join("\n\n"), wire)
+}
+
 fn emit_step(
     text: String,
     raw: Vec<crate::openai::RawToolCall>,
@@ -198,6 +277,78 @@ impl ChatAdapter for OllamaChatAdapter {
         )
         .await?;
         Ok(emit_step(text, raw, on_event))
+    }
+}
+
+/// Anthropic's Messages API. The base URL is a constructor argument so tests
+/// can point one at a loopback server; production always uses the cloud base.
+pub struct AnthropicChatAdapter {
+    base_url: String,
+}
+
+impl AnthropicChatAdapter {
+    pub fn new() -> Self {
+        Self { base_url: crate::anthropic::BASE.to_string() }
+    }
+
+    pub fn with_base(base_url: impl Into<String>) -> Self {
+        Self { base_url: base_url.into() }
+    }
+}
+
+impl Default for AnthropicChatAdapter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl ChatAdapter for AnthropicChatAdapter {
+    fn provider_id(&self) -> &'static str {
+        "anthropic"
+    }
+
+    async fn step(
+        &self,
+        ctx: ChatCtx<'_>,
+        messages: &[ChatTurn],
+        tools: &[ToolSpec],
+        on_event: &mut (dyn FnMut(ChatStreamEvent) + Send),
+    ) -> Result<ChatStep> {
+        let api_key = ctx.api_key.ok_or_else(|| {
+            anyhow!("Anthropic chat needs an API key — add one in Settings → Chat.")
+        })?;
+        let (system, wire_messages) = lower_messages_anthropic(messages);
+        if wire_messages.is_empty() {
+            return Err(anyhow!("Nothing to send — the conversation has no content."));
+        }
+        let wire_tools = lower_tools_anthropic(tools);
+        let mut tool_calls: Vec<ToolCall> = Vec::new();
+        let step = crate::anthropic::messages_stream(
+            &self.base_url,
+            api_key,
+            ctx.model,
+            &system,
+            &wire_messages,
+            &wire_tools,
+            crate::anthropic::CHAT_MAX_TOKENS,
+            |ev| {
+                match ev {
+                    crate::anthropic::AnthropicEvent::Text(t) => {
+                        on_event(ChatStreamEvent::TextDelta(t))
+                    }
+                    crate::anthropic::AnthropicEvent::ToolCall(c) => {
+                        let tc = ToolCall { id: c.id, name: c.name, arguments: c.arguments };
+                        tool_calls.push(tc.clone());
+                        on_event(ChatStreamEvent::ToolCall(tc));
+                    }
+                    crate::anthropic::AnthropicEvent::Thinking(_) => {}
+                }
+                !ctx.cancel.is_cancelled()
+            },
+        )
+        .await?;
+        Ok(ChatStep { text: step.text, tool_calls })
     }
 }
 
@@ -415,5 +566,179 @@ mod local_compat_tests {
         let native = crate::openai::ollama_native_url("http://localhost:11434/v1");
         assert_eq!(native.as_deref(), Some("http://localhost:11434/api"));
         assert_eq!(crate::openai::ollama_native_url("http://127.0.0.1:8000/v1"), None);
+    }
+}
+
+#[cfg(test)]
+mod anthropic_tests {
+    use super::*;
+    use crate::chat::adapter::CancelFlag;
+    use crate::chat::test_server::serve_sse;
+
+    fn spec() -> ToolSpec {
+        ToolSpec {
+            name: "search_notes",
+            description: "Search the user's notes",
+            parameters: json!({"type": "object", "properties": {"query": {"type": "string"}}}),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_empty_conversation_is_refused_before_the_request() {
+        let cancel = CancelFlag::new();
+        let ctx = ChatCtx {
+            model: "claude-sonnet-5",
+            api_key: Some("sk-ant-test"),
+            base_url: "",
+            think: false,
+            cancel: &cancel,
+        };
+        let err = AnthropicChatAdapter::with_base("http://127.0.0.1:1/v1")
+            .step(ctx, &[ChatTurn::new("user", "")], &[], &mut |_| {})
+            .await
+            .expect_err("an empty turn list must not reach the wire")
+            .to_string();
+        assert!(err.contains("Nothing to send"), "{err}");
+    }
+
+    #[test]
+    fn a_tool_spec_lowers_to_input_schema_with_no_function_wrapper() {
+        let wire = lower_tools_anthropic(&[spec()]);
+        assert_eq!(wire[0]["name"], "search_notes");
+        assert_eq!(wire[0]["description"], "Search the user's notes");
+        assert_eq!(wire[0]["input_schema"], spec().parameters);
+        assert!(wire[0].get("type").is_none(), "{}", wire[0]);
+        assert!(wire[0].get("parameters").is_none(), "{}", wire[0]);
+    }
+
+    #[test]
+    fn system_turns_leave_the_message_list() {
+        let (system, wire) = lower_messages_anthropic(&[
+            ChatTurn::new("system", "You are Humla."),
+            ChatTurn::new("system", "Cite your sources."),
+            ChatTurn::new("user", "what did we agree?"),
+        ]);
+        assert_eq!(system, "You are Humla.\n\nCite your sources.");
+        assert_eq!(wire.len(), 1);
+        assert_eq!(wire[0]["role"], "user");
+    }
+
+    #[test]
+    fn an_assistant_tool_turn_becomes_text_and_tool_use_blocks() {
+        let (_, wire) = lower_messages_anthropic(&[ChatTurn::assistant_tool_calls(
+            "Let me look.",
+            vec![ToolCall {
+                id: "toolu_1".into(),
+                name: "search_notes".into(),
+                arguments: "{\"query\":\"budget\"}".into(),
+            }],
+        )]);
+        let blocks = wire[0]["content"].as_array().unwrap();
+        assert_eq!(blocks[0], json!({"type": "text", "text": "Let me look."}));
+        assert_eq!(blocks[1]["type"], "tool_use");
+        assert_eq!(blocks[1]["id"], "toolu_1");
+        assert_eq!(blocks[1]["input"], json!({"query": "budget"}));
+    }
+
+    #[test]
+    fn unparseable_tool_arguments_lower_to_an_empty_object() {
+        let (_, wire) = lower_messages_anthropic(&[ChatTurn::assistant_tool_calls(
+            "",
+            vec![ToolCall { id: "t".into(), name: "n".into(), arguments: "not json".into() }],
+        )]);
+        let blocks = wire[0]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 1, "an empty text block must not be sent");
+        assert_eq!(blocks[0]["input"], json!({}));
+    }
+
+    #[test]
+    fn tool_results_group_into_one_user_turn_and_roles_alternate() {
+        let (_, wire) = lower_messages_anthropic(&[
+            ChatTurn::new("user", "what did we agree?"),
+            ChatTurn::assistant_tool_calls(
+                "",
+                vec![
+                    ToolCall { id: "a".into(), name: "search_notes".into(), arguments: "{}".into() },
+                    ToolCall { id: "b".into(), name: "get_note".into(), arguments: "{}".into() },
+                ],
+            ),
+            ChatTurn::tool_result("a", "hit one"),
+            ChatTurn::tool_result("b", "hit two"),
+            ChatTurn::new("assistant", "Here is the answer."),
+        ]);
+        let roles: Vec<&str> = wire.iter().map(|m| m["role"].as_str().unwrap()).collect();
+        assert_eq!(roles, vec!["user", "assistant", "user", "assistant"]);
+        let results = wire[2]["content"].as_array().unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0]["type"], "tool_result");
+        assert_eq!(results[0]["tool_use_id"], "a");
+        assert_eq!(results[1]["tool_use_id"], "b");
+    }
+
+    #[tokio::test]
+    async fn a_step_streams_text_and_offers_tools_on_the_messages_endpoint() {
+        let body = "event: content_block_delta\n\
+                    data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Budsjettet \"}}\n\n\
+                    data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ble godkjent.\"}}\n\n\
+                    data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n\
+                    data: {\"type\":\"message_stop\"}\n\n";
+        let (port, server) = serve_sse(vec![body.into()]).await;
+        let cancel = CancelFlag::new();
+        let ctx = ChatCtx {
+            model: "claude-sonnet-5",
+            api_key: Some("sk-ant-test"),
+            base_url: "",
+            think: false,
+            cancel: &cancel,
+        };
+        let mut seen = String::new();
+        let step = AnthropicChatAdapter::with_base(format!("http://127.0.0.1:{port}/v1"))
+            .step(ctx, &[ChatTurn::new("user", "budsjett?")], &[spec()], &mut |ev| {
+                if let ChatStreamEvent::TextDelta(d) = ev {
+                    seen.push_str(&d);
+                }
+            })
+            .await
+            .expect("the step must complete");
+        assert_eq!(step.text, "Budsjettet ble godkjent.");
+        assert_eq!(seen, step.text);
+
+        let req = server.await.unwrap().remove(0);
+        assert!(req.starts_with("POST /v1/messages"), "{req}");
+        assert!(req.contains("x-api-key: sk-ant-test"), "{req}");
+        assert!(req.contains("anthropic-version: 2023-06-01"), "{req}");
+        assert!(req.contains("\"input_schema\""), "{req}");
+        assert!(!req.contains("\"temperature\""), "{req}");
+        assert!(!req.contains("\"thinking\""), "{req}");
+    }
+
+    #[tokio::test]
+    async fn a_streamed_tool_call_is_assembled_and_emitted() {
+        let body = "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_9\",\"name\":\"search_notes\",\"input\":{}}}\n\n\
+                    data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"query\\\":\\\"budget\\\"}\"}}\n\n\
+                    data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+                    data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n";
+        let (port, server) = serve_sse(vec![body.into()]).await;
+        let cancel = CancelFlag::new();
+        let ctx = ChatCtx {
+            model: "claude-sonnet-5",
+            api_key: Some("sk-ant-test"),
+            base_url: "",
+            think: false,
+            cancel: &cancel,
+        };
+        let mut calls = Vec::new();
+        let step = AnthropicChatAdapter::with_base(format!("http://127.0.0.1:{port}/v1"))
+            .step(ctx, &[ChatTurn::new("user", "budget?")], &[spec()], &mut |ev| {
+                if let ChatStreamEvent::ToolCall(tc) = ev {
+                    calls.push(tc);
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(step.tool_calls.len(), 1);
+        assert_eq!(step.tool_calls[0].arguments, "{\"query\":\"budget\"}");
+        assert_eq!(calls, step.tool_calls);
+        let _ = server.await.unwrap();
     }
 }

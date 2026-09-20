@@ -42,10 +42,35 @@ export function localChatHint({
   return "";
 }
 
+/** The same ladder for a cloud provider: a key, then a model. One copy, so the
+ *  Settings tab and the Note pane can't answer differently.
+ *
+ *  `requireModel` is off for the pane: both cloud resolvers fall back to a
+ *  default model, so an unset one is not something the reader has to fix —
+ *  and the pane has no picker to fix it with. */
+export function cloudChatHint({
+  hasKey,
+  model,
+  providerLabel,
+  where,
+  requireModel = true,
+}: {
+  hasKey: boolean;
+  model: string;
+  providerLabel: string;
+  where: "above" | "settings";
+  requireModel?: boolean;
+}): string {
+  const at = where === "above" ? "above" : "in Settings → Chat";
+  if (!hasKey) return `Add your ${providerLabel} key ${at} to use chat.`;
+  if (requireModel && !model) return `Choose a chat model ${at}.`;
+  return "";
+}
+
 // Chat readiness for the Note's Chat tab (issue #44): what's still missing
 // before a chat can run, so the panel shows a setup prompt instead of a dead
 // input. Settings are read once on mount — they only change from the Settings
-// dialog, which isn't open while chatting. Both provider hooks run
+// dialog, which isn't open while chatting. Every provider hook runs
 // unconditionally (rules of hooks); the local probe parks itself on cloud chat.
 export function useChatReadiness() {
   const [loading, setLoading] = useState(true);
@@ -76,7 +101,9 @@ export function useChatReadiness() {
   }, []);
 
   const isOllama = provider === "ollama";
-  const key = useProviderKey("openai");
+  const isAnthropic = provider === "anthropic";
+  const key = useProviderKey("openai", { enabled: !isOllama && !isAnthropic });
+  const anthropicKey = useProviderKey("anthropic", { enabled: isAnthropic });
   const { reachable, installed } = useOllamaProbe(baseUrl, { enabled: isOllama });
 
   let ready = false;
@@ -87,8 +114,14 @@ export function useChatReadiness() {
     hint = localChatHint({ reachable, installed, model, baseUrl, where: "settings" });
     ready = hint === "";
   } else {
-    if (!key.hasKey) hint = "Add your OpenAI key in Settings → Chat to use chat.";
-    else ready = true;
+    hint = cloudChatHint({
+      hasKey: isAnthropic ? anthropicKey.hasKey : key.hasKey,
+      model,
+      providerLabel: isAnthropic ? "Anthropic" : "OpenAI",
+      where: "settings",
+      requireModel: false,
+    });
+    ready = hint === "";
   }
 
   return { loading, ready, hint, provider, model, baseUrl };

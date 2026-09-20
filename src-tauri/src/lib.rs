@@ -1,6 +1,7 @@
 mod db;
 mod html_text;
 mod openai;
+mod anthropic;
 mod local_whisper;
 mod diarize;
 mod languages;
@@ -386,6 +387,7 @@ where
             commands::local_whisper_download,
             commands::local_whisper_delete,
             commands::local_llm_list_models,
+            commands::anthropic_list_models,
             commands::local_llm_embed_probe,
             commands::diarize_status,
             commands::diarize_download,

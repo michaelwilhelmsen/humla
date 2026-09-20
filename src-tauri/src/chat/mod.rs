@@ -10,7 +10,7 @@ mod providers;
 mod tools;
 
 pub use adapter::{CancelFlag, ChatAdapter, ChatCtx, ChatStreamEvent, ChatTurn, ToolSpec};
-pub use providers::{OllamaChatAdapter, OpenAiChatAdapter};
+pub use providers::{AnthropicChatAdapter, OllamaChatAdapter, OpenAiChatAdapter};
 
 /// A stand-in OpenAI-compat server, shared by every test here that needs one on
 /// the wire rather than behind a fake adapter.
@@ -496,6 +496,7 @@ pub fn build_chat_adapter(provider: ProviderId) -> Result<Box<dyn ChatAdapter>> 
     match provider {
         ProviderId::Local => Ok(Box::new(OllamaChatAdapter)),
         ProviderId::OpenAi => Ok(Box::new(OpenAiChatAdapter)),
+        ProviderId::Anthropic => Ok(Box::new(AnthropicChatAdapter::new())),
         ProviderId::Deepgram | ProviderId::Groq => {
             anyhow::bail!("{provider} is a transcription provider and can't chat")
         }

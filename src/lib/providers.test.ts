@@ -12,6 +12,7 @@ function rustRegistry() {
     keychain: /keychain_account: Some\(/.test(row),
     summarize: /summarize: true/.test(row),
     chat: /chat: true/.test(row),
+    transcribe: /transcribe: true/.test(row),
   }));
 }
 
@@ -23,7 +24,7 @@ describe("providers.ts mirrors providers.rs", () => {
   });
 
   it("derives the key providers from the keychain flag", () => {
-    expect(KEY_PROVIDERS).toEqual(["openai", "deepgram", "groq"]);
+    expect(KEY_PROVIDERS).toEqual(["openai", "anthropic", "deepgram", "groq"]);
     expect(isKeyProvider("local")).toBe(false);
     expect(isKeyProvider("groq")).toBe(true);
   });

@@ -14,11 +14,15 @@ beforeEach(() => {
 });
 
 describe("ChatTab provider setting", () => {
-  it("offers exactly OpenAI and Ollama — never Groq/Deepgram", async () => {
+  it("offers exactly the chat-capable providers — never Groq/Deepgram", async () => {
     render(<ChatTab s={settings({ chat_provider: "openai" })} update={async () => {}} />);
     await userEvent.click(screen.getByRole("combobox", { name: /Cloud \(OpenAI\)/ }));
     const options = screen.getAllByRole("option").map((o) => o.textContent);
-    expect(options).toEqual(["Cloud (OpenAI)", "Local (any OpenAI-compatible server)"]);
+    expect(options).toEqual([
+      "Cloud (OpenAI)",
+      "Cloud (Anthropic)",
+      "Local (any OpenAI-compatible server)",
+    ]);
     expect(screen.queryByRole("option", { name: /Groq/i })).toBeNull();
     expect(screen.queryByRole("option", { name: /Deepgram/i })).toBeNull();
   });
@@ -29,6 +33,41 @@ describe("ChatTab provider setting", () => {
     await userEvent.click(screen.getByRole("combobox", { name: /Cloud \(OpenAI\)/ }));
     await userEvent.click(screen.getByRole("option", { name: "Local (any OpenAI-compatible server)" }));
     expect(update).toHaveBeenCalledWith("chat_provider", "ollama");
+  });
+});
+
+describe("ChatTab on Anthropic", () => {
+  it("shows the key card, a model row and the keyword-only note", async () => {
+    render(
+      <ChatTab s={settings({ chat_provider: "anthropic", chat_model: "claude-sonnet-5" })} update={async () => {}} />,
+    );
+    expect(await screen.findByLabelText("Anthropic API key")).toBeInTheDocument();
+    expect(screen.getByRole("combobox", { name: "claude-sonnet-5" })).toBeInTheDocument();
+    expect(screen.getByText(/searches your notes by keyword/)).toBeInTheDocument();
+  });
+
+  it("touches nothing Anthropic while OpenAI is selected", async () => {
+    const keyReads: unknown[] = [];
+    const listed = vi.fn(() => []);
+    mockTauri({
+      provider_key_get: (args) => {
+        keyReads.push((args as { provider: string }).provider);
+        return null;
+      },
+      anthropic_list_models: listed,
+    });
+    render(<ChatTab s={settings({ chat_provider: "openai" })} update={async () => {}} />);
+    await screen.findByLabelText("OpenAI API key");
+    expect(keyReads).not.toContain("anthropic");
+    expect(listed).not.toHaveBeenCalled();
+  });
+
+  it("flags a missing key", async () => {
+    mockTauri({ provider_key_get: () => null });
+    render(
+      <ChatTab s={settings({ chat_provider: "anthropic", chat_model: "claude-sonnet-5" })} update={async () => {}} />,
+    );
+    expect(await screen.findByText(/Add your Anthropic key above/)).toBeInTheDocument();
   });
 });
 

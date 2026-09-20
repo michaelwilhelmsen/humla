@@ -32,6 +32,7 @@ mod tests {
     #[test]
     fn known_providers_have_keychain_accounts() {
         assert_eq!(keychain_account_for("openai"), Some("openai_api_key"));
+        assert_eq!(keychain_account_for("anthropic"), Some("anthropic_api_key"));
         assert_eq!(keychain_account_for("deepgram"), Some("deepgram_api_key"));
         assert_eq!(keychain_account_for("groq"), Some("groq_api_key"));
         assert_eq!(keychain_account_for("local"), None);

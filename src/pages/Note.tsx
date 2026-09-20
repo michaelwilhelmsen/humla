@@ -31,6 +31,7 @@ import {
 } from "lucide-react";
 import { ipc, onSummaryThinkingDelta, onSummaryContentDelta, type Note as TNote, type NoteRevision, type NoteSession, type SummaryPrompt, type TimelineEntry } from "../lib/ipc";
 import { convertFileSrc } from "@tauri-apps/api/core";
+import { SUMMARY_CAPABLE, type SummaryProvider } from "../lib/providers";
 import { useLiveSetting } from "../lib/settingsBus";
 import { useDownloadStore, useNotesStore, useRecordingStore } from "../lib/store";
 import { computeSetupStatus } from "../lib/setupStatus";
@@ -2464,6 +2465,14 @@ function SpeakersPicker({
 
 // Per-note summary provider — a simple Cloud / Local toggle. Defaults to the
 // global Settings value when the note has no explicit choice (value === "").
+// Each summary-capable provider's one-word name on the chip; which ones are
+// offered comes from the registry.
+const CHIP_LABEL: Record<SummaryProvider, string> = {
+  openai: "Cloud",
+  anthropic: "Claude",
+  local: "Local",
+};
+
 function SummaryProviderChip({
   value,
   globalDefault,
@@ -2474,7 +2483,7 @@ function SummaryProviderChip({
   onChange: (v: string) => void;
 }) {
   const effective = value.length > 0 ? value : globalDefault;
-  const label = effective === "local" ? "Local" : "Cloud";
+  const label = CHIP_LABEL[effective as SummaryProvider] ?? "Cloud";
   return (
     <CtlSelect
       icon={<Cloud size={14} strokeWidth={1.6} />}
@@ -2482,10 +2491,7 @@ function SummaryProviderChip({
       value={effective}
       onChange={onChange}
       title="Where this note's summary runs"
-      options={[
-        { value: "openai", label: "Cloud" },
-        { value: "local", label: "Local" },
-      ]}
+      options={SUMMARY_CAPABLE.map((id) => ({ value: id, label: CHIP_LABEL[id] }))}
     />
   );
 }

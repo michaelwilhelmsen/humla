@@ -48,7 +48,7 @@ import {
   chosenCloudProvider,
   type CloudTranscribeProvider,
 } from "../../../lib/transcribeDefault";
-import { KEY_PROVIDERS } from "../../../lib/providers";
+import { TRANSCRIBE_KEY_PROVIDERS } from "../../../lib/providers";
 import { useDownloadStore } from "../../../lib/store";
 import { useProviderKey } from "../../../components/provider/useProviderKey";
 import type { StepContext } from "../types";
@@ -93,7 +93,7 @@ const CLOUD_COPY: Record<CloudTranscribeProvider, { label: string; placeholder: 
   groq: { label: "Groq (Whisper Large v3 Turbo)", placeholder: "gsk_…" },
 };
 
-const CLOUD_PROVIDERS = KEY_PROVIDERS.map((value) => ({ value, label: CLOUD_COPY[value].label }));
+const CLOUD_PROVIDERS = TRANSCRIBE_KEY_PROVIDERS.map((value) => ({ value, label: CLOUD_COPY[value].label }));
 
 function keyPlaceholder(p: CloudTranscribeProvider): string {
   return CLOUD_COPY[p].placeholder;

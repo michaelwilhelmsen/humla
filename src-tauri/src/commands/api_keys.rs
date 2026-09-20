@@ -166,9 +166,11 @@ pub async fn provider_key_test(
     let test = ProviderId::parse(id)
         .and_then(|p| p.spec().key_test)
         .ok_or_else(|| format!("provider {id} doesn't support test"))?;
-    let r = openai::client()
-        .get(test.url)
-        .header("Authorization", test.auth.header_value(&key))
+    let mut req = openai::client().get(test.url);
+    for (name, value) in test.auth.headers(&key) {
+        req = req.header(name, value);
+    }
+    let r = req
         .send()
         .await
         .map_err(|e| format!("network: {e}"))?;
@@ -177,6 +179,10 @@ pub async fn provider_key_test(
         return Ok(TestResult { ok: true, status: status.as_u16(), error: None });
     }
     let body = r.text().await.unwrap_or_default();
-    let snippet: String = body.chars().take(300).collect();
-    Ok(TestResult { ok: false, status: status.as_u16(), error: Some(snippet) })
+    let error = if id == "anthropic" {
+        crate::anthropic::readable_error(status.as_u16(), &body)
+    } else {
+        body.chars().take(300).collect()
+    };
+    Ok(TestResult { ok: false, status: status.as_u16(), error: Some(error) })
 }

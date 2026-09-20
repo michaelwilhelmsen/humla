@@ -9,7 +9,10 @@ export type { KeyProvider };
 // ProviderKeyCard renders rows; the onboarding steps wrap `test()` to write
 // their provider config when it passes (their "commit point"). The backend
 // only ever reports a sentinel, never the key, so drafts are write-only.
-export function useProviderKey(provider: KeyProvider) {
+export function useProviderKey(
+  provider: KeyProvider,
+  { enabled = true }: { enabled?: boolean } = {},
+) {
   const [hasKey, setHasKey] = useState(false);
   const [draft, setDraft] = useState("");
   const [testing, setTesting] = useState(false);
@@ -19,11 +22,14 @@ export function useProviderKey(provider: KeyProvider) {
 
   // Provider change = a different Keychain slot: reset the surface and
   // re-read the sentinel.
+  // Disabled means the caller isn't showing this provider: don't open its
+  // Keychain slot at all, since a read is a prompt on a fresh machine.
   useEffect(() => {
     let cancelled = false;
     setDraft("");
     setResult(null);
     setHasKey(false);
+    if (!enabled) return;
     ipc
       .getProviderKey(provider)
       .then((v) => {
@@ -33,7 +39,7 @@ export function useProviderKey(provider: KeyProvider) {
     return () => {
       cancelled = true;
     };
-  }, [provider]);
+  }, [provider, enabled]);
 
   async function save() {
     const key = draft.trim();

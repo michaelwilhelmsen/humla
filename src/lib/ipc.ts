@@ -123,6 +123,8 @@ export type SettingsKey =
   | "sync_audio"
   | "custom_vocabulary"
   | "summary_model"
+  // The Anthropic summary model (#183). Chat reuses `chat_model`, as OpenAI does.
+  | "anthropic_model"
   | "summary_provider"
   | "local_llm_base_url"
   | "local_llm_model"
@@ -548,6 +550,9 @@ export const ipc = {
 
   localLlmListModels: (baseUrl: string) =>
     invoke<string[]>("local_llm_list_models", { baseUrl }),
+
+  /** Models the stored Anthropic key can reach, newest first (#183). */
+  anthropicListModels: () => invoke<string[]>("anthropic_list_models"),
 
   // Dimensionality of one real embedding, or the server's own error. The model
   // listing can't answer this (#179): a server can list a model and serve no

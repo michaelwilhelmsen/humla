@@ -28,20 +28,45 @@ use tauri::{AppHandle, Emitter, Manager, State};
 /// halves (#179), because only Ollama serves the embedder beside the chat
 /// model: mlx_lm.server has no `/v1/embeddings` route, llama-server needs its
 /// own process, and LM Studio names the model `text-embedding-embeddinggemma-…`.
-fn resolve_embed(resolved: &ResolvedChat) -> embed::EmbedConfig {
+/// `None` where the chat provider has no embeddings endpoint at all
+/// (Anthropic): retrieval then runs keyword-only rather than spending the
+/// Anthropic key against an OpenAI route it can't authenticate.
+fn resolve_embed(resolved: &ResolvedChat) -> Option<embed::EmbedConfig> {
     match resolved.provider {
-        ProviderId::Local => embed::EmbedConfig {
+        ProviderId::Local => Some(embed::EmbedConfig {
             provider: "ollama",
             model: resolved.embed.model.clone().unwrap_or_else(|| OLLAMA_EMBED_MODEL.to_string()),
             base_url: resolved.embed.base_url.clone().unwrap_or_else(|| resolved.base_url.clone()),
             api_key: None,
-        },
-        _ => embed::EmbedConfig {
+        }),
+        ProviderId::Anthropic => None,
+        _ => Some(embed::EmbedConfig {
             provider: "openai",
             model: OPENAI_EMBED_MODEL.to_string(),
             base_url: resolved.base_url.clone(),
             api_key: resolved.api_key.clone(),
-        },
+        }),
+    }
+}
+
+/// The Keychain key for whichever provider chat is set to. Reading every slot
+/// would prompt for providers this turn never calls, so the setting is read
+/// first and only the matching slot is opened.
+fn chat_api_key(state: &State<AppState>) -> Option<String> {
+    let stored = {
+        let conn = state.db.lock();
+        db::get_setting(&conn, "chat_provider")
+            .ok()
+            .flatten()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "openai".into())
+    };
+    match ProviderId::parse(&stored) {
+        Some(id) if id.keychain_account().is_some() => {
+            super::read_provider_api_key(state, id.as_str()).ok().flatten()
+        }
+        _ => None,
     }
 }
 
@@ -83,13 +108,14 @@ pub(crate) async fn embed_note(
 /// editing never blocks on embedding. No-op if no provider is configured.
 pub async fn embed_note_bg(app: AppHandle, note_id: String) {
     let state: State<AppState> = app.state();
-    let key = super::read_provider_api_key(&state, "openai").ok().flatten();
+    let key = chat_api_key(&state);
     let resolved = {
         let conn = state.db.lock();
         resolve_chat(&conn, key)
     };
     let Ok(resolved) = resolved else { return };
-    let adapter = resolve_embed(&resolved).adapter();
+    let Some(cfg) = resolve_embed(&resolved) else { return };
+    let adapter = cfg.adapter();
     embed_note(&state.db, &adapter, &note_id).await;
 }
 
@@ -133,13 +159,14 @@ pub fn backfill_note_chunks(db: &std::sync::Arc<parking_lot::Mutex<rusqlite::Con
 /// it's idempotent and cheap on reruns.
 pub async fn embed_backfill(app: AppHandle) {
     let state: State<AppState> = app.state();
-    let key = super::read_provider_api_key(&state, "openai").ok().flatten();
+    let key = chat_api_key(&state);
     let resolved = {
         let conn = state.db.lock();
         resolve_chat(&conn, key)
     };
     let Ok(resolved) = resolved else { return };
-    let adapter = resolve_embed(&resolved).adapter();
+    let Some(cfg) = resolve_embed(&resolved) else { return };
+    let adapter = cfg.adapter();
     let ids = {
         let conn = state.db.lock();
         db::note_ids_needing_embedding(&conn, adapter.model_id()).unwrap_or_default()
@@ -163,11 +190,11 @@ pub async fn embed_backfill(app: AppHandle) {
 /// embedded under it, and those are the two halves a user reads as one.
 #[tauri::command]
 pub fn chat_unembedded_note_count(state: State<AppState>) -> Result<usize, String> {
-    let key = super::read_provider_api_key(&state, "openai").ok().flatten();
+    let key = chat_api_key(&state);
     let conn = state.db.lock();
     let Ok(resolved) = resolve_chat(&conn, key) else { return Ok(0) };
-    let model = resolve_embed(&resolved).model;
-    db::note_ids_needing_embedding(&conn, &model).map(|ids| ids.len()).map_err(super::err)
+    let Some(cfg) = resolve_embed(&resolved) else { return Ok(0) };
+    db::note_ids_needing_embedding(&conn, &cfg.model).map(|ids| ids.len()).map_err(super::err)
 }
 
 /// Embed what `chat_unembedded_note_count` counts, without waiting for the next
@@ -177,11 +204,11 @@ pub fn chat_unembedded_note_count(state: State<AppState>) -> Result<usize, Strin
 pub async fn chat_embed_missing(app: AppHandle) -> Result<usize, String> {
     let before = {
         let state: State<AppState> = app.state();
-        let key = super::read_provider_api_key(&state, "openai").ok().flatten();
+        let key = chat_api_key(&state);
         let conn = state.db.lock();
         let Ok(resolved) = resolve_chat(&conn, key) else { return Ok(0) };
-        let model = resolve_embed(&resolved).model;
-        db::note_ids_needing_embedding(&conn, &model).map_err(super::err)?.len()
+        let Some(cfg) = resolve_embed(&resolved) else { return Ok(0) };
+        db::note_ids_needing_embedding(&conn, &cfg.model).map_err(super::err)?.len()
     };
     embed_backfill(app).await;
     Ok(before)
@@ -441,7 +468,7 @@ struct EmbedOverride {
 
 fn resolve_chat(
     conn: &rusqlite::Connection,
-    openai_api_key: Option<String>,
+    api_key: Option<String>,
 ) -> anyhow::Result<ResolvedChat> {
     // Read a setting as a non-empty trimmed value, or None.
     let setting = |key: &str| -> anyhow::Result<Option<String>> {
@@ -482,7 +509,7 @@ fn resolve_chat(
             Ok(ResolvedChat { provider: id, base_url, api_key: None, model, think, embed })
         }
         ProviderId::OpenAi => {
-            let api_key = openai_api_key.filter(|s| !s.is_empty()).ok_or_else(|| {
+            let api_key = api_key.filter(|s| !s.is_empty()).ok_or_else(|| {
                 anyhow::anyhow!("OpenAI API key not set — add one in Settings → Chat.")
             })?;
             // A fresh install may have a key but no explicit model yet; fall
@@ -491,6 +518,20 @@ fn resolve_chat(
             Ok(ResolvedChat {
                 provider: id,
                 base_url: openai::BASE.into(),
+                api_key: Some(api_key),
+                model,
+                think: false,
+                embed: EmbedOverride::default(),
+            })
+        }
+        ProviderId::Anthropic => {
+            let api_key = api_key.filter(|s| !s.is_empty()).ok_or_else(|| {
+                anyhow::anyhow!("Anthropic API key not set — add one in Settings → Chat.")
+            })?;
+            let model = model_setting.unwrap_or_else(|| crate::anthropic::DEFAULT_MODEL.to_string());
+            Ok(ResolvedChat {
+                provider: id,
+                base_url: crate::anthropic::BASE.into(),
                 api_key: Some(api_key),
                 model,
                 think: false,
@@ -1633,9 +1674,9 @@ pub async fn chat_send(
         return chat_send_cloud(app, target, conversation_id, message, owner_name, draft).await;
     }
 
-    // Keychain read out of band — not inside the DB lock. Chat reuses the
-    // shared OpenAI key (issue #44).
-    let openai_api_key = super::read_provider_api_key(&state, "openai")?;
+    // Keychain read out of band — not inside the DB lock, and only the slot
+    // the configured chat provider uses.
+    let chat_key = chat_api_key(&state);
 
     let (grounding, resolved, conversation_id, tool_scope, workspace) = {
         let conn = state.db.lock();
@@ -1643,7 +1684,7 @@ pub async fn chat_send(
         // We branched to the Personal path above (no active workspace), so the
         // tenant is Personal and there's no workspace to scope tools to.
         let workspace = String::new();
-        let resolved = resolve_chat(&conn, openai_api_key).map_err(|e| e.to_string())?;
+        let resolved = resolve_chat(&conn, chat_key).map_err(|e| e.to_string())?;
         // Resolve the target session (issue #61): an explicit id, else the
         // active/most-recent one, lazily creating the target's first session on
         // the first send. Breadth is a persisted live filter within it.
@@ -1680,10 +1721,9 @@ pub async fn chat_send(
     // for the note the user is chatting about on the very first question. Other
     // notes are embedded at their own checkpoints (issue #48) — so a library-wide
     // turn has nothing to pre-embed and skips straight to the loop.
-    let embed_cfg = resolve_embed(&resolved);
-    let embedder = embed_cfg.adapter();
-    if let Some(anchor) = target.note_id() {
-        embed_note(&state.db, &embedder, anchor).await;
+    let embedder = resolve_embed(&resolved).map(|cfg| cfg.adapter());
+    if let (Some(embedder), Some(anchor)) = (embedder.as_ref(), target.note_id()) {
+        embed_note(&state.db, embedder, anchor).await;
     }
 
     let adapter = chat::build_chat_adapter(resolved.provider).map_err(|e| e.to_string())?;
@@ -1751,7 +1791,7 @@ pub async fn chat_send(
         &grounding.text,
         &tool_scope,
         &workspace,
-        Some(&embedder as &dyn EmbeddingAdapter),
+        embedder.as_ref().map(|e| e as &dyn EmbeddingAdapter),
         &message,
         asker.as_deref(),
         sink,
@@ -2833,9 +2873,9 @@ mod tests {
     fn resolve_chat_rejects_an_unknown_provider_instead_of_calling_openai() {
         let dir = tempfile::tempdir().unwrap();
         let conn = db::open(&dir.path().join("t.sqlite")).unwrap();
-        db::set_setting(&conn, "chat_provider", "anthropic").unwrap();
+        db::set_setting(&conn, "chat_provider", "mistral").unwrap();
         let err = resolve_chat(&conn, Some("sk-test".into())).err().unwrap().to_string();
-        assert!(err.contains("anthropic"), "{err}");
+        assert!(err.contains("mistral"), "{err}");
     }
 
     #[test]
@@ -2869,14 +2909,14 @@ mod tests {
         db::set_setting(&conn, "chat_model", "gemma4:12b-mlx").unwrap();
         db::set_setting(&conn, "local_llm_base_url", "http://127.0.0.1:8000/v1").unwrap();
 
-        let cfg = resolve_embed(&resolve_chat(&conn, None).unwrap());
+        let cfg = resolve_embed(&resolve_chat(&conn, None).unwrap()).unwrap();
         assert_eq!(cfg.base_url, "http://127.0.0.1:8000/v1");
         assert_eq!(cfg.model, OLLAMA_EMBED_MODEL);
 
         // The shape #179 exists for: embeddings on Ollama, chat on mlx.
         db::set_setting(&conn, "embed_base_url", "http://localhost:11434/v1").unwrap();
         db::set_setting(&conn, "embed_model", "embeddinggemma:latest").unwrap();
-        let cfg = resolve_embed(&resolve_chat(&conn, None).unwrap());
+        let cfg = resolve_embed(&resolve_chat(&conn, None).unwrap()).unwrap();
         assert_eq!(cfg.base_url, "http://localhost:11434/v1");
         assert_eq!(cfg.model, "embeddinggemma:latest");
         // The index is keyed by the model id, so an override must reach it —
@@ -2892,9 +2932,32 @@ mod tests {
         db::set_setting(&conn, "chat_model", "gemma4:12b-mlx").unwrap();
         db::set_setting(&conn, "embed_base_url", "   ").unwrap();
         db::set_setting(&conn, "embed_model", "").unwrap();
-        let cfg = resolve_embed(&resolve_chat(&conn, None).unwrap());
+        let cfg = resolve_embed(&resolve_chat(&conn, None).unwrap()).unwrap();
         assert_eq!(cfg.base_url, DEFAULT_LOCAL_LLM_BASE_URL);
         assert_eq!(cfg.model, OLLAMA_EMBED_MODEL);
+    }
+
+    // Anthropic serves no embeddings route, so chat there is keyword-only
+    // rather than spending the Anthropic key on an OpenAI endpoint.
+    #[test]
+    fn anthropic_chat_has_no_embedder() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = db::open(&dir.path().join("anthropic.sqlite")).unwrap();
+        db::set_setting(&conn, "chat_provider", "anthropic").unwrap();
+        let resolved = resolve_chat(&conn, Some("sk-ant-test".into())).unwrap();
+        assert_eq!(resolved.provider, ProviderId::Anthropic);
+        assert_eq!(resolved.base_url, crate::anthropic::BASE);
+        assert_eq!(resolved.model, crate::anthropic::DEFAULT_MODEL);
+        assert!(resolve_embed(&resolved).is_none());
+    }
+
+    #[test]
+    fn anthropic_chat_without_a_key_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = db::open(&dir.path().join("anthropic-nokey.sqlite")).unwrap();
+        db::set_setting(&conn, "chat_provider", "anthropic").unwrap();
+        let err = resolve_chat(&conn, None).err().unwrap().to_string();
+        assert!(err.contains("Anthropic API key not set"), "{err}");
     }
 
     #[test]
@@ -2905,7 +2968,7 @@ mod tests {
         db::set_setting(&conn, "chat_model", "gpt-5.4").unwrap();
         db::set_setting(&conn, "embed_base_url", "http://localhost:11434/v1").unwrap();
         db::set_setting(&conn, "embed_model", "embeddinggemma").unwrap();
-        let cfg = resolve_embed(&resolve_chat(&conn, Some("sk-test".into())).unwrap());
+        let cfg = resolve_embed(&resolve_chat(&conn, Some("sk-test".into())).unwrap()).unwrap();
         assert_eq!(cfg.base_url, crate::openai::BASE);
         assert_eq!(cfg.model, OPENAI_EMBED_MODEL);
     }

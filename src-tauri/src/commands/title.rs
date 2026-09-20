@@ -20,7 +20,7 @@
 //!   not be told one failed, and a local-only user with no LLM configured
 //!   would otherwise be toasted after every recording.
 
-use super::summary::{language_directive, resolve_auto, resolve_provider};
+use super::summary::{language_directive, resolve_auto, resolve_provider, summary_provider_id};
 use super::{DEFAULT_LANGUAGE, TITLE_FALLBACK_MODEL};
 use crate::db::{self, NotePatch};
 use crate::menubar::is_replaceable_title;
@@ -178,16 +178,28 @@ async fn try_generate_note_title(
     force: bool,
 ) -> anyhow::Result<Option<String>> {
     let state: State<AppState> = app.state();
-    // Keychain lookup out of band — it must not sit inside the DB lock.
-    let openai_api_key = super::read_provider_api_key(&state, "openai")
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    // Which provider first, then that provider's key — the summary path's rule,
+    // so a title never opens a Keychain slot its provider doesn't use.
+    let provider_id = {
+        let conn = state.db.lock();
+        let n = db::get_note(&conn, note_id)?;
+        if !force && !is_replaceable_title(&n.title) {
+            return Ok(None);
+        }
+        summary_provider_id(&conn, &n)?
+    };
+    let api_key = match provider_id.keychain_account() {
+        Some(_) => super::read_provider_api_key(&state, provider_id.as_str())
+            .map_err(|e| anyhow::anyhow!("{e}"))?,
+        None => None,
+    };
     let (mut provider, language, note) = {
         let conn = state.db.lock();
         let n = db::get_note(&conn, note_id)?;
         if !force && !is_replaceable_title(&n.title) {
             return Ok(None);
         }
-        let p = resolve_provider(&conn, &n, openai_api_key)?;
+        let p = resolve_provider(&conn, &n, api_key)?;
         let global = db::get_setting(&conn, "language")?
             .unwrap_or_else(|| DEFAULT_LANGUAGE.to_string());
         // Same fallback rule as the summary: the note's language wins, empty
@@ -229,18 +241,11 @@ async fn write_generated_title(
 ) -> anyhow::Result<Option<String>> {
     let state: State<AppState> = app.state();
     let body_text = crate::html_text::html_to_text(&note.body);
-    let raw = openai::summarize_with_base(
-        &provider.base_url,
-        &provider.api_key,
-        &provider.model,
-        provider.think,
-        &title_prompt(language),
-        &title_input(&body_text, &note.transcript),
-        // No streaming into the summary panel: this call is not a summary and
-        // must not touch its UI.
-        |_| {},
-    )
-    .await?;
+    // No streaming into the summary panel: this call is not a summary and must
+    // not touch its UI.
+    let raw = provider
+        .complete(&title_prompt(language), &title_input(&body_text, &note.transcript), |_| {})
+        .await?;
     let Some(title) = clean_title(&raw) else {
         eprintln!("[title] note {note_id}: model returned nothing usable, keeping the title");
         return Ok(None);

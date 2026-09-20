@@ -9,6 +9,7 @@ import type { DiarizeModelStatus, LocalWhisperModelStatus, SettingsKey } from ".
 import { SUMMARY_PRESETS, presetPromptForLang } from "../../lib/presets";
 import type { Theme } from "../../lib/theme";
 import { PALETTE_REGISTRY, type Palette } from "../../lib/palette";
+import { CHAT_CAPABLE, SUMMARY_CAPABLE, type Provider } from "../../lib/providers";
 
 // The Settings form manages every key except the ones with their own
 // dedicated controls (theme/palette) and the onboarding wizard's internal
@@ -45,6 +46,7 @@ export const DEFAULTS: Record<EditableKey, string> = {
   sync_audio: "true",
   custom_vocabulary: "",
   summary_model: "gpt-5.4-mini",
+  anthropic_model: "claude-sonnet-5",
   summary_provider: "openai",
   local_llm_base_url: "http://localhost:11434/v1",
   local_llm_model: "",
@@ -69,19 +71,28 @@ export const LOCAL_PROVIDER = {
   label: "Local (Whisper turbo, on-device)",
 };
 
-export const SUMMARY_PROVIDERS = [
-  { value: "openai", label: "Cloud (OpenAI)" },
-  { value: "local", label: "Local (any OpenAI-compatible server)" },
-];
+// How each capable provider is named in the two pickers. Which providers
+// appear is derived from the registry's capability flags; only the wording is
+// stated here.
+const PROVIDER_PICKER_LABEL: Record<Provider, string> = {
+  openai: "Cloud (OpenAI)",
+  anthropic: "Cloud (Anthropic)",
+  local: "Local (any OpenAI-compatible server)",
+  deepgram: "Deepgram",
+  groq: "Groq",
+};
 
-// AI Chat providers (issue #44). Only these two — Groq/Deepgram can't embed,
-// which chat retrieval will depend on, so they're never offered.
-export const CHAT_PROVIDERS = [
-  { value: "openai", label: "Cloud (OpenAI)" },
-  // Ollama by name is the value, not the limit: chat drives Ollama's native API
-  // on :11434 and plain OpenAI-compat anywhere else, as summaries do (#179).
-  { value: "ollama", label: "Local (any OpenAI-compatible server)" },
-];
+export const SUMMARY_PROVIDERS = SUMMARY_CAPABLE.map((id) => ({
+  value: id,
+  label: PROVIDER_PICKER_LABEL[id],
+}));
+
+// Chat stores the local provider as `ollama` from before the vocabularies were
+// unified; the stored rows are never rewritten, so the value stays.
+export const CHAT_PROVIDERS = CHAT_CAPABLE.map((id) => ({
+  value: id === "local" ? "ollama" : id,
+  label: PROVIDER_PICKER_LABEL[id],
+}));
 
 export const WHISPER_PRESETS = [
   { value: "fast", label: "Fast — lower latency, may drop borderline words" },
@@ -124,6 +135,20 @@ export const SUMMARY_MODELS = [
   "gpt-5-mini",
   "gpt-5-nano",
   "o3",
+];
+
+// Shipped fallback for the Anthropic model pickers when the live listing
+// can't be reached, newest first.
+export const ANTHROPIC_MODELS = [
+  "claude-opus-5",
+  "claude-sonnet-5",
+  "claude-opus-4-8",
+  "claude-opus-4-7",
+  "claude-opus-4-6",
+  "claude-sonnet-4-6",
+  "claude-haiku-4-5",
+  "claude-fable-5-1",
+  "claude-fable-5",
 ];
 
 export const inputClass =

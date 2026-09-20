@@ -7,7 +7,7 @@ pub const BASE: &str = "https://api.openai.com/v1";
 // Walk a reqwest::Error's source chain into a single readable string. The
 // outer Display on `Kind::Request` only says "error sending request for url
 // (...)" — the actual cause (DNS, TLS, hyper) is buried in `.source()`.
-fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
+pub(crate) fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
     let mut parts = vec![err.to_string()];
     let mut src = err.source();
     while let Some(e) = src {
@@ -48,6 +48,53 @@ fn summary_cloud_client() -> reqwest::Client {
         .timeout(std::time::Duration::from_secs(300))
         .build()
         .expect("reqwest client")
+}
+
+pub(crate) const MAX_SEND_RETRIES: u32 = 2;
+
+/// Backoff before retry `attempt` (1-based). Lengthens each time so a stale
+/// pooled connection isn't reused immediately and a brief network blip has
+/// time to clear.
+pub(crate) fn retry_backoff_ms(attempt: u32) -> u64 {
+    500u64.saturating_mul(attempt as u64).max(500)
+}
+
+/// Send a request, retrying the send-side failures that a half-closed pooled
+/// connection produces. Shared with the Anthropic transport so the two can't
+/// drift; a timeout or a connect failure is never retried, and the error is
+/// returned raw for the caller to phrase.
+pub(crate) async fn send_with_retries<F>(
+    make: F,
+    started: std::time::Instant,
+) -> std::result::Result<reqwest::Response, reqwest::Error>
+where
+    F: Fn() -> reqwest::RequestBuilder,
+{
+    let mut attempt: u32 = 0;
+    loop {
+        match make().send().await {
+            Ok(resp) => return Ok(resp),
+            Err(e) => {
+                let retryable = !e.is_timeout() && !e.is_connect() && attempt < MAX_SEND_RETRIES;
+                eprintln!(
+                    "[llm] send error after {:?}: timeout={} connect={} attempt={} retrying={} body={} source={}",
+                    started.elapsed(),
+                    e.is_timeout(),
+                    e.is_connect(),
+                    attempt,
+                    retryable,
+                    e,
+                    error_chain(&e),
+                );
+                if !retryable {
+                    return Err(e);
+                }
+                attempt += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(retry_backoff_ms(attempt)))
+                    .await;
+            }
+        }
+    }
 }
 
 pub async fn ping(api_key: &str) -> Result<bool> {
@@ -545,43 +592,19 @@ async fn post_chat(
     body: &impl Serialize,
     started: std::time::Instant,
 ) -> Result<reqwest::Response> {
-    const MAX_RETRIES: u32 = 2;
     let http = ep.client();
     let url = ep.url();
-    let mut attempt: u32 = 0;
-    let r = loop {
-        let send_res = http.post(&url).bearer_auth(api_key).json(body).send().await;
-        match send_res {
-            Ok(resp) => break resp,
-            Err(e) => {
-                let retryable = !e.is_timeout() && !e.is_connect() && attempt < MAX_RETRIES;
-                eprintln!(
-                    "[llm] send error after {:?}: timeout={} connect={} attempt={} retrying={} body={} source={}",
-                    started.elapsed(),
-                    e.is_timeout(),
-                    e.is_connect(),
-                    attempt,
-                    retryable,
-                    e,
-                    error_chain(&e),
-                );
-                if retryable {
-                    attempt += 1;
-                    // Backoff lengthens with each retry so we don't immediately
-                    // reuse the same stale pooled connection and so brief
-                    // network blips have time to clear. 500ms then 1.5s.
-                    let backoff_ms = 500u64.saturating_mul(attempt as u64).max(500);
-                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-                    continue;
-                }
-                if e.is_timeout() {
-                    return Err(ep.timeout_error(started.elapsed().as_secs()));
-                }
-                if e.is_connect() {
-                    return Err(ep.connect_error());
-                }
-                return Err(ep.network_error(&error_chain(&e)));
+    let r = match send_with_retries(|| http.post(&url).bearer_auth(api_key).json(body), started).await
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            if e.is_timeout() {
+                return Err(ep.timeout_error(started.elapsed().as_secs()));
             }
+            if e.is_connect() {
+                return Err(ep.connect_error());
+            }
+            return Err(ep.network_error(&error_chain(&e)));
         }
     };
 
@@ -1578,6 +1601,13 @@ pub(crate) async fn openai_embed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_send_retry_policy_is_two_tries_with_a_lengthening_backoff() {
+        assert_eq!(MAX_SEND_RETRIES, 2);
+        assert_eq!(retry_backoff_ms(1), 500);
+        assert_eq!(retry_backoff_ms(2), 1000);
+    }
 
     // Feed a whole SSE body through the parser in fixed-size byte slices,
     // returning (assembled answer, the deltas that fired). Slicing at

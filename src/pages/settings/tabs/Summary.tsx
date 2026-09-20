@@ -8,6 +8,8 @@ import { ProviderKeyCard } from "../../../components/provider/ProviderKeyCard";
 import { CommandSnippet } from "../../../components/CommandSnippet";
 import { RECOMMENDED_OLLAMA_MODEL, RECOMMENDED_OLLAMA_MODEL_16GB } from "../../../lib/localModels";
 import { SUMMARY_PRESETS, presetLabel } from "../../../lib/presets";
+import { useAnthropicModels } from "../../../components/provider/useAnthropicModels";
+import { useProviderKey } from "../../../components/provider/useProviderKey";
 import { SUMMARY_MODELS, SUMMARY_PROVIDERS } from "../types";
 import type { SettingsHook } from "../useSettings";
 
@@ -16,13 +18,21 @@ export function SummaryTab({
   update,
 }: Pick<SettingsHook, "s" | "update">) {
   const isLocal = s.summary_provider === "local";
+  const isAnthropic = s.summary_provider === "anthropic";
+  // Called unconditionally (rules of hooks) and inert until Anthropic is the
+  // chosen provider — neither the Keychain slot nor the model listing is
+  // touched otherwise.
+  const anthropicKey = useProviderKey("anthropic", { enabled: isAnthropic });
+  const anthropicModels = useAnthropicModels(anthropicKey.hasKey, s.anthropic_model, {
+    enabled: isAnthropic,
+  });
 
   return (
     <>
       <Section title="Summaries">
         <Row
           label="Provider"
-          description="Local keeps the transcript on your Mac — pick this for confidential meetings. Cloud (OpenAI) is faster and produces better summaries but sends the transcript to OpenAI."
+          description="Local keeps the transcript on your Mac — pick this for confidential meetings. The cloud providers (OpenAI, Anthropic) are faster and produce better summaries, but send the transcript to them."
           control={
             <Select
               value={s.summary_provider}
@@ -46,6 +56,23 @@ export function SummaryTab({
               }
             />
             <ProviderKeyCard provider="openai" />
+          </>
+        )}
+
+        {isAnthropic && (
+          <>
+            <Row
+              label="Model"
+              description="Claude models. Each model's own adaptive thinking decides how much it reasons."
+              control={
+                <Select
+                  value={s.anthropic_model}
+                  onChange={(v) => update("anthropic_model", v)}
+                  options={anthropicModels}
+                />
+              }
+            />
+            <ProviderKeyCard provider="anthropic" />
           </>
         )}
 

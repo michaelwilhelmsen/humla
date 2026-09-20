@@ -255,3 +255,12 @@ pub async fn local_whisper_delete(
     }
     Ok(())
 }
+
+/// The Anthropic models this key can reach (#183). Settings offers the live
+/// list; a failure there falls back to the shipped ids on the client.
+#[tauri::command]
+pub async fn anthropic_list_models(state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    let key = super::read_provider_api_key(&state, "anthropic")?
+        .ok_or_else(|| "No Anthropic API key stored".to_string())?;
+    crate::anthropic::list_models(&key).await.map_err(err)
+}

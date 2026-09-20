@@ -7,6 +7,7 @@ use std::fmt;
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ProviderId {
     OpenAi,
+    Anthropic,
     Deepgram,
     Groq,
     /// Local Whisper for transcription; any OpenAI-compatible server (Ollama,
@@ -19,13 +20,19 @@ pub enum ProviderId {
 pub enum AuthScheme {
     Bearer,
     Token,
+    /// Anthropic: the key rides in `x-api-key`, and the API version header is
+    /// mandatory on every request.
+    AnthropicKey,
 }
 
 impl AuthScheme {
-    pub fn header_value(self, key: &str) -> String {
+    /// Every header the scheme needs, so a caller can send a key without
+    /// knowing which provider it belongs to.
+    pub fn headers(self, key: &str) -> Vec<(&'static str, String)> {
         match self {
-            AuthScheme::Bearer => format!("Bearer {key}"),
-            AuthScheme::Token => format!("Token {key}"),
+            AuthScheme::Bearer => vec![("Authorization", format!("Bearer {key}"))],
+            AuthScheme::Token => vec![("Authorization", format!("Token {key}"))],
+            AuthScheme::AnthropicKey => crate::anthropic::headers(key),
         }
     }
 }
@@ -41,6 +48,7 @@ pub struct KeyTest {
 pub struct Capabilities {
     pub summarize: bool,
     pub chat: bool,
+    pub transcribe: bool,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -66,7 +74,18 @@ pub const REGISTRY: &[ProviderSpec] = &[
             url: "https://api.openai.com/v1/models",
             auth: AuthScheme::Bearer,
         }),
-        capabilities: Capabilities { summarize: true, chat: true },
+        capabilities: Capabilities { summarize: true, chat: true, transcribe: true },
+    },
+    ProviderSpec {
+        id: ProviderId::Anthropic,
+        id_str: "anthropic",
+        label: "Anthropic",
+        keychain_account: Some("anthropic_api_key"),
+        key_test: Some(KeyTest {
+            url: "https://api.anthropic.com/v1/models",
+            auth: AuthScheme::AnthropicKey,
+        }),
+        capabilities: Capabilities { summarize: true, chat: true, transcribe: false },
     },
     ProviderSpec {
         id: ProviderId::Deepgram,
@@ -77,7 +96,7 @@ pub const REGISTRY: &[ProviderSpec] = &[
             url: "https://api.deepgram.com/v1/projects",
             auth: AuthScheme::Token,
         }),
-        capabilities: Capabilities { summarize: false, chat: false },
+        capabilities: Capabilities { summarize: false, chat: false, transcribe: true },
     },
     ProviderSpec {
         id: ProviderId::Groq,
@@ -88,7 +107,7 @@ pub const REGISTRY: &[ProviderSpec] = &[
             url: "https://api.groq.com/openai/v1/models",
             auth: AuthScheme::Bearer,
         }),
-        capabilities: Capabilities { summarize: false, chat: false },
+        capabilities: Capabilities { summarize: false, chat: false, transcribe: true },
     },
     ProviderSpec {
         id: ProviderId::Local,
@@ -96,7 +115,7 @@ pub const REGISTRY: &[ProviderSpec] = &[
         label: "Local",
         keychain_account: None,
         key_test: None,
-        capabilities: Capabilities { summarize: true, chat: true },
+        capabilities: Capabilities { summarize: true, chat: true, transcribe: true },
     },
 ];
 
@@ -174,6 +193,7 @@ mod tests {
     #[test]
     fn keychain_accounts_are_unchanged() {
         assert_eq!(ProviderId::OpenAi.keychain_account(), Some("openai_api_key"));
+        assert_eq!(ProviderId::Anthropic.keychain_account(), Some("anthropic_api_key"));
         assert_eq!(ProviderId::Deepgram.keychain_account(), Some("deepgram_api_key"));
         assert_eq!(ProviderId::Groq.keychain_account(), Some("groq_api_key"));
         assert_eq!(ProviderId::Local.keychain_account(), None);
@@ -193,8 +213,22 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_key_test_hits_the_models_listing() {
+        let test = ProviderId::Anthropic.spec().key_test.unwrap();
+        assert_eq!(test.url, format!("{}/models", crate::anthropic::BASE));
+        assert_eq!(test.auth, AuthScheme::AnthropicKey);
+    }
+
+    #[test]
     fn auth_header_values() {
-        assert_eq!(AuthScheme::Bearer.header_value("k"), "Bearer k");
-        assert_eq!(AuthScheme::Token.header_value("k"), "Token k");
+        assert_eq!(AuthScheme::Bearer.headers("k"), vec![("Authorization", "Bearer k".to_string())]);
+        assert_eq!(AuthScheme::Token.headers("k"), vec![("Authorization", "Token k".to_string())]);
+        assert_eq!(
+            AuthScheme::AnthropicKey.headers("k"),
+            vec![
+                ("x-api-key", "k".to_string()),
+                ("anthropic-version", crate::anthropic::VERSION.to_string()),
+            ]
+        );
     }
 }
