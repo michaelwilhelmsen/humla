@@ -264,3 +264,16 @@ pub async fn anthropic_list_models(state: State<'_, AppState>) -> Result<Vec<Str
         .ok_or_else(|| "No Anthropic API key stored".to_string())?;
     crate::anthropic::list_models(&key).await.map_err(err)
 }
+
+/// The chat-capable OpenAI models this key can reach. Narrowed by
+/// `openai::chat_capable_models`: a raw listing is mostly embedders,
+/// transcribers and dated snapshots.
+#[tauri::command]
+pub async fn openai_list_models(state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    let key = super::read_provider_api_key(&state, "openai")?
+        .ok_or_else(|| "No OpenAI API key stored".to_string())?;
+    let ids = crate::openai::list_models_with_key(crate::openai::BASE, Some(&key))
+        .await
+        .map_err(err)?;
+    Ok(crate::openai::chat_capable_models(ids))
+}

@@ -8,9 +8,9 @@ import { ProviderKeyCard } from "../../../components/provider/ProviderKeyCard";
 import { CommandSnippet } from "../../../components/CommandSnippet";
 import { RECOMMENDED_OLLAMA_MODEL, RECOMMENDED_OLLAMA_MODEL_16GB } from "../../../lib/localModels";
 import { SUMMARY_PRESETS, presetLabel } from "../../../lib/presets";
-import { useAnthropicModels } from "../../../components/provider/useAnthropicModels";
+import { useCloudModels } from "../../../components/provider/useCloudModels";
 import { useProviderKey } from "../../../components/provider/useProviderKey";
-import { SUMMARY_MODELS, SUMMARY_PROVIDERS } from "../types";
+import { SUMMARY_PROVIDERS } from "../types";
 import type { SettingsHook } from "../useSettings";
 
 export function SummaryTab({
@@ -19,11 +19,16 @@ export function SummaryTab({
 }: Pick<SettingsHook, "s" | "update">) {
   const isLocal = s.summary_provider === "local";
   const isAnthropic = s.summary_provider === "anthropic";
-  // Called unconditionally (rules of hooks) and inert until Anthropic is the
-  // chosen provider — neither the Keychain slot nor the model listing is
+  // Called unconditionally (rules of hooks) and inert until that provider is
+  // the chosen one — neither the Keychain slot nor the model listing is
   // touched otherwise.
+  const isOpenAi = s.summary_provider === "openai";
+  const openaiKey = useProviderKey("openai", { enabled: isOpenAi });
+  const openaiModels = useCloudModels("openai", openaiKey.hasKey, s.summary_model, {
+    enabled: isOpenAi,
+  });
   const anthropicKey = useProviderKey("anthropic", { enabled: isAnthropic });
-  const anthropicModels = useAnthropicModels(anthropicKey.hasKey, s.anthropic_model, {
+  const anthropicModels = useCloudModels("anthropic", anthropicKey.hasKey, s.anthropic_model, {
     enabled: isAnthropic,
   });
 
@@ -42,7 +47,7 @@ export function SummaryTab({
           }
         />
 
-        {s.summary_provider === "openai" && (
+        {isOpenAi && (
           <>
             <Row
               label="Model"
@@ -51,7 +56,7 @@ export function SummaryTab({
                 <Select
                   value={s.summary_model}
                   onChange={(v) => update("summary_model", v)}
-                  options={SUMMARY_MODELS.map((m) => ({ value: m, label: m }))}
+                  options={openaiModels}
                 />
               }
             />

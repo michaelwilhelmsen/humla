@@ -1508,7 +1508,54 @@ fn trim_runaway_repetition(text: &str) -> String {
 /// the Settings UI to populate a model dropdown when the user picks Local
 /// provider. Hits `<base_url>/models` and returns the `id` field for each
 /// entry — the universal OpenAI/Ollama/LM Studio shape.
-pub async fn list_models(base_url: &str) -> Result<Vec<String>> {
+/// Ids a listing offers that are no use as a chat model — a different
+/// modality, an embedder, a completion-only or tool-specific model.
+const NON_CHAT_MARKERS: &[&str] = &[
+    "realtime",
+    "audio",
+    "transcribe",
+    "tts",
+    "image",
+    "embedding",
+    "search",
+    "instruct",
+    "moderation",
+    "codex",
+];
+
+/// A dated snapshot (`gpt-5.4-2026-03-01`) — the undated alias points at the
+/// same model and is the one to offer.
+fn is_dated_snapshot(id: &str) -> bool {
+    let b = id.as_bytes();
+    if b.len() < 11 {
+        return false;
+    }
+    let tail = &b[b.len() - 11..];
+    tail[0] == b'-'
+        && tail[5] == b'-'
+        && tail[8] == b'-'
+        && tail[1..5].iter().all(|c| c.is_ascii_digit())
+        && tail[6..8].iter().all(|c| c.is_ascii_digit())
+        && tail[9..].iter().all(|c| c.is_ascii_digit())
+}
+
+/// Narrow a raw OpenAI model listing to what a summary or chat picker should
+/// offer, newest-looking first.
+pub(crate) fn chat_capable_models(ids: Vec<String>) -> Vec<String> {
+    let mut out: Vec<String> = ids
+        .into_iter()
+        .filter(|id| id.starts_with("gpt-") || is_reasoning_model(id))
+        .filter(|id| !NON_CHAT_MARKERS.iter().any(|m| id.contains(m)))
+        .filter(|id| !is_dated_snapshot(id))
+        .collect();
+    out.sort_by(|a, b| b.cmp(a));
+    out.dedup();
+    out
+}
+
+/// Models a listing offers. `api_key` is `None` for a local server, which
+/// takes no auth.
+pub async fn list_models_with_key(base_url: &str, api_key: Option<&str>) -> Result<Vec<String>> {
     #[derive(Deserialize)]
     struct ListResponse {
         data: Vec<ModelEntry>,
@@ -1517,16 +1564,21 @@ pub async fn list_models(base_url: &str) -> Result<Vec<String>> {
     struct ModelEntry {
         id: String,
     }
-    let r = client()
-        .get(format!("{base_url}/models"))
-        .send()
-        .await?;
+    let mut req = client().get(format!("{base_url}/models"));
+    if let Some(key) = api_key {
+        req = req.bearer_auth(key);
+    }
+    let r = req.send().await?;
     if !r.status().is_success() {
         let s = r.status();
         return Err(anyhow!("HTTP {s} from {base_url}/models"));
     }
     let body: ListResponse = r.json().await?;
     Ok(body.data.into_iter().map(|m| m.id).collect())
+}
+
+pub async fn list_models(base_url: &str) -> Result<Vec<String>> {
+    list_models_with_key(base_url, None).await
 }
 
 // ── Embeddings (issue #48) ──────────────────────────────────────────────────
@@ -1601,6 +1653,30 @@ pub(crate) async fn openai_embed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_model_listing_is_narrowed_to_chat_models() {
+        let raw = [
+            "whisper-1",
+            "gpt-4o-realtime-preview",
+            "text-embedding-3-small",
+            "gpt-5.4-mini",
+            "gpt-5.4-2026-03-01",
+            "o3",
+            "gpt-image-1",
+            "chatgpt-4o-latest",
+        ]
+        .map(String::from)
+        .to_vec();
+        assert_eq!(chat_capable_models(raw), vec!["o3", "gpt-5.4-mini"]);
+    }
+
+    #[test]
+    fn an_undated_alias_survives_the_snapshot_filter() {
+        assert!(is_dated_snapshot("gpt-5.4-2026-03-01"));
+        assert!(!is_dated_snapshot("gpt-5.4"));
+        assert!(!is_dated_snapshot("gpt-4o-mini"));
+    }
 
     #[test]
     fn the_send_retry_policy_is_two_tries_with_a_lengthening_backoff() {

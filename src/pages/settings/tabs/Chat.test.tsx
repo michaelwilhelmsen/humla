@@ -36,6 +36,42 @@ describe("ChatTab provider setting", () => {
   });
 });
 
+describe("ChatTab OpenAI model list", () => {
+  it("offers the live listing when there is one", async () => {
+    mockTauri({ provider_key_get: () => "stored", openai_list_models: () => ["gpt-9-turbo"] });
+    render(
+      <ChatTab s={settings({ chat_provider: "openai", chat_model: "gpt-5.4" })} update={async () => {}} />,
+    );
+    await userEvent.click(await screen.findByRole("combobox", { name: "gpt-5.4" }));
+    expect(screen.getAllByRole("option").map((o) => o.textContent)).toEqual([
+      "gpt-5.4",
+      "gpt-9-turbo",
+    ]);
+  });
+
+  it("falls back to the shipped list when the listing fails", async () => {
+    mockTauri({
+      provider_key_get: () => "stored",
+      openai_list_models: () => {
+        throw new Error("network");
+      },
+    });
+    render(
+      <ChatTab s={settings({ chat_provider: "openai", chat_model: "gpt-5.4" })} update={async () => {}} />,
+    );
+    await userEvent.click(await screen.findByRole("combobox", { name: "gpt-5.4" }));
+    expect(screen.getAllByRole("option").map((o) => o.textContent)).toContain("gpt-5.4-nano");
+  });
+
+  it("isn't called while a local server is selected", async () => {
+    const listed = vi.fn(() => []);
+    mockTauri({ provider_key_get: () => "stored", openai_list_models: listed });
+    render(<ChatTab s={settings({ chat_provider: "ollama" })} update={async () => {}} />);
+    await screen.findByLabelText("Local LLM server URL");
+    expect(listed).not.toHaveBeenCalled();
+  });
+});
+
 describe("ChatTab on Anthropic", () => {
   it("shows the key card, a model row and the keyword-only note", async () => {
     render(
@@ -44,6 +80,14 @@ describe("ChatTab on Anthropic", () => {
     expect(await screen.findByLabelText("Anthropic API key")).toBeInTheDocument();
     expect(screen.getByRole("combobox", { name: "claude-sonnet-5" })).toBeInTheDocument();
     expect(screen.getByText(/searches your notes by keyword/)).toBeInTheDocument();
+  });
+
+  it("doesn't list OpenAI models while Anthropic is selected", async () => {
+    const listed = vi.fn(() => []);
+    mockTauri({ provider_key_get: () => "stored", openai_list_models: listed });
+    render(<ChatTab s={settings({ chat_provider: "anthropic" })} update={async () => {}} />);
+    await screen.findByLabelText("Anthropic API key");
+    expect(listed).not.toHaveBeenCalled();
   });
 
   it("touches nothing Anthropic while OpenAI is selected", async () => {

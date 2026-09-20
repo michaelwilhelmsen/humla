@@ -69,6 +69,7 @@ export function mockTauri(
       case "provider_key_get":
         return null;
       case "anthropic_list_models":
+      case "openai_list_models":
         return [];
       // No embedding server in a test environment — the honest default is the
       // failure a real machine without one gives (#179).

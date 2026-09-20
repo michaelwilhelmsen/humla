@@ -10,8 +10,8 @@ import { useOllamaProbe } from "../../../components/provider/useOllamaProbe";
 import { cloudChatHint, localChatHint } from "../../../components/provider/useChatReadiness";
 import { useEmbedProbe } from "../../../components/provider/useEmbedProbe";
 import { useProviderKey } from "../../../components/provider/useProviderKey";
-import { useAnthropicModels } from "../../../components/provider/useAnthropicModels";
-import { CHAT_PROVIDERS, SUMMARY_MODELS } from "../types";
+import { useCloudModels } from "../../../components/provider/useCloudModels";
+import { CHAT_PROVIDERS } from "../types";
 import {
   EMBEDDING_OLLAMA_MODEL,
   RECOMMENDED_OLLAMA_MODEL,
@@ -33,7 +33,9 @@ export function ChatTab({ s, update }: Pick<SettingsHook, "s" | "update">) {
   // when chat isn't on Ollama, and the listing when no Anthropic key is stored.
   const key = useProviderKey("openai", { enabled: !isOllama && !isAnthropic });
   const anthropicKey = useProviderKey("anthropic", { enabled: isAnthropic });
-  const anthropicModels = useAnthropicModels(anthropicKey.hasKey, s.chat_model, {
+  const isOpenAi = !isOllama && !isAnthropic;
+  const openaiModels = useCloudModels("openai", key.hasKey, s.chat_model, { enabled: isOpenAi });
+  const anthropicModels = useCloudModels("anthropic", anthropicKey.hasKey, s.chat_model, {
     enabled: isAnthropic,
   });
   const { reachable, installed } = useOllamaProbe(s.local_llm_base_url, { enabled: isOllama });
@@ -71,7 +73,7 @@ export function ChatTab({ s, update }: Pick<SettingsHook, "s" | "update">) {
   // choice, or a model list the app doesn't hard-code) so nothing looks blank.
   const openaiModelOptions = [
     ...(s.chat_model === "" ? [{ value: "", label: "Choose a model…" }] : []),
-    ...SUMMARY_MODELS.map((m) => ({ value: m, label: m })),
+    ...openaiModels,
   ];
 
   return (
@@ -119,7 +121,7 @@ export function ChatTab({ s, update }: Pick<SettingsHook, "s" | "update">) {
         </>
       )}
 
-      {!isOllama && !isAnthropic && (
+      {isOpenAi && (
         <>
           <Row
             label="Model"

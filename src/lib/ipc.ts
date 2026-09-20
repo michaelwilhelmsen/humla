@@ -554,6 +554,9 @@ export const ipc = {
   /** Models the stored Anthropic key can reach, newest first (#183). */
   anthropicListModels: () => invoke<string[]>("anthropic_list_models"),
 
+  /** Chat-capable models the stored OpenAI key can reach. */
+  openaiListModels: () => invoke<string[]>("openai_list_models"),
+
   // Dimensionality of one real embedding, or the server's own error. The model
   // listing can't answer this (#179): a server can list a model and serve no
   // embeddings route.
