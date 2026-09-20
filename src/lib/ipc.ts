@@ -686,13 +686,12 @@ export const ipc = {
     invoke<void>("chat_set_owner_filter", { ...targetIds(target), conversationId, owner }),
   chatGetOwnerFilter: (target: ChatTarget, conversationId: string | null = null) =>
     invoke<string>("chat_get_owner_filter", { ...targetIds(target), conversationId }),
-  // Persist / read the conversation's pinned Client and speaker (#115) — null
-  // clears. NOT workspace-only, unlike the authorship pin above: a Personal
-  // library has Clients and speakers, and local retrieval applies both.
+  // Persist / read the conversation's pinned Client and speaker — null clears.
+  // Not workspace-only, unlike the authorship pin above: a Personal library has
+  // both, and local retrieval applies them.
   //
-  // The Client is an id (resolved to a name for the chip); the speaker is the
-  // transcript LABEL itself, permanently — there is no person entity to key on
-  // (ADR-0002), so two spellings of one person are two pins.
+  // The Client is an id; the speaker is the transcript label itself, since there
+  // is no person entity to key on (ADR-0002).
   chatSetClientFilter: (target: ChatTarget, conversationId: string | null, client: string | null) =>
     invoke<void>("chat_set_client_filter", { ...targetIds(target), conversationId, client }),
   chatGetClientFilter: (target: ChatTarget, conversationId: string | null = null) =>
@@ -776,10 +775,10 @@ export type ConversationMeta = {
    *  rather than a flag because a workspace's conversation list is shared: a
    *  boolean would mean different notes to different readers of one thread. */
   ownerFilter: string;
-  /** The pinned Client's id, or "" for off (#115). */
+  /** The pinned Client's id, or "" for off. */
   clientFilter: string;
-  /** The pinned speaker's transcript label, or "" for off (#115). Already a
-   *  display string — there is no id to resolve. */
+  /** The pinned speaker's transcript label, or "" for off. Already a display
+   *  string — there is no id to resolve. */
   speakerFilter: string;
   updatedAt: number;
   messageCount: number;

@@ -71,35 +71,35 @@ pub enum ToolScope {
     All,
 }
 
-/// The conversation-level pins the USER set (#115), as opposed to the filters the
-/// model chooses per call. Both narrow the same two fields, so one of them has to
-/// win: the pin does, always, and silently overrides whatever the model asked for.
+/// The conversation-level pins the user set, as opposed to the filters the model
+/// chooses per call. Both narrow the same two fields, and the pin always wins.
 ///
-/// That is the whole point of a pin. #115 exists because "a filter the model
-/// *might* apply is not a filter you can rely on" — a pin the model could widen
-/// out of by passing its own `client_id` would be the same unreliable thing with
-/// a chip drawn next to it.
+/// Orthogonal to [`ToolScope`] rather than folded into it: breadth answers what is
+/// in reach and heals against the anchor note; these answer whose and who spoke,
+/// and have no anchor to heal against.
 ///
-/// Orthogonal to [`ToolScope`] rather than folded into it: breadth answers WHAT is
-/// in reach and heals against the anchor note, while these answer WHOSE and WHO
-/// SPOKE and have no anchor to heal against. Passed beside it for the same reason
-/// `LabelFallback` rides beside `ChainProgress`.
-///
-/// Applied to search and listing only, NOT to `get_note`. A pin narrows what is
-/// FOUND; a note id only ever reaches the model through a search or listing that
-/// was already pinned, so clamping the read as well would buy nothing and would
-/// break a citation the model had legitimately been handed.
+/// Applied to search and listing, not to `get_note`: a note id only reaches the
+/// model through a search or listing that was already pinned, so clamping the read
+/// would break a citation the model was legitimately handed.
 #[derive(Debug, Clone, Default)]
 pub struct Pins {
-    /// A Client id (a real entity id — see `db::Conversation::client_filter`).
+    /// A Client id.
     pub client: Option<String>,
-    /// A transcript label, not an id, permanently (ADR-0002).
+    /// A transcript label, not an id (ADR-0002).
     pub speaker: Option<String>,
 }
 
+/// Whether the Client pin applies under this breadth.
+///
+/// Dropped under `note`: one note is in scope, so it can only take the anchor
+/// away. The speaker pin is not dropped — it narrows to the passages that person
+/// spoke in. Mirrors `resolveScope` in `humla-cloud/chat-service/src/tools.ts`.
+pub fn client_pin_applies(scope: &ToolScope) -> bool {
+    !matches!(scope, ToolScope::Note(_))
+}
+
 impl Pins {
-    /// True when nothing is pinned — the common case, and the one the disclosure
-    /// stays silent for.
+    /// True when nothing is pinned.
     pub fn is_empty(&self) -> bool {
         self.client.is_none() && self.speaker.is_none()
     }
@@ -339,11 +339,9 @@ fn resolve_filter<'a>(
         // scope a window can only take it away, but a speaker still narrows
         // MEANINGFULLY — to the passages of this note that person spoke in, which is
         // exactly "what did she say in this meeting".
-        // A Client pin is dropped here for the same reason the date window is: with
-        // one note in scope it can only take the anchor away, and a pane that
-        // answers nothing about the note it is attached to is a bug, not a filter.
-        // The speaker pin survives — it narrows to the passages that person spoke,
-        // which is exactly "what did she say in this meeting".
+        // The Client pin is dropped here, like the date window: with one note in
+        // scope it can only take the anchor away. The speaker pin survives — it
+        // narrows to the passages that person spoke in.
         ToolScope::Note(id) => NoteFilter {
             note_id: Some(id),
             speaker,
@@ -402,8 +400,7 @@ pub fn execute_tool(
     conn: &Connection,
     workspace: &str,
     scope: &ToolScope,
-    // The user's conversation-level pins (#115), which beat the model's own
-    // filter arguments for the same fields.
+    // The user's pins, which beat the model's arguments for the same fields.
     pins: &Pins,
     name: &str,
     args: &Value,
@@ -833,7 +830,7 @@ mod tests {
 
     /// A fixed "now" so the date-window tests don't depend on the wall clock.
     const NOW: i64 = 1_785_024_000_000; // 2026-07-26T00:00:00Z
-    /// The unpinned case (#115), as a borrowable constant: `resolve_filter`
+    /// `resolve_filter`
     /// borrows its pins for the returned filter's lifetime, so a `UNPINNED`
     /// temporary can't live long enough at a call site.
     const UNPINNED: &Pins = &Pins { client: None, speaker: None };
@@ -844,7 +841,7 @@ mod tests {
         execute_tool(conn, workspace, scope, UNPINNED, name, args, None, "", NOW, None)
     }
 
-    /// Same, with the user's conversation-level pins in force (#115).
+    /// Same, with the user's pins in force.
     fn exec_pinned(
         conn: &Connection,
         scope: &ToolScope,
@@ -1151,11 +1148,7 @@ mod tests {
         }
     }
 
-    /// #115: a pin BEATS the model's own argument for the same field. This is the
-    /// whole reason a pin exists — the issue's own framing is that "a filter the
-    /// model *might* apply is not a filter you can rely on", so a model that can
-    /// pass its own `client_id` and widen out of the pin has reproduced the thing
-    /// the feature was built to fix.
+    /// A pin beats the model's own argument for the same field.
     #[test]
     fn a_pinned_client_overrides_the_models_own_client_argument() {
         let conn = open();
@@ -1180,8 +1173,7 @@ mod tests {
         }
     }
 
-    /// The speaker pin does the same, and composes with the Client pin rather than
-    /// replacing it — they are orthogonal (whose account × who spoke).
+    /// The speaker pin does the same, and composes with the Client pin.
     #[test]
     fn a_pinned_speaker_overrides_the_models_argument_and_composes_with_a_client() {
         let conn = open();
@@ -1205,11 +1197,7 @@ mod tests {
         assert!(!out.model_text.contains("Acme standup"), "{}", out.model_text);
     }
 
-    /// Under `note` breadth the Client pin is DROPPED and the speaker pin survives
-    /// — the asymmetry documented in `resolve_filter`. A Client pin there could
-    /// only ever take the pane's own anchor away, which is a bug wearing a
-    /// filter's clothes; a speaker pin narrows to what that person said in the
-    /// note, which is a real question.
+    /// Under `note` breadth the Client pin is dropped and the speaker pin survives.
     #[test]
     fn under_note_breadth_a_client_pin_is_dropped_and_a_speaker_pin_survives() {
         let conn = open();

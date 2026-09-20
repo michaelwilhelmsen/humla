@@ -386,11 +386,9 @@ pub fn open(path: &Path) -> Result<Connection> {
         "ALTER TABLE conversations ADD COLUMN owner_filter TEXT NOT NULL DEFAULT ''",
         [],
     );
-    // The remaining conversation-level pins (#115): a Client and a Speaker. Same
-    // back-fill rule and the same reason as the authorship pin above.
-    //
-    // Unlike that one these are NOT workspace-only — Personal has Clients and
-    // speakers too — so both also clamp local retrieval, not only the server's.
+    // A Client and a speaker pin, same back-fill rule as the authorship pin.
+    // Unlike that one these are not workspace-only: Personal has Clients and
+    // speakers, so they clamp local retrieval too.
     let _ = conn.execute(
         "ALTER TABLE conversations ADD COLUMN client_filter TEXT NOT NULL DEFAULT ''",
         [],
@@ -642,9 +640,9 @@ pub fn list_clients(conn: &Connection, workspace: &str) -> Result<Vec<Client>> {
     Ok(rows)
 }
 
-/// One Client's name by id, for the chat pin's disclosure (#115). `None` when the
-/// id matches nothing — a Client deleted since the pin was set, which discloses
-/// nothing rather than naming an id the model has never seen.
+/// One Client's name by id, for the chat pin's disclosure. `None` for a Client
+/// deleted since the pin was set, which then discloses nothing rather than
+/// naming an id.
 pub fn client_name(conn: &Connection, id: &str) -> Result<Option<String>> {
     let mut stmt = conn.prepare_cached("SELECT name FROM clients WHERE id = ?1")?;
     let mut rows = stmt.query(params![id])?;
@@ -1262,19 +1260,15 @@ pub struct Conversation {
     /// meaning per conversation, and lets the chip name them ("Created by Anna")
     /// instead of implying "you".
     pub owner_filter: String,
-    /// A pinned Client (#115): the client id whose notes this conversation
-    /// retrieves from, or empty for no filter.
+    /// The Client id this conversation retrieves from, or empty for no filter.
     ///
-    /// A genuine id, unlike [`Self::speaker_filter`] — a Client is an entity the
-    /// user created, so it survives a rename. The asymmetry between the two is
-    /// intended, not a gap (ADR-0002).
+    /// A genuine id, unlike [`Self::speaker_filter`]: a Client is an entity the
+    /// user created, so the pin survives a rename.
     pub client_filter: String,
-    /// A pinned speaker (#115): the transcript LABEL whose passages this
-    /// conversation retrieves, or empty for no filter.
+    /// The transcript label whose passages this conversation retrieves, or empty.
     ///
-    /// A string, permanently. There is no Person entity to key on and never will
-    /// be (ADR-0002) — convergence at write time (#116's autocomplete) is the
-    /// whole identity strategy, so two spellings of one person are two pins.
+    /// A string, not an id: there is no Person entity to key on (ADR-0002), so
+    /// two spellings of one person are two pins.
     pub speaker_filter: String,
     /// Session title (issue #61). NULL until the first user message sets it
     /// (personal scope) or the migration back-fills it; the session list falls
@@ -1595,7 +1589,7 @@ pub fn set_conversation_owner_filter(
     Ok(())
 }
 
-/// Pin (or clear) the conversation's Client filter (#115). `None` clears.
+/// Pin (or clear) the conversation's Client filter. `None` clears.
 pub fn set_conversation_client_filter(
     conn: &Connection,
     id: &str,
@@ -1608,8 +1602,7 @@ pub fn set_conversation_client_filter(
     Ok(())
 }
 
-/// Pin (or clear) the conversation's speaker filter (#115). `None` clears.
-/// A transcript label, not an id — see [`Conversation::speaker_filter`].
+/// Pin (or clear) the conversation's speaker filter. `None` clears.
 pub fn set_conversation_speaker_filter(
     conn: &Connection,
     id: &str,
@@ -3485,13 +3478,9 @@ mod tests {
         );
     }
 
-    /// The Client and Speaker pins (#115) default to off, round-trip, clear, and
-    /// survive a re-open — the same contract as the authorship pin above, and the
-    /// same back-fill reason: an existing conversation was answered unpinned.
-    ///
-    /// Pinned TOGETHER rather than in two tests because the thing worth pinning is
-    /// that they are INDEPENDENT: three filter columns on one row, and setting one
-    /// must not disturb the others. A per-pin test can't see that.
+    /// Both pins default to off, round-trip, clear, and survive a re-open — and,
+    /// the part a per-pin test cannot see, stay independent of each other and of
+    /// the authorship pin.
     #[test]
     fn conversation_client_and_speaker_pins_are_independent_and_persist() {
         let dir = tempfile::tempdir().unwrap();

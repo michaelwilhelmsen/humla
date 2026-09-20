@@ -43,7 +43,7 @@ pub mod test_server {
         (port, handle)
     }
 }
-pub use tools::{execute_tool, tool_specs, Citation, Pins, ToolScope};
+pub use tools::{client_pin_applies, execute_tool, tool_specs, Citation, Pins, ToolScope};
 #[cfg(test)]
 pub use providers::{FakeChatAdapter, StallingChatAdapter};
 
@@ -368,26 +368,16 @@ pub fn system_prompt_with_context(
     out
 }
 
-/// The disclosure sentence for the user's conversation-level pins (#115), or
-/// `None` when nothing is pinned.
+/// The disclosure sentence for the conversation's pins, or `None` when nothing
+/// is pinned.
 ///
-/// **Mirrored by `pinDisclosure` in `humla-cloud/chat-service/src/chat.ts`** — a
-/// workspace turn retrieves server-side, so a change here that isn't made there
-/// leaves the gap open in exactly the tenant where Clients are most likely.
+/// **Mirrored by `pinDisclosure` in `humla-cloud/chat-service/src/chat.ts`** —
+/// a workspace turn retrieves there, so both must change together.
 ///
-/// Not optional, and for a sharper reason than breadth's. A pinned filter the
-/// model isn't told about lets it search, find nothing, and answer "nobody
-/// mentioned that anywhere in your notes" when it only ever saw one account's
-/// notes — or one person's speech. Same failure class as #106's counted zero and
-/// #113's undisclosed breadth, and worse here, because the model cannot infer a
-/// pin from its own tool results the way it might notice a narrow corpus.
-///
-/// The names are what the USER sees on the chips, not ids: an id discloses
-/// nothing to a model that has never seen it. A Client whose name can't be
-/// resolved falls back to silence for that clause rather than naming an id.
-///
-/// Terse on purpose (the minimal-prompt finding): one sentence per pin, no
-/// re-statement of what the tools already say.
+/// Without it the model can search under a pin, find nothing, and report that
+/// nothing exists anywhere; it cannot infer a pin from its own tool results.
+/// Names, never ids: an id discloses nothing to a model that has never seen one,
+/// so an unresolvable name drops its clause instead.
 fn pin_disclosure(pins: PinNames<'_>) -> Option<String> {
     let client = pins.client.map(str::trim).filter(|c| !c.is_empty());
     let speaker = pins.speaker.map(str::trim).filter(|s| !s.is_empty());
@@ -606,8 +596,7 @@ pub async fn run_chat(
     conversation_id: &str,
     grounding: &str,
     scope: &ToolScope,
-    // The conversation's user-set pins (#115). Clamp retrieval and are disclosed
-    // in the prompt, for the same reason breadth is (#113).
+    // Clamp retrieval, and are disclosed in the prompt as breadth is.
     pins: &Pins,
     workspace: &str,
     embedder: Option<&dyn crate::embed::EmbeddingAdapter>,
@@ -649,9 +638,13 @@ pub async fn run_chat(
         // resolves to None and its clause is dropped — the pin still filters (and
         // honestly returns nothing), it just loses its wording, exactly as the
         // authorship pin does for a removed member.
+        // Only a pin that is IN FORCE. `resolve_filter` drops the Client pin under
+        // `note` breadth, and announcing a filter the retrieval isn't applying is
+        // the inverse of the lie this disclosure prevents.
         let client = pins
             .client
             .as_deref()
+            .filter(|_| client_pin_applies(scope))
             .and_then(|id| db::client_name(&conn, id).ok().flatten());
         (title, folder, client)
     };
@@ -962,8 +955,7 @@ fn ctx_ref<'a>(ctx: &ChatCtx<'a>) -> ChatCtx<'a> {
 
 #[cfg(test)]
 mod tests {
-    /// No conversation-level pins (#115) — the default for every test that
-    /// isn't about them.
+    /// The default for every test that isn't about pins.
     const UNPINNED: &Pins = &Pins { client: None, speaker: None };
 
     use super::adapter::{ChatStep, ToolCall};
@@ -1174,10 +1166,8 @@ mod tests {
     /// sentence would read "restricted to the folder ''" — worse than silence, and
     /// the model cannot tell it is a bug rather than a real narrowing.
     #[test]
-    /// #115: a pinned Client or speaker is DISCLOSED, and an unpinned conversation
-    /// stays silent. The silence is what makes the disclosure mean something — and
-    /// the disclosure is what stops the model reporting "nobody mentioned that
-    /// anywhere in your notes" when it only ever searched one account's.
+    /// A pinned Client or speaker is disclosed; an unpinned conversation stays
+    /// silent, which is what makes the disclosure mean something.
     #[test]
     fn the_prompt_discloses_the_pins_and_stays_silent_when_there_are_none() {
         let none = system_prompt_with_context(NOW, None, None, PinNames::default());
@@ -1215,6 +1205,18 @@ mod tests {
     /// A pin whose name can't be resolved — a Client deleted since it was set —
     /// discloses nothing for that clause rather than naming an id the model has
     /// never seen. Same rule as a nameless folder reach.
+    /// A pin that isn't in force must not be announced. The Client pin is dropped
+    /// under `note` breadth, so disclosing it there would tell the model it is
+    /// confined to a client it is in fact searching past — the inverse of the lie
+    /// the disclosure exists to prevent, and reachable by pinning at `all` and
+    /// then narrowing the breadth.
+    #[test]
+    fn a_client_pin_dropped_by_the_breadth_is_not_disclosed() {
+        assert!(!client_pin_applies(&ToolScope::Note("n1".into())));
+        assert!(client_pin_applies(&ToolScope::All));
+        assert!(client_pin_applies(&ToolScope::Folder("f1".into())));
+    }
+
     #[test]
     fn an_unresolvable_pin_name_discloses_nothing() {
         for blank in ["", "   "] {

@@ -698,11 +698,11 @@ pub struct ConversationMeta {
     /// The pinned authorship filter's user id, or "" for none (#103). The chip
     /// resolves it to a name against the workspace roster.
     owner_filter: String,
-    /// The pinned Client's id, or "" for none (#115). The chip resolves it to a
-    /// name against the Client list.
+    /// The pinned Client's id, or "" for none. The token resolves it to a name
+    /// against the Client list.
     client_filter: String,
-    /// The pinned speaker's LABEL, or "" for none (#115). Already a display
-    /// string — there is no id to resolve (ADR-0002).
+    /// The pinned speaker's label, or "" for none. Already a display string —
+    /// there is no id to resolve (ADR-0002).
     speaker_filter: String,
     updated_at: i64,
     message_count: i64,
@@ -899,8 +899,8 @@ fn non_empty(s: &str) -> Option<String> {
 pub struct DraftSettings {
     pub breadth: Option<String>,
     pub owner_filter: Option<String>,
-    /// #115's pins, carried the same way and for the same reason: a drafting pane
-    /// holds them until the first turn materialises the row.
+    /// The other two pins, carried the same way: a drafting pane holds them
+    /// until the first turn materialises the row.
     pub client_filter: Option<String>,
     pub speaker_filter: Option<String>,
 }
@@ -969,9 +969,8 @@ fn validated_draft(
             );
         }
     }
-    // #115's pins need no context check of their own: unlike authorship, a Client
-    // and a speaker both exist in Personal, which is the whole reason they clamp
-    // local retrieval. Blank is normalised away for the same reason as above.
+    // No context check for these two: unlike authorship, a Client and a speaker
+    // both exist in Personal, which is why they clamp local retrieval.
     Ok(DraftSettings {
         breadth,
         owner_filter,
@@ -1004,9 +1003,8 @@ fn resolve_or_create(
     let breadth = draft.breadth.unwrap_or_else(|| inherited_breadth(conn, tenant, target));
     let conv = db::create_conversation(conn, tenant, target.scope(), target.scope_id(), &breadth)
         .map_err(|e| e.to_string())?;
-    // #115's pins ride onto the new row the same way. Written after creation
-    // rather than widening the INSERT, matching the authorship pin below: pins are
-    // rare and `create_conversation` is on every path that makes a row.
+    // Written after creation rather than widening the INSERT, like the authorship
+    // pin below: pins are rare and `create_conversation` is on every path.
     if let Some(client) = draft.client_filter.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
         db::set_conversation_client_filter(conn, &conv.id, Some(client))
             .map_err(|e| e.to_string())?;
@@ -1034,8 +1032,8 @@ fn resolve_or_create(
                 .map_err(|e| e.to_string())?;
             reread(conn)
         }
-        // A row that got one of #115's pins still has to be re-read, or the
-        // returned handle would carry the pre-pin values.
+        // A row that got either pin is re-read, or the handle would carry the
+        // pre-pin values.
         _ if pinned => reread(conn),
         _ => Ok(conv),
     }
@@ -1350,11 +1348,10 @@ pub fn chat_set_owner_filter(
         .map_err(|e| e.to_string())
 }
 
-/// Pin (or clear) the conversation's Client filter (#115).
+/// Pin (or clear) the conversation's Client filter.
 ///
 /// Unlike `chat_set_owner_filter` this is allowed in Personal: a Personal library
-/// has Clients, and the local retrieval path applies the pin (see `chat_send`).
-/// The same goes for the speaker pin below.
+/// has Clients, and the local path applies the pin. Same for the speaker below.
 #[tauri::command]
 pub fn chat_set_client_filter(
     app: AppHandle,
@@ -1379,11 +1376,10 @@ pub fn chat_set_client_filter(
         .map_err(|e| e.to_string())
 }
 
-/// Pin (or clear) the conversation's speaker filter (#115).
+/// Pin (or clear) the conversation's speaker filter.
 ///
-/// A transcript LABEL, not an id, and permanently so (ADR-0002). Two spellings of
-/// one person are two pins; convergence at write time (#116's autocomplete) is the
-/// whole identity strategy, and there is no read-time reconciliation coming.
+/// A transcript label, not an id (ADR-0002): two spellings of one person are two
+/// pins, and nothing reconciles them at read time.
 #[tauri::command]
 pub fn chat_set_speaker_filter(
     app: AppHandle,
@@ -1406,9 +1402,8 @@ pub fn chat_set_speaker_filter(
         .map_err(|e| e.to_string())
 }
 
-/// Read the persisted Client pin (#115). `""` = off, and no session yet is also
-/// off — a pin is only ever something the user set, so there is nothing to
-/// inherit and no row to create for the read.
+/// Read the persisted Client pin. `""` = off, and so is no session yet: a pin is
+/// only ever something the user set, so there is nothing to inherit.
 #[tauri::command]
 pub fn chat_get_client_filter(
     app: AppHandle,
@@ -1427,7 +1422,7 @@ pub fn chat_get_client_filter(
     )
 }
 
-/// Read the persisted speaker pin (#115). `""` = off.
+/// Read the persisted speaker pin. `""` = off.
 #[tauri::command]
 pub fn chat_get_speaker_filter(
     app: AppHandle,
@@ -1822,7 +1817,7 @@ pub async fn chat_send(
     // is already the source of truth for both.
     draft_breadth: Option<String>,
     draft_owner_filter: Option<String>,
-    // #115's pins, carried the same way.
+    // The other two pins, carried the same way.
     draft_client_filter: Option<String>,
     draft_speaker_filter: Option<String>,
 ) -> Result<ChatSendResult, String> {
@@ -1892,10 +1887,9 @@ pub async fn chat_send(
         // pin is read and sent. Keep this in step with that rejection — a pin that
         // could be stored but not applied is the silent-no-op shape (#103).
         //
-        // The Client and speaker pins ARE read here (#115), and that is the one
-        // way they differ from the authorship pin: Personal has Clients and
-        // speakers, so a pin set here has to clamp local retrieval or it would be
-        // exactly that silent no-op.
+        // The Client and speaker pins ARE read here, which is the one way they
+        // differ from the authorship pin: Personal has both, so a pin set here
+        // has to clamp local retrieval or it is that same silent no-op.
         let pins = chat::Pins {
             client: non_empty(&conversation.client_filter),
             speaker: non_empty(&conversation.speaker_filter),
@@ -2064,10 +2058,9 @@ async fn chat_send_cloud(
         // and binding the same way: it's the user's stated intent, so it applies
         // whatever the model asks for.
         let owner_filter = conversation.owner_filter.clone();
-        // #115's pins, read from that same row. The Client pin's display NAME is
-        // resolved here for the same reason the folder's is: the scope carries an
-        // id the model has never seen, so losing the name costs the disclosure.
-        // The speaker pin needs no resolution — it IS its own name.
+        // The Client pin's display name is resolved here as the folder's is: the
+        // scope carries an id the model has never seen, so losing the name costs
+        // the disclosure. The speaker pin is its own name.
         let client_filter = conversation.client_filter.clone();
         let speaker_filter = conversation.speaker_filter.clone();
         let client_display = (!client_filter.trim().is_empty())
@@ -2452,8 +2445,8 @@ fn ensure_workspace_handle(
     remote_id: &str,
     breadth: &str,
     owner_filter: Option<&str>,
-    // #115's pins, mirrored on the same terms: adopted at handle creation, never
-    // written over an existing local row.
+    // Mirrored on the same terms: adopted at handle creation, never written over
+    // an existing local row.
     client_filter: Option<&str>,
     speaker_filter: Option<&str>,
 ) -> Result<db::Conversation, String> {

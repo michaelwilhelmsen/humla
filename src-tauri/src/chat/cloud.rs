@@ -39,12 +39,11 @@ pub struct CloudScope<'a> {
     /// what the server filters on; the name only reaches the prompt, so the model
     /// can say whose notes it was restricted to. Absent = no filter.
     pub owner: Option<(&'a str, &'a str)>,
-    /// A pinned Client (#115): `(client_id, display_name)`, the same id/name
-    /// split as `owner` and for the same reason.
+    /// A pinned Client: `(client_id, display_name)`, the same id/name split as
+    /// `owner`.
     pub client: Option<(&'a str, &'a str)>,
-    /// A pinned speaker (#115). One value, not a pair: a speaker pin IS a
-    /// transcript label, so the filter input and the display name are the same
-    /// string and there is no id to separate (ADR-0002).
+    /// A pinned speaker. One value, not a pair: the label is both the filter
+    /// input and the display name (ADR-0002).
     pub speaker: Option<&'a str>,
     /// The anchor note's title — display name for breadth "note" (#113).
     pub note_title: Option<&'a str>,
@@ -118,10 +117,8 @@ pub fn build_cloud_request(
         }
         v
     };
-    // #115's pins ride on exactly the same terms as the authorship pin: the id is
-    // the filter input, the name is prompt text, and a missing name costs the
-    // disclosure but never the filter. Both are sent under EVERY breadth — unlike
-    // a reach name — because they compose with breadth rather than describing it.
+    // Same terms as the authorship pin. Sent under every breadth, unlike a reach
+    // name, because they compose with breadth rather than describing it.
     let with_pins = |mut v: Value| {
         if let Some((id, name)) = client.filter(|(id, _)| !id.trim().is_empty()) {
             v["client"] = json!(id);
@@ -546,10 +543,8 @@ mod tests {
         CloudScope { breadth: "note", note_id: Some(id), ..CloudScope::default() }
     }
 
-    /// #115: both pins ride the scope under EVERY breadth, with the id/name split
-    /// the authorship pin established — the id is what the server filters on, the
-    /// name only reaches the prompt. A speaker pin has no pair: the label IS the
-    /// name (ADR-0002).
+    /// Both pins ride the scope under every breadth, id separated from name. A
+    /// speaker pin has no pair: the label is the name.
     #[test]
     fn the_client_and_speaker_pins_ride_every_breadth_with_names_separated() {
         let pinned = |breadth: &'static str, folder: Option<&'static str>| CloudScope {
