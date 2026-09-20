@@ -12,9 +12,13 @@ import {
   Folder,
   Loader2,
   MessageCircle,
+  Building2,
+  MessageSquareQuote,
+  Plus,
   Settings2,
   Square,
   UserRound,
+  X,
 } from "lucide-react";
 import {
   ipc,
@@ -33,6 +37,9 @@ import { useNotesStore } from "../lib/store";
 import { cloudApi, formatSeatPrice, useCloudStore, useMemberName, type ChatAddon, type ChatKeyMeta } from "../lib/cloud";
 import { useChatReadiness } from "./provider/useChatReadiness";
 import { SelectablePopover, type PopoverItem } from "./SelectablePopover";
+import { Popover, PopoverContent, PopoverTrigger } from "./ui/Popover";
+import { Combobox, type ComboboxOption } from "./ui/Combobox";
+import { suggestSpeakerLabels, type SpeakerSuggestionSource } from "../lib/speakerSuggest";
 import { ChatKeyEntry } from "./ChatKeyEntry";
 import {
   usageTone,
@@ -275,6 +282,12 @@ export function ChatPanel({
   // id and not a flag because a workspace's conversation list is shared — a
   // boolean would mean different notes to each reader of the same thread.
   const [ownerFilter, setOwnerFilter] = useState("");
+  // The remaining conversation-level pins (#115): a Client id and a speaker
+  // LABEL, or "" for off. Display state mirroring the backend row, exactly as the
+  // two above. The speaker is a label and not an id permanently — there is no
+  // person entity to key on (ADR-0002).
+  const [clientFilter, setClientFilter] = useState("");
+  const [speakerFilter, setSpeakerFilter] = useState("");
   // Prompt picker visibility (#80). Opened by typing "/" into an empty composer;
   // the picker owns the keys while it's up (it takes focus), so the composer's
   // own key handler doesn't need to know about Escape.
@@ -448,6 +461,8 @@ export function ChatPanel({
       setMessages([]);
       setScope(meta.breadth ?? targetDefaultScope(target));
       setOwnerFilter(meta.ownerFilter ?? "");
+      setClientFilter(meta.clientFilter ?? "");
+      setSpeakerFilter(meta.speakerFilter ?? "");
       setConversations((prev) => [meta, ...prev.filter((c) => c.id !== meta.id)]);
       void reloadConversationList(gen);
     } catch (e) {
@@ -525,16 +540,20 @@ export function ChatPanel({
       const gen = beginSwitch();
       setConversationId(id);
       try {
-        const [h, b, o] = await Promise.all([
+        const [h, b, o, c, sp] = await Promise.all([
           ipc.chatHistory(target, id),
           ipc.chatGetBreadth(target, id),
           ipc.chatGetOwnerFilter(target, id).catch(() => ""),
+          ipc.chatGetClientFilter(target, id).catch(() => ""),
+          ipc.chatGetSpeakerFilter(target, id).catch(() => ""),
         ]);
         if (gen !== switchGenRef.current) return;
         setMessages(h?.messages ?? []);
         if (h?.conversationId) setConversationId(h.conversationId);
         if (b) setScope(b);
         setOwnerFilter(o ?? "");
+        setClientFilter(c ?? "");
+        setSpeakerFilter(sp ?? "");
       } catch {
         if (gen === switchGenRef.current) setMessages([]);
       } finally {
@@ -620,6 +639,15 @@ export function ChatPanel({
   // Presence tracks the SCOPE, not the note: conditioning on who owns the anchor
   // would only change the no-op case, while making the chip flicker between notes
   // for a reason nothing on screen explains.
+  const clients = useNotesStore((s) => s.clients);
+  // The pins' picker (#115). Hidden under `note` breadth for the reason the
+  // author pin and the date window are: one note is in scope, so a Client filter
+  // is either a no-op or it empties the pane's own anchor. The SPEAKER pin would
+  // still narrow meaningfully there ("what did she say in this meeting") — but
+  // the two share one picker, and a picker that silently offers half its rows
+  // depending on breadth is harder to explain than one that isn't there.
+  const showPinPicker = scope !== "note";
+  const pinnedClientName = clients.find((c) => c.id === clientFilter)?.name ?? null;
   const showAuthorPin = inWorkspace && scope !== "note";
   // Editable iff the filter is off, or pinned to you. Anna's way out of a thread
   // pinned to Michael is her own thread — the alternative is her quietly rewriting
@@ -632,13 +660,57 @@ export function ChatPanel({
   // disclosure line. Null when unresolvable (a removed member, or a roster that
   // hasn't loaded); the pin still filters, it just loses its wording.
   const pinnedAuthorName = useMemberName(ownerFilter || null);
+  // What the strip renders: one token per ACTIVE pin, nothing when none are.
+  // The authorship pin stays in the row as a toggle rather than joining these —
+  // it is binary and always offerable, where a Client or a speaker is a value
+  // that had to be chosen.
+  const pinTokens: {
+    key: string;
+    label: string;
+    title: string;
+    icon: React.ReactNode;
+    clear: () => void;
+  }[] = [
+    ...(clientFilter
+      ? [
+          {
+            key: "client",
+            // A Client deleted since the pin was set has no name left. The pin
+            // still filters (and honestly returns nothing), so say that rather
+            // than showing an id or pretending it's off.
+            label: pinnedClientName ?? "Deleted client",
+            title: pinnedClientName
+              ? `Only notes for ${pinnedClientName} are searched.`
+              : "This conversation is pinned to a Client that no longer exists, so searches return nothing. Remove the filter to search again.",
+            icon: <Building2 size={12} strokeWidth={1.7} aria-hidden="true" />,
+            clear: () => pinClient(null),
+          },
+        ]
+      : []),
+    ...(speakerFilter
+      ? [
+          {
+            key: "speaker",
+            label: speakerFilter,
+            // Deliberately not promising precision it doesn't have: one label can
+            // be two people, and a name spelled differently in another note is a
+            // different pin (ADR-0002).
+            title: `Only passages where "${speakerFilter}" is the speaker are searched. Names are matched as written in each transcript.`,
+            icon: <MessageSquareQuote size={12} strokeWidth={1.7} aria-hidden="true" />,
+            clear: () => pinSpeaker(null),
+          },
+        ]
+      : []),
+  ];
+
   const showComposerControls =
     noteId !== null ||
     // A folder pane has no anchor but does have a reach worth stating (#110).
     folderId !== null ||
     (!onPage && !inWorkspace && !!model) ||
     !!usage ||
-    showAuthorPin;
+    showAuthorPin ||
+    showPinPicker;
 
   // Activation gating (#76). Only on the managed server + a workspace. While the
   // key metadata is still loading (undefined) show neither composer nor pane, so
@@ -749,6 +821,25 @@ export function ChatPanel({
       .catch(() => {
         if (!cancelled && gen === switchGenRef.current) setOwnerFilter("");
       });
+    // #115's pins, on the same terms and with the same fallback: off under-
+    // promises, where a chip wrongly reading "on" would claim a narrowing the
+    // turn isn't doing.
+    ipc
+      .chatGetClientFilter(target)
+      .then((c) => {
+        if (!cancelled && gen === switchGenRef.current) setClientFilter(c ?? "");
+      })
+      .catch(() => {
+        if (!cancelled && gen === switchGenRef.current) setClientFilter("");
+      });
+    ipc
+      .chatGetSpeakerFilter(target)
+      .then((sp) => {
+        if (!cancelled && gen === switchGenRef.current) setSpeakerFilter(sp ?? "");
+      })
+      .catch(() => {
+        if (!cancelled && gen === switchGenRef.current) setSpeakerFilter("");
+      });
     void reloadConversationList(gen);
     void refreshActivation(gen);
     return () => {
@@ -792,6 +883,21 @@ export function ChatPanel({
     void ipc
       .chatSetOwnerFilter(target, conversationId, next === "" ? null : next)
       .catch((e) => setError(String(e)));
+  }
+
+  // Set or clear #115's pins. Optimistic and draft-aware on exactly the same
+  // terms as the breadth and authorship writes above — nothing to write to on a
+  // drafting pane, where `send` carries the value in instead.
+  function pinClient(next: string | null) {
+    setClientFilter(next ?? "");
+    if (!conversationId && !targetResumesOnOpen(target)) return;
+    void ipc.chatSetClientFilter(target, conversationId, next).catch((e) => setError(String(e)));
+  }
+
+  function pinSpeaker(next: string | null) {
+    setSpeakerFilter(next ?? "");
+    if (!conversationId && !targetResumesOnOpen(target)) return;
+    void ipc.chatSetSpeakerFilter(target, conversationId, next).catch((e) => setError(String(e)));
   }
 
   // Owner activated chat from the pane (#76): the entry reports fresh metadata →
@@ -971,7 +1077,14 @@ export function ChatPanel({
         conversationId,
         text,
         pinnedAuthorName,
-        conversationId ? null : { breadth: scope, ownerFilter: ownerFilter || null },
+        conversationId
+          ? null
+          : {
+              breadth: scope,
+              ownerFilter: ownerFilter || null,
+              clientFilter: clientFilter || null,
+              speakerFilter: speakerFilter || null,
+            },
       );
       if (gen !== switchGenRef.current) return;
       setConversationId(result.conversationId);
@@ -1365,6 +1478,38 @@ export function ChatPanel({
             on `/chat` in Personal is all of them: an empty flex row still costs
             the container's gap, and that showed up as an unexplained band under
             the composer that looked like space reserved for something. */}
+        {/* The pins' own strip, ABOVE the control row (#115). They live here and
+            not in the row for one measured reason: with three of them inline the
+            row stacks to three lines at the 320px panel floor, and — worse —
+            `--color-accent-soft` is the "this is narrowing every answer" signal,
+            so three filled chips turn most of the row gold and the fill stops
+            meaning anything at exactly the density that made it necessary.
+            Costing nothing when nothing is pinned is the property that decided
+            it: the row below stays exactly as quiet as it was before this
+            existed. (Prototype: `prototype/115-composer-row`, four shapes at
+            three widths.) */}
+        {pinTokens.length > 0 && (
+          <div className="flex flex-wrap items-center gap-1 px-1" data-testid="chat-pin-strip">
+            {pinTokens.map((t) => (
+              <span
+                key={t.key}
+                className="inline-flex items-center gap-1 rounded-full bg-[var(--color-accent-soft)] px-2 py-0.5 text-xs text-[var(--color-accent-text)]"
+              >
+                {t.icon}
+                <span className="max-w-[14rem] truncate">{t.label}</span>
+                <button
+                  type="button"
+                  aria-label={`Remove filter: ${t.label}`}
+                  title={t.title}
+                  onClick={t.clear}
+                  className="cursor-pointer opacity-70 transition-opacity hover:opacity-100"
+                >
+                  <X size={11} strokeWidth={2.5} aria-hidden="true" />
+                </button>
+              </span>
+            ))}
+          </div>
+        )}
         {showComposerControls && (
         <div className="flex items-center justify-between gap-2 px-1">
           <div className="flex min-w-0 items-center gap-2">
@@ -1383,6 +1528,15 @@ export function ChatPanel({
                 name={pinnedAuthorName}
                 editable={authorPinEditable}
                 onToggle={toggleOwnerFilter}
+              />
+            )}
+            {showPinPicker && (
+              <PinPicker
+                clients={clients}
+                clientFilter={clientFilter}
+                speakerFilter={speakerFilter}
+                onClient={pinClient}
+                onSpeaker={pinSpeaker}
               />
             )}
             {/* Which model is about to answer (#80) — previously invisible
@@ -1764,6 +1918,184 @@ function AuthorPin({
       <UserRound size={13} strokeWidth={1.7} aria-hidden="true" />
       {label}
     </button>
+  );
+}
+
+// The pins' one affordance (#115): a `+ Filter` trigger opening a small panel
+// with a Client picker and a speaker box. One control for both, because they are
+// the same kind of thing — a value the user chose that narrows every answer — and
+// two more chips in the row is exactly what the row could not take.
+//
+// Active pins are NOT shown here; they render as removable tokens above the
+// composer. This panel is only for setting one, which is why the trigger's word
+// never changes with state: it is an action, not a status.
+function PinPicker({
+  clients,
+  clientFilter,
+  speakerFilter,
+  onClient,
+  onSpeaker,
+}: {
+  clients: { id: string; name: string }[];
+  clientFilter: string;
+  speakerFilter: string;
+  onClient: (id: string | null) => void;
+  onSpeaker: (label: string | null) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  return (
+    <Popover open={open} onOpenChange={setOpen}>
+      <PopoverTrigger asChild>
+        <button
+          type="button"
+          data-testid="chat-pin-picker"
+          title="Narrow this conversation to one client, or to one person's speech"
+          className={cn(QUIET_CONTROL, "shrink-0 cursor-pointer hover:text-[var(--color-text)]")}
+        >
+          <Plus size={13} strokeWidth={2} aria-hidden="true" />
+          Filter
+        </button>
+      </PopoverTrigger>
+      <PopoverContent
+        className="w-64 p-3"
+        // Focus stays on the trigger. Radix would otherwise move it to the first
+        // focusable child — the speaker input — whose suggestion listbox then
+        // opens over the Client field sitting above it, so the panel would show
+        // one of its two fields covered by the other's dropdown before the user
+        // had chosen anything. Keyboard users tab in; focus returns here on close.
+        onOpenAutoFocus={(e) => e.preventDefault()}
+      >
+        <div className="flex flex-col gap-3">
+          <PinField label="Client">
+            {clients.length === 0 ? (
+              // Nothing to pick rather than an empty menu: a library with no
+              // Clients can't express this filter, and a disabled picker would
+              // only raise a question the panel can't answer.
+              <span className="text-xs text-[var(--color-text-muted)]">
+                No clients yet — tag a note with one first.
+              </span>
+            ) : (
+              <SelectablePopover
+                ariaLabel="Pin to a client"
+                items={clients.map((c) => ({ id: c.id, label: c.name }))}
+                activeId={clientFilter || null}
+                onSelect={(id) => {
+                  onClient(id);
+                  setOpen(false);
+                }}
+                noneLabel="Any client"
+                trigger={
+                  <span className={cn(QUIET_CONTROL, "cursor-pointer hover:text-[var(--color-text)]")}>
+                    {clients.find((c) => c.id === clientFilter)?.name ?? "Any client"}
+                    <ChevronDown size={12} strokeWidth={2} aria-hidden="true" className="shrink-0" />
+                  </span>
+                }
+              />
+            )}
+          </PinField>
+          <PinField label="Speaker">
+            <SpeakerPinInput
+              value={speakerFilter}
+              onCommit={(label) => {
+                onSpeaker(label);
+                setOpen(false);
+              }}
+            />
+          </PinField>
+        </div>
+      </PopoverContent>
+    </Popover>
+  );
+}
+
+function PinField({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <div className="flex flex-col gap-1">
+      <span className="text-[11px] uppercase tracking-wide text-[var(--color-text-muted)]">
+        {label}
+      </span>
+      {children}
+    </div>
+  );
+}
+
+// The speaker pin's input. A Combobox and not a menu, for #116's reason: a
+// speaker label is a string the user may have to type, since the set of labels
+// isn't a list anything owns (ADR-0002). Suggestions come from the same ranked
+// source the transcript's rename picker uses, so a pin converges on the spelling
+// already in the library instead of inventing a second one.
+function SpeakerPinInput({
+  value,
+  onCommit,
+}: {
+  value: string;
+  onCommit: (label: string | null) => void;
+}) {
+  const [draft, setDraft] = useState(value);
+  const [suggestions, setSuggestions] = useState<SpeakerSuggestionSource | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    void Promise.all([
+      ipc.speakerLabelStats().catch(() => []),
+      ipc.speakerRoster().catch(() => [] as string[]),
+    ]).then(([stats, roster]) => {
+      // Normalised, not just caught: a `.catch` covers a rejection, and what an
+      // older backend (or a command it doesn't know) actually does is RESOLVE
+      // with null. Suggestions are an enhancement — the pin is typeable without
+      // them — so a bad shape must not take the composer down with it.
+      if (!cancelled) {
+        setSuggestions({
+          stats: Array.isArray(stats) ? stats : [],
+          roster: Array.isArray(roster) ? roster : [],
+        });
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  const options: ComboboxOption[] = useMemo(
+    () =>
+      // Suggestions appear once you type, not on an empty box. `Combobox` renders
+      // a listbox whenever `options` is non-empty AND focuses itself on mount (it
+      // was built for the rename popover, where it IS the only control) — so an
+      // unfiltered list would open over the Client field above it the moment this
+      // panel appeared. #116's show-everything-on-empty behaviour earns its place
+      // in a popover that exists only to pick a name; here it covers the other
+      // half of the panel.
+      suggestions && draft.trim() !== ""
+        ? suggestSpeakerLabels({
+            query: draft,
+            stats: suggestions.stats,
+            roster: suggestions.roster,
+            inNoteLabels: [],
+          }).map((s) => ({ value: s.label, label: s.label, content: <span>@{s.label}</span> }))
+        : [],
+    [suggestions, draft],
+  );
+  return (
+    <div className="flex flex-col gap-1">
+      <Combobox
+        value={draft}
+        onValueChange={setDraft}
+        options={options}
+        onCommit={(v) => onCommit(v.trim() || null)}
+        onCancel={() => setDraft(value)}
+        listLabel="Speakers"
+        placeholder="Anyone speaking"
+        className="w-full"
+      />
+      {value && (
+        <button
+          type="button"
+          className="self-start text-xs text-[var(--color-text-muted)] hover:text-[var(--color-text)]"
+          onClick={() => onCommit(null)}
+        >
+          Clear
+        </button>
+      )}
+    </div>
   );
 }
 

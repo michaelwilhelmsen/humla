@@ -2029,3 +2029,94 @@ describe("ChatPanel authorship pin", () => {
     expect(sends[0]!.ownerName).toBe("Anna");
   });
 });
+
+describe("ChatPanel conversation pins (#115)", () => {
+  // Under `note` breadth the picker is hidden, so every test here widens first.
+  async function widenToAll() {
+    await userEvent.click(await screen.findByRole("button", { name: "Chat scope" }));
+    await userEvent.click(await screen.findByText("All notes"));
+  }
+
+  it("costs the composer row nothing when nothing is pinned", async () => {
+    mockTauri({ provider_key_get: () => "sk-test", chat_history: () => history() });
+    renderPanel();
+    await screen.findByPlaceholderText(/Ask about your notes/);
+    // The whole argument for the strip living above the row rather than in it:
+    // an unpinned conversation looks exactly as it did before #115.
+    expect(screen.queryByTestId("chat-pin-strip")).toBeNull();
+  });
+
+  it("pins a Client, shows it as a removable token, and writes it through", async () => {
+    const calls: { client: string | null }[] = [];
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () => history(),
+      chat_set_client_filter: (a) => {
+        calls.push(a as { client: string | null });
+        return null;
+      },
+    });
+    // The picker reads the Client list off the store, as the note's own Client
+    // picker does — seeded directly here, like the notes and folders above.
+    useNotesStore.setState({
+      clients: [{ id: "c-acme", name: "Acme", created_at: 0, updated_at: 0 }],
+    });
+    renderPanel();
+    await screen.findByPlaceholderText(/Ask about your notes/);
+    await widenToAll();
+
+    await userEvent.click(await screen.findByTestId("chat-pin-picker"));
+    await userEvent.click(await screen.findByRole("button", { name: "Pin to a client" }));
+    await userEvent.click(await screen.findByText("Acme"));
+
+    const strip = await screen.findByTestId("chat-pin-strip");
+    expect(strip).toHaveTextContent("Acme");
+    await waitFor(() => expect(calls.at(-1)?.client).toBe("c-acme"));
+
+    // And the token's × clears it, in one click — the property that decided the
+    // shape over a collapsing "2 filters" chip.
+    await userEvent.click(screen.getByRole("button", { name: "Remove filter: Acme" }));
+    expect(screen.queryByTestId("chat-pin-strip")).toBeNull();
+    await waitFor(() => expect(calls.at(-1)?.client).toBeNull());
+  });
+
+  it("names a Client that no longer exists instead of showing an id or reading as off", async () => {
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () => history(),
+      // A pin whose Client was deleted since: the id resolves to no name.
+      chat_get_client_filter: () => "c-gone",
+      clients_list: () => [],
+    });
+    renderPanel();
+    const strip = await screen.findByTestId("chat-pin-strip");
+    expect(strip).toHaveTextContent("Deleted client");
+    expect(strip).not.toHaveTextContent("c-gone");
+  });
+
+  it("hides the picker under note breadth, where a Client pin could only empty the anchor", async () => {
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () => history(),
+      chat_get_breadth: () => "note",
+    });
+    renderPanel();
+    await screen.findByPlaceholderText(/Ask about your notes/);
+    expect(screen.queryByTestId("chat-pin-picker")).toBeNull();
+  });
+
+  it("keeps showing an active pin's token under note breadth, so a live filter is never invisible", async () => {
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () => history(),
+      chat_get_breadth: () => "note",
+      chat_get_speaker_filter: () => "Hege",
+    });
+    renderPanel();
+    // The picker is gone but the pin still binds the turn, so the strip must
+    // still render it — a filter the user can't see is the thing #115 exists to
+    // stop.
+    expect(await screen.findByTestId("chat-pin-strip")).toHaveTextContent("Hege");
+    expect(screen.queryByTestId("chat-pin-picker")).toBeNull();
+  });
+});
