@@ -11,6 +11,24 @@ export type Release = {
 
 export const releases: Release[] = [
   {
+    version: "0.64.0",
+    date: "2026-09-21",
+    title: "Keep a chat on one client",
+    summary: "Pin a conversation to one client, or to one person’s speech.",
+    paragraphs: [
+      "Chat already lets you choose how much of your library a conversation can reach. Now you can also narrow it to a single client, or to the passages where one particular person was speaking. Set it once and every answer in that thread follows it — no need to repeat yourself each time you ask.",
+      "Active filters sit just above the message box as small tags, so you can always see what a conversation is working from, and remove one with a single click.",
+    ],
+    highlights: [
+      "Pin a conversation to one client.",
+      "Narrow it to what one person said.",
+      "See and clear active filters above the message box.",
+    ],
+    issues: [
+      { title: "Chat: pin a conversation to one Client", reference: "#115", status: "Closed", url: "https://github.com/michaelwilhelmsen/humla/issues/115" },
+    ],
+  },
+  {
     version: "0.63.0",
     date: "2026-09-20",
     title: "Claude joins the lineup",
