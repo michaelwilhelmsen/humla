@@ -43,7 +43,7 @@ pub mod test_server {
         (port, handle)
     }
 }
-pub use tools::{execute_tool, tool_specs, Citation, ToolScope};
+pub use tools::{client_pin_applies, execute_tool, tool_specs, Citation, Pins, ToolScope};
 #[cfg(test)]
 pub use providers::{FakeChatAdapter, StallingChatAdapter};
 
@@ -342,6 +342,7 @@ pub fn system_prompt_with_context(
     now_ms: i64,
     asker: Option<&str>,
     reach: Option<Reach<'_>>,
+    pins: PinNames<'_>,
 ) -> String {
     use chrono::{TimeZone, Utc};
     let mut out = SYSTEM_PROMPT.to_string();
@@ -359,7 +360,57 @@ pub fn system_prompt_with_context(
         out.push('\n');
         out.push_str(&line);
     }
+    if let Some(line) = pin_disclosure(pins) {
+        out.push('\n');
+        out.push('\n');
+        out.push_str(&line);
+    }
     out
+}
+
+/// The disclosure sentence for the conversation's pins, or `None` when nothing
+/// is pinned.
+///
+/// **Mirrored by `pinDisclosure` in `humla-cloud/chat-service/src/chat.ts`** —
+/// a workspace turn retrieves there, so both must change together.
+///
+/// Without it the model can search under a pin, find nothing, and report that
+/// nothing exists anywhere; it cannot infer a pin from its own tool results.
+/// Names, never ids: an id discloses nothing to a model that has never seen one,
+/// so an unresolvable name drops its clause instead.
+fn pin_disclosure(pins: PinNames<'_>) -> Option<String> {
+    let client = pins.client.map(str::trim).filter(|c| !c.is_empty());
+    let speaker = pins.speaker.map(str::trim).filter(|s| !s.is_empty());
+    let mut clauses: Vec<String> = Vec::new();
+    if let Some(name) = client {
+        clauses.push(format!(
+            "only notes for the client \"{name}\""
+        ));
+    }
+    if let Some(name) = speaker {
+        clauses.push(format!(
+            "only passages where \"{name}\" was the speaker"
+        ));
+    }
+    if clauses.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "The user has pinned this conversation to {}. Every search and listing you run is \
+         confined to that and you cannot widen it — so an empty result means \"not under this \
+         filter\", never \"not anywhere\". Say which when it matters.",
+        clauses.join(", and "),
+    ))
+}
+
+/// The pin NAMES for disclosure — resolved strings, not the ids `Pins` carries.
+///
+/// [`Pins`] is the filter input the retrieval acts on; this is prompt text, and
+/// carries names where that carries ids.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PinNames<'a> {
+    pub client: Option<&'a str>,
+    pub speaker: Option<&'a str>,
 }
 
 /// What this conversation can retrieve from, for disclosure only (issue #113).
@@ -544,6 +595,8 @@ pub async fn run_chat(
     conversation_id: &str,
     grounding: &str,
     scope: &ToolScope,
+    // Clamp retrieval, and are disclosed in the prompt as breadth is.
+    pins: &Pins,
     workspace: &str,
     embedder: Option<&dyn crate::embed::EmbeddingAdapter>,
     user_text: &str,
@@ -573,13 +626,26 @@ pub async fn run_chat(
     // (#113). `ToolScope` carries ids; the prompt has to say "the folder \"K2 pilot\"",
     // not an id the user never sees. Scoped so no lock is held across an await, and
     // a missing row degrades to no disclosure rather than to a blank name.
-    let (anchor_title, anchor_folder) = {
+    let (anchor_title, anchor_folder, pinned_client) = {
         let conn = db.lock();
-        match scope {
+        let (title, folder) = match scope {
             ToolScope::Note(id) => (db::get_note(&conn, id).ok().map(|n| n.title), None),
             ToolScope::Folder(id) => (None, db::folder_name(&conn, id).ok().flatten()),
             ToolScope::All => (None, None),
-        }
+        };
+        // The Client pin discloses by NAME. A Client deleted since the pin was set
+        // resolves to None and its clause is dropped — the pin still filters (and
+        // honestly returns nothing), it just loses its wording, exactly as the
+        // authorship pin does for a removed member.
+        // Only a pin that is IN FORCE. `resolve_filter` drops the Client pin under
+        // `note` breadth, and announcing a filter the retrieval isn't applying is
+        // the inverse of the lie this disclosure prevents.
+        let client = pins
+            .client
+            .as_deref()
+            .filter(|_| client_pin_applies(scope))
+            .and_then(|id| db::client_name(&conn, id).ok().flatten());
+        (title, folder, client)
     };
     let reach = match scope {
         ToolScope::Note(_) => anchor_title.as_deref().map(Reach::Note),
@@ -587,7 +653,17 @@ pub async fn run_chat(
         ToolScope::All => None,
     };
     let base =
-        assemble_prompt(&system_prompt_with_context(now_ms, asker, reach), grounding, &turns)?;
+        assemble_prompt(
+            &system_prompt_with_context(
+                now_ms,
+                asker,
+                reach,
+                // The speaker pin IS its own name — a label, not an id (ADR-0002).
+                PinNames { client: pinned_client.as_deref(), speaker: pins.speaker.as_deref() },
+            ),
+            grounding,
+            &turns,
+        )?;
     eprintln!(
         "[chat] provider={} model={} turns={} grounding_chars={}",
         adapter.provider_id(),
@@ -609,8 +685,8 @@ pub async fn run_chat(
     // 3. Agentic loop.
     let specs = tool_specs();
     let result = agentic_loop(
-        db, adapter, ctx, scope, workspace, &specs, base, &assistant_id, &answer_block, embedder,
-        now_ms, asker, &mut sink,
+        db, adapter, ctx, scope, pins, workspace, &specs, base, &assistant_id, &answer_block,
+        embedder, now_ms, asker, &mut sink,
     )
     .await;
 
@@ -670,6 +746,7 @@ async fn agentic_loop(
     adapter: &dyn ChatAdapter,
     ctx: ChatCtx<'_>,
     scope: &ToolScope,
+    pins: &Pins,
     workspace: &str,
     specs: &[ToolSpec],
     base: Vec<ChatTurn>,
@@ -799,7 +876,7 @@ async fn agentic_loop(
 
             let outcome = {
                 let conn = db.lock();
-                execute_tool(&conn, workspace, scope, &call.name, &args, query_vec.as_deref(), embed_model, now_ms, asker)
+                execute_tool(&conn, workspace, scope, pins, &call.name, &args, query_vec.as_deref(), embed_model, now_ms, asker)
             };
             sink(ChatEvent::ToolActivity {
                 message_id: assistant_id.to_string(),
@@ -877,6 +954,9 @@ fn ctx_ref<'a>(ctx: &ChatCtx<'a>) -> ChatCtx<'a> {
 
 #[cfg(test)]
 mod tests {
+    /// The default for every test that isn't about pins.
+    const UNPINNED: &Pins = &Pins { client: None, speaker: None };
+
     use super::adapter::{ChatStep, ToolCall};
     use super::*;
 
@@ -1050,12 +1130,12 @@ mod tests {
         // disclosure meaningful when it does appear.
         // Asserted against the disclosure's own phrases, not a common word like
         // "only" — that would break the moment SYSTEM_PROMPT happened to use it.
-        let all = system_prompt_with_context(NOW, None, None);
+        let all = system_prompt_with_context(NOW, None, None, PinNames::default());
         assert!(!all.contains("cannot widen"), "a whole-library turn discloses nothing:\n{all}");
         assert!(!all.contains("confined to"));
 
         // Folder: named, stated as unliftable, and told what an empty result means.
-        let folder = system_prompt_with_context(NOW, None, Some(Reach::Folder("K2 pilot")));
+        let folder = system_prompt_with_context(NOW, None, Some(Reach::Folder("K2 pilot")), PinNames::default());
         assert!(folder.contains("K2 pilot"), "the folder must be NAMED, not just implied");
         assert!(folder.contains("cannot widen"), "the clamp is stated, not offered");
         assert!(
@@ -1067,7 +1147,7 @@ mod tests {
         // "reference material about the current note", but that is not the same
         // claim — a note-anchored pane can have breadth `all`, so grounding tells
         // the model a note EXISTS, never that it is the only one searchable.
-        let note = system_prompt_with_context(NOW, None, Some(Reach::Note("Kickoff with K2")));
+        let note = system_prompt_with_context(NOW, None, Some(Reach::Note("Kickoff with K2")), PinNames::default());
         assert!(note.contains("Kickoff with K2"));
         assert!(note.contains("cannot widen"));
 
@@ -1076,23 +1156,121 @@ mod tests {
         // and disclosed server-side, so it never appears in a Personal prompt at all.
         // The composition test that matters lives in chat-service's suite, where both
         // paragraphs really do land together.
-        let both = system_prompt_with_context(NOW, Some("Michael"), Some(Reach::Folder("K2 pilot")));
+        let both = system_prompt_with_context(NOW, Some("Michael"), Some(Reach::Folder("K2 pilot")), PinNames::default());
         assert!(both.contains("K2 pilot"), "the reach survives alongside the asker line");
         assert!(both.contains("You are talking to Michael"), "and the asker line survives it");
     }
 
-    /// A blank or whitespace name must NOT produce a disclosure, because the
-    /// sentence would read "restricted to the folder ''" — worse than silence, and
-    /// the model cannot tell it is a bug rather than a real narrowing.
+    /// A pinned Client or speaker is disclosed; an unpinned conversation stays
+    /// silent, which is what makes the disclosure mean something.
+    #[test]
+    fn the_prompt_discloses_the_pins_and_stays_silent_when_there_are_none() {
+        let none = system_prompt_with_context(NOW, None, None, PinNames::default());
+        assert!(!none.contains("pinned"), "an unpinned conversation says nothing:\n{none}");
+
+        let client = system_prompt_with_context(
+            NOW,
+            None,
+            None,
+            PinNames { client: Some("Acme"), speaker: None },
+        );
+        assert!(client.contains("Acme"), "the Client is named:\n{client}");
+        assert!(client.contains("cannot widen"), "and stated as a clamp:\n{client}");
+
+        let speaker = system_prompt_with_context(
+            NOW,
+            None,
+            None,
+            PinNames { client: None, speaker: Some("Hege Tronshaugen") },
+        );
+        assert!(speaker.contains("Hege Tronshaugen"), "{speaker}");
+
+        // Both pins compose into ONE sentence rather than stacking two — the
+        // minimal-prompt finding: a small model re-litigates long constraint blocks.
+        let both = system_prompt_with_context(
+            NOW,
+            None,
+            None,
+            PinNames { client: Some("Acme"), speaker: Some("Hege") },
+        );
+        assert!(both.contains("Acme") && both.contains("Hege"), "{both}");
+        assert_eq!(both.matches("cannot widen").count(), 1, "one sentence, not two:\n{both}");
+    }
+
+    /// A pin that isn't in force must not be announced: the Client pin is dropped
+    /// under `note` breadth, so disclosing it there would say the conversation is
+    /// confined to a client it is in fact searching past. Reachable by pinning at
+    /// `all` and then narrowing.
+    ///
+    /// Asserted through `resolve_filter` and the prompt together, not through the
+    /// predicate they share — either one drifting off it is the regression.
+    #[test]
+    fn a_client_pin_dropped_by_the_breadth_is_neither_applied_nor_disclosed() {
+        let pins = Pins { client: Some("c-acme".into()), speaker: None };
+        let args = serde_json::json!({});
+        for (scope, applies) in [
+            (ToolScope::Note("n1".into()), false),
+            (ToolScope::All, true),
+            (ToolScope::Folder("f1".into()), true),
+        ] {
+            let filter = tools::resolve_filter(&scope, &pins, &args, NOW, None);
+            assert_eq!(
+                filter.client_id.is_some(),
+                applies,
+                "retrieval disagrees with the rule for {scope:?}"
+            );
+            let prompt = system_prompt_with_context(
+                NOW,
+                None,
+                None,
+                PinNames {
+                    client: client_pin_applies(&scope).then_some("Acme"),
+                    speaker: None,
+                },
+            );
+            assert_eq!(
+                prompt.contains("Acme"),
+                applies,
+                "the prompt disagrees with the rule for {scope:?}"
+            );
+        }
+    }
+
+    /// A pin whose name can't be resolved — a Client deleted since it was set —
+    /// discloses nothing for that clause rather than naming an id the model has
+    /// never seen. Same rule as a nameless folder reach.
+
+    #[test]
+    fn an_unresolvable_pin_name_discloses_nothing() {
+        for blank in ["", "   "] {
+            let p = system_prompt_with_context(
+                NOW,
+                None,
+                None,
+                PinNames { client: Some(blank), speaker: None },
+            );
+            assert!(!p.contains("pinned"), "a blank Client name must stay silent:\n{p}");
+        }
+        // But a blank alongside a real one keeps the real one.
+        let mixed = system_prompt_with_context(
+            NOW,
+            None,
+            None,
+            PinNames { client: Some(""), speaker: Some("Hege") },
+        );
+        assert!(mixed.contains("Hege"), "{mixed}");
+        assert!(!mixed.contains("client"), "and drops the nameless clause:\n{mixed}");
+    }
+
     #[test]
     fn a_reach_with_no_usable_name_discloses_nothing() {
         for name in ["", "   "] {
-            let folder = system_prompt_with_context(NOW, None, Some(Reach::Folder(name)));
+            let folder = system_prompt_with_context(NOW, None, Some(Reach::Folder(name)), PinNames::default());
             assert!(
                 !folder.contains("cannot widen"),
                 "a nameless folder reach must stay silent, got:\n{folder}"
             );
-            let note = system_prompt_with_context(NOW, None, Some(Reach::Note(name)));
+            let note = system_prompt_with_context(NOW, None, Some(Reach::Note(name)), PinNames::default());
             assert!(!note.contains("cannot widen"), "same for a nameless note reach");
         }
     }
@@ -1266,6 +1444,7 @@ mod tests {
             &conv_id,
             "",
             &ToolScope::All,
+            UNPINNED,
             "",
             None,
             "When does the budget land?",
@@ -1302,7 +1481,7 @@ mod tests {
         let adapter = FakeChatAdapter::new(["Hello world"]);
         let mut events: Vec<ChatEvent> = Vec::new();
         run_chat(
-            &dbh, &adapter, FAKE_CTX, &conv_id, "GROUNDING", &ToolScope::All, "", None, "What happened?", None,
+            &dbh, &adapter, FAKE_CTX, &conv_id, "GROUNDING", &ToolScope::All, UNPINNED, "", None, "What happened?", None,
             |ev| events.push(ev),
         )
         .await
@@ -1335,7 +1514,7 @@ mod tests {
             let (dbh, _path) = temp_db(&dir);
             conv_id = conv(&dbh, "note-1");
             let adapter = FakeChatAdapter::new(["answer"]);
-            run_chat(&dbh, &adapter, FAKE_CTX, &conv_id, "G", &ToolScope::All, "", None, "hi", None, |_| {})
+            run_chat(&dbh, &adapter, FAKE_CTX, &conv_id, "G", &ToolScope::All, UNPINNED, "", None, "hi", None, |_| {})
                 .await
                 .unwrap();
         }
@@ -1401,7 +1580,7 @@ mod tests {
         let (dbh, _path) = temp_db(&dir);
         let conv_id = conv(&dbh, "n");
         let res = run_chat(
-            &dbh, &FailingAdapter, FAKE_CTX, &conv_id, "G", &ToolScope::All, "", None, "hi", None, |_| {},
+            &dbh, &FailingAdapter, FAKE_CTX, &conv_id, "G", &ToolScope::All, UNPINNED, "", None, "hi", None, |_| {},
         )
         .await;
         assert!(res.is_err());
@@ -1428,7 +1607,7 @@ mod tests {
         ]);
         let mut events: Vec<ChatEvent> = Vec::new();
         run_chat(
-            &dbh, &adapter, FAKE_CTX, &conv_id, "", &ToolScope::All, "", None, "what about budget?", None,
+            &dbh, &adapter, FAKE_CTX, &conv_id, "", &ToolScope::All, UNPINNED, "", None, "what about budget?", None,
             |ev| events.push(ev),
         )
         .await
@@ -1470,6 +1649,7 @@ mod tests {
             &conv_id,
             "",
             &ToolScope::All,
+            UNPINNED,
             "",
             None,
             "stop me", None,
@@ -1505,6 +1685,7 @@ mod tests {
             &conv_id,
             "",
             &ToolScope::All,
+            UNPINNED,
             "",
             None,
             "search then stop",
@@ -1556,6 +1737,7 @@ mod tests {
             &conv_id,
             "",
             &ToolScope::All,
+            UNPINNED,
             "",
             None,
             "narrate, search, then stop",
@@ -1603,6 +1785,7 @@ mod tests {
             &conv_id,
             "",
             &ToolScope::All,
+            UNPINNED,
             "",
             None,
             "start answering then stop", None,
@@ -1655,6 +1838,7 @@ mod tests {
             &conv_id,
             "",
             &ToolScope::All,
+            UNPINNED,
             "",
             None,
             "narrate, search, answer, then stop",
@@ -1693,7 +1877,7 @@ mod tests {
             FakeChatAdapter::text_step("I couldn't open that note, but here's what I know."),
         ]);
         let mut events: Vec<ChatEvent> = Vec::new();
-        run_chat(&dbh, &adapter, FAKE_CTX, &conv_id, "", &ToolScope::All, "", None, "open note x", None, |ev| {
+        run_chat(&dbh, &adapter, FAKE_CTX, &conv_id, "", &ToolScope::All, UNPINNED, "", None, "open note x", None, |ev| {
             events.push(ev)
         })
         .await
@@ -1720,7 +1904,7 @@ mod tests {
             .map(|_| FakeChatAdapter::tool_step("c", "search_notes", r#"{"query":"content"}"#))
             .collect();
         let adapter = FakeChatAdapter::scripted(steps);
-        run_chat(&dbh, &adapter, FAKE_CTX, &conv_id, "", &ToolScope::All, "", None, "keep going", None, |_| {})
+        run_chat(&dbh, &adapter, FAKE_CTX, &conv_id, "", &ToolScope::All, UNPINNED, "", None, "keep going", None, |_| {})
             .await
             .unwrap();
 
@@ -1761,6 +1945,7 @@ mod tests {
             &conv_id,
             "REF",
             &ToolScope::Note(anchor),
+            UNPINNED,
             "",
             None,
             "keep going", None,
@@ -1779,7 +1964,7 @@ mod tests {
     /// the questions people actually ask are unresolvable.
     #[test]
     fn the_prompt_names_who_is_asking_and_ties_them_to_the_transcript() {
-        let p = system_prompt_with_context(1_785_024_000_000, Some("Michael"), None);
+        let p = system_prompt_with_context(1_785_024_000_000, Some("Michael"), None, PinNames::default());
         assert!(p.contains("You are talking to Michael."), "{p}");
         assert!(p.contains("\"I\", \"me\" and \"my\" mean Michael"), "{p}");
         // The user's own speech is labelled `You:` on remote calls and often
@@ -1796,7 +1981,7 @@ mod tests {
     #[test]
     fn an_unknown_asker_costs_nothing_but_the_asker_line() {
         for asker in [None, Some(""), Some("   ")] {
-            let p = system_prompt_with_context(1_785_024_000_000, asker, None);
+            let p = system_prompt_with_context(1_785_024_000_000, asker, None, PinNames::default());
             assert!(!p.contains("You are talking to"), "{asker:?}");
             assert!(p.contains("Today's date is 2026-07-26."), "{asker:?}");
         }
@@ -1804,7 +1989,7 @@ mod tests {
 
     #[test]
     fn the_prompt_tells_the_model_todays_date_without_touching_the_mirrored_constant() {
-        let with_date = system_prompt_with_context(1_785_024_000_000, None, None); // 2026-07-26
+        let with_date = system_prompt_with_context(1_785_024_000_000, None, None, PinNames::default()); // 2026-07-26
         assert!(with_date.starts_with(SYSTEM_PROMPT));
         assert!(with_date.contains("Today's date is 2026-07-26."));
         // Every tool result carries absolute note dates; without this line the
@@ -1834,7 +2019,7 @@ mod tests {
         };
         let adapter =
             FakeChatAdapter::scripted(vec![preamble, FakeChatAdapter::text_step("The answer.")]);
-        run_chat(&dbh, &adapter, FAKE_CTX, &conv_id, "", &ToolScope::All, "", None, "q", None, |_| {})
+        run_chat(&dbh, &adapter, FAKE_CTX, &conv_id, "", &ToolScope::All, UNPINNED, "", None, "q", None, |_| {})
             .await
             .unwrap();
 
@@ -1876,7 +2061,7 @@ mod tests {
         ]);
         let mut events: Vec<ChatEvent> = Vec::new();
         run_chat(
-            &dbh, &adapter, FAKE_CTX, &conv_id, "", &ToolScope::All, "", Some(&FailingEmbedder),
+            &dbh, &adapter, FAKE_CTX, &conv_id, "", &ToolScope::All, UNPINNED, "", Some(&FailingEmbedder),
             "budget?", None, |ev| events.push(ev),
         )
         .await
@@ -1905,7 +2090,7 @@ mod tests {
         ]);
         let mut events: Vec<ChatEvent> = Vec::new();
         run_chat(
-            &dbh, &adapter, FAKE_CTX, &conv_id, "", &ToolScope::Note(anchor.clone()), "", None,
+            &dbh, &adapter, FAKE_CTX, &conv_id, "", &ToolScope::Note(anchor.clone()), UNPINNED, "", None,
             "find it", None, |ev| events.push(ev),
         )
         .await

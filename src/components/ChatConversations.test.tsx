@@ -12,7 +12,19 @@ import type { ConversationMeta } from "../lib/ipc";
 const HOUR = 3_600_000;
 
 function conversation(over: Partial<ConversationMeta> & { id: string }): ConversationMeta {
-  return { title: "Untitled", breadth: "all", ownerFilter: "", updatedAt: 1, messageCount: 2, ...over };
+  // Every pin defaults to "" rather than being omitted: serde always emits the
+  // column, so a fixture that leaves one out is a fixture the real payload never
+  // produces.
+  return {
+    title: "Untitled",
+    breadth: "all",
+    ownerFilter: "",
+    clientFilter: "",
+    speakerFilter: "",
+    updatedAt: 1,
+    messageCount: 2,
+    ...over,
+  };
 }
 
 function publish(over: Partial<ChatSessionControls> = {}) {

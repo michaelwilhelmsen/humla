@@ -1852,7 +1852,19 @@ describe("ChatPanel stop (#80)", () => {
 // The conversation's pinned authorship filter (#103) — "Created by me" beside the
 // breadth picker. Breadth says WHAT is in reach; this says WHOSE.
 describe("ChatPanel authorship pin", () => {
-  const PIN = { name: /Created by/ };
+  // The pin is set from the shared `+ Filter` panel and shown as a token, so
+  // these drive that surface. The contract is unchanged: an id rather than a
+  // flag, cleared with null, and inert when it is someone else's.
+
+  /** Open the composer's filter panel. */
+  async function openPicker() {
+    await userEvent.click(await screen.findByTestId("chat-pin-picker"));
+  }
+
+  /** The panel's author control, or null when it isn't offered. */
+  function authorControl() {
+    return screen.queryByRole("button", { name: /^(Only me|Anyone)$/ });
+  }
 
   // Signed into a workspace WITHOUT billing (so the BYOK activation pane doesn't
   // gate the composer), as a user with an id — the chip resolves the pin against
@@ -1888,7 +1900,8 @@ describe("ChatPanel authorship pin", () => {
     mockTauri({ provider_key_get: () => "sk-test", chat_history: () => history(), chat_get_breadth: () => "all" });
     renderGlobal();
     await screen.findByPlaceholderText(/Ask about your notes/);
-    expect(screen.queryByRole("button", PIN)).toBeNull();
+    await openPicker();
+    expect(authorControl()).toBeNull();
   });
 
   // Presence tracks the SCOPE, not the note. Under `note` breadth the filter is
@@ -1901,11 +1914,14 @@ describe("ChatPanel authorship pin", () => {
     renderPanel();
 
     await screen.findByPlaceholderText(/Ask about your notes/);
-    expect(screen.queryByRole("button", PIN)).toBeNull();
+    await openPicker();
+    expect(authorControl()).toBeNull();
+    await userEvent.keyboard("{Escape}");
 
     await userEvent.click(await screen.findByRole("button", { name: "Chat scope" }));
     await userEvent.click(await screen.findByRole("menuitemradio", { name: "All notes" }));
-    await waitFor(() => expect(screen.getByRole("button", PIN)).toBeInTheDocument());
+    await openPicker();
+    await waitFor(() => expect(authorControl()).toBeInTheDocument());
   });
 
   // Pinned on a DRAFT (the library-wide default since #120): nothing is written
@@ -1927,10 +1943,9 @@ describe("ChatPanel authorship pin", () => {
     });
     renderGlobal();
 
-    fireEvent.click(await screen.findByRole("button", PIN));
-    await waitFor(() =>
-      expect(screen.getByRole("button", PIN)).toHaveAttribute("aria-pressed", "true"),
-    );
+    await openPicker();
+    await userEvent.click(screen.getByRole("button", { name: "Only me" }));
+    await waitFor(() => expect(screen.getByTestId("chat-pin-strip")).toHaveTextContent("Created by me"));
 
     const input = screen.getByPlaceholderText(/Ask about your notes/);
     fireEvent.change(input, { target: { value: "what did we agree?" } });
@@ -1960,8 +1975,9 @@ describe("ChatPanel authorship pin", () => {
     });
     renderGlobal();
 
-    await waitFor(() => expect(screen.getByRole("button", PIN)).toHaveAttribute("aria-pressed", "true"));
-    fireEvent.click(screen.getByRole("button", PIN));
+    // Cleared from the token's own ×, which is one click — the property that
+    // decided the strip over a collapsing chip.
+    fireEvent.click(await screen.findByRole("button", { name: "Remove filter: Created by me" }));
     await waitFor(() => expect(writes).toHaveLength(1));
     expect(writes[0]!.owner).toBeNull();
   });
@@ -1983,9 +1999,12 @@ describe("ChatPanel authorship pin", () => {
     });
     renderGlobal();
 
-    const chip = await screen.findByRole("button", { name: /Created by Anna/ });
-    expect(chip).toBeDisabled();
-    fireEvent.click(chip);
+    // Shown, because it binds every answer in the thread — but with no × to lift
+    // it, and no author control in the panel either.
+    expect(await screen.findByTestId("chat-pin-strip")).toHaveTextContent("Created by Anna");
+    expect(screen.queryByRole("button", { name: /Remove filter: Created by Anna/ })).toBeNull();
+    await openPicker();
+    expect(authorControl()).toBeNull();
     expect(writes).toHaveLength(0);
   });
 
@@ -2002,9 +2021,8 @@ describe("ChatPanel authorship pin", () => {
     });
     renderGlobal();
 
-    const chip = await screen.findByRole("button", { name: /Created by someone else/ });
-    expect(chip).toHaveAttribute("aria-pressed", "true");
-    expect(chip).toBeDisabled();
+    expect(await screen.findByTestId("chat-pin-strip")).toHaveTextContent("Created by someone else");
+    expect(screen.queryByRole("button", { name: /Remove filter: Created by someone else/ })).toBeNull();
   });
 
   it("sends the pinned person's name with the turn, for the model's disclosure", async () => {
@@ -2027,5 +2045,121 @@ describe("ChatPanel authorship pin", () => {
     fireEvent.keyDown(input, { key: "Enter" });
     await waitFor(() => expect(sends).toHaveLength(1));
     expect(sends[0]!.ownerName).toBe("Anna");
+  });
+});
+
+describe("ChatPanel conversation pins (#115)", () => {
+  // Under `note` breadth the picker is hidden, so every test here widens first.
+  async function widenToAll() {
+    await userEvent.click(await screen.findByRole("button", { name: "Chat scope" }));
+    await userEvent.click(await screen.findByText("All notes"));
+  }
+
+  it("costs the composer row nothing when nothing is pinned", async () => {
+    mockTauri({ provider_key_get: () => "sk-test", chat_history: () => history() });
+    renderPanel();
+    await screen.findByPlaceholderText(/Ask about your notes/);
+    // The whole argument for the strip living above the row rather than in it:
+    // an unpinned conversation looks exactly as it did before #115.
+    expect(screen.queryByTestId("chat-pin-strip")).toBeNull();
+  });
+
+  it("pins a Client, shows it as a removable token, and writes it through", async () => {
+    const calls: { kind: string; value: string | null }[] = [];
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () => history(),
+      chat_set_pin: (a) => {
+        calls.push(a as { kind: string; value: string | null });
+        return null;
+      },
+    });
+    // The picker reads the Client list off the store, as the note's own Client
+    // picker does — seeded directly here, like the notes and folders above.
+    useNotesStore.setState({
+      clients: [{ id: "c-acme", name: "Acme", created_at: 0, updated_at: 0 }],
+    });
+    renderPanel();
+    await screen.findByPlaceholderText(/Ask about your notes/);
+    await widenToAll();
+
+    await userEvent.click(await screen.findByTestId("chat-pin-picker"));
+    await userEvent.click(await screen.findByRole("button", { name: "Pin to a client" }));
+    await userEvent.click(await screen.findByText("Acme"));
+
+    const strip = await screen.findByTestId("chat-pin-strip");
+    expect(strip).toHaveTextContent("Acme");
+    await waitFor(() => expect(calls.at(-1)).toMatchObject({ kind: "client", value: "c-acme" }));
+
+    // And the token's × clears it, in one click — the property that decided the
+    // shape over a collapsing "2 filters" chip.
+    await userEvent.click(screen.getByRole("button", { name: "Remove filter: Acme" }));
+    expect(screen.queryByTestId("chat-pin-strip")).toBeNull();
+    await waitFor(() => expect(calls.at(-1)).toMatchObject({ kind: "client", value: null }));
+  });
+
+  it("hides the Client token under note breadth, where retrieval drops the pin", async () => {
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () => history(),
+      chat_get_breadth: () => "note",
+      chat_get_pin: (a) => ((a as { kind: string }).kind === "client" ? "c-acme" : "Hege"),
+    });
+    useNotesStore.setState({
+      clients: [{ id: "c-acme", name: "Acme", created_at: 0, updated_at: 0 }],
+    });
+    renderPanel();
+    // The pin is stored and comes back when the breadth widens, but while it is
+    // dropped a token would claim a narrowing the search isn't doing. The speaker
+    // pin IS applied here, so its token stays.
+    const strip = await screen.findByTestId("chat-pin-strip");
+    expect(strip).toHaveTextContent("Hege");
+    expect(strip).not.toHaveTextContent("Acme");
+  });
+
+  it("names a Client that no longer exists instead of showing an id or reading as off", async () => {
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () => history(),
+      // Widened, or the token would be hidden for the other reason.
+      chat_get_breadth: () => "all",
+      // A pin whose Client was deleted since: the id resolves to no name.
+      chat_get_pin: (a) => ((a as { kind: string }).kind === "client" ? "c-gone" : ""),
+      clients_list: () => [],
+    });
+    renderPanel();
+    const strip = await screen.findByTestId("chat-pin-strip");
+    expect(strip).toHaveTextContent("Deleted client");
+    expect(strip).not.toHaveTextContent("c-gone");
+  });
+
+  it("drops the Client field under note breadth but keeps the speaker one", async () => {
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () => history(),
+      chat_get_breadth: () => "note",
+    });
+    useNotesStore.setState({
+      clients: [{ id: "c-acme", name: "Acme", created_at: 0, updated_at: 0 }],
+    });
+    renderPanel();
+    await screen.findByPlaceholderText(/Ask about your notes/);
+    await userEvent.click(await screen.findByTestId("chat-pin-picker"));
+    // Retrieval drops a Client pin here (Rust's `client_pin_applies`), so it
+    // isn't offered. The speaker pin stays live — it narrows to the passages
+    // that person spoke in, which is the question a note pane is for.
+    expect(screen.queryByText("CLIENT")).toBeNull();
+    expect(await screen.findByPlaceholderText("Anyone speaking")).toBeInTheDocument();
+  });
+
+  it("keeps showing an active speaker pin under note breadth, where it still narrows", async () => {
+    mockTauri({
+      provider_key_get: () => "sk-test",
+      chat_history: () => history(),
+      chat_get_breadth: () => "note",
+      chat_get_pin: (a) => ((a as { kind: string }).kind === "speaker" ? "Hege" : ""),
+    });
+    renderPanel();
+    expect(await screen.findByTestId("chat-pin-strip")).toHaveTextContent("Hege");
   });
 });

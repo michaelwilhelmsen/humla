@@ -26,8 +26,9 @@ import App from "./App";
 import { mockTauri } from "./test/tauri";
 import { makeNote } from "./test/fixtures";
 import { CommandSnippet } from "./components/CommandSnippet";
+import { ChatPanel } from "./components/ChatPanel";
 import { RecordingBar } from "./components/RecordingBar";
-import { useRecordingStore, type ReplayRun } from "./lib/store";
+import { useNotesStore, useRecordingStore, type ReplayRun } from "./lib/store";
 import { Segmented } from "./pages/settings/components/Segmented";
 import { Toggle } from "./pages/settings/components/Toggle";
 import { NoteTitleBox, NoteToolbar, PanelEmpty, TranscriptEditor, TranscriptPlayer } from "./pages/Note";
@@ -978,6 +979,46 @@ const MOCK_WORKSPACE = {
   plan_status: "active" as const,
 };
 
+// ---- #115 axis: is anything pinned -----------------------------------------
+function chatPinsCase(pinned: boolean): Scenario {
+  return {
+    wrap: (node) => (
+      // The right context panel at its 320px floor — the width the whole
+      // composer-row question is about.
+      <div className="flex justify-center p-8">
+        <div className="flex h-[520px] w-[320px] flex-col rounded-[var(--radius-card)] bg-[var(--color-surface)] shadow-[var(--shadow-card)]">
+          {node}
+        </div>
+      </div>
+    ),
+    render: () => <ChatPanel target={{ kind: "note", noteId: "n1" }} />,
+    seed: () => {
+      useNotesStore.setState({
+        clients: [{ id: "c-acme", name: "Sparebanken Vest", created_at: 0, updated_at: 0 }],
+      });
+    },
+    ipc: {
+      provider_key_get: () => "sk-test",
+      chat_history: () => ({ conversationId: "c1", messages: [] }),
+      chat_get_breadth: () => "all",
+      chat_get_pin: (a) =>
+        pinned
+          ? (a as { kind: string }).kind === "client"
+            ? "c-acme"
+            : "Hege Tronshaugen"
+          : "",
+      chat_list_conversations: () => [],
+      notes_list: () => demoNotes(),
+      clients_list: () => DEMO_CLIENTS,
+      speaker_label_stats: () => [
+        { label: "Hege Tronshaugen", notes: 4, lastUsed: 0 },
+        { label: "Michael", notes: 9, lastUsed: 0 },
+      ],
+      cloud_speaker_roster: () => [],
+    },
+  };
+}
+
 const CASES: Record<string, Scenario> = {
   home: {
     route: "/",
@@ -1290,6 +1331,13 @@ const CASES: Record<string, Scenario> = {
   // --- The note grid, whole-app at /all-notes against a populated library.
   // Card density, excerpt length and the borderless card's separation from its
   // ground are all things jsdom pins to zero.
+  // #115: the composer row with the pins' strip above it, at the panel's floor
+  // width — the question the prototype settled, now in the real component.
+  // `pins` starts with both set; `pins-none` is the unpinned row, which must
+  // look exactly as it did before #115.
+  pins: chatPinsCase(true),
+  "pins-none": chatPinsCase(false),
+
   notes: {
     route: "/all-notes",
     render: () => null, // unused — `route` renders the app

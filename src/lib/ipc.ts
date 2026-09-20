@@ -624,7 +624,12 @@ export const ipc = {
     conversationId: string | null,
     message: string,
     ownerName: string | null = null,
-    draft: { breadth: ChatScope | null; ownerFilter: string | null } | null = null,
+    draft: {
+      breadth: ChatScope | null;
+      ownerFilter: string | null;
+      clientFilter: string | null;
+      speakerFilter: string | null;
+    } | null = null,
   ) =>
     invoke<ChatSendResult>("chat_send", {
       ...targetIds(target),
@@ -633,6 +638,8 @@ export const ipc = {
       ownerName,
       draftBreadth: draft?.breadth ?? null,
       draftOwnerFilter: draft?.ownerFilter ?? null,
+      draftClientFilter: draft?.clientFilter ?? null,
+      draftSpeakerFilter: draft?.speakerFilter ?? null,
     }),
   // Stop the turn streaming in a pane (issue #80). A no-op when nothing is in
   // flight, so a stray click can't error. Any text that already streamed is kept;
@@ -679,6 +686,21 @@ export const ipc = {
     invoke<void>("chat_set_owner_filter", { ...targetIds(target), conversationId, owner }),
   chatGetOwnerFilter: (target: ChatTarget, conversationId: string | null = null) =>
     invoke<string>("chat_get_owner_filter", { ...targetIds(target), conversationId }),
+  // Persist / read the conversation's pinned Client and speaker — null clears.
+  // Mirrors `PinKind` in `commands/chat.rs` — change both.
+  // Not workspace-only, unlike the authorship pin above: a Personal library has
+  // both, and local retrieval applies them.
+  //
+  // The Client is an id; the speaker is the transcript label itself, since there
+  // is no person entity to key on (ADR-0002).
+  chatSetPin: (
+    target: ChatTarget,
+    conversationId: string | null,
+    kind: ChatPinKind,
+    value: string | null,
+  ) => invoke<void>("chat_set_pin", { ...targetIds(target), conversationId, kind, value }),
+  chatGetPin: (target: ChatTarget, kind: ChatPinKind, conversationId: string | null = null) =>
+    invoke<string>("chat_get_pin", { ...targetIds(target), conversationId, kind }),
   // Workspace turn allowance for the composer meter (issue #69). null in personal
   // context, and on any unavailable/error/unmetered outcome — a meter never
   // errors the pane, so the caller just hides the display when this is null.
@@ -754,12 +776,19 @@ export type ConversationMeta = {
    *  rather than a flag because a workspace's conversation list is shared: a
    *  boolean would mean different notes to different readers of one thread. */
   ownerFilter: string;
+  /** The pinned Client's id, or "" for off. */
+  clientFilter: string;
+  /** The pinned speaker's transcript label, or "" for off. Already a display
+   *  string — there is no id to resolve. */
+  speakerFilter: string;
   updatedAt: number;
   messageCount: number;
 };
 // Retrieval breadth chosen in the Scope popover (issue #47), persisted per
 // conversation on the backend (issue #58).
 export type ChatScope = "note" | "folder" | "all";
+/** Which pin `chatSetPin` / `chatGetPin` act on. Mirrors Rust's `PinKind`. */
+export type ChatPinKind = "client" | "speaker";
 // Workspace turn allowance for the composer meter (issue #69). Only ever present
 // for a metered workspace; personal/unmetered/unavailable resolve to null.
 /** The server's view of a workspace's retrieval index (#102). "empty" covers both

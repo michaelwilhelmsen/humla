@@ -39,6 +39,12 @@ pub struct CloudScope<'a> {
     /// what the server filters on; the name only reaches the prompt, so the model
     /// can say whose notes it was restricted to. Absent = no filter.
     pub owner: Option<(&'a str, &'a str)>,
+    /// A pinned Client: `(client_id, display_name)`, the same id/name split as
+    /// `owner`.
+    pub client: Option<(&'a str, &'a str)>,
+    /// A pinned speaker. One value, not a pair: the label is both the filter
+    /// input and the display name (ADR-0002).
+    pub speaker: Option<&'a str>,
     /// The anchor note's title — display name for breadth "note" (#113).
     pub note_title: Option<&'a str>,
     /// The folder's name — display name for breadth "folder" (#113).
@@ -65,7 +71,8 @@ pub fn build_cloud_request(
     title: Option<&str>,
     scope: CloudScope<'_>,
 ) -> Result<Value, String> {
-    let CloudScope { breadth, note_id, folder_id, owner, note_title, folder_name } = scope;
+    let CloudScope { breadth, note_id, folder_id, owner, client, speaker, note_title, folder_name } =
+        scope;
     // Reject an unknown breadth through the shared validator — one owner of the
     // vocabulary and its error, no duplicated match/message here.
     super::validate_breadth(breadth)?;
@@ -110,6 +117,20 @@ pub fn build_cloud_request(
         }
         v
     };
+    // Same terms as the authorship pin. Sent under every breadth, unlike a reach
+    // name, because they compose with breadth rather than describing it.
+    let with_pins = |mut v: Value| {
+        if let Some((id, name)) = client.filter(|(id, _)| !id.trim().is_empty()) {
+            v["client"] = json!(id);
+            if !name.trim().is_empty() {
+                v["client_name"] = json!(name);
+            }
+        }
+        if let Some(label) = speaker.map(str::trim).filter(|s| !s.is_empty()) {
+            v["speaker"] = json!(label);
+        }
+        v
+    };
     // Only the name the BREADTH uses is sent. Under "all" neither goes — the anchor
     // rides along to resolve the conversation, so sending its title would invite the
     // server to announce a one-note confinement on a library-wide turn.
@@ -125,12 +146,12 @@ pub fn build_cloud_request(
         v
     };
     let scope_json = match breadth {
-        "note" => with_reach_name(with_owner(with_anchor(json!({ "breadth": "note" })))),
-        "all" => with_owner(with_anchor(json!({ "breadth": "all" }))),
+        "note" => with_reach_name(with_pins(with_owner(with_anchor(json!({ "breadth": "note" }))))),
+        "all" => with_pins(with_owner(with_anchor(json!({ "breadth": "all" })))),
         "folder" => match folder_id.filter(|f| !f.is_empty()) {
-            Some(f) => with_reach_name(with_owner(with_anchor(
+            Some(f) => with_reach_name(with_pins(with_owner(with_anchor(
                 json!({ "breadth": "folder", "folder_id": f }),
-            ))),
+            )))),
             None => {
                 return Err(
                     "\"Folder\" scope needs a folder, but this note isn't in one.".into()
@@ -521,6 +542,51 @@ mod tests {
     fn note_scope(id: &str) -> CloudScope<'_> {
         CloudScope { breadth: "note", note_id: Some(id), ..CloudScope::default() }
     }
+
+    /// Both pins ride the scope under every breadth, id separated from name. A
+    /// speaker pin has no pair: the label is the name.
+    #[test]
+    fn the_client_and_speaker_pins_ride_every_breadth_with_names_separated() {
+        let pinned = |breadth: &'static str, folder: Option<&'static str>| CloudScope {
+            breadth,
+            note_id: Some("n1"),
+            folder_id: folder,
+            client: Some(("c7", "Acme")),
+            speaker: Some("Hege Tronshaugen"),
+            folder_name: folder.map(|_| "Kunder"),
+            ..Default::default()
+        };
+        for (breadth, folder) in [("note", None), ("all", None), ("folder", Some("f1"))] {
+            let b = req(pinned(breadth, folder)).unwrap();
+            let scope = &b["scope"];
+            assert_eq!(scope["client"], "c7", "{breadth}: the id is the filter input");
+            assert_eq!(scope["client_name"], "Acme", "{breadth}: the name is prompt text");
+            assert_eq!(scope["speaker"], "Hege Tronshaugen", "{breadth}");
+            assert!(scope.get("speaker_name").is_none(), "{breadth}: a label needs no second copy");
+        }
+    }
+
+    /// A pin whose display name never resolved — a Client deleted since it was set
+    /// — still FILTERS. Losing the name costs the server's disclosure, never the
+    /// narrowing, which is the same rule the authorship pin and the reach names
+    /// follow.
+    #[test]
+    fn a_nameless_client_pin_still_filters() {
+        let b = req(CloudScope {
+            breadth: "all",
+            client: Some(("c7", "   ")),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(b["scope"]["client"], "c7");
+        assert!(b["scope"].get("client_name").is_none(), "a blank name is omitted, not quoted");
+        // And a blank ID is no pin at all, rather than a pin on nobody.
+        let none = req(CloudScope { breadth: "all", client: Some(("  ", "Acme")), ..Default::default() })
+            .unwrap();
+        assert!(none["scope"].get("client").is_none());
+        assert!(none["scope"].get("client_name").is_none());
+    }
+
 
     #[test]
     fn request_defaults_to_note_breadth_with_grounding_anchor() {

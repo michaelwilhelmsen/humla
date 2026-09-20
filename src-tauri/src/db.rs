@@ -386,6 +386,17 @@ pub fn open(path: &Path) -> Result<Connection> {
         "ALTER TABLE conversations ADD COLUMN owner_filter TEXT NOT NULL DEFAULT ''",
         [],
     );
+    // A Client and a speaker pin, same back-fill rule as the authorship pin.
+    // Unlike that one these are not workspace-only: Personal has Clients and
+    // speakers, so they clamp local retrieval too.
+    let _ = conn.execute(
+        "ALTER TABLE conversations ADD COLUMN client_filter TEXT NOT NULL DEFAULT ''",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE conversations ADD COLUMN speaker_filter TEXT NOT NULL DEFAULT ''",
+        [],
+    );
     // Chat sessions (issue #61). Two idempotent steps:
     //   1. Drop the old UNIQUE index that pinned one conversation per
     //      (tenant, scope, scope_id) — sessions need many per scope now. IF
@@ -627,6 +638,18 @@ pub fn list_clients(conn: &Connection, workspace: &str) -> Result<Vec<Client>> {
         .query_map(params![workspace], map_client)?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
+}
+
+/// One Client's name by id, for the chat pin's disclosure. `None` for a Client
+/// deleted since the pin was set, which then discloses nothing rather than
+/// naming an id.
+pub fn client_name(conn: &Connection, id: &str) -> Result<Option<String>> {
+    let mut stmt = conn.prepare_cached("SELECT name FROM clients WHERE id = ?1")?;
+    let mut rows = stmt.query(params![id])?;
+    Ok(match rows.next()? {
+        Some(row) => Some(row.get(0)?),
+        None => None,
+    })
 }
 
 pub fn create_client(conn: &Connection, name: &str, workspace: &str) -> Result<Client> {
@@ -1237,6 +1260,16 @@ pub struct Conversation {
     /// meaning per conversation, and lets the chip name them ("Created by Anna")
     /// instead of implying "you".
     pub owner_filter: String,
+    /// The Client id this conversation retrieves from, or empty for no filter.
+    ///
+    /// A genuine id, unlike [`Self::speaker_filter`]: a Client is an entity the
+    /// user created, so the pin survives a rename.
+    pub client_filter: String,
+    /// The transcript label whose passages this conversation retrieves, or empty.
+    ///
+    /// A string, not an id: there is no Person entity to key on (ADR-0002), so
+    /// two spellings of one person are two pins.
+    pub speaker_filter: String,
     /// Session title (issue #61). NULL until the first user message sets it
     /// (personal scope) or the migration back-fills it; the session list falls
     /// back to a derived date label when it's still absent.
@@ -1267,14 +1300,17 @@ fn map_conversation(row: &rusqlite::Row) -> rusqlite::Result<Conversation> {
         remote_id: row.get(4)?,
         breadth: row.get(5)?,
         owner_filter: row.get(6)?,
-        title: row.get(7)?,
-        created_at: row.get(8)?,
-        updated_at: row.get(9)?,
+        client_filter: row.get(7)?,
+        speaker_filter: row.get(8)?,
+        title: row.get(9)?,
+        created_at: row.get(10)?,
+        updated_at: row.get(11)?,
     })
 }
 
 const CONVERSATION_COLS: &str =
-    "id, scope, scope_id, tenant, remote_id, breadth, owner_filter, title, created_at, updated_at";
+    "id, scope, scope_id, tenant, remote_id, breadth, owner_filter, client_filter, speaker_filter, \
+     title, created_at, updated_at";
 
 /// The most-recently-updated conversation ("active session") for a scope, or
 /// None (issue #61). This replaces the old get-or-create: opening the Chat tab
@@ -1549,6 +1585,32 @@ pub fn set_conversation_owner_filter(
     conn.execute(
         "UPDATE conversations SET owner_filter = ?1, updated_at = ?2 WHERE id = ?3",
         params![owner.unwrap_or(""), now_ms(), id],
+    )?;
+    Ok(())
+}
+
+/// Pin (or clear) the conversation's Client filter. `None` clears.
+pub fn set_conversation_client_filter(
+    conn: &Connection,
+    id: &str,
+    client: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE conversations SET client_filter = ?1, updated_at = ?2 WHERE id = ?3",
+        params![client.unwrap_or(""), now_ms(), id],
+    )?;
+    Ok(())
+}
+
+/// Pin (or clear) the conversation's speaker filter. `None` clears.
+pub fn set_conversation_speaker_filter(
+    conn: &Connection,
+    id: &str,
+    speaker: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE conversations SET speaker_filter = ?1, updated_at = ?2 WHERE id = ?3",
+        params![speaker.unwrap_or(""), now_ms(), id],
     )?;
     Ok(())
 }
@@ -3414,6 +3476,47 @@ mod tests {
             "u-anna",
             "the pin survives a re-open (idempotent migration)"
         );
+    }
+
+    /// Both pins default to off, round-trip, clear, and survive a re-open — and,
+    /// the part a per-pin test cannot see, stay independent of each other and of
+    /// the authorship pin.
+    #[test]
+    fn conversation_client_and_speaker_pins_are_independent_and_persist() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pins.sqlite");
+        let reload = |conn: &Connection| {
+            latest_conversation(conn, CHAT_TENANT_PERSONAL, CHAT_SCOPE_NOTE, "note1")
+                .unwrap()
+                .unwrap()
+        };
+        {
+            let conn = open(&path).unwrap();
+            let conv =
+                create_conversation(&conn, CHAT_TENANT_PERSONAL, CHAT_SCOPE_NOTE, "note1", "note")
+                    .unwrap();
+            assert_eq!(conv.client_filter, "", "a new conversation has no Client pin");
+            assert_eq!(conv.speaker_filter, "", "a new conversation has no speaker pin");
+
+            set_conversation_client_filter(&conn, &conv.id, Some("c-acme")).unwrap();
+            set_conversation_speaker_filter(&conn, &conv.id, Some("Hege Tronshaugen")).unwrap();
+            set_conversation_owner_filter(&conn, &conv.id, Some("u-anna")).unwrap();
+            let got = reload(&conn);
+            assert_eq!(got.client_filter, "c-acme", "the Client pin round-trips");
+            assert_eq!(got.speaker_filter, "Hege Tronshaugen", "the speaker pin round-trips");
+            assert_eq!(got.owner_filter, "u-anna", "and the authorship pin is untouched");
+
+            // Clearing one leaves the other two alone — the case a per-pin test misses.
+            set_conversation_client_filter(&conn, &conv.id, None).unwrap();
+            let got = reload(&conn);
+            assert_eq!(got.client_filter, "", "None clears the Client pin");
+            assert_eq!(got.speaker_filter, "Hege Tronshaugen", "without touching the speaker pin");
+            assert_eq!(got.owner_filter, "u-anna", "or the authorship pin");
+        }
+        let conn = open(&path).unwrap();
+        let got = reload(&conn);
+        assert_eq!(got.speaker_filter, "Hege Tronshaugen", "the pin survives a re-open");
+        assert_eq!(got.owner_filter, "u-anna", "idempotent migration, all three columns");
     }
 
     /// Migration idempotency + first-session preservation (issue #61). Seeds a
