@@ -91,9 +91,10 @@ pub struct Pins {
 /// Whether the Client pin applies under this breadth.
 ///
 /// Dropped under `note`, where one note is in scope and it could only take the
-/// anchor away. The single owner of that rule: `resolve_filter` reads it, so does
-/// the prompt's disclosure, and the client's own picker mirrors it. Mirrors
-/// `resolveScope` in `humla-cloud/chat-service/src/tools.ts`.
+/// anchor away. The one owner of that rule here: `resolve_filter` reads it and so
+/// does the prompt's disclosure. Mirrored by `clientPinApplies` in
+/// `humla-cloud/chat-service/src/tools.ts`, and by `showClientPin` in
+/// `ChatPanel.tsx`, which gates both the picker and the token.
 pub fn client_pin_applies(scope: &ToolScope) -> bool {
     !matches!(scope, ToolScope::Note(_))
 }
