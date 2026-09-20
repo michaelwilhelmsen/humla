@@ -869,6 +869,15 @@ fn resolve_for_write(
     Ok(Some(resolve_or_create(conn, tenant, target, explicit, DraftSettings::default())?))
 }
 
+/// A stored filter column as an optional value: empty (and blank) is "no pin",
+/// never a pin on nothing. One owner for that normalisation, since every pin
+/// column is written by a setter that already refuses blanks and read by paths
+/// that must not depend on that having happened.
+fn non_empty(s: &str) -> Option<String> {
+    let t = s.trim();
+    (!t.is_empty()).then(|| t.to_string())
+}
+
 /// What a draft had chosen before it had a row to store it on (issue #120).
 ///
 /// A library-wide pane holds its breadth and authorship pin locally until the
@@ -1701,7 +1710,7 @@ pub async fn chat_send(
     // the configured chat provider uses.
     let chat_key = chat_api_key(&state);
 
-    let (grounding, resolved, conversation_id, tool_scope, workspace) = {
+    let (grounding, resolved, conversation_id, tool_scope, pins, workspace) = {
         let conn = state.db.lock();
         let note = anchor_note(&conn, &target)?;
         // We branched to the Personal path above (no active workspace), so the
@@ -1736,8 +1745,17 @@ pub async fn chat_send(
         // empty on this path. The workspace turn (`chat_send_cloud`) is where the
         // pin is read and sent. Keep this in step with that rejection — a pin that
         // could be stored but not applied is the silent-no-op shape (#103).
+        //
+        // The Client and speaker pins ARE read here (#115), and that is the one
+        // way they differ from the authorship pin: Personal has Clients and
+        // speakers, so a pin set here has to clamp local retrieval or it would be
+        // exactly that silent no-op.
+        let pins = chat::Pins {
+            client: non_empty(&conversation.client_filter),
+            speaker: non_empty(&conversation.speaker_filter),
+        };
         let tool_scope = resolve_scope(&breadth, note.as_ref(), target.folder_id())?;
-        (grounding, resolved, conversation.id, tool_scope, workspace)
+        (grounding, resolved, conversation.id, tool_scope, pins, workspace)
     };
 
     // Embed the anchor Note now (best-effort, cached) so semantic search works
@@ -1813,6 +1831,7 @@ pub async fn chat_send(
         &conversation_id,
         &grounding.text,
         &tool_scope,
+        &pins,
         &workspace,
         embedder.as_ref().map(|e| e as &dyn EmbeddingAdapter),
         &message,
@@ -3294,6 +3313,8 @@ mod tests {
                 remote_id: remote.map(String::from),
                 breadth: "note".to_string(),
                 owner_filter: String::new(),
+                client_filter: String::new(),
+                speaker_filter: String::new(),
                 title: None,
                 created_at: 0,
                 updated_at: 0,

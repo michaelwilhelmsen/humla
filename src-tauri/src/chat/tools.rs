@@ -71,6 +71,40 @@ pub enum ToolScope {
     All,
 }
 
+/// The conversation-level pins the USER set (#115), as opposed to the filters the
+/// model chooses per call. Both narrow the same two fields, so one of them has to
+/// win: the pin does, always, and silently overrides whatever the model asked for.
+///
+/// That is the whole point of a pin. #115 exists because "a filter the model
+/// *might* apply is not a filter you can rely on" — a pin the model could widen
+/// out of by passing its own `client_id` would be the same unreliable thing with
+/// a chip drawn next to it.
+///
+/// Orthogonal to [`ToolScope`] rather than folded into it: breadth answers WHAT is
+/// in reach and heals against the anchor note, while these answer WHOSE and WHO
+/// SPOKE and have no anchor to heal against. Passed beside it for the same reason
+/// `LabelFallback` rides beside `ChainProgress`.
+///
+/// Applied to search and listing only, NOT to `get_note`. A pin narrows what is
+/// FOUND; a note id only ever reaches the model through a search or listing that
+/// was already pinned, so clamping the read as well would buy nothing and would
+/// break a citation the model had legitimately been handed.
+#[derive(Debug, Clone, Default)]
+pub struct Pins {
+    /// A Client id (a real entity id — see `db::Conversation::client_filter`).
+    pub client: Option<String>,
+    /// A transcript label, not an id, permanently (ADR-0002).
+    pub speaker: Option<String>,
+}
+
+impl Pins {
+    /// True when nothing is pinned — the common case, and the one the disclosure
+    /// stays silent for.
+    pub fn is_empty(&self) -> bool {
+        self.client.is_none() && self.speaker.is_none()
+    }
+}
+
 /// The three retrieval tool names, in one place so specs + dispatch agree.
 pub const TOOL_SEARCH: &str = "search_notes";
 pub const TOOL_GET: &str = "get_note";
@@ -276,13 +310,16 @@ fn validate_window(scope: &ToolScope, args: &Value, now_ms: i64) -> Result<(), S
 /// hits searching the very note on screen.
 fn resolve_filter<'a>(
     scope: &'a ToolScope,
+    pins: &'a Pins,
     args: &'a Value,
     now_ms: i64,
     asker: Option<&'a str>,
 ) -> NoteFilter<'a> {
     let since_ms = window_since(args, now_ms);
     let until_ms = window_until(args, now_ms);
-    let speaker = str_arg(args, ARG_SPEAKER);
+    // A pin beats the model's own argument for the same field (see `Pins`).
+    let speaker = pins.speaker.as_deref().or_else(|| str_arg(args, ARG_SPEAKER));
+    let client_id = pins.client.as_deref().or_else(|| str_arg(args, "client_id"));
     // The app user's own speech lives under two labels across a library: the literal
     // `You` the diarizer writes for mic chunks on remote calls, and their real name
     // wherever they renamed it. So asking for either finds both — filtering for one
@@ -302,6 +339,11 @@ fn resolve_filter<'a>(
         // scope a window can only take it away, but a speaker still narrows
         // MEANINGFULLY — to the passages of this note that person spoke in, which is
         // exactly "what did she say in this meeting".
+        // A Client pin is dropped here for the same reason the date window is: with
+        // one note in scope it can only take the anchor away, and a pane that
+        // answers nothing about the note it is attached to is a bug, not a filter.
+        // The speaker pin survives — it narrows to the passages that person spoke,
+        // which is exactly "what did she say in this meeting".
         ToolScope::Note(id) => NoteFilter {
             note_id: Some(id),
             speaker,
@@ -311,7 +353,7 @@ fn resolve_filter<'a>(
         ToolScope::Folder(id) => NoteFilter {
             folder_id: Some(id),
             // A client narrowing still composes within the folder breadth.
-            client_id: str_arg(args, "client_id"),
+            client_id,
             since_ms,
             until_ms,
             speaker,
@@ -320,7 +362,7 @@ fn resolve_filter<'a>(
         },
         ToolScope::All => NoteFilter {
             folder_id: str_arg(args, "folder_id"),
-            client_id: str_arg(args, "client_id"),
+            client_id,
             since_ms,
             until_ms,
             speaker,
@@ -360,6 +402,9 @@ pub fn execute_tool(
     conn: &Connection,
     workspace: &str,
     scope: &ToolScope,
+    // The user's conversation-level pins (#115), which beat the model's own
+    // filter arguments for the same fields.
+    pins: &Pins,
     name: &str,
     args: &Value,
     query_vec: Option<&[f32]>,
@@ -372,10 +417,10 @@ pub fn execute_tool(
 ) -> ToolOutcome {
     match name {
         TOOL_SEARCH => {
-            run_search(conn, workspace, scope, args, query_vec, embed_model, now_ms, asker)
+            run_search(conn, workspace, scope, pins, args, query_vec, embed_model, now_ms, asker)
         }
         TOOL_GET => run_get(conn, workspace, scope, args),
-        TOOL_LIST => run_list(conn, workspace, scope, args, now_ms, asker),
+        TOOL_LIST => run_list(conn, workspace, scope, pins, args, now_ms, asker),
         other => ToolOutcome::error(format!(
             "Unknown tool \"{other}\". Available tools: {TOOL_SEARCH}, {TOOL_GET}, {TOOL_LIST}."
         )),
@@ -387,6 +432,7 @@ fn run_search(
     conn: &Connection,
     workspace: &str,
     scope: &ToolScope,
+    pins: &Pins,
     args: &Value,
     query_vec: Option<&[f32]>,
     embed_model: &str,
@@ -399,7 +445,7 @@ fn run_search(
     if let Err(msg) = validate_window(scope, args, now_ms) {
         return ToolOutcome::error(msg);
     }
-    let filter = resolve_filter(scope, args, now_ms, asker);
+    let filter = resolve_filter(scope, pins, args, now_ms, asker);
     let outcome = match db::hybrid_search_chunks(
         conn,
         query,
@@ -575,6 +621,7 @@ fn run_list(
     conn: &Connection,
     workspace: &str,
     scope: &ToolScope,
+    pins: &Pins,
     args: &Value,
     now_ms: i64,
     asker: Option<&str>,
@@ -582,7 +629,7 @@ fn run_list(
     if let Err(msg) = validate_window(scope, args, now_ms) {
         return ToolOutcome::error(msg);
     }
-    let filter = resolve_filter(scope, args, now_ms, asker);
+    let filter = resolve_filter(scope, pins, args, now_ms, asker);
     // Fetch one past the cap so a truncated listing can say so rather than reading
     // as complete — a capped listing that looks whole is how a model ends up
     // asserting a note doesn't exist.
@@ -786,11 +833,26 @@ mod tests {
 
     /// A fixed "now" so the date-window tests don't depend on the wall clock.
     const NOW: i64 = 1_785_024_000_000; // 2026-07-26T00:00:00Z
+    /// The unpinned case (#115), as a borrowable constant: `resolve_filter`
+    /// borrows its pins for the returned filter's lifetime, so a `UNPINNED`
+    /// temporary can't live long enough at a call site.
+    const UNPINNED: &Pins = &Pins { client: None, speaker: None };
     const DAY: i64 = 86_400_000;
 
     /// Keyword-only tool call (no query embedding) — the common test path.
     fn exec(conn: &Connection, workspace: &str, scope: &ToolScope, name: &str, args: &Value) -> ToolOutcome {
-        execute_tool(conn, workspace, scope, name, args, None, "", NOW, None)
+        execute_tool(conn, workspace, scope, UNPINNED, name, args, None, "", NOW, None)
+    }
+
+    /// Same, with the user's conversation-level pins in force (#115).
+    fn exec_pinned(
+        conn: &Connection,
+        scope: &ToolScope,
+        pins: &Pins,
+        name: &str,
+        args: &Value,
+    ) -> ToolOutcome {
+        execute_tool(conn, "", scope, pins, name, args, None, "", NOW, None)
     }
 
     /// Backdate a note's creation time — the date window filters on `created_at`,
@@ -1036,11 +1098,11 @@ mod tests {
         let args = json!({ "within_days": 1 });
         let scope = ToolScope::Note(anchor.clone());
         assert!(exec(&conn, "", &scope, TOOL_LIST, &args).model_text.contains("Anchor"));
-        assert!(resolve_filter(&scope, &args, NOW, None).since_ms.is_none());
+        assert!(resolve_filter(&scope, UNPINNED, &args, NOW, None).since_ms.is_none());
         // …but a folder or library scope does honour it.
-        assert_eq!(resolve_filter(&ToolScope::All, &args, NOW, None).since_ms, Some(NOW - DAY));
+        assert_eq!(resolve_filter(&ToolScope::All, UNPINNED, &args, NOW, None).since_ms, Some(NOW - DAY));
         assert_eq!(
-            resolve_filter(&ToolScope::Folder("f".into()), &args, NOW, None).since_ms,
+            resolve_filter(&ToolScope::Folder("f".into()), UNPINNED, &args, NOW, None).since_ms,
             Some(NOW - DAY)
         );
     }
@@ -1087,6 +1149,89 @@ mod tests {
             assert!(!out.model_text.contains("Acme kickoff"), "{tool}");
             assert!(!out.model_text.contains("Internal standup"), "{tool}");
         }
+    }
+
+    /// #115: a pin BEATS the model's own argument for the same field. This is the
+    /// whole reason a pin exists — the issue's own framing is that "a filter the
+    /// model *might* apply is not a filter you can rely on", so a model that can
+    /// pass its own `client_id` and widen out of the pin has reproduced the thing
+    /// the feature was built to fix.
+    #[test]
+    fn a_pinned_client_overrides_the_models_own_client_argument() {
+        let conn = open();
+        let acme = db::create_client(&conn, "Acme", "").unwrap();
+        let other = db::create_client(&conn, "Other", "").unwrap();
+        let a = seed(&conn, "Acme kickoff", "the budget came up");
+        let o = seed(&conn, "Other kickoff", "the budget came up");
+        db::set_note_client(&conn, &a, Some(&acme.id)).unwrap();
+        db::set_note_client(&conn, &o, Some(&other.id)).unwrap();
+
+        let pins = Pins { client: Some(acme.id.clone()), speaker: None };
+        for tool in [TOOL_LIST, TOOL_SEARCH] {
+            // The model asks for the OTHER client. The pin wins.
+            let args = json!({ "query": "budget", "client_id": other.id });
+            let out = exec_pinned(&conn, &ToolScope::All, &pins, tool, &args);
+            assert!(out.model_text.contains("Acme kickoff"), "{tool}: the pin holds");
+            assert!(
+                !out.model_text.contains("Other kickoff"),
+                "{tool}: the model widened out of the pin — got:\n{}",
+                out.model_text
+            );
+        }
+    }
+
+    /// The speaker pin does the same, and composes with the Client pin rather than
+    /// replacing it — they are orthogonal (whose account × who spoke).
+    #[test]
+    fn a_pinned_speaker_overrides_the_models_argument_and_composes_with_a_client() {
+        let conn = open();
+        let acme = db::create_client(&conn, "Acme", "").unwrap();
+        let hers = seed(&conn, "Acme review", "Hege: the budget came up");
+        let his = seed(&conn, "Acme standup", "Michael: the budget came up");
+        for id in [&hers, &his] {
+            db::set_note_client(&conn, id, Some(&acme.id)).unwrap();
+        }
+        // `speakers` is derived from the transcript by reindex_note, so retrieval
+        // can only filter on what the reindex wrote.
+        for (id, text) in [(&hers, "Hege: the budget came up"), (&his, "Michael: the budget came up")] {
+            db::reindex_note(&conn, id, "", text, "").unwrap();
+        }
+
+        let pins = Pins { client: Some(acme.id.clone()), speaker: Some("Hege".into()) };
+        // The model asks for the other speaker; the pin wins, inside the Client pin.
+        let args = json!({ "query": "budget", ARG_SPEAKER: "Michael" });
+        let out = exec_pinned(&conn, &ToolScope::All, &pins, TOOL_SEARCH, &args);
+        assert!(out.model_text.contains("Acme review"), "the speaker pin holds: {}", out.model_text);
+        assert!(!out.model_text.contains("Acme standup"), "{}", out.model_text);
+    }
+
+    /// Under `note` breadth the Client pin is DROPPED and the speaker pin survives
+    /// — the asymmetry documented in `resolve_filter`. A Client pin there could
+    /// only ever take the pane's own anchor away, which is a bug wearing a
+    /// filter's clothes; a speaker pin narrows to what that person said in the
+    /// note, which is a real question.
+    #[test]
+    fn under_note_breadth_a_client_pin_is_dropped_and_a_speaker_pin_survives() {
+        let conn = open();
+        let acme = db::create_client(&conn, "Acme", "").unwrap();
+        let note = seed(&conn, "Kickoff", "Hege: the budget came up\nMichael: agreed");
+        db::reindex_note(&conn, &note, "", "Hege: the budget came up\nMichael: agreed", "").unwrap();
+        // Deliberately tagged to NO client, so a live Client pin would empty it.
+        let scope = ToolScope::Note(note.clone());
+
+        let pinned_elsewhere = Pins { client: Some(acme.id.clone()), speaker: None };
+        let out = exec_pinned(&conn, &scope, &pinned_elsewhere, TOOL_SEARCH, &json!({ "query": "budget" }));
+        assert!(
+            out.model_text.contains("Kickoff"),
+            "a Client pin must not empty the pane's own anchor: {}",
+            out.model_text
+        );
+
+        let by_speaker = Pins { client: None, speaker: Some("Hege".into()) };
+        let empty = json!({});
+        let f = resolve_filter(&scope, &by_speaker, &empty, NOW, None);
+        assert_eq!(f.speaker, Some("Hege"), "the speaker pin still narrows within the note");
+        assert!(f.client_id.is_none(), "and no client id rides along under note breadth");
     }
 
     // ── #106: a bounded window, and how many notes actually matched ──────────
@@ -1192,10 +1337,10 @@ mod tests {
 
         let args = json!({ ARG_UNTIL: 30 });
         let scope = ToolScope::Note(anchor.clone());
-        assert!(resolve_filter(&scope, &args, NOW, None).until_ms.is_none());
+        assert!(resolve_filter(&scope, UNPINNED, &args, NOW, None).until_ms.is_none());
         assert!(exec(&conn, "", &scope, TOOL_LIST, &args).model_text.contains("Anchor"));
         // …but a folder or library scope does honour it.
-        assert_eq!(resolve_filter(&ToolScope::All, &args, NOW, None).until_ms, Some(NOW - 30 * DAY));
+        assert_eq!(resolve_filter(&ToolScope::All, UNPINNED, &args, NOW, None).until_ms, Some(NOW - 30 * DAY));
     }
 
     /// The `You:` sentinel and the asker's own name are the same person, so asking
@@ -1205,36 +1350,36 @@ mod tests {
     #[test]
     fn the_asker_and_the_you_sentinel_are_treated_as_one_person() {
         let by_name = json!({ ARG_SPEAKER: "Michael" });
-        let f = resolve_filter(&ToolScope::All, &by_name, NOW, Some("Michael"));
+        let f = resolve_filter(&ToolScope::All, UNPINNED, &by_name, NOW, Some("Michael"));
         assert_eq!(f.speaker, Some("Michael"));
         assert_eq!(f.speaker_alias, Some("You"), "their name must also match You:");
 
         // Case-insensitively, since the model echoes names from prose.
         let lower = json!({ ARG_SPEAKER: "michael" });
-        let f = resolve_filter(&ToolScope::All, &lower, NOW, Some("Michael"));
+        let f = resolve_filter(&ToolScope::All, UNPINNED, &lower, NOW, Some("Michael"));
         assert_eq!(f.speaker_alias, Some("You"));
 
         // And the reverse direction: asking for "You" also matches their real name,
         // for the notes where the label was renamed.
         let by_sentinel = json!({ ARG_SPEAKER: "You" });
-        let f = resolve_filter(&ToolScope::All, &by_sentinel, NOW, Some("Michael"));
+        let f = resolve_filter(&ToolScope::All, UNPINNED, &by_sentinel, NOW, Some("Michael"));
         assert_eq!(f.speaker, Some("You"));
         assert_eq!(f.speaker_alias, Some("Michael"));
 
         // Somebody else's name gets no alias — Hege is not the asker, and aliasing
         // her to `You` would hand back the user's own speech as hers.
         let other = json!({ ARG_SPEAKER: "Hege" });
-        let f = resolve_filter(&ToolScope::All, &other, NOW, Some("Michael"));
+        let f = resolve_filter(&ToolScope::All, UNPINNED, &other, NOW, Some("Michael"));
         assert_eq!(f.speaker, Some("Hege"));
         assert_eq!(f.speaker_alias, None, "aliasing a third party would forge attribution");
 
         // No asker known (the local-only majority): no alias, and no crash.
-        let f = resolve_filter(&ToolScope::All, &by_name, NOW, None);
+        let f = resolve_filter(&ToolScope::All, UNPINNED, &by_name, NOW, None);
         assert_eq!(f.speaker_alias, None);
 
         // The alias also survives Note breadth, where the date window does not.
         let note_scope = ToolScope::Note("n1".into());
-        let f = resolve_filter(&note_scope, &by_name, NOW, Some("Michael"));
+        let f = resolve_filter(&note_scope, UNPINNED, &by_name, NOW, Some("Michael"));
         assert_eq!(f.speaker, Some("Michael"));
         assert_eq!(f.speaker_alias, Some("You"));
     }
