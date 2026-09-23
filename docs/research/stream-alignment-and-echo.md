@@ -348,7 +348,9 @@ that delay to L and removes the steps, so the two compose. Whether it is worth
 it is decided by §6 step 6. The prior is strong: on the test take, 154 s of the
 mic's 180 s of content is echo, and every engine that can count voices counts
 it. It is also the precondition for leaving Community-1: an end-to-end engine
-on an echoed mic stream will never earn `You`.
+on an echoed mic stream will never earn `You`. That switch is decided in
+[ADR-0005](../adr/0005-nemotron-3-is-the-default-diarization-engine.md) and
+waits on this (#193).
 
 ## 8. Open questions
 
