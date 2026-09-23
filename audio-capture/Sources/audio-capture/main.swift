@@ -334,6 +334,11 @@ final class FullRecordingWriter {
     private var url: URL?
     private var written: AVAudioFrameCount = 0
     private let queue: DispatchQueue
+    // Buffers handed over after `close()`. Each one reopens the file, which
+    // replaces the recording `full_recording` just reported. Counted, not
+    // prevented: whether it happens in practice is what the count is for.
+    private var closed = false
+    private var writesAfterClose = 0
 
     init(source: String, dir: URL) {
         self.source = source
@@ -343,6 +348,7 @@ final class FullRecordingWriter {
 
     func write(_ buffer: AVAudioPCMBuffer) {
         queue.sync {
+            if closed { writesAfterClose += 1 }
             do {
                 if file == nil {
                     let u = dir.appendingPathComponent("\(source)-full.wav")
@@ -357,8 +363,14 @@ final class FullRecordingWriter {
         }
     }
 
+    /// See `writesAfterClose`.
+    func lateWriteCount() -> Int {
+        queue.sync { writesAfterClose }
+    }
+
     func close() {
         queue.sync {
+            closed = true
             file = nil
             if let u = url, written > 0 {
                 let durationMs = Int(Double(written) / targetSampleRate * 1000.0)
@@ -406,6 +418,28 @@ func recordSysStats(samples: [Float]) {
     stats.lock.unlock()
 }
 
+// MARK: - Capture timing (diagnostics)
+//
+// Where each stream's first frame fell on the host clock, and whether the
+// frames after it kept pace — see StreamTiming.swift. Reported once, as
+// `capture_timing`, just before `stopped`.
+
+/// The host clock in seconds: `mach_absolute_time`'s timebase, which an input
+/// tap's `AVAudioTime.hostTime` and ScreenCaptureKit's presentation timestamps
+/// are both expected to be in. Each interval reports its first frame's arrival
+/// beside its stamp, which is what checks that expectation per stream.
+func hostSecondsNow() -> Double {
+    AVAudioTime.seconds(forHostTime: mach_absolute_time())
+}
+
+/// Every host time `capture_timing` reports is relative to this instant. Taken
+/// here, before either stream starts: main.swift initialises its globals in
+/// order, so this runs ahead of `engine.start()` below.
+let timingEpoch = hostSecondsNow()
+
+let micTiming = StreamTiming()
+let sysTiming = StreamTiming()
+
 // MARK: - Input device name (#174)
 //
 // The no-audio warning used to say "check your microphone", which named the one
@@ -450,8 +484,18 @@ func audioDeviceName(_ id: AudioDeviceID) -> String? {
 /// The device macOS currently considers the default input — what the engine
 /// follows, and what the user sees selected in System Settings.
 func defaultInputDeviceID() -> AudioDeviceID {
+    defaultDeviceID(kAudioHardwarePropertyDefaultInputDevice)
+}
+
+/// The default output — where a call plays, and so where an echo on the mic
+/// comes from. Read for the timing report only.
+func defaultOutputDeviceID() -> AudioDeviceID {
+    defaultDeviceID(kAudioHardwarePropertyDefaultOutputDevice)
+}
+
+func defaultDeviceID(_ selector: AudioObjectPropertySelector) -> AudioDeviceID {
     var address = AudioObjectPropertyAddress(
-        mSelector: kAudioHardwarePropertyDefaultInputDevice,
+        mSelector: selector,
         mScope: kAudioObjectPropertyScopeGlobal,
         mElement: kAudioObjectPropertyElementMain
     )
@@ -504,6 +548,145 @@ final class InputDevice {
 }
 let inputDevice = InputDevice()
 
+/// The device the mic tap was last installed on, as an id — for the timing
+/// report's latency figures, never for a name. Set where the tap is installed
+/// (main thread), read at shutdown, for the same reason `InputDevice` is.
+final class TappedInputDevice {
+    private let lock = NSLock()
+    private var id = AudioDeviceID(kAudioObjectUnknown)
+    func set(_ value: AudioDeviceID) {
+        lock.lock()
+        id = value
+        lock.unlock()
+    }
+    func get() -> AudioDeviceID {
+        lock.lock()
+        defer { lock.unlock() }
+        return id
+    }
+}
+let tappedInputDevice = TappedInputDevice()
+
+func deviceUInt32(
+    _ id: AudioObjectID,
+    _ selector: AudioObjectPropertySelector,
+    _ scope: AudioObjectPropertyScope
+) -> UInt32? {
+    var address = AudioObjectPropertyAddress(
+        mSelector: selector,
+        mScope: scope,
+        mElement: kAudioObjectPropertyElementMain
+    )
+    var value: UInt32 = 0
+    var size = UInt32(MemoryLayout<UInt32>.size)
+    let status = AudioObjectGetPropertyData(id, &address, 0, nil, &size, &value)
+    return status == noErr ? value : nil
+}
+
+func deviceFloat64(
+    _ id: AudioObjectID,
+    _ selector: AudioObjectPropertySelector,
+    _ scope: AudioObjectPropertyScope
+) -> Double? {
+    var address = AudioObjectPropertyAddress(
+        mSelector: selector,
+        mScope: scope,
+        mElement: kAudioObjectPropertyElementMain
+    )
+    var value: Float64 = 0
+    var size = UInt32(MemoryLayout<Float64>.size)
+    let status = AudioObjectGetPropertyData(id, &address, 0, nil, &size, &value)
+    return status == noErr && value.isFinite ? value : nil
+}
+
+/// Latency of a device's first stream in `scope`, which the HAL reports apart
+/// from the device's own.
+func firstStreamLatency(_ id: AudioObjectID, _ scope: AudioObjectPropertyScope) -> UInt32? {
+    var address = AudioObjectPropertyAddress(
+        mSelector: kAudioDevicePropertyStreams,
+        mScope: scope,
+        mElement: kAudioObjectPropertyElementMain
+    )
+    var size: UInt32 = 0
+    guard AudioObjectGetPropertyDataSize(id, &address, 0, nil, &size) == noErr,
+          size >= UInt32(MemoryLayout<AudioStreamID>.size) else { return nil }
+    var streams = [AudioStreamID](
+        repeating: 0,
+        count: Int(size) / MemoryLayout<AudioStreamID>.size
+    )
+    guard AudioObjectGetPropertyData(id, &address, 0, nil, &size, &streams) == noErr,
+          let first = streams.first else { return nil }
+    return deviceUInt32(first, kAudioStreamPropertyLatency, kAudioObjectPropertyScopeGlobal)
+}
+
+/// One device's latency and clocking as the HAL reports it — what splits an
+/// echo delay into the capture's start offset and the device's own path (a
+/// built-in speaker's few milliseconds against a Bluetooth output's hundreds).
+/// `clock_domain` says whether two devices share a sample clock, and so
+/// whether their streams can drift apart at all.
+///
+/// The transport is its four-char code (`bltn`, `blue`, `usb `…), never the
+/// device's name: names are display-only (#174) and this is persisted.
+func deviceTimingReport(_ id: AudioDeviceID, scope: AudioObjectPropertyScope) -> [String: Any]? {
+    guard id != AudioDeviceID(kAudioObjectUnknown) else { return nil }
+    let global = kAudioObjectPropertyScopeGlobal
+    var out: [String: Any] = [:]
+    if let v = deviceUInt32(id, kAudioDevicePropertyTransportType, global) {
+        out["transport"] = fourCCString(v)
+    }
+    if let v = deviceFloat64(id, kAudioDevicePropertyNominalSampleRate, global) {
+        out["nominal_rate"] = v
+    }
+    if let v = deviceUInt32(id, kAudioDevicePropertyLatency, scope) {
+        out["latency_frames"] = Int(v)
+    }
+    if let v = deviceUInt32(id, kAudioDevicePropertySafetyOffset, scope) {
+        out["safety_offset_frames"] = Int(v)
+    }
+    if let v = deviceUInt32(id, kAudioDevicePropertyBufferFrameSize, scope) {
+        out["buffer_frames"] = Int(v)
+    }
+    if let v = firstStreamLatency(id, scope) {
+        out["stream_latency_frames"] = Int(v)
+    }
+    if let v = deviceUInt32(id, kAudioDevicePropertyClockDomain, global) {
+        out["clock_domain"] = Int(v)
+    }
+    return out
+}
+
+/// Emit `capture_timing`. Called once, from shutdown: after the writers close,
+/// so `frames_written` is final, and before `stopped`, after which the Rust
+/// reader stops reading.
+func emitCaptureTiming() {
+    var devices: [String: Any] = [:]
+    let tapped = tappedInputDevice.get()
+    let inputID = tapped != AudioDeviceID(kAudioObjectUnknown) ? tapped : defaultInputDeviceID()
+    if let d = deviceTimingReport(inputID, scope: kAudioObjectPropertyScopeInput) {
+        devices["input"] = d
+    }
+    if let d = deviceTimingReport(defaultOutputDeviceID(), scope: kAudioObjectPropertyScopeOutput) {
+        devices["output"] = d
+    }
+    let payload: [String: Any] = [
+        "event": "capture_timing",
+        "version": 1,
+        "gap_threshold_ms": millis(deliveryGapThreshold),
+        "streams": [
+            micTiming.report(source: "mic", epoch: timingEpoch),
+            sysTiming.report(source: "sys", epoch: timingEpoch),
+        ],
+        "devices": devices,
+    ]
+    // Checked rather than trusted: JSONSerialization raises on anything it
+    // can't write, and that would take the `stopped` after this with it.
+    guard JSONSerialization.isValidJSONObject(payload) else {
+        FileHandle.standardError.write(Data("capture timing: payload not serialisable, skipped\n".utf8))
+        return
+    }
+    emit(payload)
+}
+
 // Wrap a Float32 sample array into an AVAudioPCMBuffer for the writers. The
 // writers expect mono Float32 at the target sample rate.
 func makeBuffer(_ samples: [Float]) -> AVAudioPCMBuffer? {
@@ -533,7 +716,9 @@ func installMicTap(_ input: AVAudioInputNode, format inFormat: AVAudioFormat) {
     // Both callers are on the main thread (startup, and device-change
     // recovery). Cached rather than re-resolved per heartbeat — see `InputDevice`.
     inputDevice.set(resolveInputDeviceName())
-    input.installTap(onBus: 0, bufferSize: 4096, format: inFormat) { buffer, _ in
+    tappedInputDevice.set(engine.inputNode.auAudioUnit.deviceID)
+    input.installTap(onBus: 0, bufferSize: 4096, format: inFormat) { buffer, when in
+        let arrival = hostSecondsNow()
         guard let conv = micConverter else { return }
         let ratio = targetSampleRate / inFormat.sampleRate
         let cap = AVAudioFrameCount(Double(buffer.frameLength) * ratio + 1024)
@@ -549,6 +734,7 @@ func installMicTap(_ input: AVAudioInputNode, format inFormat: AVAudioFormat) {
             status.pointee = .haveData
             return buffer
         }
+        var written = 0
         if status != .error, out.frameLength > 0,
            let chans = out.floatChannelData {
             let n = Int(out.frameLength)
@@ -557,7 +743,19 @@ func installMicTap(_ input: AVAudioInputNode, format inFormat: AVAudioFormat) {
             if let buf = makeBuffer(arr) {
                 micWriter.write(buf)
                 micFullWriter.write(buf)
+                written = n
             }
+        }
+        // Noted whenever the converter took the buffer, even when it gave
+        // nothing back yet: those frames are held, not lost.
+        if status != .error {
+            micTiming.note(
+                stamp: when.isHostTimeValid ? AVAudioTime.seconds(forHostTime: when.hostTime) : nil,
+                arrival: arrival,
+                inFrames: Int(buffer.frameLength),
+                inRate: buffer.format.sampleRate,
+                outFrames: written
+            )
         }
     }
 }
@@ -613,6 +811,7 @@ final class SystemAudioOutput: NSObject, SCStreamOutput {
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
         guard type == .audio else { return }
+        let arrival = hostSecondsNow()
         bufferCount += 1
         if bufferCount == 1 {
             FileHandle.standardError.write(Data("scstream: first audio buffer received\n".utf8))
@@ -743,9 +942,11 @@ final class SystemAudioOutput: NSObject, SCStreamOutput {
         let n = Int(out.frameLength)
         let arr = Array(UnsafeBufferPointer(start: chans[0], count: n))
         recordSysStats(samples: arr)
+        var written = 0
         if let buf = makeBuffer(arr) {
             sysWriter.write(buf)
             sysFullWriter.write(buf)
+            written = n
             if bufferCount == 1 {
                 FileHandle.standardError.write(Data(
                     "scstream: first buffer written to sysWriter (n=\(n) samples)\n".utf8
@@ -756,6 +957,17 @@ final class SystemAudioOutput: NSObject, SCStreamOutput {
                 FileHandle.standardError.write(Data("scstream: makeBuffer returned nil (n=\(n))\n".utf8))
             }
         }
+        // Only a buffer that got this far is noted, so one dropped on any of
+        // the early returns above shows up as a gap in what was written —
+        // which is the timeline the WAV actually has.
+        let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        sysTiming.note(
+            stamp: pts.isNumeric ? pts.seconds : nil,
+            arrival: arrival,
+            inFrames: Int(frames),
+            inRate: inFormat.sampleRate,
+            outFrames: written
+        )
     }
 }
 
@@ -857,6 +1069,11 @@ func pauseCapture() {
 func resumeCapture() {
     if !paused { return }
     paused = false
+    // Marked at resume rather than at pause: a ScreenCaptureKit stream stops
+    // asynchronously, and a straggler delivered after the pause still belongs
+    // to the interval before it.
+    micTiming.openInterval("resume")
+    sysTiming.openInterval("resume")
     do {
         try engine.start()
     } catch {
@@ -901,6 +1118,7 @@ func reconfigureMicAfterDeviceChange() {
         emitError("Audio device changed but the new microphone format is unavailable; mic capture did not resume.")
         return
     }
+    micTiming.openInterval("device_change")
     installMicTap(input, format: newFormat)
     // While paused the engine is intentionally stopped — resumeCapture() starts
     // it later, now against the freshly-installed tap. Only restart here if we
@@ -987,12 +1205,21 @@ let shutdown: () -> Void = {
         micWriter.close()
         sysWriter.close()
         releaseSystemAwake()
+        emitCaptureTiming()
         emit(["event": "stopped"])
         // Now best-effort SCK shutdown for cleanliness. If it stalls,
         // we've already emitted everything the parent needs and the
         // OS will reclaim resources on exit.
         if let s = scStream {
             try? await s.stopCapture()
+        }
+        // Only now can this be counted, and the reader has stopped at
+        // `stopped`, so it reaches stderr (the dev console) and nothing else.
+        let late = (mic: micFullWriter.lateWriteCount(), sys: sysFullWriter.lateWriteCount())
+        if late.mic + late.sys > 0 {
+            FileHandle.standardError.write(Data(
+                "capture timing: \(late.mic) mic / \(late.sys) sys buffer(s) reached a full-recording writer after it closed; that file was rewritten\n".utf8
+            ))
         }
         exit(0)
     }

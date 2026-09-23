@@ -101,7 +101,7 @@ impl Default for TranscriptTrail {
 /// mic chunks (system is silent → no chunks emitted) and the diarizer runs
 /// on the mic stream instead so multiple humans in the same room get
 /// distinct labels.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ChunkSource {
     Mic,
@@ -114,6 +114,16 @@ impl Default for ChunkSource {
         // sidecar event for any reason (stale dev cache mid-upgrade), treat
         // the chunk as mic — the safer default since mic always exists.
         ChunkSource::Mic
+    }
+}
+
+impl ChunkSource {
+    /// The wire name, as the sidecar spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ChunkSource::Mic => "mic",
+            ChunkSource::Sys => "sys",
+        }
     }
 }
 
@@ -213,6 +223,10 @@ pub struct CaptureSink {
     // time on the grounds that index / started_at / duration / streams never
     // change, so a corrected duration re-pushes under a byte-identical key.
     pub captured_duration_ms: Arc<Mutex<u64>>,
+    // What the sidecar measured about the two streams' timing, reported once on
+    // shutdown. Diagnostics only — see `CaptureTiming`. `None` until then, and
+    // for an import or a replay, which run no live capture.
+    pub capture_timing: Arc<Mutex<Option<CaptureTiming>>>,
     // How far the replay this sink belongs to has got, when it is one. `None`
     // for a live capture and for a "Transcribe manually" one: neither measures
     // its work in takes, and a live capture's progress is the transcript
@@ -522,6 +536,7 @@ impl CaptureSink {
             mic_full_wav_path: Arc::new(Mutex::new(None)),
             sys_full_wav_path: Arc::new(Mutex::new(None)),
             captured_duration_ms: Arc::new(Mutex::new(0)),
+            capture_timing: Arc::new(Mutex::new(None)),
             replay_progress: None,
             mode,
         }
@@ -1047,6 +1062,285 @@ pub struct ErrorPayload {
     pub message: String,
 }
 
+/// What the capture sidecar measured about its own two streams' timing, sent
+/// once as `capture_timing` just before `stopped`.
+///
+/// Both full WAVs count frames from their own first delivered frame, and the
+/// playback mix, the timeline and every cross-stream comparison line the two up
+/// by index — so how far apart the first frames were, and whether either stream
+/// lost frames or drifted afterwards, *is* how far the streams are misaligned.
+/// An echo delay measured off the audio is that misalignment plus the output
+/// and acoustic path; this is what tells the two apart.
+///
+/// Diagnostics only: nothing downstream reads it. It carries timestamps,
+/// counts and the HAL's latency figures — no audio, and no device names
+/// (#174) — so it is safe to write to disk. Every host time is relative to one
+/// instant the sidecar took before starting either stream.
+#[derive(Clone, Debug, Default, PartialEq, serde::Deserialize, Serialize)]
+pub struct CaptureTiming {
+    #[serde(default)]
+    pub version: u32,
+    #[serde(default)]
+    pub gap_threshold_ms: f64,
+    #[serde(default)]
+    pub streams: Vec<StreamTiming>,
+    #[serde(default)]
+    pub devices: CaptureDevices,
+}
+
+/// One stream's delivery over a take.
+#[derive(Clone, Debug, Default, PartialEq, serde::Deserialize, Serialize)]
+pub struct StreamTiming {
+    #[serde(default)]
+    pub source: ChunkSource,
+    /// 16 kHz frames the stream put into its full WAV — the length that file
+    /// should have on disk.
+    #[serde(default)]
+    pub frames_written: u64,
+    #[serde(default)]
+    pub intervals: Vec<DeliveryInterval>,
+}
+
+/// One stretch of continuous delivery: from start, resume or (mic only) a
+/// device change, to the pause, stop or re-tap that ended it. The `*_ms`
+/// stamps are host times; `media_ms` is how much audio the stream delivered.
+#[derive(Clone, Debug, Default, PartialEq, serde::Deserialize, Serialize)]
+#[serde(default)]
+pub struct DeliveryInterval {
+    pub opened_by: String,
+    /// Where the interval's first frame landed in the full WAV.
+    pub start_frame: u64,
+    /// The first frame's own timestamp — or its arrival, when
+    /// `stamp_from_arrival`.
+    pub first_stamp_ms: f64,
+    pub first_arrival_ms: f64,
+    pub stamp_from_arrival: bool,
+    pub last_end_stamp_ms: f64,
+    pub last_arrival_ms: f64,
+    pub media_ms: f64,
+    pub in_rate: f64,
+    pub out_frames: u64,
+    pub buffers: u64,
+    /// Buffers that started later than the previous one ended, by more than
+    /// the event's `gap_threshold_ms` — audio the stream never delivered.
+    pub gaps: u64,
+    pub gap_ms: f64,
+    pub max_gap_ms: f64,
+    /// Buffers that started earlier than the previous one ended.
+    pub overlaps: u64,
+    pub overlap_ms: f64,
+    /// Largest discontinuity that stayed under the threshold.
+    pub max_jitter_ms: f64,
+    /// Where the first gaps and overlaps fell, as `(frame, ms)`: the WAV
+    /// frame the buffer after one landed at, and its size — positive a gap,
+    /// negative an overlap. The sidecar keeps at most 64 per interval; the
+    /// counts above stay exact past that.
+    pub jumps: Vec<(u64, f64)>,
+}
+
+impl DeliveryInterval {
+    /// This interval's clock drift against the host clock, in parts per
+    /// million: the time its timestamps span, less the audio delivered and the
+    /// gaps already counted, per unit of audio. `None` when that would mean
+    /// nothing — arrival-stamped, or too short for a few ppm to be visible.
+    pub fn drift_ppm(&self) -> Option<f64> {
+        if self.stamp_from_arrival || self.media_ms < 10_000.0 {
+            return None;
+        }
+        let span = self.last_end_stamp_ms - self.first_stamp_ms;
+        let unexplained = span - self.media_ms - self.gap_ms + self.overlap_ms;
+        Some(unexplained / self.media_ms * 1e6)
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, serde::Deserialize, Serialize)]
+pub struct CaptureDevices {
+    /// The device the mic tap was last installed on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<DeviceTiming>,
+    /// The default output at stop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<DeviceTiming>,
+}
+
+/// One device's latency and clocking, as the HAL reports it.
+#[derive(Clone, Debug, Default, PartialEq, serde::Deserialize, Serialize)]
+#[serde(default)]
+pub struct DeviceTiming {
+    /// The HAL transport's four-char code: `bltn`, `blue`, `usb `…
+    pub transport: Option<String>,
+    pub nominal_rate: Option<f64>,
+    pub latency_frames: Option<u64>,
+    pub safety_offset_frames: Option<u64>,
+    pub buffer_frames: Option<u64>,
+    pub stream_latency_frames: Option<u64>,
+    /// Devices in one clock domain share a sample clock and can't drift.
+    pub clock_domain: Option<u64>,
+}
+
+impl DeviceTiming {
+    /// The HAL's own account of this device's path, in ms at its nominal
+    /// rate: device latency, safety offset and stream latency, plus one IO
+    /// buffer for an output, which is written a buffer ahead of playing.
+    pub fn latency_ms(&self, output: bool) -> Option<f64> {
+        let rate = self.nominal_rate.filter(|r| *r > 0.0)?;
+        let mut frames = self.latency_frames.unwrap_or(0)
+            + self.safety_offset_frames.unwrap_or(0)
+            + self.stream_latency_frames.unwrap_or(0);
+        if output {
+            frames += self.buffer_frames.unwrap_or(0);
+        }
+        Some(frames as f64 / rate * 1000.0)
+    }
+
+    /// The transport in words, for a log line.
+    pub fn transport_label(&self) -> &str {
+        match self.transport.as_deref() {
+            Some("bltn") => "built-in",
+            Some("blue") => "bluetooth",
+            Some("blea") => "bluetooth-le",
+            Some("usb ") => "usb",
+            Some("grup") => "aggregate",
+            Some("virt") => "virtual",
+            Some("hdmi") => "hdmi",
+            Some("dprt") => "displayport",
+            Some("airp") => "airplay",
+            Some("thun") => "thunderbolt",
+            Some("pci ") => "pci",
+            Some(other) => other,
+            None => "unknown",
+        }
+    }
+}
+
+impl StreamTiming {
+    /// How much audio this stream's full WAV holds, in ms.
+    pub fn written_ms(&self) -> f64 {
+        self.frames_written as f64 / 16.0
+    }
+
+    pub fn gap_count(&self) -> u64 {
+        self.intervals.iter().map(|i| i.gaps).sum()
+    }
+
+    pub fn gap_ms(&self) -> f64 {
+        self.intervals.iter().map(|i| i.gap_ms).sum()
+    }
+}
+
+impl CaptureTiming {
+    pub fn stream(&self, source: ChunkSource) -> Option<&StreamTiming> {
+        self.streams.iter().find(|s| s.source == source)
+    }
+
+    /// How much later the system stream's first frame was than the mic's, in
+    /// ms. Positive means sys started later — so its content sits this much
+    /// *early* against the mic in anything that lines the streams up by index.
+    pub fn start_offset_ms(&self) -> Option<f64> {
+        let mic = self.stream(ChunkSource::Mic)?.intervals.first()?;
+        let sys = self.stream(ChunkSource::Sys)?.intervals.first()?;
+        Some(sys.first_stamp_ms - mic.first_stamp_ms)
+    }
+
+    /// The same misalignment at the last instant both streams were delivering:
+    /// that instant's position in the mic WAV less its position in the sys WAV.
+    /// It differs from [`Self::start_offset_ms`] by whatever the take
+    /// accumulated — delivery gaps, pause and resume edges, device changes,
+    /// clock drift.
+    pub fn end_offset_ms(&self) -> Option<f64> {
+        let mic = self.stream(ChunkSource::Mic)?;
+        let sys = self.stream(ChunkSource::Sys)?;
+        let mic_end = mic.intervals.last()?.last_end_stamp_ms;
+        let sys_end = sys.intervals.last()?.last_end_stamp_ms;
+        let both = mic_end.min(sys_end);
+        let mic_pos = mic.written_ms() - (mic_end - both);
+        let sys_pos = sys.written_ms() - (sys_end - both);
+        Some(mic_pos - sys_pos)
+    }
+
+    /// The figures a reader of the diagnostics file wants first, derived once
+    /// so they needn't be recomputed from the raw intervals by hand.
+    pub fn alignment(&self) -> CaptureAlignment {
+        let stream = |source: ChunkSource| {
+            self.stream(source).map(|s| StreamAlignment {
+                source,
+                written_ms: s.written_ms(),
+                intervals: s.intervals.len() as u32,
+                gaps: s.gap_count(),
+                gap_ms: s.gap_ms(),
+                drift_ppm: s.intervals.iter().map(DeliveryInterval::drift_ppm).collect(),
+            })
+        };
+        CaptureAlignment {
+            start_offset_ms: self.start_offset_ms(),
+            end_offset_ms: self.end_offset_ms(),
+            streams: [ChunkSource::Mic, ChunkSource::Sys]
+                .into_iter()
+                .filter_map(stream)
+                .collect(),
+            input_latency_ms: self.devices.input.as_ref().and_then(|d| d.latency_ms(false)),
+            output_latency_ms: self.devices.output.as_ref().and_then(|d| d.latency_ms(true)),
+        }
+    }
+
+    /// One-line stderr summary, printed when the event arrives.
+    pub fn summary(&self) -> String {
+        let ms = |v: Option<f64>| v.map(|v| format!("{v:+.1}ms")).unwrap_or_else(|| "-".into());
+        let stream = |source: ChunkSource| match self.stream(source) {
+            Some(s) => format!(
+                "{} {:.1}s in {} interval(s), {} gap(s) {:.1}ms",
+                source.as_str(),
+                s.written_ms() / 1000.0,
+                s.intervals.len(),
+                s.gap_count(),
+                s.gap_ms(),
+            ),
+            None => format!("{} absent", source.as_str()),
+        };
+        let device = |d: Option<&DeviceTiming>, output: bool| match d {
+            Some(d) => format!(
+                "{} {}",
+                d.transport_label(),
+                d.latency_ms(output)
+                    .map(|v| format!("{v:.1}ms"))
+                    .unwrap_or_else(|| "?".into())
+            ),
+            None => "-".into(),
+        };
+        format!(
+            "capture timing: sys starts {} after mic, {} by the end | {} | {} | in {} out {}",
+            ms(self.start_offset_ms()),
+            ms(self.end_offset_ms()),
+            stream(ChunkSource::Mic),
+            stream(ChunkSource::Sys),
+            device(self.devices.input.as_ref(), false),
+            device(self.devices.output.as_ref(), true),
+        )
+    }
+}
+
+/// [`CaptureTiming`]'s headline figures, as written beside it.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct CaptureAlignment {
+    pub start_offset_ms: Option<f64>,
+    pub end_offset_ms: Option<f64>,
+    pub streams: Vec<StreamAlignment>,
+    pub input_latency_ms: Option<f64>,
+    pub output_latency_ms: Option<f64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct StreamAlignment {
+    pub source: ChunkSource,
+    pub written_ms: f64,
+    pub intervals: u32,
+    pub gaps: u64,
+    pub gap_ms: f64,
+    /// Per interval, in order; `None` where [`DeliveryInterval::drift_ppm`]
+    /// declines to say.
+    pub drift_ppm: Vec<Option<f64>>,
+}
+
 #[derive(serde::Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum SidecarEvent {
@@ -1109,6 +1403,9 @@ pub enum SidecarEvent {
         #[serde(default)]
         input_device: Option<String>,
     },
+    // How the capture's two streams lined up on the host clock (see
+    // `CaptureTiming`). Sent once, just before `Stopped`; diagnostics only.
+    CaptureTiming(CaptureTiming),
 }
 
 #[derive(Clone, Serialize)]
@@ -1954,6 +2251,141 @@ mod tests {
             }
             _ => panic!("expected Heartbeat variant"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // capture_timing
+    // -----------------------------------------------------------------------
+
+    /// A take as the sidecar would report it: sys starts 372 ms after the mic,
+    /// loses 12 ms to one delivery gap, and after a pause resumes 500 ms after
+    /// the mic does. Shaped the way JSONSerialization writes it — integral
+    /// doubles come out as integers.
+    const CAPTURE_TIMING_EVENT: &str = r#"{"event":"capture_timing","version":1,"gap_threshold_ms":5,
+        "streams":[
+          {"source":"mic","frames_written":1440000,"intervals":[
+            {"opened_by":"start","start_frame":0,"first_stamp_ms":120,"first_arrival_ms":212.5,"stamp_from_arrival":false,
+             "last_end_stamp_ms":50120,"last_arrival_ms":50205.1,"media_ms":50000,"in_rate":48000,"out_frames":800000,
+             "buffers":586,"gaps":0,"gap_ms":0,"max_gap_ms":0,"overlaps":0,"overlap_ms":0,"max_jitter_ms":0.021},
+            {"opened_by":"resume","start_frame":800000,"first_stamp_ms":60100,"first_arrival_ms":60190,"stamp_from_arrival":false,
+             "last_end_stamp_ms":100100,"last_arrival_ms":100190,"media_ms":40000,"in_rate":48000,"out_frames":640000,
+             "buffers":469,"gaps":0,"gap_ms":0,"max_gap_ms":0,"overlaps":0,"overlap_ms":0,"max_jitter_ms":0.02}]},
+          {"source":"sys","frames_written":1426176,"intervals":[
+            {"opened_by":"start","start_frame":0,"first_stamp_ms":492,"first_arrival_ms":503.2,"stamp_from_arrival":false,
+             "last_end_stamp_ms":50130,"last_arrival_ms":50141,"media_ms":49626,"in_rate":48000,"out_frames":794016,
+             "buffers":2326,"gaps":1,"gap_ms":12,"max_gap_ms":12,"overlaps":0,"overlap_ms":0,"max_jitter_ms":0.001,
+             "jumps":[[400000,12]]},
+            {"opened_by":"resume","start_frame":794016,"first_stamp_ms":60600,"first_arrival_ms":60611,"stamp_from_arrival":false,
+             "last_end_stamp_ms":100110,"last_arrival_ms":100121,"media_ms":39510,"in_rate":48000,"out_frames":632160,
+             "buffers":1852,"gaps":0,"gap_ms":0,"max_gap_ms":0,"overlaps":0,"overlap_ms":0,"max_jitter_ms":0.001}]}],
+        "devices":{
+          "input":{"transport":"bltn","nominal_rate":48000,"latency_frames":0,"safety_offset_frames":144,"buffer_frames":512,"stream_latency_frames":50,"clock_domain":0},
+          "output":{"transport":"bltn","nominal_rate":48000,"latency_frames":400,"safety_offset_frames":150,"buffer_frames":512,"stream_latency_frames":0,"clock_domain":0}}}"#;
+
+    fn capture_timing() -> CaptureTiming {
+        match serde_json::from_str::<SidecarEvent>(CAPTURE_TIMING_EVENT).unwrap() {
+            SidecarEvent::CaptureTiming(t) => t,
+            _ => panic!("expected CaptureTiming variant"),
+        }
+    }
+
+    fn close(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-6
+    }
+
+    #[test]
+    fn capture_timing_parses_from_the_sidecars_shape() {
+        let t = capture_timing();
+        assert_eq!(t.version, 1);
+        assert_eq!(t.streams.len(), 2);
+        let sys = t.stream(ChunkSource::Sys).unwrap();
+        assert_eq!(sys.frames_written, 1_426_176);
+        assert_eq!(sys.intervals[1].opened_by, "resume");
+        assert_eq!(sys.gap_count(), 1);
+        assert_eq!(sys.intervals[0].jumps, vec![(400_000, 12.0)]);
+        assert!(sys.intervals[1].jumps.is_empty());
+        assert_eq!(t.devices.output.as_ref().unwrap().transport.as_deref(), Some("bltn"));
+    }
+
+    #[test]
+    fn the_start_offset_is_how_much_later_sys_began() {
+        assert!(close(capture_timing().start_offset_ms().unwrap(), 372.0));
+    }
+
+    #[test]
+    fn the_end_offset_carries_what_the_take_accumulated() {
+        // 372 ms at the start, 12 ms of sys the stream never delivered, and
+        // 490 ms more of sys than mic lost across the pause (the mic was dark
+        // 50.12 s → 60.1 s, sys 50.13 s → 60.6 s).
+        assert!(close(capture_timing().end_offset_ms().unwrap(), 874.0));
+    }
+
+    #[test]
+    fn a_stream_that_never_delivered_leaves_the_offsets_unknown() {
+        let mut t = capture_timing();
+        t.streams.retain(|s| s.source == ChunkSource::Mic);
+        assert_eq!(t.start_offset_ms(), None);
+        assert_eq!(t.end_offset_ms(), None);
+        assert!(t.summary().contains("sys absent"));
+    }
+
+    #[test]
+    fn an_older_capture_timing_with_missing_fields_still_parses() {
+        // The sidecar is stamp-cached apart from the Rust build: whatever it
+        // leaves out must default rather than drop the event.
+        let json = r#"{"event":"capture_timing","streams":[{"source":"sys","intervals":[{"first_stamp_ms":5}]}]}"#;
+        match serde_json::from_str::<SidecarEvent>(json).unwrap() {
+            SidecarEvent::CaptureTiming(t) => {
+                assert_eq!(t.stream(ChunkSource::Sys).unwrap().intervals[0].gaps, 0);
+                assert_eq!(t.devices, CaptureDevices::default());
+            }
+            _ => panic!("expected CaptureTiming variant"),
+        }
+    }
+
+    #[test]
+    fn device_latency_counts_the_io_buffer_only_on_the_output() {
+        let t = capture_timing();
+        let input = t.devices.input.as_ref().unwrap().latency_ms(false).unwrap();
+        let output = t.devices.output.as_ref().unwrap().latency_ms(true).unwrap();
+        assert!(close(input, 194.0 / 48.0));
+        assert!(close(output, 1062.0 / 48.0));
+    }
+
+    #[test]
+    fn drift_is_what_the_stamps_span_beyond_the_audio_and_its_gaps() {
+        let t = capture_timing();
+        let sys = t.stream(ChunkSource::Sys).unwrap();
+        // 49 638 ms of stamps = 49 626 ms of audio + a 12 ms gap: no drift.
+        assert!(close(sys.intervals[0].drift_ppm().unwrap(), 0.0));
+        let drifting = DeliveryInterval {
+            first_stamp_ms: 0.0,
+            last_end_stamp_ms: 60_030.0,
+            media_ms: 60_000.0,
+            ..Default::default()
+        };
+        assert!(close(drifting.drift_ppm().unwrap(), 500.0));
+        let arrival_stamped = DeliveryInterval { stamp_from_arrival: true, ..drifting.clone() };
+        assert_eq!(arrival_stamped.drift_ppm(), None);
+        let too_short = DeliveryInterval { media_ms: 2_000.0, last_end_stamp_ms: 2_001.0, ..drifting };
+        assert_eq!(too_short.drift_ppm(), None);
+    }
+
+    #[test]
+    fn the_capture_timing_summary_reads_the_offsets_and_devices() {
+        let line = capture_timing().summary();
+        assert!(line.contains("sys starts +372.0ms after mic, +874.0ms by the end"), "{line}");
+        assert!(line.contains("sys 89.1s in 2 interval(s), 1 gap(s) 12.0ms"), "{line}");
+        assert!(line.contains("out built-in 22.1ms"), "{line}");
+    }
+
+    #[test]
+    fn the_alignment_written_beside_the_timing_serializes_its_sources() {
+        let a = capture_timing().alignment();
+        let v = serde_json::to_value(&a).unwrap();
+        assert_eq!(v["streams"][0]["source"], "mic");
+        assert_eq!(v["streams"][1]["gaps"], 1);
+        assert!(close(v["start_offset_ms"].as_f64().unwrap(), 372.0));
     }
 
     // -----------------------------------------------------------------------
