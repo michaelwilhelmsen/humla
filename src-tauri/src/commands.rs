@@ -6162,24 +6162,16 @@ fn token_jaccard(a: &[String], b: &[String]) -> f32 {
     }
 }
 
-/// Containment coefficient: |A ∩ B| / min(|A|, |B|). 1.0 when A ⊆ B
-/// (or vice versa). Used for cross-stream echo dedup where a sys
-/// window concatenated from multiple chunks is often much larger
-/// than a single mic chunk; Jaccard's union-in-the-denominator
-/// would suppress the score below threshold even on a perfect echo.
+/// Share of `a`'s distinct tokens that also appear in `b`: |A ∩ B| / |A|.
+/// Directional — a long `b` doesn't dilute it, and a short `b` can't account
+/// for a longer `a`.
 fn token_containment(a: &[String], b: &[String]) -> f32 {
     if a.is_empty() || b.is_empty() {
         return 0.0;
     }
     let set_a: std::collections::HashSet<&str> = a.iter().map(String::as_str).collect();
     let set_b: std::collections::HashSet<&str> = b.iter().map(String::as_str).collect();
-    let inter = set_a.intersection(&set_b).count() as f32;
-    let smaller = set_a.len().min(set_b.len()) as f32;
-    if smaller == 0.0 {
-        0.0
-    } else {
-        inter / smaller
-    }
+    set_a.intersection(&set_b).count() as f32 / set_a.len() as f32
 }
 
 /// Maximum word count for a labelled piece to be considered a "short
@@ -9927,6 +9919,37 @@ mod diarize_tests {
     }
 
     #[test]
+    fn dedup_keeps_mic_speech_a_short_sys_reply_cannot_account_for() {
+        // Every word of the remote's reply is in the user's next sentence,
+        // but they are three of its thirteen.
+        let chunks = vec![
+            sys(10_000, "Ja, det er det."),
+            mic(
+                11_500,
+                "Ja, det er det jeg tenker også, vi må ha budsjettet klart før fredag.",
+            ),
+        ];
+        let kept = dedup_mic_against_sys(&chunks);
+        assert!(
+            kept.iter().any(|c| c.source == ChunkSource::Mic),
+            "user speech dropped: {kept:?}"
+        );
+    }
+
+    #[test]
+    fn dedup_drops_mic_echo_of_a_short_sys_chunk_with_an_extra_word() {
+        let chunks = vec![
+            sys(10_000, "Sounds good, see you Friday."),
+            mic(10_150, "Sounds good, see you on Friday."),
+        ];
+        let kept = dedup_mic_against_sys(&chunks);
+        assert!(
+            kept.iter().all(|c| c.source == ChunkSource::Sys),
+            "echo kept: {kept:?}"
+        );
+    }
+
+    #[test]
     fn token_containment_perfect_subset() {
         let a: Vec<String> = ["ship", "the", "migration"].iter().map(|s| s.to_string()).collect();
         let b: Vec<String> = ["we", "should", "ship", "the", "migration", "on", "friday"]
@@ -9940,6 +9963,17 @@ mod diarize_tests {
         let a: Vec<String> = ["completely", "different", "words"].iter().map(|s| s.to_string()).collect();
         let b: Vec<String> = ["nothing", "in", "common"].iter().map(|s| s.to_string()).collect();
         assert!(token_containment(&a, &b) < 1e-6);
+    }
+
+    #[test]
+    fn token_containment_is_the_share_of_a_found_in_b() {
+        let a: Vec<String> = ["ja", "det", "er", "budsjettet", "klart", "fredag"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let b: Vec<String> = ["ja", "det", "er"].iter().map(|s| s.to_string()).collect();
+        assert!((token_containment(&a, &b) - 0.5).abs() < 1e-6);
+        assert!((token_containment(&b, &a) - 1.0).abs() < 1e-6);
     }
 }
 
