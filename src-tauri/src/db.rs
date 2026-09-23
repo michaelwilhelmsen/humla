@@ -1009,6 +1009,14 @@ pub fn purge_note(conn: &Connection, id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Whether a note's row exists at all — live or in the Trash.
+pub fn note_exists(conn: &Connection, id: &str) -> Result<bool> {
+    Ok(conn
+        .query_row("SELECT 1 FROM notes WHERE id = ?1", params![id], |_| Ok(()))
+        .optional()?
+        .is_some())
+}
+
 pub fn get_setting(conn: &Connection, key: &str) -> Result<Option<String>> {
     // Hot path — called ~7 times per chunk inside transcribe_chunk's cfg
     // block. prepare_cached reuses the same prepared statement instead of
@@ -4385,6 +4393,23 @@ mod tests {
 
         assert!(list_note_revisions(&conn, &doomed).unwrap().is_empty());
         assert_eq!(list_note_revisions(&conn, &keeper).unwrap().len(), 1, "another note's history is untouched");
+    }
+
+    /// The line a chain's end-of-run purge draws: a trashed note still counts, or a
+    /// note that can be restored would lose its audio.
+    #[test]
+    fn a_note_exists_until_it_is_purged() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("t.sqlite")).unwrap();
+        let id = create_note(&conn, "en", "meeting", "").unwrap().id;
+        assert!(note_exists(&conn, &id).unwrap());
+
+        delete_note(&conn, &id).unwrap();
+        assert!(note_exists(&conn, &id).unwrap(), "a trashed note can still be restored");
+
+        purge_note(&conn, &id).unwrap();
+        assert!(!note_exists(&conn, &id).unwrap());
+        assert!(!note_exists(&conn, "never-created").unwrap());
     }
 
     /// Soft delete is the opposite case and must NOT clear anything — a Trash

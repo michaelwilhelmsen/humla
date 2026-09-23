@@ -1536,7 +1536,9 @@ pub async fn cloud_upload_note_audio(app: tauri::AppHandle, note_id: String) -> 
 
 #[tauri::command]
 pub async fn cloud_download_note_audio(app: tauri::AppHandle, note_id: String) -> Result<bool, String> {
-    download_note_audio(&app, &note_id).await
+    let fetched = download_note_audio(&app, &note_id).await;
+    super::notes::purge_note_assets_if_gone(&app, &note_id);
+    fetched
 }
 
 // ---- per-session asset sync (#16) ------------------------------------------
@@ -1924,7 +1926,9 @@ pub async fn cloud_repair_note_sessions(app: tauri::AppHandle, note_id: String) 
 
 #[tauri::command]
 pub async fn cloud_download_note_sessions(app: tauri::AppHandle, note_id: String) -> Result<bool, String> {
-    download_note_sessions(&app, &note_id).await
+    let fetched = download_note_sessions(&app, &note_id).await;
+    super::notes::purge_note_assets_if_gone(&app, &note_id);
+    fetched
 }
 
 // ---- recording lock (shared-note mutual exclusion) -------------------------

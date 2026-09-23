@@ -158,6 +158,17 @@ pub(crate) fn purge_note_assets_best_effort(app: &AppHandle, note_id: &str) {
     }
 }
 
+/// For the end of a chain that writes a note's files, after its last write: a
+/// note purged or withdrawn while the chain ran must not get back what it wrote.
+/// A trashed note keeps its row, and so its files.
+pub(crate) fn purge_note_assets_if_gone(app: &AppHandle, note_id: &str) {
+    let state = app.state::<AppState>();
+    let gone = matches!(db::note_exists(&state.db.lock(), note_id), Ok(false));
+    if gone {
+        purge_note_assets_best_effort(app, note_id);
+    }
+}
+
 /// Remove both directories a note keeps under the app data dir:
 /// `recordings/<note_id>/` (retained audio, playback assets, timelines) and
 /// `diagnostics/<note_id>/` (the diarize dumps, which hold the transcript text).
