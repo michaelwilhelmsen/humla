@@ -1,0 +1,20 @@
+[package]
+name = "echo-probe"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Measures how a take's mic and system-audio streams line up, and cancels the system audio's echo out of the mic, offline. A measurement tool: the app does not depend on it."
+license = "MIT"
+publish = false
+
+# Deliberately no DSP or CLI dependencies: the FFT, the WAV reader and the
+# argument parsing are small and live here, so this builds offline from the
+# workspace lock in seconds. serde_json is only for the capture-timing file the
+# app writes and the report this writes back.
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[[bin]]
+name = "echo-probe"
+path = "src/main.rs"

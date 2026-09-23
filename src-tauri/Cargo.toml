@@ -21,8 +21,12 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 # humla-cloud repo when the client was consolidated into the public app). Its
 # rusqlite is pinned to 0.32 to match the core — the Arc<Mutex<Connection>>
 # handed across the sync seam must unify to the same concrete type.
+#
+# echo-probe is a measurement tool for stream alignment and echo (see
+# docs/research/stream-alignment-and-echo.md). Nothing here depends on it, so it
+# is built only when asked for: `cargo run --release -p echo-probe -- …`.
 [workspace]
-members = ["crates/cloud-sync"]
+members = ["crates/cloud-sync", "crates/echo-probe"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -86,3 +90,9 @@ custom-protocol = ["tauri/custom-protocol"]
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-updater = "2"
+
+# echo-probe's tests push minutes of synthetic audio through FFTs, which takes
+# minutes unoptimised. Scoped to that one package: the app's own dev build is
+# unaffected.
+[profile.dev.package.echo-probe]
+opt-level = 3

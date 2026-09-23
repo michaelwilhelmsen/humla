@@ -1961,6 +1961,9 @@ struct PostStopSnapshot {
     /// How long the sidecar said this capture ran. Only consulted when the
     /// take has no timeline to measure instead — see `finalize_session`.
     captured_duration_ms: u64,
+    /// How the capture's two streams lined up, when the sidecar reported it.
+    /// `None` for an import, and from a sidecar that predates the event.
+    capture_timing: Option<crate::recording::CaptureTiming>,
 }
 
 /// Copy the temp-dir full WAVs to a permanent location keyed by
@@ -2883,6 +2886,7 @@ fn take_post_stop_snapshot(s: &mut crate::recording::LiveCapture) -> PostStopSna
     let chunks = s.sink.chunk_log.lock().clone();
     let deferred = !s.sink.transcribes_on_arrival();
     let captured_duration_ms = *s.sink.captured_duration_ms.lock();
+    let capture_timing = s.sink.capture_timing.lock().clone();
     let transcript_at_start = s.transcript_at_start.lock().clone();
     let session_id = s
         .session_id
@@ -2901,6 +2905,7 @@ fn take_post_stop_snapshot(s: &mut crate::recording::LiveCapture) -> PostStopSna
         session_started_at,
         deferred,
         captured_duration_ms,
+        capture_timing,
     }
 }
 
@@ -3045,6 +3050,42 @@ async fn write_replay_timings(app: &AppHandle, note_id: &str, timings: &ReplayTi
     }
 }
 
+/// A capture's stream timing, at `diagnostics/<note_id>/capture-<session_id>.json`.
+///
+/// One file per take, because every take has its own offset — the diarize
+/// dumps are keyed `<engine>-<source>` and a second take would overwrite the
+/// first. Holds no `chunks`, so `read_chunks_from_diagnostic` passes over it.
+/// Timestamps and HAL latency figures only: no audio, no device names (#174),
+/// which is why it is written whatever `keep_audio` says. Best-effort.
+async fn write_capture_timing(
+    app: &AppHandle,
+    note_id: &str,
+    session_id: &str,
+    timing: &crate::recording::CaptureTiming,
+) {
+    let Ok(app_dir) = app.path().app_data_dir() else { return };
+    let dir = app_dir.join("diagnostics").join(note_id);
+    if let Err(e) = tokio::fs::create_dir_all(&dir).await {
+        eprintln!("capture timing: mkdir {}: {e}", dir.display());
+        return;
+    }
+    let path = dir.join(format!("capture-{session_id}.json"));
+    let payload = serde_json::json!({
+        "session_id": session_id,
+        "created_at": chrono::Utc::now().timestamp_millis(),
+        "alignment": timing.alignment(),
+        "capture_timing": timing,
+    });
+    match serde_json::to_string_pretty(&payload) {
+        Ok(json) => {
+            if let Err(e) = tokio::fs::write(&path, json).await {
+                eprintln!("capture timing: write {}: {e}", path.display());
+            }
+        }
+        Err(e) => eprintln!("capture timing: serialize: {e}"),
+    }
+}
+
 /// The chain's body. Split out so the slot release, the Idle and the timings
 /// write in [`run_post_stop_chain`] cover every one of its early returns.
 async fn post_stop_chain_inner(
@@ -3067,6 +3108,12 @@ async fn post_stop_chain_inner(
     } else {
         ChainProgress::PostStop { note_id: note_id.clone() }
     };
+
+    // First, and whatever kind of take this is: it depends on nothing below,
+    // and a deferred take returns early.
+    if let Some(timing) = post_stop.capture_timing.as_ref() {
+        write_capture_timing(&app, &note_id, &post_stop.session_id, timing).await;
+    }
 
     // Make the note's storage session-shaped before writing this take. For a
     // pre-feature flat note, migrate its single take into a session subdir so
@@ -3397,12 +3444,15 @@ async fn dispatch_sidecar_event(
             false
         }
         SidecarEvent::FullRecording { source, path, duration_ms } => {
+            let source = sink.resolve_source(source);
+            // Per stream, because the sink keeps only the longer of the two —
+            // and the difference is the first thing an alignment question asks.
+            eprintln!("sidecar: full_recording {} duration_ms={duration_ms}", source.as_str());
             sink.note_stream_duration(duration_ms);
             // Stash the path on this capture's sink; the diarization pass reads
             // it. Each source has its own slot so the post-stop pass can branch
             // (mic-only → diarize mic; both present → diarize both).
-            *sink.full_wav_slot(sink.resolve_source(source)).lock() =
-                Some(PathBuf::from(path));
+            *sink.full_wav_slot(source).lock() = Some(PathBuf::from(path));
             false
         }
         SidecarEvent::Error { message } => {
@@ -3448,6 +3498,13 @@ async fn dispatch_sidecar_event(
                 note_id: Some(note_id.to_string()),
                 message: recovery_toast(message, input_device),
             });
+            false
+        }
+        SidecarEvent::CaptureTiming(timing) => {
+            // Diagnostics only: logged here, written beside the take's other
+            // diagnostics by the post-stop chain (`write_capture_timing`).
+            eprintln!("{}", timing.summary());
+            *sink.capture_timing.lock() = Some(timing);
             false
         }
     }
@@ -10110,6 +10167,7 @@ mod import_tests {
             session_started_at: String::new(),
             deferred: true,
             captured_duration_ms: 0,
+            capture_timing: None,
         };
         assert_eq!(retained_streams(&snapshot), vec!["mic", "sys"]);
         assert!(session_streams(&snapshot.chunks).is_empty());
