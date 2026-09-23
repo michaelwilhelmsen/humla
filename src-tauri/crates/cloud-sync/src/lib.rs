@@ -797,7 +797,6 @@ impl Worker {
             conn.execute("DELETE FROM note_chunks_fts WHERE note_id = ?1", rusqlite::params![r.note_client_id])?;
             conn.execute("DELETE FROM notes WHERE id = ?1", rusqlite::params![r.note_client_id])?;
         }
-        // Everything the note left on this disk goes with it.
         (self.purged)(&r.note_client_id);
         Ok(())
     }
@@ -1864,8 +1863,7 @@ mod it {
         }
     }
 
-    /// A worker whose `purged` callback records the note ids it is handed.
-    fn purge_recording_worker(db: Db, config: Config) -> (Worker, Arc<Mutex<Vec<String>>>) {
+    fn worker_collecting_purges(db: Db, config: Config) -> (Worker, Arc<Mutex<Vec<String>>>) {
         let purged = Arc::new(Mutex::new(Vec::new()));
         let seen = purged.clone();
         let w = Worker {
@@ -1900,7 +1898,7 @@ mod it {
     #[test]
     fn a_revocation_removes_someone_elses_note_and_its_index() {
         let db = test_db();
-        let (w, purged) = purge_recording_worker(db.clone(), offline_config("wsR"));
+        let (w, purged) = worker_collecting_purges(db.clone(), offline_config("wsR"));
         {
             let conn = db.lock();
             conn.execute(
@@ -1949,7 +1947,7 @@ mod it {
     #[test]
     fn a_reshared_note_survives_the_revocation_that_preceded_it() {
         let db = test_db();
-        let (w, purged) = purge_recording_worker(db.clone(), offline_config("wsR"));
+        let (w, purged) = worker_collecting_purges(db.clone(), offline_config("wsR"));
         {
             let conn = db.lock();
             conn.execute(
@@ -1975,7 +1973,7 @@ mod it {
     #[test]
     fn a_revocation_for_an_unknown_note_is_harmless() {
         let db = test_db();
-        let (w, purged) = purge_recording_worker(db.clone(), offline_config("wsR"));
+        let (w, purged) = worker_collecting_purges(db.clone(), offline_config("wsR"));
         w.apply_remote_revocation(&json!({ "note_client_id": "never-seen", "at": 1 }), "u-me").unwrap();
         w.apply_remote_revocation(&json!({ "note_client_id": "../../etc/passwd", "at": 1 }), "u-me").unwrap();
         assert!(purged.lock().is_empty(), "no files to remove, and never under a hostile id");

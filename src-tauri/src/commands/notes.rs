@@ -145,22 +145,22 @@ pub fn notes_purge(app: AppHandle, state: State<AppState>, id: String) -> Result
         let conn = state.db.lock();
         db::purge_note(&conn, &id).map_err(err)?;
     } // drop the db guard before touching the filesystem
-    // Best-effort asset cleanup: the DB row is already gone, which is the
-    // primary effect. A missing directory is expected (notes without retained
-    // audio) and is not an error; any other IO failure is swallowed so a
-    // filesystem hiccup can't leave the note un-purgeable.
-    if let Ok(base) = app.path().app_data_dir() {
-        let _ = purge_note_assets(&base, &id);
-    }
+    purge_note_assets_best_effort(&app, &id);
     Ok(())
+}
+
+/// For a note whose row is already gone: the purge has happened, so a failure to
+/// remove its files is logged, not returned.
+pub(crate) fn purge_note_assets_best_effort(app: &AppHandle, note_id: &str) {
+    let Ok(base) = app.path().app_data_dir() else { return };
+    if let Err(e) = purge_note_assets(&base, note_id) {
+        eprintln!("purge: could not remove note {note_id}'s files: {e}");
+    }
 }
 
 /// Remove both directories a note keeps under the app data dir:
 /// `recordings/<note_id>/` (retained audio, playback assets, timelines) and
 /// `diagnostics/<note_id>/` (the diarize dumps, which hold the transcript text).
-/// A directory that never existed is not an error. An id that is not a plain path
-/// segment is refused before anything is removed. Any other IO error propagates,
-/// once both directories have been tried.
 pub(crate) fn purge_note_assets(app_data_dir: &Path, note_id: &str) -> std::io::Result<()> {
     if !crate::sessions::is_safe_session_id(note_id) {
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "unsafe note id"));
@@ -334,8 +334,6 @@ mod tests {
         }
     }
 
-    /// One root that can't be cleared must not keep the other from going, and the
-    /// failure is still reported.
     #[test]
     fn purge_clears_every_root_before_reporting_a_failure() {
         let base = tempfile::tempdir().unwrap();

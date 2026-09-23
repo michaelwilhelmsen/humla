@@ -119,10 +119,7 @@ impl Manager {
             move |note_id| {
                 // A pull deleted a note outright (its author withdrew it), so its
                 // files go the same way a Trash purge takes them.
-                let Ok(base) = app_purged.path().app_data_dir() else { return };
-                if let Err(e) = super::notes::purge_note_assets(&base, note_id) {
-                    eprintln!("cloud-sync: could not remove withdrawn note's files: {e}");
-                }
+                super::notes::purge_note_assets_best_effort(&app_purged, note_id);
             },
         ) {
             Ok((handle, fut)) => {
