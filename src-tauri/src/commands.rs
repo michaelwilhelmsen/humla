@@ -5122,31 +5122,15 @@ fn split_by_labels(
     pieces
 }
 
-/// Cross-stream echo dedup. When a meeting plays through laptop speakers,
-/// the mic re-captures the speaker output and Whisper transcribes the same
-/// words on both streams ("You: ..." + "Speaker 1: ..." with near-identical
-/// text). This pass drops mic chunks whose tokens are mostly contained in
-/// time-overlapping sys chunks. The OS-level fix
-/// (`AVAudioInputNode.setVoiceProcessingEnabled`) ducks the system output
-/// device, which is unusable for a meeting recorder — so we cancel at the
-/// transcript layer instead. See `feedback_voice_processing.md` for the
-/// long story.
-///
-/// Behaviour:
-/// - No-op when there are no sys chunks (in-person mode, mic-only).
-/// - Skips mic chunks under `MIN_MIC_TOKENS` so brief acks ("yeah", "ok")
-///   aren't dropped just because those words also appear somewhere in the
-///   sys window.
-/// - Containment coefficient (intersection / smaller set) rather than
-///   Jaccard, because a single sys chunk can be much longer than a mic
-///   chunk; Jaccard would dilute below threshold even on a perfect match.
+/// Cross-stream echo dedup: when a meeting plays through laptop speakers the
+/// mic picks the remote voices up again, so this drops mic chunks whose tokens
+/// are mostly contained in the sys chunks overlapping them in time. A no-op
+/// without sys chunks.
 fn dedup_mic_against_sys(chunks: &[ChunkRecord]) -> Vec<ChunkRecord> {
-    // Time tolerance for matching mic chunks to sys chunks. Boundaries
-    // don't align (each source is VAD-bounded independently) so a sys
-    // chunk's content can sit anywhere from a few seconds before a mic
-    // chunk starts to a chunk-length after.
-    const PRE_MS: u64 = 5_000;
-    const POST_MS: u64 = 15_000;
+    // How far apart the two streams can place the same sound — their start
+    // offset plus the speaker-to-mic path, a few hundred ms — with room for a
+    // chunk end estimated from its word count.
+    const TOLERANCE_MS: u64 = 2_000;
     // Token-overlap threshold above which a mic chunk is considered an
     // echo of the sys text and dropped. Genuine simultaneous speech
     // (you talking while the remote speaks) typically shares <0.3 of
@@ -5156,15 +5140,14 @@ fn dedup_mic_against_sys(chunks: &[ChunkRecord]) -> Vec<ChunkRecord> {
     // ("yeah", "ok") match by chance against any windowed sys text.
     const MIN_MIC_TOKENS: usize = 3;
 
-    let has_sys = chunks.iter().any(|c| c.source == ChunkSource::Sys);
-    if !has_sys {
-        return chunks.to_vec();
-    }
-
-    let sys_chunks: Vec<&ChunkRecord> = chunks
+    let sys_spans: Vec<(u64, u64, &str)> = chunks
         .iter()
         .filter(|c| c.source == ChunkSource::Sys)
+        .map(|c| (c.start_ms, chunk_end_ms(c), c.text.as_str()))
         .collect();
+    if sys_spans.is_empty() {
+        return chunks.to_vec();
+    }
 
     let mut kept: Vec<ChunkRecord> = Vec::with_capacity(chunks.len());
     for chunk in chunks {
@@ -5177,15 +5160,15 @@ fn dedup_mic_against_sys(chunks: &[ChunkRecord]) -> Vec<ChunkRecord> {
             kept.push(chunk.clone());
             continue;
         }
-        let lower = chunk.start_ms.saturating_sub(PRE_MS);
-        let upper = chunk.start_ms.saturating_add(POST_MS);
+        let lower = chunk.start_ms.saturating_sub(TOLERANCE_MS);
+        let upper = chunk_end_ms(chunk).saturating_add(TOLERANCE_MS);
         let mut sys_window = String::new();
-        for s in &sys_chunks {
-            if s.start_ms >= lower && s.start_ms <= upper {
+        for &(start, end, text) in &sys_spans {
+            if start <= upper && end >= lower {
                 if !sys_window.is_empty() {
                     sys_window.push(' ');
                 }
-                sys_window.push_str(&s.text);
+                sys_window.push_str(text);
             }
         }
         if sys_window.is_empty() {
@@ -5199,6 +5182,27 @@ fn dedup_mic_against_sys(chunks: &[ChunkRecord]) -> Vec<ChunkRecord> {
         // else: this mic chunk is an echo of the sys content — drop it.
     }
     kept
+}
+
+/// Stream-absolute end of a chunk's speech: its last word's end, or an
+/// estimate from its word count when the provider returned no word timings.
+/// Never later than the longest chunk the audio-capture sidecar cuts
+/// (`maxSeconds` on its `ChunkWriter`s).
+fn chunk_end_ms(c: &ChunkRecord) -> u64 {
+    const MAX_CHUNK_MS: u64 = 15_000;
+    let spoken_ms = match c.words.iter().map(|w| w.end_ms).max() {
+        Some(end_ms) => end_ms,
+        None => estimated_speech_ms(&c.text),
+    };
+    c.start_ms.saturating_add(spoken_ms.min(MAX_CHUNK_MS))
+}
+
+/// How long `text` takes to say at a typical conversational ~350 ms a word,
+/// never under a second.
+fn estimated_speech_ms(text: &str) -> u64 {
+    (text.split_whitespace().count() as u64)
+        .saturating_mul(350)
+        .max(1_000)
 }
 
 /// Lowercase, split on non-alphanumeric, drop tokens shorter than 2
@@ -5420,8 +5424,7 @@ fn serialize_timeline(
         } else if next_same_source_start[i] > entry.start_ms {
             next_same_source_start[i]
         } else {
-            let word_count = entry.text.split_whitespace().count() as u64;
-            let estimated = word_count.saturating_mul(350).max(1_000);
+            let estimated = estimated_speech_ms(&entry.text);
             entry.start_ms.saturating_add(estimated)
         };
         let json = serde_json::json!({
@@ -6159,24 +6162,16 @@ fn token_jaccard(a: &[String], b: &[String]) -> f32 {
     }
 }
 
-/// Containment coefficient: |A ∩ B| / min(|A|, |B|). 1.0 when A ⊆ B
-/// (or vice versa). Used for cross-stream echo dedup where a sys
-/// window concatenated from multiple chunks is often much larger
-/// than a single mic chunk; Jaccard's union-in-the-denominator
-/// would suppress the score below threshold even on a perfect echo.
+/// Share of `a`'s distinct tokens that also appear in `b`: |A ∩ B| / |A|.
+/// Directional — a long `b` doesn't dilute it, and a short `b` can't account
+/// for a longer `a`.
 fn token_containment(a: &[String], b: &[String]) -> f32 {
     if a.is_empty() || b.is_empty() {
         return 0.0;
     }
     let set_a: std::collections::HashSet<&str> = a.iter().map(String::as_str).collect();
     let set_b: std::collections::HashSet<&str> = b.iter().map(String::as_str).collect();
-    let inter = set_a.intersection(&set_b).count() as f32;
-    let smaller = set_a.len().min(set_b.len()) as f32;
-    if smaller == 0.0 {
-        0.0
-    } else {
-        inter / smaller
-    }
+    set_a.intersection(&set_b).count() as f32 / set_a.len() as f32
 }
 
 /// Maximum word count for a labelled piece to be considered a "short
@@ -9858,6 +9853,103 @@ mod diarize_tests {
     }
 
     #[test]
+    fn dedup_drops_mic_echo_straddling_two_sys_chunks() {
+        // Continuous speech cuts both streams at the 15 s cap, each on its own
+        // phase: the mic chunk at 45–60 s echoes 45–54 s of the sys chunk at
+        // 39–54 s and 54–60 s of the one at 54–69 s.
+        fn one_word_a_second(words: &[String]) -> Vec<(&str, u64, u64)> {
+            words
+                .iter()
+                .zip(0u64..)
+                .map(|(w, i)| (w.as_str(), i * 1_000, i * 1_000 + 800))
+                .collect()
+        }
+        let vocab: Vec<String> = (0..30).map(|i| format!("word{i}")).collect();
+        let chunks = vec![
+            sys_with_words(39_000, one_word_a_second(&vocab[0..15])),
+            sys_with_words(54_000, one_word_a_second(&vocab[15..30])),
+            mic_with_words(45_000, one_word_a_second(&vocab[6..21])),
+        ];
+        let kept = dedup_mic_against_sys(&chunks);
+        assert!(
+            kept.iter().all(|c| c.source == ChunkSource::Sys),
+            "echo kept: {kept:?}"
+        );
+        assert_eq!(kept.len(), 2);
+    }
+
+    #[test]
+    fn dedup_drops_straddling_mic_echo_without_word_timings() {
+        // The same phases from a provider that returns no word timings, at 40
+        // words per 15 s chunk: sys 39 s holds words 0–39, sys 54 s words
+        // 40–79, and the mic chunk at 45 s echoes words 16–55.
+        let vocab: Vec<String> = (0..80).map(|i| format!("word{i}")).collect();
+        let text = |range: std::ops::Range<usize>| vocab[range].join(" ");
+        let chunks = vec![
+            sys(39_000, &text(0..40)),
+            sys(54_000, &text(40..80)),
+            mic(45_000, &text(16..56)),
+        ];
+        let kept = dedup_mic_against_sys(&chunks);
+        assert!(
+            kept.iter().all(|c| c.source == ChunkSource::Sys),
+            "echo kept: {kept:?}"
+        );
+    }
+
+    #[test]
+    fn dedup_keeps_mic_speech_the_remote_repeats_after_it_ends() {
+        // The mic chunk's speech is over at 3 s. The same words on sys from
+        // 8 s can't be its echo.
+        let chunks = vec![
+            mic_with_words(
+                0,
+                vec![
+                    ("We", 0, 400),
+                    ("ship", 400, 900),
+                    ("the", 900, 1_200),
+                    ("migration", 1_200, 2_000),
+                    ("on", 2_000, 2_300),
+                    ("Friday.", 2_300, 3_000),
+                ],
+            ),
+            sys(8_000, "We ship the migration on Friday."),
+        ];
+        assert_eq!(dedup_mic_against_sys(&chunks).len(), 2);
+    }
+
+    #[test]
+    fn dedup_keeps_mic_speech_a_short_sys_reply_cannot_account_for() {
+        // Every word of the remote's reply is in the user's next sentence,
+        // but they are three of its thirteen.
+        let chunks = vec![
+            sys(10_000, "Ja, det er det."),
+            mic(
+                11_500,
+                "Ja, det er det jeg tenker også, vi må ha budsjettet klart før fredag.",
+            ),
+        ];
+        let kept = dedup_mic_against_sys(&chunks);
+        assert!(
+            kept.iter().any(|c| c.source == ChunkSource::Mic),
+            "user speech dropped: {kept:?}"
+        );
+    }
+
+    #[test]
+    fn dedup_drops_mic_echo_of_a_short_sys_chunk_with_an_extra_word() {
+        let chunks = vec![
+            sys(10_000, "Sounds good, see you Friday."),
+            mic(10_150, "Sounds good, see you on Friday."),
+        ];
+        let kept = dedup_mic_against_sys(&chunks);
+        assert!(
+            kept.iter().all(|c| c.source == ChunkSource::Sys),
+            "echo kept: {kept:?}"
+        );
+    }
+
+    #[test]
     fn token_containment_perfect_subset() {
         let a: Vec<String> = ["ship", "the", "migration"].iter().map(|s| s.to_string()).collect();
         let b: Vec<String> = ["we", "should", "ship", "the", "migration", "on", "friday"]
@@ -9871,6 +9963,17 @@ mod diarize_tests {
         let a: Vec<String> = ["completely", "different", "words"].iter().map(|s| s.to_string()).collect();
         let b: Vec<String> = ["nothing", "in", "common"].iter().map(|s| s.to_string()).collect();
         assert!(token_containment(&a, &b) < 1e-6);
+    }
+
+    #[test]
+    fn token_containment_is_the_share_of_a_found_in_b() {
+        let a: Vec<String> = ["ja", "det", "er", "budsjettet", "klart", "fredag"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let b: Vec<String> = ["ja", "det", "er"].iter().map(|s| s.to_string()).collect();
+        assert!((token_containment(&a, &b) - 0.5).abs() < 1e-6);
+        assert!((token_containment(&b, &a) - 1.0).abs() < 1e-6);
     }
 }
 
