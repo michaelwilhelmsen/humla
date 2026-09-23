@@ -12,7 +12,8 @@ and a standalone tool (`echo-probe`) that measures the lag and cancels the echo
 offline. The capture-side proposal waits on the measurements in §6.
 
 Verified against `main` at v0.64.0 and two real takes measured on the user's
-Mac. The Swift half of the diagnostics has not yet been compiled — see §5.
+Mac. The Swift half of the diagnostics compiles but has not yet run on a real
+take — see §5.
 
 ## TL;DR
 
@@ -61,7 +62,7 @@ Code facts, `audio-capture/Sources/audio-capture/main.swift` and
 | `FullRecordingWriter` | `mic-full.wav` / `sys-full.wav` each start at their own first frame |
 | `build_playback_wav` | sums the two from index 0 |
 | `serialize_timeline`, `build_pieces_unbridged`, `build_hybrid_labels` | sort mic and sys chunks together by `(start_ms, source)` |
-| `dedup_mic_against_sys` | pairs a mic chunk with sys chunks starting −5 s … +15 s around it |
+| `dedup_mic_against_sys` | pairs a mic chunk with the sys chunks whose spans overlap its own, give or take 2 s |
 
 Start-up order: `engine.start()` runs synchronously near the top of
 `main.swift`, then `Task { await startSystemAudio() }` queries
@@ -90,8 +91,10 @@ Consequences beyond the echo:
 - **Playback.** `playback.wav` holds each remote voice twice, Δ + L apart: a
   slap-back at 157–420 ms. Aligning shrinks the gap to L, which at 60–90 ms is
   still an audible doubling. Only a cancelled mic removes it.
-- **Dedup.** Its −5/+15 s window absorbs today's offsets. An offset that
-  accumulates (many pauses, recurring SCK gaps) would eventually walk past it.
+- **Dedup.** Its 2 s tolerance absorbs the offsets measured so far (157–420 ms
+  of lag). An offset that accumulates past it (many pauses, recurring SCK
+  gaps) starts to push an echo's sys text out of the window, and the echoed
+  mic chunk survives into the transcript.
 
 ## 2. What the first measurements say
 
@@ -159,23 +162,23 @@ Plain subtraction of the time-aligned sys signal does not get there. The echo
 is sys filtered by a speaker, a room and (here) an inverting path, and a
 delay-and-gain match removes a few dB at best. It needs an adaptive filter.
 
-## 4. Found on the way: a full-recording WAV can be rewritten after close
+## 4. Found on the way: a full-recording WAV could be rewritten after close
 
-`FullRecordingWriter.close()` sets `file = nil`, and `write()` reopens the file
+`FullRecordingWriter.close()` set `file = nil`, and `write()` reopened the file
 with `AVAudioFile(forWriting:)`, which **replaces** it, whenever `file == nil`.
 In `shutdown`, the writers close before `scStream.stopCapture()` is awaited. So
-an SCK buffer delivered in that window recreates `sys-full.wav` with only the
-late buffer in it. The `full_recording` event has already gone out with the
-correct duration, and the reader has stopped at `stopped`. The post-stop chain
-then copies and diarizes the replacement.
+an SCK buffer delivered in that window recreated `sys-full.wav` with only the
+late buffer in it. The `full_recording` event had already gone out with the
+correct duration, and the reader had stopped at `stopped`. The post-stop chain
+then copied and diarized the replacement.
 
-How often this bites is unknown: SCK may deliver nothing once the far end has
-gone quiet, which is the usual state at stop. This change **counts** it rather
-than fixing it. The sidecar logs `capture timing: N mic / M sys buffer(s)
-reached a full-recording writer after it closed` to stderr, and `echo-probe`
-compares each WAV's length to the `frames_written` the sidecar reported. The fix
-is a guard in `write()` (drop buffers once closed). It is small, but it touches
-the capture path, so it gets its own change.
+**Fixed in #194:** both writers ignore any `write()` after `close()`, and the
+sidecar logs the drops to stderr (`capture timing: a sys buffer reached the
+full-recording writer after it closed; dropped …`). SCK does deliver in that
+window, even with nothing playing, so this was reachable on any stop.
+`echo-probe` still compares each WAV's length with the `frames_written` the
+sidecar reported, now as the regression check: a buffer the full writer turns
+away is never counted, so the two agree exactly on a healthy take.
 
 ## 5. What landed (instrumentation only)
 
@@ -196,7 +199,7 @@ device change):
   buffers that started more than 5 ms after or before where the previous one
   ended — and `max_jitter_ms`, the largest discontinuity under that threshold.
   `jumps` lists where the first 64 fell, as `[frame, ms]`.
-- `frames_written`: what the full WAV should hold.
+- `frames_written`: what the full WAV holds.
 - `devices.input` / `devices.output`: the HAL's latency, safety offset, IO
   buffer and stream latency (frames), nominal rate, transport as a four-char
   code (`bltn`, `blue`, `usb `…) and clock domain. **No names** (#174): a
@@ -208,11 +211,9 @@ stderr line — `capture timing: sys starts +73.4ms after mic, +73.6ms by the en
 | …` — and writes `diagnostics/<note_id>/capture-<session_id>.json`: the raw
 event plus derived `alignment` (start offset, end offset, gaps, drift per
 interval, HAL latencies). It is timestamps only, so it is written whatever
-`keep_audio` says, and it syncs nowhere. The Rust side is tested (57 tests in
-`recording.rs`, 750 in the crate on Linux). **The Swift side has not been
-compiled**: the cloud container has no Swift toolchain and can't reach
-`download.swift.org`. `./scripts/build-sidecar.sh` on the Mac is its first
-compile.
+`keep_audio` says, and it syncs nowhere. The Rust side is tested against a
+fixture of the event's shape. The Swift side compiles clean on the Mac, but no
+real take has emitted the event yet: §6 step 1 is its first run.
 
 **`echo-probe`** (`src-tauri/crates/echo-probe`): a workspace member nothing
 depends on, with zero DSP dependencies. From `src-tauri/`:
@@ -265,12 +266,12 @@ cancel), so about a minute for an hour.
 
 ## 6. Measurement plan
 
-On the Mac, on this branch:
+On the Mac:
 
-1. `FORCE_SIDECAR_REBUILD=1 ./scripts/build-sidecar.sh`. This is the first
-   compile of the Swift changes; macOS may re-ask for Screen Recording if the
-   build falls back to ad-hoc signing. Then `pnpm tauri dev`, which also shows
-   the `capture timing:` and `sidecar: full_recording …` stderr lines.
+1. `FORCE_SIDECAR_REBUILD=1 ./scripts/build-sidecar.sh`; macOS may re-ask for
+   Screen Recording if the build falls back to ad-hoc signing. Then
+   `pnpm tauri dev`, which also shows the `capture timing:` and
+   `sidecar: full_recording …` stderr lines.
 2. Settings → Recording → **keep_audio on**. Leave "Transcribe manually" off.
 3. `cargo run --release -p echo-probe -- selftest` (from `src-tauri/`).
 4. Record, each 2–3 minutes, with the built-in speakers loud:
@@ -305,7 +306,7 @@ What to read off `session`:
 - `gap(s)` per stream, and each first buffer's `arrived … after its stamp:
   stamp is host time ✓`. If it says otherwise, the SCK timestamps are on
   another clock, and (a) must be built on arrival times instead.
-- `WAV length matches ✓` — or the §4 bug, caught in the act.
+- `WAV length matches ✓`. A mismatch means §4's fix has regressed.
 
 ## 7. Decision rule, and the proposal
 

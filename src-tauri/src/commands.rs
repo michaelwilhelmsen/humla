@@ -6201,9 +6201,7 @@ async fn unify_apply(
 /// at similar VAD lengths — penalising added unique tokens lets us
 /// keep legitimate continuations (chunk N+1 = chunk N's content +
 /// new sentence) while still catching exact / near-exact repeats
-/// from a Whisper hallucination loop. Containment is the wrong
-/// metric here because `min()` makes it symmetric and scores a
-/// strict superset as 1.0.
+/// from a Whisper hallucination loop.
 fn token_jaccard(a: &[String], b: &[String]) -> f32 {
     if a.is_empty() || b.is_empty() {
         return 0.0;
