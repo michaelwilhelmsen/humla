@@ -200,6 +200,9 @@ final class ChunkWriter {
     private var totalFramesWritten: AVAudioFrameCount = 0
     private var chunkStartFrames: AVAudioFrameCount = 0
     private let queue: DispatchQueue
+    // Set by `close()`. A later buffer would start a chunk after `stopped`,
+    // which the parent never reads. See `FullRecordingWriter.closed`.
+    private var closed = false
 
     init(source: String, dir: URL, minSeconds: Double, maxSeconds: Double, vadSilenceMs: Double) {
         self.source = source
@@ -212,6 +215,7 @@ final class ChunkWriter {
 
     func write(_ buffer: AVAudioPCMBuffer) {
         queue.sync {
+            if closed { return }
             do {
                 if file == nil { try openNext() }
                 try file!.write(from: buffer)
@@ -254,6 +258,7 @@ final class ChunkWriter {
 
     func close() {
         queue.sync {
+            closed = true
             if let u = url, written > 0 {
                 file = nil
                 if chunkPeak >= silenceThreshold {
@@ -334,6 +339,12 @@ final class FullRecordingWriter {
     private var url: URL?
     private var written: AVAudioFrameCount = 0
     private let queue: DispatchQueue
+    // Buffers still arrive after `close()`: shutdown closes the writers before
+    // it awaits `stopCapture()`, and ScreenCaptureKit delivers until that
+    // returns. Opening the file again would replace the recording
+    // `full_recording` just reported, so they are dropped, and counted.
+    private var closed = false
+    private var writesAfterClose = 0
 
     init(source: String, dir: URL) {
         self.source = source
@@ -343,6 +354,18 @@ final class FullRecordingWriter {
 
     func write(_ buffer: AVAudioPCMBuffer) {
         queue.sync {
+            if closed {
+                writesAfterClose += 1
+                // Said here as well as in `shutdown`, whose tally is lost if the
+                // process dies first: once the parent stops reading stdout at
+                // `stopped`, the next heartbeat raises SIGPIPE.
+                if writesAfterClose == 1 {
+                    FileHandle.standardError.write(Data(
+                        "capture timing: a \(source) buffer reached the full-recording writer after it closed; dropped, with any after it\n".utf8
+                    ))
+                }
+                return
+            }
             do {
                 if file == nil {
                     let u = dir.appendingPathComponent("\(source)-full.wav")
@@ -357,8 +380,14 @@ final class FullRecordingWriter {
         }
     }
 
+    /// See `writesAfterClose`.
+    func lateWriteCount() -> Int {
+        queue.sync { writesAfterClose }
+    }
+
     func close() {
         queue.sync {
+            closed = true
             file = nil
             if let u = url, written > 0 {
                 let durationMs = Int(Double(written) / targetSampleRate * 1000.0)
@@ -993,6 +1022,14 @@ let shutdown: () -> Void = {
         // OS will reclaim resources on exit.
         if let s = scStream {
             try? await s.stopCapture()
+        }
+        // Final only once capture has stopped. stderr, because the parent
+        // stops reading stdout at `stopped`.
+        let late = (mic: micFullWriter.lateWriteCount(), sys: sysFullWriter.lateWriteCount())
+        if late.mic + late.sys > 0 {
+            FileHandle.standardError.write(Data(
+                "capture timing: \(late.mic) mic / \(late.sys) sys buffer(s) reached a full-recording writer after it closed; dropped\n".utf8
+            ))
         }
         exit(0)
     }
