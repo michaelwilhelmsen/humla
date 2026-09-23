@@ -352,7 +352,9 @@ final class FullRecordingWriter {
         self.queue = DispatchQueue(label: "full.writer.\(source)")
     }
 
-    func write(_ buffer: AVAudioPCMBuffer) {
+    /// Whether `buffer` reached the file: false once closed, or if the write failed.
+    @discardableResult
+    func write(_ buffer: AVAudioPCMBuffer) -> Bool {
         queue.sync {
             if closed {
                 writesAfterClose += 1
@@ -364,7 +366,7 @@ final class FullRecordingWriter {
                         "capture timing: a \(source) buffer reached the full-recording writer after it closed; dropped, with any after it\n".utf8
                     ))
                 }
-                return
+                return false
             }
             do {
                 if file == nil {
@@ -374,8 +376,10 @@ final class FullRecordingWriter {
                 }
                 try file!.write(from: buffer)
                 written += buffer.frameLength
+                return true
             } catch {
                 emitError("\(source) full write: \(error.localizedDescription)")
+                return false
             }
         }
     }
@@ -759,12 +763,13 @@ func installMicTap(_ input: AVAudioInputNode, format inFormat: AVAudioFormat) {
             recordMicStats(samples: arr)
             if let buf = makeBuffer(arr) {
                 micWriter.write(buf)
-                micFullWriter.write(buf)
+                guard micFullWriter.write(buf) else { return }
                 written = n
             }
         }
         // Noted whenever the converter took the buffer, even when it gave
-        // nothing back yet: those frames are held, not lost.
+        // nothing back yet: those frames are held, not lost. One the full
+        // writer turned away returned above, as if it had never arrived.
         if status != .error {
             micTiming.note(
                 stamp: when.isHostTimeValid ? AVAudioTime.seconds(forHostTime: when.hostTime) : nil,
@@ -962,7 +967,7 @@ final class SystemAudioOutput: NSObject, SCStreamOutput {
         var written = 0
         if let buf = makeBuffer(arr) {
             sysWriter.write(buf)
-            sysFullWriter.write(buf)
+            guard sysFullWriter.write(buf) else { return }
             written = n
             if bufferCount == 1 {
                 FileHandle.standardError.write(Data(
