@@ -138,6 +138,14 @@ fn err<E: std::fmt::Display>(e: E) -> String { e.to_string() }
 /// can't be reconstructed from the transcript text alone).
 #[tauri::command]
 pub async fn rediarize_note(app: AppHandle, note_id: String) -> Result<(), String> {
+    let result = rediarize_note_inner(app.clone(), note_id.clone()).await;
+    notes::purge_note_assets_if_gone(&app, &note_id);
+    result
+}
+
+/// The command's body, split out so the purge check in [`rediarize_note`] covers
+/// every one of its returns.
+async fn rediarize_note_inner(app: AppHandle, note_id: String) -> Result<(), String> {
     let app_dir = app.path().app_data_dir().map_err(err)?;
     // Re-diarize operates on the most recent session's retained audio. Legacy
     // flat notes resolve to the flat dir; multi-session notes re-diarize the
@@ -2932,6 +2940,7 @@ async fn run_post_stop_chain(
     let timings = clock.finish();
     eprintln!("{}", timings.summary());
     write_stop_timings(&app, &note_id, &timings).await;
+    notes::purge_note_assets_if_gone(&app, &note_id);
 }
 
 /// Wall clock for one stop chain: when stop was pressed, plus the durations
@@ -3954,6 +3963,7 @@ pub async fn transcribe_note(
     }
     emit_transcribe_status(&app, &note_id, true);
     let result = transcribe_takes(&app, &note_id, scope).await;
+    notes::purge_note_assets_if_gone(&app, &note_id);
     state.transcribing.lock().remove(&note_id);
     emit_transcribe_status(&app, &note_id, false);
     // No `emit_error` here: the command's rejection is what the caller toasts,

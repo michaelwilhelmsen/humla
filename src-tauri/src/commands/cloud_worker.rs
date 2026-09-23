@@ -93,6 +93,7 @@ impl Manager {
         let app = self.app.clone();
         let app_status = self.app.clone();
         let app_conflict = self.app.clone();
+        let app_purged = self.app.clone();
         match cloud_sync::start(
             self.db.clone(),
             cfg,
@@ -114,6 +115,11 @@ impl Manager {
                 // A pull preserved local edits as a conflict copy → toast it so
                 // the user knows their version was kept and the note also changed.
                 let _ = app_conflict.emit("sync_conflict", title);
+            },
+            move |note_id| {
+                // A pull deleted a note outright (its author withdrew it), so its
+                // files go the same way a Trash purge takes them.
+                super::notes::purge_note_assets_best_effort(&app_purged, note_id);
             },
         ) {
             Ok((handle, fut)) => {

@@ -154,17 +154,19 @@ pub enum SyncState {
     Error,
 }
 
-pub fn start<N, S, C>(
+pub fn start<N, S, C, P>(
     db: Db,
     config: Config,
     notify: N,
     status: S,
     conflict: C,
+    purged: P,
 ) -> Result<(Arc<CloudSync>, impl std::future::Future<Output = ()>)>
 where
     N: Fn() + Send + Sync + 'static,
     S: Fn(SyncState) + Send + Sync + 'static,
     C: Fn(&str) + Send + Sync + 'static,
+    P: Fn(&str) + Send + Sync + 'static,
 {
     init_tables(&db)?;
     let (tx, rx) = mpsc::unbounded_channel();
@@ -175,6 +177,7 @@ where
         notify: Arc::new(notify),
         status: Arc::new(status),
         conflict: Arc::new(conflict),
+        purged: Arc::new(purged),
         auth: Mutex::new(None),
     };
     Ok((Arc::new(CloudSync { tx }), worker.run(rx)))
@@ -195,6 +198,9 @@ struct Worker {
     /// Fired (with the note title) when a pull preserved local edits as a
     /// conflict copy instead of silently overwriting them.
     conflict: Arc<dyn Fn(&str) + Send + Sync>,
+    /// Fired (with the note id) when a pull deleted a note outright, so the app
+    /// can remove every file that note kept on this disk.
+    purged: Arc<dyn Fn(&str) + Send + Sync>,
     auth: Mutex<Option<Auth>>,
 }
 
@@ -791,13 +797,7 @@ impl Worker {
             conn.execute("DELETE FROM note_chunks_fts WHERE note_id = ?1", rusqlite::params![r.note_client_id])?;
             conn.execute("DELETE FROM notes WHERE id = ?1", rusqlite::params![r.note_client_id])?;
         }
-        // Audio and timelines the note left on this disk go with it.
-        let dir = self.config.recordings_dir.join(&r.note_client_id);
-        if let Err(e) = std::fs::remove_dir_all(&dir) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                eprintln!("cloud-sync: could not remove withdrawn note's assets: {e}");
-            }
-        }
+        (self.purged)(&r.note_client_id);
         Ok(())
     }
 
@@ -1858,8 +1858,19 @@ mod it {
             notify: Arc::new(|| {}) as Arc<dyn Fn() + Send + Sync>,
             status: Arc::new(|_| {}) as Arc<dyn Fn(SyncState) + Send + Sync>,
             conflict: Arc::new(|_: &str| {}) as Arc<dyn Fn(&str) + Send + Sync>,
+            purged: Arc::new(|_: &str| {}) as Arc<dyn Fn(&str) + Send + Sync>,
             auth: Mutex::new(None),
         }
+    }
+
+    fn worker_collecting_purges(db: Db, config: Config) -> (Worker, Arc<Mutex<Vec<String>>>) {
+        let purged = Arc::new(Mutex::new(Vec::new()));
+        let seen = purged.clone();
+        let w = Worker {
+            purged: Arc::new(move |id: &str| seen.lock().push(id.to_string())),
+            ..worker(db, config)
+        };
+        (w, purged)
     }
 
     fn scalar(db: &Db, sql: &str, id: &str) -> Option<String> {
@@ -1887,10 +1898,7 @@ mod it {
     #[test]
     fn a_revocation_removes_someone_elses_note_and_its_index() {
         let db = test_db();
-        let dir = std::env::temp_dir().join(format!("humla-revoke-{}", now_ms()));
-        let mut cfg = offline_config("wsR");
-        cfg.recordings_dir = dir.clone();
-        let w = worker(db.clone(), cfg);
+        let (w, purged) = worker_collecting_purges(db.clone(), offline_config("wsR"));
         {
             let conn = db.lock();
             conn.execute(
@@ -1911,8 +1919,6 @@ mod it {
             )
             .unwrap();
         }
-        std::fs::create_dir_all(dir.join("theirs")).unwrap();
-        std::fs::write(dir.join("theirs").join("playback.wav"), b"audio").unwrap();
 
         for id in ["theirs", "mine", "local"] {
             w.apply_remote_revocation(&json!({ "note_client_id": id, "at": 100 }), "u-me").unwrap();
@@ -1930,8 +1936,7 @@ mod it {
             scalar(&db, "SELECT id FROM note_revisions WHERE note_id = ?1", "theirs").is_none(),
             "and the version history, which holds the same transcript"
         );
-        assert!(!dir.join("theirs").exists(), "and so does the audio on this disk");
-        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(*purged.lock(), ["theirs"], "and so do its files on this disk, that note's alone");
     }
 
     /// A note withdrawn and then RE-SHARED must survive. Each collection has its
@@ -1942,7 +1947,7 @@ mod it {
     #[test]
     fn a_reshared_note_survives_the_revocation_that_preceded_it() {
         let db = test_db();
-        let w = worker(db.clone(), offline_config("wsR"));
+        let (w, purged) = worker_collecting_purges(db.clone(), offline_config("wsR"));
         {
             let conn = db.lock();
             conn.execute(
@@ -1955,10 +1960,12 @@ mod it {
         // Withdrawn at 4_000; the copy we hold was re-shared at 5_000.
         w.apply_remote_revocation(&json!({ "note_client_id": "n1", "at": 4_000 }), "u-me").unwrap();
         assert!(scalar(&db, "SELECT id FROM notes WHERE id = ?1", "n1").is_some());
+        assert!(purged.lock().is_empty(), "its files stay with it");
 
         // A withdrawal AFTER the copy we hold still takes it.
         w.apply_remote_revocation(&json!({ "note_client_id": "n1", "at": 6_000 }), "u-me").unwrap();
         assert!(scalar(&db, "SELECT id FROM notes WHERE id = ?1", "n1").is_none());
+        assert_eq!(*purged.lock(), ["n1"]);
     }
 
     /// A revocation for a note this device has never seen is a no-op, not an error:
@@ -1966,9 +1973,10 @@ mod it {
     #[test]
     fn a_revocation_for_an_unknown_note_is_harmless() {
         let db = test_db();
-        let w = worker(db.clone(), offline_config("wsR"));
+        let (w, purged) = worker_collecting_purges(db.clone(), offline_config("wsR"));
         w.apply_remote_revocation(&json!({ "note_client_id": "never-seen", "at": 1 }), "u-me").unwrap();
         w.apply_remote_revocation(&json!({ "note_client_id": "../../etc/passwd", "at": 1 }), "u-me").unwrap();
+        assert!(purged.lock().is_empty(), "no files to remove, and never under a hostile id");
     }
 
     /// Outbox coalescing (no network): repeated edits to the same record collapse
@@ -2410,6 +2418,7 @@ mod it {
             notify: Arc::new(|| {}),
             status: Arc::new(|_| {}),
             conflict: Arc::new(move |_: &str| f.store(true, Ordering::SeqCst)),
+            purged: Arc::new(|_: &str| {}),
             auth: Mutex::new(None),
         };
         {

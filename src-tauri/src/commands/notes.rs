@@ -136,36 +136,55 @@ pub fn notes_restore(state: State<AppState>, id: String) -> Result<Note, String>
 /// Permanently delete a note from the Trash (hard delete, not recoverable). The
 /// server copy is already tombstoned from the soft-delete, so this is local-only.
 ///
-/// Cascade (issue #19): purge is the point of no return, so the note's retained
-/// audio / playback assets under `recordings/<note_id>/` go with it. Soft delete
-/// deliberately does NOT touch these — a Trash-restore must keep playback intact.
+/// Purge is the point of no return, so every file the note keeps on disk goes
+/// with it ([`purge_note_assets`]). Soft delete deliberately does NOT touch these
+/// — a Trash-restore must keep playback intact.
 #[tauri::command]
 pub fn notes_purge(app: AppHandle, state: State<AppState>, id: String) -> Result<(), String> {
     {
         let conn = state.db.lock();
         db::purge_note(&conn, &id).map_err(err)?;
     } // drop the db guard before touching the filesystem
-    // Best-effort asset cleanup: the DB row is already gone, which is the
-    // primary effect. A missing directory is expected (notes without retained
-    // audio) and is not an error; any other IO failure is swallowed so a
-    // filesystem hiccup can't leave the note un-purgeable.
-    if let Ok(base) = app.path().app_data_dir() {
-        let _ = purge_note_assets(&base, &id);
-    }
+    purge_note_assets_best_effort(&app, &id);
     Ok(())
 }
 
-/// Remove a note's `recordings/<note_id>/` directory (retained audio + the
-/// always-written playback assets). Returns `Ok` when the directory never
-/// existed — purging a note that had no assets is not an error. Any other IO
-/// error propagates so callers/tests can observe a genuine failure.
-pub(crate) fn purge_note_assets(app_data_dir: &Path, note_id: &str) -> std::io::Result<()> {
-    let dir = app_data_dir.join("recordings").join(note_id);
-    match std::fs::remove_dir_all(&dir) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e),
+/// For a note whose row is already gone: the purge has happened, so a failure to
+/// remove its files is logged, not returned.
+pub(crate) fn purge_note_assets_best_effort(app: &AppHandle, note_id: &str) {
+    let Ok(base) = app.path().app_data_dir() else { return };
+    if let Err(e) = purge_note_assets(&base, note_id) {
+        eprintln!("purge: could not remove note {note_id}'s files: {e}");
     }
+}
+
+/// For the end of a chain that writes a note's files, after its last write: a
+/// note purged or withdrawn while the chain ran must not get back what it wrote.
+/// A trashed note keeps its row, and so its files.
+pub(crate) fn purge_note_assets_if_gone(app: &AppHandle, note_id: &str) {
+    let state = app.state::<AppState>();
+    let gone = matches!(db::note_exists(&state.db.lock(), note_id), Ok(false));
+    if gone {
+        purge_note_assets_best_effort(app, note_id);
+    }
+}
+
+/// Remove both directories a note keeps under the app data dir:
+/// `recordings/<note_id>/` (retained audio, playback assets, timelines) and
+/// `diagnostics/<note_id>/` (the diarize dumps, which hold the transcript text).
+pub(crate) fn purge_note_assets(app_data_dir: &Path, note_id: &str) -> std::io::Result<()> {
+    if !crate::sessions::is_safe_session_id(note_id) {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "unsafe note id"));
+    }
+    let mut first_err = None;
+    for root in ["recordings", "diagnostics"] {
+        if let Err(e) = std::fs::remove_dir_all(app_data_dir.join(root).join(note_id)) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                first_err.get_or_insert(e);
+            }
+        }
+    }
+    first_err.map_or(Ok(()), Err)
 }
 
 /// Saved content revisions for a note, newest first (local version history).
@@ -296,22 +315,75 @@ pub fn notes_set_private(
 mod tests {
     use super::purge_note_assets;
     use std::fs;
+    use std::io::ErrorKind;
 
     #[test]
-    fn purge_removes_the_notes_recordings_dir() {
+    fn purge_removes_the_notes_recordings_and_diagnostics_dirs() {
         let base = tempfile::tempdir().unwrap();
         let note_id = "note-123";
         let dir = base.path().join("recordings").join(note_id);
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("playback.wav"), b"fake").unwrap();
         fs::write(dir.join("mic-full.wav"), b"fake").unwrap();
-        assert!(dir.exists());
+        // The diarize dump holds every chunk's text: the transcript, in other words.
+        let diag = base.path().join("diagnostics").join(note_id);
+        fs::create_dir_all(&diag).unwrap();
+        fs::write(diag.join("community1-mic.json"), br#"{"chunks":[{"text":"the price"}]}"#).unwrap();
+        fs::write(diag.join("replay-timings.json"), b"{}").unwrap();
+        let sibling = ["recordings", "diagnostics"].map(|root| base.path().join(root).join("note-456"));
+        for d in &sibling {
+            fs::create_dir_all(d).unwrap();
+            fs::write(d.join("kept.json"), b"{}").unwrap();
+        }
 
         purge_note_assets(base.path(), note_id).unwrap();
 
         assert!(!dir.exists(), "recordings/<note_id> should be gone after purge");
-        // A sibling note's assets must be untouched.
-        assert!(base.path().join("recordings").exists());
+        assert!(!diag.exists(), "diagnostics/<note_id> should be gone after purge");
+        for d in &sibling {
+            assert!(d.join("kept.json").exists(), "a sibling note's {} must be untouched", d.display());
+        }
+    }
+
+    #[test]
+    fn purge_clears_every_root_before_reporting_a_failure() {
+        let base = tempfile::tempdir().unwrap();
+        // A plain file where the recordings dir should be, which remove_dir_all refuses.
+        fs::create_dir_all(base.path().join("recordings")).unwrap();
+        fs::write(base.path().join("recordings").join("note-123"), b"not a dir").unwrap();
+        let diag = base.path().join("diagnostics").join("note-123");
+        fs::create_dir_all(&diag).unwrap();
+        fs::write(diag.join("community1-mic.json"), b"{}").unwrap();
+
+        let e = purge_note_assets(base.path(), "note-123").unwrap_err();
+
+        assert_ne!(e.kind(), ErrorKind::NotFound);
+        assert!(!diag.exists(), "the transcript text goes even when the audio can't");
+    }
+
+    /// The id becomes a path segment under both roots. An empty id names each root
+    /// itself and `..` the whole app data dir, so anything but a plain segment is
+    /// refused before a single directory is removed.
+    #[test]
+    fn purge_refuses_an_id_that_is_not_a_plain_path_segment() {
+        let base = tempfile::tempdir().unwrap();
+        let app_data = base.path().join("app");
+        let kept = ["recordings", "diagnostics"].map(|root| app_data.join(root).join("note-456"));
+        for d in &kept {
+            fs::create_dir_all(d).unwrap();
+        }
+        let outside = base.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+
+        for id in ["", ".", "..", "note-456/..", "../../outside"] {
+            let e = purge_note_assets(&app_data, id).unwrap_err();
+            assert_eq!(e.kind(), ErrorKind::InvalidInput, "{id:?}");
+        }
+
+        for d in &kept {
+            assert!(d.exists(), "{} must survive", d.display());
+        }
+        assert!(outside.exists(), "nothing outside the app data dir is reachable");
     }
 
     /// #191 — visibility is sticky per workspace, and shared until the user says
@@ -349,9 +421,17 @@ mod tests {
     #[test]
     fn purge_is_ok_when_no_assets_exist() {
         let base = tempfile::tempdir().unwrap();
-        // No recordings/ dir at all — a note that never retained audio.
+        // No recordings/ or diagnostics/ dir at all — a note that was never recorded.
         purge_note_assets(base.path(), "never-recorded").unwrap();
         // Idempotent: purging again is still fine.
         purge_note_assets(base.path(), "never-recorded").unwrap();
+
+        // A note can have diagnostics and no recordings dir; the missing one must
+        // not stop the other going.
+        let diag = base.path().join("diagnostics").join("diagnosed-only");
+        fs::create_dir_all(&diag).unwrap();
+        fs::write(diag.join("sortformer-mic.json"), b"{}").unwrap();
+        purge_note_assets(base.path(), "diagnosed-only").unwrap();
+        assert!(!diag.exists());
     }
 }
