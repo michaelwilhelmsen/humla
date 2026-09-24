@@ -278,7 +278,9 @@ once snapped to the recorded jump.
 | soft-clipped speaker (nonlinear) | 15 / 25 dB | ±0.00 dB | 13 / 23 dB |
 
 Speed: 2.3 s for a 120 s take in the cloud container (delay + two-pass
-cancel), so about a minute for an hour.
+cancel), so about a minute for an hour. The app's echo pass spreads a take
+longer than ten minutes over threads instead (#200): about 7–8 s and 470 MB for
+an hour on an M1 Max.
 
 ## 6. Measurement plan
 

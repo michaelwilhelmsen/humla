@@ -10,6 +10,7 @@
 //!   with drift and steps.
 //! - [`autocorr`] — the same lag from a mixed `playback.wav` alone.
 //! - [`aec`] — reference-based echo cancellation for the diarize input.
+//! - [`sample`] — a stream held as 16-bit integers or as floats.
 //! - [`timing`] — the app's `capture-<session>.json`, to split a lag into the
 //!   capture's start offset and the output path.
 
@@ -17,7 +18,13 @@ pub mod aec;
 pub mod autocorr;
 pub mod delay;
 pub mod fft;
+pub mod sample;
 pub mod stats;
 pub mod synth;
 pub mod timing;
 pub mod wav;
+
+/// Threads the long parts of the echo pass spread over.
+pub fn default_threads() -> usize {
+    std::thread::available_parallelism().map_or(1, |n| n.get()).min(8)
+}

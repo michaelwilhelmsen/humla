@@ -8,13 +8,15 @@
 //! heard while the system stream is silent is dropped as echo.
 
 use crate::diarize::Segment;
-use echo_probe::aec::{self, AecConfig, AecReport};
+use echo_probe::aec::{self, AecConfig, AecReport, Threading};
 use echo_probe::delay::{self, DelayConfig, DelayMap, LagPoint, TrackSummary};
+use echo_probe::sample::Sample;
 
 /// Every stream the sidecar writes is 16 kHz mono.
 const RATE: u32 = 16_000;
 
-/// Samples in one of the check's 10 ms frames.
+/// Samples in one of the check's 10 ms frames, which is how
+/// `aec::Cancelled::linear_energy` frames the linear output too.
 const FRAME: usize = 160;
 
 /// A window's lag counts only when this many of the valid windows either side
@@ -64,7 +66,7 @@ impl TakeAnalysis {
     /// The mic with the echo cancelled out of it — the diarize input — when
     /// there was an echo. Taken rather than lent, so it can be let go of as
     /// soon as it is written.
-    pub fn take_cleaned(&mut self) -> Option<Vec<f32>> {
+    pub fn take_cleaned(&mut self) -> Option<Vec<i16>> {
         self.echo.as_mut().map(|e| std::mem::take(&mut e.cleaned))
     }
 
@@ -102,8 +104,9 @@ pub struct TakeEcho {
     /// Per 10 ms frame: the mic's energy, and the linear canceller's output's.
     mic_energy: Vec<f64>,
     linear_energy: Vec<f64>,
-    /// The mic after the canceller and its residual suppressor.
-    cleaned: Vec<f32>,
+    /// The mic after the canceller and its residual suppressor, as the WAV
+    /// the mic diarize reads holds it.
+    cleaned: Vec<i16>,
     cancel: AecReport,
 }
 
@@ -308,8 +311,8 @@ fn voice_frames(segments: &[&Segment], frames: usize) -> Vec<bool> {
 }
 
 /// The lag of `mic` behind `sys`, the echo cancelled out of `mic`, and what
-/// the check needs from all three.
-pub fn analyze_take(mic: Vec<f32>, sys: Vec<f32>) -> TakeAnalysis {
+/// the check needs from all three. Both streams as their WAVs hold them.
+pub fn analyze_take(mic: Vec<i16>, sys: Vec<i16>) -> TakeAnalysis {
     let cfg = DelayConfig::default();
     let mut points = delay::lag_track(&mic, &sys, RATE, &cfg);
     keep_agreeing(&mut points, cfg.step_ms);
@@ -322,15 +325,13 @@ pub fn analyze_take(mic: Vec<f32>, sys: Vec<f32>) -> TakeAnalysis {
         return TakeAnalysis { lag, echo: None };
     };
     let sys_active = at_mic(&sys_activity(&sys), mic.len().div_ceil(FRAME), &map);
-    let aec_cfg = AecConfig::default();
-    let reference = aec::align_reference(&sys, mic.len(), RATE, &map, aec_cfg.margin_ms);
+    let aec::Cancelled { cleaned, linear_energy, report } =
+        aec::cancel_threaded(&mic, &sys, &map, RATE, &AecConfig::default(), &Threading::default());
     drop(sys);
-    let aec::AecOutput { linear, cleaned, report, .. } = aec::cancel(&mic, &reference, RATE, &aec_cfg);
-    drop(reference);
     let echo = TakeEcho {
         sys_active,
         mic_energy: frame_energy(&mic),
-        linear_energy: frame_energy(&linear),
+        linear_energy,
         cleaned,
         cancel: report,
     };
@@ -338,7 +339,7 @@ pub fn analyze_take(mic: Vec<f32>, sys: Vec<f32>) -> TakeAnalysis {
 }
 
 /// Per 10 ms frame of `sys`: it sounds there.
-fn sys_activity(sys: &[f32]) -> Vec<bool> {
+fn sys_activity<S: Sample>(sys: &[S]) -> Vec<bool> {
     let energy = frame_energy(sys);
     let mut sorted = energy.clone();
     sorted.sort_by(f64::total_cmp);
@@ -351,8 +352,8 @@ fn sys_activity(sys: &[f32]) -> Vec<bool> {
 }
 
 /// Sum of squares per 10 ms frame, the last one partial.
-fn frame_energy(x: &[f32]) -> Vec<f64> {
-    x.chunks(FRAME).map(|c| c.iter().map(|&v| v as f64 * v as f64).sum()).collect()
+fn frame_energy<S: Sample>(x: &[S]) -> Vec<f64> {
+    x.chunks(FRAME).map(|c| c.iter().map(|&v| v.f() * v.f()).sum()).collect()
 }
 
 /// `sys_active` carried to the `frames` 10 ms frames of the mic: each reads
@@ -398,10 +399,15 @@ pub(crate) mod tests {
         scenario(&ScenarioConfig { levelled: true, ..cfg })
     }
 
+    /// A stream as the sidecar writes it.
+    fn pcm(x: &[f32]) -> Vec<i16> {
+        x.iter().map(|&v| echo_probe::sample::pcm16(v)).collect()
+    }
+
     #[test]
     fn finds_the_takes_own_lag_behind_an_inverting_echo() {
         let s = take(ScenarioConfig { lag_ms: 157.3, polarity: -1.0, ..Default::default() });
-        let analysis = analyze_take(s.mic, s.sys);
+        let analysis = analyze_take(pcm(&s.mic), pcm(&s.sys));
         let lag = analysis.lag.median_ms.expect("a lag");
         assert!((lag - 157.3).abs() < 0.5, "lag {lag}");
         assert!(analysis.echo.is_some());
@@ -410,7 +416,7 @@ pub(crate) mod tests {
     #[test]
     fn cancels_the_echo_out_of_the_mic_and_leaves_the_user_alone() {
         let s = take(ScenarioConfig { lag_ms: 323.0, polarity: -1.0, ..Default::default() });
-        let mut analysis = analyze_take(s.mic.clone(), s.sys.clone());
+        let mut analysis = analyze_take(pcm(&s.mic), pcm(&s.sys));
         let cleaned = analysis.take_cleaned().expect("an echo");
         assert_eq!(cleaned.len(), s.mic.len());
         // From 10 s on: the first pass converges, and a score over the opening
@@ -429,13 +435,34 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_short_take_reads_as_two_whole_passes_over_its_float_decoding_do() {
+        let s = take(ScenarioConfig { lag_ms: 323.0, polarity: -1.0, ..Default::default() });
+        let (mic, sys) = (pcm(&s.mic), pcm(&s.sys));
+        let decode = |x: &[i16]| x.iter().map(|&v| v.f() as f32).collect::<Vec<f32>>();
+        let (mic_f, sys_f) = (decode(&mic), decode(&sys));
+        let mut analysis = analyze_take(mic, sys);
+
+        let map = DelayMap::from_summary(&analysis.lag).expect("an echo");
+        let cfg = AecConfig::default();
+        let reference = aec::align_reference(&sys_f, mic_f.len(), RATE, &map, cfg.margin_ms);
+        let floats = aec::cancel(&mic_f, &reference, RATE, &cfg);
+        let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<u64>>();
+        let echo = analysis.echo.as_ref().expect("an echo");
+        assert!(bits(&echo.linear_energy) == bits(&frame_energy(&floats.linear)));
+        assert!(bits(&echo.mic_energy) == bits(&frame_energy(&mic_f)));
+        assert!(echo.sys_active == at_mic(&sys_activity(&sys_f), mic_f.len().div_ceil(FRAME), &map));
+        let cleaned: Vec<i16> = floats.cleaned.iter().map(|&v| echo_probe::sample::pcm16(v)).collect();
+        assert!(analysis.take_cleaned() == Some(cleaned));
+    }
+
+    #[test]
     fn a_take_with_no_echo_has_nothing_to_check() {
         // The user alone on the mic, the remote voices alone on sys: nothing
         // correlates the two, as on headphones.
         for seed in [1, 2, 3, 7] {
             let s = take(ScenarioConfig { seed, ..Default::default() });
             let mic: Vec<f32> = s.mic.iter().zip(&s.echo).map(|(m, e)| m - e).collect();
-            let analysis = analyze_take(mic, s.sys);
+            let analysis = analyze_take(pcm(&mic), pcm(&s.sys));
             assert_eq!(analysis.lag.valid, 0, "seed {seed}: {:?}", analysis.lag);
             assert!(analysis.echo.is_none());
         }
@@ -446,7 +473,7 @@ pub(crate) mod tests {
         let s = take(ScenarioConfig::default());
         let mic: Vec<f32> = s.mic.iter().zip(&s.echo).map(|(m, e)| m - e).collect();
         let segments = vec![seg(10.0, 14.0, "a"), seg(17.0, 20.0, "b")];
-        let (kept, report) = analyze_take(mic, s.sys).check(segments.clone());
+        let (kept, report) = analyze_take(pcm(&mic), pcm(&s.sys)).check(segments.clone());
         assert_eq!(kept, segments);
         assert!(report.cancel.is_none() && report.check.is_none());
     }
@@ -455,7 +482,7 @@ pub(crate) mod tests {
     fn the_dump_keeps_every_number_the_thresholds_are_revisited_by() {
         let s = take(ScenarioConfig { lag_ms: 323.0, polarity: -1.0, ..Default::default() });
         let segments = truth(&s);
-        let (_, report) = analyze_take(s.mic, s.sys).check(segments);
+        let (_, report) = analyze_take(pcm(&s.mic), pcm(&s.sys)).check(segments);
         let dump = serde_json::to_value(&report).unwrap();
         assert!(dump["lag"]["median_ms"].is_number(), "{dump}");
         assert!(dump["lag"]["steps"].is_array());
@@ -625,7 +652,7 @@ pub(crate) mod tests {
     fn reads_the_echo_voices_off_a_synthetic_take_and_keeps_the_user() {
         let s = take(ScenarioConfig { lag_ms: 323.0, polarity: -1.0, ..Default::default() });
         let segments = truth(&s);
-        let analysis = analyze_take(s.mic.clone(), s.sys.clone());
+        let analysis = analyze_take(pcm(&s.mic), pcm(&s.sys));
         let echo = analysis.echo.expect("an echo");
         let check = check_voices(&segments, &echo.evidence());
         let verdict = |id: &str| check.voices.iter().find(|v| v.speaker_id == id).unwrap();

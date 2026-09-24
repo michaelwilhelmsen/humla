@@ -66,6 +66,7 @@ impl Mul for C64 {
 }
 
 /// A plan for one power-of-two size: twiddles and the bit-reversal table.
+#[derive(Clone)]
 pub struct Fft {
     n: usize,
     twiddles: Vec<C64>,

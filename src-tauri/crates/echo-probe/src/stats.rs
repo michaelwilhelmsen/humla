@@ -2,6 +2,8 @@
 //! always carries a few windows where the correlation locked onto the wrong
 //! peak, and one of those should not move an answer.
 
+use crate::sample::Sample;
+
 pub fn median(values: &[f64]) -> Option<f64> {
     if values.is_empty() {
         return None;
@@ -47,11 +49,11 @@ pub fn theil_sen(points: &[(f64, f64)]) -> Option<(f64, f64)> {
     Some((slope, median(&intercepts)?))
 }
 
-pub fn rms(x: &[f32]) -> f64 {
+pub fn rms<S: Sample>(x: &[S]) -> f64 {
     if x.is_empty() {
         return 0.0;
     }
-    (x.iter().map(|&v| v as f64 * v as f64).sum::<f64>() / x.len() as f64).sqrt()
+    (x.iter().map(|&v| v.f() * v.f()).sum::<f64>() / x.len() as f64).sqrt()
 }
 
 pub fn dbfs(rms: f64) -> f64 {

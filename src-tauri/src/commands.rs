@@ -2014,10 +2014,10 @@ impl EchoPass {
 struct CancelledMicWav(PathBuf);
 
 impl CancelledMicWav {
-    async fn write(samples: &[f32]) -> anyhow::Result<Self> {
+    async fn write(samples: &[i16]) -> anyhow::Result<Self> {
         // Held before the write, so a half-written file is removed too.
         let wav = Self(std::env::temp_dir().join(format!("humla-echo-{}.wav", uuid::Uuid::new_v4())));
-        wav::write_pcm16_mono_16k(&wav.0, samples).await?;
+        wav::write_i16_mono_16k(&wav.0, samples).await?;
         Ok(wav)
     }
 
@@ -2040,7 +2040,7 @@ async fn analyze_take_echo(
     sys: &std::path::Path,
 ) -> Option<crate::echo::TakeAnalysis> {
     let (mic_samples, sys_samples) =
-        match tokio::try_join!(wav::read_f32_mono_16k(mic), wav::read_f32_mono_16k(sys)) {
+        match tokio::try_join!(wav::read_i16_mono_16k(mic), wav::read_i16_mono_16k(sys)) {
             Ok(both) => both,
             Err(e) => {
                 eprintln!("echo: can't read the take's streams ({e}); diarizing the mic as captured");
@@ -9206,12 +9206,12 @@ mod diarize_tests {
     async fn the_cancelled_mic_lives_in_the_temp_dir_only_as_long_as_the_diarize() {
         // Audio under `recordings/` or `diagnostics/` would sit outside
         // `keep_audio` and "Delete stored audio".
-        let wav = CancelledMicWav::write(&[0.1; 1600]).await.expect("written");
+        let wav = CancelledMicWav::write(&[3277; 1600]).await.expect("written");
         let path = wav.path().to_path_buf();
         assert!(path.starts_with(std::env::temp_dir()), "{}", path.display());
         assert!(!path.components().any(|c| c.as_os_str() == "no.humla.app"));
-        assert_eq!(wav::read_f32_mono_16k(&path).await.unwrap().len(), 1600);
-        let other = CancelledMicWav::write(&[0.0; 16]).await.unwrap();
+        assert_eq!(wav::read_i16_mono_16k(&path).await.unwrap(), vec![3277; 1600]);
+        let other = CancelledMicWav::write(&[0; 16]).await.unwrap();
         assert_ne!(other.path(), path, "two diarizes never share one file");
         drop(wav);
         assert!(!path.exists(), "gone once the diarize is done with it");

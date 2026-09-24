@@ -9,6 +9,7 @@
 //! the output path.
 
 use crate::fft::Fft;
+use crate::sample::Sample;
 
 /// xorshift64*: deterministic, so every test run hears the same take.
 pub struct Rng(u64);
@@ -426,14 +427,14 @@ pub fn scenario(cfg: &ScenarioConfig) -> Scenario {
 }
 
 /// Energy of `x` over the frames `mask` selects.
-pub fn masked_energy(x: &[f32], mask: &[bool]) -> f64 {
+pub fn masked_energy<S: Sample>(x: &[S], mask: &[bool]) -> f64 {
     mask.iter()
         .enumerate()
         .filter(|(_, &m)| m)
         .map(|(f, _)| {
             x[f * FRAME..((f + 1) * FRAME).min(x.len())]
                 .iter()
-                .map(|&v| v as f64 * v as f64)
+                .map(|&v| v.f() * v.f())
                 .sum::<f64>()
         })
         .sum()
