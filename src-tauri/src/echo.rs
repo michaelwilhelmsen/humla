@@ -1,4 +1,4 @@
-//! Keeps the speakers' echo out of the mic's voices (#196).
+//! Keeps the speakers' echo out of the mic's voices.
 //!
 //! When a call plays through the laptop's speakers the mic records every
 //! remote voice a second time, and the mic diarize hears that echo as people.
@@ -25,17 +25,14 @@ const NEIGHBOURS: usize = 3;
 /// The check reads the mic in 10 ms frames.
 const FRAME_MS: u64 = 10;
 
-/// A voice heard in sys silence less than half as often as the take is, is
-/// echo. Measured: echo voices 0.00–0.36, the user 0.67–3.55.
+/// A voice heard in sys silence less than half as often as the take is, is echo.
 const ECHO_RATIO: f64 = 0.5;
 
 /// A voice that lost this much of its energy to the linear canceller is echo.
-/// Measured: the user 0.9–3.8 dB (the top of it double talk), echo voices
-/// 5.1–26 dB.
 const ECHO_REMOVED_DB: f64 = 4.5;
 
 /// Below this much sys silence in a take, the share a voice is measured
-/// against is too thin to judge by. Test audio had about 8 s.
+/// against is too thin to judge by.
 const MIN_SYS_SILENCE_MS: u64 = 5_000;
 
 /// Sys sounds in a frame within this many dB of its 95th-percentile frame...
@@ -56,10 +53,7 @@ impl TakeAnalysis {
     /// `segments` — the take's mic voices — without the ones that read as
     /// echo, and what the diarize dump records of it.
     pub fn check(&self, segments: Vec<Segment>) -> (Vec<Segment>, EchoReport) {
-        let check = match &self.echo {
-            Some(echo) if !segments.is_empty() => Some(check_voices(&segments, &echo.evidence())),
-            _ => None,
-        };
+        let check = self.voice_check(&segments);
         let kept = match &check {
             Some(c) => c.keep(segments),
             None => segments,
@@ -67,8 +61,21 @@ impl TakeAnalysis {
         (kept, self.report(check))
     }
 
+    /// The mic with the echo cancelled out of it — the diarize input — when
+    /// there was an echo. Taken rather than lent, so it can be let go of as
+    /// soon as it is written.
+    pub fn take_cleaned(&mut self) -> Option<Vec<f32>> {
+        self.echo.as_mut().map(|e| std::mem::take(&mut e.cleaned))
+    }
+
+    /// `None` when there is no echo to check against, or no voice to check.
+    fn voice_check(&self, segments: &[Segment]) -> Option<VoiceCheck> {
+        let echo = self.echo.as_ref().filter(|_| !segments.is_empty())?;
+        Some(check_voices(segments, &echo.evidence()))
+    }
+
     /// What the diarize dump records of this take, with `check`'s verdicts.
-    pub fn report(&self, check: Option<VoiceCheck>) -> EchoReport {
+    fn report(&self, check: Option<VoiceCheck>) -> EchoReport {
         EchoReport {
             lag: self.lag.clone(),
             cancel: self.echo.as_ref().map(|e| e.cancel.clone()),
@@ -101,27 +108,22 @@ pub struct TakeEcho {
 }
 
 impl TakeEcho {
-    pub fn evidence(&self) -> Evidence<'_> {
+    fn evidence(&self) -> Evidence<'_> {
         Evidence {
             sys_active: &self.sys_active,
-            energy: Some((&self.mic_energy, &self.linear_energy)),
+            mic_energy: &self.mic_energy,
+            linear_energy: &self.linear_energy,
         }
-    }
-
-    /// The mic with the echo cancelled out of it — the diarize input. Taken
-    /// rather than lent, so it can be let go of as soon as it is written.
-    pub fn take_cleaned(&mut self) -> Vec<f32> {
-        std::mem::take(&mut self.cleaned)
     }
 }
 
 /// What the check reads, per 10 ms frame of the mic.
-pub struct Evidence<'a> {
+struct Evidence<'a> {
     /// The system stream sounds here, once shifted by the take's lag.
-    pub sys_active: &'a [bool],
-    /// The mic's energy here and the linear canceller's output's, when the
-    /// canceller ran.
-    pub energy: Option<(&'a [f64], &'a [f64])>,
+    sys_active: &'a [bool],
+    /// The mic's energy here, and the linear canceller's output's.
+    mic_energy: &'a [f64],
+    linear_energy: &'a [f64],
 }
 
 /// One mic voice as the check read it.
@@ -164,10 +166,10 @@ impl VoiceCheck {
 
 /// Which of `segments`' voices are echo.
 ///
-/// A person talks independently of sys, or in its pauses, so the share of
-/// their frames in sys silence is about the take's or more. An echo voice can
-/// only sound while sys does, so its share is near nothing.
-pub fn check_voices(segments: &[Segment], evidence: &Evidence) -> VoiceCheck {
+/// Someone in the room talks independently of sys, or in its pauses, so the
+/// share of their frames in sys silence is about the take's or more. An echo
+/// voice can only sound while sys does, so its share is near nothing.
+fn check_voices(segments: &[Segment], evidence: &Evidence) -> VoiceCheck {
     let frames = evidence.sys_active.len();
     let silent = evidence.sys_active.iter().filter(|a| !**a).count();
     let base = silent as f64 / frames.max(1) as f64;
@@ -188,7 +190,7 @@ pub fn check_voices(segments: &[Segment], evidence: &Evidence) -> VoiceCheck {
                 .count();
             let ratio = (base > 0.0).then(|| in_silence as f64 / heard as f64 / base);
             let energy_removed_db =
-                evidence.energy.and_then(|(mic, linear)| energy_removed(&on, mic, linear));
+                energy_removed(&on, evidence.mic_energy, evidence.linear_energy);
             // The energy only ever adds to what the ratio finds: on a mic the
             // canceller already cleaned, what is left of an echo voice is where
             // it removed little.
@@ -216,36 +218,47 @@ pub fn check_voices(segments: &[Segment], evidence: &Evidence) -> VoiceCheck {
     }
 }
 
-/// One take that had a system stream, inside a mic stream that joins several
-/// takes end to end: where it starts and ends there, in ms.
-pub struct TakeSpan<'a> {
+/// One take of a mic stream that joins several end to end.
+pub struct JoinedTake<'a> {
+    /// Where it starts in the joined stream, in ms. It ends where the next
+    /// one starts.
     pub start_ms: u64,
-    pub end_ms: u64,
-    pub evidence: Evidence<'a>,
+    /// `None` for a take with no system stream, which is never judged.
+    pub analysis: Option<&'a TakeAnalysis>,
 }
 
 /// The check over voices diarized from takes joined end to end. Each take
 /// judges the voices heard inside it against its own sys silence, so a voice
-/// that is echo in one take and a person in another is dropped only where it
-/// was echo. A take with no system stream isn't in `takes` and is never judged.
-pub fn check_joined(segments: &[Segment], takes: &[TakeSpan]) -> (Vec<Segment>, Vec<VoiceCheck>) {
+/// that is echo in one take and in the room in another is dropped only where
+/// it was echo. Returns the voices kept and, per take, what the dump records
+/// of it.
+pub fn check_joined(
+    segments: &[Segment],
+    takes: &[JoinedTake],
+) -> (Vec<Segment>, Vec<Option<EchoReport>>) {
+    let ends = takes.iter().skip(1).map(|t| t.start_ms).chain(std::iter::once(u64::MAX));
     let mut cuts: Vec<(u64, u64, String)> = Vec::new();
-    let mut checks = Vec::with_capacity(takes.len());
-    for take in takes {
-        let (start, end) = (take.start_ms, take.end_ms);
-        let local: Vec<Segment> = segments
-            .iter()
-            .filter(|s| s.start_ms < end && s.end_ms > start)
-            .map(|s| Segment {
-                start_ms: s.start_ms.max(start) - start,
-                end_ms: s.end_ms.min(end) - start,
-                speaker_id: s.speaker_id.clone(),
-            })
-            .collect();
-        let check = check_voices(&local, &take.evidence);
-        cuts.extend(check.voices.iter().filter(|v| v.dropped).map(|v| (start, end, v.speaker_id.clone())));
-        checks.push(check);
-    }
+    let reports = takes
+        .iter()
+        .zip(ends)
+        .map(|(take, end)| {
+            let analysis = take.analysis?;
+            let start = take.start_ms;
+            let local: Vec<Segment> = segments
+                .iter()
+                .filter(|s| s.start_ms < end && s.end_ms > start)
+                .map(|s| Segment {
+                    start_ms: s.start_ms.max(start) - start,
+                    end_ms: s.end_ms.min(end) - start,
+                    speaker_id: s.speaker_id.clone(),
+                })
+                .collect();
+            let check = analysis.voice_check(&local);
+            let dropped = check.iter().flat_map(|c| &c.voices).filter(|v| v.dropped);
+            cuts.extend(dropped.map(|v| (start, end, v.speaker_id.clone())));
+            Some(analysis.report(check))
+        })
+        .collect();
     let mut kept = Vec::with_capacity(segments.len());
     for s in segments {
         let mut pieces = vec![(s.start_ms, s.end_ms)];
@@ -265,7 +278,7 @@ pub fn check_joined(segments: &[Segment], takes: &[TakeSpan]) -> (Vec<Segment>, 
             speaker_id: s.speaker_id.clone(),
         }));
     }
-    (kept, checks)
+    (kept, reports)
 }
 
 /// How much of the mic's energy over the frames `on` marks the linear
@@ -324,9 +337,7 @@ pub fn analyze_take(mic: Vec<f32>, sys: Vec<f32>) -> TakeAnalysis {
     TakeAnalysis { lag, echo: Some(echo) }
 }
 
-/// Per 10 ms frame of `sys`: it sounds there. Taken from its own energy rather
-/// than from a diarize of it, because how an engine pads its segments decides
-/// how much silence is left to measure against.
+/// Per 10 ms frame of `sys`: it sounds there.
 fn sys_activity(sys: &[f32]) -> Vec<bool> {
     let energy = frame_energy(sys);
     let mut sorted = energy.clone();
@@ -377,7 +388,7 @@ fn keep_agreeing(points: &mut [LagPoint], tolerance_ms: f64) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use echo_probe::synth::{masked_energy, scenario, Scenario, ScenarioConfig};
 
@@ -400,7 +411,7 @@ mod tests {
     fn cancels_the_echo_out_of_the_mic_and_leaves_the_user_alone() {
         let s = take(ScenarioConfig { lag_ms: 323.0, polarity: -1.0, ..Default::default() });
         let mut analysis = analyze_take(s.mic.clone(), s.sys.clone());
-        let cleaned = analysis.echo.as_mut().expect("an echo").take_cleaned();
+        let cleaned = analysis.take_cleaned().expect("an echo");
         assert_eq!(cleaned.len(), s.mic.len());
         // From 10 s on: the first pass converges, and a score over the opening
         // would measure that rather than the filter.
@@ -430,6 +441,37 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_take_with_no_echo_keeps_its_voices_as_diarized() {
+        let s = take(ScenarioConfig::default());
+        let mic: Vec<f32> = s.mic.iter().zip(&s.echo).map(|(m, e)| m - e).collect();
+        let segments = vec![seg(10.0, 14.0, "a"), seg(17.0, 20.0, "b")];
+        let (kept, report) = analyze_take(mic, s.sys).check(segments.clone());
+        assert_eq!(kept, segments);
+        assert!(report.cancel.is_none() && report.check.is_none());
+    }
+
+    #[test]
+    fn the_dump_keeps_every_number_the_thresholds_are_revisited_by() {
+        let s = take(ScenarioConfig { lag_ms: 323.0, polarity: -1.0, ..Default::default() });
+        let segments = truth(&s);
+        let (_, report) = analyze_take(s.mic, s.sys).check(segments);
+        let dump = serde_json::to_value(&report).unwrap();
+        assert!(dump["lag"]["median_ms"].is_number(), "{dump}");
+        assert!(dump["lag"]["steps"].is_array());
+        assert!(dump["cancel"]["erle_linear_db"].is_number());
+        assert!(dump["cancel"]["erle_db"].is_number());
+        let voices = dump["check"]["voices"].as_array().unwrap();
+        assert_eq!(voices.len(), 3);
+        for v in voices {
+            for key in ["seconds", "ratio", "energy_removed_db"] {
+                assert!(v[key].is_number(), "{key} in {v}");
+            }
+            assert!(v["dropped"].is_boolean() && v["speaker_id"].is_string());
+        }
+        assert!(dump["check"]["sys_silent_s"].is_number());
+    }
+
     fn seg(start_s: f64, end_s: f64, id: &str) -> Segment {
         Segment {
             start_ms: (start_s * 1000.0) as u64,
@@ -438,14 +480,31 @@ mod tests {
         }
     }
 
-    /// Per 10 ms frame of a `len_s` take: sys sounds inside `spans`.
-    fn active(len_s: f64, spans: &[(f64, f64)]) -> Vec<bool> {
-        (0..(len_s * 100.0) as usize)
+    /// What the check reads of a `len_s` take whose sys sounds inside `spans`
+    /// (seconds), when the canceller took nothing from any voice.
+    fn sys_sounding(len_s: f64, spans: &[(f64, f64)]) -> TakeEcho {
+        let sys_active: Vec<bool> = (0..(len_s * 100.0) as usize)
             .map(|f| {
                 let t = f as f64 / 100.0;
                 spans.iter().any(|&(a, b)| t >= a && t < b)
             })
-            .collect()
+            .collect();
+        let flat = vec![1.0; sys_active.len()];
+        TakeEcho {
+            sys_active,
+            mic_energy: flat.clone(),
+            linear_energy: flat,
+            cleaned: Vec::new(),
+            cancel: AecReport::default(),
+        }
+    }
+
+    /// A take analysed as having an echo, with [`sys_sounding`]'s evidence.
+    pub(crate) fn echoed_take(len_s: f64, spans: &[(f64, f64)]) -> TakeAnalysis {
+        TakeAnalysis {
+            lag: delay::summarize(&[], &DelayConfig::default()),
+            echo: Some(sys_sounding(len_s, spans)),
+        }
     }
 
     fn ids(segments: &[Segment]) -> Vec<&str> {
@@ -459,7 +518,7 @@ mod tests {
     fn drops_the_echo_voice_and_keeps_both_room_voices() {
         // Sys sounds for 40 of 60 s. Two people in the room talk in its pauses
         // and over it; the echo only ever sounds while it does.
-        let sys_active = active(60.0, &[(0.0, 20.0), (30.0, 50.0)]);
+        let echo = sys_sounding(60.0, &[(0.0, 20.0), (30.0, 50.0)]);
         let segments = vec![
             seg(1.0, 4.0, "echo"),
             seg(5.0, 8.0, "anna"),
@@ -468,7 +527,7 @@ mod tests {
             seg(35.0, 40.0, "bjorn"),
             seg(52.0, 58.0, "bjorn"),
         ];
-        let check = check_voices(&segments, &Evidence { sys_active: &sys_active, energy: None });
+        let check = check_voices(&segments, &echo.evidence());
         let dropped: Vec<&str> =
             check.voices.iter().filter(|v| v.dropped).map(|v| v.speaker_id.as_str()).collect();
         assert_eq!(dropped, vec!["echo"]);
@@ -479,9 +538,9 @@ mod tests {
     fn keeps_every_voice_when_all_of_them_read_as_echo() {
         // Community-1 merges the user and the echo into one voice, mostly
         // echo. No check can split it, and dropping it would leave nobody.
-        let sys_active = active(60.0, &[(0.0, 50.0)]);
+        let echo = sys_sounding(60.0, &[(0.0, 50.0)]);
         let segments = vec![seg(0.0, 48.0, "merged"), seg(50.5, 51.0, "merged"), seg(10.0, 20.0, "echo")];
-        let check = check_voices(&segments, &Evidence { sys_active: &sys_active, energy: None });
+        let check = check_voices(&segments, &echo.evidence());
         assert!(check.voices.iter().all(|v| v.ratio.unwrap() < 0.5), "{check:?}");
         assert!(check.voices.iter().all(|v| !v.dropped), "{check:?}");
         assert!(check.kept_all);
@@ -492,16 +551,16 @@ mod tests {
     fn judges_nothing_when_sys_is_silent_for_under_five_seconds() {
         // 4 s of silence in a minute: a share too thin to measure a voice
         // against, however clearly one reads as echo.
-        let sys_active = active(60.0, &[(0.0, 30.0), (34.0, 60.0)]);
+        let echo = sys_sounding(60.0, &[(0.0, 30.0), (34.0, 60.0)]);
         let segments = vec![seg(1.0, 20.0, "echo"), seg(30.0, 34.0, "user"), seg(40.0, 45.0, "user")];
-        let check = check_voices(&segments, &Evidence { sys_active: &sys_active, energy: None });
+        let check = check_voices(&segments, &echo.evidence());
         assert!(check.skipped);
         assert!((check.sys_silent_s - 4.0).abs() < 0.05, "{}", check.sys_silent_s);
         assert!(check.voices.iter().all(|v| !v.dropped), "{check:?}");
         assert_eq!(check.keep(segments.clone()).len(), 3);
 
-        let sys_active = active(60.0, &[(0.0, 30.0), (36.0, 60.0)]);
-        let check = check_voices(&segments, &Evidence { sys_active: &sys_active, energy: None });
+        let echo = sys_sounding(60.0, &[(0.0, 30.0), (36.0, 60.0)]);
+        let check = check_voices(&segments, &echo.evidence());
         assert!(!check.skipped);
         assert!(check.voices.iter().any(|v| v.dropped), "{check:?}");
     }
@@ -511,26 +570,21 @@ mod tests {
         // Per voice, how much of the mic's energy the linear canceller took:
         // the user little, a 1 s echo fragment that happens to sit in a sys
         // pause a lot, and an echo voice the cancelled mic under-reads.
-        let sys_active = active(60.0, &[(0.0, 20.0), (30.0, 50.0)]);
+        let mut echo = sys_sounding(60.0, &[(0.0, 20.0), (30.0, 50.0)]);
         let segments = vec![
             seg(16.0, 19.0, "user"),
             seg(20.5, 28.0, "user"),
             seg(1.0, 15.0, "echo"),
             seg(51.0, 52.0, "fragment"),
         ];
-        let mic = vec![1.0; 6000];
-        let mut linear = mic.clone();
         for (id, removed_db) in [("user", 1.0), ("fragment", 5.2), ("echo", 3.0)] {
             for s in segments.iter().filter(|s| s.speaker_id == id) {
                 for f in (s.start_ms / 10) as usize..(s.end_ms / 10) as usize {
-                    linear[f] = 10f64.powf(-removed_db / 10.0);
+                    echo.linear_energy[f] = 10f64.powf(-removed_db / 10.0);
                 }
             }
         }
-        let check = check_voices(
-            &segments,
-            &Evidence { sys_active: &sys_active, energy: Some((&mic, &linear)) },
-        );
+        let check = check_voices(&segments, &echo.evidence());
         let verdict = |id: &str| check.voices.iter().find(|v| v.speaker_id == id).unwrap();
         assert!(!verdict("user").dropped, "{check:?}");
         assert!((verdict("user").energy_removed_db.unwrap() - 1.0).abs() < 0.05);
@@ -590,7 +644,7 @@ mod tests {
         // her voice reached the mic only while sys sounded. Take 2 (60–120 s)
         // was in person — she sat at the laptop — and has no system stream,
         // so it is not checked at all. One segment runs across the join.
-        let sys_active = active(60.0, &[(0.0, 20.0), (30.0, 50.0)]);
+        let call = echoed_take(60.0, &[(0.0, 20.0), (30.0, 50.0)]);
         let segments = vec![
             seg(1.0, 15.0, "hege"),
             seg(21.0, 29.0, "user"),
@@ -600,14 +654,14 @@ mod tests {
             seg(80.0, 100.0, "hege"),
             seg(101.0, 110.0, "user"),
         ];
-        let takes = [TakeSpan {
-            start_ms: 0,
-            end_ms: 60_000,
-            evidence: Evidence { sys_active: &sys_active, energy: None },
-        }];
-        let (kept, checks) = check_joined(&segments, &takes);
-        assert_eq!(checks.len(), 1);
-        assert!(checks[0].voices.iter().any(|v| v.speaker_id == "hege" && v.dropped), "{checks:?}");
+        let takes = [
+            JoinedTake { start_ms: 0, analysis: Some(&call) },
+            JoinedTake { start_ms: 60_000, analysis: None },
+        ];
+        let (kept, reports) = check_joined(&segments, &takes);
+        let check = reports[0].as_ref().and_then(|r| r.check.as_ref()).expect("take 1 judged");
+        assert!(check.voices.iter().any(|v| v.speaker_id == "hege" && v.dropped), "{check:?}");
+        assert!(reports[1].is_none(), "take 2 has no system stream to judge by");
         let hege: Vec<(u64, u64)> = kept
             .iter()
             .filter(|s| s.speaker_id == "hege")

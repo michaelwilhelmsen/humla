@@ -1257,6 +1257,12 @@ const CASES: Record<string, Scenario> = {
     index: 1,
     count: 2,
   }),
+  "recbar-echo": recBarCase(414, { phase: "diarizing", step: "removing_echo" }),
+  "recbar-echo-summary": recBarCase(380, {
+    phase: "diarizing",
+    step: "removing_echo",
+    summarizing: true,
+  }),
   "recbar-diarizing-2of2": recBarCase(414, {
     phase: "diarizing",
     step: "diarizing",

@@ -24,7 +24,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 #
 # echo-probe measures stream alignment and echo (see
 # docs/research/stream-alignment-and-echo.md). Its `delay` and `aec` modules are
-# also what the app's echo pass runs (#196); its CLI is built only when asked
+# also what the app's echo pass runs; its CLI is built only when asked
 # for: `cargo run --release -p echo-probe -- …`.
 [workspace]
 members = ["crates/cloud-sync", "crates/echo-probe"]
@@ -77,7 +77,7 @@ keyring = { version = "3", default-features = false, features = ["apple-native"]
 cloud-sync = { path = "crates/cloud-sync", optional = true }
 rmcp = { version = "3", default-features = false, features = ["server", "transport-io", "macros"] }
 # The lag of the mic behind the system stream and the echo canceller, for the
-# diarize input (#196). No DSP dependencies of its own.
+# diarize input. No DSP dependencies of its own.
 echo-probe = { path = "crates/echo-probe" }
 
 [dev-dependencies]

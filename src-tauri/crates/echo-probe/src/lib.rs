@@ -2,8 +2,8 @@
 //! cancels the system audio's echo out of the mic, offline.
 //!
 //! The CLI is a measurement tool, and it reads and writes WAVs only where it is
-//! pointed. The app's echo pass (#196, `src-tauri/src/echo.rs`) runs [`delay`]
-//! and [`aec`] in memory. See `docs/research/stream-alignment-and-echo.md` for
+//! pointed. The app's echo pass (`src-tauri/src/echo.rs`) runs [`delay`] and
+//! [`aec`] in memory. See `docs/research/stream-alignment-and-echo.md` for
 //! what it is for and how to read what it prints.
 //!
 //! - [`delay`] — GCC-PHAT lag of the mic behind the system stream, per window,

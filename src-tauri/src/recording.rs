@@ -262,8 +262,7 @@ pub enum Step {
     /// tens of megabytes per stream.
     SavingAudio,
     /// Estimating where the speakers' echo lands in the mic and taking it out,
-    /// before a take with a system stream is diarized (#196). About a minute
-    /// per hour of audio, once per take.
+    /// before a take with a system stream is diarized. Once per take.
     RemovingEcho,
     /// One diarize sidecar pass per stream that carried speech. Two on a
     /// hybrid capture, run sequentially because the mic's speaker-count hint
@@ -441,7 +440,9 @@ fn take_steps(take: TakeShape) -> Vec<StepReport> {
 /// take's echo out, a take at a time, then each joined stream diarized.
 #[cfg(test)]
 fn unify_steps(echo_takes: u32, streams: u32) -> Vec<StepReport> {
-    let mut out = stream_reports(Step::RemovingEcho, echo_takes);
+    let mut out: Vec<StepReport> = (1..=echo_takes)
+        .map(|k| StepReport::counted(Step::RemovingEcho, k, echo_takes))
+        .collect();
     out.extend(stream_reports(Step::MatchingSpeakers, streams));
     out
 }
@@ -853,10 +854,14 @@ pub struct StopTimings {
     pub diagnostics_path: Option<PathBuf>,
 }
 
+/// A timing for a summary line, `-` for a step that didn't run.
+fn or_dash(ms: Option<u64>) -> String {
+    ms.map(|v| v.to_string()).unwrap_or_else(|| "-".into())
+}
+
 impl StopTimings {
     /// One-line stderr summary of the chain, printed on every stop.
     pub fn summary(&self) -> String {
-        let opt = |v: Option<u64>| v.map(|v| v.to_string()).unwrap_or_else(|| "-".into());
         format!(
             "stop timings: total={}ms sidecar={} reader={} drain={} ({} pending) keep_audio={} detect_lang={} echo={} diarize_mic={} diarize_sys={} playback={} finalize={} unify={} unify_echo={} cleanup={}",
             self.total_ms,
@@ -866,13 +871,13 @@ impl StopTimings {
             self.drain_pending_chunks,
             self.keep_audio_ms,
             self.detect_language_ms,
-            opt(self.echo_ms),
-            opt(self.diarize_mic_ms),
-            opt(self.diarize_sys_ms),
+            or_dash(self.echo_ms),
+            or_dash(self.diarize_mic_ms),
+            or_dash(self.diarize_sys_ms),
             self.playback_assets_ms,
             self.finalize_session_ms,
             self.unify_ms,
-            opt(self.unify_echo_ms),
+            or_dash(self.unify_echo_ms),
             self.temp_cleanup_ms,
         )
     }
@@ -890,12 +895,10 @@ pub struct ReplayTakeTimings {
     pub audio_ms: u64,
     pub transcribe_ms: u64,
     pub diarize_ms: u64,
-    /// The echo pass and the mixed `playback.wav` write, which `diarize_ms`
-    /// covers the rest of. Rows of their own because each is its own named
-    /// step and runs sample by sample over the whole take. The echo pass runs
-    /// only beside a system stream, and is absent otherwise.
+    /// The echo pass, inside `diarize_ms`. Absent without a system stream.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub echo_ms: Option<u64>,
+    /// The mixed `playback.wav` write, inside `diarize_ms`.
     pub playback_ms: u64,
 }
 
@@ -915,7 +918,6 @@ pub struct ReplayTimings {
 impl ReplayTimings {
     /// One-line stderr summary of the run, printed once however it ends.
     pub fn summary(&self) -> String {
-        let opt = |v: Option<u64>| v.map(|v| v.to_string()).unwrap_or_else(|| "-".into());
         let takes: Vec<String> = self
             .takes
             .iter()
@@ -927,7 +929,7 @@ impl ReplayTimings {
                     t.audio_ms,
                     t.transcribe_ms,
                     t.diarize_ms,
-                    opt(t.echo_ms),
+                    or_dash(t.echo_ms),
                     t.playback_ms
                 )
             })
@@ -936,7 +938,7 @@ impl ReplayTimings {
             "replay timings: total={}ms unify={} unify_echo={} takes={} {}",
             self.total_ms,
             self.unify_ms,
-            opt(self.unify_echo_ms),
+            or_dash(self.unify_echo_ms),
             self.takes.len(),
             takes.join(" ")
         )
