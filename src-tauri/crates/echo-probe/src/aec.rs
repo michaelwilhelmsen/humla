@@ -415,10 +415,13 @@ pub fn cancel(mic: &[f32], reference: &[f32], rate: u32, cfg: &AecConfig) -> Aec
     let blocks = len.div_ceil(b);
     let get = |v: &[f32], i: usize| if i < v.len() { v[i] as f64 } else { 0.0 };
     let mut mdf = Mdf::new(b, p, rate as f64);
-    let mut e = vec![0.0f64; blocks * b];
-    let mut y = vec![0.0f64; blocks * b];
+    // Whole-take buffers are f32 — an hour of them in f64 is gigabytes — while
+    // every block is computed in f64.
+    let mut e = vec![0.0f32; blocks * b];
+    let mut y = vec![0.0f32; blocks * b];
     let mut leak = vec![0.0f64; blocks];
     let (mut d_blk, mut x_blk) = (vec![0.0; b], vec![0.0; b]);
+    let (mut e_blk, mut y_blk) = (vec![0.0; b], vec![0.0; b]);
     for pass in 0..cfg.passes.max(1) {
         if pass > 0 {
             mdf.reset_history();
@@ -428,7 +431,11 @@ pub fn cancel(mic: &[f32], reference: &[f32], rate: u32, cfg: &AecConfig) -> Aec
                 d_blk[i] = get(mic, blk * b + i);
                 x_blk[i] = get(reference, blk * b + i);
             }
-            mdf.process(&d_blk, &x_blk, &mut e[blk * b..(blk + 1) * b], &mut y[blk * b..(blk + 1) * b]);
+            mdf.process(&d_blk, &x_blk, &mut e_blk, &mut y_blk);
+            for i in 0..b {
+                e[blk * b + i] = e_blk[i] as f32;
+                y[blk * b + i] = y_blk[i] as f32;
+            }
             leak[blk] = mdf.leak;
         }
     }
@@ -447,9 +454,9 @@ pub fn cancel(mic: &[f32], reference: &[f32], rate: u32, cfg: &AecConfig) -> Aec
         let sum = |v: &dyn Fn(usize) -> f64| range.clone().map(v).sum::<f64>();
         let sdd = sum(&|i| (mic[i] as f64).powi(2));
         let sxx = sum(&|i| get(reference, i).powi(2));
-        let syy = sum(&|i| y[i] * y[i]);
-        let see = sum(&|i| e[i] * e[i]);
-        let scc = sum(&|i| cleaned[i] * cleaned[i]);
+        let syy = sum(&|i| (y[i] as f64).powi(2));
+        let see = sum(&|i| (e[i] as f64).powi(2));
+        let scc = sum(&|i| (cleaned[i] as f64).powi(2));
         if sxx > level(-60.0) {
             erl_y += syy;
             erl_x += sxx;
@@ -472,19 +479,14 @@ pub fn cancel(mic: &[f32], reference: &[f32], rate: u32, cfg: &AecConfig) -> Aec
     r.near_change_db = db_ratio(near_c, near_d);
     r.leak_median = median(&leak);
 
-    AecOutput {
-        linear: e.iter().map(|&v| v as f32).collect(),
-        cleaned: cleaned.iter().map(|&v| v as f32).collect(),
-        echo: y.iter().map(|&v| v as f32).collect(),
-        report: r,
-    }
+    AecOutput { linear: e, cleaned, echo: y, report: r }
 }
 
 /// Stage 3: a decision-directed Wiener gain per bin, against the residual
 /// echo the filter predicts it left (leak × echo estimate), held over a short
 /// decay for the reverberation beyond the filter. Weighted overlap-add with
 /// square-root Hann windows, so a gain of 1 everywhere returns `e` exactly.
-fn suppress(e: &[f64], y: &[f64], leak: &[f64], block: usize, cfg: &AecConfig) -> Vec<f64> {
+fn suppress(e: &[f32], y: &[f32], leak: &[f64], block: usize, cfg: &AecConfig) -> Vec<f32> {
     const ALPHA: f64 = 0.9;
     const DECAY: f64 = 0.5;
     let l = 2 * block;
@@ -497,13 +499,17 @@ fn suppress(e: &[f64], y: &[f64], leak: &[f64], block: usize, cfg: &AecConfig) -
     let bins = l / 2 + 1;
     let (mut r_prev, mut post_prev) = (vec![0.0; bins], vec![0.0; bins]);
     let len = e.len();
-    let mut out = vec![0.0; len];
+    let mut out = vec![0.0f32; len];
     let (mut ef, mut yf) = (vec![C64::ZERO; l], vec![C64::ZERO; l]);
     for f in 0..len / h + 2 {
         let start = f as isize * h as isize - h as isize;
         for i in 0..l {
             let at = start + i as isize;
-            let (ev, yv) = if at >= 0 && (at as usize) < len { (e[at as usize], y[at as usize]) } else { (0.0, 0.0) };
+            let (ev, yv) = if at >= 0 && (at as usize) < len {
+                (e[at as usize] as f64, y[at as usize] as f64)
+            } else {
+                (0.0, 0.0)
+            };
             ef[i] = C64::new(ev * win[i], 0.0);
             yf[i] = C64::new(yv * win[i], 0.0);
         }
@@ -532,7 +538,7 @@ fn suppress(e: &[f64], y: &[f64], leak: &[f64], block: usize, cfg: &AecConfig) -
         for i in 0..l {
             let at = start + i as isize;
             if at >= 0 && (at as usize) < len {
-                out[at as usize] += ef[i].re * win[i];
+                out[at as usize] += (ef[i].re * win[i]) as f32;
             }
         }
     }
@@ -646,11 +652,11 @@ mod tests {
 
     #[test]
     fn suppression_with_unit_gain_is_transparent() {
-        let e: Vec<f64> = (0..10_000).map(|i| ((i * 31) % 97) as f64 / 97.0 - 0.5).collect();
+        let e: Vec<f32> = (0..10_000).map(|i| ((i * 31) % 97) as f32 / 97.0 - 0.5).collect();
         let y = vec![0.0; e.len()];
         let out = suppress(&e, &y, &vec![0.1; 40], 256, &AecConfig::default());
         for (a, b) in out.iter().zip(&e) {
-            assert!((a - b).abs() < 1e-9);
+            assert!((a - b).abs() < 1e-6);
         }
     }
 }

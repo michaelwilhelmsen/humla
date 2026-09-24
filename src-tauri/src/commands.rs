@@ -684,7 +684,7 @@ async fn rediarize_apply_to_chunks(
             // for why the hint is worth more on the mic, and the echo pass
             // first. Mirrors `diarize_and_apply`'s hybrid branch; change both
             // together.
-            let echo = EchoPass::run(&app, progress, mic_wav.as_deref(), sys_wav.as_deref()).await;
+            let mut echo = EchoPass::run(&app, progress, mic_wav.as_deref(), sys_wav.as_deref()).await;
             let mut diarize_steps = StreamSteps::new(
                 &app,
                 progress,
@@ -710,7 +710,7 @@ async fn rediarize_apply_to_chunks(
             );
             let mic_segments = if let Some(p) = mic_wav.as_ref() {
                 diarize_steps.begin();
-                diarize_and_maybe_clean(&app, p, mic_speaker_hint, engine, thresholds)
+                diarize_and_maybe_clean(&app, echo.mic_input(p), mic_speaker_hint, engine, thresholds)
                     .await
                     .unwrap_or_else(|e| {
                         eprintln!("rediarize: mic diarize failed ({e}), mic falls back to You");
@@ -720,6 +720,7 @@ async fn rediarize_apply_to_chunks(
                 eprintln!("rediarize hybrid: no saved mic.wav, mic falls back to You");
                 Vec::new()
             };
+            echo.release_cancelled_mic();
             eprintln!(
                 "rediarize hybrid: mic resolved to {} voice(s)",
                 distinct_speaker_count(&mic_segments)
@@ -1954,6 +1955,8 @@ async fn timed_diarize(
 /// the echo out with.
 struct EchoPass {
     analysis: Option<crate::echo::TakeAnalysis>,
+    /// The mic with the echo cancelled out, for the mic diarize to read.
+    cancelled: Option<CancelledMicWav>,
     /// What the step cost, when it ran.
     ms: Option<u64>,
 }
@@ -1966,12 +1969,32 @@ impl EchoPass {
         sys: Option<&std::path::Path>,
     ) -> Self {
         let (Some(mic), Some(sys)) = (mic, sys) else {
-            return Self { analysis: None, ms: None };
+            return Self { analysis: None, cancelled: None, ms: None };
         };
         progress.step(app, Step::RemovingEcho);
         let t = std::time::Instant::now();
-        let analysis = analyze_take_echo(mic, sys).await;
-        Self { analysis, ms: Some(ms_since(t)) }
+        let mut analysis = analyze_take_echo(mic, sys).await;
+        let cancelled = match analysis.as_mut().and_then(|a| a.echo.as_mut()) {
+            Some(echo) => match CancelledMicWav::write(&echo.take_cleaned()).await {
+                Ok(wav) => Some(wav),
+                Err(e) => {
+                    eprintln!("echo: can't write the cancelled mic ({e}); diarizing the mic as captured");
+                    None
+                }
+            },
+            None => None,
+        };
+        Self { analysis, cancelled, ms: Some(ms_since(t)) }
+    }
+
+    /// What the mic diarize reads: the cancelled mic, when there is one.
+    fn mic_input<'a>(&'a self, captured: &'a std::path::Path) -> &'a std::path::Path {
+        self.cancelled.as_ref().map_or(captured, |wav| wav.path())
+    }
+
+    /// The mic diarize has read the cancelled mic, so nothing keeps it.
+    fn release_cancelled_mic(&mut self) {
+        self.cancelled = None;
     }
 
     /// The mic's voices without the ones that read as echo, and what the
@@ -1988,6 +2011,30 @@ impl EchoPass {
             log_echo_check(check);
         }
         (kept, Some(report))
+    }
+}
+
+/// A cancelled mic written for the diarize sidecar to read. It lives in the
+/// system temp dir and goes when dropped: a WAV under `recordings/` or
+/// `diagnostics/` would sit outside `keep_audio` and "Delete stored audio".
+struct CancelledMicWav(PathBuf);
+
+impl CancelledMicWav {
+    async fn write(samples: &[f32]) -> anyhow::Result<Self> {
+        // Held before the write, so a half-written file is removed too.
+        let wav = Self(std::env::temp_dir().join(format!("humla-echo-{}.wav", uuid::Uuid::new_v4())));
+        wav::write_pcm16_mono_16k(&wav.0, samples).await?;
+        Ok(wav)
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for CancelledMicWav {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
     }
 }
 
@@ -4766,7 +4813,7 @@ async fn diarize_and_apply(
             // Before either, the echo pass: the speakers' echo on the mic is
             // heard as extra voices, which the check drops before numbering.
             // Mirrors `rediarize_apply_to_chunks`' hybrid branch; change both.
-            let echo = EchoPass::run(&app, progress, mic_wav.as_deref(), sys_wav.as_deref()).await;
+            let mut echo = EchoPass::run(&app, progress, mic_wav.as_deref(), sys_wav.as_deref()).await;
             record_timing(clock, |x| x.echo_ms = echo.ms);
             let mut diarize_steps = StreamSteps::new(
                 &app,
@@ -4808,7 +4855,7 @@ async fn diarize_and_apply(
                 }
                 Some(wav) => {
                     diarize_steps.begin();
-                    timed_diarize(&app, &wav, mic_speaker_hint, engine, thresholds, clock, ChunkSource::Mic)
+                    timed_diarize(&app, echo.mic_input(&wav), mic_speaker_hint, engine, thresholds, clock, ChunkSource::Mic)
                         .await
                         .unwrap_or_else(|e| {
                             eprintln!("diarize: hybrid mic diarize failed ({e}), mic falls back to You");
@@ -4816,6 +4863,7 @@ async fn diarize_and_apply(
                         })
                 }
             };
+            echo.release_cancelled_mic();
             if mic_segments.is_empty() && sys_segments.is_empty() {
                 emit_error(
                     &app,
@@ -6242,7 +6290,6 @@ async fn unify_apply(
     // neither concat can hit a missing file and misalign the offsets.
     let mic_takes: Vec<&UnifyCandidate> =
         unifiable.iter().filter(|c| c.mode != SessionMode::SysOnly).collect();
-    let mic_paths: Vec<PathBuf> = mic_takes.iter().map(|c| c.dir.join("mic.wav")).collect();
     let sys_paths: Vec<PathBuf> = unifiable
         .iter()
         .filter(|c| c.mode != SessionMode::MicOnly)
@@ -6250,29 +6297,15 @@ async fn unify_apply(
         .collect();
     let mic_concat = tmp.join("mic-concat.wav");
     let sys_concat = tmp.join("sys-concat.wav");
-    // Each hybrid take's echo pass, a take at a time, before the takes are
-    // joined: every take's lag is its own (#196). `session_unifiable` has
-    // already made sure a hybrid take kept both streams.
-    let hybrid_takes: Vec<usize> = (0..mic_takes.len())
-        .filter(|&i| mic_takes[i].mode == SessionMode::Hybrid)
-        .collect();
-    let mut echo_steps =
-        StreamSteps::new(app, progress, Step::RemovingEcho, &vec![true; hybrid_takes.len()]);
-    let t_echo = std::time::Instant::now();
-    let mut echoes: Vec<(usize, Option<crate::echo::TakeAnalysis>)> = Vec::new();
-    for &i in &hybrid_takes {
-        echo_steps.begin();
-        let dir = &mic_takes[i].dir;
-        echoes.push((i, analyze_take_echo(&dir.join("mic.wav"), &dir.join("sys.wav")).await));
-    }
-    let echo_ms = (!hybrid_takes.is_empty()).then(|| ms_since(t_echo));
-    // Named a stream at a time: each stream's concat and its diarize are
-    // announced together, so the label names the work actually running.
+    let JoinedMic { offsets: mic_offsets, echoes, echo_ms } =
+        join_mic_takes(app, progress, &mic_takes, &mic_concat).await?;
+    // Named a stream at a time: each stream's diarize is announced on its own,
+    // so the label names the work actually running.
     let mut unify_steps = StreamSteps::new(
         app,
         progress,
         Step::MatchingSpeakers,
-        &[!mic_paths.is_empty(), !sys_paths.is_empty()],
+        &[!mic_takes.is_empty(), !sys_paths.is_empty()],
     );
     // Same speaker-count hint semantics as the per-take pass. With no system
     // stream in play the note's expected_speakers applies to the mic directly
@@ -6280,10 +6313,9 @@ async fn unify_apply(
     // so the mic goes in unhinted and the sys stream is asked for whatever the
     // mic didn't account for. Sortformer's 4-speaker cap applies to the
     // combined audio exactly as it does to a single take — no special-casing.
-    if !mic_paths.is_empty() {
+    if !mic_takes.is_empty() {
         unify_steps.begin();
     }
-    let mic_offsets = concat_wavs(&mic_paths, &mic_concat).await?;
     let mic_hint = if sys_paths.is_empty() {
         expected_speakers
     } else {
@@ -6297,7 +6329,7 @@ async fn unify_apply(
         unify_steps.begin();
     }
     let sys_offsets = concat_wavs(&sys_paths, &sys_concat).await?;
-    let sys_hint = if mic_paths.is_empty() {
+    let sys_hint = if mic_takes.is_empty() {
         expected_speakers
     } else {
         expected_speakers
@@ -6339,7 +6371,7 @@ async fn unify_apply(
     let sessions_in: Vec<UnifySession> = unifiable
         .iter()
         .map(|c| {
-            // Must mirror `mic_paths` / `sys_paths` above exactly — these
+            // Must mirror `mic_takes` / `sys_paths` above exactly — these
             // offsets are consumed in the same order the concat was built, so a
             // filter that disagrees shifts every later session's segment
             // lookups into the wrong take's audio.
@@ -6392,6 +6424,57 @@ async fn unify_apply(
     Ok(UnifyCosts { echo_ms })
 }
 
+/// The unify pass's joined mic stream, as [`join_mic_takes`] wrote it.
+struct JoinedMic {
+    /// Where each mic take starts in it, in ms; `None` when no take has a mic.
+    offsets: Option<Vec<u64>>,
+    /// `(i, analysis)` for each hybrid take, `i` its place among the mic takes.
+    echoes: Vec<(usize, Option<crate::echo::TakeAnalysis>)>,
+    /// What the echo passes cost; `None` when no take had a system stream.
+    echo_ms: Option<u64>,
+}
+
+/// Joins the mic takes end to end into `out`: each hybrid take's mic with its
+/// echo cancelled out, a take at a time since every take's lag is its own, and
+/// every other take's mic as captured. `session_unifiable` has made sure a
+/// hybrid take kept both streams.
+async fn join_mic_takes(
+    app: &AppHandle,
+    progress: &ChainProgress,
+    mic_takes: &[&UnifyCandidate],
+    out: &std::path::Path,
+) -> anyhow::Result<JoinedMic> {
+    if mic_takes.is_empty() {
+        return Ok(JoinedMic { offsets: None, echoes: Vec::new(), echo_ms: None });
+    }
+    let hybrid = mic_takes.iter().filter(|c| c.mode == SessionMode::Hybrid).count();
+    let mut echo_steps = StreamSteps::new(app, progress, Step::RemovingEcho, &vec![true; hybrid]);
+    let mut joined: Vec<f32> = Vec::new();
+    let mut counts = Vec::with_capacity(mic_takes.len());
+    let mut echoes = Vec::new();
+    let mut echo_ms: Option<u64> = None;
+    for (i, take) in mic_takes.iter().enumerate() {
+        let mic = take.dir.join("mic.wav");
+        let mut cleaned = None;
+        if take.mode == SessionMode::Hybrid {
+            echo_steps.begin();
+            let t = std::time::Instant::now();
+            let mut analysis = analyze_take_echo(&mic, &take.dir.join("sys.wav")).await;
+            cleaned = analysis.as_mut().and_then(|a| a.echo.as_mut()).map(|e| e.take_cleaned());
+            echoes.push((i, analysis));
+            *echo_ms.get_or_insert(0) += ms_since(t);
+        }
+        let samples = match cleaned {
+            Some(samples) => samples,
+            None => wav::read_f32_mono_16k(&mic).await?,
+        };
+        counts.push(samples.len());
+        joined.extend_from_slice(&samples);
+    }
+    wav::write_pcm16_mono_16k(out, &joined).await?;
+    Ok(JoinedMic { offsets: Some(concat_offsets_ms(&counts)), echoes, echo_ms })
+}
+
 /// The check over the unify pass's joined mic stream: each hybrid take's
 /// voices judged inside its own span of it, and what the pass found written to
 /// `diagnostics/<note_id>/<engine>-unify.json` (text only, like every dump).
@@ -6441,10 +6524,7 @@ async fn drop_joined_echo(
             serde_json::json!({
                 "session_id": mic_takes[*i].entry.id,
                 "index": mic_takes[*i].entry.index,
-                "echo": analysis.as_ref().map(|a| crate::echo::EchoReport {
-                    lag: a.lag.clone(),
-                    check,
-                }),
+                "echo": analysis.as_ref().map(|a| a.report(check)),
             })
         })
         .collect();
@@ -9175,6 +9255,21 @@ mod diarize_tests {
         assert_eq!(labels.mic.get("ANNA").map(String::as_str), Some("Speaker 2"));
         assert_eq!(labels.mic.get("BJORN").map(String::as_str), Some("Speaker 3"));
         assert_eq!(labels.sys.get("REMOTE").map(String::as_str), Some("Speaker 1"));
+    }
+
+    #[tokio::test]
+    async fn the_cancelled_mic_lives_in_the_temp_dir_only_as_long_as_the_diarize() {
+        // Audio under `recordings/` or `diagnostics/` would sit outside
+        // `keep_audio` and "Delete stored audio".
+        let wav = CancelledMicWav::write(&[0.1; 1600]).await.expect("written");
+        let path = wav.path().to_path_buf();
+        assert!(path.starts_with(std::env::temp_dir()), "{}", path.display());
+        assert!(!path.components().any(|c| c.as_os_str() == "no.humla.app"));
+        assert_eq!(wav::read_f32_mono_16k(&path).await.unwrap().len(), 1600);
+        let other = CancelledMicWav::write(&[0.0; 16]).await.unwrap();
+        assert_ne!(other.path(), path, "two diarizes never share one file");
+        drop(wav);
+        assert!(!path.exists(), "gone once the diarize is done with it");
     }
 
     #[test]

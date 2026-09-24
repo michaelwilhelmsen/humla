@@ -1,10 +1,10 @@
 //! Measures how a Humla take's mic and system-audio streams line up, and
 //! cancels the system audio's echo out of the mic, offline.
 //!
-//! A measurement tool, not part of the app: nothing in `src-tauri/src` depends
-//! on it, and it reads and writes WAVs only where it is pointed. See
-//! `docs/research/stream-alignment-and-echo.md` for what it is for and how to
-//! read what it prints.
+//! The CLI is a measurement tool, and it reads and writes WAVs only where it is
+//! pointed. The app's echo pass (#196, `src-tauri/src/echo.rs`) runs [`delay`]
+//! and [`aec`] in memory. See `docs/research/stream-alignment-and-echo.md` for
+//! what it is for and how to read what it prints.
 //!
 //! - [`delay`] — GCC-PHAT lag of the mic behind the system stream, per window,
 //!   with drift and steps.

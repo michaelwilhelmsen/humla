@@ -2,10 +2,13 @@
 //!
 //! When a call plays through the laptop's speakers the mic records every
 //! remote voice a second time, and the mic diarize hears that echo as people.
-//! Echo can only sound while the system stream does, so a mic voice that is
-//! almost never heard while the system stream is silent is echo.
+//! Two things keep it out. The system stream is the far-end signal, so the
+//! echo is cancelled out of the mic before it is diarized; and echo can only
+//! sound while the system stream does, so a mic voice that is almost never
+//! heard while the system stream is silent is dropped as echo.
 
 use crate::diarize::Segment;
+use echo_probe::aec::{self, AecConfig, AecReport};
 use echo_probe::delay::{self, DelayConfig, DelayMap, LagPoint, TrackSummary};
 
 /// Every stream the sidecar writes is 16 kHz mono.
@@ -61,7 +64,16 @@ impl TakeAnalysis {
             Some(c) => c.keep(segments),
             None => segments,
         };
-        (kept, EchoReport { lag: self.lag.clone(), check })
+        (kept, self.report(check))
+    }
+
+    /// What the diarize dump records of this take, with `check`'s verdicts.
+    pub fn report(&self, check: Option<VoiceCheck>) -> EchoReport {
+        EchoReport {
+            lag: self.lag.clone(),
+            cancel: self.echo.as_ref().map(|e| e.cancel.clone()),
+            check,
+        }
     }
 }
 
@@ -71,6 +83,8 @@ impl TakeAnalysis {
 pub struct EchoReport {
     /// Where the echo lands in the mic: level, spread, polarity, drift, steps.
     pub lag: TrackSummary,
+    /// How much echo the canceller removed.
+    pub cancel: Option<AecReport>,
     /// `None` when there was no echo to check against, or no voice to check.
     pub check: Option<VoiceCheck>,
 }
@@ -78,11 +92,26 @@ pub struct EchoReport {
 pub struct TakeEcho {
     /// Per 10 ms frame of the mic: the system stream sounds there.
     sys_active: Vec<bool>,
+    /// Per 10 ms frame: the mic's energy, and the linear canceller's output's.
+    mic_energy: Vec<f64>,
+    linear_energy: Vec<f64>,
+    /// The mic after the canceller and its residual suppressor.
+    cleaned: Vec<f32>,
+    cancel: AecReport,
 }
 
 impl TakeEcho {
     pub fn evidence(&self) -> Evidence<'_> {
-        Evidence { sys_active: &self.sys_active, energy: None }
+        Evidence {
+            sys_active: &self.sys_active,
+            energy: Some((&self.mic_energy, &self.linear_energy)),
+        }
+    }
+
+    /// The mic with the echo cancelled out of it — the diarize input. Taken
+    /// rather than lent, so it can be let go of as soon as it is written.
+    pub fn take_cleaned(&mut self) -> Vec<f32> {
+        std::mem::take(&mut self.cleaned)
     }
 }
 
@@ -158,7 +187,8 @@ pub fn check_voices(segments: &[Segment], evidence: &Evidence) -> VoiceCheck {
                 .filter(|(v, a)| **v && !**a)
                 .count();
             let ratio = (base > 0.0).then(|| in_silence as f64 / heard as f64 / base);
-            let energy_removed_db = evidence.energy.and_then(|(mic, linear)| energy_removed(&on, mic, linear));
+            let energy_removed_db =
+                evidence.energy.and_then(|(mic, linear)| energy_removed(&on, mic, linear));
             // The energy only ever adds to what the ratio finds: on a mic the
             // canceller already cleaned, what is left of an echo voice is where
             // it removed little.
@@ -264,7 +294,8 @@ fn voice_frames(segments: &[&Segment], frames: usize) -> Vec<bool> {
     on
 }
 
-/// The lag of `mic` behind `sys` and what the check needs from both.
+/// The lag of `mic` behind `sys`, the echo cancelled out of `mic`, and what
+/// the check needs from all three.
 pub fn analyze_take(mic: Vec<f32>, sys: Vec<f32>) -> TakeAnalysis {
     let cfg = DelayConfig::default();
     let mut points = delay::lag_track(&mic, &sys, RATE, &cfg);
@@ -278,7 +309,19 @@ pub fn analyze_take(mic: Vec<f32>, sys: Vec<f32>) -> TakeAnalysis {
         return TakeAnalysis { lag, echo: None };
     };
     let sys_active = at_mic(&sys_activity(&sys), mic.len().div_ceil(FRAME), &map);
-    TakeAnalysis { lag, echo: Some(TakeEcho { sys_active }) }
+    let aec_cfg = AecConfig::default();
+    let reference = aec::align_reference(&sys, mic.len(), RATE, &map, aec_cfg.margin_ms);
+    drop(sys);
+    let aec::AecOutput { linear, cleaned, report, .. } = aec::cancel(&mic, &reference, RATE, &aec_cfg);
+    drop(reference);
+    let echo = TakeEcho {
+        sys_active,
+        mic_energy: frame_energy(&mic),
+        linear_energy: frame_energy(&linear),
+        cleaned,
+        cancel: report,
+    };
+    TakeAnalysis { lag, echo: Some(echo) }
 }
 
 /// Per 10 ms frame of `sys`: it sounds there. Taken from its own energy rather
@@ -336,7 +379,7 @@ fn keep_agreeing(points: &mut [LagPoint], tolerance_ms: f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use echo_probe::synth::{scenario, Scenario, ScenarioConfig};
+    use echo_probe::synth::{masked_energy, scenario, Scenario, ScenarioConfig};
 
     /// A synthetic take whose voices are levelled as speech is, since the check
     /// tells the system stream's speech from its silence by energy.
@@ -351,6 +394,27 @@ mod tests {
         let lag = analysis.lag.median_ms.expect("a lag");
         assert!((lag - 157.3).abs() < 0.5, "lag {lag}");
         assert!(analysis.echo.is_some());
+    }
+
+    #[test]
+    fn cancels_the_echo_out_of_the_mic_and_leaves_the_user_alone() {
+        let s = take(ScenarioConfig { lag_ms: 323.0, polarity: -1.0, ..Default::default() });
+        let mut analysis = analyze_take(s.mic.clone(), s.sys.clone());
+        let cleaned = analysis.echo.as_mut().expect("an echo").take_cleaned();
+        assert_eq!(cleaned.len(), s.mic.len());
+        // From 10 s on: the first pass converges, and a score over the opening
+        // would measure that rather than the filter.
+        let from_10s = |m: Vec<bool>| -> Vec<bool> {
+            m.into_iter().enumerate().map(|(i, v)| v && i >= 1000).collect()
+        };
+        let (far, near) = (from_10s(s.far_only()), from_10s(s.near_only()));
+        let db = |num: f64, den: f64| 10.0 * (num / den).log10();
+        let removed = db(masked_energy(&s.echo, &far), masked_energy(&cleaned, &far));
+        let user = db(masked_energy(&cleaned, &near), masked_energy(&s.mic, &near));
+        assert!(removed > 25.0, "echo removed {removed:.1} dB");
+        assert!(user.abs() < 0.5, "the user alone {user:+.2} dB");
+        let report = analysis.check(Vec::new()).1.cancel.expect("the canceller's report");
+        assert!(report.erle_linear_db.unwrap() > 20.0, "{report:?}");
     }
 
     #[test]
@@ -513,6 +577,11 @@ mod tests {
         let verdict = |id: &str| check.voices.iter().find(|v| v.speaker_id == id).unwrap();
         assert!(!verdict("user").dropped && verdict("user").ratio.unwrap() > 1.0, "{check:?}");
         assert!(verdict("remote-1").dropped && verdict("remote-2").dropped, "{check:?}");
+        // The canceller's second signal reads the same take the same way.
+        assert!(verdict("user").energy_removed_db.unwrap() < ECHO_REMOVED_DB, "{check:?}");
+        for id in ["remote-1", "remote-2"] {
+            assert!(verdict(id).energy_removed_db.unwrap() >= ECHO_REMOVED_DB, "{check:?}");
+        }
     }
 
     #[test]

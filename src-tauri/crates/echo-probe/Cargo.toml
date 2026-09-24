@@ -3,7 +3,7 @@ name = "echo-probe"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
-description = "Measures how a take's mic and system-audio streams line up, and cancels the system audio's echo out of the mic, offline. A measurement tool: the app does not depend on it."
+description = "Measures how a take's mic and system-audio streams line up, and cancels the system audio's echo out of the mic, offline. The app's echo pass runs its delay and aec modules; the CLI is a measurement tool."
 license = "MIT"
 publish = false
 
