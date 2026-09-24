@@ -6,14 +6,16 @@ sit, why, and what should Humla change: align the streams in capture (a), align
 only in `build_playback_wav` and the timeline (b), or nothing (c)? And is an
 echo-suppressed mic worth it for the diarize input?
 
-**Status: measuring.** Nothing here changes behaviour. What landed is
-instrumentation (a `capture_timing` event from the sidecar, persisted per take)
-and a standalone tool (`echo-probe`) that measures the lag and cancels the echo
-offline. The capture-side proposal waits on the measurements in §6.
+**Status: measured, 2026-09-24.** Nothing here changes behaviour yet. What
+landed is instrumentation (a `capture_timing` event from the sidecar, persisted
+per take) and a standalone tool (`echo-probe`) that measures the lag and
+cancels the echo offline. The first real take with `capture_timing` (R1) and a
+re-run of the Test audio take settled what both proposals rest on (§6,
+*Results*). Both are specified for implementation: #197 aligns the streams in
+capture, #196 keeps the echo out of the mic's voices.
 
-Verified against `main` at v0.64.0 and two real takes measured on the user's
-Mac. The Swift half of the diagnostics compiles but has not yet run on a real
-take — see §5.
+Verified against `main` after v0.64.0 and three real takes measured on the
+user's M1 Max MacBook Pro. `capture_timing` has now run on a real take (R1).
 
 ## TL;DR
 
@@ -29,13 +31,13 @@ take — see §5.
   change subtracts the mic's outage, and any SCK delivery gap shifts everything
   after it.
 - **An echo lag measured off the audio is that start offset plus the output and
-  acoustic path.** The one real take with raw streams shows a 157 ms lag
-  (inverted polarity, no drift over 211 s) with the mic 72 ms longer than sys
-  — consistent with roughly 70–90 ms of start offset and 65–85 ms of path, but
-  lengths alone can't separate the two. The downloaded 56-minute call showed
-  420 ms. **The lag differs per take, so a fixed correction is wrong**, and it
-  has to be measured per take. The new `capture_timing` diagnostic separates
-  start offset from path directly.
+  acoustic path, and the start offset is most of it.** On R1, `capture_timing`
+  put sys's first frame **296 ms** after the mic's; the echo lag was 323 ms, so
+  the path is **28 ms**, which is the output latency the HAL reports. The Test
+  audio take (153 ms) then carried about 125 ms of start offset, and the
+  56-minute call from another Mac 414 ms of lag. **The offset differs per take,
+  so a fixed correction is wrong**, and it has to be measured per take.
+  Aligning in capture would shrink R1's lag from 323 ms to about 28 ms.
 - **The echo breaks "You is earned", and not only in principle.**
   `build_hybrid_labels` numbers the mic's voices over the chunks *before*
   `dedup_mic_against_sys` drops the echoed ones. So every chunk Whisper
@@ -43,13 +45,25 @@ take — see §5.
   take's mic stream: Sortformer finds 4 speakers, Nemotron 5, both
   echo-dominated. Community-1 merges everything into one, so "You" is earned
   by accident, and whatever echo survives dedup is then attributed to the user.
-- **Recommendation, provisional on §6:** (a) — align in capture with
-  timestamp-driven writers — plus **reference-based echo cancellation of the
-  mic for the diarize input**. (c) is already out: the benign take's mic WAV
-  is 72 ms longer than its sys WAV although the mic stops first, so the two sit
-  at least that far apart by index, and the 56-minute call further. (b) would put a per-take offset map (and a gap map) into every
-  consumer and the sync schema. The canceller is independent of the alignment
-  fix, and it is the prerequisite for moving the mic off Community-1.
+  The rule itself is not the problem: a room with several people is numbered
+  as it should be. The problem is that echo becomes voices, which in a hybrid
+  meeting reads as people in the room who aren't there.
+- **A per-voice check fixes the count; the canceller makes it robust.** Echo
+  can only sound while the remote side does, so a mic voice that is almost
+  never heard while sys is silent is echo. Dropping such voices left exactly
+  the user with Sortformer and Nemotron on both measured takes, on the raw mic
+  as well as the cancelled one. The canceller removes 17–21 dB of echo in a
+  real room (R1) and leaves the user alone untouched. It is what saves
+  Community-1, which merges the user and the echo into one voice no check can
+  split, and it keeps echo from taking a diarizer's slots in a crowded hybrid
+  meeting (unmeasured).
+- **Recommendation (measured, §6):** (a) — align in capture with
+  timestamp-driven writers (#197) — plus the per-voice check and
+  **reference-based echo cancellation of the mic for the diarize input**
+  (#196). (c) is out: R1's streams sit 296 ms apart by index. (b) would put a
+  per-take offset map (and a gap map) into every consumer and the sync schema.
+  #196 is independent of the alignment fix, and it is the prerequisite for
+  moving the mic off Community-1.
 
 ## 1. How the two streams are timed today
 
@@ -115,16 +129,15 @@ user's Mac:
 
 Reading it:
 
-- The mic ends at `engine.stop()` while sys keeps delivering until
-  `sysFullWriter.close()` a few ms later, so **Δ ≈ the length difference plus a
-  few ms ≈ 70–90 ms** on the test take, leaving **L ≈ 65–85 ms**. L is
-  plausible for an Apple-silicon MacBook, whose speaker and mic paths both carry
-  DSP. The 56-minute call, recorded on a different machine, would then carry
-  roughly 300+ ms of start offset. `capture_timing` replaces this inference with
-  a measurement.
+- ~~Δ ≈ the length difference plus a few ms ≈ 70–90 ms on the test take,
+  leaving L ≈ 65–85 ms.~~ **Wrong, as R1 showed** (§6, *Results*): L is about
+  28 ms on this Mac, so the test take's Δ was about 125 ms. The length
+  difference understates Δ by about 65 ms, because sys delivers ~56 ms past the
+  mic's stop and the mic's converter never writes its last ~10 ms.
 - No drift and no steps across 211 s of continuous playback says nothing about
   silence: a podcast never stops sending audio. Whether SCK goes quiet when the
-  far end does is §6's R4.
+  far end does is §6's R4. The 56-minute call has since answered it for a real
+  call: its lag is 414.3 ms from minute 1 to minute 53 with no step (§6).
 
 ## 3. The echo and "You is earned"
 
@@ -212,8 +225,8 @@ stderr line — `capture timing: sys starts +73.4ms after mic, +73.6ms by the en
 event plus derived `alignment` (start offset, end offset, gaps, drift per
 interval, HAL latencies). It is timestamps only, so it is written whatever
 `keep_audio` says, and it syncs nowhere. The Rust side is tested against a
-fixture of the event's shape. The Swift side compiles clean on the Mac, but no
-real take has emitted the event yet: §6 step 1 is its first run.
+fixture of the event's shape. The first real take to emit it was R1 on
+2026-09-24, and it matches the fixture (§6, *Results*).
 
 **`echo-probe`** (`src-tauri/crates/echo-probe`): a workspace member nothing
 depends on, with zero DSP dependencies. From `src-tauri/`:
@@ -308,6 +321,136 @@ What to read off `session`:
   another clock, and (a) must be built on arrival times instead.
 - `WAV length matches ✓`. A mismatch means §4's fix has regressed.
 
+### Results (2026-09-24)
+
+Run on `main` at `8771a18`, with the sidecar rebuilt from it. R1 was recorded
+for this, and the Test audio take (T0 below) was re-run with the same tools.
+
+**Capture timing** (R1: 233 s, a podcast through the built-in speakers, the
+user talking now and then):
+
+- The event matches, field for field, the fixture `recording.rs` tests its
+  parser against, and it names no device.
+- sys's first frame came **+295.6 ms** after the mic's. Each stream's first
+  buffer arrived shortly after its stamp: +108.6 ms for the mic (100 ms tap
+  buffers) and +113.1 ms for sys (20 ms buffers). Both stamp spans match the
+  frames delivered (−0.8 and 0.0 ppm), and the two devices share one clock
+  domain. **SCK's presentation timestamp is host time**, so (a) stands.
+- There were no gaps, overlaps or steps in either stream. `WAV length matches ✓`
+  held for both, so #194's fix holds: one late sys buffer was dropped at stop,
+  as designed.
+- Devices: the input is `grup` (the private aggregate AVAudioEngine makes when
+  input and output are different devices) at +52.7 ms; the output is the
+  built-in speakers at +28.0 ms.
+- `misaligned +286.2 ms by the end` reads 9.4 ms under the start, although
+  the audio shows no change. The cause is the mic's converter: `installMicTap`
+  converts in the default prime mode and never sends end-of-stream, so the
+  resampler's last ~10 ms (160 frames) is never written, and `end_offset_ms`
+  counts written frames. The sys converter holds back only 6 frames.
+
+**The lag and its parts:**
+
+| | R1 | T0 (Test audio) | `d0c612d0` (56 min, other Mac) |
+|---|---|---|---|
+| Echo lag | 323.26 ms ±0.05, inverted | 153.45 ms ±0.06, inverted | 414.31 ms ±0.18, normal |
+| Drift, steps | +0.8 ppm, none | +0.7 ppm, none | +0.4 ppm, none (32 clear windows, minutes 1–53) |
+| Start offset Δ | 295.61 ms (`capture_timing`) | ≈ 125 ms (lag − L) | unknown |
+| Path L | 27.65 ms | — | — |
+
+- L equals the output latency the HAL reports (28.04 ms). It doesn't equal the
+  80.7 ms the HAL reports for output and input together, so the tap's
+  `hostTime` evidently already sits at the mic. After (a), the echo lag on
+  this Mac should read about 28 ms.
+- `d0c612d0` answers step 7. On a real call the lag stayed flat for 53
+  minutes, so SCK kept delivering through that call's silences.
+
+**Cancellation** (`echo-probe cancel`, both passes):
+
+| | R1 | T0 |
+|---|---|---|
+| Echo in the mic, against sys | −21.3 dB | −15.2 dB |
+| Echo removed where it dominates (median, linear / suppressed) | 17.2 / 21.1 dB | 20.7 / 28.6 dB |
+| The mic alone, level change | −0.0 dB | −0.1 dB |
+
+The real room landed where the soft-clipped synthetic take did (15 / 25 dB).
+
+**Diarizing the mic.** The reference comes from the chunk log: a mic word is
+echo when the sys transcript has it within ±2 s of (mic time − lag). R1 has
+126 user words and 586 echo words; T0 has 98 and 779. The sys stream has 5
+voices (Nemotron on sys, both takes).
+
+| Mic stream, engine | Voices (R1 / T0) | `You` earned (R1 / T0) | Echo inside the voices (R1 / T0) |
+|---|---|---|---|
+| raw, Community-1 | 1 / 1 | yes / yes | 97% / 98% |
+| raw, Sortformer | 3 / 4 | no / no | 91% / 91% |
+| raw, Nemotron | 5 / 5 | no / no | 95% / 94% |
+| linear, Community-1 | 2 / 1 | no / yes | 69% / 61% |
+| linear, Sortformer | 2 / 3 | no / no | 18% / 42% |
+| linear, Nemotron | 4 / 3 | no / no | 83% / 56% |
+| suppressed, Community-1 | 1 / 1 | yes / yes | 34% / 14% |
+| suppressed, Sortformer | 2 / 1 | no / yes | 8% / 4% |
+| suppressed, Nemotron | 3 / 2 | no / no | 11% / 12% |
+
+Sortformer and Nemotron find the user as a voice of their own in every
+variant: 39–41 s on R1 and 14–19 s on T0. Community-1 merges the user with
+the echo. What breaks the count is the echo that is left. On R1's suppressed
+mic that is 4 s for Sortformer, and 10 s plus a 1 s fragment for Nemotron.
+
+**The per-voice check.** For each mic voice, take the share of its time when
+the lag-shifted sys stream is silent. Divide it by the share of the whole take
+when sys is silent. Echo can't sound while sys is silent, so an echo voice
+reads near 0. A person talks independently of sys (about 1) or in its pauses
+(above 1). Sys activity here came from sys's own energy (frames within 40 dB
+of its loud frames, with a 150 ms hang), which doesn't depend on how an engine
+pads its segments.
+
+- Echo voices read 0.00–0.36. The user read 0.67–3.55. The low end is T0,
+  where sys is silent only 4% of the take and the user mostly talked over it.
+- Dropping every voice under 0.5 leaves exactly the user, who then earns
+  `You`. That held for Sortformer and Nemotron on the raw, linear and
+  suppressed mic of both takes. The one exception is R1's suppressed Nemotron,
+  where a 1 s fragment reads 1.96.
+- With sys activity taken from the sys diarize segments instead, the result is
+  the same with a thinner margin: Nemotron's segments put two linear-mic echo
+  voices at 0.51 and 0.52.
+- The lag must be the take's own. An error of ±100 ms still works, ±300 ms
+  doesn't.
+- Community-1's single merged voice can't be split. The check must keep the
+  last voice rather than drop it.
+- Words the user speaks over the remote side mostly land in an echo voice.
+  When that voice is dropped, they move to the nearest remaining voice. That
+  is right when the user is alone at the mic, and a guess in a room of people.
+
+A second signal needs no pauses in sys: how much of a voice's energy the linear
+canceller removed.
+
+- The user lost 0.9–1.0 dB on R1 and 3.0–3.8 dB on T0, where most of the
+  user's speech was double talk. Echo voices lost 5.1–26 dB. This catches R1's
+  1 s fragment (5.2 dB).
+- It is biased for voices found on a cancelled mic. What the canceller leaves
+  behind is where it removed little, so one T0 echo voice read 3.7 dB. It
+  therefore only ever adds to the timing check.
+- With both rules (echo if the ratio is under 0.5, or at least 4.5 dB was
+  removed), every Sortformer and Nemotron run on both takes resolves to the
+  user alone.
+
+These thresholds are fitted on two podcast takes from one machine. #196 records
+the numbers per voice so they can be revisited on real meetings.
+
+**The plan from here.** R1 answered what (a) and the canceller rest on, so the
+rest of the plan changes:
+
+- R2 (pause) and R4 (idle output) test what (a) handles by design. They become
+  its acceptance takes.
+- R3's question is answered by `d0c612d0`.
+- R5 only matters if Bluetooth shows drift.
+- The take that would still add information is a **real hybrid meeting**, with
+  several people in the room and the remote voices on the speakers.
+
+The scoring scripts (reference, votes, cluster map, the per-voice check) lived
+in a session scratchpad and are not in the repo. The tables above are their
+output.
+
 ## 7. Decision rule, and the proposal
 
 | If the measurements show | Then |
@@ -316,7 +459,8 @@ What to read off `session`:
 | Δ ≥ 50 ms but constant within takes, pauses rare | (a) recommended; (b) acceptable as a stopgap |
 | gaps, steps at pause/resume, or drift | (a) — (b) can't express them without a per-take discontinuity map |
 
-Every datum so far points at row 2 or 3.
+R1 is row 2: Δ = 296 ms, constant within the take. R2 would show whether pauses
+make it row 3, and (a) is the answer either way.
 
 **(a) Align in capture — timestamp-driven writers.** Each writer places a
 buffer at the frame its own timestamp says it belongs at:
@@ -328,9 +472,22 @@ applied to both streams, so a slow SCK restart becomes silence in sys rather
 than a shift. The result: the two WAVs share one clock, and every consumer in
 §1 is correct without knowing any of this. No data-model or sync change, and
 old takes keep their meaning. Risks: it is the sidecar (macOS-only, the hardest
-component to test), and it rests on SCK's timestamps being host time — which is
-exactly what `capture_timing` verifies first. Keep the drift out of it unless
-R5 shows some.
+component to test), and it rests on SCK's timestamps being host time — which
+R1 confirmed. Keep the drift out of it unless R5 shows some.
+
+R1 adds two constraints:
+
+- **Place converted audio by frame count, not by each input buffer's stamp.**
+  The mic converter holds back ~10 ms in steady state, so a converted buffer
+  starts ~10 ms before its input buffer's stamp. Placing each output at that
+  stamp would shift the mic 10 ms late, behind a 10 ms hole. Place from the
+  interval's first stamp plus the frames written, and re-anchor only at a
+  discontinuity `capture_timing` already detects (> 5 ms). Flush the
+  converters at close so the tail is written.
+- **Make the offsets read WAV positions.** `CaptureTiming::start_offset_ms` and
+  echo-probe's decomposition compare stamps only, so after (a) they would still
+  read ~296 ms. They must subtract each first interval's `start_frame`, which
+  is 0 today and the leading pad afterwards.
 
 **(b), for contrast,** stores Δ (and, for correctness, every gap and resume
 edge) per take, then applies it in `build_playback_wav`, `serialize_timeline`,
@@ -338,30 +495,43 @@ the transcript sort, the hybrid numbering, dedup, the unify pass, re-diarize
 and replay — and the sessions sync contract has to carry it. It is the same fix
 in nine places instead of one.
 
-**The canceller, for the diarize input.** Reference-based echo cancellation
-belongs in the post-stop chain: `sys-full.wav` in, a cleaned mic stream out,
-fed to the mic diarize (and later to `build_playback_wav`, which removes the
-doubling). The live transcript keeps its text-based dedup, since chunks
-transcribe before the full streams exist. It is independent of (a): the
-canceller estimates its own bulk delay per take, steps included. But (a) shrinks
-that delay to L and removes the steps, so the two compose. Whether it is worth
-it is decided by §6 step 6. The prior is strong: on the test take, 154 s of the
-mic's 180 s of content is echo, and every engine that can count voices counts
-it. It is also the precondition for leaving Community-1: an end-to-end engine
-on an echoed mic stream will never earn `You`. That switch is decided in
+**Keeping the echo out of the mic's voices (#196).** Two parts, in this order:
+
+1. **The per-voice check** drops mic voices that aren't heard while sys is
+   silent (§6, *Results*). It is what makes the count right, and it works on
+   the raw mic.
+2. **Reference-based echo cancellation** in the post-stop chain: `sys-full.wav`
+   in, a cleaned mic stream out. The mic diarize reads the suppressed output.
+   For Sortformer and Nemotron it left 4–12% echo inside the voices, against
+   18–83% for the linear output, with the user's voice the same size in both.
+   Later, `build_playback_wav` can use it to remove the doubling. With the
+   canceller in, the check also counts the energy it removed per voice.
+
+The live transcript keeps its text-based dedup, since chunks transcribe before
+the full streams exist. #196 is independent of (a): it estimates its own bulk
+delay per take, steps included. But (a) shrinks that delay to L and removes the
+steps, so the two compose. #196 is also the precondition for leaving
+Community-1, because an end-to-end engine on an echoed mic counts the echo as
+people. That switch is decided in
 [ADR-0005](../adr/0005-nemotron-3-is-the-default-diarization-engine.md) and
 waits on this (#193).
 
 ## 8. Open questions
 
-- Is SCK's presentation timestamp on the host clock? The design of (a) depends
-  on it; `capture_timing` answers it on the first take.
-- Does SCK stop delivering when the system output goes idle (R3, R4)? If it
-  does, sys loses wall-clock time at every silence today, and zero-filling in
-  (a) is essential rather than tidy.
-- How much of L does the HAL report? A large unexplained remainder means DSP in
-  the speaker or mic path. Harmless for (a) — L is real — but it sets the
-  canceller's bulk delay after alignment.
-- Real-room cancellation depth. Synthetic takes bound the code; a MacBook
-  speaker at volume is nonlinear, and the soft-clipped case (15 / 25 dB) is the
-  better guide.
+- ~~Is SCK's presentation timestamp on the host clock?~~ **Yes** (R1). Each
+  stream's first buffer arrived about one buffer plus a little after its stamp.
+  Both stamp spans match the frames delivered to within a ppm, and the
+  decomposition gives a positive path that matches the HAL's output latency.
+- Does SCK stop delivering when the system output goes idle? **Not during a
+  call**: `d0c612d0` is flat for 53 minutes. With nothing playing at all (R4),
+  it is still open. (a) zero-fills either way, and R4 is one of its acceptance
+  takes.
+- ~~How much of L does the HAL report?~~ **More than L.** The HAL reports
+  80.7 ms and the measured path is 27.65 ms, which matches its output latency
+  alone. After (a), the canceller's bulk delay on this Mac is about 28 ms.
+- ~~Real-room cancellation depth.~~ **17 / 21 dB (R1) and 21 / 29 dB (T0)**,
+  median, linear / suppressed. The soft-clipped synthetic case was the right
+  guide.
+- Hybrid meetings: does the per-voice check hold with several people in the
+  room and the remote voices on the speakers, and does the echo crowd the
+  diarizer's slots? One real meeting answers both.
