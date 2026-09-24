@@ -3143,6 +3143,23 @@ pub fn migrate_grandfather_onboarding(conn: &Connection, models_dir: &Path) -> R
     Ok(())
 }
 
+/// Keeps an install that has run before on community-1, the engine it ran with
+/// no `diarize_model` row, and marks it for the offer to switch
+/// (`nemotron_offer`). A stored engine this build doesn't have becomes
+/// community-1 too. A fresh install keeps no row, so the default applies.
+pub fn migrate_diarize_engine(conn: &Connection, existing_install: bool) -> Result<()> {
+    const FLAG: &str = "migrated_diarize_engine_v1";
+    if get_setting(conn, FLAG)?.is_some() {
+        return Ok(());
+    }
+    let on_nemotron = get_setting(conn, "diarize_model")?.as_deref() == Some("nemotron3");
+    if existing_install && !on_nemotron {
+        set_setting(conn, "diarize_model", "community1")?;
+        set_setting(conn, "nemotron_offer", "pending")?;
+    }
+    set_setting(conn, FLAG, "true")
+}
+
 fn map_note(row: &rusqlite::Row) -> rusqlite::Result<Note> {
     Ok(Note {
         id: row.get(0)?,
@@ -3165,6 +3182,15 @@ fn map_note(row: &rusqlite::Row) -> rusqlite::Result<Note> {
         detected_language: row.get(17)?,
         private: row.get(18)?,
     })
+}
+
+/// An in-memory database holding only the settings table.
+#[cfg(test)]
+pub(crate) fn settings_only_conn() -> Connection {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+        .unwrap();
+    conn
 }
 
 #[cfg(test)]
@@ -3716,15 +3742,6 @@ mod tests {
         );
     }
 
-    fn settings_only_conn() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
-        )
-        .unwrap();
-        conn
-    }
-
     fn settings_keys(conn: &Connection) -> Vec<String> {
         let mut stmt = conn.prepare("SELECT key FROM settings ORDER BY key").unwrap();
         let rows: Vec<String> = stmt
@@ -4030,6 +4047,75 @@ mod tests {
             Some("true"),
             "prior value preserved; migration short-circuits",
         );
+    }
+
+    fn diarize_settings(conn: &Connection) -> (Option<String>, Option<String>) {
+        (
+            get_setting(conn, "diarize_model").unwrap(),
+            get_setting(conn, "nemotron_offer").unwrap(),
+        )
+    }
+
+    #[test]
+    fn diarize_migration_pins_an_existing_install_to_the_engine_it_ran() {
+        // Before Nemotron 3, an unset row meant community-1.
+        let conn = settings_only_conn();
+        migrate_diarize_engine(&conn, true).unwrap();
+        assert_eq!(
+            diarize_settings(&conn),
+            (Some("community1".into()), Some("pending".into()))
+        );
+    }
+
+    #[test]
+    fn diarize_migration_moves_sortformer_to_community1() {
+        let conn = settings_only_conn();
+        set_setting(&conn, "diarize_model", "sortformer").unwrap();
+        migrate_diarize_engine(&conn, true).unwrap();
+        assert_eq!(
+            diarize_settings(&conn),
+            (Some("community1".into()), Some("pending".into()))
+        );
+    }
+
+    #[test]
+    fn diarize_migration_keeps_a_chosen_community1() {
+        let conn = settings_only_conn();
+        set_setting(&conn, "diarize_model", "community1").unwrap();
+        migrate_diarize_engine(&conn, true).unwrap();
+        assert_eq!(
+            diarize_settings(&conn),
+            (Some("community1".into()), Some("pending".into()))
+        );
+    }
+
+    #[test]
+    fn diarize_migration_leaves_a_fresh_install_on_the_default() {
+        let conn = settings_only_conn();
+        migrate_diarize_engine(&conn, false).unwrap();
+        assert_eq!(diarize_settings(&conn), (None, None));
+    }
+
+    #[test]
+    fn diarize_migration_runs_once() {
+        let conn = settings_only_conn();
+        migrate_diarize_engine(&conn, true).unwrap();
+        // The user accepts the offer; the next launch must not undo it.
+        set_setting(&conn, "diarize_model", "nemotron3").unwrap();
+        set_setting(&conn, "nemotron_offer", "accepted").unwrap();
+        migrate_diarize_engine(&conn, true).unwrap();
+        assert_eq!(
+            diarize_settings(&conn),
+            (Some("nemotron3".into()), Some("accepted".into()))
+        );
+    }
+
+    #[test]
+    fn diarize_migration_offers_nothing_to_an_install_already_on_nemotron() {
+        let conn = settings_only_conn();
+        set_setting(&conn, "diarize_model", "nemotron3").unwrap();
+        migrate_diarize_engine(&conn, true).unwrap();
+        assert_eq!(diarize_settings(&conn), (Some("nemotron3".into()), None));
     }
 
     // ── Retrieval substrate: chunking + FTS5 search (issue #47) ──────────────

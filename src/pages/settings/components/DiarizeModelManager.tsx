@@ -1,35 +1,27 @@
+import { ProgressTrack } from "../../../components/ui/ProgressTrack";
+import { downloadProgress } from "../../../lib/diarizeEngine";
 import type { DiarizeState } from "../types";
 import { Btn } from "./Btn";
 import { formatBytes } from "./format";
 
 export function DiarizeModelManager({
   state,
+  cost,
   onDownload,
   onDelete,
 }: {
   state: DiarizeState;
+  /** What downloading it costs, said before the user starts. */
+  cost: string;
   onDownload: () => void;
   onDelete: () => void;
 }) {
   if (state.downloading) {
-    const pct = Math.min(100, state.fraction * 100);
-    const phaseLabel =
-      state.phase === "compiling"
-        ? "Compiling for Apple Neural Engine"
-        : state.phase === "listing"
-        ? "Listing files"
-        : "Downloading models";
+    const { label, value } = downloadProgress(state.phase, state.fraction);
     return (
       <div className="flex flex-col gap-2">
-        <div className="text-sm">
-          {phaseLabel}… {state.phase === "compiling" ? "" : `${pct.toFixed(0)}%`}
-        </div>
-        <div className="h-1.5 rounded bg-[var(--color-pill-hover)] overflow-hidden">
-          <div
-            className="h-full bg-[var(--color-text-muted)] transition-[width] duration-150"
-            style={{ width: state.phase === "compiling" ? "100%" : `${pct}%` }}
-          />
-        </div>
+        <div className="text-sm">{label}</div>
+        <ProgressTrack value={value} label={label} />
       </div>
     );
   }
@@ -38,7 +30,7 @@ export function DiarizeModelManager({
     return (
       <div className="flex flex-col gap-2">
         <div className="text-sm">
-          Downloaded — FluidAudio diarization (CoreML)
+          Downloaded
           {state.status.sizeBytes ? ` (${formatBytes(state.status.sizeBytes)})` : ""}
         </div>
         {state.status.path && (
@@ -68,10 +60,7 @@ export function DiarizeModelManager({
 
   return (
     <div className="flex flex-col gap-2">
-      <div className="text-sm">
-        Not downloaded. The model is ~15 MB. First-time setup also compiles
-        for the Apple Neural Engine, which takes 20-30 s.
-      </div>
+      <div className="text-sm">Not downloaded. {cost}</div>
       <div className="flex gap-2">
         <Btn onClick={onDownload}>Download model</Btn>
       </div>

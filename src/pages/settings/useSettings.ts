@@ -1,13 +1,15 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
   ipc,
   onDiarizeDownloadProgress,
   onLocalWhisperDownloadError,
   onLocalWhisperProgress,
+  type DiarizeEngine,
   type ProviderConfig,
   type TranscribeConfig,
 } from "../../lib/ipc";
-import { broadcastSettingChange } from "../../lib/settingsBus";
+import { DIARIZE_ENGINE_LABEL, DIARIZE_ENGINES } from "../../lib/diarizeEngine";
+import { onSettingChange, writeSetting } from "../../lib/settingsBus";
 import {
   DEFAULTS,
   EMPTY_DIARIZE_STATE,
@@ -23,13 +25,25 @@ import {
 // stay focused on layout.
 export function useSettings() {
   const [local, setLocal] = useState<LocalState>(EMPTY_LOCAL_STATE);
-  const [diarize, setDiarize] = useState<DiarizeState>(EMPTY_DIARIZE_STATE);
-  // Parallel state for the Sortformer engine. Tracked independently of
-  // community1 so each can be downloaded / deleted on its own. The active
-  // engine is decided by the `diarize_model` setting; the manager UI
-  // shows both rows so users can have one downloaded but the other active
-  // while they decide.
-  const [sortformer, setSortformer] = useState<DiarizeState>(EMPTY_DIARIZE_STATE);
+  // One per engine, so each can be downloaded or deleted on its own whichever
+  // `diarize_model` selects.
+  const [diarize, setDiarize] = useState<Record<DiarizeEngine, DiarizeState>>({
+    nemotron3: EMPTY_DIARIZE_STATE,
+    community1: EMPTY_DIARIZE_STATE,
+  });
+  const updateDiarize = useCallback(
+    (engine: DiarizeEngine, f: (s: DiarizeState) => DiarizeState) =>
+      setDiarize((p) => ({ ...p, [engine]: f(p[engine]) })),
+    [],
+  );
+  const loadDiarizeStatuses = useCallback(async () => {
+    const statuses = await Promise.all(
+      DIARIZE_ENGINES.map((e) => ipc.diarizeStatus(e).catch(() => null)),
+    );
+    DIARIZE_ENGINES.forEach((engine, i) =>
+      updateDiarize(engine, (d) => ({ ...d, status: statuses[i] })),
+    );
+  }, [updateDiarize]);
   const [s, setS] = useState<Record<EditableKey, string>>(DEFAULTS);
   const [transcribeConfig, setTranscribeConfig] = useState<TranscribeConfig>({
     default: { provider: "openai", model: "whisper-1" },
@@ -39,16 +53,13 @@ export function useSettings() {
   useEffect(() => {
     let cancelled = false;
     (async () => {
-      const [models, ds, ss, cfg] = await Promise.all([
+      const [models, cfg] = await Promise.all([
         ipc.localWhisperModels(),
-        ipc.diarizeStatus("community1").catch(() => null),
-        ipc.diarizeStatus("sortformer").catch(() => null),
         ipc.getTranscribeConfig().catch(() => null),
+        loadDiarizeStatuses(),
       ]);
       if (cancelled) return;
       setLocal((p) => ({ ...p, models }));
-      setDiarize((p) => ({ ...p, status: ds }));
-      setSortformer((p) => ({ ...p, status: ss }));
       if (cfg) setTranscribeConfig(cfg);
       const entries = await Promise.all(
         (Object.keys(DEFAULTS) as EditableKey[]).map(
@@ -61,7 +72,19 @@ export function useSettings() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [loadDiarizeStatuses]);
+
+  // A write from another view, such as Home's offer switching the engine once
+  // its model is ready, while this dialog is open over it.
+  useEffect(
+    () =>
+      onSettingChange((key, value) => {
+        if (!(key in DEFAULTS)) return;
+        setS((p) => (p[key as EditableKey] === value ? p : { ...p, [key]: value }));
+        if (key === "diarize_model") void loadDiarizeStatuses();
+      }),
+    [loadDiarizeStatuses],
+  );
 
   // Tauri listen() is async; the .then() can resolve *after* a StrictMode
   // remount has already torn down this effect, leaking the listener. The
@@ -142,16 +165,8 @@ export function useSettings() {
     let cancelled = false;
     let unlisten: (() => void) | undefined;
     onDiarizeDownloadProgress((p) => {
-      // Route the progress event to whichever engine's state it belongs
-      // to. Both engines share the channel; we filter by the engine
-      // tag the backend includes in the payload.
-      const update = (s: DiarizeState) => ({
-        ...s,
-        fraction: p.fraction,
-        phase: p.phase,
-      });
-      if (p.engine === "sortformer") setSortformer(update);
-      else setDiarize(update);
+      if (!DIARIZE_ENGINES.includes(p.engine)) return;
+      updateDiarize(p.engine, (d) => ({ ...d, fraction: p.fraction, phase: p.phase }));
     }).then((u) => {
       if (cancelled) u();
       else unlisten = u;
@@ -160,7 +175,7 @@ export function useSettings() {
       cancelled = true;
       unlisten?.();
     };
-  }, []);
+  }, [updateDiarize]);
 
   // Local-model flash helper. 8s clear (instead of the 4s used by other
   // flashes) — gives the user time to read + act on the
@@ -173,17 +188,10 @@ export function useSettings() {
       setLocal((p) => (p.flash === flash ? { ...p, flash: null } : p));
     }, 8000);
   }
-  function flashDiarize(msg: string) {
-    setDiarize((p) => ({ ...p, flash: msg }));
+  function flashDiarize(engine: DiarizeEngine, msg: string) {
+    updateDiarize(engine, (d) => ({ ...d, flash: msg }));
     window.setTimeout(() => {
-      setDiarize((p) => (p.flash === msg ? { ...p, flash: null } : p));
-    }, 4000);
-  }
-
-  function flashSortformer(msg: string) {
-    setSortformer((p) => ({ ...p, flash: msg }));
-    window.setTimeout(() => {
-      setSortformer((p) => (p.flash === msg ? { ...p, flash: null } : p));
+      updateDiarize(engine, (d) => (d.flash === msg ? { ...d, flash: null } : d));
     }, 4000);
   }
 
@@ -282,122 +290,37 @@ export function useSettings() {
     }
   }
 
-  async function downloadDiarize() {
-    setDiarize({
-      status: null,
-      downloading: true,
-      fraction: 0,
-      phase: null,
-      error: null,
-      flash: null,
-    });
+  async function downloadDiarize(engine: DiarizeEngine) {
+    updateDiarize(engine, () => ({ ...EMPTY_DIARIZE_STATE, downloading: true }));
     try {
-      await ipc.diarizeDownload("community1");
-      const status = await ipc.diarizeStatus("community1");
-      setDiarize({
-        status,
-        downloading: false,
-        fraction: 0,
-        phase: null,
-        error: null,
-        flash: null,
-      });
-      flashDiarize("Community-1 model downloaded");
+      await ipc.diarizeDownload(engine);
+      const status = await ipc.diarizeStatus(engine);
+      updateDiarize(engine, () => ({ ...EMPTY_DIARIZE_STATE, status }));
+      flashDiarize(engine, `${DIARIZE_ENGINE_LABEL[engine]} model downloaded`);
     } catch (e) {
-      const status = await ipc.diarizeStatus("community1").catch(() => null);
-      setDiarize({
-        status,
-        downloading: false,
-        fraction: 0,
-        phase: null,
-        error: String(e),
-        flash: null,
-      });
+      const status = await ipc.diarizeStatus(engine).catch(() => null);
+      updateDiarize(engine, () => ({ ...EMPTY_DIARIZE_STATE, status, error: String(e) }));
     }
   }
 
-  async function deleteDiarize() {
-    const beforePath = diarize.status?.path;
+  async function deleteDiarize(engine: DiarizeEngine) {
+    const beforePath = diarize[engine].status?.path;
     try {
-      await ipc.diarizeDelete("community1");
-      const status = await ipc.diarizeStatus("community1");
-      setDiarize({
-        status,
-        downloading: false,
-        fraction: 0,
-        phase: null,
-        error: null,
-        flash: null,
-      });
+      await ipc.diarizeDelete(engine);
+      const status = await ipc.diarizeStatus(engine);
+      updateDiarize(engine, () => ({ ...EMPTY_DIARIZE_STATE, status }));
       flashDiarize(
-        beforePath ? `Deleted ${beforePath}` : "Community-1 model deleted",
+        engine,
+        beforePath ? `Deleted ${beforePath}` : `${DIARIZE_ENGINE_LABEL[engine]} model deleted`,
       );
     } catch (e) {
-      setDiarize((p) => ({ ...p, error: String(e) }));
-    }
-  }
-
-  async function downloadSortformer() {
-    setSortformer({
-      status: null,
-      downloading: true,
-      fraction: 0,
-      phase: null,
-      error: null,
-      flash: null,
-    });
-    try {
-      await ipc.diarizeDownload("sortformer");
-      const status = await ipc.diarizeStatus("sortformer");
-      setSortformer({
-        status,
-        downloading: false,
-        fraction: 0,
-        phase: null,
-        error: null,
-        flash: null,
-      });
-      flashSortformer("Sortformer model downloaded");
-    } catch (e) {
-      const status = await ipc.diarizeStatus("sortformer").catch(() => null);
-      setSortformer({
-        status,
-        downloading: false,
-        fraction: 0,
-        phase: null,
-        error: String(e),
-        flash: null,
-      });
-    }
-  }
-
-  async function deleteSortformer() {
-    const beforePath = sortformer.status?.path;
-    try {
-      await ipc.diarizeDelete("sortformer");
-      const status = await ipc.diarizeStatus("sortformer");
-      setSortformer({
-        status,
-        downloading: false,
-        fraction: 0,
-        phase: null,
-        error: null,
-        flash: null,
-      });
-      flashSortformer(
-        beforePath ? `Deleted ${beforePath}` : "Sortformer model deleted",
-      );
-    } catch (e) {
-      setSortformer((p) => ({ ...p, error: String(e) }));
+      updateDiarize(engine, (d) => ({ ...d, error: String(e) }));
     }
   }
 
   async function update(key: EditableKey, value: string) {
     setS((prev) => ({ ...prev, [key]: value }));
-    await ipc.setSetting(key, value);
-    // Tell views outside this dialog (see settingsBus for why they can't
-    // notice on their own).
-    broadcastSettingChange(key, value);
+    await writeSetting(key, value);
   }
 
   async function updateTranscribeConfig(cfg: TranscribeConfig) {
@@ -450,9 +373,6 @@ export function useSettings() {
     diarize,
     downloadDiarize,
     deleteDiarize,
-    sortformer,
-    downloadSortformer,
-    deleteSortformer,
   };
 }
 

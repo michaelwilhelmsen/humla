@@ -14,11 +14,13 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 // ---- Speaker diarization model management ---------------------------------
 
-fn parse_engine(engine: Option<String>) -> diarize::Engine {
-    engine
-        .as_deref()
-        .map(diarize::Engine::from_setting)
-        .unwrap_or(diarize::Engine::Community1)
+/// Strict, unlike a stored setting: an engine this build doesn't know must not
+/// quietly become community-1, or deleting it would delete community-1's model.
+fn parse_engine(engine: Option<String>) -> Result<diarize::Engine, String> {
+    match engine.as_deref() {
+        None => Ok(diarize::Engine::Community1),
+        Some(arg) => diarize::Engine::parse(arg).ok_or_else(|| format!("unknown diarize engine {arg:?}")),
+    }
 }
 
 #[tauri::command]
@@ -26,17 +28,17 @@ pub async fn diarize_status(
     app: AppHandle,
     engine: Option<String>,
 ) -> Result<diarize::ModelStatus, String> {
-    diarize::status(&app, parse_engine(engine)).await.map_err(err)
+    diarize::status(&app, parse_engine(engine)?).await.map_err(err)
 }
 
 #[tauri::command]
 pub async fn diarize_download(app: AppHandle, engine: Option<String>) -> Result<(), String> {
-    diarize::download(&app, parse_engine(engine)).await.map_err(err)
+    diarize::download(&app, parse_engine(engine)?).await.map_err(err)
 }
 
 #[tauri::command]
 pub async fn diarize_delete(app: AppHandle, engine: Option<String>) -> Result<(), String> {
-    diarize::delete(&app, parse_engine(engine)).await.map_err(err)
+    diarize::delete(&app, parse_engine(engine)?).await.map_err(err)
 }
 
 // ---- Local Whisper model management ----------------------------------------

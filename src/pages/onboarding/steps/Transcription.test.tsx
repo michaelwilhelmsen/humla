@@ -209,10 +209,13 @@ describe("onboarding TranscriptionStep — on-device download flow", () => {
     storeProgress(TURBO, 287_000_000, 574_000_000);
     expect(await screen.findByText(/downloading/i)).toBeInTheDocument();
 
-    // Continuing mid-download advances and quietly kicks off the diarize model.
+    // Continuing mid-download advances and quietly kicks off the diarize
+    // models: community-1 first, then the default Nemotron 3.
     await userEvent.click(cont);
     expect(c.goNext).toHaveBeenCalledTimes(1);
-    await waitFor(() => expect(diarizeDownloads).toHaveLength(1));
+    await waitFor(() =>
+      expect(diarizeDownloads).toEqual([{ engine: "community1" }, { engine: "nemotron3" }]),
+    );
 
     dl.resolve(null);
     act(() => useDownloadStore.getState().clear());
@@ -742,7 +745,7 @@ describe("onboarding TranscriptionStep — resuming a stored config", () => {
 });
 
 describe("onboarding TranscriptionStep — skip semantics", () => {
-  it("Skip advances with nothing chosen and quietly fires the diarize download", async () => {
+  it("Skip advances with nothing chosen and quietly fires the diarize downloads", async () => {
     const diarizeDownloads: unknown[] = [];
     const { ctx: c } = renderStep({
       diarize_download: (args) => {
@@ -755,10 +758,12 @@ describe("onboarding TranscriptionStep — skip semantics", () => {
     await userEvent.click(screen.getByRole("button", { name: /skip for now/i }));
 
     expect(c.goNext).toHaveBeenCalledTimes(1);
-    await waitFor(() => expect(diarizeDownloads).toHaveLength(1));
+    await waitFor(() =>
+      expect(diarizeDownloads).toEqual([{ engine: "community1" }, { engine: "nemotron3" }]),
+    );
   });
 
-  it("skips the diarize download when the model is already present", async () => {
+  it("skips the diarize downloads when the models are already present", async () => {
     const diarizeDownloads: unknown[] = [];
     const { ctx: c } = renderStep({
       diarize_status: () => ({ downloaded: true, sizeBytes: 30_000_000, path: "/x" }),

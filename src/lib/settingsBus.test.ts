@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import { renderHook, waitFor, act } from "@testing-library/react";
-import { broadcastSettingChange, useLiveSetting } from "./settingsBus";
+import { broadcastSettingChange, onSettingChange, useLiveSetting, writeSetting } from "./settingsBus";
 import { mockTauri } from "../test/tauri";
 
 describe("useLiveSetting", () => {
@@ -43,5 +43,39 @@ describe("useLiveSetting", () => {
     // No throw, and nothing to assert on a torn-down hook — this guards the
     // removeEventListener, which a leaked listener would silently skip.
     expect(() => broadcastSettingChange("keep_audio", "true")).not.toThrow();
+  });
+});
+
+describe("writeSetting", () => {
+  it("stores the value and announces it to whatever is showing it", async () => {
+    const writes: [string, string][] = [];
+    mockTauri({
+      settings_get: () => "false",
+      settings_set: (args) => {
+        const { key, value } = args as { key: string; value: string };
+        writes.push([key, value]);
+        return null;
+      },
+    });
+    const { result } = renderHook(() => useLiveSetting("keep_audio"));
+    await waitFor(() => expect(result.current).toBe("false"));
+
+    await act(async () => {
+      await writeSetting("keep_audio", "true");
+    });
+
+    expect(writes).toEqual([["keep_audio", "true"]]);
+    expect(result.current).toBe("true");
+  });
+});
+
+describe("onSettingChange", () => {
+  it("hears every key until it unsubscribes", () => {
+    const heard: string[] = [];
+    const off = onSettingChange((key, value) => heard.push(`${key}=${value}`));
+    broadcastSettingChange("diarize_model", "nemotron3");
+    off();
+    broadcastSettingChange("diarize_model", "community1");
+    expect(heard).toEqual(["diarize_model=nemotron3"]);
   });
 });

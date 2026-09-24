@@ -8,6 +8,7 @@ import { Row, Section } from "../components/Section";
 import { RenameYouRow } from "../components/RenameYouRow";
 import { Select } from "../../../components/ui/Select";
 import { ProviderKeyCard, type KeyProvider } from "../../../components/provider/ProviderKeyCard";
+import { NEMOTRON_MAX_SPEAKERS } from "../../../lib/diarizeEngine";
 import { KEY_PROVIDERS } from "../../../lib/providers";
 import { LANGUAGES, languageOptionLabel } from "../../../lib/languages";
 import { inputClass } from "../types";
@@ -106,9 +107,6 @@ export function TranscriptionTab({
   diarize,
   downloadDiarize,
   deleteDiarize,
-  sortformer,
-  downloadSortformer,
-  deleteSortformer,
 }: Pick<
   SettingsHook,
   | "s"
@@ -123,9 +121,6 @@ export function TranscriptionTab({
   | "diarize"
   | "downloadDiarize"
   | "deleteDiarize"
-  | "sortformer"
-  | "downloadSortformer"
-  | "deleteSortformer"
 >) {
   const def = transcribeConfig.default;
 
@@ -216,35 +211,43 @@ export function TranscriptionTab({
 
       <Section title="Speaker labels">
         <p className="text-xs text-[var(--color-text-muted)] py-3">
-          When downloaded and active, every recording is automatically
-          tagged with <code>Speaker 1:</code> / <code>Speaker 2:</code>
-          labels after stop. Both engines run locally via CoreML / Apple
-          Neural Engine; pick whichever works better for your recordings.
+          After a recording stops, each voice in it is labelled{" "}
+          <code>Speaker 1:</code>, <code>Speaker 2:</code> and so on. Both
+          engines run on your Mac, on the Neural Engine.
         </p>
         <EngineOption
+          label="Nemotron 3 (end-to-end)"
+          description={`NVIDIA Nemotron 3. Up to ${NEMOTRON_MAX_SPEAKERS} speakers, counts them itself. A note whose speaker count is set above ${NEMOTRON_MAX_SPEAKERS} uses Community-1 instead.`}
+          checked={s.diarize_model === "nemotron3"}
+          disabled={!diarize.nemotron3.status?.downloaded}
+          onPick={() => update("diarize_model", "nemotron3")}
+        >
+          <DiarizeModelManager
+            state={diarize.nemotron3}
+            cost="The model is 193 MB. Setting it up also prepares it for the Neural Engine, which takes about two minutes, once."
+            onDownload={() => downloadDiarize("nemotron3")}
+            onDelete={() => deleteDiarize("nemotron3")}
+          />
+          {s.diarize_model === "nemotron3" &&
+            diarize.nemotron3.status?.downloaded === false &&
+            diarize.community1.status?.downloaded && (
+              <p className="text-xs text-[var(--color-text-muted)] mt-2">
+                Until it’s downloaded, recordings are labelled with Community-1.
+              </p>
+            )}
+        </EngineOption>
+        <EngineOption
           label="Community-1 (clustering)"
-          description="Pyannote community-1 segmentation + WeSpeaker embeddings + VBx clustering. Strong baseline; auto-detects speaker count; occasionally collapses on rapid back-and-forth in the same channel."
+          description={`Pyannote community-1 segmentation and VBx clustering. Uses the note’s speaker count; on Auto it can merge a meeting one person dominates into a single speaker. It also labels any note set above ${NEMOTRON_MAX_SPEAKERS} speakers, so keep it downloaded.`}
           checked={s.diarize_model === "community1"}
-          disabled={!diarize.status?.downloaded}
+          disabled={!diarize.community1.status?.downloaded}
           onPick={() => update("diarize_model", "community1")}
         >
           <DiarizeModelManager
-            state={diarize}
-            onDownload={downloadDiarize}
-            onDelete={deleteDiarize}
-          />
-        </EngineOption>
-        <EngineOption
-          label="Sortformer (end-to-end)"
-          description="NVIDIA Sortformer running in batch over the saved WAV. Fixed 4-speaker cap. Handles the rapid speaker changes clustering struggles with — the answer if Community-1 keeps confusing your speakers."
-          checked={s.diarize_model === "sortformer"}
-          disabled={!sortformer.status?.downloaded}
-          onPick={() => update("diarize_model", "sortformer")}
-        >
-          <DiarizeModelManager
-            state={sortformer}
-            onDownload={downloadSortformer}
-            onDelete={deleteSortformer}
+            state={diarize.community1}
+            cost="The model is about 22 MB. Setting it up also compiles it for the Neural Engine, which takes 20–30 s."
+            onDownload={() => downloadDiarize("community1")}
+            onDelete={() => deleteDiarize("community1")}
           />
         </EngineOption>
         <Disclosure label="Advanced">
@@ -254,20 +257,6 @@ export function TranscriptionTab({
             value={s.community1_threshold}
             placeholder="0.5"
             onChange={(v) => update("community1_threshold", v)}
-          />
-          <ThresholdRow
-            label="Sortformer silence threshold"
-            description="Sum of speaker probabilities below which a frame is treated as silence. Default 0.5."
-            value={s.sortformer_silence_threshold}
-            placeholder="0.5"
-            onChange={(v) => update("sortformer_silence_threshold", v)}
-          />
-          <ThresholdRow
-            label="Sortformer prediction threshold"
-            description="Speech-probability threshold for crediting a speaker. Default 0.25."
-            value={s.sortformer_pred_threshold}
-            placeholder="0.25"
-            onChange={(v) => update("sortformer_pred_threshold", v)}
           />
           <ThresholdRow
             label="Silence RMS threshold"

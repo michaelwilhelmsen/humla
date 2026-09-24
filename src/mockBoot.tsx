@@ -36,14 +36,16 @@ import { IntegrationsSection } from "./pages/settings/tabs/Integrations";
 import { ChatTab } from "./pages/settings/tabs/Chat";
 import { RecordingSection } from "./pages/settings/tabs/Recording";
 import { TranscriptionTab } from "./pages/settings/tabs/Transcription";
+import { DiarizeModelManager } from "./pages/settings/components/DiarizeModelManager";
+import { useNemotronOffer, type NemotronOfferState } from "./lib/nemotronOffer";
 import { useSettings } from "./pages/settings/useSettings";
 import { NewWorkspaceModal } from "./components/NewWorkspaceModal";
 import { DISCONNECTED, useCloudStore, type CloudStatus, type CloudWorkspace } from "./lib/cloud";
-import { DEFAULTS, type EditableKey } from "./pages/settings/types";
+import { DEFAULTS, EMPTY_DIARIZE_STATE, type EditableKey } from "./pages/settings/types";
 import { SummaryStep } from "./pages/onboarding/steps/Summary";
 import { TranscriptionStep } from "./pages/onboarding/steps/Transcription";
 import { STEP_ORDER, type StepContext, type StepId } from "./pages/onboarding/types";
-import type { ProviderConfig, RecordingStatus, Step, TimelineEntry } from "./lib/ipc";
+import type { DiarizeEngine, ProviderConfig, RecordingStatus, Step, TimelineEntry } from "./lib/ipc";
 import { DEMO_CLIENTS, DEMO_FOLDERS, demoNotes } from "./test/noteLibrary";
 // Mirrors src/main.tsx — every theme's typeface, so a scenario reviewed under
 // `?palette=<id>` renders in that design's face rather than falling back.
@@ -571,6 +573,68 @@ function TranscriptionKeysHarness() {
   return <TranscriptionTab {...h} />;
 }
 
+// ---- #193 axis: the speaker-label engines in Settings, and Home's offer to
+// switch an upgraded install to Nemotron 3.
+const ENGINE_SIZE: Record<DiarizeEngine, number> = { nemotron3: 193_000_000, community1: 21_776_918 };
+
+function speakerEnginesCase(stored: DiarizeEngine | null, downloaded: DiarizeEngine[]): Scenario {
+  return {
+    wrap: settingsWrap,
+    render: () => <TranscriptionKeysHarness />,
+    ipc: {
+      get_transcribe_config: () => ({ default: { provider: "openai", model: "whisper-1" }, per_language: {} }),
+      provider_key_get: () => "stored",
+      local_whisper_models: () => [],
+      settings_get: (args) => ((args as { key: string }).key === "diarize_model" ? stored : null),
+      diarize_status: (args) => {
+        const engine = (args as { engine: DiarizeEngine }).engine;
+        const on = downloaded.includes(engine);
+        return {
+          downloaded: on,
+          sizeBytes: on ? ENGINE_SIZE[engine] : null,
+          path: on ? `~/Library/Application Support/FluidAudio/Models/${engine}` : null,
+        };
+      },
+    },
+  };
+}
+
+// The warm-up only arises from a click and a progress event, which a component
+// scenario has no event bus for, so the manager is rendered in that state.
+function diarizeWarmingCase(): Scenario {
+  return {
+    wrap: settingsWrap,
+    render: () => (
+      <DiarizeModelManager
+        state={{ ...EMPTY_DIARIZE_STATE, downloading: true, phase: "warming" }}
+        cost=""
+        onDownload={() => {}}
+        onDelete={() => {}}
+      />
+    ),
+    ipc: {},
+  };
+}
+
+function nemotronOfferCase(offer?: NemotronOfferState): Scenario {
+  return {
+    route: "/",
+    render: () => null,
+    ipc: {
+      notes_list: () => demoNotes(),
+      folders_list: () => DEMO_FOLDERS,
+      settings_get: (args) => {
+        const key = (args as { key: string }).key;
+        if (key === "nemotron_offer") return "pending";
+        if (key === "diarize_model") return "community1";
+        return null;
+      },
+      diarize_download: () => new Promise(() => {}),
+    },
+    seed: offer ? () => useNemotronOffer.setState({ offer }) : undefined,
+  };
+}
+
 // ---- workspace-creation axis: the sheet's five stages ----------------------
 // Five separate scenarios rather than one clickable flow: the stages are DERIVED
 // from cloud status, so seeding the status is how you reach one — and each is a
@@ -1065,6 +1129,17 @@ const CASES: Record<string, Scenario> = {
   // --- #192: the key cards derive from the provider registry.
   "keys-openai": transcriptionKeysCase({ provider: "openai", model: "whisper-1" }),
   "keys-deepgram": transcriptionKeysCase({ provider: "deepgram", model: "nova-3" }),
+
+  // --- #193: Nemotron 3 as the default diarizer.
+  "engines-fresh": speakerEnginesCase(null, ["community1"]),
+  "engines-upgraded": speakerEnginesCase("community1", ["community1"]),
+  "engines-both": speakerEnginesCase("nemotron3", ["nemotron3", "community1"]),
+  "engines-warming": diarizeWarmingCase(),
+  "offer-home": nemotronOfferCase(),
+  "offer-downloading": nemotronOfferCase({ stage: "downloading", fraction: 0.42, phase: "downloading" }),
+  "offer-warming": nemotronOfferCase({ stage: "downloading", fraction: 0, phase: "warming" }),
+  "offer-failed": nemotronOfferCase({ stage: "offered", error: "download failed: The Internet connection appears to be offline." }),
+  "offer-done": nemotronOfferCase({ stage: "done" }),
 
   // --- #179: local chat on Ollama, on a plain OpenAI-compat server, and on one
   // whose embedder is pointed back at Ollama (the shape the issue needs).

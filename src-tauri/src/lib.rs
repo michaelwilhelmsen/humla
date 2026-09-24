@@ -176,6 +176,9 @@ where
                 .expect("app data dir");
             std::fs::create_dir_all(&app_dir).ok();
             let db_path = app_dir.join("notes.sqlite");
+            // Read before `open` creates the file: some migrations treat an
+            // install that has run before differently from a fresh one.
+            let existing_install = db_path.exists();
             let conn = db::open(&db_path).expect("open db");
             let db = Arc::new(Mutex::new(conn));
             // Build the sync observer now that the db handle and AppHandle
@@ -204,21 +207,22 @@ where
                     let _ = app.emit("menu://check-for-updates", ());
                 }
             });
-            // One-shot cleanup of pre-v0.8.0 streaming diarizer files
-            // (pyannote_segmentation.mlmodelc + wespeaker_v2.mlmodelc).
-            // Replaced by the community-1 offline set in v0.8.0 — same dir,
-            // different filenames, so the old files would otherwise sit
-            // there forever as dead weight. Gated on a settings flag so
-            // this only runs once per install, never re-deleting files
-            // upstream might legitimately reintroduce later.
+            // Diarization models Humla no longer uses, removed once per install.
             {
                 let state: tauri::State<AppState> = app.state();
                 let conn = state.db.lock();
-                diarize::cleanup_legacy_streaming_models(app.handle(), &conn);
+                diarize::remove_retired_models(app.handle(), &conn);
+            }
+            {
+                let state: tauri::State<AppState> = app.state();
+                let conn = state.db.lock();
+                if let Err(e) = db::migrate_diarize_engine(&conn, existing_install) {
+                    eprintln!("migrate_diarize_engine: {e}");
+                }
             }
             // One-shot migration of the legacy single-custom-prompt setting
             // into the summary_prompts table. Same flag-guarded shape as the
-            // diarize cleanup above.
+            // migration above.
             {
                 let state: tauri::State<AppState> = app.state();
                 let conn = state.db.lock();

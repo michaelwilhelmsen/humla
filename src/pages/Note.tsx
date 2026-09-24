@@ -38,6 +38,8 @@ import { computeSetupStatus } from "../lib/setupStatus";
 import { useOwnerName, useCloudStore } from "../lib/cloud";
 import { billingCta, planIsLive } from "../lib/billing";
 import { extractSpeakerLabels, renameSpeakerInTranscript } from "../lib/speakers";
+import { NEMOTRON_MAX_SPEAKERS } from "../lib/diarizeEngine";
+import { SPEAKER_COUNT_OPTIONS, speakerCountLabel } from "../lib/speakerCount";
 import { htmlToText } from "../lib/noteList";
 import { shouldAdoptRemoteBody, shouldAdoptRemoteTitle, shouldRequestTitleForBody } from "../lib/noteSync";
 import { SpeakerLabels, speakerColorMap } from "../components/SpeakerLabels";
@@ -2425,16 +2427,6 @@ function LanguagePicker({
 //
 // In remote-call mode the count is *total* including the user — the backend
 // subtracts 1 for the `You:` label before passing to the diarizer.
-const SPEAKER_OPTIONS: { value: number; label: string }[] = [
-  { value: 0, label: "Auto" },
-  { value: 1, label: "1" },
-  { value: 2, label: "2" },
-  { value: 3, label: "3" },
-  { value: 4, label: "4" },
-  { value: 5, label: "5" },
-  { value: 6, label: "6" },
-];
-
 function SpeakersPicker({
   value,
   onChange,
@@ -2442,23 +2434,18 @@ function SpeakersPicker({
   value: number | null;
   onChange: (n: number | null) => void;
 }) {
-  // Internal sentinel: 0 stands in for `null` (auto), since the picker's
-  // values are strings. Convert at the boundary.
   const selected = value ?? 0;
   return (
     <CtlSelect
       icon={<Users size={14} strokeWidth={1.6} />}
-      label={selected === 0 ? "Auto" : `${selected} speakers`}
+      label={selected === 0 ? "Auto" : speakerCountLabel(selected)}
       value={String(selected)}
       onChange={(v) => {
         const n = parseInt(v, 10);
         onChange(n > 0 ? n : null);
       }}
-      title="Expected speakers — diarization hint. 'Auto' lets the model decide."
-      options={SPEAKER_OPTIONS.map((o) => ({
-        value: String(o.value),
-        label: o.label === "Auto" ? "Auto" : `${o.label} speakers`,
-      }))}
+      title={`Expected speakers. Community-1 uses this count; Nemotron 3 counts up to ${NEMOTRON_MAX_SPEAKERS} by itself, and a note set above ${NEMOTRON_MAX_SPEAKERS} always uses Community-1.`}
+      options={SPEAKER_COUNT_OPTIONS}
     />
   );
 }

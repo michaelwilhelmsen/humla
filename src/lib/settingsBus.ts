@@ -16,9 +16,26 @@ const SETTING_CHANGED = "humla:setting-changed";
 
 type Detail = { key: SettingsKey; value: string };
 
-/** Announce a settings write. Called by `useSettings.update`, nowhere else. */
+/** Announce a settings write. Called by `writeSetting`, nowhere else. */
 export function broadcastSettingChange(key: SettingsKey, value: string) {
   window.dispatchEvent(new CustomEvent<Detail>(SETTING_CHANGED, { detail: { key, value } }));
+}
+
+/** Store a setting and announce it: the one write path for a value some other
+ *  view may be showing. */
+export async function writeSetting(key: SettingsKey, value: string): Promise<void> {
+  await ipc.setSetting(key, value);
+  broadcastSettingChange(key, value);
+}
+
+/** Hear every announced write. Returns the unsubscribe. */
+export function onSettingChange(cb: (key: SettingsKey, value: string) => void): () => void {
+  const onChange = (e: Event) => {
+    const detail = (e as CustomEvent<Detail>).detail;
+    if (detail) cb(detail.key, detail.value);
+  };
+  window.addEventListener(SETTING_CHANGED, onChange);
+  return () => window.removeEventListener(SETTING_CHANGED, onChange);
 }
 
 /**
@@ -35,14 +52,12 @@ export function useLiveSetting(key: SettingsKey): string | null {
     ipc.getSetting(key).then((v) => {
       if (!cancelled) setValue(v);
     });
-    const onChange = (e: Event) => {
-      const detail = (e as CustomEvent<Detail>).detail;
-      if (detail?.key === key) setValue(detail.value);
-    };
-    window.addEventListener(SETTING_CHANGED, onChange);
+    const off = onSettingChange((changed, v) => {
+      if (changed === key) setValue(v);
+    });
     return () => {
       cancelled = true;
-      window.removeEventListener(SETTING_CHANGED, onChange);
+      off();
     };
   }, [key]);
 

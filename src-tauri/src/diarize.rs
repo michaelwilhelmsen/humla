@@ -6,20 +6,9 @@ use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
-// fluidaudio-rs v0.1.0 advertises diarization but the Rust bindings are
-// stubs — only the underlying FluidAudio Swift package implements it. So
-// we wrap that Swift package in a sidecar binary (`speaker-diarize`) and
-// IPC over stdout JSON, mirroring our `audio-capture` sidecar pattern.
-//
-// The sidecar uses FluidAudio's `OfflineDiarizerManager` (community-1
-// segmentation + VBx clustering with PLDA) — the upgrade from the 3.1-based
-// `DiarizerManager` we used initially. Picked because community-1 counts and
-// assigns speakers more accurately on dense single-mic captures (e.g.
-// in-person meetings where everyone shares one acoustic context). The
-// sidecar handles: model download (~30 MB of CoreML files on first run,
-// cached after), compile for the Apple Neural Engine, audio resample to
-// 16 kHz mono Float32, and the actual diarization. It writes a single JSON
-// array of segments to stdout and exits.
+// Diarization runs in the `speaker-diarize` sidecar, a wrapper around the
+// FluidAudio Swift package, which downloads and compiles the CoreML models,
+// diarizes a WAV and prints its segments as one JSON array on stdout.
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Segment {
@@ -28,11 +17,9 @@ pub struct Segment {
     pub speaker_id: String,
 }
 
-/// Maximum gap (ms) between two same-speaker segments to merge them
-/// into one continuous turn. Sortformer in particular often slices a
-/// single speaker's turn into multiple sub-segments separated by 100-
-/// 200 ms of model-internal frame boundaries; merging recovers the
-/// natural turn shape.
+/// Maximum gap (ms) between two same-speaker segments to merge them into one
+/// turn. An end-to-end engine slices a single turn at its own frame boundaries,
+/// 100–200 ms apart.
 const SAME_SPEAKER_MERGE_GAP_MS: u64 = 250;
 
 /// Maximum duration (ms) for a segment to be a candidate for "noise"
@@ -55,19 +42,13 @@ const NOISE_CONTAINER_LENGTH_RATIO: u64 = 2;
 /// these are per-frame prediction blips.
 const HARD_FLOOR_MS: u64 = 150;
 
-/// Pre-processing pass over raw diarize output. Sortformer in particular
-/// produces highly fragmented segments — for example a 60-minute
-/// recording yielded 2072 segments with median duration 960 ms, 32%
-/// under 500 ms, and frequent overlap between different-speaker
-/// segments. Without cleaning, walking word-level alignment over this
-/// segment set produces hyper-fragmented `LabelledPiece` sequences
-/// that downstream flicker absorption (`bridge_short_interjections`)
-/// cannot fully rescue.
+/// Pre-processing pass over raw diarize output. An end-to-end engine emits
+/// short, overlapping fragments, and word-level alignment over them produces
+/// more speaker changes than `bridge_short_interjections` can absorb.
 ///
 /// Three passes, applied in order:
 ///   1. Merge adjacent same-speaker segments separated by ≤250 ms gap
-///      or overlapping. Recovers continuous turns Sortformer's
-///      per-frame output sliced into pieces.
+///      or overlapping.
 ///   2. Drop short segments (<600 ms) that are ≥80% contained inside
 ///      a longer (2× or more) different-speaker segment. These are
 ///      almost always per-frame prediction blips, not real backchannels.
@@ -153,60 +134,105 @@ fn drop_subthreshold(segments: Vec<Segment>) -> Vec<Segment> {
         .collect()
 }
 
-/// Run speaker diarization on a WAV file by invoking the speaker-diarize
-/// sidecar. First call downloads the offline diarizer models (~30 MB of
-/// CoreML files) and compiles them for the Apple Neural Engine — that's
-/// slow (20–30 s). Subsequent calls reuse the cached + compiled models and
-/// run substantially faster than realtime on M-series.
-///
-/// `num_speakers` is an optional caller-supplied hint. When provided, the
-/// sidecar pins the cluster count via `OfflineDiarizerConfig.withSpeakers
-/// (exactly:)`, which is the most reliable fix for dominant-speaker
-/// recordings where VBx auto-detection collapses to one cluster. `None`
-/// leaves auto-detection on.
-/// User-tunable thresholds passed through to the sidecar. `None` for any
-/// field means "use the sidecar's built-in default" — the values that
-/// match what the project shipped before these became settings.
+/// User-tunable thresholds passed through to the sidecar. `None` means the
+/// sidecar's own default.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Thresholds {
     pub community1_clustering: Option<f64>,
-    pub sortformer_silence: Option<f32>,
-    pub sortformer_pred: Option<f32>,
 }
 
-/// Which diarization engine the sidecar should run.
+/// Which diarization engine the sidecar runs.
 ///
-/// `Community1` is FluidAudio's `OfflineDiarizerManager` (community-1
-/// segmentation + VBx clustering with PLDA). Strong baseline, but
-/// clustering-based approaches plateau on rapid within-channel speaker
-/// turns — the architectural ceiling that drove the Sortformer addition.
-///
-/// `Sortformer` is NVIDIA's Streaming Sortformer (4-speaker end-to-end
-/// transformer) running in batch via `SortformerDiarizer.processComplete`.
-/// We use the `highContextV2_1` variant (chunkRightContext=40 frames,
-/// ~4s of right-side lookahead) for offline accuracy, not the streaming
-/// latency the default `fastV2_1` is tuned for. Trade-off: 4-speaker hard
-/// cap (vs auto-detect on community-1), no num_speakers hint.
+/// `Nemotron3` is NVIDIA's end-to-end Nemotron 3 Diarization: it counts
+/// speakers itself, up to [`NEMOTRON_MAX_SPEAKERS`], and takes no count.
+/// `Community1` is pyannote segmentation plus VBx clustering: it takes the
+/// note's speaker count, and without one it tends to merge a meeting one person
+/// dominates onto a single speaker.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Engine {
     Community1,
-    Sortformer,
+    Nemotron3,
 }
 
+/// The most speakers Nemotron 3 can tell apart.
+pub const NEMOTRON_MAX_SPEAKERS: i64 = 8;
+
 impl Engine {
-    pub fn from_setting(s: &str) -> Self {
-        match s {
-            "sortformer" => Engine::Sortformer,
-            _ => Engine::Community1,
+    pub fn parse(arg: &str) -> Option<Self> {
+        match arg {
+            "community1" => Some(Engine::Community1),
+            "nemotron3" => Some(Engine::Nemotron3),
+            _ => None,
         }
+    }
+
+    /// A stored value this build doesn't know reads as community-1. Mirrored by
+    /// `selectedDiarizeEngine` in `src/lib/diarizeEngine.ts`.
+    pub fn from_setting(s: &str) -> Self {
+        Self::parse(s).unwrap_or(Engine::Community1)
     }
 
     pub(crate) fn arg(self) -> &'static str {
         match self {
             Engine::Community1 => "community1",
-            Engine::Sortformer => "sortformer",
+            Engine::Nemotron3 => "nemotron3",
         }
     }
+
+    pub(crate) fn takes_speaker_hint(self) -> bool {
+        self == Engine::Community1
+    }
+
+    fn other(self) -> Self {
+        match self {
+            Engine::Community1 => Engine::Nemotron3,
+            Engine::Nemotron3 => Engine::Community1,
+        }
+    }
+}
+
+/// The engines a note may be diarized with, best first: a count above what
+/// Nemotron 3 can represent prefers community-1, anything else the selected
+/// engine, and the other engine follows as the fallback for a missing model,
+/// since labels from either beat none. Mirrored by `enginesToDownload` in
+/// `src/lib/diarizeEngine.ts`, which fetches what this falls back to.
+pub fn engine_preference(selected: Engine, expected_speakers: Option<i64>) -> Vec<Engine> {
+    let preferred = if expected_speakers.is_some_and(|n| n > NEMOTRON_MAX_SPEAKERS) {
+        Engine::Community1
+    } else {
+        selected
+    };
+    vec![preferred, preferred.other()]
+}
+
+/// The engine a note is diarized with, and whether its model is on disk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EngineChoice {
+    pub engine: Engine,
+    pub downloaded: bool,
+}
+
+/// The first engine in [`engine_preference`] whose model is downloaded. When
+/// none is, the note's preferred engine with `downloaded: false`.
+pub async fn choose_engine(
+    app: &AppHandle,
+    selected: Engine,
+    expected_speakers: Option<i64>,
+) -> EngineChoice {
+    let preference = engine_preference(selected, expected_speakers);
+    for &engine in &preference {
+        if matches!(status(app, engine).await, Ok(s) if s.downloaded) {
+            if engine != preference[0] {
+                eprintln!(
+                    "diarize: {} model not downloaded, using {}",
+                    preference[0].arg(),
+                    engine.arg()
+                );
+            }
+            return EngineChoice { engine, downloaded: true };
+        }
+    }
+    EngineChoice { engine: preference[0], downloaded: false }
 }
 
 pub async fn diarize_file(
@@ -224,21 +250,12 @@ pub async fn diarize_file(
     let mut cmd = Command::new(&sidecar);
     cmd.arg(path_str);
     cmd.arg("--engine").arg(engine.arg());
-    // Sortformer has a fixed 4-speaker output cap and ignores hints —
-    // only forward the flag on the community-1 path.
-    if engine == Engine::Community1 {
+    if engine.takes_speaker_hint() {
         if let Some(n) = num_speakers.filter(|n| *n > 0) {
             cmd.arg("--num-speakers").arg(n.to_string());
         }
         if let Some(t) = thresholds.community1_clustering {
             cmd.arg("--threshold").arg(format!("{t}"));
-        }
-    } else if engine == Engine::Sortformer {
-        if let Some(t) = thresholds.sortformer_silence {
-            cmd.arg("--silence-threshold").arg(format!("{t}"));
-        }
-        if let Some(t) = thresholds.sortformer_pred {
-            cmd.arg("--pred-threshold").arg(format!("{t}"));
         }
     }
     let output = cmd
@@ -300,8 +317,7 @@ pub async fn diarize_file(
 /// flushes only at process exit — *after* our unbuffered payload write — and
 /// lands as a trailing line. `serde_json::from_str` over the whole buffer then
 /// fails with "trailing characters at line 2 column 1" and diarization dies,
-/// surfacing the raw parse error where the transcript should be. (Seen on the
-/// Sortformer engine, whose vendored diarizer leaks such a line.)
+/// surfacing the raw parse error where the transcript should be.
 ///
 /// So scan for the line that actually parses as a segment array rather than
 /// trusting the whole buffer. The payload is always a single line
@@ -366,62 +382,63 @@ pub async fn cleanup_full_wav(path: &Path) {
     }
 }
 
-/// One-shot purge of the old streaming diarization model files left behind
-/// by pre-v0.8.0 installs. The community-1 (offline) pipeline lives in the
-/// same FluidAudio directory but uses different filenames, so leftover
-/// `pyannote_segmentation.mlmodelc` + `wespeaker_v2.mlmodelc` directories
-/// stick around as ~14 MB of dead weight after upgrade.
-///
-/// Gated on a settings flag so it runs exactly once per install. Running on
-/// every launch would be technically idempotent today (the names we wipe
-/// are no longer produced by FluidAudio), but it would silently delete any
-/// future upstream model file that happens to reuse those names — a hard-
-/// to-debug failure mode. The flag pins the cleanup to "once, right after
-/// the upgrade" and makes the function inert thereafter.
-///
-/// Resolves the FluidAudio dir from `app_data_dir().parent()` rather than
-/// hardcoding `~/Library/...` so the function survives a future Tauri path
-/// reshuffle. FluidAudio writes to `~/Library/Application Support/FluidAudio/`,
-/// a sibling of our own `~/Library/Application Support/no.humla.app/`.
-pub fn cleanup_legacy_streaming_models(app: &AppHandle, conn: &rusqlite::Connection) {
-    const FLAG_KEY: &str = "legacy_streaming_models_purged_v1";
-    match crate::db::get_setting(conn, FLAG_KEY) {
-        Ok(Some(_)) => return, // already purged on a prior launch
-        Ok(None) => {}
-        Err(e) => {
-            eprintln!("cleanup_legacy: read flag failed: {e}");
-            // Don't proceed without a working DB — the flag write below
-            // would also fail and we'd loop on every launch.
-            return;
-        }
-    }
+/// Model directories under FluidAudio's `Models` root that Humla no longer
+/// uses — the old streaming diarizer's files and Sortformer's — each with the
+/// flag that removes it once per install.
+const RETIRED_MODEL_DIRS: &[(&str, &[&str])] = &[
+    (
+        "legacy_streaming_models_purged_v1",
+        &[
+            "speaker-diarization/pyannote_segmentation.mlmodelc",
+            "speaker-diarization/wespeaker_v2.mlmodelc",
+        ],
+    ),
+    ("sortformer_models_purged_v1", &["sortformer"]),
+];
 
+/// Remove the retired model directories left in FluidAudio's shared model
+/// cache, a sibling of Humla's own app-data directory.
+pub fn remove_retired_models(app: &AppHandle, conn: &rusqlite::Connection) {
     let app_data = match app.path().app_data_dir() {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("cleanup_legacy: no app_data_dir: {e}");
+            eprintln!("retired models: no app_data_dir: {e}");
             return;
         }
     };
     let Some(application_support) = app_data.parent() else {
-        eprintln!("cleanup_legacy: app_data_dir has no parent");
+        eprintln!("retired models: app_data_dir has no parent");
         return;
     };
-    let fluid_dir = application_support
-        .join("FluidAudio")
-        .join("Models")
-        .join("speaker-diarization");
-    for legacy in ["pyannote_segmentation.mlmodelc", "wespeaker_v2.mlmodelc"] {
-        let p = fluid_dir.join(legacy);
-        if p.exists() {
-            match std::fs::remove_dir_all(&p) {
-                Ok(_) => eprintln!("cleanup_legacy: removed {}", p.display()),
-                Err(e) => eprintln!("cleanup_legacy: remove {} failed: {e}", p.display()),
+    remove_retired_model_dirs(&application_support.join("FluidAudio").join("Models"), conn);
+}
+
+/// Once per flag rather than every launch: the folders sit in a cache other
+/// FluidAudio clients share, and one of them may use a folder after we left it.
+fn remove_retired_model_dirs(models: &Path, conn: &rusqlite::Connection) {
+    for (flag, dirs) in RETIRED_MODEL_DIRS {
+        match crate::db::get_setting(conn, flag) {
+            Ok(Some(_)) => continue,
+            Ok(None) => {}
+            Err(e) => {
+                // Without a readable flag the write below would fail too, and
+                // the removal would repeat on every launch.
+                eprintln!("retired models: read {flag} failed: {e}");
+                continue;
             }
         }
-    }
-    if let Err(e) = crate::db::set_setting(conn, FLAG_KEY, "1") {
-        eprintln!("cleanup_legacy: write flag failed: {e}");
+        for dir in *dirs {
+            let p = models.join(dir);
+            if p.exists() {
+                match std::fs::remove_dir_all(&p) {
+                    Ok(_) => eprintln!("retired models: removed {}", p.display()),
+                    Err(e) => eprintln!("retired models: remove {} failed: {e}", p.display()),
+                }
+            }
+        }
+        if let Err(e) = crate::db::set_setting(conn, flag, "1") {
+            eprintln!("retired models: write {flag} failed: {e}");
+        }
     }
 }
 
@@ -471,16 +488,16 @@ pub async fn status(app: &AppHandle, engine: Engine) -> Result<ModelStatus> {
 pub struct DownloadProgress {
     pub fraction: f64,
     pub phase: String,
-    /// Which engine this progress event belongs to ("community1" or
-    /// "sortformer"). Both engines share the diarize_download_progress
-    /// event channel; the frontend filters by this field so simultaneous
-    /// downloads don't cross-pollute each other's progress bars.
+    /// Which engine this progress event belongs to. Every engine shares the
+    /// diarize_download_progress channel, and the frontend filters on this so
+    /// simultaneous downloads don't cross into each other's progress bars.
     pub engine: String,
 }
 
 /// Trigger the model download via the sidecar, emitting Tauri events for
-/// each progress line so the UI can show a progress bar. The sidecar handles
-/// FluidAudio's three-phase flow (listing → downloading → compiling).
+/// each progress line so the UI can show a progress bar. Phases are FluidAudio's
+/// `listing` → `downloading` → `compiling`, then `warming` for an engine that
+/// compiles for the Neural Engine before it reports done.
 pub async fn download(app: &AppHandle, engine: Engine) -> Result<()> {
     let sidecar = sidecar_path(app)?;
     let mut child = Command::new(&sidecar)
@@ -609,9 +626,9 @@ mod tests {
     }
 
     #[test]
-    fn drops_contained_noise_sortformer_pattern() {
-        // Classic Sortformer artifact: 81ms S1 sliver fully inside an
-        // 800ms S0 segment. Drop the sliver.
+    fn drops_contained_noise_end_to_end_pattern() {
+        // An end-to-end engine's typical artifact: an 81 ms S1 sliver fully
+        // inside an 800 ms S0 segment. Drop the sliver.
         let input = vec![seg(480, 1280, "S0"), seg(799, 880, "S1")];
         assert_eq!(clean_segments(input), vec![seg(480, 1280, "S0")]);
     }
@@ -709,5 +726,104 @@ mod tests {
     #[test]
     fn payload_errors_when_no_array_present() {
         assert!(parse_segment_payload("humla-error: something went wrong\n").is_err());
+    }
+
+    #[test]
+    fn engine_setting_round_trips_and_anything_else_reads_as_community1() {
+        for engine in [Engine::Community1, Engine::Nemotron3] {
+            assert_eq!(Engine::from_setting(engine.arg()), engine);
+        }
+        assert_eq!(Engine::from_setting("sortformer"), Engine::Community1);
+        assert_eq!(Engine::from_setting(""), Engine::Community1);
+    }
+
+    #[test]
+    fn parsing_an_engine_argument_refuses_an_unknown_one() {
+        assert_eq!(Engine::parse("nemotron3"), Some(Engine::Nemotron3));
+        assert_eq!(Engine::parse("community1"), Some(Engine::Community1));
+        assert_eq!(Engine::parse("sortformer"), None);
+    }
+
+    #[test]
+    fn a_note_up_to_eight_speakers_prefers_the_selected_engine() {
+        for hint in [None, Some(1), Some(3), Some(8)] {
+            assert_eq!(
+                engine_preference(Engine::Nemotron3, hint),
+                vec![Engine::Nemotron3, Engine::Community1],
+                "hint {hint:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_note_above_eight_speakers_prefers_community1_whichever_is_selected() {
+        assert_eq!(
+            engine_preference(Engine::Community1, Some(9)),
+            vec![Engine::Community1, Engine::Nemotron3]
+        );
+    }
+
+    #[test]
+    fn a_note_above_eight_speakers_prefers_community1() {
+        assert_eq!(
+            engine_preference(Engine::Nemotron3, Some(9)),
+            vec![Engine::Community1, Engine::Nemotron3]
+        );
+    }
+
+    #[test]
+    fn community1_selected_falls_back_to_nemotron_only_when_its_model_is_missing() {
+        // A Sortformer install moved to community-1 may never have fetched it.
+        for hint in [None, Some(4)] {
+            assert_eq!(
+                engine_preference(Engine::Community1, hint),
+                vec![Engine::Community1, Engine::Nemotron3]
+            );
+        }
+        assert_eq!(
+            engine_preference(Engine::Community1, Some(12)),
+            vec![Engine::Community1, Engine::Nemotron3]
+        );
+    }
+
+    #[test]
+    fn only_community1_takes_the_speaker_hint() {
+        assert!(Engine::Community1.takes_speaker_hint());
+        assert!(!Engine::Nemotron3.takes_speaker_hint());
+    }
+
+    #[test]
+    fn retired_model_dirs_go_and_the_models_in_use_stay() {
+        let root = tempfile::tempdir().unwrap();
+        let models = root.path();
+        for dir in [
+            "sortformer/SortformerNvidiaHigh_v2.1.mlmodelc",
+            "speaker-diarization/pyannote_segmentation.mlmodelc",
+            "speaker-diarization/Segmentation.mlmodelc",
+            "nemotron-3-diarization/monolithic",
+        ] {
+            std::fs::create_dir_all(models.join(dir)).unwrap();
+        }
+        let conn = crate::db::settings_only_conn();
+
+        remove_retired_model_dirs(models, &conn);
+
+        assert!(!models.join("sortformer").exists());
+        assert!(!models.join("speaker-diarization/pyannote_segmentation.mlmodelc").exists());
+        assert!(models.join("speaker-diarization/Segmentation.mlmodelc").exists());
+        assert!(models.join("nemotron-3-diarization/monolithic").exists());
+    }
+
+    #[test]
+    fn retired_model_dirs_are_removed_once_per_install() {
+        let root = tempfile::tempdir().unwrap();
+        let conn = crate::db::settings_only_conn();
+        remove_retired_model_dirs(root.path(), &conn);
+
+        // Another FluidAudio client may use the folder later; that is its own.
+        std::fs::create_dir_all(root.path().join("sortformer")).unwrap();
+        remove_retired_model_dirs(root.path(), &conn);
+
+        assert!(root.path().join("sortformer").exists());
     }
 }
