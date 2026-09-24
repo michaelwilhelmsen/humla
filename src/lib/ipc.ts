@@ -909,6 +909,7 @@ export type TitleStatus = { noteId: string; active: boolean };
 export type Step =
   | "transcribing"
   | "saving_audio"
+  | "removing_echo"
   | "diarizing"
   | "writing_playback"
   | "matching_speakers";

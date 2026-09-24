@@ -201,7 +201,7 @@ impl Engine {
         }
     }
 
-    fn arg(self) -> &'static str {
+    pub(crate) fn arg(self) -> &'static str {
         match self {
             Engine::Community1 => "community1",
             Engine::Sortformer => "sortformer",
