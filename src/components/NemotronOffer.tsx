@@ -1,6 +1,6 @@
 import { useEffect } from "react";
 import { Check, Users, X } from "lucide-react";
-import { NEMOTRON_MAX_SPEAKERS, downloadProgress } from "../lib/diarizeEngine";
+import { downloadProgress } from "../lib/diarizeEngine";
 import type { DiarizeDownloadProgress } from "../lib/ipc";
 import {
   acceptNemotronOffer,
@@ -44,20 +44,19 @@ export function NemotronOffer() {
     <section className="home-offer" aria-labelledby="home-offer-heading">
       <h2 id="home-offer-heading">
         <Users size={16} strokeWidth={1.7} className="home-offer-icon" />
-        Sharper speaker labels
+        Make it clearer who said what
       </h2>
       <p>
-        Nemotron 3 tells up to {NEMOTRON_MAX_SPEAKERS} speakers apart and counts them
-        itself, so a meeting no longer ends up under one speaker when its speaker count
-        is left on Auto.
+        Upgrade to <strong>Nemotron 3</strong>, our new, more accurate speaker-labeling
+        model. It’s better at telling voices apart, especially when several people share
+        a microphone.
       </p>
       {offer.stage === "downloading" ? (
         <DownloadProgress fraction={offer.fraction} phase={offer.phase} />
       ) : (
         <>
           <p className="home-offer-meta">
-            A 193 MB download, then about two minutes preparing it for your Mac, once.
-            You can also switch later in Settings → Transcription.
+            One-time setup: 193 MB download and about 2 minutes to prepare.
           </p>
           {offer.error && (
             <p className="home-offer-error" role="alert">
@@ -70,7 +69,7 @@ export function NemotronOffer() {
               className="nd-btn nd-btn-primary no-drag"
               onClick={() => void acceptNemotronOffer()}
             >
-              Switch to Nemotron 3
+              Upgrade speaker labels
             </button>
             <button
               type="button"

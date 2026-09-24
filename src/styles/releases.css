@@ -78,6 +78,7 @@
 .home-offer { width: min(100%, 540px); padding: 18px 20px; border-radius: var(--radius-card); background: var(--color-surface); box-shadow: var(--shadow-card); text-align: left; }
 .home-offer h2 { display: flex; align-items: center; gap: 8px; font-size: 14px; font-weight: 600; }
 .home-offer p { margin-top: 8px; font-size: var(--text-ui-size); line-height: 1.6; }
+.home-offer strong { font-weight: 600; }
 .home-offer .home-offer-meta { font-size: 12px; color: var(--color-text-muted); }
 .home-offer .home-offer-error { font-size: 12px; color: var(--color-danger); }
 .home-offer-icon { flex-shrink: 0; color: var(--color-accent-text); }

@@ -49,7 +49,7 @@ function setup(opts: {
 }
 
 const offerText = () => screen.findByText(/193 MB/);
-const switchButton = () => screen.getByRole("button", { name: /switch to nemotron 3/i });
+const switchButton = () => screen.getByRole("button", { name: /upgrade speaker labels/i });
 
 beforeEach(() => {
   useNemotronOffer.setState({ offer: { stage: "hidden" } });
@@ -73,8 +73,9 @@ describe("NemotronOffer", () => {
   it("offers an upgraded install the switch and names the download", async () => {
     setup({ offer: "pending", engine: "community1" });
     render(<NemotronOffer />);
-    expect(await offerText()).toBeInTheDocument();
-    expect(screen.getByText(/up to 8 speakers/i)).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Make it clearer who said what" })).toBeInTheDocument();
+    expect(screen.getByText("One-time setup: 193 MB download and about 2 minutes to prepare.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Not now" })).toBeInTheDocument();
   });
 
   it("switches the engine only once the model is downloaded and warmed", async () => {
@@ -170,7 +171,7 @@ describe("NemotronOffer", () => {
 
     render(<NemotronOffer />);
     expect(await screen.findByRole("progressbar")).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /switch to nemotron 3/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: /upgrade speaker labels/i })).toBeNull();
     expect(downloads).toEqual(["nemotron3"]);
     dl.resolve();
   });
