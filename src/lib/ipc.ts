@@ -107,8 +107,9 @@ export type SettingsKey =
   | "default_summary_preset"
   | "diarize_model"
   | "community1_threshold"
-  | "sortformer_silence_threshold"
-  | "sortformer_pred_threshold"
+  // The offer to switch to Nemotron 3 that an upgraded install gets: "pending"
+  // (written by the upgrade migration), "accepted" or "declined".
+  | "nemotron_offer"
   | "keep_audio"
   // Skip transcription while recording and run it later from the note's
   // Transcribe action (#146). Only ever in force while `keep_audio` is on —
@@ -236,14 +237,15 @@ export type DiarizeModelStatus = {
 
 export type DiarizeDownloadProgress = {
   fraction: number;
-  phase: "listing" | "downloading" | "compiling";
-  // Which engine this progress belongs to. Both community1 and
-  // sortformer share the diarize_download_progress event channel; the
-  // frontend filters by this field.
-  engine: "community1" | "sortformer";
+  // `warming` is Nemotron 3's one-time Neural Engine compile after the
+  // download, which reports no fraction.
+  phase: "listing" | "downloading" | "compiling" | "warming";
+  // Every engine shares the diarize_download_progress channel; the frontend
+  // filters by this field.
+  engine: DiarizeEngine;
 };
 
-export type DiarizeEngine = "community1" | "sortformer";
+export type DiarizeEngine = "community1" | "nemotron3";
 
 // Word-level timing in stream-absolute milliseconds. Drives the
 // playback view's word-by-word highlight when present. Empty for

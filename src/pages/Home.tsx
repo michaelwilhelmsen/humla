@@ -3,6 +3,7 @@ import { useNavigate } from "react-router-dom";
 import { Plus } from "lucide-react";
 import { ipc } from "../lib/ipc";
 import { useNotesStore } from "../lib/store";
+import { NemotronOffer } from "../components/NemotronOffer";
 import { ReleaseNotes } from "../components/ReleaseNotes";
 import humlaIcon from "../../src-tauri/icons/icon.png";
 
@@ -47,6 +48,7 @@ export function Home() {
             New note
           </button>
         </div>
+        <NemotronOffer />
         <ReleaseNotes />
       </div>
     </div>

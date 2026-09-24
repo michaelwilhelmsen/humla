@@ -3,6 +3,7 @@ import { FileAudio } from "lucide-react";
 import { Modal } from "../pages/settings/components/Modal";
 import { Select } from "./ui/Select";
 import { LANGUAGES, languageOptionLabel } from "../lib/languages";
+import { SPEAKER_COUNT_OPTIONS } from "../lib/speakerCount";
 import { ipc } from "../lib/ipc";
 
 // Config step shown between picking an audio file and starting the import.
@@ -16,18 +17,6 @@ const LANGUAGE_OPTIONS = LANGUAGES.map((l) => ({
   value: l.value,
   label: languageOptionLabel(l),
 }));
-
-// Mirrors SpeakersPicker in Note.tsx: sentinel "0" = Auto (let the offline
-// diarizer decide), 1–6 pins the cluster count.
-const SPEAKER_OPTIONS = [
-  { value: "0", label: "Auto" },
-  { value: "1", label: "1 speaker" },
-  { value: "2", label: "2 speakers" },
-  { value: "3", label: "3 speakers" },
-  { value: "4", label: "4 speakers" },
-  { value: "5", label: "5 speakers" },
-  { value: "6", label: "6 speakers" },
-];
 
 function basename(path: string): string {
   const parts = path.split(/[\\/]/);
@@ -99,7 +88,7 @@ export function ImportDialog({
 
         <div className="flex items-center justify-between gap-4">
           <label htmlFor="import-speakers" className="text-sm">Speakers</label>
-          <Select id="import-speakers" value={speakers} onChange={setSpeakers} options={SPEAKER_OPTIONS} />
+          <Select id="import-speakers" value={speakers} onChange={setSpeakers} options={SPEAKER_COUNT_OPTIONS} />
         </div>
 
         {error && (

@@ -72,23 +72,16 @@ use models::local_model_path;
 use transcription_config::read_transcribe_config;
 
 pub(crate) const DEFAULT_LANGUAGE: &str = "no";
-// Default diarization engine. community1 = FluidAudio's
-// OfflineDiarizerManager (the path we shipped through v0.11.0). Existing
-// installs keep this transparently. Users who hit the rapid-turn ceiling
-// can switch to "sortformer" in Settings → Transcription → Speaker
-// diarization. Both engines coexist; the user has to download whichever
-// they want before recording.
-const DEFAULT_DIARIZE_MODEL: &str = "community1";
+// The diarization engine when `diarize_model` is unset. Only a fresh install
+// has no row, since `db::migrate_diarize_engine` writes one for every other.
+// Mirrored by `DEFAULT_DIARIZE_ENGINE` in `src/lib/diarizeEngine.ts`.
+const DEFAULT_DIARIZE_MODEL: &str = "nemotron3";
 
-// Diarizer threshold defaults — match the sidecar's hardcoded values so
-// "default" in settings produces the same behaviour as the original
-// fixed-knob releases. Users tweak these in Settings → Transcription
-// → Speaker diarization → Advanced when iterating on recordings the
-// stock thresholds get wrong. Stored as strings (settings table is
-// string-keyed); parsed at use site.
+// Matches the sidecar's own default. Stored as a string and parsed at use.
 const DEFAULT_COMMUNITY1_THRESHOLD: &str = "0.5";
-const DEFAULT_SORTFORMER_SILENCE_THRESHOLD: &str = "0.5";
-const DEFAULT_SORTFORMER_PRED_THRESHOLD: &str = "0.25";
+
+const DIARIZE_MODEL_MISSING: &str = "Diarize model isn't downloaded. Download it in Settings → Transcription → Speaker labels, then try again.";
+const DIARIZE_MODEL_MISSING_UNLABELLED: &str = "Speaker diarization model isn't downloaded — transcript saved without speaker labels. Download it from Settings → Transcription → Speaker labels.";
 // Silent-chunk gate. RMS below this is dropped before transcription so
 // Whisper / gpt-4o-transcribe don't hallucinate confident text on silence.
 // Was 0.008 originally — too aggressive for users sitting >40 cm from a
@@ -161,18 +154,8 @@ async fn rediarize_note_inner(app: AppHandle, note_id: String) -> Result<(), Str
     // auto-retention). Single-session notes never enter this branch and
     // keep today's behaviour exactly.
     if sessions::resolve_sessions(&recordings).len() >= 2 {
-        {
-            let state: State<AppState> = app.state();
-            let engine = active_diarize_engine(&state);
-            match diarize::status(&app, engine).await {
-                Ok(s) if s.downloaded => {}
-                _ => {
-                    return Err(
-                        "Diarize model isn't downloaded. Download it in Settings → Transcription → Speaker diarization, then try again."
-                            .to_string(),
-                    );
-                }
-            }
+        if !note_diarize_settings(&app, &note_id).await.choice.downloaded {
+            return Err(DIARIZE_MODEL_MISSING.to_string());
         }
         // On the per-note channel, never the global phase: a recording may be
         // running on another note throughout (#187).
@@ -219,25 +202,9 @@ async fn rediarize_note_inner(app: AppHandle, note_id: String) -> Result<(), Str
         );
     }
 
-    let state: State<AppState> = app.state();
-    let engine = active_diarize_engine(&state);
-    let thresholds = read_diarize_thresholds(&state);
-    let expected_speakers = {
-        let conn = state.db.lock();
-        db::get_note(&conn, &note_id)
-            .ok()
-            .and_then(|n| n.expected_speakers)
-            .filter(|n| *n > 0)
-    };
-
-    match diarize::status(&app, engine).await {
-        Ok(s) if s.downloaded => {}
-        _ => {
-            return Err(
-                "Diarize model isn't downloaded. Download it in Settings → Transcription → Speaker diarization, then try again."
-                    .to_string(),
-            );
-        }
+    let settings = note_diarize_settings(&app, &note_id).await;
+    if !settings.choice.downloaded {
+        return Err(DIARIZE_MODEL_MISSING.to_string());
     }
 
     let progress = ChainProgress::Rediarize { note_id: note_id.clone() };
@@ -248,9 +215,7 @@ async fn rediarize_note_inner(app: AppHandle, note_id: String) -> Result<(), Str
         mic_wav,
         sys_wav,
         chunks,
-        expected_speakers,
-        engine,
-        thresholds,
+        settings,
         LabelFallback::Abort,
         &progress,
     )
@@ -515,12 +480,11 @@ async fn rediarize_apply_to_chunks(
     mic_wav: Option<PathBuf>,
     sys_wav: Option<PathBuf>,
     chunks: Vec<ChunkRecord>,
-    expected_speakers: Option<i64>,
-    engine: diarize::Engine,
-    thresholds: diarize::Thresholds,
+    settings: NoteDiarizeSettings,
     fallback: LabelFallback,
     progress: &ChainProgress,
 ) -> anyhow::Result<TakeStepCosts> {
+    let NoteDiarizeSettings { choice, thresholds, expected_speakers } = settings;
     // Before deciding the capture mode — a hallucinated chunk on an otherwise
     // silent stream would misclassify the whole recording. Also cleans up notes
     // recorded before the transcribe-time guard existed, which is the point of
@@ -566,16 +530,12 @@ async fn rediarize_apply_to_chunks(
     };
     // The model being absent is the ordinary case of that, and worth catching
     // before the per-stream branches so neither has to. Under `Abort` the
-    // caller has already checked, so this costs one status probe.
-    let model_missing = fallback == LabelFallback::Unlabelled
-        && !matches!(diarize::status(&app, engine).await, Ok(st) if st.downloaded);
+    // caller has already refused to start without one.
+    let model_missing = fallback == LabelFallback::Unlabelled && !choice.downloaded;
     if model_missing {
-        emit_error(
-            &app,
-            Some(&note_id),
-            "Speaker diarization model isn't downloaded — transcript saved without speaker labels. Download it from Settings → Speaker diarization.",
-        );
+        emit_error(&app, Some(&note_id), DIARIZE_MODEL_MISSING_UNLABELLED);
     }
+    let engine = choice.engine;
 
     let stage: DiarizeStage = if model_missing {
         unlabelled_stage("model not downloaded")
@@ -1692,16 +1652,43 @@ pub fn note_timeline_rename(
 
 // ---- Speaker diarization model management ---------------------------------
 
-/// Resolve the active diarization engine from settings. Used by
-/// diarize_and_apply when it needs to know which engine to call without
-/// the caller having to thread the value through.
-fn active_diarize_engine(state: &State<AppState>) -> diarize::Engine {
+/// The diarization engine selected in Settings.
+fn selected_diarize_engine(state: &State<AppState>) -> diarize::Engine {
     let conn = state.db.lock();
     let id = db::get_setting(&conn, "diarize_model")
         .ok()
         .flatten()
         .unwrap_or_else(|| DEFAULT_DIARIZE_MODEL.to_string());
     diarize::Engine::from_setting(&id)
+}
+
+/// How one note is diarized.
+#[derive(Clone, Copy)]
+struct NoteDiarizeSettings {
+    /// Chosen from the selected engine, the note's speaker count and which
+    /// models are downloaded (`diarize::choose_engine`), for the whole note.
+    choice: diarize::EngineChoice,
+    thresholds: diarize::Thresholds,
+    expected_speakers: Option<i64>,
+}
+
+async fn note_diarize_settings(app: &AppHandle, note_id: &str) -> NoteDiarizeSettings {
+    let (selected, thresholds, expected_speakers) = {
+        let state: State<AppState> = app.state();
+        let selected = selected_diarize_engine(&state);
+        let thresholds = read_diarize_thresholds(&state);
+        let conn = state.db.lock();
+        let hint = db::get_note(&conn, note_id)
+            .ok()
+            .and_then(|n| n.expected_speakers)
+            .filter(|n| *n > 0);
+        (selected, thresholds, hint)
+    };
+    NoteDiarizeSettings {
+        choice: diarize::choose_engine(app, selected, expected_speakers).await,
+        thresholds,
+        expected_speakers,
+    }
 }
 
 /// Whether to run `diarize::clean_segments` over the raw sidecar output
@@ -1892,8 +1879,6 @@ async fn write_diagnostics_json(
         "source": source,
         "thresholds": {
             "community1_clustering": thresholds.community1_clustering,
-            "sortformer_silence": thresholds.sortformer_silence,
-            "sortformer_pred": thresholds.sortformer_pred,
         },
         "mic_segments": mic_segments,
         "sys_segments": sys_segments,
@@ -2450,12 +2435,10 @@ async fn write_chunks_json(target: &std::path::Path, chunks: &[ChunkRecord]) {
     }
 }
 
-/// Read the user-tunable diarizer thresholds from settings. Missing
-/// values fall back to the DEFAULT_* constants at the top of this file
-/// so a fresh DB (no settings rows yet) uses the same numbers the
-/// settings UI shows. Unparseable values still drop to None — we don't
-/// paper over a malformed value because silently picking the default
-/// when the user typed "abc" hides the bug.
+/// Read the user-tunable diarizer thresholds from settings. A missing value
+/// falls back to its DEFAULT_* constant, the number the settings UI shows. An
+/// unparseable one drops to None, the sidecar's default, rather than silently
+/// becoming ours.
 fn read_diarize_thresholds(state: &State<AppState>) -> diarize::Thresholds {
     let conn = state.db.lock();
     let community1_clustering = db::get_setting(&conn, "community1_threshold")
@@ -2463,21 +2446,7 @@ fn read_diarize_thresholds(state: &State<AppState>) -> diarize::Thresholds {
         .flatten()
         .or_else(|| Some(DEFAULT_COMMUNITY1_THRESHOLD.to_string()))
         .and_then(|s| s.parse::<f64>().ok());
-    let sortformer_silence = db::get_setting(&conn, "sortformer_silence_threshold")
-        .ok()
-        .flatten()
-        .or_else(|| Some(DEFAULT_SORTFORMER_SILENCE_THRESHOLD.to_string()))
-        .and_then(|s| s.parse::<f32>().ok());
-    let sortformer_pred = db::get_setting(&conn, "sortformer_pred_threshold")
-        .ok()
-        .flatten()
-        .or_else(|| Some(DEFAULT_SORTFORMER_PRED_THRESHOLD.to_string()))
-        .and_then(|s| s.parse::<f32>().ok());
-    diarize::Thresholds {
-        community1_clustering,
-        sortformer_silence,
-        sortformer_pred,
-    }
+    diarize::Thresholds { community1_clustering }
 }
 
 #[tauri::command]
@@ -4213,15 +4182,7 @@ async fn transcribe_takes(
     // the one that was configured when the audio was captured. Check before
     // replaying an hour of it.
     ensure_provider_ready(app, &state, note_id).await?;
-    let engine = active_diarize_engine(&state);
-    let thresholds = read_diarize_thresholds(&state);
-    let expected_speakers = {
-        let conn = state.db.lock();
-        db::get_note(&conn, note_id)
-            .ok()
-            .and_then(|n| n.expected_speakers)
-            .filter(|n| *n > 0)
-    };
+    let settings = note_diarize_settings(app, note_id).await;
 
     // The run's shape, settled before a single chunk decodes: each take's
     // retained streams are replayed one after the other, so a take that kept
@@ -4338,9 +4299,7 @@ async fn transcribe_takes(
             mic_wav.clone(),
             sys_wav.clone(),
             chunks.clone(),
-            expected_speakers,
-            engine,
-            thresholds,
+            settings,
             LabelFallback::Unlabelled,
             &chain,
         )
@@ -4620,36 +4579,20 @@ async fn diarize_and_apply(
     let chunks = drop_incidental_stream_hallucinations(post_stop.chunks.clone());
     let snapshot = post_stop.transcript_at_start.clone();
     let session_id = post_stop.session_id.clone();
-    let (expected_speakers, engine, thresholds) = {
-        let state: State<AppState> = app.state();
-        let eng = active_diarize_engine(&state);
-        let thr = read_diarize_thresholds(&state);
-        let conn = state.db.lock();
-        let hint = db::get_note(&conn, &note_id)
-            .ok()
-            .and_then(|n| n.expected_speakers)
-            .filter(|n| *n > 0);
-        (hint, eng, thr)
-    };
     if chunks.is_empty() {
         eprintln!("diarize: no chunks captured, skipping");
         return Ok(());
     }
-    // Diarization is optional — the model may not be downloaded. This used to
-    // `return Ok(())` right here, which is the origin of #169: the chunks had
-    // already been live-appended to `note.transcript`, so the recording ended
-    // with text in the note and no session, no timeline behind it. Under
-    // ADR-0004 the timeline is canonical for a note's content, so a recording
-    // that lands text always writes a session — this path just writes it with
-    // no speaker labels. Tell the user why the labels never arrive.
-    let diarize_available = matches!(diarize::status(&app, engine).await, Ok(s) if s.downloaded);
+    let NoteDiarizeSettings { choice, thresholds, expected_speakers } =
+        note_diarize_settings(&app, &note_id).await;
+    // Under ADR-0004 a recording that lands text always writes a session, so
+    // with no model downloaded the timeline is written without speaker labels,
+    // and the user is told why they never arrive.
+    let diarize_available = choice.downloaded;
+    let engine = choice.engine;
     if !diarize_available {
         eprintln!("diarize: model not downloaded, saving the timeline without labels");
-        emit_error(
-            &app,
-            Some(&note_id),
-            "Speaker diarization model isn't downloaded — transcript saved without speaker labels. Download it from Settings → Speaker diarization.",
-        );
+        emit_error(&app, Some(&note_id), DIARIZE_MODEL_MISSING_UNLABELLED);
     }
 
     let mic_chunks_present = chunks.iter().any(|c| c.source == ChunkSource::Mic);
@@ -6184,23 +6127,10 @@ pub(crate) async fn unify_note_speakers(
         return Ok(None);
     }
 
-    let (expected_speakers, engine, thresholds) = {
-        let state: State<AppState> = app.state();
-        let eng = active_diarize_engine(&state);
-        let thr = read_diarize_thresholds(&state);
-        let conn = state.db.lock();
-        let hint = db::get_note(&conn, note_id)
-            .ok()
-            .and_then(|n| n.expected_speakers)
-            .filter(|n| *n > 0);
-        (hint, eng, thr)
-    };
-    match diarize::status(app, engine).await {
-        Ok(s) if s.downloaded => {}
-        _ => {
-            eprintln!("unify: diarize model not downloaded, keeping per-take labels");
-            return Ok(None);
-        }
+    let settings = note_diarize_settings(app, note_id).await;
+    if !settings.choice.downloaded {
+        eprintln!("unify: diarize model not downloaded, keeping per-take labels");
+        return Ok(None);
     }
 
     // Partition into sessions that can join the concatenated pass and
@@ -6239,18 +6169,7 @@ pub(crate) async fn unify_note_speakers(
     // invocation so overlapping passes can't clobber each other's concats.
     let tmp = unify_scratch_dir(note_id);
     tokio::fs::create_dir_all(&tmp).await?;
-    let result = unify_apply(
-        app,
-        note_id,
-        &tmp,
-        &unifiable,
-        &frozen_dirs,
-        expected_speakers,
-        engine,
-        thresholds,
-        progress,
-    )
-    .await;
+    let result = unify_apply(app, note_id, &tmp, &unifiable, &frozen_dirs, settings, progress).await;
     let _ = tokio::fs::remove_dir_all(&tmp).await;
     result.map(Some)
 }
@@ -6259,18 +6178,17 @@ pub(crate) async fn unify_note_speakers(
 /// up the temp dir. Concatenates + diarizes per stream, runs the pure
 /// relabel, writes every unified session's timeline, and rebuilds the DB
 /// transcript from all sessions (frozen ones included, untouched).
-#[allow(clippy::too_many_arguments)]
 async fn unify_apply(
     app: &AppHandle,
     note_id: &str,
     tmp: &std::path::Path,
     unifiable: &[UnifyCandidate],
     frozen_dirs: &[PathBuf],
-    expected_speakers: Option<i64>,
-    engine: diarize::Engine,
-    thresholds: diarize::Thresholds,
+    settings: NoteDiarizeSettings,
     progress: &ChainProgress,
 ) -> anyhow::Result<UnifyCosts> {
+    let NoteDiarizeSettings { choice, thresholds, expected_speakers } = settings;
+    let engine = choice.engine;
     // Per-stream concatenation in manifest order. Mic concat = every session
     // that captured mic (mic-only *and* hybrid — a hybrid take's mic is
     // diarized now, not assumed to be one person); sys concat = sys-only +
@@ -6305,8 +6223,8 @@ async fn unify_apply(
     // stream in play the note's expected_speakers applies to the mic directly
     // (in-person). Once both streams exist the total can't be split a priori,
     // so the mic goes in unhinted and the sys stream is asked for whatever the
-    // mic didn't account for. Sortformer's 4-speaker cap applies to the
-    // combined audio exactly as it does to a single take — no special-casing.
+    // mic didn't account for. Only community-1 takes the hint; Nemotron 3
+    // counts the combined audio itself, as it does a single take.
     if !mic_paths.is_empty() {
         unify_steps.begin();
     }
@@ -6707,8 +6625,8 @@ fn piece_starts_continuation(text: &str) -> bool {
 ///   - A-B-A with B long (multi-word mid-sentence fragments the
 ///     acoustic bridge rejects on word/duration limits)
 ///   - A-B-C with no clean acoustic sandwich but clear textual flow
-///   - Longer chains where Sortformer alternated labels piece-by-piece
-///     through a single speaker's utterance
+///   - Longer chains where an end-to-end engine alternated labels piece by
+///     piece through a single speaker's utterance
 ///
 /// Trades a small risk of merging a legitimate cross-speaker
 /// interruption (the interrupter happens to finish the original

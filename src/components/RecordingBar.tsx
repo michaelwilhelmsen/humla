@@ -5,6 +5,7 @@ import { ipc, type RecordingPhase, type RecordingStatus, type Step } from "../li
 import { useRecordingStore, type ReplayRun } from "../lib/store";
 import { STEP_LABELS } from "../lib/recordingSteps";
 import { cn } from "../lib/cn";
+import { ProgressTrack } from "./ui/ProgressTrack";
 
 // ~10s of active capture with the mic never rising above the audible floor
 // trips the "no audio detected" warning. Active time only — pauses don't count
@@ -416,45 +417,6 @@ export function CaptureIndicator({
         </>
       )}
     </button>
-  );
-}
-
-/**
- * The track itself. A `null` value is indeterminate in ARIA's own terms — a
- * `progressbar` with no `aria-valuenow` — which is exactly what the diarize
- * step is, so nothing here has to say "no percentage" twice.
- */
-function ProgressTrack({
-  value,
-  label,
-  className,
-}: {
-  value: number | null;
-  /** The whole label, as the bar's own name. Not `aria-labelledby` to the
-      visible text: a step can hide part of that (#188), and a name that
-      shrinks with the column is a name that says less than it knows. */
-  label: string;
-  className?: string;
-}) {
-  const pct = value === null ? 100 : Math.round(value * 100);
-  return (
-    <div
-      role="progressbar"
-      aria-label={label}
-      aria-valuemin={0}
-      aria-valuemax={100}
-      aria-valuenow={value === null ? undefined : pct}
-      aria-busy={value === null ? true : undefined}
-      className={cn("h-1 rounded-full bg-[var(--color-pill-hover)] overflow-hidden", className)}
-    >
-      <div
-        className={cn(
-          "h-full rounded-full bg-[var(--color-accent)] transition-[width] duration-200",
-          value === null && "nd-progress-indeterminate",
-        )}
-        style={{ width: `${pct}%` }}
-      />
-    </div>
   );
 }
 

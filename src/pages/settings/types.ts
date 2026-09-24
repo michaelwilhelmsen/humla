@@ -5,7 +5,8 @@
 // they're tightly coupled to how the form is shaped — moving them out
 // would create a layer of indirection without buying us reuse.
 
-import type { DiarizeModelStatus, LocalWhisperModelStatus, SettingsKey } from "../../lib/ipc";
+import type { DiarizeDownloadProgress, DiarizeModelStatus, LocalWhisperModelStatus, SettingsKey } from "../../lib/ipc";
+import { DEFAULT_DIARIZE_ENGINE } from "../../lib/diarizeEngine";
 import { SUMMARY_PRESETS, presetPromptForLang } from "../../lib/presets";
 import type { Theme } from "../../lib/theme";
 import { PALETTE_REGISTRY, type Palette } from "../../lib/palette";
@@ -28,6 +29,8 @@ export type EditableKey = Exclude<
   | "onboarding_step"
   | "telemetry_enabled"
   | "record_hotkey"
+  // Owned by Home's offer card (src/lib/nemotronOffer.ts).
+  | "nemotron_offer"
 >;
 
 export type { Provider } from "../../lib/providers";
@@ -35,10 +38,8 @@ export type { Provider } from "../../lib/providers";
 export const DEFAULTS: Record<EditableKey, string> = {
   language: "no",
   default_summary_preset: "meeting",
-  diarize_model: "community1",
+  diarize_model: DEFAULT_DIARIZE_ENGINE,
   community1_threshold: "0.5",
-  sortformer_silence_threshold: "0.5",
-  sortformer_pred_threshold: "0.25",
   keep_audio: "false",
   transcribe_manually: "false",
   keep_awake: "true",
@@ -189,7 +190,7 @@ export type DiarizeState = {
   status: DiarizeModelStatus | null;
   downloading: boolean;
   fraction: number;
-  phase: "listing" | "downloading" | "compiling" | null;
+  phase: DiarizeDownloadProgress["phase"] | null;
   error: string | null;
   flash: string | null;
 };
@@ -202,6 +203,7 @@ export const EMPTY_DIARIZE_STATE: DiarizeState = {
   error: null,
   flash: null,
 };
+
 
 // Discriminated so the Summary tab can render guidance tailored to the
 // failure mode. "unreachable" means the local server isn't responding —

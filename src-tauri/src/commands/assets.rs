@@ -169,7 +169,7 @@ pub fn delete_stored_audio(app: AppHandle) -> Result<usize, String> {
 }
 
 /// Lists which diagnostic dumps exist for a note (e.g. ["community1-mic.json",
-/// "sortformer-sys.json"]). Empty vec when no diarize has run yet.
+/// "nemotron3-sys.json"]). Empty vec when no diarize has run yet.
 #[tauri::command]
 pub fn note_diagnostics_files(app: AppHandle, note_id: String) -> Result<Vec<String>, String> {
     let dir = app

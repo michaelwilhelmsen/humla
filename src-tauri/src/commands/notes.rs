@@ -430,7 +430,7 @@ mod tests {
         // not stop the other going.
         let diag = base.path().join("diagnostics").join("diagnosed-only");
         fs::create_dir_all(&diag).unwrap();
-        fs::write(diag.join("sortformer-mic.json"), b"{}").unwrap();
+        fs::write(diag.join("nemotron3-mic.json"), b"{}").unwrap();
         purge_note_assets(base.path(), "diagnosed-only").unwrap();
         assert!(!diag.exists());
     }

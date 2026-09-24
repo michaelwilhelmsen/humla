@@ -36,9 +36,6 @@ export function Settings() {
           diarize={settings.diarize}
           downloadDiarize={settings.downloadDiarize}
           deleteDiarize={settings.deleteDiarize}
-          sortformer={settings.sortformer}
-          downloadSortformer={settings.downloadSortformer}
-          deleteSortformer={settings.deleteSortformer}
         />
       </>
     ),

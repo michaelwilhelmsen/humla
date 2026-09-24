@@ -48,6 +48,7 @@ import {
   chosenCloudProvider,
   type CloudTranscribeProvider,
 } from "../../../lib/transcribeDefault";
+import { downloadDiarizeModels } from "../../../lib/diarizeEngine";
 import { TRANSCRIBE_KEY_PROVIDERS } from "../../../lib/providers";
 import { useDownloadStore } from "../../../lib/store";
 import { useProviderKey } from "../../../components/provider/useProviderKey";
@@ -377,26 +378,14 @@ export function TranscriptionStep({ ctx }: { ctx: StepContext }) {
     setCloudProvider(p);
   }
 
-  // Fire the diarize download once when leaving the step forward. Non-fatal.
+  // Fire the diarize downloads once when leaving the step forward, and leave
+  // them running on the backend. Non-fatal.
   const diarizeFiredRef = useRef(false);
-  async function fireDiarizeDownload() {
-    if (diarizeFiredRef.current) return;
-    diarizeFiredRef.current = true;
-    try {
-      const status = await ipc.diarizeStatus("community1");
-      if (!status.downloaded) {
-        // Fire-and-forget; the command runs to completion on the backend.
-        void ipc.diarizeDownload("community1").catch((e) => {
-          console.warn("[onboarding] diarize download failed:", e);
-        });
-      }
-    } catch (e) {
-      console.warn("[onboarding] diarize status check failed:", e);
-    }
-  }
-
   function proceed() {
-    void fireDiarizeDownload();
+    if (!diarizeFiredRef.current) {
+      diarizeFiredRef.current = true;
+      void downloadDiarizeModels();
+    }
     ctx.goNext();
   }
 

@@ -63,8 +63,8 @@ Set a **default provider** in Settings, then add **per-language overrides** if y
 When you stop the recording, Humla runs a speaker-identification pass on your Mac (no audio uploaded). It labels each turn with `Speaker 1`, `Speaker 2`, etc. — click any label to rename them ("Speaker 2" → "Wilma") and the change applies across the whole transcript.
 
 Two engines, both free and on-device:
-- **Community-1** — robust default, auto-detects how many speakers are in the room.
-- **Sortformer** — better at rapid back-and-forth, fixed 4-speaker cap.
+- **Nemotron 3** — the default. NVIDIA's end-to-end model tells up to 8 speakers apart and counts them itself.
+- **Community-1** — pyannote clustering that uses the speaker count you set on a note, and takes over for meetings set above 8.
 
 ### Summarises with both your notes and the transcript
 
@@ -120,7 +120,7 @@ The defaults are designed so nothing you write leaves your machine unless you te
 - **API keys** are stored in the macOS **Keychain** (one entry per provider — OpenAI, Deepgram, Groq), not in plaintext on disk.
 - **Model downloads** are one-time fetches from HuggingFace; the files live in `~/Library/Application Support/no.humla.app/models/` and `~/Library/Application Support/FluidAudio/Models/`.
 
-If you use only Local Whisper + Community-1 (or Sortformer) + a local LLM for summaries, **no audio or text ever leaves your Mac**.
+If you use only Local Whisper + the on-device speaker labels + a local LLM for summaries, **no audio or text ever leaves your Mac**.
 
 ## Team sync & self-hosting
 
@@ -252,7 +252,7 @@ humla/
 - **Frontend** — React 19 + Vite 6 + Tailwind v4 + Tiptap + Zustand + react-markdown + lucide-react
 - **App shell** — Tauri 2, Rust 1.85, reqwest (rustls-tls), rusqlite (bundled), tokio
 - **Local Whisper** — `whisper-rs` 0.16 (binds `whisper.cpp`) with the `metal` feature; `large-v3-turbo-q5` default plus alternative multilingual models and NB Whisper Large for Norwegian
-- **Speaker diarization** — FluidAudio Swift package; pyannote community-1 + VBx clustering with PLDA, *or* NVIDIA Sortformer; CoreML on Apple Neural Engine
+- **Speaker diarization** — FluidAudio Swift package; NVIDIA Nemotron 3 Diarization, *or* pyannote community-1 + VBx clustering with PLDA; CoreML on Apple Neural Engine
 - **Note chat** — agentic tool loop over three retrieval tools; hybrid search combining SQLite **FTS5** keyword ranking with semantic embedding similarity; OpenAI or Ollama as the chat provider
 - **MCP server** — `rmcp` (the official Rust MCP SDK) over stdio, built as a second binary from the same crate and signed into the app bundle; opens the notes database directly, so it runs with or without the app
 - **Audio capture** — Swift, `AVAudioEngine`, `ScreenCaptureKit`; sandbox-detached via `setsid` so TCC permissions bind to the sidecar binary
@@ -262,7 +262,8 @@ humla/
 Humla stands on the shoulders of:
 
 - [whisper.cpp](https://github.com/ggml-org/whisper.cpp) by Georgi Gerganov — the local transcription engine
-- [FluidAudio](https://github.com/FluidInference/FluidAudio) — the offline diarization pipeline (pyannote community-1 + VBx + PLDA, plus Sortformer, ported to CoreML)
+- [FluidAudio](https://github.com/FluidInference/FluidAudio) — the offline diarization pipeline (Nemotron 3 Diarization and pyannote community-1 + VBx + PLDA, ported to CoreML)
+- [Nemotron 3 Diarization](https://huggingface.co/nvidia/Nemotron-3-Diarization) by NVIDIA — the default speaker-diarization model (OpenMDW-1.1)
 - [NB Whisper Large](https://huggingface.co/NbAiLab/nb-whisper-large) by Nasjonalbiblioteket — Norwegian-tuned Whisper model
 - [Tauri](https://tauri.app) — the native app shell
 - [Tiptap](https://tiptap.dev) — the rich-text editor

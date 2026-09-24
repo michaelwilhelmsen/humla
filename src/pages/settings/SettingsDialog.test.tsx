@@ -1,7 +1,8 @@
 import { describe, it, expect } from "vitest";
-import { fireEvent, screen, within } from "@testing-library/react";
+import { act, fireEvent, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { latestReleases } from "../../content/releases";
+import { writeSetting } from "../../lib/settingsBus";
 import { renderApp, openSettingsFromSidebar } from "../../test/app";
 
 describe("settings dialog", () => {
@@ -585,6 +586,71 @@ describe("settings dialog", () => {
     expect(
       within(dialog).getByText(/silence rms threshold/i),
     ).toBeInTheDocument();
+  });
+
+  describe("speaker label engines", () => {
+    function renderEngines(opts: { stored: string | null; downloaded: string[] }) {
+      const writes: Record<string, string> = {};
+      renderApp("/settings?tab=transcription", {
+        settings_get: (args) => {
+          const key = (args as { key: string }).key;
+          if (key === "onboarding_completed") return "true";
+          return key === "diarize_model" ? opts.stored : null;
+        },
+        settings_set: (args) => {
+          const { key, value } = args as { key: string; value: string };
+          writes[key] = value;
+          return null;
+        },
+        diarize_status: (args) => {
+          const downloaded = opts.downloaded.includes((args as { engine: string }).engine);
+          return { downloaded, sizeBytes: downloaded ? 1 : null, path: downloaded ? "/m" : null };
+        },
+      });
+      return writes;
+    }
+
+    it("offers Nemotron 3 and community-1, and nothing else", async () => {
+      renderEngines({ stored: null, downloaded: [] });
+      const dialog = await screen.findByRole("dialog", { name: /settings/i });
+      const radios = await within(dialog).findAllByRole("radio", { name: /for new recordings/i });
+      expect(radios.map((r) => r.getAttribute("aria-label"))).toEqual([
+        "Use Nemotron 3 (end-to-end) for new recordings",
+        "Use Community-1 (clustering) for new recordings",
+      ]);
+      expect(within(dialog).getByText(/up to 8 speakers, counts them itself/i)).toBeInTheDocument();
+      expect(within(dialog).getByText(/193 MB/)).toBeInTheDocument();
+    });
+
+    it("selects Nemotron 3 on a fresh install and says what labels until it's downloaded", async () => {
+      renderEngines({ stored: null, downloaded: ["community1"] });
+      const dialog = await screen.findByRole("dialog", { name: /settings/i });
+      expect(
+        await within(dialog).findByText(/until it’s downloaded, recordings are labelled with community-1/i),
+      ).toBeInTheDocument();
+      expect(within(dialog).getByRole("radio", { name: /nemotron 3/i })).toBeChecked();
+    });
+
+    it("follows a switch made from Home while it is open", async () => {
+      renderEngines({ stored: "community1", downloaded: ["community1", "nemotron3"] });
+      const dialog = await screen.findByRole("dialog", { name: /settings/i });
+      expect(await within(dialog).findByRole("radio", { name: /community-1/i })).toBeChecked();
+
+      await act(async () => {
+        await writeSetting("diarize_model", "nemotron3");
+      });
+
+      expect(within(dialog).getByRole("radio", { name: /nemotron 3/i })).toBeChecked();
+    });
+
+    it("switches the engine once its model is downloaded", async () => {
+      const writes = renderEngines({ stored: "community1", downloaded: ["community1", "nemotron3"] });
+      const dialog = await screen.findByRole("dialog", { name: /settings/i });
+      const nemotron = await within(dialog).findByRole("radio", { name: /nemotron 3/i });
+      await within(dialog).findAllByText(/^Downloaded/);
+      await userEvent.click(nemotron);
+      expect(writes.diarize_model).toBe("nemotron3");
+    });
   });
 
   it("summaries: labeled provider rows with the OpenAI key inline, preset relocated", async () => {
