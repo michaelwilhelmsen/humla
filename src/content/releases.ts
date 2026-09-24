@@ -3,7 +3,7 @@ export type Release = {
   date: string;
   title: string;
   summary: string;
-  visual?: "filters" | "privacy" | "activity" | "updates";
+  visual?: "filters" | "privacy" | "activity" | "updates" | "speakers";
   paragraphs: string[];
   highlights: string[];
   issues: { title: string; reference: string; status: "Open" | "Closed"; url: string }[];
@@ -15,6 +15,7 @@ export const releases: Release[] = [
     date: "2026-09-24",
     title: "Sharper speaker labels",
     summary: "Nemotron 3 tells up to eight voices apart, and call echo no longer adds any.",
+    visual: "speakers",
     paragraphs: [
       "Humla now labels speakers with NVIDIA’s Nemotron 3, which tells up to eight voices apart and counts them itself. A meeting left on Auto used to come back as a single speaker whenever one person did most of the talking; now it doesn’t need the speaker count to get it right. It runs entirely on your Mac, on the Neural Engine.",
       "New installs get it straight away. If you’ve been using Humla already, nothing changes until you choose it: a card on the home screen offers the switch, a 193 MB download plus about two minutes of one-time setup. Community-1 stays in Settings, and takes over by itself for any note set to more than eight speakers.",
@@ -27,7 +28,7 @@ export const releases: Release[] = [
       "The retired Sortformer engine and its models are cleaned up.",
     ],
     issues: [
-      { title: "Make Nemotron 3 the default diarization engine (replaces Sortformer)", reference: "#193", status: "Closed", url: "https://github.com/michaelwilhelmsen/humla/issues/193" },
+      { title: "Make Nemotron 3 the default diarization engine (replaces Sortformer)", reference: "#193", status: "Open", url: "https://github.com/michaelwilhelmsen/humla/issues/193" },
       { title: "Stop speaker echo from becoming extra voices on the mic", reference: "#196", status: "Closed", url: "https://github.com/michaelwilhelmsen/humla/issues/196" },
       { title: "Speed up the echo pass and cut its memory on long takes", reference: "#200", status: "Closed", url: "https://github.com/michaelwilhelmsen/humla/issues/200" },
     ],

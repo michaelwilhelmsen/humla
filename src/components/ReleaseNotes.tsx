@@ -1,8 +1,10 @@
 import { useCallback, useState } from "react";
-import { ArrowUpRight, Check, CircleCheck, CircleDot, Building2, Folder, Lock, Tag, Users, X } from "lucide-react";
+import { ArrowUpRight, Check, ChevronDown, CircleCheck, CircleDot, Building2, Folder, Languages, Lock, Tag, Users, X } from "lucide-react";
 import { isTauri } from "@tauri-apps/api/core";
 import { open as openExternal } from "@tauri-apps/plugin-shell";
 import { latestReleases, type Release } from "../content/releases";
+import { speakerCountLabel } from "../lib/speakerCount";
+import { speakerColorMap } from "./SpeakerLabels";
 import { rowClass } from "./ui/surface";
 import { Modal } from "../pages/settings/components/Modal";
 import "../styles/releases.css";
@@ -28,6 +30,22 @@ function PreviewNote({ recording = false }: { recording?: boolean }) {
     </div>
   );
 }
+
+const PREVIEW_TURNS = [
+  { speaker: "Speaker 1", at: "0:04", text: "Let’s start with the new designs." },
+  { speaker: "Speaker 2", at: "0:09", text: "The home screen feels much calmer now." },
+  { speaker: "Speaker 3", at: "0:15", text: "I’d like one more pass on Settings." },
+  { speaker: "Speaker 4", at: "0:21", text: "Then that’s our focus for next week." },
+];
+const PREVIEW_TURN_COLORS = speakerColorMap(PREVIEW_TURNS.map((turn) => turn.speaker));
+
+const VISUAL_CAPTION: Record<NonNullable<Release["visual"]>, string> = {
+  updates: "Catch up on the latest changes.",
+  filters: "Find a note by what it contains.",
+  privacy: "Choose who can see your note.",
+  activity: "Follow the recording from your library.",
+  speakers: "See who said what, even on Auto.",
+};
 
 function ReleaseVisual({ kind }: { kind: NonNullable<Release["visual"]> }) {
   return (
@@ -67,8 +85,19 @@ function ReleaseVisual({ kind }: { kind: NonNullable<Release["visual"]> }) {
           <div className="release-demo-heading"><span>All notes</span><small>8 notes</small></div>
           <PreviewNote recording />
         </>}
+        {kind === "speakers" && <>
+          <div className="release-demo-heading"><span>Product catch-up</span><small>{speakerCountLabel(PREVIEW_TURNS.length)}</small></div>
+          <div className="release-preview-pickers">
+            <span className="nd-meta is-filled"><Languages size={14} strokeWidth={1.6} />English<ChevronDown size={12} strokeWidth={2} /></span>
+            <span className="nd-meta is-filled"><Users size={14} strokeWidth={1.6} />Auto<ChevronDown size={12} strokeWidth={2} /></span>
+          </div>
+          <div className="release-preview-turns">{PREVIEW_TURNS.map((turn) => <div key={turn.speaker}>
+            <div className="release-preview-turn-title"><i style={{ background: PREVIEW_TURN_COLORS.get(turn.speaker) }} />{turn.speaker}<small>{turn.at}</small></div>
+            <p>{turn.text}</p>
+          </div>)}</div>
+        </>}
       </div>
-      <span className="release-visual-caption">{kind === "updates" ? "Catch up on the latest changes." : kind === "filters" ? "Find a note by what it contains." : kind === "privacy" ? "Choose who can see your note." : "Follow the recording from your library."}</span>
+      <span className="release-visual-caption">{VISUAL_CAPTION[kind]}</span>
     </div>
   );
 }
