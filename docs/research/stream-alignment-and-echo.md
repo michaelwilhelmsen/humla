@@ -6,13 +6,15 @@ sit, why, and what should Humla change: align the streams in capture (a), align
 only in `build_playback_wav` and the timeline (b), or nothing (c)? And is an
 echo-suppressed mic worth it for the diarize input?
 
-**Status: measured, 2026-09-24.** Nothing here changes behaviour yet. What
-landed is instrumentation (a `capture_timing` event from the sidecar, persisted
-per take) and a standalone tool (`echo-probe`) that measures the lag and
-cancels the echo offline. The first real take with `capture_timing` (R1) and a
-re-run of the Test audio take settled what both proposals rest on (§6,
-*Results*). Both are specified for implementation: #197 aligns the streams in
-capture, #196 keeps the echo out of the mic's voices.
+**Status: measured, 2026-09-24; #196 implemented.** What landed first is
+instrumentation (a `capture_timing` event from the sidecar, persisted per take)
+and a standalone tool (`echo-probe`) that measures the lag and cancels the echo
+offline. The first real take with `capture_timing` (R1) and a re-run of the
+Test audio take settled what both proposals rest on (§6, *Results*). #196 now
+keeps the echo out of the mic's voices: wherever the mic is diarized beside a
+system stream, the take's echo is cancelled out of the diarize input and every
+mic voice that reads as echo is dropped (`src-tauri/src/echo.rs`). #197, which
+aligns the streams in capture, is still open.
 
 Verified against `main` after v0.64.0 and three real takes measured on the
 user's M1 Max MacBook Pro. `capture_timing` has now run on a real take (R1).
@@ -228,8 +230,9 @@ interval, HAL latencies). It is timestamps only, so it is written whatever
 fixture of the event's shape. The first real take to emit it was R1 on
 2026-09-24, and it matches the fixture (§6, *Results*).
 
-**`echo-probe`** (`src-tauri/crates/echo-probe`): a workspace member nothing
-depends on, with zero DSP dependencies. From `src-tauri/`:
+**`echo-probe`** (`src-tauri/crates/echo-probe`): a workspace member with zero
+DSP dependencies, whose `delay` and `aec` modules the app's echo pass also runs
+(#196). From `src-tauri/`:
 
 ```sh
 cargo run --release -p echo-probe -- selftest     # known-answer takes; run once per build
@@ -275,7 +278,9 @@ once snapped to the recorded jump.
 | soft-clipped speaker (nonlinear) | 15 / 25 dB | ±0.00 dB | 13 / 23 dB |
 
 Speed: 2.3 s for a 120 s take in the cloud container (delay + two-pass
-cancel), so about a minute for an hour.
+cancel), so about a minute for an hour. The app's echo pass spreads a take
+longer than ten minutes over threads instead (#200): about 7–8 s and 470 MB for
+an hour on an M1 Max.
 
 ## 6. Measurement plan
 

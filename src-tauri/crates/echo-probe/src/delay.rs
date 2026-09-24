@@ -12,6 +12,7 @@
 //! reported rather than assumed.
 
 use crate::fft::{Fft, C64};
+use crate::sample::Sample;
 use crate::stats::{dbfs, mad, median, rms, theil_sen};
 
 #[derive(Clone, Debug)]
@@ -34,6 +35,9 @@ pub struct DelayConfig {
     /// A change of level bigger than this between neighbouring windows is a
     /// step rather than drift or noise.
     pub step_ms: f64,
+    /// Windows are measured this many at a time. Each is independent of the
+    /// others, so the track doesn't depend on it.
+    pub threads: usize,
 }
 
 impl Default for DelayConfig {
@@ -47,6 +51,7 @@ impl Default for DelayConfig {
             min_ref_dbfs: -55.0,
             min_prominence: 8.0,
             step_ms: 2.0,
+            threads: crate::default_threads(),
         }
     }
 }
@@ -145,7 +150,7 @@ fn gcc_peak(fft: &Fft, sig: &[f64], reference: &[f64], max_lag: usize, rate: f64
 }
 
 /// Lag of `sig` behind `reference`, per window across the whole take.
-pub fn lag_track(sig: &[f32], reference: &[f32], rate: u32, cfg: &DelayConfig) -> Vec<LagPoint> {
+pub fn lag_track<S: Sample>(sig: &[S], reference: &[S], rate: u32, cfg: &DelayConfig) -> Vec<LagPoint> {
     let rate_f = rate as f64;
     let window = (cfg.window_s * rate_f).round() as usize;
     let hop = ((cfg.hop_s * rate_f).round() as usize).max(1);
@@ -156,13 +161,9 @@ pub fn lag_track(sig: &[f32], reference: &[f32], rate: u32, cfg: &DelayConfig) -
     }
     let fft = Fft::new((window + 2 * max_lag).next_power_of_two());
     let taper = tukey(window, 0.1);
-    let mut out = Vec::new();
-    let mut start = 0;
-    while start + window <= len {
-        let ref_win = &reference[start..start + window];
-        let sig_win = &sig[start..start + window];
-        let ref_db = dbfs(rms(ref_win));
-        let sig_db = dbfs(rms(sig_win));
+    let point_at = |start: usize| {
+        let ref_db = dbfs(rms(&reference[start..start + window]));
+        let sig_db = dbfs(rms(&sig[start..start + window]));
         let mut point = LagPoint {
             t_s: (start + window / 2) as f64 / rate_f,
             lag_ms: 0.0,
@@ -181,23 +182,30 @@ pub fn lag_track(sig: &[f32], reference: &[f32], rate: u32, cfg: &DelayConfig) -
                 point.valid = peak.prominence >= cfg.min_prominence;
             }
         }
-        out.push(point);
-        start += hop;
-    }
-    out
+        point
+    };
+    let starts: Vec<usize> = (0..).map(|i| i * hop).take_while(|&s| s + window <= len).collect();
+    let per_thread = starts.len().div_ceil(cfg.threads.max(1));
+    std::thread::scope(|scope| {
+        let runs: Vec<_> = starts
+            .chunks(per_thread)
+            .map(|run| scope.spawn(|| run.iter().map(|&start| point_at(start)).collect::<Vec<_>>()))
+            .collect();
+        runs.into_iter().flat_map(|r| r.join().expect("a lag-track thread")).collect()
+    })
 }
 
 /// The reference window at `start` (tapered) and the signal around it, running
 /// `max_lag` either side, zero past either end of the take.
-fn window_pair(sig: &[f32], reference: &[f32], start: usize, window: usize, max_lag: usize, taper: &[f64]) -> (Vec<f64>, Vec<f64>) {
-    let reference_f = reference[start..start + window].iter().zip(taper).map(|(&v, &w)| v as f64 * w).collect();
+fn window_pair<S: Sample>(sig: &[S], reference: &[S], start: usize, window: usize, max_lag: usize, taper: &[f64]) -> (Vec<f64>, Vec<f64>) {
+    let reference_f = reference[start..start + window].iter().zip(taper).map(|(&v, &w)| v.f() * w).collect();
     let sig_f = (0..window + 2 * max_lag)
         .map(|i| {
             let at = (start + i) as isize - max_lag as isize;
             if at < 0 || at as usize >= sig.len() {
                 0.0
             } else {
-                sig[at as usize] as f64
+                sig[at as usize].f()
             }
         })
         .collect();
@@ -360,7 +368,7 @@ pub fn summarize(points: &[LagPoint], cfg: &DelayConfig) -> TrackSummary {
 /// every window weighted by how clearly it shows an echo at all. A window-long
 /// uncertainty is seconds of misaligned reference for the canceller; this makes
 /// it a fraction of one.
-pub fn refine_steps(sig: &[f32], reference: &[f32], rate: u32, summary: &mut TrackSummary, cfg: &DelayConfig) {
+pub fn refine_steps<S: Sample>(sig: &[S], reference: &[S], rate: u32, summary: &mut TrackSummary, cfg: &DelayConfig) {
     let rate_f = rate as f64;
     let len = sig.len().min(reference.len());
     let window = (1.024 * rate_f) as usize;
@@ -545,6 +553,46 @@ mod tests {
         let snapped = snap_steps(&mut summary, &[(49.2, 12.0), (50.0, 12.0), (80.0, -5.0)], 3.0);
         assert_eq!(snapped, 1);
         assert_eq!(summary.steps[0].at_s, 50.0);
+    }
+
+    fn bits(points: &[LagPoint]) -> Vec<(u64, u64, u64, i8, u64, u64, bool)> {
+        points
+            .iter()
+            .map(|p| {
+                let b = |v: f64| v.to_bits();
+                (b(p.t_s), b(p.lag_ms), b(p.prominence), p.polarity, b(p.ref_dbfs), b(p.sig_dbfs), p.valid)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_track_is_the_same_on_any_number_of_threads() {
+        let s = scenario(&ScenarioConfig { gap: Some((50.0, 12.0)), dur_s: 120.0, ..Default::default() });
+        let on = |threads: usize| bits(&lag_track(&s.mic, &s.sys, s.rate, &DelayConfig { threads, ..Default::default() }));
+        let one = on(1);
+        assert_eq!(one.len(), 29);
+        for threads in [2, 3, 8, 64] {
+            assert_eq!(on(threads), one, "{threads} threads");
+        }
+    }
+
+    #[test]
+    fn a_16_bit_take_tracks_exactly_as_its_float_decoding_does() {
+        let s = scenario(&ScenarioConfig { gap: Some((50.0, 12.0)), dur_s: 120.0, ..Default::default() });
+        let (mic, sys): (Vec<i16>, Vec<i16>) = (
+            s.mic.iter().map(|&v| crate::sample::pcm16(v)).collect(),
+            s.sys.iter().map(|&v| crate::sample::pcm16(v)).collect(),
+        );
+        let decode = |x: &[i16]| x.iter().map(|&v| v.f() as f32).collect::<Vec<f32>>();
+        let (mic_f, sys_f) = (decode(&mic), decode(&sys));
+        let dc = DelayConfig::default();
+        let (ints, floats) = (lag_track(&mic, &sys, s.rate, &dc), lag_track(&mic_f, &sys_f, s.rate, &dc));
+        assert_eq!(bits(&ints), bits(&floats));
+        let (mut a, mut b) = (summarize(&ints, &dc), summarize(&floats, &dc));
+        refine_steps(&mic, &sys, s.rate, &mut a, &dc);
+        refine_steps(&mic_f, &sys_f, s.rate, &mut b, &dc);
+        assert_eq!(a.steps.len(), 1);
+        assert_eq!(a.steps[0].at_s.to_bits(), b.steps[0].at_s.to_bits());
     }
 
     #[test]

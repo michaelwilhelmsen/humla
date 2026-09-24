@@ -458,6 +458,7 @@ describe("the bar on a named step", () => {
   it("says what the chain is doing rather than one word for all of it", () => {
     for (const [step, label] of [
       ["saving_audio", "Saving audio…"],
+      ["removing_echo", "Removing echo…"],
       ["diarizing", "Identifying speakers…"],
       ["writing_playback", "Writing playback…"],
       ["matching_speakers", "Matching speakers…"],

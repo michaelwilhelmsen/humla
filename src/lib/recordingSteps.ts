@@ -11,6 +11,7 @@ import type { Step } from "./ipc";
 export const STEP_LABELS: Record<Step, string> = {
   transcribing: "Transcribing",
   saving_audio: "Saving audio",
+  removing_echo: "Removing echo",
   diarizing: "Identifying speakers",
   writing_playback: "Writing playback",
   matching_speakers: "Matching speakers",

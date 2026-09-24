@@ -4,6 +4,7 @@ mod openai;
 mod anthropic;
 mod local_whisper;
 mod diarize;
+mod echo;
 mod languages;
 mod presets;
 mod wav;

@@ -179,11 +179,11 @@ async fn rediarize_note_inner(app: AppHandle, note_id: String) -> Result<(), Str
         let progress = ChainProgress::Rediarize { note_id: note_id.clone() };
         progress.started(&app);
         match unify_note_speakers(&app, &note_id, &progress).await {
-            Ok(true) => {
+            Ok(Some(_)) => {
                 progress.finished(&app);
                 return Ok(());
             }
-            Ok(false) => {
+            Ok(None) => {
                 // Not enough retained per-session audio to unify — fall
                 // through to the latest-take re-diarize.
                 progress.finished(&app);
@@ -498,13 +498,16 @@ impl<'a> StreamSteps<'a> {
     }
 }
 
+/// What the named steps inside one take's (re)diarize cost, in ms.
+struct TakeStepCosts {
+    /// `None` when the take had no system stream beside its mic.
+    echo_ms: Option<u64>,
+    playback_ms: u64,
+}
+
 /// Mirror of [`diarize_and_apply`]'s branching over caller-supplied paths and
 /// chunks instead of recording-session state. No snapshot — the transcript is
 /// rebuilt from the chunk timings rather than appended to an in-flight session.
-///
-/// Returns what the playback write cost, in ms: it is its own named step and
-/// mixes sample-by-sample over the whole take, so a replay's per-take row
-/// reports it separately from the diarize it sits inside.
 async fn rediarize_apply_to_chunks(
     app: AppHandle,
     note_id: String,
@@ -517,7 +520,7 @@ async fn rediarize_apply_to_chunks(
     thresholds: diarize::Thresholds,
     fallback: LabelFallback,
     progress: &ChainProgress,
-) -> anyhow::Result<u64> {
+) -> anyhow::Result<TakeStepCosts> {
     // Before deciding the capture mode — a hallucinated chunk on an otherwise
     // silent stream would misclassify the whole recording. Also cleans up notes
     // recorded before the transcribe-time guard existed, which is the point of
@@ -542,6 +545,8 @@ async fn rediarize_apply_to_chunks(
         mic_segments_for_dump: Vec<diarize::Segment>,
         sys_segments_for_dump: Vec<diarize::Segment>,
         source_tag: &'static str,
+        echo: Option<crate::echo::EchoReport>,
+        echo_ms: Option<u64>,
     }
     // Under `Unlabelled`, a diarize that can't run is not a failure — the text
     // still has to reach the note (#146 / ADR-0004), just without `Speaker N:`
@@ -555,6 +560,8 @@ async fn rediarize_apply_to_chunks(
             mic_segments_for_dump: Vec::new(),
             sys_segments_for_dump: Vec::new(),
             source_tag: "unlabelled",
+            echo: None,
+            echo_ms: None,
         }
     };
     // The model being absent is the ordinary case of that, and worth catching
@@ -616,6 +623,8 @@ async fn rediarize_apply_to_chunks(
                         mic_segments_for_dump: segments_for_dump,
                         sys_segments_for_dump: Vec::new(),
                         source_tag: "mic",
+                        echo: None,
+                        echo_ms: None,
                     }
                 }
             }
@@ -659,6 +668,8 @@ async fn rediarize_apply_to_chunks(
                         mic_segments_for_dump: Vec::new(),
                         sys_segments_for_dump: segments_for_dump,
                         source_tag: "sys",
+                        echo: None,
+                        echo_ms: None,
                     }
                 }
             }
@@ -668,8 +679,13 @@ async fn rediarize_apply_to_chunks(
             // `You` is kept only when the mic resolves to a single voice — see
             // `build_hybrid_labels`. System stream first, mic second with the
             // remaining head-count: see `hybrid_sys_hint` / `mic_hint_after_sys`
-            // for why the hint is worth more on the mic. Mirrors
-            // `diarize_and_apply`'s hybrid branch; change both together.
+            // for why the hint is worth more on the mic, and the echo pass
+            // first. Mirrors `diarize_and_apply`'s hybrid branch; change both
+            // together.
+            let mut echo = EchoPass::run(mic_wav.as_deref(), sys_wav.as_deref(), || {
+                progress.step(&app, Step::RemovingEcho)
+            })
+            .await;
             let mut diarize_steps = StreamSteps::new(
                 &app,
                 progress,
@@ -695,7 +711,7 @@ async fn rediarize_apply_to_chunks(
             );
             let mic_segments = if let Some(p) = mic_wav.as_ref() {
                 diarize_steps.begin();
-                diarize_and_maybe_clean(&app, p, mic_speaker_hint, engine, thresholds)
+                diarize_and_maybe_clean(&app, echo.mic_input(p), mic_speaker_hint, engine, thresholds)
                     .await
                     .unwrap_or_else(|e| {
                         eprintln!("rediarize: mic diarize failed ({e}), mic falls back to You");
@@ -705,11 +721,14 @@ async fn rediarize_apply_to_chunks(
                 eprintln!("rediarize hybrid: no saved mic.wav, mic falls back to You");
                 Vec::new()
             };
+            echo.release_cancelled_mic();
             eprintln!(
                 "rediarize hybrid: mic resolved to {} voice(s)",
                 distinct_speaker_count(&mic_segments)
             );
-            let mic_segments_for_dump = mic_segments.clone();
+            let (kept_mic, echo_report) = echo.check(&mic_segments);
+            let mic_segments_for_dump = mic_segments;
+            let mic_segments = kept_mic;
             let sys_segments_for_dump = sys_segments.clone();
             let labels = build_hybrid_labels(&chunks, &mic_segments, &sys_segments);
             let sys_fallback = format!("Speaker {}", labels.next_free);
@@ -729,6 +748,8 @@ async fn rediarize_apply_to_chunks(
                 mic_segments_for_dump,
                 sys_segments_for_dump,
                 source_tag: "hybrid",
+                echo: echo_report,
+                echo_ms: echo.ms,
             }
         }
         (false, false) => {
@@ -754,11 +775,12 @@ async fn rediarize_apply_to_chunks(
         &stage.sys_segments_for_dump,
         &chunks,
         &thresholds,
-        Some(&pieces_pre),
-        Some(&pieces_post),
+        Some((&pieces_pre, &pieces_post)),
+        stage.echo.as_ref(),
     )
     .await;
 
+    let echo_ms = stage.echo_ms;
     let split_chunk = stage.splitter;
     let new_transcript = build_labelled_transcript(&chunks, split_chunk.as_ref());
     if new_transcript.trim().is_empty() {
@@ -809,7 +831,7 @@ async fn rediarize_apply_to_chunks(
     session_changed_for_sync(&app, &note_id, &session_id);
 
     progress.finished(&app);
-    Ok(playback_ms)
+    Ok(TakeStepCosts { echo_ms, playback_ms })
 }
 
 /// Speaker-number offset for a session being (re)built in isolation: the
@@ -1756,11 +1778,13 @@ fn pieces_to_json(pieces: &[LabelledPiece]) -> Vec<serde_json::Value> {
 /// loose. Best-effort: a write failure logs and proceeds, never breaks
 /// the diarize pipeline.
 ///
-/// `pieces_pre` and `pieces_post` are the labelled-piece sequence the
-/// transcript emitter walks, captured before and after
-/// `bridge_short_interjections` runs. When both are present the dump
-/// also includes a `bridge_changes` diff so flicker-absorption
+/// `pieces` is the labelled-piece sequence the transcript emitter walks,
+/// captured before and after `bridge_short_interjections` runs. When present
+/// the dump also includes a `bridge_changes` diff so flicker-absorption
 /// decisions (and non-decisions) are inspectable.
+///
+/// `mic_segments` are the mic's voices as diarized, echo included; `echo` says
+/// which of them the check dropped before they were numbered.
 async fn write_diagnostics_json(
     app: &AppHandle,
     note_id: &str,
@@ -1770,8 +1794,8 @@ async fn write_diagnostics_json(
     sys_segments: &[diarize::Segment],
     chunks: &[ChunkRecord],
     thresholds: &diarize::Thresholds,
-    pieces_pre: Option<&[LabelledPiece]>,
-    pieces_post: Option<&[LabelledPiece]>,
+    pieces: Option<(&[LabelledPiece], &[LabelledPiece])>,
+    echo: Option<&crate::echo::EchoReport>,
 ) -> Option<PathBuf> {
     let Ok(app_dir) = app.path().app_data_dir() else {
         eprintln!("diagnostics: app_data_dir unavailable, skipping write");
@@ -1782,10 +1806,7 @@ async fn write_diagnostics_json(
         eprintln!("diagnostics: mkdir {}: {e}", dir.display());
         return None;
     }
-    let engine_arg = match engine {
-        diarize::Engine::Community1 => "community1",
-        diarize::Engine::Sortformer => "sortformer",
-    };
+    let engine_arg = engine.arg();
     let path = dir.join(format!("{engine_arg}-{source}.json"));
 
     let chunk_payload: Vec<_> = chunks
@@ -1844,10 +1865,10 @@ async fn write_diagnostics_json(
     // is a piece the sandwich rule moved; every short A-B-A pattern that
     // ISN'T in `bridge_changes` is a piece the bridge declined to move,
     // and the reason is decidable from word count + duration + neighbours.
-    let pieces_pre_json = pieces_pre.map(|pieces| pieces_to_json(pieces));
-    let pieces_post_json = pieces_post.map(|pieces| pieces_to_json(pieces));
-    let bridge_changes = match (pieces_pre, pieces_post) {
-        (Some(pre), Some(post)) if pre.len() == post.len() => pre
+    let pieces_pre_json = pieces.map(|(pre, _)| pieces_to_json(pre));
+    let pieces_post_json = pieces.map(|(_, post)| pieces_to_json(post));
+    let bridge_changes = match pieces {
+        Some((pre, post)) if pre.len() == post.len() => pre
             .iter()
             .zip(post.iter())
             .enumerate()
@@ -1880,6 +1901,7 @@ async fn write_diagnostics_json(
         "pieces_before_bridge": pieces_pre_json,
         "pieces_after_bridge": pieces_post_json,
         "bridge_changes": bridge_changes,
+        "echo": echo,
         "created_at": chrono::Utc::now().timestamp_millis(),
     });
 
@@ -1921,6 +1943,162 @@ async fn timed_diarize(
     out
 }
 
+/// One take's echo pass as a chain runs it: named as its own step and
+/// timed, over the take's two full streams, before its mic is diarized. Holds
+/// nothing for a take that lacks either stream — there is no reference to take
+/// the echo out with.
+struct EchoPass {
+    analysis: Option<crate::echo::TakeAnalysis>,
+    /// The mic with the echo cancelled out, for the mic diarize to read.
+    cancelled: Option<CancelledMicWav>,
+    /// What the step cost, when it ran.
+    ms: Option<u64>,
+}
+
+impl EchoPass {
+    /// `announce` names the step, and runs only when the pass does.
+    async fn run(
+        mic: Option<&std::path::Path>,
+        sys: Option<&std::path::Path>,
+        announce: impl FnOnce(),
+    ) -> Self {
+        let (Some(mic), Some(sys)) = (mic, sys) else {
+            return Self { analysis: None, cancelled: None, ms: None };
+        };
+        announce();
+        let t = std::time::Instant::now();
+        let mut analysis = analyze_take_echo(mic, sys).await;
+        let cancelled = match analysis.as_mut().and_then(crate::echo::TakeAnalysis::take_cleaned) {
+            Some(cleaned) => match CancelledMicWav::write(&cleaned).await {
+                Ok(wav) => Some(wav),
+                Err(e) => {
+                    eprintln!("echo: can't write the cancelled mic ({e}); diarizing the mic as captured");
+                    None
+                }
+            },
+            None => None,
+        };
+        Self { analysis, cancelled, ms: Some(ms_since(t)) }
+    }
+
+    /// What the mic diarize reads: the cancelled mic, when there is one.
+    fn mic_input<'a>(&'a self, captured: &'a std::path::Path) -> &'a std::path::Path {
+        self.cancelled.as_ref().map_or(captured, |wav| wav.path())
+    }
+
+    /// The mic diarize has read the cancelled mic, so nothing keeps it.
+    fn release_cancelled_mic(&mut self) {
+        self.cancelled = None;
+    }
+
+    /// The mic's voices without the ones that read as echo, and what the
+    /// diarize dump records of the pass.
+    fn check(
+        &self,
+        mic_segments: &[diarize::Segment],
+    ) -> (Vec<diarize::Segment>, Option<crate::echo::EchoReport>) {
+        let Some(analysis) = &self.analysis else {
+            return (mic_segments.to_vec(), None);
+        };
+        let (kept, report) = analysis.check(mic_segments.to_vec());
+        if let Some(check) = &report.check {
+            log_echo_check(check);
+        }
+        (kept, Some(report))
+    }
+}
+
+/// A cancelled mic written for the diarize sidecar to read. It lives in the
+/// system temp dir and goes when dropped: a WAV under `recordings/` or
+/// `diagnostics/` would sit outside `keep_audio` and "Delete stored audio".
+struct CancelledMicWav(PathBuf);
+
+impl CancelledMicWav {
+    async fn write(samples: &[i16]) -> anyhow::Result<Self> {
+        // Held before the write, so a half-written file is removed too.
+        let wav = Self(std::env::temp_dir().join(format!("humla-echo-{}.wav", uuid::Uuid::new_v4())));
+        wav::write_i16_mono_16k(&wav.0, samples).await?;
+        Ok(wav)
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for CancelledMicWav {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Reads a take's two full streams and analyses the echo between them, off the
+/// async runtime. `None` when either can't be read: the mic is then diarized as
+/// it was captured.
+async fn analyze_take_echo(
+    mic: &std::path::Path,
+    sys: &std::path::Path,
+) -> Option<crate::echo::TakeAnalysis> {
+    let (mic_samples, sys_samples) =
+        match tokio::try_join!(wav::read_i16_mono_16k(mic), wav::read_i16_mono_16k(sys)) {
+            Ok(both) => both,
+            Err(e) => {
+                eprintln!("echo: can't read the take's streams ({e}); diarizing the mic as captured");
+                return None;
+            }
+        };
+    let analysis = match tokio::task::spawn_blocking(move || {
+        crate::echo::analyze_take(mic_samples, sys_samples)
+    })
+    .await
+    {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("echo: analysis failed ({e}); diarizing the mic as captured");
+            return None;
+        }
+    };
+    let lag = &analysis.lag;
+    match (lag.median_ms, analysis.echo.is_some()) {
+        (Some(ms), true) => eprintln!(
+            "echo: the mic hears sys {ms:+.1} ms late in {} of {} windows, {} step(s)",
+            lag.valid,
+            lag.windows,
+            lag.steps.len()
+        ),
+        _ => eprintln!("echo: none in {} windows; the mic is left as it is", lag.windows),
+    }
+    Some(analysis)
+}
+
+fn log_echo_check(check: &crate::echo::VoiceCheck) {
+    let voices: Vec<String> = check
+        .voices
+        .iter()
+        .map(|v| {
+            format!(
+                "{} {:.0}s {}{}",
+                v.speaker_id,
+                v.seconds,
+                v.ratio.map(|r| format!("{r:.2}")).unwrap_or_else(|| "-".into()),
+                if v.dropped { " dropped" } else { "" }
+            )
+        })
+        .collect();
+    let note = if check.skipped {
+        " — too little sys silence to judge"
+    } else if check.kept_all {
+        " — every voice read as echo, so all were kept"
+    } else {
+        ""
+    };
+    eprintln!(
+        "echo: sys silent {:.1}s; {}{note}",
+        check.sys_silent_s,
+        voices.join(" · ")
+    );
+}
+
 /// [`write_diagnostics_json`] for a stop chain: the file it wrote is remembered
 /// on the clock, so the chain's timings are merged into that same file instead
 /// of a sibling.
@@ -1934,9 +2112,10 @@ async fn write_diagnostics_timed(
     chunks: &[ChunkRecord],
     thresholds: &diarize::Thresholds,
     clock: Option<&StopClock>,
+    echo: Option<&crate::echo::EchoReport>,
 ) {
     let path = write_diagnostics_json(
-        app, note_id, engine, source, mic_segments, sys_segments, chunks, thresholds, None, None,
+        app, note_id, engine, source, mic_segments, sys_segments, chunks, thresholds, None, echo,
     )
     .await;
     if let Some(path) = path {
@@ -3276,8 +3455,11 @@ async fn post_stop_chain_inner(
     // failures keep the per-take labels.
     let t_unify = std::time::Instant::now();
     match unify_note_speakers(&app, &note_id, &progress).await {
-        Ok(true) => eprintln!("unify: cross-session speaker unification applied"),
-        Ok(false) => {}
+        Ok(Some(costs)) => {
+            eprintln!("unify: cross-session speaker unification applied");
+            clock.record(|t| t.unify_echo_ms = costs.echo_ms);
+        }
+        Ok(None) => {}
         Err(e) => eprintln!("unify: failed, keeping per-take labels: {e}"),
     }
     clock.record(|t| t.unify_ms = ms_since(t_unify));
@@ -4117,6 +4299,7 @@ async fn transcribe_takes(
             audio_ms: entry.duration_ms,
             transcribe_ms: ms_since(t_transcribe),
             diarize_ms: 0,
+            echo_ms: None,
             playback_ms: 0,
         };
         let chunks = sink.chunk_log.lock().clone();
@@ -4163,8 +4346,9 @@ async fn transcribe_takes(
         )
         .await;
         take_timings.diarize_ms = ms_since(t_diarize);
-        if let Ok(playback_ms) = &diarized {
-            take_timings.playback_ms = *playback_ms;
+        if let Ok(costs) = &diarized {
+            take_timings.echo_ms = costs.echo_ms;
+            take_timings.playback_ms = costs.playback_ms;
         }
         timings.takes.push(take_timings);
         if let Err(e) = diarized {
@@ -4219,8 +4403,11 @@ async fn transcribe_takes(
     // a failure keeps the per-take labels.
     let t_unify = std::time::Instant::now();
     match unify_note_speakers(app, note_id, &chain).await {
-        Ok(true) => eprintln!("unify: cross-session speaker unification applied"),
-        Ok(false) => {}
+        Ok(Some(costs)) => {
+            eprintln!("unify: cross-session speaker unification applied");
+            timings.unify_echo_ms = costs.echo_ms;
+        }
+        Ok(None) => {}
         Err(e) => eprintln!("unify: failed, keeping per-take labels: {e}"),
     }
     timings.unify_ms = ms_since(t_unify);
@@ -4543,7 +4730,7 @@ async fn diarize_and_apply(
                             single_speaker_fallback()
                         }
                         Ok(segments) => {
-                            write_diagnostics_timed(&app, &note_id, engine, "mic", &segments, &[], &chunks, &thresholds, clock).await;
+                            write_diagnostics_timed(&app, &note_id, engine, "mic", &segments, &[], &chunks, &thresholds, clock, None).await;
                             let display_map = build_display_map(&chunks, &segments, ChunkSource::Mic);
                             Box::new(move |c: &ChunkRecord| split_by_segments(c, &segments, &display_map))
                         }
@@ -4591,7 +4778,7 @@ async fn diarize_and_apply(
                             single_speaker_fallback()
                         }
                         Ok(segments) => {
-                            write_diagnostics_timed(&app, &note_id, engine, "sys", &[], &segments, &chunks, &thresholds, clock).await;
+                            write_diagnostics_timed(&app, &note_id, engine, "sys", &[], &segments, &chunks, &thresholds, clock, None).await;
                             let display_map = build_display_map(&chunks, &segments, ChunkSource::Sys);
                             Box::new(move |c: &ChunkRecord| split_by_segments(c, &segments, &display_map))
                         }
@@ -4614,6 +4801,15 @@ async fn diarize_and_apply(
             // speaker-diarize/main.swift) — exactly the in-person meeting
             // where one person does most of the talking. So the system stream
             // goes first and the mic takes the remainder.
+            //
+            // Before either, the echo pass: the speakers' echo on the mic is
+            // heard as extra voices, which the check drops before numbering.
+            // Mirrors `rediarize_apply_to_chunks`' hybrid branch; change both.
+            let mut echo = EchoPass::run(mic_wav.as_deref(), sys_wav.as_deref(), || {
+                progress.step(&app, Step::RemovingEcho)
+            })
+            .await;
+            record_timing(clock, |x| x.echo_ms = echo.ms);
             let mut diarize_steps = StreamSteps::new(
                 &app,
                 progress,
@@ -4654,7 +4850,7 @@ async fn diarize_and_apply(
                 }
                 Some(wav) => {
                     diarize_steps.begin();
-                    timed_diarize(&app, &wav, mic_speaker_hint, engine, thresholds, clock, ChunkSource::Mic)
+                    timed_diarize(&app, echo.mic_input(&wav), mic_speaker_hint, engine, thresholds, clock, ChunkSource::Mic)
                         .await
                         .unwrap_or_else(|e| {
                             eprintln!("diarize: hybrid mic diarize failed ({e}), mic falls back to You");
@@ -4662,6 +4858,7 @@ async fn diarize_and_apply(
                         })
                 }
             };
+            echo.release_cancelled_mic();
             if mic_segments.is_empty() && sys_segments.is_empty() {
                 emit_error(
                     &app,
@@ -4669,7 +4866,9 @@ async fn diarize_and_apply(
                     "Diarization found no distinct speakers; speech grouped by audio source.",
                 );
             }
-            write_diagnostics_timed(&app, &note_id, engine, "hybrid", &mic_segments, &sys_segments, &chunks, &thresholds, clock).await;
+            let (kept_mic, echo_report) = echo.check(&mic_segments);
+            write_diagnostics_timed(&app, &note_id, engine, "hybrid", &mic_segments, &sys_segments, &chunks, &thresholds, clock, echo_report.as_ref()).await;
+            let mic_segments = kept_mic;
             let labels = build_hybrid_labels(&chunks, &mic_segments, &sys_segments);
             // A stream whose diarize produced nothing still needs a distinct
             // label. A `None` label makes `build_labelled_transcript` glue the
@@ -5926,22 +6125,13 @@ async fn concat_wavs(
     Ok(Some(concat_offsets_ms(&counts)))
 }
 
-/// Run the cross-session speaker unification pass (#17) on a note.
-///
-/// Returns `Ok(true)` when the pass ran and rewrote labels, `Ok(false)` when
-/// the note doesn't qualify (fewer than two sessions, fewer than two with
-/// retained source audio + chunk timings, or the diarize model isn't
-/// downloaded) — callers then keep the per-take offset labelling exactly as
-/// before. `Err` means the pass started but failed; existing labels are left
-/// untouched (the pass only writes after diarize succeeded on every needed
-/// stream).
-///
-/// Cost note: this re-diarizes the note's ENTIRE concatenated audio (per
-/// stream) each time it runs — on every stop of a multi-session note the
-/// diarizer processes all takes, not just the new one. That's inherent to
-/// the approach (clustering must see all takes at once to unify voices) and
-/// bounded by note length; the concat WAVs live in a temp dir and are
-/// removed when the pass ends.
+/// What the named steps inside one unify pass cost, in ms, beyond the pass as
+/// a whole.
+pub(crate) struct UnifyCosts {
+    /// The echo pass over every hybrid take; `None` when there was none.
+    echo_ms: Option<u64>,
+}
+
 /// A scratch dir for one unify invocation's concat WAVs. Unique per call (a
 /// UUID suffix) so two overlapping unify passes for the *same* note — auto-unify
 /// in the post-stop chain racing a user `rediarize_note`, or two rapid
@@ -5962,6 +6152,16 @@ fn unify_note_lock(
     locks.lock().entry(note_id.to_string()).or_default().clone()
 }
 
+/// Run the cross-session speaker unification pass on a note: every take's
+/// audio joined end to end and diarized once per stream, all takes each time,
+/// so one voice keeps one label across them. The joined WAVs live in a temp
+/// dir removed when the pass ends.
+///
+/// Returns what it cost when the pass ran and rewrote labels, and `Ok(None)`
+/// when the note doesn't qualify (fewer than two sessions, fewer than two with
+/// retained source audio and chunk timings, or no diarize model), in which case
+/// callers keep the per-take labels. `Err` leaves the existing labels
+/// untouched: the pass writes only after every diarize it needed succeeded.
 pub(crate) async fn unify_note_speakers(
     app: &AppHandle,
     note_id: &str,
@@ -5969,7 +6169,7 @@ pub(crate) async fn unify_note_speakers(
     // is reached from the live stop, the user-pressed Re-diarize and a deferred
     // replay, and only the first of those owns `recording_status`.
     progress: &ChainProgress,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<Option<UnifyCosts>> {
     // Per-note re-entrancy guard: a second unify for this note waits for the
     // first to finish (then re-runs on its up-to-date timelines) rather than
     // racing it. Held for the whole pass; safe because unify is a leaf that
@@ -5981,7 +6181,7 @@ pub(crate) async fn unify_note_speakers(
     let recordings = sessions::recordings_dir(&app_dir, note_id);
     let resolved = sessions::resolve_sessions(&recordings);
     if resolved.len() < 2 {
-        return Ok(false);
+        return Ok(None);
     }
 
     let (expected_speakers, engine, thresholds) = {
@@ -5999,7 +6199,7 @@ pub(crate) async fn unify_note_speakers(
         Ok(s) if s.downloaded => {}
         _ => {
             eprintln!("unify: diarize model not downloaded, keeping per-take labels");
-            return Ok(false);
+            return Ok(None);
         }
     }
 
@@ -6032,7 +6232,7 @@ pub(crate) async fn unify_note_speakers(
             "unify: only {} session(s) have retained audio + chunk timings (need 2+), keeping per-take labels",
             unifiable.len()
         );
-        return Ok(false);
+        return Ok(None);
     }
 
     // Concat WAVs are scratch files — never inside the session dirs. Unique per
@@ -6052,7 +6252,7 @@ pub(crate) async fn unify_note_speakers(
     )
     .await;
     let _ = tokio::fs::remove_dir_all(&tmp).await;
-    result
+    result.map(Some)
 }
 
 /// The IO half of the unify pass, split out so the caller can always clean
@@ -6070,18 +6270,15 @@ async fn unify_apply(
     engine: diarize::Engine,
     thresholds: diarize::Thresholds,
     progress: &ChainProgress,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<UnifyCosts> {
     // Per-stream concatenation in manifest order. Mic concat = every session
     // that captured mic (mic-only *and* hybrid — a hybrid take's mic is
     // diarized now, not assumed to be one person); sys concat = sys-only +
     // hybrid. Matches the per-source passes diarize_and_apply runs on a single
     // take. `session_unifiable` guarantees a hybrid session has both WAVs, so
     // neither concat can hit a missing file and misalign the offsets.
-    let mic_paths: Vec<PathBuf> = unifiable
-        .iter()
-        .filter(|c| c.mode != SessionMode::SysOnly)
-        .map(|c| c.dir.join("mic.wav"))
-        .collect();
+    let mic_takes: Vec<&UnifyCandidate> =
+        unifiable.iter().filter(|c| c.mode != SessionMode::SysOnly).collect();
     let sys_paths: Vec<PathBuf> = unifiable
         .iter()
         .filter(|c| c.mode != SessionMode::MicOnly)
@@ -6089,6 +6286,13 @@ async fn unify_apply(
         .collect();
     let mic_concat = tmp.join("mic-concat.wav");
     let sys_concat = tmp.join("sys-concat.wav");
+    let mut echoes = cancel_each_takes_echo(app, progress, &mic_takes).await;
+    let echo_ms = echoes.iter().filter_map(|e| e.ms).reduce(|a, b| a + b);
+    let mic_paths: Vec<PathBuf> = mic_takes
+        .iter()
+        .zip(&echoes)
+        .map(|(take, echo)| echo.mic_input(&take.dir.join("mic.wav")).to_path_buf())
+        .collect();
     // Named a stream at a time: each stream's concat and its diarize are
     // announced together, so the label names the work actually running.
     let mut unify_steps = StreamSteps::new(
@@ -6107,6 +6311,7 @@ async fn unify_apply(
         unify_steps.begin();
     }
     let mic_offsets = concat_wavs(&mic_paths, &mic_concat).await?;
+    echoes.iter_mut().for_each(EchoPass::release_cancelled_mic);
     let mic_hint = if sys_paths.is_empty() {
         expected_speakers
     } else {
@@ -6116,6 +6321,17 @@ async fn unify_apply(
         Some(_) => diarize_and_maybe_clean(app, &mic_concat, mic_hint, engine, thresholds).await?,
         None => Vec::new(),
     };
+    if mic_offsets.is_some() && mic_segments.is_empty() {
+        anyhow::bail!("diarize returned no segments for the combined mic stream");
+    }
+    // Dropped before the sys hint counts the mic's voices, which echo must
+    // not add to.
+    let (mic_segments, echo_takes) = drop_joined_echo(
+        &mic_takes,
+        &echoes,
+        mic_offsets.as_deref().unwrap_or_default(),
+        &mic_segments,
+    );
     if !sys_paths.is_empty() {
         unify_steps.begin();
     }
@@ -6132,11 +6348,11 @@ async fn unify_apply(
         }
         None => Vec::new(),
     };
-    if mic_offsets.is_some() && mic_segments.is_empty() {
-        anyhow::bail!("diarize returned no segments for the combined mic stream");
-    }
     if sys_offsets.is_some() && sys_segments.is_empty() {
         anyhow::bail!("diarize returned no segments for the combined system stream");
+    }
+    if !echo_takes.is_empty() {
+        write_unify_dump(app, note_id, engine, &echo_takes).await;
     }
 
     // Unified generated numbers start past any frozen session's existing
@@ -6152,7 +6368,7 @@ async fn unify_apply(
     let sessions_in: Vec<UnifySession> = unifiable
         .iter()
         .map(|c| {
-            // Must mirror `mic_paths` / `sys_paths` above exactly — these
+            // Must mirror `mic_takes` / `sys_paths` above exactly — these
             // offsets are consumed in the same order the concat was built, so a
             // filter that disagrees shifts every later session's segment
             // lookups into the wrong take's audio.
@@ -6202,7 +6418,102 @@ async fn unify_apply(
         unifiable.len(),
         frozen_dirs.len()
     );
-    Ok(true)
+    Ok(UnifyCosts { echo_ms })
+}
+
+/// Each hybrid take's echo pass, a take at a time since every take's lag is
+/// its own: one [`EchoPass`] per mic take, holding nothing for a take with no
+/// system stream. `session_unifiable` has made sure a hybrid take kept both.
+async fn cancel_each_takes_echo(
+    app: &AppHandle,
+    progress: &ChainProgress,
+    mic_takes: &[&UnifyCandidate],
+) -> Vec<EchoPass> {
+    let hybrid = mic_takes.iter().filter(|c| c.mode == SessionMode::Hybrid).count() as u32;
+    let mut nth = 0;
+    let mut echoes = Vec::with_capacity(mic_takes.len());
+    for take in mic_takes {
+        let sys = (take.mode == SessionMode::Hybrid).then(|| take.dir.join("sys.wav"));
+        let echo = EchoPass::run(Some(&take.dir.join("mic.wav")), sys.as_deref(), || {
+            nth += 1;
+            progress.report(app, StepReport::counted(Step::RemovingEcho, nth, hybrid));
+        })
+        .await;
+        echoes.push(echo);
+    }
+    echoes
+}
+
+/// What the unify dump records of one take's echo pass.
+#[derive(serde::Serialize)]
+struct UnifyTakeEcho<'a> {
+    session_id: &'a str,
+    index: u32,
+    echo: crate::echo::EchoReport,
+}
+
+/// The joined mic's voices without the ones that read as echo, each hybrid
+/// take judged inside its own span of it, and what the dump records of every
+/// take that had an echo pass. `offsets[i]` is where `mic_takes[i]` starts in
+/// the joined stream, and `echoes[i]` is its echo pass.
+fn drop_joined_echo<'a>(
+    mic_takes: &[&'a UnifyCandidate],
+    echoes: &[EchoPass],
+    offsets: &[u64],
+    mic_segments: &[diarize::Segment],
+) -> (Vec<diarize::Segment>, Vec<UnifyTakeEcho<'a>>) {
+    let takes: Vec<crate::echo::JoinedTake> = echoes
+        .iter()
+        .zip(offsets)
+        .map(|(echo, &start_ms)| crate::echo::JoinedTake {
+            start_ms,
+            analysis: echo.analysis.as_ref(),
+        })
+        .collect();
+    let (kept, reports) = crate::echo::check_joined(mic_segments, &takes);
+    let dump = mic_takes
+        .iter()
+        .zip(reports)
+        .filter_map(|(take, report)| {
+            let echo = report?;
+            if let Some(check) = &echo.check {
+                log_echo_check(check);
+            }
+            Some(UnifyTakeEcho { session_id: &take.entry.id, index: take.entry.index, echo })
+        })
+        .collect();
+    (kept, dump)
+}
+
+/// `diagnostics/<note_id>/<engine>-unify.json`. Holds no `chunks`, so
+/// `read_chunks_from_diagnostic` passes over it. Best-effort.
+async fn write_unify_dump(
+    app: &AppHandle,
+    note_id: &str,
+    engine: diarize::Engine,
+    takes: &[UnifyTakeEcho<'_>],
+) {
+    let Ok(app_dir) = app.path().app_data_dir() else { return };
+    let dir = app_dir.join("diagnostics").join(note_id);
+    if let Err(e) = tokio::fs::create_dir_all(&dir).await {
+        eprintln!("diagnostics: mkdir {}: {e}", dir.display());
+        return;
+    }
+    let path = dir.join(format!("{}-unify.json", engine.arg()));
+    let payload = serde_json::json!({
+        "engine": engine.arg(),
+        "source": "unify",
+        "takes": takes,
+        "created_at": chrono::Utc::now().timestamp_millis(),
+    });
+    match serde_json::to_string_pretty(&payload) {
+        Ok(json) => {
+            if let Err(e) = tokio::fs::write(&path, json).await {
+                eprintln!("diagnostics: write {}: {e}", path.display());
+            }
+        }
+        Err(e) => eprintln!("diagnostics: serialize: {e}"),
+    }
 }
 
 /// Jaccard similarity: |A ∩ B| / |A ∪ B|. 1.0 when the sets are
@@ -8861,6 +9172,90 @@ mod diarize_tests {
     }
 
     #[test]
+    fn hybrid_echo_voice_is_dropped_before_the_two_room_voices_are_numbered() {
+        // Two people in the room on a call played through the speakers. The
+        // mic diarize heard the remote side's echo as a third voice.
+        let take = crate::echo::tests::echoed_take(60.0, &[(0.0, 20.0), (30.0, 50.0)]);
+        let chunks = vec![
+            sys(0, "Remote opens the call."),
+            mic(5_000, "Anna answers over it."),
+            mic(20_500, "Anna again, in the pause."),
+            sys(30_000, "Remote carries on."),
+            mic(35_000, "Bjorn talks over the call."),
+            mic(52_000, "Bjorn, in the pause."),
+        ];
+        let mic_segs = vec![
+            seg(1_000, 4_000, "ECHO"),
+            seg(5_000, 8_000, "ANNA"),
+            seg(20_500, 25_000, "ANNA"),
+            seg(31_000, 45_000, "ECHO"),
+            seg(35_000, 40_000, "BJORN"),
+            seg(52_000, 58_000, "BJORN"),
+        ];
+        let sys_segs = vec![seg(0, 20_000, "REMOTE"), seg(30_000, 50_000, "REMOTE")];
+
+        let (kept, _) = take.check(mic_segs);
+        let labels = build_hybrid_labels(&chunks, &kept, &sys_segs);
+        assert_eq!(labels.mic.get("ECHO"), None, "the echo is no voice at all");
+        assert_eq!(labels.mic.get("ANNA").map(String::as_str), Some("Speaker 2"));
+        assert_eq!(labels.mic.get("BJORN").map(String::as_str), Some("Speaker 3"));
+        assert_eq!(labels.sys.get("REMOTE").map(String::as_str), Some("Speaker 1"));
+    }
+
+    #[tokio::test]
+    async fn the_cancelled_mic_lives_in_the_temp_dir_only_as_long_as_the_diarize() {
+        // Audio under `recordings/` or `diagnostics/` would sit outside
+        // `keep_audio` and "Delete stored audio".
+        let wav = CancelledMicWav::write(&[3277; 1600]).await.expect("written");
+        let path = wav.path().to_path_buf();
+        assert!(path.starts_with(std::env::temp_dir()), "{}", path.display());
+        assert!(!path.components().any(|c| c.as_os_str() == "no.humla.app"));
+        assert_eq!(wav::read_i16_mono_16k(&path).await.unwrap(), vec![3277; 1600]);
+        let other = CancelledMicWav::write(&[0; 16]).await.unwrap();
+        assert_ne!(other.path(), path, "two diarizes never share one file");
+        drop(wav);
+        assert!(!path.exists(), "gone once the diarize is done with it");
+    }
+
+    #[test]
+    fn hybrid_lone_user_earns_you_once_the_echo_voices_are_dropped() {
+        // The user plus two voices made of echo.
+        // Whisper transcribed the echo on the mic too, and the voices are
+        // numbered before the text dedup drops those chunks — so each echo
+        // voice is reached, and would cost the user `You`.
+        let take = crate::echo::tests::echoed_take(60.0, &[(0.0, 20.0), (30.0, 50.0)]);
+        let chunks = vec![
+            sys(0, "The remote side opens the call now."),
+            mic(1_000, "The remote side opens the call now."),
+            mic(21_000, "I answer in the pause."),
+            sys(30_000, "The remote side carries on talking."),
+            mic(31_000, "The remote side carries on talking."),
+            mic(52_000, "And once more."),
+        ];
+        let mic_segs = vec![
+            seg(500, 19_000, "ECHO_A"),
+            seg(21_000, 28_000, "ME"),
+            seg(31_000, 49_000, "ECHO_B"),
+            seg(52_000, 57_000, "ME"),
+        ];
+        let sys_segs = vec![seg(0, 20_000, "REMOTE"), seg(30_000, 50_000, "REMOTE")];
+        assert_eq!(build_hybrid_labels(&chunks, &mic_segs, &sys_segs).mic.len(), 3);
+
+        let (kept, _) = take.check(mic_segs);
+        let labels = build_hybrid_labels(&chunks, &kept, &sys_segs);
+        assert_eq!(labels.mic.len(), 1);
+        assert_eq!(labels.mic.get("ME").map(String::as_str), Some("You"));
+        let splitter = hybrid_splitter(&chunks, kept, sys_segs);
+        assert_eq!(
+            build_labelled_transcript(&chunks, &splitter),
+            "Speaker 1: The remote side opens the call now.\n\
+             You: I answer in the pause.\n\
+             Speaker 1: The remote side carries on talking.\n\
+             You: And once more."
+        );
+    }
+
+    #[test]
     fn hybrid_speaker_numbers_never_collide_across_streams() {
         let chunks = vec![
             mic(0, "Room one."),
@@ -10797,6 +11192,62 @@ mod unify_tests {
         .unwrap();
         assert_eq!(max_speaker_in_timeline(&path), 2);
         assert_eq!(max_speaker_in_timeline(&tmp.path().join("absent.jsonl")), 0);
+    }
+
+    fn candidate(id: &str, index: u32, mode: SessionMode) -> UnifyCandidate {
+        UnifyCandidate {
+            entry: sessions::SessionEntry {
+                id: id.to_string(),
+                index,
+                started_at: String::new(),
+                duration_ms: 60_000,
+                streams: Vec::new(),
+                transcribed: true,
+            },
+            dir: PathBuf::new(),
+            chunks: Vec::new(),
+            mode,
+        }
+    }
+
+    #[test]
+    fn the_unify_pass_judges_each_hybrid_take_inside_its_own_span_and_never_a_mic_only_one() {
+        // Take 1 (0–60 s) was in person, with Hege at the laptop. Take 2
+        // (60–120 s) was a call on the speakers with Hege remote, so the mic
+        // heard her only while sys sounded.
+        let in_person = candidate("s1", 1, SessionMode::MicOnly);
+        let call = candidate("s2", 2, SessionMode::Hybrid);
+        let echoes = [
+            EchoPass { analysis: None, cancelled: None, ms: None },
+            EchoPass {
+                analysis: Some(crate::echo::tests::echoed_take(60.0, &[(0.0, 20.0), (30.0, 50.0)])),
+                cancelled: None,
+                ms: Some(0),
+            },
+        ];
+        let segments = vec![
+            seg(1_000, 15_000, "HEGE"),
+            seg(21_000, 29_000, "ME"),
+            seg(61_000, 75_000, "HEGE"),
+            seg(81_000, 89_000, "ME"),
+            seg(92_000, 108_000, "HEGE"),
+            seg(112_000, 118_000, "ME"),
+        ];
+
+        let (kept, dump) =
+            drop_joined_echo(&[&in_person, &call], &echoes, &[0, 60_000], &segments);
+
+        let hege: Vec<(u64, u64)> = kept
+            .iter()
+            .filter(|s| s.speaker_id == "HEGE")
+            .map(|s| (s.start_ms, s.end_ms))
+            .collect();
+        assert_eq!(hege, vec![(1_000, 15_000)], "her echo goes, and only her echo");
+        assert_eq!(kept.iter().filter(|s| s.speaker_id == "ME").count(), 3);
+        assert_eq!(dump.len(), 1, "a mic-only take has no echo pass to record");
+        assert_eq!((dump[0].session_id, dump[0].index), ("s2", 2));
+        let check = dump[0].echo.check.as_ref().expect("the call was judged");
+        assert!(check.voices.iter().any(|v| v.speaker_id == "HEGE" && v.dropped), "{check:?}");
     }
 }
 

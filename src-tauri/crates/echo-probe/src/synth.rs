@@ -9,6 +9,7 @@
 //! the output path.
 
 use crate::fft::Fft;
+use crate::sample::Sample;
 
 /// xorshift64*: deterministic, so every test run hears the same take.
 pub struct Rng(u64);
@@ -82,9 +83,20 @@ pub const VOICE_B: Voice = Voice {
     ],
 };
 
+/// A fricative's level against a vowel's in a levelled voice: 12 dB under.
+const FRICATIVE_LEVEL: f64 = 0.25;
+
 /// `voice` speaking inside `spans` (seconds), scaled so its active part sits
-/// at `rms_dbfs`.
-pub fn speech(voice: &Voice, rate: u32, len: usize, spans: &[(f64, f64)], rms_dbfs: f64, rng: &mut Rng) -> Vec<f64> {
+/// at `rms_dbfs`. `levelled`: see [`ScenarioConfig::levelled`].
+pub fn speech(
+    voice: &Voice,
+    rate: u32,
+    len: usize,
+    spans: &[(f64, f64)],
+    rms_dbfs: f64,
+    levelled: bool,
+    rng: &mut Rng,
+) -> Vec<f64> {
     let rate_f = rate as f64;
     let mut out = vec![0.0; len];
     for &(a, b) in spans {
@@ -130,6 +142,13 @@ pub fn speech(voice: &Voice, rate: u32, len: usize, spans: &[(f64, f64)], rms_db
                     let g = rng.gauss();
                     *v = 0.3 * (g - prev);
                     prev = g;
+                }
+            }
+            if levelled {
+                let level = if voiced { 1.0 } else { FRICATIVE_LEVEL };
+                let rms = (sig.iter().map(|v| v * v).sum::<f64>() / n as f64).sqrt();
+                if rms > 0.0 {
+                    sig.iter_mut().for_each(|v| *v *= level / rms);
                 }
             }
             for (i, v) in sig.iter().enumerate() {
@@ -230,6 +249,12 @@ pub struct ScenarioConfig {
     pub nonlinear: bool,
     pub noise_dbfs: f64,
     pub seed: u64,
+    /// Level every syllable as speech is — vowels loudest, fricatives 12 dB
+    /// under — for anything that tells speech from silence by its energy.
+    /// Unlevelled, narrow formants leave the vowels some 50 dB under the
+    /// fricatives. Off by default, which is what this crate's calibrated
+    /// thresholds assume.
+    pub levelled: bool,
 }
 
 impl Default for ScenarioConfig {
@@ -245,6 +270,7 @@ impl Default for ScenarioConfig {
             nonlinear: false,
             noise_dbfs: -85.0,
             seed: 7,
+            levelled: false,
         }
     }
 }
@@ -332,8 +358,8 @@ pub fn scenario(cfg: &ScenarioConfig) -> Scenario {
     let len = (cfg.dur_s * rate_f) as usize;
     let mut rng = Rng::new(cfg.seed);
     let (far_a, far_c, near_b) = pattern(cfg.dur_s);
-    let a = speech(&VOICE_A, rate, len, &far_a, -21.0, &mut rng);
-    let c = speech(&VOICE_C, rate, len, &far_c, -22.0, &mut rng);
+    let a = speech(&VOICE_A, rate, len, &far_a, -21.0, cfg.levelled, &mut rng);
+    let c = speech(&VOICE_C, rate, len, &far_c, -22.0, cfg.levelled, &mut rng);
     let sys_true: Vec<f64> = a.iter().zip(&c).map(|(x, y)| x + y).collect();
 
     let mut speaker = highpass(&sys_true, 250.0, rate_f);
@@ -365,7 +391,7 @@ pub fn scenario(cfg: &ScenarioConfig) -> Scenario {
     // over its active spans, so compare like with like.
     let far_share = far_a.iter().chain(&far_c).map(|(s, e)| e - s).sum::<f64>() / cfg.dur_s;
     let near_target = echo_level - 10.0 * far_share.log10() + cfg.near_db;
-    let near = speech(&VOICE_B, rate, len, &near_b, near_target, &mut rng);
+    let near = speech(&VOICE_B, rate, len, &near_b, near_target, cfg.levelled, &mut rng);
 
     let noise_amp = 10f64.powf(cfg.noise_dbfs / 20.0);
     let mic: Vec<f32> = (0..len)
@@ -401,14 +427,14 @@ pub fn scenario(cfg: &ScenarioConfig) -> Scenario {
 }
 
 /// Energy of `x` over the frames `mask` selects.
-pub fn masked_energy(x: &[f32], mask: &[bool]) -> f64 {
+pub fn masked_energy<S: Sample>(x: &[S], mask: &[bool]) -> f64 {
     mask.iter()
         .enumerate()
         .filter(|(_, &m)| m)
         .map(|(f, _)| {
             x[f * FRAME..((f + 1) * FRAME).min(x.len())]
                 .iter()
-                .map(|&v| v as f64 * v as f64)
+                .map(|&v| v.f() * v.f())
                 .sum::<f64>()
         })
         .sum()

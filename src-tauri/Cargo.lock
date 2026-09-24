@@ -1834,6 +1834,7 @@ dependencies = [
  "chrono",
  "cloud-sync",
  "dirs 5.0.1",
+ "echo-probe",
  "futures-util",
  "keyring",
  "libc",

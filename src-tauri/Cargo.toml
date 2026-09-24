@@ -22,9 +22,10 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 # rusqlite is pinned to 0.32 to match the core — the Arc<Mutex<Connection>>
 # handed across the sync seam must unify to the same concrete type.
 #
-# echo-probe is a measurement tool for stream alignment and echo (see
-# docs/research/stream-alignment-and-echo.md). Nothing here depends on it, so it
-# is built only when asked for: `cargo run --release -p echo-probe -- …`.
+# echo-probe measures stream alignment and echo (see
+# docs/research/stream-alignment-and-echo.md). Its `delay` and `aec` modules are
+# also what the app's echo pass runs; its CLI is built only when asked
+# for: `cargo run --release -p echo-probe -- …`.
 [workspace]
 members = ["crates/cloud-sync", "crates/echo-probe"]
 
@@ -75,6 +76,9 @@ keyring = { version = "3", default-features = false, features = ["apple-native"]
 # subset of the core's, so enabling it adds no new transitive crates.
 cloud-sync = { path = "crates/cloud-sync", optional = true }
 rmcp = { version = "3", default-features = false, features = ["server", "transport-io", "macros"] }
+# The lag of the mic behind the system stream and the echo canceller, for the
+# diarize input. No DSP dependencies of its own.
+echo-probe = { path = "crates/echo-probe" }
 
 [dev-dependencies]
 tempfile = "3"
@@ -91,8 +95,8 @@ custom-protocol = ["tauri/custom-protocol"]
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-updater = "2"
 
-# echo-probe's tests push minutes of synthetic audio through FFTs, which takes
-# minutes unoptimised. Scoped to that one package: the app's own dev build is
-# unaffected.
+# echo-probe pushes minutes of audio through FFTs, which takes minutes
+# unoptimised — in its own tests, and in the app's echo pass under `tauri dev`
+# and `cargo test`. Scoped to that one package.
 [profile.dev.package.echo-probe]
 opt-level = 3

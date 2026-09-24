@@ -261,6 +261,9 @@ pub enum Step {
     /// Copying the capture's retained per-source WAVs out of the temp dir —
     /// tens of megabytes per stream.
     SavingAudio,
+    /// Estimating where the speakers' echo lands in the mic and taking it out,
+    /// before a take with a system stream is diarized. Once per take.
+    RemovingEcho,
     /// One diarize sidecar pass per stream that carried speech. Two on a
     /// hybrid capture, run sequentially because the mic's speaker-count hint
     /// is derived from the system stream's result.
@@ -344,12 +347,18 @@ pub struct StopShape {
     pub deferred: bool,
     /// Full WAVs to copy out of the temp dir — zero when retention is off.
     pub retained_streams: u32,
+    /// Both streams carried speech and both full WAVs are there, so the echo
+    /// pass runs before the diarize.
+    pub removes_echo: bool,
     /// Streams that carried speech, so a diarize pass runs over each. Zero
     /// when the diarize model isn't downloaded, which is not the same as the
     /// take landing no text.
     pub diarized_streams: u32,
     /// The take landed text, so its timeline and mixed WAV get written.
     pub writes_playback: bool,
+    /// Hybrid takes the cross-session unify pass takes the echo out of, one
+    /// at a time, before it joins their mic streams.
+    pub unified_echo_takes: u32,
     /// Streams the cross-session unify pass concatenates — zero when the note
     /// has fewer than two unifiable takes.
     pub unified_streams: u32,
@@ -359,6 +368,8 @@ pub struct StopShape {
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TakeShape {
+    /// See [`StopShape::removes_echo`].
+    pub removes_echo: bool,
     /// See [`StopShape::diarized_streams`].
     pub diarized_streams: u32,
     /// See [`StopShape::writes_playback`]. False for a take that transcribed
@@ -372,6 +383,8 @@ pub struct TakeShape {
 pub struct ReplayShape {
     /// Each take in run order.
     pub takes: Vec<TakeShape>,
+    /// See [`StopShape::unified_echo_takes`].
+    pub unified_echo_takes: u32,
     pub unified_streams: u32,
 }
 
@@ -387,10 +400,11 @@ pub fn stop_steps(shape: StopShape) -> Vec<StepReport> {
     }
     let mut out = stream_reports(Step::SavingAudio, shape.retained_streams);
     out.extend(take_steps(TakeShape {
+        removes_echo: shape.removes_echo,
         diarized_streams: shape.diarized_streams,
         writes_playback: shape.writes_playback,
     }));
-    out.extend(stream_reports(Step::MatchingSpeakers, shape.unified_streams));
+    out.extend(unify_steps(shape.unified_echo_takes, shape.unified_streams));
     out
 }
 
@@ -404,17 +418,32 @@ pub fn replay_steps(shape: &ReplayShape) -> Vec<StepReport> {
         out.push(StepReport::plain(Step::Transcribing));
         out.extend(take_steps(*take));
     }
-    out.extend(stream_reports(Step::MatchingSpeakers, shape.unified_streams));
+    out.extend(unify_steps(shape.unified_echo_takes, shape.unified_streams));
     out
 }
 
 /// The diarize pass over one take, which both chains run and neither varies.
 #[cfg(test)]
 fn take_steps(take: TakeShape) -> Vec<StepReport> {
-    let mut out = stream_reports(Step::Diarizing, take.diarized_streams);
+    let mut out = Vec::new();
+    if take.removes_echo {
+        out.push(StepReport::plain(Step::RemovingEcho));
+    }
+    out.extend(stream_reports(Step::Diarizing, take.diarized_streams));
     if take.writes_playback {
         out.push(StepReport::plain(Step::WritingPlayback));
     }
+    out
+}
+
+/// The unify pass, which both chains run after their takes: each hybrid
+/// take's echo out, a take at a time, then each joined stream diarized.
+#[cfg(test)]
+fn unify_steps(echo_takes: u32, streams: u32) -> Vec<StepReport> {
+    let mut out: Vec<StepReport> = (1..=echo_takes)
+        .map(|k| StepReport::counted(Step::RemovingEcho, k, echo_takes))
+        .collect();
+    out.extend(stream_reports(Step::MatchingSpeakers, streams));
     out
 }
 
@@ -795,8 +824,9 @@ impl RecordingStatus {
 /// Filled as the chain runs and merged into the take's diarize diagnostics
 /// JSON at the end, so a slow stop can be attributed to a step instead of
 /// guessed at. `diarize_mic_ms` / `diarize_sys_ms` are per sidecar invocation
-/// and absent when that stream wasn't diarized; `diagnostics_path` is the file
-/// the timings are merged into, not a duration.
+/// and absent when that stream wasn't diarized, as the echo rows are when no
+/// take had a system stream beside its mic; `diagnostics_path` is the file the
+/// timings are merged into, not a duration.
 #[derive(Clone, Default, Serialize)]
 pub struct StopTimings {
     pub sidecar_shutdown_ms: u64,
@@ -809,21 +839,31 @@ pub struct StopTimings {
     pub diarize_mic_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diarize_sys_ms: Option<u64>,
+    /// The take's echo pass, which runs before either stream is diarized.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub echo_ms: Option<u64>,
     pub playback_assets_ms: u64,
     pub finalize_session_ms: u64,
     pub unify_ms: u64,
+    /// The echo pass over every hybrid take inside `unify_ms`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unify_echo_ms: Option<u64>,
     pub temp_cleanup_ms: u64,
     pub total_ms: u64,
     #[serde(skip)]
     pub diagnostics_path: Option<PathBuf>,
 }
 
+/// A timing for a summary line, `-` for a step that didn't run.
+fn or_dash(ms: Option<u64>) -> String {
+    ms.map(|v| v.to_string()).unwrap_or_else(|| "-".into())
+}
+
 impl StopTimings {
     /// One-line stderr summary of the chain, printed on every stop.
     pub fn summary(&self) -> String {
-        let opt = |v: Option<u64>| v.map(|v| v.to_string()).unwrap_or_else(|| "-".into());
         format!(
-            "stop timings: total={}ms sidecar={} reader={} drain={} ({} pending) keep_audio={} detect_lang={} diarize_mic={} diarize_sys={} playback={} finalize={} unify={} cleanup={}",
+            "stop timings: total={}ms sidecar={} reader={} drain={} ({} pending) keep_audio={} detect_lang={} echo={} diarize_mic={} diarize_sys={} playback={} finalize={} unify={} unify_echo={} cleanup={}",
             self.total_ms,
             self.sidecar_shutdown_ms,
             self.reader_wait_ms,
@@ -831,11 +871,13 @@ impl StopTimings {
             self.drain_pending_chunks,
             self.keep_audio_ms,
             self.detect_language_ms,
-            opt(self.diarize_mic_ms),
-            opt(self.diarize_sys_ms),
+            or_dash(self.echo_ms),
+            or_dash(self.diarize_mic_ms),
+            or_dash(self.diarize_sys_ms),
             self.playback_assets_ms,
             self.finalize_session_ms,
             self.unify_ms,
+            or_dash(self.unify_echo_ms),
             self.temp_cleanup_ms,
         )
     }
@@ -853,9 +895,10 @@ pub struct ReplayTakeTimings {
     pub audio_ms: u64,
     pub transcribe_ms: u64,
     pub diarize_ms: u64,
-    /// The mixed `playback.wav` write, which `diarize_ms` covers the rest of.
-    /// Its own row because it is its own named step and mixes sample-by-sample
-    /// over the whole take.
+    /// The echo pass, inside `diarize_ms`. Absent without a system stream.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub echo_ms: Option<u64>,
+    /// The mixed `playback.wav` write, inside `diarize_ms`.
     pub playback_ms: u64,
 }
 
@@ -866,6 +909,9 @@ pub struct ReplayTimings {
     /// The cross-session unify pass over the whole run — a second full
     /// diarize, and the one step here that isn't per take.
     pub unify_ms: u64,
+    /// The echo pass over every hybrid take inside `unify_ms`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unify_echo_ms: Option<u64>,
     pub total_ms: u64,
 }
 
@@ -877,15 +923,22 @@ impl ReplayTimings {
             .iter()
             .map(|t| {
                 format!(
-                    "[{}: streams={} audio={} transcribe={} diarize={} playback={}]",
-                    t.index, t.streams, t.audio_ms, t.transcribe_ms, t.diarize_ms, t.playback_ms
+                    "[{}: streams={} audio={} transcribe={} diarize={} echo={} playback={}]",
+                    t.index,
+                    t.streams,
+                    t.audio_ms,
+                    t.transcribe_ms,
+                    t.diarize_ms,
+                    or_dash(t.echo_ms),
+                    t.playback_ms
                 )
             })
             .collect();
         format!(
-            "replay timings: total={}ms unify={} takes={} {}",
+            "replay timings: total={}ms unify={} unify_echo={} takes={} {}",
             self.total_ms,
             self.unify_ms,
+            or_dash(self.unify_echo_ms),
             self.takes.len(),
             takes.join(" ")
         )
@@ -1674,6 +1727,7 @@ mod tests {
         );
         let hybrid = StopShape {
             retained_streams: 2,
+            removes_echo: true,
             diarized_streams: 2,
             writes_playback: true,
             ..StopShape::default()
@@ -1683,9 +1737,35 @@ mod tests {
             vec![
                 StepReport::counted(Step::SavingAudio, 1, 2),
                 StepReport::counted(Step::SavingAudio, 2, 2),
+                StepReport::plain(Step::RemovingEcho),
                 StepReport::counted(Step::Diarizing, 1, 2),
                 StepReport::counted(Step::Diarizing, 2, 2),
                 StepReport::plain(Step::WritingPlayback),
+            ],
+            "the echo comes out of the mic before either stream is diarized"
+        );
+    }
+
+    #[test]
+    fn the_unify_pass_removes_each_hybrid_takes_echo_before_matching_speakers() {
+        // Every take's lag is its own, so the joined mic is cancelled a take at
+        // a time before it is diarized.
+        let steps = stop_steps(StopShape {
+            retained_streams: 2,
+            removes_echo: true,
+            diarized_streams: 2,
+            writes_playback: true,
+            unified_echo_takes: 2,
+            unified_streams: 2,
+            ..StopShape::default()
+        });
+        assert_eq!(
+            &steps[steps.len() - 4..],
+            &[
+                StepReport::counted(Step::RemovingEcho, 1, 2),
+                StepReport::counted(Step::RemovingEcho, 2, 2),
+                StepReport::counted(Step::MatchingSpeakers, 1, 2),
+                StepReport::counted(Step::MatchingSpeakers, 2, 2),
             ]
         );
     }
@@ -1735,8 +1815,10 @@ mod tests {
         assert!(stop_steps(StopShape {
             deferred: true,
             retained_streams: 2,
+            removes_echo: true,
             diarized_streams: 2,
             writes_playback: true,
+            unified_echo_takes: 2,
             unified_streams: 2,
         })
         .is_empty());
@@ -1744,21 +1826,24 @@ mod tests {
 
     #[test]
     fn a_replay_names_every_take_then_the_unify_once() {
-        let two_streams = TakeShape { diarized_streams: 2, writes_playback: true };
-        let one_stream_take = TakeShape { diarized_streams: 1, writes_playback: true };
+        let two_streams = TakeShape { removes_echo: true, diarized_streams: 2, writes_playback: true };
+        let one_stream_take = TakeShape { diarized_streams: 1, writes_playback: true, ..TakeShape::default() };
         assert_eq!(
             replay_steps(&ReplayShape {
                 takes: vec![two_streams, one_stream_take],
+                unified_echo_takes: 1,
                 unified_streams: 2,
             }),
             vec![
                 StepReport::plain(Step::Transcribing),
+                StepReport::plain(Step::RemovingEcho),
                 StepReport::counted(Step::Diarizing, 1, 2),
                 StepReport::counted(Step::Diarizing, 2, 2),
                 StepReport::plain(Step::WritingPlayback),
                 StepReport::plain(Step::Transcribing),
                 StepReport::plain(Step::Diarizing),
                 StepReport::plain(Step::WritingPlayback),
+                StepReport::plain(Step::RemovingEcho),
                 StepReport::counted(Step::MatchingSpeakers, 1, 2),
                 StepReport::counted(Step::MatchingSpeakers, 2, 2),
             ],
@@ -1775,9 +1860,9 @@ mod tests {
             replay_steps(&ReplayShape {
                 takes: vec![
                     TakeShape::default(),
-                    TakeShape { diarized_streams: 1, writes_playback: true },
+                    TakeShape { diarized_streams: 1, writes_playback: true, ..TakeShape::default() },
                 ],
-                unified_streams: 0,
+                ..ReplayShape::default()
             }),
             vec![
                 StepReport::plain(Step::Transcribing),
@@ -1792,8 +1877,8 @@ mod tests {
     fn a_single_take_replay_never_names_the_unify() {
         assert_eq!(
             replay_steps(&ReplayShape {
-                takes: vec![TakeShape { diarized_streams: 1, writes_playback: true }],
-                unified_streams: 0,
+                takes: vec![TakeShape { diarized_streams: 1, writes_playback: true, ..TakeShape::default() }],
+                ..ReplayShape::default()
             })
             .iter()
             .filter(|r| r.step == Step::MatchingSpeakers)
@@ -1806,16 +1891,19 @@ mod tests {
     fn no_counter_in_either_plan_reads_past_its_total() {
         let mut all = stop_steps(StopShape {
             retained_streams: 2,
+            removes_echo: true,
             diarized_streams: 2,
             writes_playback: true,
+            unified_echo_takes: 3,
             unified_streams: 2,
             ..StopShape::default()
         });
         all.extend(replay_steps(&ReplayShape {
             takes: vec![
-                TakeShape { diarized_streams: 2, writes_playback: true },
-                TakeShape { diarized_streams: 1, writes_playback: true },
+                TakeShape { removes_echo: true, diarized_streams: 2, writes_playback: true },
+                TakeShape { diarized_streams: 1, writes_playback: true, ..TakeShape::default() },
             ],
+            unified_echo_takes: 1,
             unified_streams: 2,
         }));
         // And within one step the index only ever climbs.
@@ -1967,6 +2055,7 @@ mod tests {
                 out.push(p.snapshot());
             }
             for report in take_steps(TakeShape {
+                removes_echo: take.streams == 2,
                 diarized_streams: take.streams,
                 writes_playback: true,
             }) {
@@ -1995,6 +2084,7 @@ mod tests {
             steps,
             vec![
                 (Step::Transcribing, 1),
+                (Step::RemovingEcho, 1),
                 (Step::Diarizing, 1),
                 (Step::WritingPlayback, 1),
                 (Step::Transcribing, 2),
@@ -2035,6 +2125,7 @@ mod tests {
                     audio_ms: 1_054_000,
                     transcribe_ms: 175_000,
                     diarize_ms: 108_000,
+                    echo_ms: Some(17_000),
                     playback_ms: 9_000,
                 },
                 ReplayTakeTimings {
@@ -2043,17 +2134,19 @@ mod tests {
                     audio_ms: 60_000,
                     transcribe_ms: 9_000,
                     diarize_ms: 4_000,
+                    echo_ms: None,
                     playback_ms: 1_000,
                 },
             ],
             unify_ms: 62_000,
+            unify_echo_ms: Some(18_000),
             total_ms: 296_000,
         };
         assert_eq!(
             t.summary(),
-            "replay timings: total=296000ms unify=62000 takes=2 \
-             [1: streams=2 audio=1054000 transcribe=175000 diarize=108000 playback=9000] \
-             [2: streams=1 audio=60000 transcribe=9000 diarize=4000 playback=1000]"
+            "replay timings: total=296000ms unify=62000 unify_echo=18000 takes=2 \
+             [1: streams=2 audio=1054000 transcribe=175000 diarize=108000 echo=17000 playback=9000] \
+             [2: streams=1 audio=60000 transcribe=9000 diarize=4000 echo=- playback=1000]"
         );
         // The file is the same shape as a stop's, so `merge_timings` is shared.
         let merged = merge_timings(None, &t);
@@ -2073,6 +2166,11 @@ mod tests {
         // one the run doesn't spend per take (#189).
         assert!(merged["timings"]["unify_ms"].is_u64());
         assert!(merged["timings"]["total_ms"].is_u64());
+        // The echo pass runs only for a take with a system stream beside it,
+        // so a take without one says nothing rather than zero.
+        assert_eq!(takes[0]["echo_ms"], 17_000);
+        assert!(takes[1].get("echo_ms").is_none());
+        assert_eq!(merged["timings"]["unify_echo_ms"], 18_000);
     }
 
     #[test]
@@ -2086,9 +2184,11 @@ mod tests {
             detect_language_ms: 1,
             diarize_mic_ms: Some(21_000),
             diarize_sys_ms: None,
+            echo_ms: Some(4_000),
             playback_assets_ms: 300,
             finalize_session_ms: 12,
             unify_ms: 0,
+            unify_echo_ms: None,
             temp_cleanup_ms: 7,
             total_ms: 30_484,
             diagnostics_path: Some(PathBuf::from("/tmp/community1-mic.json")),
@@ -2115,6 +2215,10 @@ mod tests {
         assert_eq!(timings["diarize_mic_ms"], 21_000);
         // A stream that wasn't diarized says nothing rather than zero.
         assert!(timings.get("diarize_sys_ms").is_none());
+        assert_eq!(timings["echo_ms"], 4_000);
+        assert!(timings.get("unify_echo_ms").is_none());
+        assert!(t.summary().contains(" echo=4000 "), "{}", t.summary());
+        assert!(t.summary().contains(" unify_echo=- "), "{}", t.summary());
         // The merge target is bookkeeping for the writer, not part of the dump.
         assert!(timings.get("diagnostics_path").is_none());
 
