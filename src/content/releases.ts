@@ -28,7 +28,7 @@ export const releases: Release[] = [
       "The retired Sortformer engine and its models are cleaned up.",
     ],
     issues: [
-      { title: "Make Nemotron 3 the default diarization engine (replaces Sortformer)", reference: "#193", status: "Open", url: "https://github.com/michaelwilhelmsen/humla/issues/193" },
+      { title: "Make Nemotron 3 the default diarization engine (replaces Sortformer)", reference: "#193", status: "Closed", url: "https://github.com/michaelwilhelmsen/humla/issues/193" },
       { title: "Stop speaker echo from becoming extra voices on the mic", reference: "#196", status: "Closed", url: "https://github.com/michaelwilhelmsen/humla/issues/196" },
       { title: "Speed up the echo pass and cut its memory on long takes", reference: "#200", status: "Closed", url: "https://github.com/michaelwilhelmsen/humla/issues/200" },
     ],
