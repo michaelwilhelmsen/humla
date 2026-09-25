@@ -9,6 +9,7 @@
 #   - Working tree clean
 #   - Versions in package.json + tauri.conf.json + Cargo.toml all match
 #   - That version is greater than the latest GitHub release
+#   - Optional: cargo-sweep (`cargo install cargo-sweep`), which prunes target/
 #
 # Usage: pnpm release   (or: ./scripts/release.sh)
 set -euo pipefail
@@ -70,25 +71,19 @@ fi
 if [[ "${SKIP_BUILD:-0}" == "1" ]]; then
   echo "SKIP_BUILD=1 → reusing existing artifacts (no rebuild)"
 else
+  # A Rust update leaves a full copy of every compiled dependency in target/.
+  if cargo sweep --version >/dev/null 2>&1; then
+    (cd src-tauri && cargo sweep --installed) || echo "warning: cargo sweep failed, building anyway" >&2
+  else
+    echo "note: cargo-sweep not installed, skipping target/ cleanup (cargo install cargo-sweep)" >&2
+  fi
   ./scripts/build-dmg.sh
 fi
 
-# 4. Locate artifacts — by VERSION and by payload, never by "newest on disk".
-#
-# This used to be three `ls -t | head -n1` calls, which is a trap that nearly
-# shipped during v0.52.0. Tauri bundles in the order app → DMG → updater
-# tarball, so a failure in the DMG step (that one was macOS refusing
-# `bundle_dmg.sh` its Finder automation prompt) leaves the app rebuilt but the
-# updater tarball still belonging to the PREVIOUS release. `ls -t` then picks
-# that stale tarball happily, and since `latest.json` takes its version from
-# these files' surroundings rather than from their contents, the release
-# publishes as the new version carrying the old payload — with a signature that
-# verifies, because it is the old payload's own signature. Every install would
-# have taken the update and quietly moved backwards. Nothing about the release
-# would have looked wrong.
-#
-# So: demand each artifact by name where the name carries the version, and read
-# the version out of the payload where it does not.
+# 4. Locate artifacts — by VERSION and by payload, never by "newest on disk":
+# a failed DMG step leaves the previous release's updater tarball in place, and
+# its signature still verifies, so only a version in the name or the payload
+# tells a stale artifact from a fresh one.
 
 # The DMG's filename carries the version; only the arch suffix varies
 # (aarch64 / x64), so glob that much and insist on exactly one match.

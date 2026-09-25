@@ -95,6 +95,12 @@ custom-protocol = ["tauri/custom-protocol"]
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-updater = "2"
 
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
 # echo-probe pushes minutes of audio through FFTs, which takes minutes
 # unoptimised — in its own tests, and in the app's echo pass under `tauri dev`
 # and `cargo test`. Scoped to that one package.
