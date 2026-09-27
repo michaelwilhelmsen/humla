@@ -18,6 +18,18 @@ func writeStderr(_ msg: String) {
     FileHandle.standardError.write(Data("\(msg)\n".utf8))
 }
 
+/// Tagged so the Rust side can pick it out of FluidAudio's stderr logging.
+func writeError(_ error: Error) {
+    writeStderr("humla-error: \(error.localizedDescription)")
+}
+
+/// A download also logs the full error, domain and code included, which the
+/// tagged line leaves out.
+func writeDownloadError(_ error: Error) {
+    writeStderr("download error: \(error)")
+    writeError(error)
+}
+
 func writeStdout(_ obj: Any) {
     if let data = try? JSONSerialization.data(withJSONObject: obj),
        let s = String(data: data, encoding: .utf8) {
@@ -205,7 +217,7 @@ func runDownloadCommunity1() async -> Int32 {
         writeStdout(["event": "done"])
         return 0
     } catch {
-        writeStderr("download error: \(error)")
+        writeDownloadError(error)
         return 1
     }
 }
@@ -234,7 +246,7 @@ func runDownloadNemotron() async -> Int32 {
         writeStdout(["event": "done"])
         return 0
     } catch {
-        writeStderr("download error: \(error)")
+        writeDownloadError(error)
         return 1
     }
 }
@@ -279,8 +291,7 @@ func runDiarizeCommunity1(audioPath: String, numSpeakers: Int?, threshold: Doubl
         })
         return 0
     } catch {
-        // Tagged so the Rust side can pick it out of FluidAudio's stderr logging.
-        writeStderr("humla-error: \(error.localizedDescription)")
+        writeError(error)
         return 1
     }
 }
@@ -315,7 +326,7 @@ func runDiarizeNemotron(audioPath: String) async -> Int32 {
         })
         return 0
     } catch {
-        writeStderr("humla-error: \(error.localizedDescription)")
+        writeError(error)
         return 1
     }
 }

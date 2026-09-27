@@ -48,6 +48,12 @@ function setup(opts: {
   return { writes, downloads };
 }
 
+// A command's error reaches the frontend as the string `diarize::download`
+// words, naming the step that failed.
+const OFFLINE = "The download didn’t finish: The Internet connection appears to be offline.";
+const PREPARE_FAILED =
+  "The model downloaded, but preparing it for this Mac failed: Output backing for feature named 'speaker_preds' is not compatible with the model's output feature description.";
+
 const offerText = () => screen.findByText(/193 MB/);
 const switchButton = () => screen.getByRole("button", { name: /upgrade speaker labels/i });
 
@@ -116,24 +122,40 @@ describe("NemotronOffer", () => {
     const { writes } = setup({
       offer: "pending",
       engine: "community1",
-      download: () => Promise.reject(new Error("download failed: offline")),
+      download: () => Promise.reject(OFFLINE),
     });
     render(<NemotronOffer />);
     await offerText();
 
     await userEvent.click(switchButton());
 
-    expect(await screen.findByText(/offline/)).toBeInTheDocument();
+    expect(await screen.findByRole("alert")).toHaveTextContent(OFFLINE);
     expect(writes.diarize_model).toBeUndefined();
     expect(writes.nemotron_offer).toBeUndefined();
     expect(switchButton()).toBeEnabled();
+  });
+
+  it("says preparing failed, not the download, when the Neural Engine warm-up fails", async () => {
+    setup({
+      offer: "pending",
+      engine: "community1",
+      download: () => Promise.reject(PREPARE_FAILED),
+    });
+    render(<NemotronOffer />);
+    await offerText();
+
+    await userEvent.click(switchButton());
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent(PREPARE_FAILED);
+    expect(alert).not.toHaveTextContent(/didn.t finish/);
   });
 
   it("still says why the last download failed when the card comes back", async () => {
     setup({
       offer: "pending",
       engine: "community1",
-      download: () => Promise.reject(new Error("download failed: offline")),
+      download: () => Promise.reject(OFFLINE),
     });
     const first = render(<NemotronOffer />);
     await offerText();

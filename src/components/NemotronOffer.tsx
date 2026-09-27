@@ -60,7 +60,7 @@ export function NemotronOffer() {
           </p>
           {offer.error && (
             <p className="home-offer-error" role="alert">
-              The download didn’t finish: {offer.error}
+              {offer.error}
             </p>
           )}
           <div className="home-offer-actions">

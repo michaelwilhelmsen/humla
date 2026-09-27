@@ -266,26 +266,7 @@ pub async fn diarize_file(
         .map_err(|e| anyhow!("spawn speaker-diarize: {e}"))?;
 
     if !output.status.success() {
-        // FluidAudio prints a wall of `[Profiling]` logs to stderr on every
-        // invocation; without filtering, the entire dump would land in the
-        // user's recording-error toast. The sidecar tags its own final error
-        // line with `humla-error:` so we can pluck it out cleanly. Fall back
-        // to the last non-empty line if no tag is present (older sidecars,
-        // unexpected crashes).
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let clean = stderr
-            .lines()
-            .filter_map(|l| l.strip_prefix("humla-error: "))
-            .last()
-            .map(str::to_string)
-            .or_else(|| {
-                stderr
-                    .lines()
-                    .rev()
-                    .map(str::trim)
-                    .find(|l| !l.is_empty())
-                    .map(str::to_string)
-            })
+        let clean = sidecar_error(&String::from_utf8_lossy(&output.stderr))
             .unwrap_or_else(|| format!("speaker-diarize exit {}", output.status));
         return Err(anyhow!("{clean}"));
     }
@@ -305,6 +286,18 @@ pub async fn diarize_file(
             .join(" ")
     );
     Ok(segments)
+}
+
+/// The sidecar's own error line out of its stderr, which FluidAudio fills with
+/// logging, so the sidecar tags that line `humla-error:`. An untagged failure
+/// (a crash) falls back to the last line written.
+fn sidecar_error(stderr: &str) -> Option<String> {
+    stderr
+        .lines()
+        .filter_map(|l| l.strip_prefix("humla-error: "))
+        .last()
+        .or_else(|| stderr.lines().rev().map(str::trim).find(|l| !l.is_empty()))
+        .map(str::to_string)
 }
 
 /// Extract the segment array from the sidecar's stdout.
@@ -494,10 +487,39 @@ pub struct DownloadProgress {
     pub engine: String,
 }
 
+/// Which half of a model download a failure belongs to. The sidecar reports
+/// `warming` once the files are on disk, so from there a failure is the
+/// preparation's, never the network's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DownloadStep {
+    Fetch,
+    Prepare,
+}
+
+impl DownloadStep {
+    fn after(self, phase: &str) -> Self {
+        if phase == "warming" {
+            Self::Prepare
+        } else {
+            self
+        }
+    }
+
+    fn failure(self, reason: &str) -> String {
+        match self {
+            Self::Fetch => format!("The download didn’t finish: {reason}"),
+            Self::Prepare => {
+                format!("The model downloaded, but preparing it for this Mac failed: {reason}")
+            }
+        }
+    }
+}
+
 /// Trigger the model download via the sidecar, emitting Tauri events for
 /// each progress line so the UI can show a progress bar. Phases are FluidAudio's
 /// `listing` → `downloading` → `compiling`, then `warming` for an engine that
-/// compiles for the Neural Engine before it reports done.
+/// compiles for the Neural Engine before it reports done. A failure's message
+/// names which of the two steps failed.
 pub async fn download(app: &AppHandle, engine: Engine) -> Result<()> {
     let sidecar = sidecar_path(app)?;
     let mut child = Command::new(&sidecar)
@@ -524,6 +546,7 @@ pub async fn download(app: &AppHandle, engine: Engine) -> Result<()> {
         buf
     });
 
+    let mut step = DownloadStep::Fetch;
     let mut reader = BufReader::new(stdout).lines();
     while let Ok(Some(line)) = reader.next_line().await {
         let trimmed = line.trim();
@@ -545,6 +568,7 @@ pub async fn download(app: &AppHandle, engine: Engine) -> Result<()> {
                         .to_string(),
                     engine: engine.arg().to_string(),
                 };
+                step = step.after(&progress.phase);
                 let _ = app.emit("diarize_download_progress", progress);
             }
             Some("done") => {
@@ -557,7 +581,10 @@ pub async fn download(app: &AppHandle, engine: Engine) -> Result<()> {
     let exit = child.wait().await.map_err(|e| anyhow!("wait: {e}"))?;
     if !exit.success() {
         let stderr_text = stderr_handle.await.unwrap_or_default();
-        return Err(anyhow!("download failed: {stderr_text}"));
+        eprintln!("speaker-diarize download --engine {} failed:\n{stderr_text}", engine.arg());
+        let reason =
+            sidecar_error(&stderr_text).unwrap_or_else(|| format!("speaker-diarize exit {exit}"));
+        return Err(anyhow!("{}", step.failure(&reason)));
     }
     Ok(())
 }
@@ -726,6 +753,56 @@ mod tests {
     #[test]
     fn payload_errors_when_no_array_present() {
         assert!(parse_segment_payload("humla-error: something went wrong\n").is_err());
+    }
+
+    #[test]
+    fn sidecar_error_is_the_tagged_line_not_fluidaudios_logging() {
+        let stderr = "[Profiling] load 0.8 s\n\
+            download error: Error Domain=com.apple.CoreML Code=1 \"Output backing …\"\n\
+            humla-error: Output backing for feature named 'speaker_preds' is not compatible\n\
+            [Profiling] teardown\n";
+        assert_eq!(
+            sidecar_error(stderr).as_deref(),
+            Some("Output backing for feature named 'speaker_preds' is not compatible")
+        );
+    }
+
+    #[test]
+    fn an_untagged_sidecar_failure_falls_back_to_its_last_line() {
+        assert_eq!(sidecar_error("first\nlast words  \n\n").as_deref(), Some("last words"));
+        assert_eq!(sidecar_error(" \n"), None);
+    }
+
+    #[test]
+    fn a_failure_before_the_warm_up_is_the_downloads() {
+        let step = ["listing", "downloading", "compiling", "downloading"]
+            .into_iter()
+            .fold(DownloadStep::Fetch, DownloadStep::after);
+        assert_eq!(step, DownloadStep::Fetch);
+        assert!(step
+            .failure("The Internet connection appears to be offline.")
+            .starts_with("The download didn’t finish: The Internet connection"));
+    }
+
+    #[test]
+    fn a_failure_once_the_warm_up_began_is_not_called_a_download_failure() {
+        // #203: the files were on disk and the Neural Engine warm-up's first
+        // prediction failed.
+        let step = ["downloading", "warming"]
+            .into_iter()
+            .fold(DownloadStep::Fetch, DownloadStep::after);
+        assert_eq!(step, DownloadStep::Prepare);
+        let message = step.failure(
+            "Output backing for feature named 'speaker_preds' is not compatible with the model's output feature description.",
+        );
+        assert!(!message.contains("download didn"), "{message}");
+        assert!(message.contains("preparing it for this Mac"), "{message}");
+        assert!(message.ends_with("output feature description."), "{message}");
+    }
+
+    #[test]
+    fn the_warm_up_is_never_undone_by_a_later_phase() {
+        assert_eq!(DownloadStep::Prepare.after("downloading"), DownloadStep::Prepare);
     }
 
     #[test]
