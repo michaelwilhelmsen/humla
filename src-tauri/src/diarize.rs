@@ -2,6 +2,7 @@ use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::LazyLock;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -190,13 +191,48 @@ impl Engine {
             Engine::Nemotron3 => Engine::Community1,
         }
     }
+
+    /// Mirrored by `DIARIZE_ENGINE_LABEL` in `src/lib/diarizeEngine.ts`.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Engine::Community1 => "Community-1",
+            Engine::Nemotron3 => "Nemotron 3",
+        }
+    }
+
+    /// Whether the engine is ready only once a warm-up inference has run on this
+    /// Mac, which the sidecar records in a marker beside the model.
+    fn has_warm_marker(self) -> bool {
+        self == Engine::Nemotron3
+    }
+
+    fn demoted_flag(self) -> &'static AtomicBool {
+        static COMMUNITY1_DEMOTED: AtomicBool = AtomicBool::new(false);
+        static NEMOTRON_DEMOTED: AtomicBool = AtomicBool::new(false);
+        match self {
+            Engine::Community1 => &COMMUNITY1_DEMOTED,
+            Engine::Nemotron3 => &NEMOTRON_DEMOTED,
+        }
+    }
+
+    /// Whether a run with this engine failed this launch where the other engine
+    /// then succeeded on the same audio.
+    fn is_demoted(self) -> bool {
+        self.demoted_flag().load(Ordering::Relaxed)
+    }
+
+    /// Settings prepared the engine again.
+    pub(crate) fn clear_demotion(self) {
+        self.demoted_flag().store(false, Ordering::Relaxed);
+    }
 }
 
 /// The engines a note may be diarized with, best first: a count above what
 /// Nemotron 3 can represent prefers community-1, anything else the selected
-/// engine, and the other engine follows as the fallback for a missing model,
-/// since labels from either beat none. Mirrored by `enginesToDownload` in
-/// `src/lib/diarizeEngine.ts`, which fetches what this falls back to.
+/// engine, and the other engine follows as the fallback for a missing model or
+/// a failed run, since labels from either beat none. Mirrored by
+/// `enginesToDownload` in `src/lib/diarizeEngine.ts`, which fetches what this
+/// falls back to.
 pub fn engine_preference(selected: Engine, expected_speakers: Option<i64>) -> Vec<Engine> {
     let preferred = if expected_speakers.is_some_and(|n| n > NEMOTRON_MAX_SPEAKERS) {
         Engine::Community1
@@ -213,27 +249,136 @@ pub struct EngineChoice {
     pub downloaded: bool,
 }
 
-/// The first engine in [`engine_preference`] whose model is downloaded. When
-/// none is, the note's preferred engine with `downloaded: false`.
+/// What `choose_engine` knows about one engine.
+#[derive(Clone, Copy, Debug)]
+struct Candidate {
+    engine: Engine,
+    downloaded: bool,
+    demoted: bool,
+}
+
+/// The first downloaded engine in preference order that hasn't been demoted,
+/// then a demoted one that is still on disk, since trying it beats writing no
+/// labels. When none is downloaded, the preferred engine with
+/// `downloaded: false`.
+fn pick_engine(candidates: &[Candidate]) -> EngineChoice {
+    let usable = candidates
+        .iter()
+        .find(|c| c.downloaded && !c.demoted)
+        .or_else(|| candidates.iter().find(|c| c.downloaded));
+    match usable {
+        Some(c) => EngineChoice { engine: c.engine, downloaded: true },
+        None => EngineChoice { engine: candidates[0].engine, downloaded: false },
+    }
+}
+
+/// The engine a note is diarized with, over [`engine_preference`]: see
+/// [`pick_engine`].
 pub async fn choose_engine(
     app: &AppHandle,
     selected: Engine,
     expected_speakers: Option<i64>,
 ) -> EngineChoice {
-    let preference = engine_preference(selected, expected_speakers);
-    for &engine in &preference {
-        if matches!(status(app, engine).await, Ok(s) if s.downloaded) {
-            if engine != preference[0] {
-                eprintln!(
-                    "diarize: {} model not downloaded, using {}",
-                    preference[0].arg(),
-                    engine.arg()
-                );
-            }
-            return EngineChoice { engine, downloaded: true };
+    let mut candidates = Vec::new();
+    for engine in engine_preference(selected, expected_speakers) {
+        candidates.push(candidate(app, engine).await);
+    }
+    let choice = pick_engine(&candidates);
+    if choice.downloaded && choice.engine != candidates[0].engine {
+        let why = if candidates[0].downloaded { "demoted" } else { "not downloaded" };
+        eprintln!(
+            "diarize: {} {why}, using {}",
+            candidates[0].engine.arg(),
+            choice.engine.arg()
+        );
+    }
+    choice
+}
+
+async fn candidate(app: &AppHandle, engine: Engine) -> Candidate {
+    Candidate {
+        engine,
+        downloaded: matches!(status(app, engine).await, Ok(s) if s.downloaded),
+        demoted: engine.is_demoted(),
+    }
+}
+
+/// A failed run is retried with the other engine when it is downloaded and
+/// hasn't been demoted itself.
+fn retry_candidate(other: Candidate) -> Option<Engine> {
+    (other.downloaded && !other.demoted).then_some(other.engine)
+}
+
+pub async fn retry_engine(app: &AppHandle, failed: Engine) -> Option<Engine> {
+    retry_candidate(candidate(app, failed.other()).await)
+}
+
+/// Skipped by `choose_engine` for the rest of the launch. Only for an engine
+/// that failed where the other one then succeeded on the same audio, which
+/// makes the failure the engine's rather than the audio's.
+pub fn demote(engine: Engine) {
+    engine.demoted_flag().store(true, Ordering::Relaxed);
+}
+
+/// Runs a demoted Nemotron 3's warm-up inference again. When preparing it
+/// fails, its warm marker goes, so after a restart it waits for Settings to
+/// prepare it instead of failing on the first note again. Community-1 has no
+/// warm-up to re-run.
+pub async fn recheck(app: &AppHandle, engine: Engine) -> Result<()> {
+    if !engine.has_warm_marker() {
+        return Ok(());
+    }
+    let _turn = DOWNLOAD_TURN.lock().await;
+    let mut step = DownloadStep::Fetch;
+    let outcome = run_download(app, engine, &mut step).await;
+    if outcome.is_err() && step == DownloadStep::Prepare {
+        if let Some(models) = fluidaudio_models_root(app) {
+            withdraw_warm_markers(&models.join(NEMOTRON_MODELS_DIR));
         }
     }
-    EngineChoice { engine: preference[0], downloaded: false }
+    outcome.map_err(|e| anyhow!("{}", step.failure(&e.to_string())))
+}
+
+/// The toast for a run that fell back from `failed` to `used`.
+pub fn fell_back_message(failed: Engine, used: Engine, reason: &str) -> String {
+    let recheck = if failed.has_warm_marker() {
+        format!(" Humla is checking {} again in the background.", failed.label())
+    } else {
+        String::new()
+    };
+    format!(
+        "{} failed on this Mac ({reason}), so speakers were identified with {} instead, and will be until Humla restarts.{recheck}",
+        failed.label(),
+        used.label()
+    )
+}
+
+/// The toast for a re-check that failed too.
+pub fn recheck_failed_message(engine: Engine, reason: &str) -> String {
+    format!(
+        "{} can't run on this Mac right now ({reason}). Speakers are identified with {} until you prepare it again in Settings → Transcription → Speaker labels.",
+        engine.label(),
+        engine.other().label()
+    )
+}
+
+/// FluidAudio's folder for Nemotron 3 under its `Models` root.
+const NEMOTRON_MODELS_DIR: &str = "nemotron-3-diarization";
+
+/// The sidecar names its warm marker for the process that warmed it, so every
+/// identity's marker goes: the failure is this Mac's, not one build's.
+const WARM_MARKER_PREFIX: &str = ".humla-warm-";
+
+fn withdraw_warm_markers(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        if entry.file_name().to_string_lossy().starts_with(WARM_MARKER_PREFIX) {
+            match std::fs::remove_file(entry.path()) {
+                Ok(()) => eprintln!("diarize: withdrew {}", entry.path().display()),
+                Err(e) => eprintln!("diarize: withdraw {} failed: {e}", entry.path().display()),
+            }
+        }
+    }
 }
 
 pub async fn diarize_file(
@@ -427,7 +572,8 @@ pub fn remove_retired_models(app: &AppHandle, conn: &rusqlite::Connection) {
 
 /// Nemotron 3's bundle from before FluidAudio re-exported it into
 /// `monolithic/v2`. Nothing loads it now.
-const OLD_NEMOTRON_BUNDLE: &str = "nemotron-3-diarization/monolithic/Nemotron3Diarizer_fast128.mlmodelc";
+/// Under [`NEMOTRON_MODELS_DIR`].
+const OLD_NEMOTRON_BUNDLE: &str = "monolithic/Nemotron3Diarizer_fast128.mlmodelc";
 
 #[derive(Debug, PartialEq, Eq)]
 enum OldBundle {
@@ -452,7 +598,7 @@ fn old_bundle_plan(present: bool, selected: Engine) -> OldBundle {
 /// that succeeds, so a failed attempt is made again at the next launch.
 pub fn replace_old_nemotron_bundle(app: &AppHandle, selected: Engine) {
     let Some(models) = fluidaudio_models_root(app) else { return };
-    let old = models.join(OLD_NEMOTRON_BUNDLE);
+    let old = models.join(NEMOTRON_MODELS_DIR).join(OLD_NEMOTRON_BUNDLE);
     match old_bundle_plan(old.exists(), selected) {
         OldBundle::Absent => {}
         OldBundle::Remove => remove_old_bundle(&old),
@@ -596,14 +742,15 @@ impl DownloadStep {
 /// compiles for the Neural Engine before it reports done. Every failure's
 /// message names which of the two steps failed.
 pub async fn download(app: &AppHandle, engine: Engine) -> Result<()> {
-    // Two sidecars fetching one model would write the same files.
-    static ONE_AT_A_TIME: LazyLock<tokio::sync::Mutex<()>> =
-        LazyLock::new(|| tokio::sync::Mutex::new(()));
-    let _turn = ONE_AT_A_TIME.lock().await;
+    let _turn = DOWNLOAD_TURN.lock().await;
     let mut step = DownloadStep::Fetch;
     let outcome = run_download(app, engine, &mut step).await;
     outcome.map_err(|e| anyhow!("{}", step.failure(&e.to_string())))
 }
+
+/// Two sidecars fetching one model would write the same files.
+static DOWNLOAD_TURN: LazyLock<tokio::sync::Mutex<()>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 async fn run_download(app: &AppHandle, engine: Engine, step: &mut DownloadStep) -> Result<()> {
     let sidecar = sidecar_path(app)?;
@@ -995,6 +1142,133 @@ mod tests {
             engine_preference(Engine::Community1, Some(12)),
             vec![Engine::Community1, Engine::Nemotron3]
         );
+    }
+
+    fn candidate(engine: Engine, downloaded: bool, demoted: bool) -> Candidate {
+        Candidate { engine, downloaded, demoted }
+    }
+
+    #[test]
+    fn a_note_is_diarized_with_its_preferred_engine_while_it_is_usable() {
+        let choice = pick_engine(&[
+            candidate(Engine::Nemotron3, true, false),
+            candidate(Engine::Community1, true, false),
+        ]);
+        assert_eq!(choice, EngineChoice { engine: Engine::Nemotron3, downloaded: true });
+    }
+
+    #[test]
+    fn a_demoted_engine_gives_way_to_the_other_one_though_it_is_downloaded() {
+        let choice = pick_engine(&[
+            candidate(Engine::Nemotron3, true, true),
+            candidate(Engine::Community1, true, false),
+        ]);
+        assert_eq!(choice, EngineChoice { engine: Engine::Community1, downloaded: true });
+    }
+
+    #[test]
+    fn a_missing_model_still_falls_back_to_the_other_engine() {
+        let choice = pick_engine(&[
+            candidate(Engine::Nemotron3, false, false),
+            candidate(Engine::Community1, true, false),
+        ]);
+        assert_eq!(choice, EngineChoice { engine: Engine::Community1, downloaded: true });
+    }
+
+    #[test]
+    fn a_demoted_engine_is_still_tried_when_it_is_the_only_one_on_disk() {
+        let choice = pick_engine(&[
+            candidate(Engine::Community1, true, true),
+            candidate(Engine::Nemotron3, false, false),
+        ]);
+        assert_eq!(choice, EngineChoice { engine: Engine::Community1, downloaded: true });
+    }
+
+    #[test]
+    fn with_no_model_on_disk_the_choice_is_the_preferred_engine_undownloaded() {
+        let choice = pick_engine(&[
+            candidate(Engine::Community1, false, false),
+            candidate(Engine::Nemotron3, false, true),
+        ]);
+        assert_eq!(choice, EngineChoice { engine: Engine::Community1, downloaded: false });
+    }
+
+    #[test]
+    fn a_failed_run_is_retried_with_the_other_engine_only_when_it_is_usable() {
+        assert_eq!(
+            retry_candidate(candidate(Engine::Community1, true, false)),
+            Some(Engine::Community1)
+        );
+        assert_eq!(
+            retry_candidate(candidate(Engine::Nemotron3, true, false)),
+            Some(Engine::Nemotron3)
+        );
+        assert_eq!(retry_candidate(candidate(Engine::Community1, false, false)), None);
+        // Demoted earlier this launch: it already failed where the other worked.
+        assert_eq!(retry_candidate(candidate(Engine::Community1, true, true)), None);
+    }
+
+    #[test]
+    fn the_fallback_toast_says_how_long_the_other_engine_stands_in() {
+        assert_eq!(
+            fell_back_message(Engine::Nemotron3, Engine::Community1, "Output backing is not compatible"),
+            "Nemotron 3 failed on this Mac (Output backing is not compatible), so speakers were \
+             identified with Community-1 instead, and will be until Humla restarts. Humla is \
+             checking Nemotron 3 again in the background."
+        );
+        assert_eq!(
+            fell_back_message(Engine::Community1, Engine::Nemotron3, "boom"),
+            "Community-1 failed on this Mac (boom), so speakers were identified with Nemotron 3 \
+             instead, and will be until Humla restarts."
+        );
+    }
+
+    #[test]
+    fn a_failed_recheck_points_at_settings() {
+        assert_eq!(
+            recheck_failed_message(
+                Engine::Nemotron3,
+                "Preparing the model for this Mac failed: Output backing is not compatible"
+            ),
+            "Nemotron 3 can't run on this Mac right now (Preparing the model for this Mac \
+             failed: Output backing is not compatible). Speakers are identified with Community-1 \
+             until you prepare it again in Settings → Transcription → Speaker labels."
+        );
+    }
+
+    #[test]
+    fn engine_labels_match_the_settings_labels() {
+        let ts = include_str!("../../src/lib/diarizeEngine.ts");
+        for engine in [Engine::Community1, Engine::Nemotron3] {
+            assert!(
+                ts.contains(&format!("{}: \"{}\"", engine.arg(), engine.label())),
+                "{engine:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn withdrawing_readiness_removes_every_warm_marker_and_nothing_else() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path();
+        for marker in [".humla-warm-no.humla.app", ".humla-warm-speaker-diarize-aarch64-apple-darwin"] {
+            std::fs::write(dir.join(marker), "v2 monolithic/v2\n").unwrap();
+        }
+        std::fs::write(dir.join(".weights-version"), "2\n").unwrap();
+        std::fs::create_dir_all(dir.join("monolithic/v2")).unwrap();
+
+        withdraw_warm_markers(dir);
+
+        assert!(!dir.join(".humla-warm-no.humla.app").exists());
+        assert!(!dir.join(".humla-warm-speaker-diarize-aarch64-apple-darwin").exists());
+        assert!(dir.join(".weights-version").exists());
+        assert!(dir.join("monolithic/v2").exists());
+    }
+
+    #[test]
+    fn the_warm_marker_is_named_as_the_sidecar_names_it() {
+        let sidecar = include_str!("../../speaker-diarize/Sources/speaker-diarize/main.swift");
+        assert!(sidecar.contains(&format!("\"{WARM_MARKER_PREFIX}\\(identity)\"")));
     }
 
     #[test]
