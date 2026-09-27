@@ -41,19 +41,27 @@ export function DiarizeModelManager({
         <div className="flex gap-2">
           <Btn onClick={onDelete}>Delete model</Btn>
         </div>
-        {state.flash && (
-          <p
-            className="text-xs px-2 py-1 rounded bg-[var(--color-pill-hover)] inline-block break-all"
-            role="status"
-          >
-            {state.flash}
-          </p>
-        )}
-        {state.error && (
-          <p className="text-sm text-red-600 dark:text-red-400 break-all">
-            {state.error}
-          </p>
-        )}
+        <Messages state={state} />
+      </div>
+    );
+  }
+
+  // The files are here; only the Neural Engine warm-up is missing, which the
+  // app runs at launch unless it already failed on this macOS.
+  if (state.status?.needsWarmUp) {
+    const failed = state.status.warmUpError;
+    return (
+      <div className="flex flex-col gap-2">
+        <div className="text-sm">
+          {failed != null
+            ? `Couldn’t be prepared for this version of macOS${failed ? `: ${failed}` : "."}`
+            : "Downloaded, and being prepared for this version of macOS, which takes about two minutes."}
+        </div>
+        <div className="flex gap-2">
+          <Btn onClick={onDownload}>{failed != null ? "Try again" : "Prepare now"}</Btn>
+          <Btn onClick={onDelete}>Delete model</Btn>
+        </div>
+        <Messages state={state} />
       </div>
     );
   }
@@ -64,6 +72,14 @@ export function DiarizeModelManager({
       <div className="flex gap-2">
         <Btn onClick={onDownload}>Download model</Btn>
       </div>
+      <Messages state={state} />
+    </div>
+  );
+}
+
+function Messages({ state }: { state: DiarizeState }) {
+  return (
+    <>
       {state.flash && (
         <p
           className="text-xs px-2 py-1 rounded bg-[var(--color-pill-hover)] inline-block break-all"
@@ -77,6 +93,6 @@ export function DiarizeModelManager({
           {state.error}
         </p>
       )}
-    </div>
+    </>
   );
 }

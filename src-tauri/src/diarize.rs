@@ -447,18 +447,15 @@ fn old_bundle_plan(present: bool, selected: Engine) -> OldBundle {
     }
 }
 
-/// Readies Nemotron 3 in the background at launch, so neither a download nor a
-/// Neural Engine compile lands in a post-stop chain. An install that fetched the
-/// old bundle is moved onto the current one, and the old bundle removed only
-/// once that succeeds; otherwise model files warmed up under another macOS
-/// build or sidecar are warmed up again. A failed attempt is made again at the
-/// next launch, and until one succeeds `choose_engine` uses community-1.
+/// Readies Nemotron 3 in the background. The old bundle is removed only once
+/// the current one is ready, so a failed replace is retried at the next launch;
+/// until something succeeds, `choose_engine` uses community-1.
 pub fn prepare_nemotron_at_launch(app: &AppHandle, selected: Engine) {
     let Some(models) = fluidaudio_models_root(app) else { return };
     let old = models.join(OLD_NEMOTRON_BUNDLE);
-    let app = app.clone();
     match old_bundle_plan(old.exists(), selected) {
         OldBundle::Replace => {
+            let app = app.clone();
             tauri::async_runtime::spawn(async move {
                 match download(&app, Engine::Nemotron3).await {
                     Ok(()) => remove_old_bundle(&old),
@@ -466,19 +463,30 @@ pub fn prepare_nemotron_at_launch(app: &AppHandle, selected: Engine) {
                 }
             });
         }
-        plan => {
-            if plan == OldBundle::Remove {
-                remove_old_bundle(&old);
-            }
-            tauri::async_runtime::spawn(async move { rewarm_if_stale(&app).await });
+        OldBundle::Remove => {
+            remove_old_bundle(&old);
+            spawn_rewarm_if_stale(app);
         }
+        OldBundle::Absent => spawn_rewarm_if_stale(app),
     }
+}
+
+/// Whatever engine is selected, since Nemotron 3 is community-1's fallback.
+fn spawn_rewarm_if_stale(app: &AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move { rewarm_if_stale(&app).await });
+}
+
+/// A warm-up that already failed under this macOS build and sidecar is left for
+/// the user to retry, rather than recompiling on every launch.
+fn wants_rewarm(status: &ModelStatus) -> bool {
+    status.needs_warm_up && status.warm_up_error.is_none()
 }
 
 /// A `download` of files already on disk fetches nothing and runs the warm-up.
 async fn rewarm_if_stale(app: &AppHandle) {
     match status(app, Engine::Nemotron3).await {
-        Ok(s) if s.needs_warm_up => {
+        Ok(s) if wants_rewarm(&s) => {
             eprintln!("nemotron: warming up again for this macOS build and sidecar");
             if let Err(e) = download(app, Engine::Nemotron3).await {
                 eprintln!("nemotron: warm-up failed: {e}");
@@ -533,6 +541,9 @@ pub struct ModelStatus {
     /// sidecar. Nemotron 3 only.
     #[serde(default)]
     pub needs_warm_up: bool,
+    /// Why the last warm-up under this macOS build and sidecar failed.
+    #[serde(default)]
+    pub warm_up_error: Option<String>,
     pub size_bytes: Option<u64>,
     pub path: Option<String>,
 }
@@ -548,6 +559,7 @@ pub async fn status(app: &AppHandle, engine: Engine) -> Result<ModelStatus> {
             return Ok(ModelStatus {
                 downloaded: false,
                 needs_warm_up: false,
+                warm_up_error: None,
                 size_bytes: None,
                 path: None,
             });
@@ -626,6 +638,10 @@ pub async fn download(app: &AppHandle, engine: Engine) -> Result<()> {
     static ONE_AT_A_TIME: LazyLock<tokio::sync::Mutex<()>> =
         LazyLock::new(|| tokio::sync::Mutex::new(()));
     let _turn = ONE_AT_A_TIME.lock().await;
+    // A download queued behind another of the same model finds it ready.
+    if matches!(status(app, engine).await, Ok(s) if s.downloaded) {
+        return Ok(());
+    }
     let mut step = DownloadStep::Fetch;
     let outcome = run_download(app, engine, &mut step).await;
     outcome.map_err(|e| anyhow!("{}", step.failure(&e.to_string())))
@@ -951,18 +967,38 @@ mod tests {
         );
     }
 
+    fn parse_status(json: &str) -> ModelStatus {
+        serde_json::from_str(json).unwrap()
+    }
+
     #[test]
-    fn status_reads_the_sidecars_warm_up_flag_and_defaults_it_off() {
+    fn status_reads_the_sidecars_warm_up_fields_and_defaults_them_off() {
         let sidecar = include_str!("../../speaker-diarize/Sources/speaker-diarize/main.swift");
         assert!(sidecar.contains(r#""needsWarmUp": needsWarmUp"#));
-        let stale: ModelStatus = serde_json::from_str(
-            r#"{"downloaded":false,"needsWarmUp":true,"path":"/m","sizeBytes":1}"#,
-        )
-        .unwrap();
-        assert!(stale.needs_warm_up && !stale.downloaded);
-        let older: ModelStatus =
-            serde_json::from_str(r#"{"downloaded":true,"path":"/m","sizeBytes":1}"#).unwrap();
-        assert!(!older.needs_warm_up);
+        assert!(sidecar.contains(r#""warmUpError": warmUpError"#));
+        let failed = parse_status(
+            r#"{"downloaded":false,"needsWarmUp":true,"warmUpError":"no ANE","path":"/m","sizeBytes":1}"#,
+        );
+        assert!(failed.needs_warm_up && !failed.downloaded);
+        assert_eq!(failed.warm_up_error.as_deref(), Some("no ANE"));
+        let older = parse_status(r#"{"downloaded":true,"path":"/m","sizeBytes":1}"#);
+        assert!(!older.needs_warm_up && older.warm_up_error.is_none());
+    }
+
+    #[test]
+    fn a_stale_warm_up_reruns_at_launch_unless_it_already_failed_under_this_stamp() {
+        let stale = parse_status(
+            r#"{"downloaded":false,"needsWarmUp":true,"warmUpError":null,"path":"/m","sizeBytes":1}"#,
+        );
+        assert!(wants_rewarm(&stale));
+        let failed = parse_status(
+            r#"{"downloaded":false,"needsWarmUp":true,"warmUpError":"no ANE","path":"/m","sizeBytes":1}"#,
+        );
+        assert!(!wants_rewarm(&failed));
+        let ready = parse_status(r#"{"downloaded":true,"needsWarmUp":false,"path":"/m","sizeBytes":1}"#);
+        assert!(!wants_rewarm(&ready));
+        let missing = parse_status(r#"{"downloaded":false,"needsWarmUp":false,"path":null,"sizeBytes":null}"#);
+        assert!(!wants_rewarm(&missing));
     }
 
     #[test]

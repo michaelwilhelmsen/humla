@@ -145,24 +145,33 @@ func nemotronFilesPresent() -> Bool {
 /// sidecar reports the app's bundle id, a bare binary its own name. FluidAudio
 /// writes its weights marker before any load, so that one can't say this.
 func nemotronWarmMarker() -> URL {
-    let identity = Bundle.main.bundleIdentifier ?? ProcessInfo.processInfo.processName
-    return nemotronModelsDirectory().appendingPathComponent(".humla-warm-\(identity)")
+    nemotronModelsDirectory().appendingPathComponent(".humla-warm-\(markerIdentity)")
+}
+
+/// Written when a warm-up of files already on disk fails: the stamp it failed
+/// under, then the error. The app doesn't retry on its own under that stamp.
+func nemotronWarmFailureMarker() -> URL {
+    nemotronModelsDirectory().appendingPathComponent(".humla-warm-failed-\(markerIdentity)")
+}
+
+var markerIdentity: String {
+    Bundle.main.bundleIdentifier ?? ProcessInfo.processInfo.processName
 }
 
 /// The macOS build, which is what CoreML keys its Neural Engine compile on.
 func osBuild() -> String {
     var size = 0
-    guard sysctlbyname("kern.osversion", nil, &size, nil, 0) == 0, size > 0 else {
+    sysctlbyname("kern.osversion", nil, &size, nil, 0)
+    var buffer = [CChar](repeating: 0, count: max(size, 1))
+    guard size > 0, sysctlbyname("kern.osversion", &buffer, &size, nil, 0) == 0 else {
         return ProcessInfo.processInfo.operatingSystemVersionString
             .replacingOccurrences(of: " ", with: "_")
     }
-    var buffer = [CChar](repeating: 0, count: size)
-    guard sysctlbyname("kern.osversion", &buffer, &size, nil, 0) == 0 else { return "unknown" }
     return String(cString: buffer)
 }
 
-/// A hash of this binary, so any sidecar change counts as a new version,
-/// FluidAudio's included.
+/// A hash of this binary, signature included, so any sidecar change counts as a
+/// new version, FluidAudio's and a re-sign included.
 func sidecarVersion() -> String {
     let url = (Bundle.main.executableURL ?? URL(fileURLWithPath: CommandLine.arguments[0]))
         .resolvingSymlinksInPath()
@@ -170,10 +179,9 @@ func sidecarVersion() -> String {
     return SHA256.hash(data: data).prefix(8).map { String(format: "%02x", $0) }.joined()
 }
 
-/// What the warm marker records: the weights and bundle warmed (a FluidAudio
+/// What the warm marker records: the weights and the bundle warmed (a FluidAudio
 /// release can re-export a preset under the same weights), the macOS build and
-/// this sidecar. A change to any of them can mean a new compile or a model that
-/// no longer runs, which the warm-up should find rather than a meeting.
+/// this sidecar.
 func nemotronWarmStamp() -> String {
     [
         ModelNames.Nemotron3.weightsVersion,
@@ -183,21 +191,26 @@ func nemotronWarmStamp() -> String {
     ].joined(separator: " ")
 }
 
-/// Downloaded and compiled for the Neural Engine, so a diarize run neither
-/// fetches nor compiles after a recording stops.
-func nemotronIsReady() -> Bool {
-    nemotronFilesPresent() && readMarker(nemotronWarmMarker()) == nemotronWarmStamp()
+/// The error of a warm-up that failed under `stamp`.
+func nemotronWarmUpError(stamp: String) -> String? {
+    guard let text = readMarker(nemotronWarmFailureMarker()) else { return nil }
+    let lines = text.split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false)
+    guard lines.first.map(String.init) == stamp else { return nil }
+    return lines.count > 1 ? String(lines[1]) : ""
 }
 
 // MARK: - Status
 
 /// `needsWarmUp`: the files are on disk but not prepared for this macOS and
 /// sidecar, which a `download` fixes without fetching anything.
-func writeStatus(downloaded: Bool, needsWarmUp: Bool = false, dir: URL) {
+func writeStatus(
+    downloaded: Bool, needsWarmUp: Bool = false, warmUpError: String? = nil, dir: URL
+) {
     guard FileManager.default.fileExists(atPath: dir.path) else {
         writeStdout([
             "downloaded": false,
             "needsWarmUp": false,
+            "warmUpError": NSNull(),
             "path": NSNull(),
             "sizeBytes": NSNull(),
         ] as [String: Any])
@@ -206,6 +219,7 @@ func writeStatus(downloaded: Bool, needsWarmUp: Bool = false, dir: URL) {
     writeStdout([
         "downloaded": downloaded,
         "needsWarmUp": needsWarmUp,
+        "warmUpError": warmUpError ?? NSNull(),
         "path": dir.path,
         "sizeBytes": directorySize(dir),
     ] as [String: Any])
@@ -223,10 +237,16 @@ func runStatus() {
     case .community1:
         writeStatus(downloaded: community1FilesPresent(), dir: community1ModelsDirectory())
     case .nemotron3:
-        let ready = nemotronIsReady()
+        // Downloaded counts only once compiled for the Neural Engine, so a
+        // diarize run neither fetches nor compiles after a recording stops.
+        let stamp = nemotronWarmStamp()
+        let filesPresent = nemotronFilesPresent()
+        let ready = filesPresent && readMarker(nemotronWarmMarker()) == stamp
+        let needsWarmUp = filesPresent && !ready
         writeStatus(
             downloaded: ready,
-            needsWarmUp: !ready && nemotronFilesPresent(),
+            needsWarmUp: needsWarmUp,
+            warmUpError: needsWarmUp ? nemotronWarmUpError(stamp: stamp) : nil,
             dir: nemotronModelsDirectory()
         )
     }
@@ -298,10 +318,18 @@ func runDownloadNemotron() async -> Int32 {
             .processComplete([Float](repeating: 0, count: 16_000))
         try Data((nemotronWarmStamp() + "\n").utf8)
             .write(to: nemotronWarmMarker(), options: .atomic)
+        try? FileManager.default.removeItem(at: nemotronWarmFailureMarker())
         writeStdout(["event": "done"])
         return 0
     } catch {
-        writeDownloadFailure(error, filesOnDisk: nemotronFilesPresent())
+        let filesOnDisk = nemotronFilesPresent()
+        if filesOnDisk {
+            let message = error.localizedDescription
+                .split(whereSeparator: \.isNewline).joined(separator: " ")
+            try? Data("\(nemotronWarmStamp())\n\(message)\n".utf8)
+                .write(to: nemotronWarmFailureMarker(), options: .atomic)
+        }
+        writeDownloadFailure(error, filesOnDisk: filesOnDisk)
         return 1
     }
 }

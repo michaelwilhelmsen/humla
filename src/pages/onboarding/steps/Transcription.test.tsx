@@ -766,7 +766,7 @@ describe("onboarding TranscriptionStep — skip semantics", () => {
   it("skips the diarize downloads when the models are already present", async () => {
     const diarizeDownloads: unknown[] = [];
     const { ctx: c } = renderStep({
-      diarize_status: () => ({ downloaded: true, sizeBytes: 30_000_000, path: "/x" }),
+      diarize_status: () => ({ downloaded: true, needsWarmUp: false, warmUpError: null, sizeBytes: 30_000_000, path: "/x" }),
       diarize_download: (args) => {
         diarizeDownloads.push(args);
         return null;

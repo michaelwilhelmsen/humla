@@ -604,7 +604,13 @@ describe("settings dialog", () => {
         },
         diarize_status: (args) => {
           const downloaded = opts.downloaded.includes((args as { engine: string }).engine);
-          return { downloaded, sizeBytes: downloaded ? 1 : null, path: downloaded ? "/m" : null };
+          return {
+            downloaded,
+            needsWarmUp: false,
+            warmUpError: null,
+            sizeBytes: downloaded ? 1 : null,
+            path: downloaded ? "/m" : null,
+          };
         },
       });
       return writes;
@@ -622,11 +628,11 @@ describe("settings dialog", () => {
       expect(within(dialog).getByText(/193 MB/)).toBeInTheDocument();
     });
 
-    it("selects Nemotron 3 on a fresh install and says what labels until it's downloaded", async () => {
+    it("selects Nemotron 3 on a fresh install and says what labels until it's ready", async () => {
       renderEngines({ stored: null, downloaded: ["community1"] });
       const dialog = await screen.findByRole("dialog", { name: /settings/i });
       expect(
-        await within(dialog).findByText(/until it’s downloaded, recordings are labelled with community-1/i),
+        await within(dialog).findByText(/until it’s ready, recordings are labelled with community-1/i),
       ).toBeInTheDocument();
       expect(within(dialog).getByRole("radio", { name: /nemotron 3/i })).toBeChecked();
     });

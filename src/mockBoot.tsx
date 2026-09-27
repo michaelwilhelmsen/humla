@@ -128,7 +128,7 @@ function resumeCase(
         },
       ],
       system_arch: () => "aarch64",
-      diarize_status: () => ({ downloaded: true, sizeBytes: 30_000_000, path: "/x" }),
+      diarize_status: () => ({ downloaded: true, needsWarmUp: false, warmUpError: null, sizeBytes: 30_000_000, path: "/x" }),
     },
   };
 }
@@ -563,7 +563,7 @@ function transcriptionKeysCase(def: ProviderConfig): Scenario {
         (args as { provider: string }).provider === def.provider ? "stored" : null,
       provider_key_test: () => ({ ok: true, status: 200, error: null }),
       local_whisper_models: () => [],
-      diarize_status: () => ({ downloaded: false, sizeBytes: 0, path: "" }),
+      diarize_status: () => ({ downloaded: false, needsWarmUp: false, warmUpError: null, sizeBytes: 0, path: "" }),
     },
   };
 }
@@ -577,7 +577,13 @@ function TranscriptionKeysHarness() {
 // switch an upgraded install to Nemotron 3.
 const ENGINE_SIZE: Record<DiarizeEngine, number> = { nemotron3: 193_000_000, community1: 21_776_918 };
 
-function speakerEnginesCase(stored: DiarizeEngine | null, downloaded: DiarizeEngine[]): Scenario {
+// `warmUpError`: Nemotron 3's files are on disk awaiting a warm-up, which failed
+// under this macOS when it is a string.
+function speakerEnginesCase(
+  stored: DiarizeEngine | null,
+  downloaded: DiarizeEngine[],
+  warmUpError?: string | null,
+): Scenario {
   return {
     wrap: settingsWrap,
     render: () => <TranscriptionKeysHarness />,
@@ -589,10 +595,14 @@ function speakerEnginesCase(stored: DiarizeEngine | null, downloaded: DiarizeEng
       diarize_status: (args) => {
         const engine = (args as { engine: DiarizeEngine }).engine;
         const on = downloaded.includes(engine);
+        const warming = engine === "nemotron3" && warmUpError !== undefined;
+        const present = on || warming;
         return {
           downloaded: on,
-          sizeBytes: on ? ENGINE_SIZE[engine] : null,
-          path: on ? `~/Library/Application Support/FluidAudio/Models/${engine}` : null,
+          needsWarmUp: warming,
+          warmUpError: warming ? warmUpError : null,
+          sizeBytes: present ? ENGINE_SIZE[engine] : null,
+          path: present ? `~/Library/Application Support/FluidAudio/Models/${engine}` : null,
         };
       },
     },
@@ -1134,6 +1144,12 @@ const CASES: Record<string, Scenario> = {
   "engines-fresh": speakerEnginesCase(null, ["community1"]),
   "engines-upgraded": speakerEnginesCase("community1", ["community1"]),
   "engines-both": speakerEnginesCase("nemotron3", ["nemotron3", "community1"]),
+  "engines-rewarm": speakerEnginesCase("nemotron3", ["community1"], null),
+  "engines-rewarm-failed": speakerEnginesCase(
+    "nemotron3",
+    ["community1"],
+    "Failed to build the model execution plan using a model architecture file",
+  ),
   "engines-warming": diarizeWarmingCase(),
   "offer-home": nemotronOfferCase(),
   "offer-downloading": nemotronOfferCase({ stage: "downloading", fraction: 0.42, phase: "downloading" }),
