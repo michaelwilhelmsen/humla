@@ -16,12 +16,13 @@ export const releases: Release[] = [
     title: "Nemotron 3 on macOS 27",
     summary: "The switch to Nemotron 3 now finishes on macOS 27 and on newer Macs.",
     paragraphs: [
-      "On macOS 27, and on some newer Macs, switching to Nemotron 3 stopped right at the end with an error about an “output backing”. The download itself had finished. What failed was the last step, where Humla runs the model once to get it ready, and that step works now. If the switch failed for you, try it again from the card on the home screen, or from Settings → Transcription → Speaker labels.",
-      "If you switched earlier and have since moved to macOS 27, new recordings get their speaker labels from Nemotron 3 again. And when setup does fail, the message now says which part went wrong, so a problem preparing the model no longer reads like a problem with your connection.",
+      "On macOS 27, and on some newer Macs, switching to Nemotron 3 stopped right at the end with an error about an “output backing”. The download itself had finished. What failed was the last step, where Humla runs the model once to get it ready. This version moves to an updated build of the model that gets through that step.",
+      "If you already use Nemotron 3, or a new install tried to set it up and couldn’t, Humla fetches the updated model in the background the first time you open this version: another 193 MB and a couple of minutes of setup, once. Until it’s ready, new recordings get their speaker labels from Community-1.",
+      "If the switch from the home screen failed for you, try it again from the card there. And when setup does fail, the message now says which part went wrong, so a problem preparing the model no longer reads like a problem with your connection.",
     ],
     highlights: [
       "The Nemotron 3 upgrade finishes on macOS 27 and on newer Macs.",
-      "Recordings on macOS 27 get their speaker labels from Nemotron 3.",
+      "Existing Nemotron 3 installs update the model once, in the background.",
       "A failed setup says whether the download or the preparation went wrong.",
     ],
     issues: [
