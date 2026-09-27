@@ -1653,7 +1653,7 @@ pub fn note_timeline_rename(
 // ---- Speaker diarization model management ---------------------------------
 
 /// The diarization engine selected in Settings.
-fn selected_diarize_engine(state: &State<AppState>) -> diarize::Engine {
+pub(crate) fn selected_diarize_engine(state: &State<AppState>) -> diarize::Engine {
     let conn = state.db.lock();
     let id = db::get_setting(&conn, "diarize_model")
         .ok()

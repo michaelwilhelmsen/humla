@@ -1138,7 +1138,12 @@ const CASES: Record<string, Scenario> = {
   "offer-home": nemotronOfferCase(),
   "offer-downloading": nemotronOfferCase({ stage: "downloading", fraction: 0.42, phase: "downloading" }),
   "offer-warming": nemotronOfferCase({ stage: "downloading", fraction: 0, phase: "warming" }),
-  "offer-failed": nemotronOfferCase({ stage: "offered", error: "download failed: The Internet connection appears to be offline." }),
+  "offer-failed": nemotronOfferCase({ stage: "offered", error: "The download didn’t finish: The Internet connection appears to be offline." }),
+  "offer-prepare-failed": nemotronOfferCase({
+    stage: "offered",
+    error:
+      "Preparing the model for this Mac failed: Output backing for feature named 'speaker_preds' is not compatible with the model's output feature description.",
+  }),
   "offer-done": nemotronOfferCase({ stage: "done" }),
 
   // --- #179: local chat on Ollama, on a plain OpenAI-compat server, and on one
