@@ -779,6 +779,14 @@ impl DownloadStep {
     }
 }
 
+/// The sidecar's JSON event on one stdout line. CoreML writes its own errors to
+/// stdout without a trailing newline, so an event can end a line of its text.
+fn download_event(line: &str) -> Option<serde_json::Value> {
+    let line = line.trim();
+    line.match_indices('{')
+        .find_map(|(i, _)| serde_json::from_str::<serde_json::Value>(&line[i..]).ok())
+}
+
 /// Trigger the model download via the sidecar, emitting Tauri events for
 /// each progress line so the UI can show a progress bar. Phases are FluidAudio's
 /// `listing` → `downloading` → `compiling`, then `warming` for an engine that
@@ -827,14 +835,7 @@ async fn run_download(app: &AppHandle, engine: Engine, step: &mut DownloadStep) 
 
     let mut reader = BufReader::new(stdout).lines();
     while let Ok(Some(line)) = reader.next_line().await {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let v: serde_json::Value = match serde_json::from_str(trimmed) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
+        let Some(v) = download_event(&line) else { continue };
         *step = step.after(&v);
         match v.get("event").and_then(|e| e.as_str()) {
             Some("progress") => {
@@ -1098,6 +1099,26 @@ mod tests {
             assert_eq!(step_after(&lines), expected, "{phases:?}");
         }
         assert_eq!(step_after(&[r#"{"event":"done"}"#]), DownloadStep::Fetch);
+    }
+
+    #[test]
+    fn an_event_behind_coreml_stdout_still_names_its_step() {
+        // A CPU load that fails prints no progress line first, and CoreML's own
+        // message on stdout has no trailing newline.
+        let stdout = "Error(s) occurred compiling MIL to BNNS graph:\n\
+             [CreateBnnsGraphProgramFromMIL]: BNNS failed to compile due to an exception: {weights}\n \
+             @ CreateBnnsGraphProgramFromMIL{\"event\":\"failed\",\"step\":\"prepare\"}\n";
+        let step = stdout
+            .lines()
+            .filter_map(download_event)
+            .fold(DownloadStep::Fetch, |step, v| step.after(&v));
+        assert_eq!(step, DownloadStep::Prepare);
+    }
+
+    #[test]
+    fn a_line_holding_no_event_is_skipped() {
+        assert_eq!(download_event("Error(s) occurred compiling MIL to BNNS graph:"), None);
+        assert_eq!(download_event("   "), None);
     }
 
     #[test]
