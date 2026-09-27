@@ -19,11 +19,14 @@ export const releases: Release[] = [
       "On macOS 27, and on some newer Macs, switching to Nemotron 3 stopped right at the end with an error about an “output backing”. The download itself had finished. What failed was the last step, where Humla runs the model once to get it ready. This version moves to an updated build of the model that gets through that step.",
       "If you already use Nemotron 3, or a new install tried to set it up and couldn’t, Humla fetches the updated model in the background the first time you open this version: another 193 MB and a couple of minutes of setup, once. Until it’s ready, new recordings get their speaker labels from Community-1.",
       "If the switch from the home screen failed for you, try it again from the card there. And when setup does fail, the message now says which part went wrong, so a problem preparing the model no longer reads like a problem with your connection.",
+      "It’s also harder to lose speaker labels now. If identifying speakers fails on one engine, Humla tries the other one straight away instead of leaving the transcript unlabelled. And after a macOS update, Humla gets Nemotron 3 ready again when it starts, so that setup never lands at the end of a meeting. If that fails, Settings says why and lets you try again.",
     ],
     highlights: [
       "The Nemotron 3 upgrade finishes on macOS 27 and on newer Macs.",
       "Existing Nemotron 3 installs update the model once, in the background.",
       "A failed setup says whether the download or the preparation went wrong.",
+      "If one speaker engine fails, the other takes over, so the labels aren’t lost.",
+      "After a macOS update, Nemotron 3 gets ready again at launch, not after a meeting.",
     ],
     issues: [
       { title: "Nemotron 3 upgrade fails with a CoreML output-backing error, reported as a download failure", reference: "#203", status: "Closed", url: "https://github.com/michaelwilhelmsen/humla/issues/203" },
