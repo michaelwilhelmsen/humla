@@ -232,7 +232,7 @@ export function TranscriptionTab({
             diarize.nemotron3.status?.downloaded === false &&
             diarize.community1.status?.downloaded && (
               <p className="text-xs text-[var(--color-text-muted)] mt-2">
-                Until it’s downloaded, recordings are labelled with Community-1.
+                Until it’s ready, recordings are labelled with Community-1.
               </p>
             )}
         </EngineOption>

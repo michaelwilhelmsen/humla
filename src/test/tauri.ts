@@ -77,7 +77,7 @@ export function mockTauri(
       case "local_llm_embed_probe":
         throw new Error("Couldn't reach http://localhost:11434/v1/embeddings");
       case "diarize_status":
-        return { downloaded: false, sizeBytes: 0, path: "" };
+        return { downloaded: false, needsWarmUp: false, warmUpError: null, sizeBytes: 0, path: "" };
       case "app_data_dir":
         return "/tmp/humla-test";
       case "system_arch":

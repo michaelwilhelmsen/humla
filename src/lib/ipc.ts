@@ -231,6 +231,11 @@ export type LocalWhisperDownloadError = {
 
 export type DiarizeModelStatus = {
   downloaded: boolean;
+  // Nemotron 3's files are on disk but not warmed up for this macOS build and
+  // sidecar.
+  needsWarmUp: boolean;
+  // Why the last warm-up under this macOS build and sidecar failed.
+  warmUpError: string | null;
   sizeBytes: number | null;
   path: string | null;
 };

@@ -53,6 +53,8 @@ describe("downloadDiarizeModels", () => {
         (args as { key: string }).key === "diarize_model" ? (opts.stored ?? null) : null,
       diarize_status: (args) => ({
         downloaded: (opts.downloaded ?? []).includes((args as { engine: DiarizeEngine }).engine),
+        needsWarmUp: false,
+        warmUpError: null,
         sizeBytes: null,
         path: null,
       }),

@@ -369,10 +369,15 @@ const NEMOTRON_MODELS_DIR: &str = "nemotron-3-diarization";
 /// identity's marker goes: the failure is this Mac's, not one build's.
 const WARM_MARKER_PREFIX: &str = ".humla-warm-";
 
+/// The sidecar's record of a failed warm-up. It stays, so after a restart the
+/// launch re-warm leaves the model for Settings rather than retrying it.
+const WARM_FAILED_MARKER_PREFIX: &str = ".humla-warm-failed-";
+
 fn withdraw_warm_markers(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
-        if entry.file_name().to_string_lossy().starts_with(WARM_MARKER_PREFIX) {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with(WARM_MARKER_PREFIX) && !name.starts_with(WARM_FAILED_MARKER_PREFIX) {
             match std::fs::remove_file(entry.path()) {
                 Ok(()) => eprintln!("diarize: withdrew {}", entry.path().display()),
                 Err(e) => eprintln!("diarize: withdraw {} failed: {e}", entry.path().display()),
@@ -593,15 +598,13 @@ fn old_bundle_plan(present: bool, selected: Engine) -> OldBundle {
     }
 }
 
-/// Moves an install that fetched Nemotron 3's old bundle onto the current one,
-/// fetched and prepared in the background. The old bundle is removed only once
-/// that succeeds, so a failed attempt is made again at the next launch.
-pub fn replace_old_nemotron_bundle(app: &AppHandle, selected: Engine) {
+/// Readies Nemotron 3 in the background. The old bundle is removed only once
+/// the current one is ready, so a failed replace is retried at the next launch;
+/// until something succeeds, `choose_engine` uses community-1.
+pub fn prepare_nemotron_at_launch(app: &AppHandle, selected: Engine) {
     let Some(models) = fluidaudio_models_root(app) else { return };
     let old = models.join(NEMOTRON_MODELS_DIR).join(OLD_NEMOTRON_BUNDLE);
     match old_bundle_plan(old.exists(), selected) {
-        OldBundle::Absent => {}
-        OldBundle::Remove => remove_old_bundle(&old),
         OldBundle::Replace => {
             let app = app.clone();
             tauri::async_runtime::spawn(async move {
@@ -611,6 +614,37 @@ pub fn replace_old_nemotron_bundle(app: &AppHandle, selected: Engine) {
                 }
             });
         }
+        OldBundle::Remove => {
+            remove_old_bundle(&old);
+            spawn_rewarm_if_stale(app);
+        }
+        OldBundle::Absent => spawn_rewarm_if_stale(app),
+    }
+}
+
+/// Whatever engine is selected, since Nemotron 3 is community-1's fallback.
+fn spawn_rewarm_if_stale(app: &AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move { rewarm_if_stale(&app).await });
+}
+
+/// A warm-up that already failed under this macOS build and sidecar is left for
+/// the user to retry, rather than recompiling on every launch.
+fn wants_rewarm(status: &ModelStatus) -> bool {
+    status.needs_warm_up && status.warm_up_error.is_none()
+}
+
+/// A `download` of files already on disk fetches nothing and runs the warm-up.
+async fn rewarm_if_stale(app: &AppHandle) {
+    match status(app, Engine::Nemotron3).await {
+        Ok(s) if wants_rewarm(&s) => {
+            eprintln!("nemotron: warming up again for this macOS build and sidecar");
+            if let Err(e) = download(app, Engine::Nemotron3).await {
+                eprintln!("nemotron: warm-up failed: {e}");
+            }
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("nemotron: status failed: {e}"),
     }
 }
 
@@ -654,6 +688,13 @@ fn remove_retired_model_dirs(models: &Path, conn: &rusqlite::Connection) {
 #[serde(rename_all = "camelCase")]
 pub struct ModelStatus {
     pub downloaded: bool,
+    /// The files are on disk but their warm-up predates this macOS build or
+    /// sidecar. Nemotron 3 only.
+    #[serde(default)]
+    pub needs_warm_up: bool,
+    /// Why the last warm-up under this macOS build and sidecar failed.
+    #[serde(default)]
+    pub warm_up_error: Option<String>,
     pub size_bytes: Option<u64>,
     pub path: Option<String>,
 }
@@ -668,6 +709,8 @@ pub async fn status(app: &AppHandle, engine: Engine) -> Result<ModelStatus> {
         Err(_) => {
             return Ok(ModelStatus {
                 downloaded: false,
+                needs_warm_up: false,
+                warm_up_error: None,
                 size_bytes: None,
                 path: None,
             });
@@ -743,6 +786,10 @@ impl DownloadStep {
 /// message names which of the two steps failed.
 pub async fn download(app: &AppHandle, engine: Engine) -> Result<()> {
     let _turn = DOWNLOAD_TURN.lock().await;
+    // A download queued behind another of the same model finds it ready.
+    if matches!(status(app, engine).await, Ok(s) if s.downloaded) {
+        return Ok(());
+    }
     let mut step = DownloadStep::Fetch;
     let outcome = run_download(app, engine, &mut step).await;
     outcome.map_err(|e| anyhow!("{}", step.failure(&e.to_string())))
@@ -1072,6 +1119,40 @@ mod tests {
         );
     }
 
+    fn parse_status(json: &str) -> ModelStatus {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn status_reads_the_sidecars_warm_up_fields_and_defaults_them_off() {
+        let sidecar = include_str!("../../speaker-diarize/Sources/speaker-diarize/main.swift");
+        assert!(sidecar.contains(r#""needsWarmUp": needsWarmUp"#));
+        assert!(sidecar.contains(r#""warmUpError": warmUpError"#));
+        let failed = parse_status(
+            r#"{"downloaded":false,"needsWarmUp":true,"warmUpError":"no ANE","path":"/m","sizeBytes":1}"#,
+        );
+        assert!(failed.needs_warm_up && !failed.downloaded);
+        assert_eq!(failed.warm_up_error.as_deref(), Some("no ANE"));
+        let older = parse_status(r#"{"downloaded":true,"path":"/m","sizeBytes":1}"#);
+        assert!(!older.needs_warm_up && older.warm_up_error.is_none());
+    }
+
+    #[test]
+    fn a_stale_warm_up_reruns_at_launch_unless_it_already_failed_under_this_stamp() {
+        let stale = parse_status(
+            r#"{"downloaded":false,"needsWarmUp":true,"warmUpError":null,"path":"/m","sizeBytes":1}"#,
+        );
+        assert!(wants_rewarm(&stale));
+        let failed = parse_status(
+            r#"{"downloaded":false,"needsWarmUp":true,"warmUpError":"no ANE","path":"/m","sizeBytes":1}"#,
+        );
+        assert!(!wants_rewarm(&failed));
+        let ready = parse_status(r#"{"downloaded":true,"needsWarmUp":false,"path":"/m","sizeBytes":1}"#);
+        assert!(!wants_rewarm(&ready));
+        let missing = parse_status(r#"{"downloaded":false,"needsWarmUp":false,"path":null,"sizeBytes":null}"#);
+        assert!(!wants_rewarm(&missing));
+    }
+
     #[test]
     fn a_download_failure_is_worded_by_its_step() {
         assert_eq!(
@@ -1254,6 +1335,7 @@ mod tests {
         for marker in [".humla-warm-no.humla.app", ".humla-warm-speaker-diarize-aarch64-apple-darwin"] {
             std::fs::write(dir.join(marker), "v2 monolithic/v2\n").unwrap();
         }
+        std::fs::write(dir.join(".humla-warm-failed-no.humla.app"), "v2 monolithic/v2\nno ANE\n").unwrap();
         std::fs::write(dir.join(".weights-version"), "2\n").unwrap();
         std::fs::create_dir_all(dir.join("monolithic/v2")).unwrap();
 
@@ -1261,6 +1343,7 @@ mod tests {
 
         assert!(!dir.join(".humla-warm-no.humla.app").exists());
         assert!(!dir.join(".humla-warm-speaker-diarize-aarch64-apple-darwin").exists());
+        assert!(dir.join(".humla-warm-failed-no.humla.app").exists());
         assert!(dir.join(".weights-version").exists());
         assert!(dir.join("monolithic/v2").exists());
     }
@@ -1268,7 +1351,8 @@ mod tests {
     #[test]
     fn the_warm_marker_is_named_as_the_sidecar_names_it() {
         let sidecar = include_str!("../../speaker-diarize/Sources/speaker-diarize/main.swift");
-        assert!(sidecar.contains(&format!("\"{WARM_MARKER_PREFIX}\\(identity)\"")));
+        assert!(sidecar.contains(&format!("\"{WARM_MARKER_PREFIX}\\(markerIdentity)\"")));
+        assert!(sidecar.contains(&format!("\"{WARM_FAILED_MARKER_PREFIX}\\(markerIdentity)\"")));
     }
 
     #[test]
