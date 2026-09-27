@@ -1705,18 +1705,11 @@ fn should_clean_diarize_segments(app: &AppHandle) -> bool {
         .unwrap_or(true)
 }
 
-/// Drop-in replacement for `diarize::diarize_file` at sites that feed
-/// segments into `split_by_segments`. Runs the diarize sidecar, then
-/// (when enabled) hands the segments through `diarize::clean_segments`
-/// to merge same-speaker fragments, drop contained-inside noise, and
-/// floor sub-150ms artifacts. Logs the pre/post counts so the user can
-/// see the reduction in the dev console.
-///
-/// `engine` is the pass's engine. A run that fails is retried with the other
-/// engine when that one is downloaded, and when the retry succeeds `engine`
-/// becomes it, so the rest of the pass — the take's other stream, the unify
-/// pass's other stream — stays on one engine. The failed one is demoted, which
-/// is what keeps a later pass on this note, and later notes, off it.
+/// Runs the diarize sidecar, then `diarize::clean_segments` over its output
+/// unless `diarize_clean_segments` is off. A failed run is retried with the
+/// other engine when that one is downloaded; `engine` is the pass's, and
+/// becomes the fallback once the retry succeeds, so the pass's remaining
+/// streams run on it too.
 async fn diarize_and_maybe_clean(
     app: &AppHandle,
     note_id: &str,
@@ -1735,13 +1728,20 @@ async fn diarize_and_maybe_clean(
             eprintln!("diarize: {} failed ({e}), retrying with {}", failed.arg(), other.arg());
             match diarize::diarize_file(app, audio_path, num_speakers, other, thresholds).await {
                 Ok(raw) => {
-                    diarize::demote(app, failed);
+                    diarize::demote(failed);
                     *engine = other;
                     emit_error(
                         app,
                         Some(note_id),
                         &diarize::fell_back_message(failed, other, &e.to_string()),
                     );
+                    let app = app.clone();
+                    tauri::async_runtime::spawn(async move {
+                        if let Err(e) = diarize::recheck(&app, failed).await {
+                            let message = diarize::recheck_failed_message(failed, &e.to_string());
+                            emit_error(&app, None, &message);
+                        }
+                    });
                     raw
                 }
                 Err(retry) => {
@@ -4216,7 +4216,6 @@ async fn transcribe_takes(
     // the one that was configured when the audio was captured. Check before
     // replaying an hour of it.
     ensure_provider_ready(app, &state, note_id).await?;
-    let settings = note_diarize_settings(app, note_id).await;
 
     // The run's shape, settled before a single chunk decodes: each take's
     // retained streams are replayed one after the other, so a take that kept
@@ -4326,6 +4325,8 @@ async fn transcribe_takes(
         // checkpoints and the asset push below still have to happen. Recorded
         // and broken out of rather than `?`-ed straight to the caller.
         let t_diarize = std::time::Instant::now();
+        // Chosen per take, so a take after one that demoted an engine skips it.
+        let settings = note_diarize_settings(app, note_id).await;
         let diarized = rediarize_apply_to_chunks(
             app.clone(),
             note_id.to_string(),

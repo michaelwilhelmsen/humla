@@ -33,7 +33,10 @@ pub async fn diarize_status(
 
 #[tauri::command]
 pub async fn diarize_download(app: AppHandle, engine: Option<String>) -> Result<(), String> {
-    diarize::download(&app, parse_engine(engine)?).await.map_err(err)
+    let engine = parse_engine(engine)?;
+    diarize::download(&app, engine).await.map_err(err)?;
+    engine.clear_demotion();
+    Ok(())
 }
 
 #[tauri::command]

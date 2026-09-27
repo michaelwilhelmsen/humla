@@ -207,17 +207,23 @@ impl Engine {
     }
 
     fn demoted_flag(self) -> &'static AtomicBool {
-        static DEMOTED: [AtomicBool; 2] = [AtomicBool::new(false), AtomicBool::new(false)];
-        &DEMOTED[match self {
-            Engine::Community1 => 0,
-            Engine::Nemotron3 => 1,
-        }]
+        static COMMUNITY1_DEMOTED: AtomicBool = AtomicBool::new(false);
+        static NEMOTRON_DEMOTED: AtomicBool = AtomicBool::new(false);
+        match self {
+            Engine::Community1 => &COMMUNITY1_DEMOTED,
+            Engine::Nemotron3 => &NEMOTRON_DEMOTED,
+        }
     }
 
     /// Whether a run with this engine failed this launch where the other engine
     /// then succeeded on the same audio.
     fn is_demoted(self) -> bool {
         self.demoted_flag().load(Ordering::Relaxed)
+    }
+
+    /// Settings prepared the engine again.
+    pub(crate) fn clear_demotion(self) {
+        self.demoted_flag().store(false, Ordering::Relaxed);
     }
 }
 
@@ -275,15 +281,11 @@ pub async fn choose_engine(
 ) -> EngineChoice {
     let mut candidates = Vec::new();
     for engine in engine_preference(selected, expected_speakers) {
-        candidates.push(Candidate {
-            engine,
-            downloaded: matches!(status(app, engine).await, Ok(s) if s.downloaded),
-            demoted: engine.is_demoted(),
-        });
+        candidates.push(candidate(app, engine).await);
     }
     let choice = pick_engine(&candidates);
     if choice.downloaded && choice.engine != candidates[0].engine {
-        let why = if candidates[0].downloaded { "set aside" } else { "not downloaded" };
+        let why = if candidates[0].downloaded { "demoted" } else { "not downloaded" };
         eprintln!(
             "diarize: {} {why}, using {}",
             candidates[0].engine.arg(),
@@ -293,47 +295,70 @@ pub async fn choose_engine(
     choice
 }
 
-/// The engine to retry a failed run with: the other one, when it is downloaded
-/// and hasn't been demoted itself.
-fn retry_candidate(failed: Engine, other_downloaded: bool, other_demoted: bool) -> Option<Engine> {
-    (other_downloaded && !other_demoted).then_some(failed.other())
+async fn candidate(app: &AppHandle, engine: Engine) -> Candidate {
+    Candidate {
+        engine,
+        downloaded: matches!(status(app, engine).await, Ok(s) if s.downloaded),
+        demoted: engine.is_demoted(),
+    }
+}
+
+/// A failed run is retried with the other engine when it is downloaded and
+/// hasn't been demoted itself.
+fn retry_candidate(other: Candidate) -> Option<Engine> {
+    (other.downloaded && !other.demoted).then_some(other.engine)
 }
 
 pub async fn retry_engine(app: &AppHandle, failed: Engine) -> Option<Engine> {
-    let other = failed.other();
-    let downloaded = matches!(status(app, other).await, Ok(s) if s.downloaded);
-    retry_candidate(failed, downloaded, other.is_demoted())
+    retry_candidate(candidate(app, failed.other()).await)
 }
 
-/// Sets aside an engine whose run failed where the other engine then
-/// succeeded on the same audio, so the failure is the engine's on this Mac
-/// rather than the audio's. `choose_engine` skips it for the rest of the
-/// launch, and Nemotron 3 loses its warm marker, so after a restart it is used
-/// again only once Settings has prepared it anew — which runs the warm-up
-/// inference that would have caught the failure.
-pub fn demote(app: &AppHandle, engine: Engine) {
+/// Skipped by `choose_engine` for the rest of the launch. Only for an engine
+/// that failed where the other one then succeeded on the same audio, which
+/// makes the failure the engine's rather than the audio's.
+pub fn demote(engine: Engine) {
     engine.demoted_flag().store(true, Ordering::Relaxed);
-    if engine.has_warm_marker() {
+}
+
+/// Runs a demoted Nemotron 3's warm-up inference again. When preparing it
+/// fails, its warm marker goes, so after a restart it waits for Settings to
+/// prepare it instead of failing on the first note again. Community-1 has no
+/// warm-up to re-run.
+pub async fn recheck(app: &AppHandle, engine: Engine) -> Result<()> {
+    if !engine.has_warm_marker() {
+        return Ok(());
+    }
+    let _turn = DOWNLOAD_TURN.lock().await;
+    let mut step = DownloadStep::Fetch;
+    let outcome = run_download(app, engine, &mut step).await;
+    if outcome.is_err() && step == DownloadStep::Prepare {
         if let Some(models) = fluidaudio_models_root(app) {
             withdraw_warm_markers(&models.join(NEMOTRON_MODELS_DIR));
         }
     }
+    outcome.map_err(|e| anyhow!("{}", step.failure(&e.to_string())))
 }
 
 /// The toast for a run that fell back from `failed` to `used`.
 pub fn fell_back_message(failed: Engine, used: Engine, reason: &str) -> String {
-    let until = if failed.has_warm_marker() {
-        format!(
-            "{} is set aside until you prepare it again in Settings → Transcription → Speaker labels.",
-            failed.label()
-        )
+    let recheck = if failed.has_warm_marker() {
+        format!(" Humla is checking {} again in the background.", failed.label())
     } else {
-        format!("{} is set aside until Humla restarts.", failed.label())
+        String::new()
     };
     format!(
-        "{} failed on this Mac ({reason}), so speakers were identified with {} instead. {until}",
+        "{} failed on this Mac ({reason}), so speakers were identified with {} instead, and will be until Humla restarts.{recheck}",
         failed.label(),
         used.label()
+    )
+}
+
+/// The toast for a re-check that failed too.
+pub fn recheck_failed_message(engine: Engine, reason: &str) -> String {
+    format!(
+        "{} can't run on this Mac right now ({reason}). Speakers are identified with {} until you prepare it again in Settings → Transcription → Speaker labels.",
+        engine.label(),
+        engine.other().label()
     )
 }
 
@@ -547,7 +572,8 @@ pub fn remove_retired_models(app: &AppHandle, conn: &rusqlite::Connection) {
 
 /// Nemotron 3's bundle from before FluidAudio re-exported it into
 /// `monolithic/v2`. Nothing loads it now.
-const OLD_NEMOTRON_BUNDLE: &str = "nemotron-3-diarization/monolithic/Nemotron3Diarizer_fast128.mlmodelc";
+/// Under [`NEMOTRON_MODELS_DIR`].
+const OLD_NEMOTRON_BUNDLE: &str = "monolithic/Nemotron3Diarizer_fast128.mlmodelc";
 
 #[derive(Debug, PartialEq, Eq)]
 enum OldBundle {
@@ -572,7 +598,7 @@ fn old_bundle_plan(present: bool, selected: Engine) -> OldBundle {
 /// that succeeds, so a failed attempt is made again at the next launch.
 pub fn replace_old_nemotron_bundle(app: &AppHandle, selected: Engine) {
     let Some(models) = fluidaudio_models_root(app) else { return };
-    let old = models.join(OLD_NEMOTRON_BUNDLE);
+    let old = models.join(NEMOTRON_MODELS_DIR).join(OLD_NEMOTRON_BUNDLE);
     match old_bundle_plan(old.exists(), selected) {
         OldBundle::Absent => {}
         OldBundle::Remove => remove_old_bundle(&old),
@@ -716,17 +742,15 @@ impl DownloadStep {
 /// compiles for the Neural Engine before it reports done. Every failure's
 /// message names which of the two steps failed.
 pub async fn download(app: &AppHandle, engine: Engine) -> Result<()> {
-    // Two sidecars fetching one model would write the same files.
-    static ONE_AT_A_TIME: LazyLock<tokio::sync::Mutex<()>> =
-        LazyLock::new(|| tokio::sync::Mutex::new(()));
-    let _turn = ONE_AT_A_TIME.lock().await;
+    let _turn = DOWNLOAD_TURN.lock().await;
     let mut step = DownloadStep::Fetch;
     let outcome = run_download(app, engine, &mut step).await;
-    if outcome.is_ok() {
-        engine.demoted_flag().store(false, Ordering::Relaxed);
-    }
     outcome.map_err(|e| anyhow!("{}", step.failure(&e.to_string())))
 }
+
+/// Two sidecars fetching one model would write the same files.
+static DOWNLOAD_TURN: LazyLock<tokio::sync::Mutex<()>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 async fn run_download(app: &AppHandle, engine: Engine, step: &mut DownloadStep) -> Result<()> {
     let sidecar = sidecar_path(app)?;
@@ -1171,25 +1195,44 @@ mod tests {
 
     #[test]
     fn a_failed_run_is_retried_with_the_other_engine_only_when_it_is_usable() {
-        assert_eq!(retry_candidate(Engine::Nemotron3, true, false), Some(Engine::Community1));
-        assert_eq!(retry_candidate(Engine::Community1, true, false), Some(Engine::Nemotron3));
-        assert_eq!(retry_candidate(Engine::Nemotron3, false, false), None);
-        // Demoted earlier this launch: it already failed where this one worked.
-        assert_eq!(retry_candidate(Engine::Nemotron3, true, true), None);
+        assert_eq!(
+            retry_candidate(candidate(Engine::Community1, true, false)),
+            Some(Engine::Community1)
+        );
+        assert_eq!(
+            retry_candidate(candidate(Engine::Nemotron3, true, false)),
+            Some(Engine::Nemotron3)
+        );
+        assert_eq!(retry_candidate(candidate(Engine::Community1, false, false)), None);
+        // Demoted earlier this launch: it already failed where the other worked.
+        assert_eq!(retry_candidate(candidate(Engine::Community1, true, true)), None);
     }
 
     #[test]
-    fn the_fallback_toast_says_how_long_the_failed_engine_is_set_aside() {
+    fn the_fallback_toast_says_how_long_the_other_engine_stands_in() {
         assert_eq!(
             fell_back_message(Engine::Nemotron3, Engine::Community1, "Output backing is not compatible"),
             "Nemotron 3 failed on this Mac (Output backing is not compatible), so speakers were \
-             identified with Community-1 instead. Nemotron 3 is set aside until you prepare it \
-             again in Settings → Transcription → Speaker labels."
+             identified with Community-1 instead, and will be until Humla restarts. Humla is \
+             checking Nemotron 3 again in the background."
         );
         assert_eq!(
             fell_back_message(Engine::Community1, Engine::Nemotron3, "boom"),
             "Community-1 failed on this Mac (boom), so speakers were identified with Nemotron 3 \
-             instead. Community-1 is set aside until Humla restarts."
+             instead, and will be until Humla restarts."
+        );
+    }
+
+    #[test]
+    fn a_failed_recheck_points_at_settings() {
+        assert_eq!(
+            recheck_failed_message(
+                Engine::Nemotron3,
+                "Preparing the model for this Mac failed: Output backing is not compatible"
+            ),
+            "Nemotron 3 can't run on this Mac right now (Preparing the model for this Mac \
+             failed: Output backing is not compatible). Speakers are identified with Community-1 \
+             until you prepare it again in Settings → Transcription → Speaker labels."
         );
     }
 
@@ -1226,7 +1269,6 @@ mod tests {
     fn the_warm_marker_is_named_as_the_sidecar_names_it() {
         let sidecar = include_str!("../../speaker-diarize/Sources/speaker-diarize/main.swift");
         assert!(sidecar.contains(&format!("\"{WARM_MARKER_PREFIX}\\(identity)\"")));
-        assert!(OLD_NEMOTRON_BUNDLE.starts_with(&format!("{NEMOTRON_MODELS_DIR}/")));
     }
 
     #[test]
