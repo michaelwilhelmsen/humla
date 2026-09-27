@@ -220,6 +220,11 @@ where
                     eprintln!("migrate_diarize_engine: {e}");
                 }
             }
+            {
+                let state: tauri::State<AppState> = app.state();
+                let selected = commands::selected_diarize_engine(&state);
+                diarize::replace_old_nemotron_bundle(app.handle(), selected);
+            }
             // One-shot migration of the legacy single-custom-prompt setting
             // into the summary_prompts table. Same flag-guarded shape as the
             // migration above.

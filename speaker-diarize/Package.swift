@@ -12,7 +12,7 @@ let package = Package(
         // No traits, since the sidecar has no use for its text-normalization engine.
         .package(
             url: "https://github.com/FluidInference/FluidAudio.git",
-            exact: "0.17.2",
+            exact: "0.17.4",
             traits: []
         ),
     ],

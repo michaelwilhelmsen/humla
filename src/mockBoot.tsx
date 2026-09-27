@@ -1139,11 +1139,10 @@ const CASES: Record<string, Scenario> = {
   "offer-downloading": nemotronOfferCase({ stage: "downloading", fraction: 0.42, phase: "downloading" }),
   "offer-warming": nemotronOfferCase({ stage: "downloading", fraction: 0, phase: "warming" }),
   "offer-failed": nemotronOfferCase({ stage: "offered", error: "The download didn’t finish: The Internet connection appears to be offline." }),
-  // #203: the files arrived and the Neural Engine warm-up failed.
   "offer-prepare-failed": nemotronOfferCase({
     stage: "offered",
     error:
-      "The model downloaded, but preparing it for this Mac failed: Output backing for feature named 'speaker_preds' is not compatible with the model's output feature description.",
+      "Preparing the model for this Mac failed: Output backing for feature named 'speaker_preds' is not compatible with the model's output feature description.",
   }),
   "offer-done": nemotronOfferCase({ stage: "done" }),
 

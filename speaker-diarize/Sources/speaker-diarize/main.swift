@@ -4,7 +4,8 @@ import FluidAudio
 import Foundation
 
 // Every command writes one JSON payload to stdout (download streams progress lines
-// before it) and exits 0, or exits 1 with a `humla-error:` line on stderr.
+// before it) and exits 0, or exits 1 with a `humla-error:` line on stderr. A failed
+// download also prints a `failed` line naming the step that failed.
 //
 //   speaker-diarize <wav-path> [--engine community1|nemotron3] [--num-speakers N] [--threshold T]
 //   speaker-diarize status|download|delete [--engine community1|nemotron3]
@@ -18,14 +19,21 @@ func writeStderr(_ msg: String) {
     FileHandle.standardError.write(Data("\(msg)\n".utf8))
 }
 
-/// Tagged so the Rust side can pick it out of FluidAudio's stderr logging.
-func writeError(_ error: Error) {
-    writeStderr("humla-error: \(error.localizedDescription)")
+/// Tagged so the Rust side can pick it out of FluidAudio's stderr logging, and
+/// kept to one line because that side reads stderr line by line.
+func writeError(_ message: String) {
+    writeStderr("humla-error: \(message.split(whereSeparator: \.isNewline).joined(separator: " "))")
 }
 
-/// A download also logs the full error, domain and code included, which the
-/// tagged line leaves out.
-func writeDownloadError(_ error: Error) {
+func writeError(_ error: Error) {
+    writeError(error.localizedDescription)
+}
+
+/// Whether the model's files reached the disk is what says which step failed:
+/// the download, or preparing what it fetched. The full error, domain and code
+/// included, goes to the log.
+func writeDownloadFailure(_ error: Error, filesOnDisk: Bool) {
+    writeStdout(["event": "failed", "step": filesOnDisk ? "prepare" : "download"])
     writeStderr("download error: \(error)")
     writeError(error)
 }
@@ -140,10 +148,15 @@ func nemotronWarmMarker() -> URL {
     return nemotronModelsDirectory().appendingPathComponent(".humla-warm-\(identity)")
 }
 
+/// What the warm marker records: the weights and the bundle warmed, since a
+/// FluidAudio release can move a preset to a re-exported bundle of the same
+/// weights, which has to be compiled again.
+let nemotronWarmStamp = "\(ModelNames.Nemotron3.weightsVersion) \(nemotronConfig.hubSubdirectory)"
+
 /// Downloaded and compiled for the Neural Engine, so a diarize run neither
 /// fetches nor compiles after a recording stops.
 func nemotronIsReady() -> Bool {
-    nemotronFilesPresent() && readMarker(nemotronWarmMarker()) == ModelNames.Nemotron3.weightsVersion
+    nemotronFilesPresent() && readMarker(nemotronWarmMarker()) == nemotronWarmStamp
 }
 
 // MARK: - Status
@@ -164,14 +177,17 @@ func writeStatus(downloaded: Bool, dir: URL) {
     ] as [String: Any])
 }
 
+func community1FilesPresent() -> Bool {
+    let dir = community1ModelsDirectory()
+    return ModelNames.OfflineDiarizer.requiredModels.allSatisfy {
+        FileManager.default.fileExists(atPath: dir.appendingPathComponent($0).path)
+    }
+}
+
 func runStatus() {
     switch engine {
     case .community1:
-        let dir = community1ModelsDirectory()
-        let allPresent = ModelNames.OfflineDiarizer.requiredModels.allSatisfy {
-            FileManager.default.fileExists(atPath: dir.appendingPathComponent($0).path)
-        }
-        writeStatus(downloaded: allPresent, dir: dir)
+        writeStatus(downloaded: community1FilesPresent(), dir: community1ModelsDirectory())
     case .nemotron3:
         writeStatus(downloaded: nemotronIsReady(), dir: nemotronModelsDirectory())
     }
@@ -217,7 +233,7 @@ func runDownloadCommunity1() async -> Int32 {
         writeStdout(["event": "done"])
         return 0
     } catch {
-        writeDownloadError(error)
+        writeDownloadFailure(error, filesOnDisk: community1FilesPresent())
         return 1
     }
 }
@@ -241,12 +257,12 @@ func runDownloadNemotron() async -> Int32 {
         )
         _ = try Nemotron3Diarizer(config: nemotronConfig, models: models)
             .processComplete([Float](repeating: 0, count: 16_000))
-        try Data((ModelNames.Nemotron3.weightsVersion + "\n").utf8)
+        try Data((nemotronWarmStamp + "\n").utf8)
             .write(to: nemotronWarmMarker(), options: .atomic)
         writeStdout(["event": "done"])
         return 0
     } catch {
-        writeDownloadError(error)
+        writeDownloadFailure(error, filesOnDisk: nemotronFilesPresent())
         return 1
     }
 }
@@ -302,7 +318,7 @@ func runDiarizeNemotron(audioPath: String) async -> Int32 {
     do {
         // Loading a missing model would download it here, after a recording stopped.
         guard nemotronFilesPresent() else {
-            writeStderr("humla-error: Nemotron 3 model not downloaded")
+            writeError("Nemotron 3 model not downloaded")
             return 1
         }
         let models = try await Nemotron3Models.loadFromHuggingFace(

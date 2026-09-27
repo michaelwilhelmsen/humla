@@ -52,7 +52,7 @@ function setup(opts: {
 // words, naming the step that failed.
 const OFFLINE = "The download didn’t finish: The Internet connection appears to be offline.";
 const PREPARE_FAILED =
-  "The model downloaded, but preparing it for this Mac failed: Output backing for feature named 'speaker_preds' is not compatible with the model's output feature description.";
+  "Preparing the model for this Mac failed: Output backing for feature named 'speaker_preds' is not compatible with the model's output feature description.";
 
 const offerText = () => screen.findByText(/193 MB/);
 const switchButton = () => screen.getByRole("button", { name: /upgrade speaker labels/i });
@@ -129,7 +129,7 @@ describe("NemotronOffer", () => {
 
     await userEvent.click(switchButton());
 
-    expect(await screen.findByRole("alert")).toHaveTextContent(OFFLINE);
+    expect((await screen.findByRole("alert")).textContent).toBe(OFFLINE);
     expect(writes.diarize_model).toBeUndefined();
     expect(writes.nemotron_offer).toBeUndefined();
     expect(switchButton()).toBeEnabled();
@@ -146,9 +146,7 @@ describe("NemotronOffer", () => {
 
     await userEvent.click(switchButton());
 
-    const alert = await screen.findByRole("alert");
-    expect(alert).toHaveTextContent(PREPARE_FAILED);
-    expect(alert).not.toHaveTextContent(/didn.t finish/);
+    expect((await screen.findByRole("alert")).textContent).toBe(PREPARE_FAILED);
   });
 
   it("still says why the last download failed when the card comes back", async () => {

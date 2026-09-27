@@ -2,6 +2,7 @@ use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::LazyLock;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
@@ -266,8 +267,7 @@ pub async fn diarize_file(
         .map_err(|e| anyhow!("spawn speaker-diarize: {e}"))?;
 
     if !output.status.success() {
-        let clean = sidecar_error(&String::from_utf8_lossy(&output.stderr))
-            .unwrap_or_else(|| format!("speaker-diarize exit {}", output.status));
+        let clean = sidecar_error(&String::from_utf8_lossy(&output.stderr), output.status);
         return Err(anyhow!("{clean}"));
     }
 
@@ -290,14 +290,27 @@ pub async fn diarize_file(
 
 /// The sidecar's own error line out of its stderr, which FluidAudio fills with
 /// logging, so the sidecar tags that line `humla-error:`. An untagged failure
-/// (a crash) falls back to the last line written.
-fn sidecar_error(stderr: &str) -> Option<String> {
-    stderr
+/// (a crash) gives its last line and how the process exited.
+fn sidecar_error(stderr: &str, exit: impl std::fmt::Display) -> String {
+    const TAG: &str = "humla-error:";
+    let tagged = stderr
         .lines()
-        .filter_map(|l| l.strip_prefix("humla-error: "))
-        .last()
-        .or_else(|| stderr.lines().rev().map(str::trim).find(|l| !l.is_empty()))
-        .map(str::to_string)
+        .filter_map(|l| l.strip_prefix(TAG))
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .last();
+    if let Some(message) = tagged {
+        return message.to_string();
+    }
+    let last = stderr
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && !l.starts_with(TAG));
+    match last {
+        Some(line) => format!("{line} (speaker-diarize {exit})"),
+        None => format!("speaker-diarize {exit}"),
+    }
 }
 
 /// Extract the segment array from the sidecar's stdout.
@@ -316,7 +329,7 @@ fn sidecar_error(stderr: &str) -> Option<String> {
 /// trusting the whole buffer. The payload is always a single line
 /// (JSONSerialization emits compact, newline-free JSON), so the real array
 /// never spans lines and stray log lines never parse as `Vec<Segment>`.
-/// Mirrors the stderr noise-filtering in `diarize_file`. Falls back to the
+/// Mirrors `sidecar_error`'s filtering of stderr. Falls back to the
 /// whole trimmed buffer so a genuinely malformed payload still surfaces
 /// serde's diagnostic to the caller.
 fn parse_segment_payload(stdout: &str) -> serde_json::Result<Vec<Segment>> {
@@ -389,21 +402,77 @@ const RETIRED_MODEL_DIRS: &[(&str, &[&str])] = &[
     ("sortformer_models_purged_v1", &["sortformer"]),
 ];
 
-/// Remove the retired model directories left in FluidAudio's shared model
-/// cache, a sibling of Humla's own app-data directory.
-pub fn remove_retired_models(app: &AppHandle, conn: &rusqlite::Connection) {
+/// FluidAudio's shared model cache, a sibling of Humla's own app-data directory.
+fn fluidaudio_models_root(app: &AppHandle) -> Option<PathBuf> {
     let app_data = match app.path().app_data_dir() {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("retired models: no app_data_dir: {e}");
-            return;
+            eprintln!("FluidAudio models: no app_data_dir: {e}");
+            return None;
         }
     };
     let Some(application_support) = app_data.parent() else {
-        eprintln!("retired models: app_data_dir has no parent");
-        return;
+        eprintln!("FluidAudio models: app_data_dir has no parent");
+        return None;
     };
-    remove_retired_model_dirs(&application_support.join("FluidAudio").join("Models"), conn);
+    Some(application_support.join("FluidAudio").join("Models"))
+}
+
+/// Remove the retired model directories left in FluidAudio's shared model cache.
+pub fn remove_retired_models(app: &AppHandle, conn: &rusqlite::Connection) {
+    if let Some(models) = fluidaudio_models_root(app) {
+        remove_retired_model_dirs(&models, conn);
+    }
+}
+
+/// Nemotron 3's bundle from before FluidAudio re-exported it into
+/// `monolithic/v2`. Nothing loads it now.
+const OLD_NEMOTRON_BUNDLE: &str = "nemotron-3-diarization/monolithic/Nemotron3Diarizer_fast128.mlmodelc";
+
+#[derive(Debug, PartialEq, Eq)]
+enum OldBundle {
+    Absent,
+    Remove,
+    Replace,
+}
+
+/// An install on Nemotron 3 diarizes with community-1 until the current bundle
+/// is ready, so it gets that bundle before the old one goes; any other install
+/// only loses the old one.
+fn old_bundle_plan(present: bool, selected: Engine) -> OldBundle {
+    match (present, selected) {
+        (false, _) => OldBundle::Absent,
+        (true, Engine::Nemotron3) => OldBundle::Replace,
+        (true, Engine::Community1) => OldBundle::Remove,
+    }
+}
+
+/// Moves an install that fetched Nemotron 3's old bundle onto the current one,
+/// fetched and prepared in the background. The old bundle is removed only once
+/// that succeeds, so a failed attempt is made again at the next launch.
+pub fn replace_old_nemotron_bundle(app: &AppHandle, selected: Engine) {
+    let Some(models) = fluidaudio_models_root(app) else { return };
+    let old = models.join(OLD_NEMOTRON_BUNDLE);
+    match old_bundle_plan(old.exists(), selected) {
+        OldBundle::Absent => {}
+        OldBundle::Remove => remove_old_bundle(&old),
+        OldBundle::Replace => {
+            let app = app.clone();
+            tauri::async_runtime::spawn(async move {
+                match download(&app, Engine::Nemotron3).await {
+                    Ok(()) => remove_old_bundle(&old),
+                    Err(e) => eprintln!("nemotron bundle: preparing the current one failed: {e}"),
+                }
+            });
+        }
+    }
+}
+
+fn remove_old_bundle(path: &Path) {
+    match std::fs::remove_dir_all(path) {
+        Ok(_) => eprintln!("nemotron bundle: removed {}", path.display()),
+        Err(e) => eprintln!("nemotron bundle: remove {} failed: {e}", path.display()),
+    }
 }
 
 /// Once per flag rather than every launch: the folders sit in a cache other
@@ -487,9 +556,8 @@ pub struct DownloadProgress {
     pub engine: String,
 }
 
-/// Which half of a model download a failure belongs to. The sidecar reports
-/// `warming` once the files are on disk, so from there a failure is the
-/// preparation's, never the network's.
+/// Which half of a model download a failure belongs to: fetching the files, or
+/// preparing them once they are on disk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DownloadStep {
     Fetch,
@@ -497,20 +565,27 @@ enum DownloadStep {
 }
 
 impl DownloadStep {
-    fn after(self, phase: &str) -> Self {
-        if phase == "warming" {
-            Self::Prepare
-        } else {
-            self
+    /// The step after one line of the sidecar's stdout. A failure the sidecar
+    /// catches names its own step; otherwise the last progress phase stands in,
+    /// which is all a crash leaves. FluidAudio compiles only once every file is
+    /// on disk, and starts over from `listing` when a compile fails.
+    fn after(self, line: &serde_json::Value) -> Self {
+        let field = |key: &str| line.get(key).and_then(serde_json::Value::as_str);
+        match field("event") {
+            Some("failed") if field("step") == Some("prepare") => Self::Prepare,
+            Some("failed") => Self::Fetch,
+            Some("progress") => match field("phase") {
+                Some("compiling" | "warming") => Self::Prepare,
+                _ => Self::Fetch,
+            },
+            _ => self,
         }
     }
 
     fn failure(self, reason: &str) -> String {
         match self {
             Self::Fetch => format!("The download didn’t finish: {reason}"),
-            Self::Prepare => {
-                format!("The model downloaded, but preparing it for this Mac failed: {reason}")
-            }
+            Self::Prepare => format!("Preparing the model for this Mac failed: {reason}"),
         }
     }
 }
@@ -518,9 +593,19 @@ impl DownloadStep {
 /// Trigger the model download via the sidecar, emitting Tauri events for
 /// each progress line so the UI can show a progress bar. Phases are FluidAudio's
 /// `listing` → `downloading` → `compiling`, then `warming` for an engine that
-/// compiles for the Neural Engine before it reports done. A failure's message
-/// names which of the two steps failed.
+/// compiles for the Neural Engine before it reports done. Every failure's
+/// message names which of the two steps failed.
 pub async fn download(app: &AppHandle, engine: Engine) -> Result<()> {
+    // Two sidecars fetching one model would write the same files.
+    static ONE_AT_A_TIME: LazyLock<tokio::sync::Mutex<()>> =
+        LazyLock::new(|| tokio::sync::Mutex::new(()));
+    let _turn = ONE_AT_A_TIME.lock().await;
+    let mut step = DownloadStep::Fetch;
+    let outcome = run_download(app, engine, &mut step).await;
+    outcome.map_err(|e| anyhow!("{}", step.failure(&e.to_string())))
+}
+
+async fn run_download(app: &AppHandle, engine: Engine, step: &mut DownloadStep) -> Result<()> {
     let sidecar = sidecar_path(app)?;
     let mut child = Command::new(&sidecar)
         .arg("download")
@@ -546,7 +631,6 @@ pub async fn download(app: &AppHandle, engine: Engine) -> Result<()> {
         buf
     });
 
-    let mut step = DownloadStep::Fetch;
     let mut reader = BufReader::new(stdout).lines();
     while let Ok(Some(line)) = reader.next_line().await {
         let trimmed = line.trim();
@@ -557,6 +641,7 @@ pub async fn download(app: &AppHandle, engine: Engine) -> Result<()> {
             Ok(v) => v,
             Err(_) => continue,
         };
+        *step = step.after(&v);
         match v.get("event").and_then(|e| e.as_str()) {
             Some("progress") => {
                 let progress = DownloadProgress {
@@ -568,7 +653,6 @@ pub async fn download(app: &AppHandle, engine: Engine) -> Result<()> {
                         .to_string(),
                     engine: engine.arg().to_string(),
                 };
-                step = step.after(&progress.phase);
                 let _ = app.emit("diarize_download_progress", progress);
             }
             Some("done") => {
@@ -582,9 +666,7 @@ pub async fn download(app: &AppHandle, engine: Engine) -> Result<()> {
     if !exit.success() {
         let stderr_text = stderr_handle.await.unwrap_or_default();
         eprintln!("speaker-diarize download --engine {} failed:\n{stderr_text}", engine.arg());
-        let reason =
-            sidecar_error(&stderr_text).unwrap_or_else(|| format!("speaker-diarize exit {exit}"));
-        return Err(anyhow!("{}", step.failure(&reason)));
+        return Err(anyhow!("{}", sidecar_error(&stderr_text, exit)));
     }
     Ok(())
 }
@@ -762,47 +844,99 @@ mod tests {
             humla-error: Output backing for feature named 'speaker_preds' is not compatible\n\
             [Profiling] teardown\n";
         assert_eq!(
-            sidecar_error(stderr).as_deref(),
-            Some("Output backing for feature named 'speaker_preds' is not compatible")
+            sidecar_error(stderr, "exit status: 1"),
+            "Output backing for feature named 'speaker_preds' is not compatible"
         );
     }
 
     #[test]
-    fn an_untagged_sidecar_failure_falls_back_to_its_last_line() {
-        assert_eq!(sidecar_error("first\nlast words  \n\n").as_deref(), Some("last words"));
-        assert_eq!(sidecar_error(" \n"), None);
-    }
-
-    #[test]
-    fn a_failure_before_the_warm_up_is_the_downloads() {
-        let step = ["listing", "downloading", "compiling", "downloading"]
-            .into_iter()
-            .fold(DownloadStep::Fetch, DownloadStep::after);
-        assert_eq!(step, DownloadStep::Fetch);
-        assert!(step
-            .failure("The Internet connection appears to be offline.")
-            .starts_with("The download didn’t finish: The Internet connection"));
-    }
-
-    #[test]
-    fn a_failure_once_the_warm_up_began_is_not_called_a_download_failure() {
-        // #203: the files were on disk and the Neural Engine warm-up's first
-        // prediction failed.
-        let step = ["downloading", "warming"]
-            .into_iter()
-            .fold(DownloadStep::Fetch, DownloadStep::after);
-        assert_eq!(step, DownloadStep::Prepare);
-        let message = step.failure(
-            "Output backing for feature named 'speaker_preds' is not compatible with the model's output feature description.",
+    fn an_untagged_failure_gives_its_last_line_and_how_the_sidecar_exited() {
+        assert_eq!(
+            sidecar_error("first\n[WARN] last words  \n\n", "signal: 11 (SIGSEGV)"),
+            "[WARN] last words (speaker-diarize signal: 11 (SIGSEGV))"
         );
-        assert!(!message.contains("download didn"), "{message}");
-        assert!(message.contains("preparing it for this Mac"), "{message}");
-        assert!(message.ends_with("output feature description."), "{message}");
+        assert_eq!(sidecar_error(" \n", "exit status: 1"), "speaker-diarize exit status: 1");
     }
 
     #[test]
-    fn the_warm_up_is_never_undone_by_a_later_phase() {
-        assert_eq!(DownloadStep::Prepare.after("downloading"), DownloadStep::Prepare);
+    fn an_empty_tagged_line_is_not_a_message() {
+        assert_eq!(
+            sidecar_error("loading\nhumla-error: \n", "exit status: 1"),
+            "loading (speaker-diarize exit status: 1)"
+        );
+    }
+
+    fn step_after(lines: &[&str]) -> DownloadStep {
+        lines.iter().fold(DownloadStep::Fetch, |step, line| {
+            step.after(&serde_json::from_str(line).unwrap())
+        })
+    }
+
+    fn progress(phase: &str) -> String {
+        format!(r#"{{"event":"progress","fraction":0.5,"phase":"{phase}"}}"#)
+    }
+
+    #[test]
+    fn a_failure_the_sidecar_catches_names_its_own_step() {
+        let warming = progress("warming");
+        let downloading = progress("downloading");
+        assert_eq!(
+            step_after(&[&downloading, r#"{"event":"failed","step":"prepare"}"#]),
+            DownloadStep::Prepare
+        );
+        assert_eq!(
+            step_after(&[&warming, r#"{"event":"failed","step":"download"}"#]),
+            DownloadStep::Fetch
+        );
+    }
+
+    #[test]
+    fn a_crash_is_placed_by_the_last_progress_phase() {
+        for (phases, expected) in [
+            (vec!["listing", "downloading"], DownloadStep::Fetch),
+            (vec!["downloading", "compiling"], DownloadStep::Prepare),
+            // A failed compile starts FluidAudio over from the download.
+            (vec!["compiling", "listing", "downloading"], DownloadStep::Fetch),
+            (vec!["downloading", "warming"], DownloadStep::Prepare),
+        ] {
+            let lines: Vec<String> = phases.iter().map(|p| progress(p)).collect();
+            let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+            assert_eq!(step_after(&lines), expected, "{phases:?}");
+        }
+        assert_eq!(step_after(&[r#"{"event":"done"}"#]), DownloadStep::Fetch);
+    }
+
+    #[test]
+    fn the_old_nemotron_bundle_is_replaced_only_for_an_install_on_nemotron() {
+        assert_eq!(old_bundle_plan(true, Engine::Nemotron3), OldBundle::Replace);
+        assert_eq!(old_bundle_plan(true, Engine::Community1), OldBundle::Remove);
+        assert_eq!(old_bundle_plan(false, Engine::Nemotron3), OldBundle::Absent);
+        assert_eq!(old_bundle_plan(false, Engine::Community1), OldBundle::Absent);
+    }
+
+    #[test]
+    fn the_old_nemotron_bundle_is_not_the_one_the_sidecar_loads() {
+        let sidecar = include_str!("../../speaker-diarize/Sources/speaker-diarize/main.swift");
+        assert!(sidecar.contains("Nemotron3Config.fast128"));
+        let package = include_str!("../../speaker-diarize/Package.swift");
+        assert!(
+            package.contains(r#"exact: "0.17.4""#),
+            "a FluidAudio bump must re-check which Nemotron bundle {OLD_NEMOTRON_BUNDLE} names"
+        );
+    }
+
+    #[test]
+    fn a_download_failure_is_worded_by_its_step() {
+        assert_eq!(
+            DownloadStep::Fetch.failure("The Internet connection appears to be offline."),
+            "The download didn’t finish: The Internet connection appears to be offline."
+        );
+        assert_eq!(
+            DownloadStep::Prepare.failure(
+                "Output backing for feature named 'speaker_preds' is not compatible with the model's output feature description."
+            ),
+            "Preparing the model for this Mac failed: Output backing for feature named 'speaker_preds' is not compatible with the model's output feature description."
+        );
     }
 
     #[test]
