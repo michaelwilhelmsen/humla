@@ -22,9 +22,9 @@ export function selectedDiarizeEngine(stored: string | null): DiarizeEngine {
 }
 
 /** Community-1 is always wanted: it diarizes any note set above eight speakers,
- *  and it is what a note falls back to while the selected model is missing
- *  (`engine_preference` in diarize.rs). It goes first because it is the small
- *  one. */
+ *  and it is what a note falls back to while the selected model is missing or
+ *  when a run with it fails (`engine_preference` / `retry_engine` in
+ *  diarize.rs). It goes first because it is the small one. */
 export function enginesToDownload(selected: DiarizeEngine): DiarizeEngine[] {
   return selected === "community1" ? ["community1"] : ["community1", selected];
 }
