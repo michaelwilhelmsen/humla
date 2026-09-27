@@ -535,7 +535,7 @@ async fn rediarize_apply_to_chunks(
     if model_missing {
         emit_error(&app, Some(&note_id), DIARIZE_MODEL_MISSING_UNLABELLED);
     }
-    let engine = choice.engine;
+    let mut engine = choice.engine;
 
     let stage: DiarizeStage = if model_missing {
         unlabelled_stage("model not downloaded")
@@ -548,7 +548,7 @@ async fn rediarize_apply_to_chunks(
                 None => Err("mic chunks present but no saved mic.wav".to_string()),
                 Some(wav) => {
                     diarize_steps.begin();
-                    match diarize_and_maybe_clean(&app, &wav, expected_speakers, engine, thresholds)
+                    match diarize_and_maybe_clean(&app, &note_id, &wav, expected_speakers, &mut engine, thresholds)
                         .await
                     {
                         Err(e) => Err(format!("mic diarize failed: {e}")),
@@ -596,7 +596,7 @@ async fn rediarize_apply_to_chunks(
                 None => Err("sys chunks present but no saved sys.wav".to_string()),
                 Some(wav) => {
                     diarize_steps.begin();
-                    match diarize_and_maybe_clean(&app, &wav, expected_speakers, engine, thresholds)
+                    match diarize_and_maybe_clean(&app, &note_id, &wav, expected_speakers, &mut engine, thresholds)
                         .await
                     {
                         Err(e) => Err(format!("sys diarize failed: {e}")),
@@ -655,7 +655,7 @@ async fn rediarize_apply_to_chunks(
             let sys_speaker_hint = hybrid_sys_hint(expected_speakers, &chunks);
             let sys_segments = if let Some(p) = sys_wav.as_ref() {
                 diarize_steps.begin();
-                diarize_and_maybe_clean(&app, p, sys_speaker_hint, engine, thresholds)
+                diarize_and_maybe_clean(&app, &note_id, p, sys_speaker_hint, &mut engine, thresholds)
                     .await
                     .unwrap_or_else(|e| {
                         eprintln!("rediarize: sys diarize failed ({e}), sys falls back to one label");
@@ -671,7 +671,7 @@ async fn rediarize_apply_to_chunks(
             );
             let mic_segments = if let Some(p) = mic_wav.as_ref() {
                 diarize_steps.begin();
-                diarize_and_maybe_clean(&app, echo.mic_input(p), mic_speaker_hint, engine, thresholds)
+                diarize_and_maybe_clean(&app, &note_id, echo.mic_input(p), mic_speaker_hint, &mut engine, thresholds)
                     .await
                     .unwrap_or_else(|e| {
                         eprintln!("rediarize: mic diarize failed ({e}), mic falls back to You");
@@ -1705,20 +1705,53 @@ fn should_clean_diarize_segments(app: &AppHandle) -> bool {
         .unwrap_or(true)
 }
 
-/// Drop-in replacement for `diarize::diarize_file` at sites that feed
-/// segments into `split_by_segments`. Runs the diarize sidecar, then
-/// (when enabled) hands the segments through `diarize::clean_segments`
-/// to merge same-speaker fragments, drop contained-inside noise, and
-/// floor sub-150ms artifacts. Logs the pre/post counts so the user can
-/// see the reduction in the dev console.
+/// Runs the diarize sidecar, then `diarize::clean_segments` over its output
+/// unless `diarize_clean_segments` is off. A failed run is retried with the
+/// other engine when that one is downloaded; `engine` is the pass's, and
+/// becomes the fallback once the retry succeeds, so the pass's remaining
+/// streams run on it too.
 async fn diarize_and_maybe_clean(
     app: &AppHandle,
+    note_id: &str,
     audio_path: &std::path::Path,
     num_speakers: Option<i64>,
-    engine: diarize::Engine,
+    engine: &mut diarize::Engine,
     thresholds: diarize::Thresholds,
 ) -> anyhow::Result<Vec<diarize::Segment>> {
-    let raw = diarize::diarize_file(app, audio_path, num_speakers, engine, thresholds).await?;
+    let raw = match diarize::diarize_file(app, audio_path, num_speakers, *engine, thresholds).await {
+        Ok(raw) => raw,
+        Err(e) => {
+            let failed = *engine;
+            let Some(other) = diarize::retry_engine(app, failed).await else {
+                return Err(e);
+            };
+            eprintln!("diarize: {} failed ({e}), retrying with {}", failed.arg(), other.arg());
+            match diarize::diarize_file(app, audio_path, num_speakers, other, thresholds).await {
+                Ok(raw) => {
+                    diarize::demote(failed);
+                    *engine = other;
+                    emit_error(
+                        app,
+                        Some(note_id),
+                        &diarize::fell_back_message(failed, other, &e.to_string()),
+                    );
+                    let app = app.clone();
+                    tauri::async_runtime::spawn(async move {
+                        if let Err(e) = diarize::recheck(&app, failed).await {
+                            let message = diarize::recheck_failed_message(failed, &e.to_string());
+                            emit_error(&app, None, &message);
+                        }
+                    });
+                    raw
+                }
+                Err(retry) => {
+                    // Both failing is the audio's doing, not an engine's.
+                    eprintln!("diarize: {} failed too ({retry})", other.arg());
+                    return Err(e);
+                }
+            }
+        }
+    };
     if !should_clean_diarize_segments(app) {
         return Ok(raw);
     }
@@ -1909,15 +1942,16 @@ async fn write_diagnostics_json(
 /// two costs are what makes the sequential pass legible.
 async fn timed_diarize(
     app: &AppHandle,
+    note_id: &str,
     wav: &std::path::Path,
     num_speakers: Option<i64>,
-    engine: diarize::Engine,
+    engine: &mut diarize::Engine,
     thresholds: diarize::Thresholds,
     clock: Option<&StopClock>,
     source: ChunkSource,
 ) -> anyhow::Result<Vec<diarize::Segment>> {
     let t = std::time::Instant::now();
-    let out = diarize_and_maybe_clean(app, wav, num_speakers, engine, thresholds).await;
+    let out = diarize_and_maybe_clean(app, note_id, wav, num_speakers, engine, thresholds).await;
     record_timing(clock, |x| {
         let ms = ms_since(t);
         match source {
@@ -4182,7 +4216,6 @@ async fn transcribe_takes(
     // the one that was configured when the audio was captured. Check before
     // replaying an hour of it.
     ensure_provider_ready(app, &state, note_id).await?;
-    let settings = note_diarize_settings(app, note_id).await;
 
     // The run's shape, settled before a single chunk decodes: each take's
     // retained streams are replayed one after the other, so a take that kept
@@ -4292,6 +4325,8 @@ async fn transcribe_takes(
         // checkpoints and the asset push below still have to happen. Recorded
         // and broken out of rather than `?`-ed straight to the caller.
         let t_diarize = std::time::Instant::now();
+        // Chosen per take, so a take after one that demoted an engine skips it.
+        let settings = note_diarize_settings(app, note_id).await;
         let diarized = rediarize_apply_to_chunks(
             app.clone(),
             note_id.to_string(),
@@ -4589,7 +4624,7 @@ async fn diarize_and_apply(
     // with no model downloaded the timeline is written without speaker labels,
     // and the user is told why they never arrive.
     let diarize_available = choice.downloaded;
-    let engine = choice.engine;
+    let mut engine = choice.engine;
     if !diarize_available {
         eprintln!("diarize: model not downloaded, saving the timeline without labels");
         emit_error(&app, Some(&note_id), DIARIZE_MODEL_MISSING_UNLABELLED);
@@ -4653,7 +4688,7 @@ async fn diarize_and_apply(
                 }
                 Some(wav) => {
                     diarize_steps.begin();
-                    match timed_diarize(&app, &wav, expected_speakers, engine, thresholds, clock, ChunkSource::Mic).await {
+                    match timed_diarize(&app, &note_id, &wav, expected_speakers, &mut engine, thresholds, clock, ChunkSource::Mic).await {
                         Err(e) => {
                             eprintln!("diarize: mic diarize failed ({e}), falling back to single-speaker labels");
                             emit_error(
@@ -4701,7 +4736,7 @@ async fn diarize_and_apply(
                 }
                 Some(wav) => {
                     diarize_steps.begin();
-                    match timed_diarize(&app, &wav, expected_speakers, engine, thresholds, clock, ChunkSource::Sys).await {
+                    match timed_diarize(&app, &note_id, &wav, expected_speakers, &mut engine, thresholds, clock, ChunkSource::Sys).await {
                         Err(e) => {
                             eprintln!("diarize: sys diarize failed ({e}), falling back to single-speaker labels");
                             emit_error(
@@ -4772,7 +4807,7 @@ async fn diarize_and_apply(
                 }
                 Some(wav) => {
                     diarize_steps.begin();
-                    timed_diarize(&app, &wav, sys_speaker_hint, engine, thresholds, clock, ChunkSource::Sys)
+                    timed_diarize(&app, &note_id, &wav, sys_speaker_hint, &mut engine, thresholds, clock, ChunkSource::Sys)
                         .await
                         .unwrap_or_else(|e| {
                             eprintln!("diarize: sys diarize failed ({e})");
@@ -4793,7 +4828,7 @@ async fn diarize_and_apply(
                 }
                 Some(wav) => {
                     diarize_steps.begin();
-                    timed_diarize(&app, echo.mic_input(&wav), mic_speaker_hint, engine, thresholds, clock, ChunkSource::Mic)
+                    timed_diarize(&app, &note_id, echo.mic_input(&wav), mic_speaker_hint, &mut engine, thresholds, clock, ChunkSource::Mic)
                         .await
                         .unwrap_or_else(|e| {
                             eprintln!("diarize: hybrid mic diarize failed ({e}), mic falls back to You");
@@ -6188,7 +6223,7 @@ async fn unify_apply(
     progress: &ChainProgress,
 ) -> anyhow::Result<UnifyCosts> {
     let NoteDiarizeSettings { choice, thresholds, expected_speakers } = settings;
-    let engine = choice.engine;
+    let mut engine = choice.engine;
     // Per-stream concatenation in manifest order. Mic concat = every session
     // that captured mic (mic-only *and* hybrid — a hybrid take's mic is
     // diarized now, not assumed to be one person); sys concat = sys-only +
@@ -6236,7 +6271,7 @@ async fn unify_apply(
         None
     };
     let mic_segments = match &mic_offsets {
-        Some(_) => diarize_and_maybe_clean(app, &mic_concat, mic_hint, engine, thresholds).await?,
+        Some(_) => diarize_and_maybe_clean(app, note_id, &mic_concat, mic_hint, &mut engine, thresholds).await?,
         None => Vec::new(),
     };
     if mic_offsets.is_some() && mic_segments.is_empty() {
@@ -6262,7 +6297,7 @@ async fn unify_apply(
     };
     let sys_segments = match &sys_offsets {
         Some(_) => {
-            diarize_and_maybe_clean(app, &sys_concat, sys_hint, engine, thresholds).await?
+            diarize_and_maybe_clean(app, note_id, &sys_concat, sys_hint, &mut engine, thresholds).await?
         }
         None => Vec::new(),
     };
