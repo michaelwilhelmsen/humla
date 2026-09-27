@@ -223,7 +223,7 @@ where
             {
                 let state: tauri::State<AppState> = app.state();
                 let selected = commands::selected_diarize_engine(&state);
-                diarize::replace_old_nemotron_bundle(app.handle(), selected);
+                diarize::prepare_nemotron_at_launch(app.handle(), selected);
             }
             // One-shot migration of the legacy single-custom-prompt setting
             // into the summary_prompts table. Same flag-guarded shape as the

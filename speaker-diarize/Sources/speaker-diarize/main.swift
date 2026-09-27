@@ -1,4 +1,5 @@
 import CoreML
+import CryptoKit
 import DiarizeCore
 import FluidAudio
 import Foundation
@@ -148,23 +149,55 @@ func nemotronWarmMarker() -> URL {
     return nemotronModelsDirectory().appendingPathComponent(".humla-warm-\(identity)")
 }
 
-/// What the warm marker records: the weights and the bundle warmed, since a
-/// FluidAudio release can move a preset to a re-exported bundle of the same
-/// weights, which has to be compiled again.
-let nemotronWarmStamp = "\(ModelNames.Nemotron3.weightsVersion) \(nemotronConfig.hubSubdirectory)"
+/// The macOS build, which is what CoreML keys its Neural Engine compile on.
+func osBuild() -> String {
+    var size = 0
+    guard sysctlbyname("kern.osversion", nil, &size, nil, 0) == 0, size > 0 else {
+        return ProcessInfo.processInfo.operatingSystemVersionString
+            .replacingOccurrences(of: " ", with: "_")
+    }
+    var buffer = [CChar](repeating: 0, count: size)
+    guard sysctlbyname("kern.osversion", &buffer, &size, nil, 0) == 0 else { return "unknown" }
+    return String(cString: buffer)
+}
+
+/// A hash of this binary, so any sidecar change counts as a new version,
+/// FluidAudio's included.
+func sidecarVersion() -> String {
+    let url = (Bundle.main.executableURL ?? URL(fileURLWithPath: CommandLine.arguments[0]))
+        .resolvingSymlinksInPath()
+    guard let data = try? Data(contentsOf: url, options: .mappedIfSafe) else { return "unknown" }
+    return SHA256.hash(data: data).prefix(8).map { String(format: "%02x", $0) }.joined()
+}
+
+/// What the warm marker records: the weights and bundle warmed (a FluidAudio
+/// release can re-export a preset under the same weights), the macOS build and
+/// this sidecar. A change to any of them can mean a new compile or a model that
+/// no longer runs, which the warm-up should find rather than a meeting.
+func nemotronWarmStamp() -> String {
+    [
+        ModelNames.Nemotron3.weightsVersion,
+        nemotronConfig.hubSubdirectory,
+        osBuild(),
+        sidecarVersion(),
+    ].joined(separator: " ")
+}
 
 /// Downloaded and compiled for the Neural Engine, so a diarize run neither
 /// fetches nor compiles after a recording stops.
 func nemotronIsReady() -> Bool {
-    nemotronFilesPresent() && readMarker(nemotronWarmMarker()) == nemotronWarmStamp
+    nemotronFilesPresent() && readMarker(nemotronWarmMarker()) == nemotronWarmStamp()
 }
 
 // MARK: - Status
 
-func writeStatus(downloaded: Bool, dir: URL) {
+/// `needsWarmUp`: the files are on disk but not prepared for this macOS and
+/// sidecar, which a `download` fixes without fetching anything.
+func writeStatus(downloaded: Bool, needsWarmUp: Bool = false, dir: URL) {
     guard FileManager.default.fileExists(atPath: dir.path) else {
         writeStdout([
             "downloaded": false,
+            "needsWarmUp": false,
             "path": NSNull(),
             "sizeBytes": NSNull(),
         ] as [String: Any])
@@ -172,6 +205,7 @@ func writeStatus(downloaded: Bool, dir: URL) {
     }
     writeStdout([
         "downloaded": downloaded,
+        "needsWarmUp": needsWarmUp,
         "path": dir.path,
         "sizeBytes": directorySize(dir),
     ] as [String: Any])
@@ -189,7 +223,12 @@ func runStatus() {
     case .community1:
         writeStatus(downloaded: community1FilesPresent(), dir: community1ModelsDirectory())
     case .nemotron3:
-        writeStatus(downloaded: nemotronIsReady(), dir: nemotronModelsDirectory())
+        let ready = nemotronIsReady()
+        writeStatus(
+            downloaded: ready,
+            needsWarmUp: !ready && nemotronFilesPresent(),
+            dir: nemotronModelsDirectory()
+        )
     }
 }
 
@@ -257,7 +296,7 @@ func runDownloadNemotron() async -> Int32 {
         )
         _ = try Nemotron3Diarizer(config: nemotronConfig, models: models)
             .processComplete([Float](repeating: 0, count: 16_000))
-        try Data((nemotronWarmStamp + "\n").utf8)
+        try Data((nemotronWarmStamp() + "\n").utf8)
             .write(to: nemotronWarmMarker(), options: .atomic)
         writeStdout(["event": "done"])
         return 0

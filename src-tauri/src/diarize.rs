@@ -447,17 +447,18 @@ fn old_bundle_plan(present: bool, selected: Engine) -> OldBundle {
     }
 }
 
-/// Moves an install that fetched Nemotron 3's old bundle onto the current one,
-/// fetched and prepared in the background. The old bundle is removed only once
-/// that succeeds, so a failed attempt is made again at the next launch.
-pub fn replace_old_nemotron_bundle(app: &AppHandle, selected: Engine) {
+/// Readies Nemotron 3 in the background at launch, so neither a download nor a
+/// Neural Engine compile lands in a post-stop chain. An install that fetched the
+/// old bundle is moved onto the current one, and the old bundle removed only
+/// once that succeeds; otherwise model files warmed up under another macOS
+/// build or sidecar are warmed up again. A failed attempt is made again at the
+/// next launch, and until one succeeds `choose_engine` uses community-1.
+pub fn prepare_nemotron_at_launch(app: &AppHandle, selected: Engine) {
     let Some(models) = fluidaudio_models_root(app) else { return };
     let old = models.join(OLD_NEMOTRON_BUNDLE);
+    let app = app.clone();
     match old_bundle_plan(old.exists(), selected) {
-        OldBundle::Absent => {}
-        OldBundle::Remove => remove_old_bundle(&old),
         OldBundle::Replace => {
-            let app = app.clone();
             tauri::async_runtime::spawn(async move {
                 match download(&app, Engine::Nemotron3).await {
                     Ok(()) => remove_old_bundle(&old),
@@ -465,6 +466,26 @@ pub fn replace_old_nemotron_bundle(app: &AppHandle, selected: Engine) {
                 }
             });
         }
+        plan => {
+            if plan == OldBundle::Remove {
+                remove_old_bundle(&old);
+            }
+            tauri::async_runtime::spawn(async move { rewarm_if_stale(&app).await });
+        }
+    }
+}
+
+/// A `download` of files already on disk fetches nothing and runs the warm-up.
+async fn rewarm_if_stale(app: &AppHandle) {
+    match status(app, Engine::Nemotron3).await {
+        Ok(s) if s.needs_warm_up => {
+            eprintln!("nemotron: warming up again for this macOS build and sidecar");
+            if let Err(e) = download(app, Engine::Nemotron3).await {
+                eprintln!("nemotron: warm-up failed: {e}");
+            }
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("nemotron: status failed: {e}"),
     }
 }
 
@@ -508,6 +529,10 @@ fn remove_retired_model_dirs(models: &Path, conn: &rusqlite::Connection) {
 #[serde(rename_all = "camelCase")]
 pub struct ModelStatus {
     pub downloaded: bool,
+    /// The files are on disk but their warm-up predates this macOS build or
+    /// sidecar. Nemotron 3 only.
+    #[serde(default)]
+    pub needs_warm_up: bool,
     pub size_bytes: Option<u64>,
     pub path: Option<String>,
 }
@@ -522,6 +547,7 @@ pub async fn status(app: &AppHandle, engine: Engine) -> Result<ModelStatus> {
         Err(_) => {
             return Ok(ModelStatus {
                 downloaded: false,
+                needs_warm_up: false,
                 size_bytes: None,
                 path: None,
             });
@@ -923,6 +949,20 @@ mod tests {
             package.contains(r#"exact: "0.17.4""#),
             "a FluidAudio bump must re-check which Nemotron bundle {OLD_NEMOTRON_BUNDLE} names"
         );
+    }
+
+    #[test]
+    fn status_reads_the_sidecars_warm_up_flag_and_defaults_it_off() {
+        let sidecar = include_str!("../../speaker-diarize/Sources/speaker-diarize/main.swift");
+        assert!(sidecar.contains(r#""needsWarmUp": needsWarmUp"#));
+        let stale: ModelStatus = serde_json::from_str(
+            r#"{"downloaded":false,"needsWarmUp":true,"path":"/m","sizeBytes":1}"#,
+        )
+        .unwrap();
+        assert!(stale.needs_warm_up && !stale.downloaded);
+        let older: ModelStatus =
+            serde_json::from_str(r#"{"downloaded":true,"path":"/m","sizeBytes":1}"#).unwrap();
+        assert!(!older.needs_warm_up);
     }
 
     #[test]
