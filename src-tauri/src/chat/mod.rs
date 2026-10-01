@@ -548,7 +548,7 @@ pub fn build_chat_adapter(provider: ProviderId) -> Result<Box<dyn ChatAdapter>> 
         ProviderId::Local => Ok(Box::new(OllamaChatAdapter)),
         ProviderId::OpenAi => Ok(Box::new(OpenAiChatAdapter)),
         ProviderId::Anthropic => Ok(Box::new(AnthropicChatAdapter::new())),
-        ProviderId::Deepgram | ProviderId::Groq => {
+        ProviderId::Deepgram | ProviderId::Groq | ProviderId::SixtyDb => {
             anyhow::bail!("{provider} is a transcription provider and can't chat")
         }
     }

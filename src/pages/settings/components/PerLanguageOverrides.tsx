@@ -113,6 +113,8 @@ function summariseProvider(cfg: ProviderConfig): string {
       return `OpenAI · ${cfg.model}`;
     case "deepgram":
       return `Deepgram · ${cfg.model}`;
+    case "sixtydb":
+      return `60db · ${cfg.model}`;
     case "groq":
       return `Groq · ${cfg.model}`;
     case "local":
