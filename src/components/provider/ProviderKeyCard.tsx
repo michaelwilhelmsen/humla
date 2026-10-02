@@ -25,6 +25,11 @@ const DEFAULT_COPY: Record<
     description: "Nova-3 and Nova-2 cloud transcription.",
     placeholder: "Deepgram API key",
   },
+  sixtydb: {
+    label: "60db",
+    description: "Cloud speech-to-text with word timestamps.",
+    placeholder: "60db API key",
+  },
   groq: {
     label: "Groq",
     description: "Fast cloud Whisper (whisper-large-v3-turbo).",

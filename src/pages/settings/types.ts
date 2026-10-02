@@ -65,6 +65,7 @@ export const DEFAULTS: Record<EditableKey, string> = {
 export const PROVIDERS_BASE = [
   { value: "openai", label: "OpenAI" },
   { value: "deepgram", label: "Deepgram" },
+  { value: "sixtydb", label: "60db" },
   { value: "groq", label: "Groq (Whisper Large v3 Turbo)" },
 ];
 export const LOCAL_PROVIDER = {
@@ -80,6 +81,7 @@ const PROVIDER_PICKER_LABEL: Record<Provider, string> = {
   anthropic: "Cloud (Anthropic)",
   local: "Local (any OpenAI-compatible server)",
   deepgram: "Deepgram",
+  sixtydb: "60db",
   groq: "Groq",
 };
 

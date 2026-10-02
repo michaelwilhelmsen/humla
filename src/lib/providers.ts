@@ -8,6 +8,7 @@ export const PROVIDERS = [
   { id: "anthropic", label: "Anthropic", keychain: true, summarize: true, chat: true, transcribe: false },
   { id: "deepgram", label: "Deepgram", keychain: true, summarize: false, chat: false, transcribe: true },
   { id: "groq", label: "Groq", keychain: true, summarize: false, chat: false, transcribe: true },
+  { id: "sixtydb", label: "60db", keychain: true, summarize: false, chat: false, transcribe: true },
   { id: "local", label: "Local", keychain: false, summarize: true, chat: true, transcribe: true },
 ] as const;
 

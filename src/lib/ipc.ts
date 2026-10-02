@@ -172,14 +172,15 @@ export type SettingsKey =
 
 export type TranscribeProvider = Provider;
 
-// Mirror of the Rust `crate::stt::ProviderConfig` tagged union. The four
-// variants match the four supported STT providers; `local` carries the
+// Mirror of the Rust `crate::stt::ProviderConfig` tagged union. Its
+// variants match the supported STT providers; `local` carries the
 // extra preset + GPU fields it needs.
 export type ProviderConfig =
   | { provider: "openai"; model: string; base_url?: string }
   | { provider: "local"; model_id: string; preset: string; use_gpu: boolean }
   | { provider: "deepgram"; model: string; base_url?: string }
-  | { provider: "groq"; model: string };
+  | { provider: "groq"; model: string }
+  | { provider: "sixtydb"; model: string };
 
 // Mirror of the Rust `crate::stt::TranscribeConfig`. Wraps a default
 // ProviderConfig plus a map of per-language overrides keyed by ISO 639-1
