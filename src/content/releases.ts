@@ -11,6 +11,26 @@ export type Release = {
 
 export const releases: Release[] = [
   {
+    version: "0.65.2",
+    date: "2026-10-02",
+    title: "Local chat answers again",
+    summary: "Chat on local models no longer comes back empty, and your notes now have times in MCP.",
+    paragraphs: [
+      "If you chat with your notes through a local server like mlx_lm, some models came back with “returned an empty response”. The server was cutting replies off at a few hundred words, and models that think before they answer used all of that thinking. Humla now asks for a much higher limit, so the answer has room to arrive. Local summaries had the same cap and get the same fix. If a reply is still cut short, the message now says the model hit its output limit instead of calling it empty.",
+      "Apps that read your notes over MCP now get the time of each note, not just the date, in your local time with its UTC offset. A note from just after midnight also stops showing up under the day before, and date filters follow your own midnight instead of UTC’s.",
+    ],
+    highlights: [
+      "Local chat models get room to finish their answer.",
+      "Local summaries no longer stop early on a server’s default limit.",
+      "MCP shows each note’s local time and UTC offset.",
+      "MCP date filters follow your local midnight.",
+    ],
+    issues: [
+      { title: "I am unable to chat with my notes. Error - model returned an empty response", reference: "#210", status: "Closed", url: "https://github.com/michaelwilhelmsen/humla/issues/210" },
+      { title: "Feature Request: Expose the meeting start time (local time + timezone) via MCP", reference: "#208", status: "Closed", url: "https://github.com/michaelwilhelmsen/humla/issues/208" },
+    ],
+  },
+  {
     version: "0.65.1",
     date: "2026-09-27",
     title: "Nemotron 3 on macOS 27",
