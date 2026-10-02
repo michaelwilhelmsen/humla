@@ -67,6 +67,13 @@ fn set_created_at(conn: &Connection, id: &str, created_at: i64) {
         .unwrap();
 }
 
+/// The instant a wall-clock time on this Mac names, for building notes at a known
+/// local hour whatever zone the test runs in.
+fn local_ms(y: i32, m: u32, d: u32, h: u32, min: u32) -> i64 {
+    use chrono::TimeZone;
+    chrono::Local.with_ymd_and_hms(y, m, d, h, min, 0).earliest().unwrap().timestamp_millis()
+}
+
 // ── each tool answers over a seeded library ─────────────────────────────────
 
 /// Issue #172 asks every search result to name the Note it came from, and in MCP the
@@ -512,13 +519,12 @@ fn reading_one_note_names_who_spoke_its_client_and_its_folder() {
 #[test]
 fn an_absolute_date_window_selects_a_named_month_including_its_last_day() {
     let conn = open();
-    // NOW is 2026-07-26, so these land on 2026-06-15, 2026-06-30 midday, 2026-07-20.
     let mid_june = seed(&conn, "Mid-June budget", "the budget came up");
     let last_june = seed(&conn, "Last-June budget", "the budget came up");
     let july = seed(&conn, "July budget", "the budget came up");
-    set_created_at(&conn, &mid_june, NOW - 41 * DAY);
-    set_created_at(&conn, &last_june, NOW - 26 * DAY + DAY / 2);
-    set_created_at(&conn, &july, NOW - 6 * DAY);
+    set_created_at(&conn, &mid_june, local_ms(2026, 6, 15, 12, 0));
+    set_created_at(&conn, &last_june, local_ms(2026, 6, 30, 12, 0));
+    set_created_at(&conn, &july, local_ms(2026, 7, 20, 12, 0));
 
     for tool in [TOOL_LIST, TOOL_SEARCH] {
         let out = exec(
@@ -531,6 +537,58 @@ fn an_absolute_date_window_selects_a_named_month_including_its_last_day() {
         assert!(out.model_text.contains("Last-June"), "{tool} includes the day named as the end");
         assert!(!out.model_text.contains("July"), "{tool}");
     }
+}
+
+/// Issue #208: a consumer syncing notes into a calendar or CRM needs the time, and a
+/// bare date ends up as UTC midnight on their side. Every header says when the note
+/// was made in this Mac's local time with its offset — the offset of that DATE, so a
+/// winter note and a summer note in a zone with daylight saving carry different ones.
+#[test]
+fn every_note_header_carries_its_local_time_and_the_offset_of_that_date() {
+    let conn = open();
+    for (y, m, d) in [(2026, 1, 15), (2026, 7, 15)] {
+        let id = seed(&conn, &format!("Standup {m}"), "the budget came up");
+        let at = local_ms(y, m, d, 11, 14);
+        set_created_at(&conn, &id, at);
+        let expected = chrono::DateTime::from_timestamp_millis(at)
+            .unwrap()
+            .with_timezone(&chrono::Local)
+            .format("%Y-%m-%d %H:%M %:z")
+            .to_string();
+        assert!(expected.contains(" 11:14 "), "{expected}");
+
+        for (tool, args) in [
+            (TOOL_LIST, json!({})),
+            (TOOL_SEARCH, json!({ ARG_QUERY: "budget" })),
+            (TOOL_GET, json!({ ARG_NOTE_ID: id })),
+            (TOOL_TRANSCRIPT, json!({ ARG_NOTE_ID: id })),
+        ] {
+            let out = exec(&conn, tool, &args);
+            assert!(out.model_text.contains(&expected), "{tool}: {}", out.model_text);
+        }
+    }
+}
+
+/// A calendar date in a window means the user's day, not UTC's: a meeting at 00:30
+/// on the 1st belongs to that month, and one at 23:30 the night before does not.
+#[test]
+fn a_date_window_starts_and_ends_at_local_midnight() {
+    let conn = open();
+    let late = seed(&conn, "Late May budget", "the budget came up");
+    let early = seed(&conn, "Early June budget", "the budget came up");
+    let last = seed(&conn, "Last night of June budget", "the budget came up");
+    let after = seed(&conn, "First of July budget", "the budget came up");
+    set_created_at(&conn, &late, local_ms(2026, 5, 31, 23, 30));
+    set_created_at(&conn, &early, local_ms(2026, 6, 1, 0, 30));
+    set_created_at(&conn, &last, local_ms(2026, 6, 30, 23, 30));
+    set_created_at(&conn, &after, local_ms(2026, 7, 1, 0, 30));
+
+    let out = exec(&conn, TOOL_LIST, &json!({ ARG_SINCE: "2026-06-01", ARG_UNTIL_DATE: "2026-06-30" }));
+    assert!(!out.is_error, "{}", out.model_text);
+    assert!(out.model_text.contains("Early June"), "{}", out.model_text);
+    assert!(out.model_text.contains("Last night of June"), "{}", out.model_text);
+    assert!(!out.model_text.contains("Late May"), "{}", out.model_text);
+    assert!(!out.model_text.contains("First of July"), "{}", out.model_text);
 }
 
 /// Unlike every other argument here, a date that cannot be read is an error. There is
