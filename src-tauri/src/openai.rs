@@ -244,6 +244,8 @@ struct ChatRequest<'a> {
     // lets us send the right shape per model without a per-model payload.
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
 }
 
 #[derive(Serialize)]
@@ -260,17 +262,43 @@ struct ChatResponse {
 #[derive(Deserialize)]
 struct ChatChoice {
     message: ChatMessageOwned,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct ChatMessageOwned {
-    content: String,
+    // `mlx_lm.server` sends `null` when the reply holds no text.
+    #[serde(default)]
+    content: Option<String>,
     // Qwen 3+ via Ollama puts internal reasoning here (extension to the
     // OpenAI schema). If `content` is empty but this is set, the model
     // ran out of tokens or context inside the thinking phase and never
     // produced an answer — surface that as a clear error.
     #[serde(default)]
     reasoning_content: Option<String>,
+    // `mlx_lm.server`'s name for the same thing.
+    #[serde(default)]
+    reasoning: Option<String>,
+}
+
+/// The error for a reply that carried no answer and no tool call. A
+/// `finish_reason` of `length` means the server's output limit ended the reply,
+/// which on a thinking model is usually spent before the answer begins.
+fn empty_answer_error(model: &str, finish_reason: Option<&str>, reasoning_chars: usize) -> anyhow::Error {
+    if finish_reason == Some("length") {
+        return anyhow!(
+            "{model} hit its output limit before it answered ({reasoning_chars} reasoning chars). \
+             Raise the server's output token limit, or use a model that reasons less."
+        );
+    }
+    if reasoning_chars > 0 {
+        return anyhow!(
+            "{model} produced reasoning but no final answer ({reasoning_chars} reasoning chars). \
+             Try a non-thinking model or shorten the input."
+        );
+    }
+    anyhow!("{model} returned an empty response")
 }
 
 /// Reasoning models: gpt-5.x family and the o-series. They reject the
@@ -592,22 +620,58 @@ async fn post_chat(
     body: &impl Serialize,
     started: std::time::Instant,
 ) -> Result<reqwest::Response> {
+    let r = send_chat(ep, api_key, body, started).await?;
+    check_chat_status(ep, r, started).await
+}
+
+/// Asked of every local OpenAI-compat server as `max_tokens`. It guards against a
+/// runaway generation and is not a budget: a request without one gets the
+/// server's own default, which on `mlx_lm.server` is 512 tokens — too few for a
+/// thinking model to reach its answer.
+pub(crate) const LOCAL_MAX_TOKENS: u32 = 32_768;
+
+/// [`post_chat`] with the output ceiling a local server needs. `body` builds the
+/// request around the `max_tokens` to send. A server that refuses the ceiling
+/// with a 400 is asked once more without it — vLLM rejects any `max_tokens` the
+/// context left after the prompt can't hold.
+async fn post_chat_lifting_limit<B: Serialize>(
+    ep: &Endpoint<'_>,
+    api_key: &str,
+    started: std::time::Instant,
+    body: impl Fn(Option<u32>) -> B,
+) -> Result<reqwest::Response> {
+    if let Endpoint::Local(base) = ep {
+        let r = send_chat(ep, api_key, &body(Some(LOCAL_MAX_TOKENS)), started).await?;
+        if r.status() != reqwest::StatusCode::BAD_REQUEST {
+            return check_chat_status(ep, r, started).await;
+        }
+        let refusal = r.text().await.unwrap_or_default();
+        eprintln!("[llm] {base} refused max_tokens={LOCAL_MAX_TOKENS} ({refusal}); retrying without it");
+    }
+    post_chat(ep, api_key, &body(None), started).await
+}
+
+async fn send_chat(
+    ep: &Endpoint<'_>,
+    api_key: &str,
+    body: &impl Serialize,
+    started: std::time::Instant,
+) -> Result<reqwest::Response> {
     let http = ep.client();
     let url = ep.url();
-    let r = match send_with_retries(|| http.post(&url).bearer_auth(api_key).json(body), started).await
-    {
-        Ok(resp) => resp,
-        Err(e) => {
-            if e.is_timeout() {
-                return Err(ep.timeout_error(started.elapsed().as_secs()));
-            }
-            if e.is_connect() {
-                return Err(ep.connect_error());
-            }
-            return Err(ep.network_error(&error_chain(&e)));
-        }
-    };
+    match send_with_retries(|| http.post(&url).bearer_auth(api_key).json(body), started).await {
+        Ok(resp) => Ok(resp),
+        Err(e) if e.is_timeout() => Err(ep.timeout_error(started.elapsed().as_secs())),
+        Err(e) if e.is_connect() => Err(ep.connect_error()),
+        Err(e) => Err(ep.network_error(&error_chain(&e))),
+    }
+}
 
+async fn check_chat_status(
+    ep: &Endpoint<'_>,
+    r: reqwest::Response,
+    started: std::time::Instant,
+) -> Result<reqwest::Response> {
     let status = r.status();
     eprintln!("[llm] response {status} after {:?}", started.elapsed());
     if !status.is_success() {
@@ -731,7 +795,7 @@ where
     // non-streaming — they're on localhost, with no middlebox to reap the
     // connection. Ollama already took the native streaming path above.
     let _ = on_chunk;
-    let req = ChatRequest {
+    let req = |max_tokens| ChatRequest {
         model,
         // Local OpenAI-compat servers accept temperature; reasoning-model
         // suppression only applies when the actual server is OpenAI's.
@@ -744,6 +808,7 @@ where
             ChatMessage { role: "system", content: system_prompt },
             ChatMessage { role: "user", content: transcript },
         ],
+        max_tokens,
     };
     let started = std::time::Instant::now();
     eprintln!(
@@ -752,7 +817,7 @@ where
         system_prompt.len(),
         transcript.len()
     );
-    let r = post_chat(&ep, api_key, &req, started).await?;
+    let r = post_chat_lifting_limit(&ep, api_key, started, req).await?;
     // Read the body once so we can log it on parse failure (Ollama's error
     // shape on quirky responses isn't always OpenAI-compat).
     let body_text = r.text().await?;
@@ -770,10 +835,11 @@ where
     let first = body.choices.into_iter().next();
     let reasoning_chars = first
         .as_ref()
-        .and_then(|c| c.message.reasoning_content.as_deref())
+        .and_then(|c| c.message.reasoning_content.as_deref().or(c.message.reasoning.as_deref()))
         .map(str::len)
         .unwrap_or(0);
-    let content = first.map(|c| c.message.content).unwrap_or_default();
+    let finish_reason = first.as_ref().and_then(|c| c.finish_reason.clone());
+    let content = first.and_then(|c| c.message.content).unwrap_or_default();
     eprintln!(
         "[llm] success in {:?}, content {} chars, reasoning {} chars",
         started.elapsed(),
@@ -781,17 +847,7 @@ where
         reasoning_chars
     );
     if content.trim().is_empty() {
-        // The model returned only reasoning, or nothing at all. Either way
-        // we have no usable answer — surface a clear error rather than
-        // saving an empty summary.
-        if reasoning_chars > 0 {
-            return Err(anyhow!(
-                "{model} produced reasoning but no final answer ({} reasoning chars). \
-                 Try a non-thinking model (e.g. qwen3.5:4b) or shorten the input.",
-                reasoning_chars
-            ));
-        }
-        return Err(anyhow!("{model} returned an empty response"));
+        return Err(empty_answer_error(model, finish_reason.as_deref(), reasoning_chars));
     }
     Ok(content)
 }
@@ -1187,6 +1243,8 @@ struct ToolChatRequest<'a> {
     tools: Option<&'a [Value]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
 }
 
 // Streaming SSE delta shapes for OpenAI tool calls. `tool_calls` arrive as
@@ -1196,8 +1254,15 @@ struct ToolChatRequest<'a> {
 struct ToolStreamDelta {
     #[serde(default)]
     content: Option<String>,
+    // Thinking text, under whichever name the server uses for it.
     #[serde(default)]
-    tool_calls: Vec<ToolCallFragment>,
+    reasoning: Option<String>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
+    // Some servers send `null` here; a frame that fails to parse loses its
+    // `finish_reason` too.
+    #[serde(default)]
+    tool_calls: Option<Vec<ToolCallFragment>>,
 }
 #[derive(Deserialize)]
 struct ToolCallFragment {
@@ -1223,6 +1288,8 @@ struct ToolStreamFrame {
 struct ToolStreamChoice {
     #[serde(default)]
     delta: ToolStreamDelta,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 /// Run one cloud-OpenAI step with tool-calling. Streams answer tokens via
@@ -1243,17 +1310,18 @@ pub(crate) async fn openai_chat_step<F>(
 where
     F: FnMut(&str) -> bool + Send,
 {
-    let req = ToolChatRequest {
+    let req = |max_tokens| ToolChatRequest {
         model,
         messages,
         stream: true,
         tools: if tools.is_empty() { None } else { Some(tools) },
         temperature: if is_reasoning_model(model) { None } else { Some(0.2) },
+        max_tokens,
     };
     // `base_url` may be a local OpenAI-compat server, which needs the longer
     // timeout and its own failure vocabulary — `Endpoint` owns both.
     let ep = Endpoint::from_base(base_url);
-    let r = post_chat(&ep, api_key, &req, std::time::Instant::now()).await?;
+    let r = post_chat_lifting_limit(&ep, api_key, std::time::Instant::now(), req).await?;
 
     use futures_util::StreamExt;
     let mut byte_stream = r.bytes_stream();
@@ -1261,6 +1329,8 @@ where
     let mut answer = String::new();
     // Accumulate tool-call fragments by index → (id, name, arguments).
     let mut calls: Vec<(String, String, String)> = Vec::new();
+    let mut reasoning_chars = 0usize;
+    let mut finish_reason: Option<String> = None;
     // Set when `on_delta` asks to stop; breaks both loops and returns the
     // partial answer (issue #80).
     let mut stop = false;
@@ -1279,6 +1349,11 @@ where
                 Err(_) => continue,
             };
             let Some(choice) = frame.choices.into_iter().next() else { continue };
+            if choice.finish_reason.is_some() {
+                finish_reason = choice.finish_reason;
+            }
+            let reasoning = choice.delta.reasoning.as_deref().or(choice.delta.reasoning_content.as_deref());
+            reasoning_chars += reasoning.map_or(0, str::len);
             if let Some(delta) = choice.delta.content {
                 if !delta.is_empty() {
                     answer.push_str(&delta);
@@ -1288,7 +1363,7 @@ where
                     }
                 }
             }
-            for frag in choice.delta.tool_calls {
+            for frag in choice.delta.tool_calls.into_iter().flatten() {
                 if calls.len() <= frag.index {
                     calls.resize(frag.index + 1, (String::new(), String::new(), String::new()));
                 }
@@ -1325,7 +1400,7 @@ where
         .collect();
 
     if answer.trim().is_empty() && tool_calls.is_empty() {
-        return Err(anyhow!("{model} returned an empty response"));
+        return Err(empty_answer_error(model, finish_reason.as_deref(), reasoning_chars));
     }
     Ok((answer, tool_calls))
 }
@@ -1869,6 +1944,99 @@ mod tests {
             "openai-internal", // "o" prefix but not followed by a digit
         ] {
             assert!(!is_reasoning_model(m), "expected NOT reasoning: {m}");
+        }
+    }
+
+    mod local_output_ceiling {
+        use super::*;
+        use crate::chat::test_server::serve;
+        use serde_json::json;
+
+        fn base(port: u16) -> String {
+            format!("http://127.0.0.1:{port}/v1")
+        }
+
+        fn sse(frames: &[Value]) -> String {
+            let mut out: String = frames.iter().map(|f| format!("data: {f}\n\n")).collect();
+            out.push_str("data: [DONE]\n\n");
+            out
+        }
+
+        fn request_json(raw: &str) -> Value {
+            serde_json::from_str(raw.split("\r\n\r\n").nth(1).unwrap()).unwrap()
+        }
+
+        async fn step(base: &str) -> Result<(String, Vec<RawToolCall>)> {
+            let msgs = [json!({"role": "user", "content": "hei"})];
+            openai_chat_step(base, "", "gemma", &msgs, &[], |_| true).await
+        }
+
+        async fn summarize(base: &str) -> Result<String> {
+            summarize_with_base(base, "", "gemma", false, "sys", "transcript", |_| {}).await
+        }
+
+        const ANSWER: &str = r#"data: {"choices":[{"delta":{"content":"Svar"},"finish_reason":"stop"}]}
+
+data: [DONE]
+
+"#;
+
+        #[tokio::test]
+        async fn a_local_chat_step_lifts_the_server_default_output_limit() {
+            let (port, server) = serve(vec![(200, "text/event-stream", ANSWER.into())]).await;
+            step(&base(port)).await.unwrap();
+            let sent = request_json(&server.await.unwrap()[0]);
+            assert_eq!(sent["max_tokens"], LOCAL_MAX_TOKENS);
+        }
+
+        #[tokio::test]
+        async fn a_server_that_refuses_the_ceiling_is_asked_again_without_it() {
+            let (port, server) = serve(vec![
+                (400, "application/json", r#"{"error":"max_tokens too large"}"#.into()),
+                (200, "text/event-stream", ANSWER.into()),
+            ])
+            .await;
+            let (text, _) = step(&base(port)).await.unwrap();
+            assert_eq!(text, "Svar");
+            let seen = server.await.unwrap();
+            assert_eq!(request_json(&seen[0])["max_tokens"], LOCAL_MAX_TOKENS);
+            assert!(request_json(&seen[1]).get("max_tokens").is_none());
+        }
+
+        #[tokio::test]
+        async fn a_step_cut_off_while_reasoning_says_so() {
+            let body = sse(&[
+                json!({"choices":[{"delta":{"reasoning":"Thinking about it"},"finish_reason":null}]}),
+                json!({"choices":[{"delta":{"tool_calls":null},"finish_reason":"length"}]}),
+            ]);
+            let (port, _server) = serve(vec![(200, "text/event-stream", body)]).await;
+            let err = step(&base(port)).await.unwrap_err().to_string();
+            assert!(err.contains("output limit"), "{err}");
+            assert!(err.contains("reasoning"), "{err}");
+        }
+
+        #[tokio::test]
+        async fn a_local_summary_lifts_the_limit_and_reads_a_null_content_as_empty() {
+            let body = json!({"choices":[{"finish_reason":"length","message":{
+                "role":"assistant","content":null,"reasoning":"Thinking"}}]})
+            .to_string();
+            let (port, server) = serve(vec![(200, "application/json", body)]).await;
+            let err = summarize(&base(port)).await.unwrap_err().to_string();
+            assert!(err.contains("output limit"), "{err}");
+            let sent = request_json(&server.await.unwrap()[0]);
+            assert_eq!(sent["max_tokens"], LOCAL_MAX_TOKENS);
+        }
+
+        #[tokio::test]
+        async fn a_local_summary_retries_without_the_ceiling_when_refused() {
+            let ok = json!({"choices":[{"finish_reason":"stop","message":{"content":"Referat"}}]});
+            let (port, server) = serve(vec![
+                (400, "application/json", "{}".into()),
+                (200, "application/json", ok.to_string()),
+            ])
+            .await;
+            assert_eq!(summarize(&base(port)).await.unwrap(), "Referat");
+            assert!(request_json(&server.await.unwrap()[1]).get("max_tokens").is_none());
         }
     }
 }

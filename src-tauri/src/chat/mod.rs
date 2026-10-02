@@ -21,17 +21,24 @@ pub mod test_server {
     /// Answer each connection with the next `body` as an event stream, and hand
     /// back the port plus every request read, in order.
     pub async fn serve_sse(bodies: Vec<String>) -> (u16, tokio::task::JoinHandle<Vec<String>>) {
+        serve(bodies.into_iter().map(|b| (200, "text/event-stream", b)).collect()).await
+    }
+
+    /// Answer each connection with the next `(status, content type, body)`.
+    pub async fn serve(
+        responses: Vec<(u16, &'static str, String)>,
+    ) -> (u16, tokio::task::JoinHandle<Vec<String>>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let handle = tokio::spawn(async move {
             let mut seen = Vec::new();
-            for body in bodies {
+            for (status, content_type, body) in responses {
                 let (mut sock, _) = listener.accept().await.unwrap();
                 let mut buf = vec![0u8; 262_144];
                 let n = sock.read(&mut buf).await.unwrap();
                 seen.push(String::from_utf8_lossy(&buf[..n]).to_string());
                 let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{}",
+                    "HTTP/1.1 {status} \r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(),
                     body
                 );
