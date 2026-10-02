@@ -156,7 +156,7 @@ pub fn specs() -> Vec<Spec> {
     // year visible rather than silent.
     let within = json!({ "type": "integer", "description": "Optional: only notes from the last N days (7 for last week). Use this, not since/until, when the question is relative to today." });
     let until = json!({ "type": "integer", "description": "Optional: exclude notes from the last N days, so the window ends in the past. within_days 35 with until_days 7 is the four weeks before last week." });
-    let since = json!({ "type": "string", "description": "Optional: only notes created on or after this calendar date, as YYYY-MM-DD. For a named month or a fixed range; cannot be combined with within_days." });
+    let since = json!({ "type": "string", "description": "Optional: only notes created on or after this calendar date (local time), as YYYY-MM-DD. For a named month or a fixed range; cannot be combined with within_days." });
     let until_date = json!({ "type": "string", "description": "Optional: only notes created on or before this calendar date, as YYYY-MM-DD — the day itself is included. since 2026-06-01 with until 2026-06-30 is the whole of June. Cannot be combined with until_days." });
     // Who SPOKE, not who was mentioned. Matched exactly against the labels in the
     // transcript, so names must come from a listing row — an unmatched name answers
@@ -335,21 +335,24 @@ fn window_edge(args: &Value, key: &str, now_ms: i64) -> Option<i64> {
     Some(now_ms - days.min(MAX_WINDOW_DAYS) * MS_PER_DAY)
 }
 
-/// One end of the window given as a calendar date, at UTC midnight of the day named.
+/// One end of the window given as a calendar date, at local midnight of the day named
+/// — `next_day` moves it to the midnight that ends that day, which on a daylight-saving
+/// change is 23 or 25 hours later rather than a fixed day.
 ///
 /// A malformed date ERRORS rather than being ignored, unlike every other argument
 /// here. The others have a truthful "no filter" reading; this one does not — a caller
 /// who wrote `since: "June 2026"` wants a bound, and quietly widening to the whole
 /// library hands back notes from any year for the model to describe as that month.
 /// The error is one round trip and is correctable; a silent wrong answer is neither.
-fn date_arg(args: &Value, key: &str) -> Result<Option<i64>, String> {
+fn date_arg(args: &Value, key: &str, next_day: bool) -> Result<Option<i64>, String> {
     let Some(raw) = str_arg(args, key) else {
         return Ok(None);
     };
     chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d")
         .ok()
-        .and_then(|d| d.and_hms_opt(0, 0, 0))
-        .map(|dt| Some(dt.and_utc().timestamp_millis()))
+        .and_then(|d| if next_day { d.succ_opt() } else { Some(d) })
+        .and_then(local_midnight)
+        .map(Some)
         .ok_or_else(|| {
             format!(
                 "\"{key}\" must be a calendar date as YYYY-MM-DD (for example 2026-06-01), not \
@@ -369,11 +372,11 @@ fn date_arg(args: &Value, key: &str) -> Result<Option<i64>, String> {
 fn resolve_filter<'a>(args: &'a Value, now_ms: i64) -> Result<NoteFilter<'a>, String> {
     let rel_since = window_edge(args, ARG_WITHIN, now_ms);
     let rel_until = window_edge(args, ARG_UNTIL, now_ms);
-    let abs_since = date_arg(args, ARG_SINCE)?;
+    let abs_since = date_arg(args, ARG_SINCE, false)?;
     // Inclusive of the day named, converted to the exclusive upper bound the filter
     // takes. Successive windows still tile without double-counting, because the
     // boundary that moves is a whole day later than the one the caller wrote.
-    let abs_until = date_arg(args, ARG_UNTIL_DATE)?.map(|ms| ms + MS_PER_DAY);
+    let abs_until = date_arg(args, ARG_UNTIL_DATE, true)?;
 
     // Two forms of the same edge is not a narrowing to combine — it is a caller that
     // means two different things, and picking either one silently answers a question
@@ -406,7 +409,7 @@ fn resolve_filter<'a>(args: &'a Value, now_ms: i64) -> Result<NoteFilter<'a>, St
                     "That date window is empty: it ends on or before it starts. Resolved to \
                      {} – {}.",
                     fmt_date(since),
-                    fmt_date(until - MS_PER_DAY)
+                    fmt_date(until - 1)
                 )
             } else {
                 format!(
@@ -436,30 +439,51 @@ fn resolve_filter<'a>(args: &'a Value, now_ms: i64) -> Result<NoteFilter<'a>, St
 /// hallucinated year returns an empty the model reads as an absence; spelling the
 /// window back turns that into something the model can see and correct, rather than a
 /// silence it has no reason to distrust. The upper bound is shown as the inclusive
-/// last day, matching how the caller wrote it rather than how it is stored.
+/// last day (the millisecond before the exclusive bound), matching how the caller
+/// wrote it rather than how it is stored.
 fn window_echo(filter: &NoteFilter<'_>) -> String {
     match (filter.since_ms, filter.until_ms) {
         (None, None) => String::new(),
         (Some(s), None) => format!(" The date window was {} onwards.", fmt_date(s)),
         (None, Some(u)) => {
-            format!(" The date window was everything up to {}.", fmt_date(u - MS_PER_DAY))
+            format!(" The date window was everything up to {}.", fmt_date(u - 1))
         }
         (Some(s), Some(u)) => format!(
             " The date window was {} – {}.",
             fmt_date(s),
-            fmt_date(u - MS_PER_DAY)
+            fmt_date(u - 1)
         ),
     }
 }
 
 // ── formatting helpers ──────────────────────────────────────────────────────
 
-fn fmt_date(ms: i64) -> String {
-    use chrono::{TimeZone, Utc};
-    Utc.timestamp_millis_opt(ms)
-        .single()
-        .map(|dt| dt.format("%Y-%m-%d").to_string())
+/// Dates and times are this Mac's local time — the server runs on the user's own
+/// machine, and it is the time the app itself shows for a note.
+fn fmt_local(ms: i64, format: &str) -> String {
+    chrono::DateTime::from_timestamp_millis(ms)
+        .map(|dt| dt.with_timezone(&chrono::Local).format(format).to_string())
         .unwrap_or_default()
+}
+
+fn fmt_date(ms: i64) -> String {
+    fmt_local(ms, "%Y-%m-%d")
+}
+
+/// A note's own moment, date first so a reader that only wants `YYYY-MM-DD` still
+/// finds it, and with the offset of that instant so a consumer never has to guess the
+/// zone.
+fn fmt_stamp(ms: i64) -> String {
+    fmt_local(ms, "%Y-%m-%d %H:%M %:z")
+}
+
+/// The first instant of `day` here. A zone whose clocks skip midnight starts that day
+/// at the first hour that exists.
+fn local_midnight(day: chrono::NaiveDate) -> Option<i64> {
+    use chrono::TimeZone;
+    (0..3)
+        .find_map(|h| chrono::Local.from_local_datetime(&day.and_hms_opt(h, 0, 0)?).earliest())
+        .map(|dt| dt.timestamp_millis())
 }
 
 /// Cut a fragment that has to stay on ONE line — a listing row's summary, a search
@@ -696,7 +720,7 @@ fn run_search(conn: &Connection, workspace: &str, args: &Value, now_ms: i64) -> 
         lines.push(format!(
             "\"{}\" ({}) [id: {}]{}{}:",
             title_or_untitled(&first.note_title),
-            fmt_date(first.note_created_at),
+            fmt_stamp(first.note_created_at),
             note_id,
             lang_of(&langs, note_id),
             coverage
@@ -782,7 +806,7 @@ fn fetch_with_header(
     let header = reference_framing(&format!(
         "{lead} \"{}\" ({}) [id: {}]{}{}{}{}{tail}",
         title_or_untitled(&note.title),
-        fmt_date(note.created_at),
+        fmt_stamp(note.created_at),
         note.id,
         lang_of(&langs, note_id),
         client,
@@ -941,7 +965,7 @@ fn run_transcript(conn: &Connection, workspace: &str, args: &Value) -> Outcome {
             "Note \"{}\" ({}) has no transcript — it was typed rather than recorded, or the \
              recording produced no speech. Do not treat this as evidence about what was said.",
             title_or_untitled(&note.title),
-            fmt_date(note.created_at)
+            fmt_stamp(note.created_at)
         ));
     }
     Outcome::ok(format!("{header}\n{}", truncate_block(&note.transcript, TRANSCRIPT_CHARS)))
@@ -998,7 +1022,7 @@ fn run_list(conn: &Connection, workspace: &str, args: &Value, now_ms: i64) -> Ou
             "{}. \"{}\" ({}) [id: {}]{}{}{}{}",
             i + 1,
             title_or_untitled(&n.title),
-            fmt_date(n.created_at),
+            fmt_stamp(n.created_at),
             n.id,
             lang_of(&langs, &n.id),
             client_of(n),
