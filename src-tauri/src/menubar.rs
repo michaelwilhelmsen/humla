@@ -527,6 +527,57 @@ fn main_window_visible(app: &AppHandle) -> bool {
         .unwrap_or(false)
 }
 
+/// Passed only by the login item Humla registers itself (#207), which is what
+/// tells a login launch apart from one the user started. A login item added by
+/// hand in System Settings carries no arguments, so it reads as a manual launch.
+pub const LOGIN_LAUNCH_ARG: &str = "--hidden";
+
+/// Should this launch stay in the menu bar without presenting the window?
+///
+/// `args` includes the executable path at index 0, as `std::env::args` does.
+/// Onboarding not yet finished always shows the window: a first run that
+/// starts hidden would leave a new user with nothing to set up.
+pub fn starts_hidden(args: impl IntoIterator<Item = String>, onboarded: bool) -> bool {
+    onboarded && args.into_iter().skip(1).any(|a| a == LOGIN_LAUNCH_ARG)
+}
+
+/// Why the running copy can't be registered as a login item, if it can't. The
+/// login item records this path, and a copy run from the mounted DMG or from
+/// App Translocation's temporary location is gone by the next login.
+pub fn login_item_path_problem(exe: &std::path::Path) -> Option<&'static str> {
+    let path = exe.to_string_lossy();
+    if path.starts_with("/Volumes/") || path.contains("/AppTranslocation/") {
+        Some("Move Humla to your Applications folder and open it from there first.")
+    } else {
+        None
+    }
+}
+
+/// Present the window at launch, or leave Humla in the menu bar after a login
+/// launch. The window is declared invisible in `tauri.conf.json`, so a hidden
+/// launch never flashes it. Without a tray there would be nothing on screen to
+/// reach Humla by, so a launch whose tray failed always shows the window.
+pub fn present_at_launch(app: &AppHandle, tray_installed: bool) {
+    let onboarded = app
+        .try_state::<AppState>()
+        .map(|state| {
+            let conn = state.db.lock();
+            db::get_setting(&conn, "onboarding_completed")
+                .ok()
+                .flatten()
+                .as_deref()
+                == Some("true")
+        })
+        .unwrap_or(false);
+    if tray_installed && starts_hidden(std::env::args(), onboarded) {
+        #[cfg(target_os = "macos")]
+        let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+    } else if let Some(w) = app.get_webview_window("main") {
+        let _ = w.show();
+        let _ = w.set_focus();
+    }
+}
+
 /// Bring the window back and put the Dock icon with it.
 pub fn show_main_window(app: &AppHandle) {
     #[cfg(target_os = "macos")]
@@ -980,5 +1031,44 @@ mod tests {
         assert_eq!(alpha(0.5, 0.13), 0);
         // Colour is carried on every pixel; only alpha shapes the glyph.
         assert_eq!(&rgba[0..3], &[1, 2, 3]);
+    }
+
+    #[test]
+    fn a_login_item_refuses_a_path_that_wont_survive_the_session() {
+        use std::path::Path;
+        assert!(login_item_path_problem(Path::new(
+            "/Volumes/Humla/Humla.app/Contents/MacOS/humla"
+        ))
+        .is_some());
+        assert!(login_item_path_problem(Path::new(
+            "/private/var/folders/x/T/AppTranslocation/ABC/d/Humla.app/Contents/MacOS/humla"
+        ))
+        .is_some());
+        assert!(login_item_path_problem(Path::new(
+            "/Applications/Humla.app/Contents/MacOS/humla"
+        ))
+        .is_none());
+    }
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn only_a_login_launch_starts_hidden() {
+        let exe = "/Applications/Humla.app/Contents/MacOS/humla";
+        assert!(starts_hidden(args(&[exe, LOGIN_LAUNCH_ARG]), true));
+        assert!(!starts_hidden(args(&[exe]), true));
+    }
+
+    #[test]
+    fn an_unfinished_onboarding_always_shows_the_window() {
+        let exe = "/Applications/Humla.app/Contents/MacOS/humla";
+        assert!(!starts_hidden(args(&[exe, LOGIN_LAUNCH_ARG]), false));
+    }
+
+    #[test]
+    fn the_executable_path_is_never_read_as_the_flag() {
+        assert!(!starts_hidden(args(&[LOGIN_LAUNCH_ARG]), true));
     }
 }

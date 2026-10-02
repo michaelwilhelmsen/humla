@@ -3,6 +3,7 @@ import { Permissions } from "../../../components/Permissions";
 import { ipc, type StoredAudioStats } from "../../../lib/ipc";
 import { formatBytes, s as plural } from "../components/format";
 import { HotkeyField } from "../components/HotkeyField";
+import { LaunchAtLoginField } from "../components/LaunchAtLoginField";
 import { Row, Section } from "../components/Section";
 import { Toggle } from "../components/Toggle";
 import type { SettingsHook } from "../useSettings";
@@ -86,6 +87,11 @@ export function RecordingSection({
       </Section>
 
       <Section title="Menu bar">
+        <Row
+          label="Open at login"
+          description="Humla starts in the menu bar when you log in, without opening its window. If you added Humla to Login Items in System Settings, remove it there."
+          control={<LaunchAtLoginField />}
+        />
         <Row
           label="Keep running in the menu bar"
           // Off by default, so closing the window still quits until the user

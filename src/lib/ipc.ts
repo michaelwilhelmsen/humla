@@ -387,6 +387,9 @@ export const ipc = {
    *  the combination — another app already owns it — leaving the previous one
    *  in place. */
   recordHotkeySet: (accel: string) => invoke<void>("record_hotkey_set", { accel }),
+  /** Whether Humla's own login item is installed (#207). */
+  launchAtLoginGet: () => invoke<boolean>("launch_at_login_get"),
+  launchAtLoginSet: (on: boolean) => invoke<void>("launch_at_login_set", { on }),
   appDataDir: () => invoke<string>("app_data_dir"),
   // CPU architecture of the running process ("aarch64", "x86_64", …).
   // Onboarding uses it to steer Intel Macs toward cloud transcription.

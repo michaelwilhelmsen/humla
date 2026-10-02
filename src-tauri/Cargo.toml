@@ -79,6 +79,7 @@ rmcp = { version = "3", default-features = false, features = ["server", "transpo
 # The lag of the mic behind the system stream and the echo canceller, for the
 # diarize input. No DSP dependencies of its own.
 echo-probe = { path = "crates/echo-probe" }
+tauri-plugin-autostart = "~2.5"
 
 [dev-dependencies]
 tempfile = "3"

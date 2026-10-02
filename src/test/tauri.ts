@@ -46,6 +46,8 @@ export function mockTauri(
         return "idle";
       case "record_hotkey_get":
         return "Command+Control+KeyR";
+      case "launch_at_login_get":
+        return false;
       case "note_timeline_repair":
         return { repaired: false, coversTranscript: true };
       case "stored_audio_stats":

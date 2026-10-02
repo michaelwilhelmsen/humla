@@ -113,6 +113,14 @@ where
         // `menubar::install` registers it from there.
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_notification::init())
+        // Open at login (#207). Only the Settings toggle turns it on; the
+        // argument is how `menubar::present_at_launch` recognises the launch.
+        .plugin(
+            tauri_plugin_autostart::Builder::new()
+                .app_name("no.humla.app")
+                .arg(menubar::LOGIN_LAUNCH_ARG)
+                .build(),
+        )
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 // With `close_to_tray` on, the close button hides the window and
@@ -300,9 +308,14 @@ where
             // Tray + global hotkey. Last in setup so a failure here can't stop
             // the app from coming up — the menu bar is an extra surface, not a
             // precondition for using Humla.
-            if let Err(e) = menubar::install(app.handle()) {
-                eprintln!("[menubar] install failed: {e}");
-            }
+            let tray_installed = match menubar::install(app.handle()) {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!("[menubar] install failed: {e}");
+                    false
+                }
+            };
+            menubar::present_at_launch(app.handle(), tray_installed);
 
             Ok(())
         })
@@ -441,6 +454,8 @@ where
             commands::permissions_open_settings,
             commands::record_hotkey_get,
             commands::record_hotkey_set,
+            commands::launch_at_login_get,
+            commands::launch_at_login_set,
             app_relaunch,
         ])
         .build(tauri::generate_context!())

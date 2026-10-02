@@ -495,6 +495,8 @@ function menubarCase(closeToTray: boolean, hotkey: string): Scenario {
     ipc: {
       record_hotkey_get: () => hotkey,
       record_hotkey_set: () => null,
+      launch_at_login_get: () => closeToTray,
+      launch_at_login_set: () => null,
       permissions_status: () => ({ microphone: "granted", screen: "granted" }),
       stored_audio_stats: () => ({ notes: 0, files: 0, bytes: 0, noteIds: [] }),
     },
