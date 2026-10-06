@@ -11,6 +11,25 @@ export type Release = {
 
 export const releases: Release[] = [
   {
+    version: "0.66.0",
+    date: "2026-10-06",
+    title: "Start quietly in the menu bar",
+    summary: "Humla can now open when you log in, hidden in the menu bar and ready to record.",
+    paragraphs: [
+      "There’s a new Open at login setting under Settings → Recording. Turn it on and Humla starts with your Mac, straight into the menu bar, with no window and no Dock icon. Start a recording from the menu bar icon whenever a meeting begins.",
+      "When you want the window, open Humla from Finder or Spotlight, or pick Open from the menu bar icon. Opening Humla yourself always shows the window as before; only the login launch stays hidden.",
+      "If Humla is still running from the disk image or a Downloads copy macOS has moved aside, the setting asks you to move it to Applications first, since that copy won’t be there at your next login.",
+    ],
+    highlights: [
+      "Open at login, hidden in the menu bar.",
+      "No window or Dock icon until you ask for one.",
+      "Finder, Spotlight or the menu bar’s Open bring the window back.",
+    ],
+    issues: [
+      { title: "Feature Request: Start Humla Minimized / Hidden on macOS", reference: "#207", status: "Closed", url: "https://github.com/michaelwilhelmsen/humla/issues/207" },
+    ],
+  },
+  {
     version: "0.65.2",
     date: "2026-10-02",
     title: "Local chat answers again",
