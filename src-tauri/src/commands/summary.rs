@@ -176,7 +176,7 @@ pub(super) fn resolve_provider(
                 think: false,
             })
         }
-        ProviderId::Deepgram | ProviderId::Groq => unreachable!("filtered on the summarize capability"),
+        ProviderId::Deepgram | ProviderId::Groq | ProviderId::SixtyDb => unreachable!("filtered on the summarize capability"),
     }
 }
 

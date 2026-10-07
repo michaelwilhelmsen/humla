@@ -5,6 +5,7 @@ mod auth;
 mod config;
 mod deepgram;
 mod groq;
+mod sixtydb;
 mod keychain;
 mod local;
 mod openai;
@@ -23,6 +24,7 @@ pub use keychain::{
 };
 pub use deepgram::DeepgramAdapter;
 pub use groq::GroqAdapter;
+pub use sixtydb::SixtyDbAdapter;
 pub use local::LocalWhisperAdapter;
 pub use openai::OpenAiAdapter;
 
@@ -62,6 +64,7 @@ pub fn build_adapter(
             ))
         }
         ProviderConfig::Groq(_) => Box::new(GroqAdapter::new()),
+        ProviderConfig::SixtyDb(_) => Box::new(SixtyDbAdapter::new()),
         ProviderConfig::Deepgram(_) => Box::new(DeepgramAdapter::new()),
     }
 }

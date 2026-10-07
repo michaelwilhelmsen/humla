@@ -29,13 +29,14 @@ const MODEL_DESCRIPTIONS: Record<TranscribeProvider, string> = {
   deepgram:
     "nova-3 is the current best for English and falls back gracefully to other languages.",
   groq: "Whisper Large v3 Turbo at OpenAI-compatible endpoints — same Whisper quality, ~10× cheaper and faster than OpenAI's hosted version.",
+  sixtydb: "Cloud transcription with word timings and vocabulary hints. Language support is determined by the 60db STT catalog.",
   local:
     "Only downloaded models are offered — manage them under Local models below.",
 };
 
 // Reusable provider+model picker rendered as self-describing rows. Used by
 // the Default provider section and the per-language override editor. Keeps
-// the four provider variants' divergent fields (OpenAI: model, Local:
+// the provider variants' divergent fields (OpenAI: model, Local:
 // model_id+preset+gpu, Deepgram: model, Groq: model) in one place so the
 // two callers stay in lockstep.
 //
@@ -99,6 +100,8 @@ export function ProviderConfigForm({
         onChange={(v) => onChange({ provider: "groq", model: v })}
         options={GROQ_MODELS.map((m) => ({ value: m, label: m }))}
       />
+    ) : value.provider === "sixtydb" ? (
+      <span className="text-sm">60db STT v01</span>
     ) : (
       <Select
         value={value.model_id}
@@ -145,6 +148,8 @@ export function ProviderConfigForm({
                 });
               } else if (p === "deepgram") {
                 onChange({ provider: "deepgram", model: "nova-3" });
+              } else if (p === "sixtydb") {
+                onChange({ provider: "sixtydb", model: "60db-stt-v01" });
               } else if (p === "groq") {
                 onChange({ provider: "groq", model: "whisper-large-v3-turbo" });
               }

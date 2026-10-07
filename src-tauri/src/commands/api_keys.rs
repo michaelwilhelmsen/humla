@@ -166,7 +166,15 @@ pub async fn provider_key_test(
     let test = ProviderId::parse(id)
         .and_then(|p| p.spec().key_test)
         .ok_or_else(|| format!("provider {id} doesn't support test"))?;
-    let mut req = openai::client().get(test.url);
+    let client = if id == "sixtydb" {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(30))
+            .build().map_err(err)?
+    } else {
+        openai::client()
+    };
+    let mut req = client.get(test.url);
     for (name, value) in test.auth.headers(&key) {
         req = req.header(name, value);
     }
@@ -178,8 +186,10 @@ pub async fn provider_key_test(
     if status.is_success() {
         return Ok(TestResult { ok: true, status: status.as_u16(), error: None });
     }
-    let body = r.text().await.unwrap_or_default();
-    let error = if id == "anthropic" {
+    let body = if id == "sixtydb" { String::new() } else { r.text().await.unwrap_or_default() };
+    let error = if id == "sixtydb" {
+        format!("60db key test failed (HTTP {})", status.as_u16())
+    } else if id == "anthropic" {
         crate::anthropic::readable_error(status.as_u16(), &body)
     } else {
         body.chars().take(300).collect()
