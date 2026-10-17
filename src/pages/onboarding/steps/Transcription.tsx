@@ -81,6 +81,8 @@ function cloudConfig(provider: CloudTranscribeProvider): ProviderConfig {
       return { provider: "openai", model: "whisper-1" };
     case "deepgram":
       return { provider: "deepgram", model: "nova-3" };
+    case "sixtydb":
+      return { provider: "sixtydb", model: "60db-stt-v01" };
     case "groq":
       return { provider: "groq", model: "whisper-large-v3-turbo" };
   }
@@ -90,6 +92,7 @@ function cloudConfig(provider: CloudTranscribeProvider): ProviderConfig {
 // so a new Keychain provider is a compile error here until it has a row.
 const CLOUD_COPY: Record<CloudTranscribeProvider, { label: string; placeholder: string }> = {
   openai: { label: "OpenAI", placeholder: "sk-…" },
+  sixtydb: { label: "60db", placeholder: "60db API key" },
   deepgram: { label: "Deepgram", placeholder: "Deepgram API key" },
   groq: { label: "Groq (Whisper Large v3 Turbo)", placeholder: "gsk_…" },
 };

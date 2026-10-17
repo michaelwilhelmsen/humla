@@ -10,6 +10,7 @@ pub enum ProviderId {
     Anthropic,
     Deepgram,
     Groq,
+    SixtyDb,
     /// Local Whisper for transcription; any OpenAI-compatible server (Ollama,
     /// LM Studio, llama-server) for summaries and chat.
     Local,
@@ -105,6 +106,17 @@ pub const REGISTRY: &[ProviderSpec] = &[
         keychain_account: Some("groq_api_key"),
         key_test: Some(KeyTest {
             url: "https://api.groq.com/openai/v1/models",
+            auth: AuthScheme::Bearer,
+        }),
+        capabilities: Capabilities { summarize: false, chat: false, transcribe: true },
+    },
+    ProviderSpec {
+        id: ProviderId::SixtyDb,
+        id_str: "sixtydb",
+        label: "60db",
+        keychain_account: Some("sixtydb_api_key"),
+        key_test: Some(KeyTest {
+            url: "https://api.60db.ai/stt/models",
             auth: AuthScheme::Bearer,
         }),
         capabilities: Capabilities { summarize: false, chat: false, transcribe: true },
