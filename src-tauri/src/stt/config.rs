@@ -19,6 +19,8 @@ pub enum ProviderConfig {
     Deepgram(DeepgramConfig),
     #[serde(rename = "groq")]
     Groq(GroqConfig),
+    #[serde(rename = "sixtydb")]
+    SixtyDb(SixtyDbConfig),
 }
 
 impl ProviderConfig {
@@ -28,6 +30,7 @@ impl ProviderConfig {
             ProviderConfig::Local(_) => ProviderId::Local,
             ProviderConfig::Deepgram(_) => ProviderId::Deepgram,
             ProviderConfig::Groq(_) => ProviderId::Groq,
+            ProviderConfig::SixtyDb(_) => ProviderId::SixtyDb,
         }
     }
 
@@ -41,6 +44,7 @@ impl ProviderConfig {
             ProviderConfig::Local(c) => &c.model_id,
             ProviderConfig::Deepgram(c) => &c.model,
             ProviderConfig::Groq(c) => &c.model,
+            ProviderConfig::SixtyDb(c) => &c.model,
         }
     }
 
@@ -52,7 +56,7 @@ impl ProviderConfig {
             // Groq's URL is fixed; if a user wanted to point at a self-
             // hosted Groq-compat server they'd switch to the OpenAI
             // provider with a custom base_url.
-            ProviderConfig::Groq(_) => None,
+            ProviderConfig::Groq(_) | ProviderConfig::SixtyDb(_) => None,
         }
     }
 }
@@ -76,6 +80,11 @@ pub struct DeepgramConfig {
     pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SixtyDbConfig {
+    pub model: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -153,6 +162,20 @@ pub fn from_legacy_settings(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sixtydb_config_routes_and_round_trips() {
+        let cfg = ProviderConfig::SixtyDb(SixtyDbConfig { model: "60db-stt-v01".into() });
+        let mut languages = BTreeMap::new();
+        languages.insert("en".into(), cfg.clone());
+        let settings = TranscribeConfig { default: from_legacy_settings(None, None, None, None, None), per_language: languages };
+        let encoded = serde_json::to_string(&settings).unwrap();
+        let decoded: TranscribeConfig = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.resolve("en"), &cfg);
+        assert_eq!(decoded.resolve("en").provider_id(), "sixtydb");
+        assert_eq!(decoded.resolve("auto").provider_id(), "openai");
+        assert_eq!(super::super::build_adapter(&cfg, None).provider_id(), "sixtydb");
+    }
 
     #[test]
     fn openai_round_trips_through_json() {
