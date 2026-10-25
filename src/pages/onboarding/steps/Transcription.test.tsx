@@ -530,6 +530,29 @@ describe("onboarding TranscriptionStep — on-device download flow", () => {
 });
 
 describe("onboarding TranscriptionStep — cloud path", () => {
+  it("tests a stored 60db key and preserves language overrides when committing", async () => {
+    let written: TranscribeConfig | null = null;
+    const tested: unknown[] = [];
+    renderStep({
+      get_transcribe_config: () => ({
+        default: { provider: "sixtydb", model: "60db-stt-v01" },
+        per_language: { no: { provider: "local", model_id: NB, preset: "quality", use_gpu: true } },
+      }),
+      provider_key_get: (args) => (args as { provider: string }).provider === "sixtydb" ? "stored" : null,
+      provider_key_test: (args) => { tested.push(args); return { ok: true, status: 200, error: null }; },
+      set_transcribe_config: (args) => { written = (args as { config: TranscribeConfig }).config; return null; },
+    });
+    await onDeviceCard();
+    expect(await screen.findByPlaceholderText("•••••••• stored")).toBeInTheDocument();
+    expect(screen.getByRole("combobox", { name: "Provider" })).toHaveTextContent("60db");
+    expect(screen.getByRole("button", { name: /^continue$/i })).toBeDisabled();
+    await userEvent.click(screen.getByRole("button", { name: /^test$/i }));
+    expect(await screen.findByText(/connected — 60db/i)).toBeInTheDocument();
+    expect(tested).toEqual([{ provider: "sixtydb" }]);
+    expect(written!.default).toEqual({ provider: "sixtydb", model: "60db-stt-v01" });
+    expect(written!.per_language.no).toMatchObject({ provider: "local", model_id: NB });
+  });
+
   it("a passing key Test commits the provider as the transcription default", async () => {
     let written: TranscribeConfig | null = null;
     renderStep({

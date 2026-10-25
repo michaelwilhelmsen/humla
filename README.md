@@ -54,6 +54,7 @@ Pick the transcription engine that fits, and you can mix-and-match **per languag
 - **Local Whisper** — runs entirely on your Mac via Apple Silicon's GPU. Free after a one-time download. Multiple multilingual models plus a **Norwegian-tuned model** (NB Whisper Large from Nasjonalbiblioteket).
 - **OpenAI** — `whisper-1`, `gpt-4o-transcribe`, `gpt-4o-mini-transcribe`, `gpt-4o-transcribe-diarize`.
 - **Deepgram** — Nova-3 / Nova-2, native diarization, very strong on conversational English.
+- **60db** — cloud speech-to-text with word timestamps and custom vocabulary hints. Choose 60db in Settings → Transcription, save and test your API key, then use it as the default or a per-language override. Audio chunks are sent to `api.60db.ai`; speaker identification still runs on your Mac. See the [supported language catalog](https://docs.60db.ai/api-reference/stt/get-languages) before assigning a language override.
 - **Groq** — `whisper-large-v3-turbo` at OpenAI-compatible endpoints — same Whisper quality, ~10× cheaper and faster than OpenAI's hosted Whisper.
 
 Set a **default provider** in Settings, then add **per-language overrides** if you want — e.g. *Norwegian → Local NB Whisper, English → Deepgram, fallback → OpenAI*. Humla picks the right one automatically based on the recording's language.
@@ -117,7 +118,7 @@ The defaults are designed so nothing you write leaves your machine unless you te
   - The setting describes **this Mac**, not just its own recordings — with it off, a teammate's synced audio isn't downloaded here either.
   - Turning it off is going-forward only. **Delete stored audio…**, in the same settings section, sweeps what's already on disk and keeps every transcript and timeline.
 - **The MCP server is off until you enable it**, and read-only when you do. It's a local binary reading the same SQLite database — no port, no network, and no tool that can reach a recording. Turning it off in Settings takes effect on the next tool call, not at the client's next restart.
-- **API keys** are stored in the macOS **Keychain** (one entry per provider — OpenAI, Deepgram, Groq), not in plaintext on disk.
+- **API keys** are stored in the macOS **Keychain** (one entry per provider — OpenAI, Deepgram, Groq, 60db), not in plaintext on disk.
 - **Model downloads** are one-time fetches from HuggingFace; the files live in `~/Library/Application Support/no.humla.app/models/` and `~/Library/Application Support/FluidAudio/Models/`.
 
 If you use only Local Whisper + the on-device speaker labels + a local LLM for summaries, **no audio or text ever leaves your Mac**.
