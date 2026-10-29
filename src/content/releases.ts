@@ -3,13 +3,33 @@ export type Release = {
   date: string;
   title: string;
   summary: string;
-  visual?: "filters" | "privacy" | "activity" | "updates" | "speakers" | "webhook" | "export" | "two-factor" | "date" | "audio" | "copilot";
+  visual?: "filters" | "privacy" | "activity" | "updates" | "speakers" | "webhook" | "export" | "two-factor" | "date" | "audio" | "copilot" | "custom";
   paragraphs: string[];
   highlights: string[];
   issues: { title: string; reference: string; status: "Open" | "Closed"; url: string }[];
 };
 
 export const releases: Release[] = [
+  {
+    version: "0.73.0",
+    date: "2026-10-29",
+    title: "Use any OpenAI-compatible API",
+    summary: "Bring your own endpoint, like OpenRouter, for summaries, chat and transcription.",
+    visual: "custom",
+    paragraphs: [
+      "Summaries, chat and transcription now have a Custom provider: any service that speaks the OpenAI API, such as OpenRouter, Together, DeepSeek or your company's own gateway. Pick Custom under Settings → Summary, Chat or Transcription, enter the base URL and, if the service needs one, an API key, then type the model you want. One endpoint serves all three, and each picks its own model.",
+      "Humla uses the URL exactly as you type it, and when something's wrong the error shows the full address it tried. Test checks the service's model list and a short reply separately, since some services don't list their models at all. The key is kept in your Keychain.",
+      "Transcription asks for word timings, so playback can highlight each word as it's spoken. A model that can't give them still transcribes, just without the highlighting. Chat on a custom endpoint searches your notes by keyword.",
+    ],
+    highlights: [
+      "Pick Custom for summaries, chat or transcription.",
+      "Works with OpenRouter and other OpenAI-compatible APIs.",
+      "The API key is optional and stays in your Keychain.",
+    ],
+    issues: [
+      { title: "Custom OpenAI-compatible provider: user-supplied base URL + API key", reference: "#173", status: "Closed", url: "https://github.com/michaelwilhelmsen/humla/issues/173" },
+    ],
+  },
   {
     version: "0.72.1",
     date: "2026-10-29",

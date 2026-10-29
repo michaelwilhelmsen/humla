@@ -51,6 +51,7 @@ const VISUAL_CAPTION: Record<NonNullable<Release["visual"]>, string> = {
   date: "Set when a meeting happened.",
   audio: "Save a meeting’s recording.",
   copilot: "Use the Copilot subscription you already have.",
+  custom: "Bring any OpenAI-compatible API.",
 };
 
 function ReleaseVisual({ kind }: { kind: NonNullable<Release["visual"]> }) {
@@ -134,6 +135,15 @@ function ReleaseVisual({ kind }: { kind: NonNullable<Release["visual"]> }) {
             <li className="is-total"><span>Model</span><span>Claude Sonnet 5.5</span></li>
           </ul>
           <div className="release-preview-sent"><CircleCheck size={14} strokeWidth={1.8} />Summary written with your Copilot subscription</div>
+        </>}
+        {kind === "custom" && <>
+          <div className="release-demo-heading"><span>Custom endpoint</span></div>
+          <ul className="release-preview-takes">
+            <li><span>Base URL</span><span>openrouter.ai/api/v1</span></li>
+            <li><span>Transcription</span><span>elevenlabs/scribe-v2</span></li>
+            <li className="is-total"><span>Summaries</span><span>deepseek-v4.1-flash</span></li>
+          </ul>
+          <div className="release-preview-sent"><CircleCheck size={14} strokeWidth={1.8} />Model list and reply OK</div>
         </>}
         {kind === "two-factor" && <>
           <div className="release-demo-heading"><span>Two-factor authentication</span></div>
