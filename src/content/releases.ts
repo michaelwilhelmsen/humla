@@ -11,6 +11,19 @@ export type Release = {
 
 export const releases: Release[] = [
   {
+    version: "0.72.1",
+    date: "2026-10-29",
+    title: "Humla opens on macOS Ventura and Sonoma again",
+    summary: "Humla quit right after opening on Macs older than macOS Sequoia. This fixes it.",
+    paragraphs: [
+      "On macOS 13 Ventura and macOS 14 Sonoma, Humla quit as soon as it opened, with a “Humla quit unexpectedly” message. Part of the on-device transcription code needed something only macOS 15 Sequoia has. Humla now starts on macOS 13 and later again, and uses the newer feature only on Macs that have it.",
+    ],
+    highlights: [
+      "Humla opens again on macOS 13 Ventura and macOS 14 Sonoma.",
+    ],
+    issues: [],
+  },
+  {
     version: "0.72.0",
     date: "2026-10-27",
     title: "Use your GitHub Copilot",
