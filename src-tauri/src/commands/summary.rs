@@ -11,6 +11,7 @@ use super::{DEFAULT_LANGUAGE, DEFAULT_LOCAL_LLM_BASE_URL, DEFAULT_SUMMARY_MODEL}
 use crate::db::{self, Note, NotePatch};
 use crate::languages;
 use crate::anthropic;
+use crate::custom_endpoint;
 use crate::openai;
 use crate::presets::{self, DEFAULT_SUMMARY_PRESET};
 use crate::providers::ProviderId;
@@ -41,6 +42,9 @@ pub(super) struct ResolvedProvider {
 pub(super) enum Dispatch {
     Anthropic,
     Copilot,
+    /// The user's own endpoint, which is never treated as OpenAI or Ollama
+    /// whatever its URL looks like.
+    Custom,
     OpenAiCompatible,
 }
 
@@ -49,6 +53,7 @@ impl ResolvedProvider {
         match self.provider {
             ProviderId::Anthropic => Dispatch::Anthropic,
             ProviderId::Copilot => Dispatch::Copilot,
+            ProviderId::Custom => Dispatch::Custom,
             _ => Dispatch::OpenAiCompatible,
         }
     }
@@ -75,6 +80,11 @@ impl ResolvedProvider {
                     .as_ref()
                     .ok_or_else(|| anyhow::anyhow!("the Copilot CLI isn't running"))?;
                 crate::copilot::session::complete(client, &self.model, system_prompt, user_message, on_chunk)
+                    .await
+            }
+            Dispatch::Custom => {
+                let key = Some(self.api_key.as_str()).filter(|k| !k.is_empty());
+                openai::summarize_custom(&self.base_url, key, &self.model, system_prompt, user_message, on_chunk)
                     .await
             }
             Dispatch::OpenAiCompatible => {
@@ -214,6 +224,20 @@ pub(super) fn resolve_provider(
                 provider: id,
                 base_url: String::new(),
                 api_key: String::new(),
+                model,
+                think: false,
+                copilot: None,
+            })
+        }
+        ProviderId::Custom => {
+            let base_url = custom_endpoint::base_url(conn)?;
+            let model = custom_endpoint::model(conn, custom_endpoint::SUMMARY_MODEL_SETTING)?;
+            eprintln!("[llm] resolved custom: url={base_url} model={model}");
+            Ok(ResolvedProvider {
+                provider: id,
+                base_url,
+                // Optional: empty means the endpoint takes no key.
+                api_key: api_key.unwrap_or_default(),
                 model,
                 think: false,
                 copilot: None,
@@ -620,6 +644,41 @@ mod tests {
         db::set_setting(&conn, "anthropic_model", "claude-opus-5").unwrap();
         let note = db::create_note(&conn, "no", "meeting", "").unwrap();
         assert_eq!(resolve_provider(&conn, &note, None).unwrap().model, "claude-sonnet-5.5");
+    }
+
+    #[test]
+    fn custom_resolves_to_its_own_endpoint_and_summary_model_without_a_key() {
+        let (_dir, conn) = temp_conn();
+        db::set_setting(&conn, "summary_provider", "custom").unwrap();
+        // Used as typed: surrounding whitespace is an input artifact, the
+        // trailing slash is not Humla's to remove.
+        db::set_setting(&conn, "custom_base_url", "  https://openrouter.ai/api/v1/ ").unwrap();
+        db::set_setting(&conn, "custom_model", "deepseek/deepseek-chat").unwrap();
+        db::set_setting(&conn, "local_llm_model", "gemma4:12b-mlx").unwrap();
+        db::set_setting(&conn, "summary_model", "gpt-5.4").unwrap();
+        let note = db::create_note(&conn, "no", "meeting", "").unwrap();
+        let p = resolve_provider(&conn, &note, None).unwrap();
+        assert_eq!(p.provider, ProviderId::Custom);
+        assert_eq!(p.dispatch(), Dispatch::Custom);
+        assert_eq!(p.base_url, "https://openrouter.ai/api/v1/");
+        assert_eq!(p.model, "deepseek/deepseek-chat");
+        assert_eq!(p.api_key, "");
+        let keyed = resolve_provider(&conn, &note, Some("sk-or-test".into())).unwrap();
+        assert_eq!(keyed.api_key, "sk-or-test");
+    }
+
+    #[test]
+    fn custom_without_a_base_url_or_a_model_says_which() {
+        let (_dir, conn) = temp_conn();
+        db::set_setting(&conn, "summary_provider", "custom").unwrap();
+        db::set_setting(&conn, "custom_model", "m").unwrap();
+        let note = db::create_note(&conn, "no", "meeting", "").unwrap();
+        let err = resolve_provider(&conn, &note, None).err().unwrap().to_string();
+        assert!(err.contains("base URL"), "{err}");
+        db::set_setting(&conn, "custom_base_url", "https://gateway.example/v1").unwrap();
+        db::set_setting(&conn, "custom_model", "  ").unwrap();
+        let err = resolve_provider(&conn, &note, None).err().unwrap().to_string();
+        assert!(err.contains("model"), "{err}");
     }
 
     #[test]

@@ -12,6 +12,7 @@ import type { TranscribeProvider } from "../../../lib/providers";
 import { Row } from "./Section";
 import { Select } from "../../../components/ui/Select";
 import { Toggle } from "./Toggle";
+import { CustomModelField } from "../../../components/provider/CustomEndpoint";
 
 type LocalModelSummary = {
   id: string;
@@ -31,6 +32,8 @@ const MODEL_DESCRIPTIONS: Record<TranscribeProvider, string> = {
   groq: "Whisper Large v3 Turbo at OpenAI-compatible endpoints — same Whisper quality, ~10× cheaper and faster than OpenAI's hosted version.",
   local:
     "Only downloaded models are offered — manage them under Local models below.",
+  custom:
+    "Typed as the endpoint names it, e.g. elevenlabs/scribe-v2 on OpenRouter. Word timings are asked for; a model that refuses them still transcribes, without per-word highlighting.",
 };
 
 // Reusable provider+model picker rendered as self-describing rows. Used by
@@ -99,7 +102,7 @@ export function ProviderConfigForm({
         onChange={(v) => onChange({ provider: "groq", model: v })}
         options={GROQ_MODELS.map((m) => ({ value: m, label: m }))}
       />
-    ) : (
+    ) : value.provider === "custom" ? null : (
       <Select
         value={value.model_id}
         onChange={(v) => onChange({ ...value, model_id: v })}
@@ -147,6 +150,8 @@ export function ProviderConfigForm({
                 onChange({ provider: "deepgram", model: "nova-3" });
               } else if (p === "groq") {
                 onChange({ provider: "groq", model: "whisper-large-v3-turbo" });
+              } else if (p === "custom") {
+                onChange({ provider: "custom", model: "" });
               }
             }}
             options={
@@ -156,11 +161,15 @@ export function ProviderConfigForm({
         }
       />
 
-      <Row
-        label="Model"
-        description={MODEL_DESCRIPTIONS[provider]}
-        control={modelSelect}
-      />
+      {value.provider === "custom" ? (
+        <CustomModelField
+          value={value.model}
+          onChange={(model) => onChange({ provider: "custom", model })}
+          description={MODEL_DESCRIPTIONS.custom}
+        />
+      ) : (
+        <Row label="Model" description={MODEL_DESCRIPTIONS[provider]} control={modelSelect} />
+      )}
 
       {value.provider === "local" && (
         <>

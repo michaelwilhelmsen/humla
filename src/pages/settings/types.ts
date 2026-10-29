@@ -50,6 +50,9 @@ export const DEFAULTS: Record<EditableKey, string> = {
   anthropic_model: "claude-sonnet-5",
   copilot_model: "auto",
   copilot_chat_model: "auto",
+  custom_base_url: "",
+  custom_model: "",
+  custom_chat_model: "",
   summary_provider: "openai",
   local_llm_base_url: "http://localhost:11434/v1",
   local_llm_model: "",
@@ -69,6 +72,7 @@ export const PROVIDERS_BASE = [
   { value: "openai", label: "OpenAI" },
   { value: "deepgram", label: "Deepgram" },
   { value: "groq", label: "Groq (Whisper Large v3 Turbo)" },
+  { value: "custom", label: "Custom (OpenAI-compatible API)" },
 ];
 export const LOCAL_PROVIDER = {
   value: "local",
@@ -83,6 +87,7 @@ const PROVIDER_PICKER_LABEL: Record<Provider, string> = {
   anthropic: "Cloud (Anthropic)",
   copilot: "Cloud (GitHub Copilot)",
   local: "Local (any OpenAI-compatible server)",
+  custom: "Custom (OpenAI-compatible API)",
   deepgram: "Deepgram",
   groq: "Groq",
 };

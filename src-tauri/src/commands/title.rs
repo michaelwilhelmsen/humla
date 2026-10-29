@@ -31,6 +31,7 @@ use super::TITLE_FALLBACK_MODEL;
 use crate::db::{self, NotePatch};
 use crate::menubar::is_replaceable_title;
 use crate::openai;
+use crate::providers::ProviderId;
 use crate::recording::TitleStatusPayload;
 use crate::AppState;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -296,7 +297,7 @@ async fn try_generate_note_title(
     // Thinking on a five-word title is waste, whatever the user set for
     // summaries.
     provider.think = false;
-    if provider.base_url == openai::BASE && openai::is_reasoning_model(&provider.model) {
+    if provider.provider == ProviderId::OpenAi && openai::is_reasoning_model(&provider.model) {
         provider.model = TITLE_FALLBACK_MODEL.to_string();
     }
     // Everything cheap and every refusal is behind us: from here a model call

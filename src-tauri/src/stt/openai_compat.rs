@@ -1,14 +1,30 @@
 //! Shared HTTP transcriber for OpenAI-compatible STT endpoints.
-//! OpenAI itself, Groq, and self-hosted Whisper.cpp servers all expose
-//! `POST /v1/audio/transcriptions` with the same multipart shape. The
-//! per-provider adapter (OpenAiAdapter, GroqAdapter) configures base
-//! URL + model + word-timestamp policy and calls into here.
+//! OpenAI itself, Groq, a user's own endpoint and self-hosted Whisper.cpp
+//! servers all expose `POST /v1/audio/transcriptions` with the same multipart
+//! shape. The per-provider adapter (OpenAiAdapter, GroqAdapter, CustomAdapter)
+//! configures base URL + model + word-timestamp policy and calls into here.
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use serde::Deserialize;
 use std::path::Path;
 
 use crate::stt::adapter::{TranscribeResult, Word};
+
+/// A non-2xx answer, typed so an adapter can act on the status.
+#[derive(Debug)]
+pub struct HttpError {
+    pub status: u16,
+    pub url: String,
+    pub body: String,
+}
+
+impl std::fmt::Display for HttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "HTTP {} from {}: {}", self.status, self.url, self.body)
+    }
+}
+
+impl std::error::Error for HttpError {}
 
 #[derive(Deserialize)]
 struct PlainResponse {
@@ -41,10 +57,10 @@ struct VerboseWord {
 /// `bias_terms` and `prior_context` are merged into Whisper's
 /// `initial_prompt` slot via `build_whisper_prompt`. Skipped entirely
 /// when `skip_prompt_for_model` matches `model` (gpt-4o-transcribe-diarize
-/// rejects the field).
+/// rejects the field). Without an `api_key` no Authorization header is sent.
 pub async fn transcribe(
     base_url: &str,
-    api_key: &str,
+    api_key: Option<&str>,
     model: &str,
     language: Option<&str>,
     bias_terms: &[&str],
@@ -93,17 +109,17 @@ pub async fn transcribe(
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(120))
         .build()?;
-    let r = client
-        .post(format!("{base_url}/audio/transcriptions"))
-        .bearer_auth(api_key)
-        .multipart(form)
-        .send()
-        .await?;
+    let url = format!("{base_url}/audio/transcriptions");
+    let mut req = client.post(&url).multipart(form);
+    if let Some(key) = api_key {
+        req = req.bearer_auth(key);
+    }
+    let r = req.send().await?;
 
     if !r.status().is_success() {
-        let s = r.status();
+        let status = r.status().as_u16();
         let body = r.text().await.unwrap_or_default();
-        return Err(anyhow!("{base_url} {s}: {body}"));
+        return Err(HttpError { status, url, body }.into());
     }
 
     if verbose {

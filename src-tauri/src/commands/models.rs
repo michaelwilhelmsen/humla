@@ -282,3 +282,15 @@ pub async fn openai_list_models(state: State<'_, AppState>) -> Result<Vec<String
         .map_err(err)?;
     Ok(crate::openai::chat_capable_models(ids))
 }
+
+/// What the custom endpoint lists (#173), to help fill a model field that takes
+/// any typed id as well.
+#[tauri::command]
+pub async fn custom_list_models(state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    let base_url = {
+        let conn = state.db.lock();
+        crate::custom_endpoint::base_url(&conn).map_err(err)?
+    };
+    let key = super::read_provider_api_key(&state, "custom")?;
+    crate::custom_endpoint::list_models(&base_url, key.as_deref()).await.map_err(err)
+}

@@ -22,6 +22,7 @@ describe("SummaryTab provider setting", () => {
       "Cloud (Anthropic)",
       "Cloud (GitHub Copilot)",
       "Local (any OpenAI-compatible server)",
+      "Custom (OpenAI-compatible API)",
     ]);
   });
 
@@ -104,5 +105,41 @@ describe("SummaryTab on GitHub Copilot", () => {
     await userEvent.click(await screen.findByRole("option", { name: "Claude Sonnet 5" }));
     expect(update).toHaveBeenCalledWith("copilot_model", "claude-sonnet-5");
     expect(update).not.toHaveBeenCalledWith("anthropic_model", expect.anything());
+  });
+});
+
+describe("SummaryTab on a custom endpoint", () => {
+  it("shows the shared endpoint and writes the summary model to custom_model", async () => {
+    const keyReads: unknown[] = [];
+    mockTauri({
+      provider_key_get: (args) => {
+        keyReads.push((args as { provider: string }).provider);
+        return null;
+      },
+    });
+    const update = vi.fn();
+    render(
+      <SummaryTab
+        s={settings({ summary_provider: "custom", custom_base_url: "https://gw.example/v1" })}
+        update={update}
+      />,
+    );
+    expect(screen.getByLabelText("Custom endpoint base URL")).toHaveValue("https://gw.example/v1");
+    await userEvent.click(screen.getByRole("button", { name: "Type a model…" }));
+    await userEvent.type(
+      screen.getByRole("combobox", { name: "Custom endpoint model" }),
+      "deepseek/deepseek-chat{Enter}",
+    );
+    expect(update).toHaveBeenCalledWith("custom_model", "deepseek/deepseek-chat");
+    expect(update).not.toHaveBeenCalledWith("summary_model", expect.anything());
+    expect(keyReads).toEqual(["custom"]);
+  });
+
+  it("writes the base URL to custom_base_url, not the local server's", async () => {
+    const update = vi.fn();
+    render(<SummaryTab s={settings({ summary_provider: "custom" })} update={update} />);
+    await userEvent.type(screen.getByLabelText("Custom endpoint base URL"), "h");
+    expect(update).toHaveBeenCalledWith("custom_base_url", "h");
+    expect(update).not.toHaveBeenCalledWith("local_llm_base_url", expect.anything());
   });
 });

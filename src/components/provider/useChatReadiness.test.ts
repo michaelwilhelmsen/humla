@@ -135,3 +135,37 @@ describe("useChatReadiness on GitHub Copilot", () => {
     expect(status).not.toHaveBeenCalled();
   });
 });
+
+describe("useChatReadiness on a custom endpoint", () => {
+  it("is ready with a base URL and its own chat model, without any key", async () => {
+    const keyReads: unknown[] = [];
+    mockTauri({
+      settings_get: (args) =>
+        ({
+          chat_provider: "custom",
+          chat_model: "gpt-5.5",
+          custom_base_url: "https://gw.example/v1",
+          custom_chat_model: "deepseek-chat",
+        })[(args as { key: string }).key] ?? null,
+      provider_key_get: (args) => {
+        keyReads.push((args as { provider: string }).provider);
+        return null;
+      },
+    });
+    const { result } = renderHook(() => useChatReadiness());
+    await waitFor(() => expect(result.current.ready).toBe(true));
+    expect(result.current.model).toBe("deepseek-chat");
+    // The custom key is optional and never read here.
+    expect(keyReads).not.toContain("custom");
+  });
+
+  it("asks for the base URL first", async () => {
+    mockTauri({
+      settings_get: (args) => ((args as { key: string }).key === "chat_provider" ? "custom" : null),
+    });
+    const { result } = renderHook(() => useChatReadiness());
+    await waitFor(() =>
+      expect(result.current.hint).toBe("Add the custom endpoint's base URL in Settings → Chat."),
+    );
+  });
+});

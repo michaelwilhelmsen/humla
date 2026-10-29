@@ -17,6 +17,7 @@ mod sessions;
 mod commands;
 mod stt;
 mod providers;
+mod custom_endpoint;
 mod chat;
 mod embed;
 mod import_date;
@@ -429,6 +430,7 @@ where
             commands::provider_key_get,
             commands::provider_key_set,
             commands::provider_key_test,
+            commands::custom_endpoint_test,
             commands::copilot_status,
             commands::copilot_sign_in_start,
             commands::copilot_sign_in_cancel,
@@ -441,6 +443,7 @@ where
             commands::local_llm_list_models,
             commands::anthropic_list_models,
             commands::openai_list_models,
+            commands::custom_list_models,
             commands::local_llm_embed_probe,
             commands::diarize_status,
             commands::diarize_download,

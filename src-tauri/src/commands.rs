@@ -3539,6 +3539,19 @@ async fn ensure_provider_ready(
                 )
             }
         }
+        crate::stt::ProviderConfig::Custom(custom) => {
+            let conn = state.db.lock();
+            if crate::custom_endpoint::base_url(&conn).is_err() {
+                Some("The custom endpoint has no base URL. Add one in Settings → Transcription.".to_string())
+            } else if custom.model.trim().is_empty() {
+                Some(
+                    "No transcription model is set for the custom endpoint. Type one in Settings → Transcription."
+                        .to_string(),
+                )
+            } else {
+                None
+            }
+        }
         other => {
             let provider_id = other.provider_id();
             if read_provider_api_key(state, provider_id)?.is_none() {
@@ -7235,13 +7248,16 @@ async fn transcribe_chunk(
         let state: State<AppState> = app.state();
         read_transcribe_config(&state)?.resolve(&language).clone()
     };
-    // Look up the API key for the *active* provider, not just OpenAI.
-    // Phase 1 had only one cloud provider so a single Keychain slot was
-    // sufficient; Phase 2 added Deepgram/Groq with their own slots, and
-    // sending OpenAI's key to Deepgram naturally returns 401.
-    let api_key = match provider_cfg.provider_id() {
-        "local" => None,
-        provider_id => {
+    // Each provider's key has its own Keychain slot; a custom endpoint may
+    // take no key at all.
+    let api_key = match provider_cfg.provider() {
+        crate::providers::ProviderId::Local => None,
+        provider @ crate::providers::ProviderId::Custom => {
+            let state: State<AppState> = app.state();
+            read_provider_api_key(&state, provider.as_str()).map_err(|e| anyhow::anyhow!("{e}"))?
+        }
+        provider => {
+            let provider_id = provider.as_str();
             let state: State<AppState> = app.state();
             Some(
                 read_provider_api_key(&state, provider_id)
@@ -7251,6 +7267,14 @@ async fn transcribe_chunk(
                     })?,
             )
         }
+    };
+    let custom_base_url = match &provider_cfg {
+        crate::stt::ProviderConfig::Custom(_) => {
+            let state: State<AppState> = app.state();
+            let conn = state.db.lock();
+            Some(crate::custom_endpoint::base_url(&conn)?)
+        }
+        _ => None,
     };
 
     // Skip near-silent chunks. Whisper and gpt-4o-transcribe both hallucinate
@@ -7335,7 +7359,7 @@ async fn transcribe_chunk(
         bias_terms: &vocab_terms,
         prior_context: trail_snapshot.as_deref(),
         api_key: api_key.as_deref(),
-        base_url: provider_cfg.base_url(),
+        base_url: custom_base_url.as_deref().or(provider_cfg.base_url()),
     };
     let crate::stt::TranscribeResult { text, words, detected_language } =
         adapter.transcribe(ctx, &path).await?;

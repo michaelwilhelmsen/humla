@@ -2739,6 +2739,7 @@ const CHIP_LABEL: Record<SummaryProvider, string> = {
   anthropic: "Claude",
   copilot: "Copilot",
   local: "Local",
+  custom: "Custom",
 };
 
 function SummaryProviderChip({

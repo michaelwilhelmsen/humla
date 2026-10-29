@@ -115,6 +115,8 @@ function summariseProvider(cfg: ProviderConfig): string {
       return `Deepgram · ${cfg.model}`;
     case "groq":
       return `Groq · ${cfg.model}`;
+    case "custom":
+      return `Custom · ${cfg.model}`;
     case "local":
       return `Local · ${cfg.model_id} · ${cfg.preset} preset · GPU ${cfg.use_gpu ? "on" : "off"}`;
   }

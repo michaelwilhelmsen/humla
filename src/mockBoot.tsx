@@ -39,6 +39,7 @@ import { SendToWebhookModal } from "./pages/SendToWebhookModal";
 import { ExportModal } from "./pages/ExportModal";
 import { SaveAudioModal } from "./pages/SaveAudioModal";
 import { ChatTab } from "./pages/settings/tabs/Chat";
+import { SummaryTab } from "./pages/settings/tabs/Summary";
 import { RecordingSection } from "./pages/settings/tabs/Recording";
 import { TranscriptionTab } from "./pages/settings/tabs/Transcription";
 import { DiarizeModelManager } from "./pages/settings/components/DiarizeModelManager";
@@ -484,6 +485,59 @@ function CopilotHarness() {
       modelDescription="Used for summaries and titles."
     />
   );
+}
+
+// ---- #173: the custom endpoint on each surface. What needs eyes is the URL
+// field and key row sharing a card with the Test's two report lines, the model
+// field at rest and while editing, and a long base URL in the error.
+const CUSTOM_LISTING = [
+  "deepseek/deepseek-chat",
+  "deepseek/deepseek-r1",
+  "elevenlabs/scribe-v2",
+  "openai/gpt-5.5",
+  "openai/gpt-4o-transcribe",
+];
+
+function customCase(surface: "summary" | "chat" | "transcription"): Scenario {
+  return {
+    wrap: settingsWrap,
+    render: () =>
+      surface === "transcription" ? <TranscriptionKeysHarness /> : <CustomHarness surface={surface} />,
+    ipc: {
+      provider_key_get: (args) => ((args as { provider: string }).provider === "custom" ? "stored" : null),
+      provider_key_set: () => undefined,
+      custom_list_models: () => CUSTOM_LISTING,
+      summary_prompts_list: () => [],
+      custom_endpoint_test: () => ({
+        listing: {
+          outcome: "failed",
+          message:
+            "HTTP 404 from https://gateway.internal.example.com/openai/v1/models. Nothing answers at that address, or it doesn't know the model — check the base URL and model in Settings.",
+        },
+        completion: { outcome: "ok", message: "deepseek/deepseek-chat answered." },
+      }),
+      get_transcribe_config: () => ({
+        default: { provider: "custom", model: "elevenlabs/scribe-v2" },
+        per_language: {},
+      }),
+      settings_get: (args) =>
+        (args as { key: string }).key === "custom_base_url" ? "https://openrouter.ai/api/v1" : null,
+      local_whisper_models: () => [],
+      diarize_status: () => ({ downloaded: false, needsWarmUp: false, warmUpError: null, sizeBytes: 0, path: "" }),
+    },
+  };
+}
+
+function CustomHarness({ surface }: { surface: "summary" | "chat" }) {
+  const [s, setS] = useState({
+    ...DEFAULTS,
+    summary_provider: "custom",
+    chat_provider: "custom",
+    custom_base_url: "https://openrouter.ai/api/v1",
+    custom_model: "deepseek/deepseek-chat",
+  } as Record<EditableKey, string>);
+  const update = async (k: EditableKey, v: string) => setS((p) => ({ ...p, [k]: v }));
+  return surface === "summary" ? <SummaryTab s={s} update={update} /> : <ChatTab s={s} update={update} />;
 }
 
 // ---- #213: the confirmation before a note is sent. What needs eyes is the
@@ -1312,6 +1366,9 @@ const CASES: Record<string, Scenario> = {
   "copilot-broken-cli": copilotCase("broken-cli"),
   "copilot-signed-out": copilotCase("signed-out"),
   "copilot-signed-in": copilotCase("signed-in"),
+  "custom-summary": customCase("summary"),
+  "custom-chat": customCase("chat"),
+  "custom-transcription": customCase("transcription"),
   "webhook-send": webhookSendCase("hooks.example.com"),
   "webhook-send-unset": webhookSendCase(null),
   export: exportCase(),

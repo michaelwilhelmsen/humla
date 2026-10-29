@@ -1,6 +1,6 @@
 import src from "../../src-tauri/src/providers.rs?raw";
 import { describe, expect, it } from "vitest";
-import { KEY_PROVIDERS, PROVIDERS, isKeyProvider } from "./providers";
+import { KEY_PROVIDERS, PROVIDERS, TRANSCRIBE_KEY_PROVIDERS, isKeyProvider } from "./providers";
 
 // Pull each REGISTRY row out of the Rust source.
 function rustRegistry() {
@@ -24,8 +24,14 @@ describe("providers.ts mirrors providers.rs", () => {
   });
 
   it("derives the key providers from the keychain flag", () => {
-    expect(KEY_PROVIDERS).toEqual(["openai", "anthropic", "deepgram", "groq"]);
+    expect(KEY_PROVIDERS).toEqual(["openai", "anthropic", "deepgram", "groq", "custom"]);
     expect(isKeyProvider("local")).toBe(false);
     expect(isKeyProvider("groq")).toBe(true);
+  });
+
+  // A custom endpoint needs its URL as well as (optionally) a key, so a key
+  // alone never makes it a transcription choice.
+  it("keeps custom out of the key-only transcription providers", () => {
+    expect(TRANSCRIBE_KEY_PROVIDERS).toEqual(["openai", "deepgram", "groq"]);
   });
 });
