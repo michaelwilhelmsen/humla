@@ -41,16 +41,19 @@ export function useProviderKey(
     };
   }, [provider, enabled]);
 
-  async function save() {
+  // Resolves with whether a key was stored.
+  async function save(): Promise<boolean> {
     const key = draft.trim();
-    if (!key) return;
+    if (!key) return false;
     try {
       await ipc.setProviderKey(provider, key);
       setDraft("");
       setHasKey(true);
       setResult(null);
+      return true;
     } catch (e) {
       setResult({ ok: false, message: String(e) });
+      return false;
     }
   }
 

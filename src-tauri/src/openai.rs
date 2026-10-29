@@ -606,9 +606,11 @@ impl<'a> Endpoint<'a> {
         }
     }
 
-    fn status_error(&self, status: reqwest::StatusCode, body: &str) -> anyhow::Error {
+    fn status_error(&self, status: reqwest::StatusCode, body: &str, api_key: &str) -> anyhow::Error {
         match self {
-            Self::Custom(_) => crate::custom_endpoint::status_error(status.as_u16(), &self.url(), body),
+            Self::Custom(_) => {
+                crate::custom_endpoint::status_error(status.as_u16(), &self.url(), body, !api_key.is_empty())
+            }
             _ => anyhow!("HTTP {status} from {}: {body}", self.base()),
         }
     }
@@ -652,7 +654,7 @@ async fn post_chat(
     started: std::time::Instant,
 ) -> Result<reqwest::Response> {
     let r = send_chat(ep, api_key, body, started).await?;
-    check_chat_status(ep, r, started).await
+    check_chat_status(ep, r, api_key, started).await
 }
 
 /// Asked of every local OpenAI-compat server as `max_tokens`. It guards against a
@@ -674,7 +676,7 @@ async fn post_chat_lifting_limit<B: Serialize>(
     if let Endpoint::Local(base) = ep {
         let r = send_chat(ep, api_key, &body(Some(LOCAL_MAX_TOKENS)), started).await?;
         if r.status() != reqwest::StatusCode::BAD_REQUEST {
-            return check_chat_status(ep, r, started).await;
+            return check_chat_status(ep, r, api_key, started).await;
         }
         let refusal = r.text().await.unwrap_or_default();
         eprintln!("[llm] {base} refused max_tokens={LOCAL_MAX_TOKENS} ({refusal}); retrying without it");
@@ -701,6 +703,7 @@ async fn send_chat(
 async fn check_chat_status(
     ep: &Endpoint<'_>,
     r: reqwest::Response,
+    api_key: &str,
     started: std::time::Instant,
 ) -> Result<reqwest::Response> {
     let status = r.status();
@@ -708,7 +711,7 @@ async fn check_chat_status(
     if !status.is_success() {
         let body = r.text().await.unwrap_or_default();
         eprintln!("[llm] error body: {body}");
-        return Err(ep.status_error(status, &body));
+        return Err(ep.status_error(status, &body, api_key));
     }
     Ok(r)
 }
@@ -1457,7 +1460,7 @@ where
         Err(e) if e.is_connect() => return Err(ep.connect_error()),
         Err(e) => return Err(ep.network_error(&error_chain(&e))),
     };
-    let r = check_chat_status(&ep, r, started).await?;
+    let r = check_chat_status(&ep, r, api_key, started).await?;
 
     let mut stream = r.bytes_stream();
     let mut lines = LineBuf::default();

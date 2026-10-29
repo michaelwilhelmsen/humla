@@ -73,7 +73,7 @@ impl BatchSttAdapter for CustomAdapter {
             r => r,
         };
         result.map_err(|e| match e.downcast::<HttpError>() {
-            Ok(h) => crate::custom_endpoint::status_error(h.status, &h.url, &h.body),
+            Ok(h) => crate::custom_endpoint::status_error(h.status, &h.url, &h.body, ctx.api_key.is_some()),
             Err(e) => e,
         })
     }
@@ -197,6 +197,20 @@ mod tests {
             .to_string();
         assert!(err.contains(&format!("{base}/audio/transcriptions")), "{err}");
         assert!(err.contains("API key"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_keyless_401_asks_for_a_key() {
+        let body = r#"{"error":{"message":"No cookie auth credentials found","code":401}}"#;
+        let (port, _server) = serve(vec![(401, "application/json", body.into())]).await;
+        let base = format!("http://127.0.0.1:{port}/v1");
+        let (_dir, wav) = chunk();
+        let err = CustomAdapter::new()
+            .transcribe(ctx(&base, "elevenlabs/scribe-v2", None), &wav)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no API key is saved"), "{err}");
     }
 
     #[tokio::test]

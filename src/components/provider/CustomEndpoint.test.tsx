@@ -62,6 +62,31 @@ describe("CustomEndpointCard", () => {
     expect(test).toHaveBeenCalledWith({ model: "deepseek-chat" });
   });
 
+  // OpenRouter's model listing answers without a key, so a Test that ran on a
+  // typed-but-unsaved key would pass while every real request went keyless.
+  it("saves a typed key before testing with it", async () => {
+    const calls: string[] = [];
+    mockTauri({
+      provider_key_set: () => {
+        calls.push("save");
+      },
+      custom_endpoint_test: () => {
+        calls.push("test");
+        return {
+          listing: { outcome: "ok", message: "Lists 300 models." },
+          completion: { outcome: "skipped", message: "No model is set." },
+        };
+      },
+    });
+    render(<Card />);
+    await userEvent.type(screen.getByLabelText("Custom endpoint base URL"), "https://openrouter.ai/api/v1");
+    await userEvent.type(screen.getByLabelText("Custom endpoint API key"), "sk-or-test");
+    await userEvent.click(screen.getByRole("button", { name: "Test" }));
+    await screen.findByText(/Lists 300 models/);
+    expect(calls).toEqual(["save", "test"]);
+    expect(screen.getByLabelText("Custom endpoint API key")).toHaveAttribute("placeholder", "•••••••• stored");
+  });
+
   it("can't be tested before it has a base URL", () => {
     render(<Card />);
     expect(screen.getByRole("button", { name: "Test" })).toBeDisabled();

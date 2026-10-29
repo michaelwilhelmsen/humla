@@ -31,8 +31,10 @@ pub fn model(conn: &rusqlite::Connection, setting_key: &str) -> anyhow::Result<S
 }
 
 /// The error for a non-2xx answer, naming the full URL that was requested.
-pub fn status_error(status: u16, url: &str, body: &str) -> anyhow::Error {
+/// `sent_key` is whether the request carried a key at all.
+pub fn status_error(status: u16, url: &str, body: &str, sent_key: bool) -> anyhow::Error {
     let hint = match status {
+        401 | 403 if !sent_key => " The endpoint wants an API key, and no API key is saved — add one in Settings.",
         401 | 403 => " The endpoint refused the API key — check the key in Settings.",
         404 => {
             " Nothing answers at that address, or it doesn't know the model — check the base URL \
@@ -151,6 +153,18 @@ mod tests {
         let report = check(&base, None, Some("  ")).await;
         assert_eq!(report.listing.outcome, Outcome::Ok);
         assert_eq!(report.completion.outcome, Outcome::Skipped);
+    }
+
+    // OpenRouter answers a request with no key with a 401 too; that must not
+    // read as a key it refused.
+    #[test]
+    fn a_401_says_whether_a_key_was_sent() {
+        let url = "https://openrouter.ai/api/v1/audio/transcriptions";
+        let keyless = status_error(401, url, "No cookie auth credentials found", false).to_string();
+        assert!(keyless.contains("no API key is saved"), "{keyless}");
+        assert!(!keyless.contains("refused"), "{keyless}");
+        let refused = status_error(401, url, "bad key", true).to_string();
+        assert!(refused.contains("refused the API key"), "{refused}");
     }
 
     #[tokio::test]

@@ -48,6 +48,9 @@ export function CustomEndpointCard({
   const [report, setReport] = useState<Report | null>(null);
 
   async function test() {
+    // A key left typed but unsaved would otherwise be tested without, and an
+    // endpoint whose listing is public would pass.
+    if (key.draft.trim() && !(await key.save())) return;
     setTesting(true);
     setReport(null);
     try {
