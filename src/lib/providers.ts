@@ -10,6 +10,7 @@ export const PROVIDERS = [
   { id: "deepgram", label: "Deepgram", keychain: true, summarize: false, chat: false, transcribe: true },
   { id: "groq", label: "Groq", keychain: true, summarize: false, chat: false, transcribe: true },
   { id: "local", label: "Local", keychain: false, summarize: true, chat: true, transcribe: true },
+  { id: "custom", label: "Custom", keychain: true, summarize: true, chat: true, transcribe: true },
 ] as const;
 
 type Spec = (typeof PROVIDERS)[number];
@@ -25,11 +26,14 @@ export const SUMMARY_CAPABLE: readonly SummaryProvider[] = PROVIDERS.filter(
 ).map((p) => p.id);
 
 export type TranscribeProvider = Extract<Spec, { transcribe: true }>["id"];
-/** Keychain providers that can transcribe — the cloud STT picker's population. */
-export type TranscribeKeyProvider = Extract<Spec, { keychain: true; transcribe: true }>["id"];
+/** Keychain providers a stored key alone sets up. Custom also needs its
+ *  endpoint's URL, and its key is optional, so it isn't one. */
+export type KeyOnlyProvider = Exclude<KeyProvider, "custom">;
+/** Key-only providers that can transcribe — the cloud STT picker's population. */
+export type TranscribeKeyProvider = Extract<KeyOnlyProvider, TranscribeProvider>;
 
 export const TRANSCRIBE_KEY_PROVIDERS: readonly TranscribeKeyProvider[] = PROVIDERS.filter(
-  (p): p is Extract<Spec, { keychain: true; transcribe: true }> => p.keychain && p.transcribe,
+  (p): p is Extract<Spec, { id: TranscribeKeyProvider }> => p.keychain && p.transcribe && p.id !== "custom",
 ).map((p) => p.id);
 
 export const CHAT_CAPABLE: readonly ChatCapableProvider[] = PROVIDERS.filter(
@@ -39,6 +43,10 @@ export const CHAT_CAPABLE: readonly ChatCapableProvider[] = PROVIDERS.filter(
 export const KEY_PROVIDERS: readonly KeyProvider[] = PROVIDERS.filter(
   (p): p is Extract<Spec, { keychain: true }> => p.keychain,
 ).map((p) => p.id);
+
+export const KEY_ONLY_PROVIDERS: readonly KeyOnlyProvider[] = KEY_PROVIDERS.filter(
+  (p): p is KeyOnlyProvider => p !== "custom",
+);
 
 export function providerLabel(p: Provider): string {
   return PROVIDERS.find((s) => s.id === p)!.label;

@@ -152,3 +152,19 @@ pub async fn provider_key_test(
     };
     Ok(TestResult { ok: false, status: status.as_u16(), error: Some(error) })
 }
+
+/// Settings' Test for the custom endpoint, which has no fixed URL to test: the
+/// listing, and a completion with `model` (the model of the surface being
+/// tested), each reported on its own.
+#[tauri::command]
+pub async fn custom_endpoint_test(
+    state: State<'_, AppState>,
+    model: Option<String>,
+) -> Result<crate::custom_endpoint::Check, String> {
+    let base_url = {
+        let conn = state.db.lock();
+        crate::custom_endpoint::base_url(&conn).map_err(err)?
+    };
+    let key = read_provider_api_key(&state, "custom")?;
+    Ok(crate::custom_endpoint::check(&base_url, key.as_deref(), model.as_deref()).await)
+}

@@ -8,8 +8,9 @@ import { Row, Section } from "../components/Section";
 import { RenameYouRow } from "../components/RenameYouRow";
 import { Select } from "../../../components/ui/Select";
 import { ProviderKeyCard, type KeyProvider } from "../../../components/provider/ProviderKeyCard";
+import { CustomEndpointCard } from "../../../components/provider/CustomEndpoint";
 import { NEMOTRON_MAX_SPEAKERS } from "../../../lib/diarizeEngine";
-import { KEY_PROVIDERS } from "../../../lib/providers";
+import { KEY_ONLY_PROVIDERS } from "../../../lib/providers";
 import { LANGUAGES, languageOptionLabel } from "../../../lib/languages";
 import { inputClass } from "../types";
 import type { SettingsHook } from "../useSettings";
@@ -138,7 +139,13 @@ export function TranscriptionTab({
             before recording.
           </p>
         )}
-        {def.provider !== "local" && (
+        {def.provider === "custom" && (
+          <CustomEndpointCard
+            baseUrl={s.custom_base_url}
+            onBaseUrlChange={(v) => update("custom_base_url", v)}
+          />
+        )}
+        {def.provider !== "local" && def.provider !== "custom" && (
           <ProviderKeyCard provider={def.provider as KeyProvider} />
         )}
         <Row
@@ -202,10 +209,22 @@ export function TranscriptionTab({
             <p className="text-xs text-[var(--color-text-muted)] mt-0.5">
               Keys for providers used only by per-language overrides.
             </p>
-            {KEY_PROVIDERS.filter((p) => p !== def.provider).map((p) => (
+            {KEY_ONLY_PROVIDERS.filter((p) => p !== def.provider).map((p) => (
               <ProviderKeyCard key={p} provider={p} />
             ))}
           </div>
+          {def.provider !== "custom" && (
+            <div>
+              <div className="text-sm">Custom endpoint</div>
+              <p className="text-xs text-[var(--color-text-muted)] mt-0.5">
+                Any OpenAI-compatible API, for a per-language override that uses Custom.
+              </p>
+              <CustomEndpointCard
+                baseUrl={s.custom_base_url}
+                onBaseUrlChange={(v) => update("custom_base_url", v)}
+              />
+            </div>
+          )}
         </Disclosure>
       </Section>
 

@@ -1,7 +1,9 @@
 import { Btn } from "../../pages/settings/components/Btn";
-import { useProviderKey, type KeyProvider } from "./useProviderKey";
+import { useProviderKey } from "./useProviderKey";
+import type { KeyOnlyProvider } from "../../lib/providers";
 
-export type { KeyProvider };
+// A custom endpoint has a card of its own (`CustomEndpointCard`).
+export type KeyProvider = KeyOnlyProvider;
 
 // Default row copy per provider — consumers can override, but usually
 // shouldn't have to.

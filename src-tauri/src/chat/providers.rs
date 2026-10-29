@@ -280,6 +280,39 @@ impl ChatAdapter for OllamaChatAdapter {
     }
 }
 
+/// The user's own OpenAI-compatible endpoint (#173): the OpenAI message and
+/// tool shapes, and nothing else on the request.
+pub struct CustomChatAdapter;
+
+#[async_trait]
+impl ChatAdapter for CustomChatAdapter {
+    fn provider_id(&self) -> &'static str {
+        "custom"
+    }
+
+    async fn step(
+        &self,
+        ctx: ChatCtx<'_>,
+        messages: &[ChatTurn],
+        tools: &[ToolSpec],
+        on_event: &mut (dyn FnMut(ChatStreamEvent) + Send),
+    ) -> Result<ChatStep> {
+        let (text, raw) = crate::openai::custom_chat_step(
+            ctx.base_url,
+            ctx.api_key,
+            ctx.model,
+            &lower_messages_openai(messages),
+            &lower_tools(tools),
+            |delta| {
+                on_event(ChatStreamEvent::TextDelta(delta.to_string()));
+                !ctx.cancel.is_cancelled()
+            },
+        )
+        .await?;
+        Ok(emit_step(text, raw, on_event))
+    }
+}
+
 /// GitHub Copilot through its CLI. One adapter serves one turn, and the turn's
 /// steps share a session (`copilot::session::ChatTurnSession`).
 pub struct CopilotChatAdapter {

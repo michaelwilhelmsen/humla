@@ -32,3 +32,45 @@ describe("computeSetupStatus: summary configured", () => {
     expect((await computeSetupStatus()).summaryConfigured).toBe(true);
   });
 });
+
+// A custom endpoint's key is optional, so what makes it configured is its URL
+// and the surface's model — never a key.
+describe("computeSetupStatus on a custom endpoint", () => {
+  function custom(settings: Record<string, string>) {
+    const asked: string[] = [];
+    mockTauri({
+      settings_get: (args) => settings[(args as { key: string }).key] ?? null,
+      get_transcribe_config: () => ({ default: { provider: "custom", model: settings.stt_model ?? "" }, per_language: {} }),
+      provider_key_get: (args) => {
+        asked.push((args as { provider: string }).provider);
+        return null;
+      },
+    });
+    return asked;
+  }
+
+  it("transcribes and summarises with a URL and models, and no key", async () => {
+    const asked = custom({
+      summary_provider: "custom",
+      custom_base_url: "https://gw.example/v1",
+      custom_model: "deepseek-chat",
+      stt_model: "elevenlabs/scribe-v2",
+    });
+    const status = await computeSetupStatus();
+    expect(status.stt).toMatchObject({ working: true, kind: "cloud", provider: "custom", model: "elevenlabs/scribe-v2" });
+    expect(status.pipelineReady).toBe(true);
+    expect(status.summaryConfigured).toBe(true);
+    expect(asked).toEqual([]);
+  });
+
+  it("is not working without a base URL, or without a model", async () => {
+    custom({ summary_provider: "custom", custom_model: "m", stt_model: "m" });
+    let status = await computeSetupStatus();
+    expect(status.stt.working).toBe(false);
+    expect(status.summaryConfigured).toBe(false);
+    custom({ summary_provider: "custom", custom_base_url: "https://gw.example/v1" });
+    status = await computeSetupStatus();
+    expect(status.stt.working).toBe(false);
+    expect(status.summaryConfigured).toBe(false);
+  });
+});

@@ -15,7 +15,7 @@
 import { ipc, type TranscribeProvider } from "./ipc";
 import { copilotReady } from "./copilot";
 import { KEY_PROVIDERS } from "./providers";
-import { chosenCloudProvider, isCloudProvider } from "./transcribeDefault";
+import { chosenCloudProvider, customDefaultWorking, isCloudProvider } from "./transcribeDefault";
 import { cloudApi } from "./cloud";
 
 // A model download the chip / recap can surface as "Downloading — NN%".
@@ -97,6 +97,13 @@ export async function computeSetupStatus(): Promise<SetupStatus> {
       provider: "local",
       model: modelId,
     };
+  } else if (def?.provider === "custom") {
+    stt = {
+      working: await customDefaultWorking(def),
+      kind: "cloud",
+      provider: "custom",
+      model: def.model,
+    };
   } else if (def && isCloudProvider(def.provider)) {
     // Shared with the onboarding resume so the two can't disagree on what
     // counts as a configured cloud default (see transcribeDefault.ts).
@@ -116,7 +123,7 @@ export async function computeSetupStatus(): Promise<SetupStatus> {
 
   // ---- Summary configured? (informational) --------------------------------
   // A keyed provider → its key exists; local → a model name is set; copilot →
-  // signed in with a CLI. Never gates.
+  // signed in with a CLI; custom → a URL and a model. Never gates.
   let summaryConfigured = false;
   if (summaryProvider === "local") {
     const model = await ipc.getSetting("local_llm_model").catch(() => null);
@@ -124,6 +131,12 @@ export async function computeSetupStatus(): Promise<SetupStatus> {
   } else if (summaryProvider === "copilot") {
     const status = await ipc.copilotStatus().catch(() => null);
     summaryConfigured = copilotReady(status);
+  } else if (summaryProvider === "custom") {
+    const [url, model] = await Promise.all([
+      ipc.getSetting("custom_base_url").catch(() => null),
+      ipc.getSetting("custom_model").catch(() => null),
+    ]);
+    summaryConfigured = !!url?.trim() && !!model?.trim();
   } else {
     // A keyed provider is configured iff its key is present; anything else
     // reads as the default, openai. (This read may duplicate the STT one

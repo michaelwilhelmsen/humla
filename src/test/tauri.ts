@@ -76,6 +76,7 @@ export function mockTauri(
         return { url: "", headers: [] };
       case "anthropic_list_models":
       case "openai_list_models":
+      case "custom_list_models":
       case "copilot_models":
         return [];
       case "copilot_status":

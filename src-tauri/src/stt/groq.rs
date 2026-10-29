@@ -55,7 +55,7 @@ impl BatchSttAdapter for GroqAdapter {
         let base_url = ctx.base_url.unwrap_or(GROQ_BASE);
         openai_compat::transcribe(
             base_url,
-            api_key,
+            Some(api_key),
             ctx.model,
             Some(ctx.language),
             ctx.bias_terms,

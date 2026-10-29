@@ -54,6 +54,18 @@ export function useProviderKey(
     }
   }
 
+  // An empty key deletes the Keychain entry.
+  async function remove() {
+    try {
+      await ipc.setProviderKey(provider, "");
+      setDraft("");
+      setHasKey(false);
+      setResult(null);
+    } catch (e) {
+      setResult({ ok: false, message: String(e) });
+    }
+  }
+
   // Resolves with the verdict so consumers can hang commit logic on a pass.
   async function test(): Promise<boolean> {
     setTesting(true);
@@ -77,5 +89,5 @@ export function useProviderKey(
     }
   }
 
-  return { hasKey, draft, setDraft, testing, result, save, test };
+  return { hasKey, draft, setDraft, testing, result, save, remove, test };
 }

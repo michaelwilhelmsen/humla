@@ -33,6 +33,10 @@ const NO_SELECTION = "__empty__";
 const toRadixValue = (v: string) => (v === "" ? NO_SELECTION : v);
 const fromRadixValue = (v: string) => (v === NO_SELECTION ? "" : v);
 
+/** The trigger's chrome, for a control that should sit in a row of Selects. */
+export const selectTriggerClass =
+  "inline-flex items-center gap-1.5 max-w-[260px] px-2.5 py-1.5 rounded-md text-sm border border-[var(--color-line-visible)] bg-[var(--color-surface)] hover:bg-[var(--color-pill-hover)] transition-colors disabled:opacity-50";
+
 export function Select({
   value,
   onChange,
@@ -80,10 +84,7 @@ export function Select({
         aria-label={ariaLabel ?? (id ? undefined : (current?.label ?? value))}
         ref={triggerRef}
         disabled={disabled}
-        className={cn(
-          "inline-flex items-center gap-1.5 max-w-[260px] px-2.5 py-1.5 rounded-md text-sm border border-[var(--color-line-visible)] bg-[var(--color-surface)] hover:bg-[var(--color-pill-hover)] transition-colors disabled:opacity-50",
-          className,
-        )}
+        className={cn(selectTriggerClass, className)}
       >
         <span className="truncate">{current?.label ?? placeholder ?? value}</span>
         <RadixSelect.Icon asChild>

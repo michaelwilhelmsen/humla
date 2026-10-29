@@ -528,6 +528,10 @@ enum Endpoint<'a> {
     /// Base URL of a local OpenAI-compat server (Ollama, LM Studio,
     /// llama-server, vLLM).
     Local(&'a str),
+    /// The user's own endpoint (#173), used exactly as typed. Nothing about it
+    /// is inferred from its URL or its model names, so requests to it carry no
+    /// optional parameter at all.
+    Custom(&'a str),
 }
 
 impl<'a> Endpoint<'a> {
@@ -542,7 +546,7 @@ impl<'a> Endpoint<'a> {
     fn base(&self) -> &str {
         match self {
             Self::Cloud => BASE,
-            Self::Local(base) => base,
+            Self::Local(base) | Self::Custom(base) => base,
         }
     }
 
@@ -553,7 +557,7 @@ impl<'a> Endpoint<'a> {
     fn client(&self) -> reqwest::Client {
         match self {
             Self::Cloud => summary_cloud_client(),
-            Self::Local(_) => local_client(),
+            Self::Local(_) | Self::Custom(_) => local_client(),
         }
     }
 
@@ -570,6 +574,10 @@ impl<'a> Endpoint<'a> {
                  The local model may be stuck — restart your \
                  local-LLM server (e.g. `pkill ollama && ollama serve`)."
             ),
+            Self::Custom(_) => anyhow!(
+                "Timed out after {secs}s waiting for {}. Try again, or pick a faster model.",
+                self.url()
+            ),
         }
     }
 
@@ -582,6 +590,26 @@ impl<'a> Endpoint<'a> {
             Self::Local(_) => anyhow!(
                 "Couldn't reach {base}. Is your local-LLM server running? (ollama serve, etc.)"
             ),
+            Self::Custom(_) => anyhow!(
+                "Couldn't reach {}. Check the base URL in Settings and your connection.",
+                self.url()
+            ),
+        }
+    }
+
+    /// Attach the key. A custom endpoint's key is optional, and one that takes
+    /// none gets no Authorization header rather than an empty bearer.
+    fn authorize(&self, req: reqwest::RequestBuilder, api_key: &str) -> reqwest::RequestBuilder {
+        match self {
+            Self::Custom(_) if api_key.is_empty() => req,
+            _ => req.bearer_auth(api_key),
+        }
+    }
+
+    fn status_error(&self, status: reqwest::StatusCode, body: &str) -> anyhow::Error {
+        match self {
+            Self::Custom(_) => crate::custom_endpoint::status_error(status.as_u16(), &self.url(), body),
+            _ => anyhow!("HTTP {status} from {}: {body}", self.base()),
         }
     }
 
@@ -596,6 +624,7 @@ impl<'a> Endpoint<'a> {
                 "Network error talking to {base}: {cause}. \
                  Check that your local-LLM server is reachable."
             ),
+            Self::Custom(_) => anyhow!("Network error talking to {}: {cause}.", self.url()),
         }
     }
 }
@@ -661,7 +690,7 @@ async fn send_chat(
 ) -> Result<reqwest::Response> {
     let http = ep.client();
     let url = ep.url();
-    match send_with_retries(|| http.post(&url).bearer_auth(api_key).json(body), started).await {
+    match send_with_retries(|| ep.authorize(http.post(&url).json(body), api_key), started).await {
         Ok(resp) => Ok(resp),
         Err(e) if e.is_timeout() => Err(ep.timeout_error(started.elapsed().as_secs())),
         Err(e) if e.is_connect() => Err(ep.connect_error()),
@@ -679,20 +708,22 @@ async fn check_chat_status(
     if !status.is_success() {
         let body = r.text().await.unwrap_or_default();
         eprintln!("[llm] error body: {body}");
-        return Err(anyhow!("HTTP {status} from {}: {body}", ep.base()));
+        return Err(ep.status_error(status, &body));
     }
     Ok(r)
 }
 
-/// Cloud-OpenAI summary, streamed. Same contract as `summarize_with_base` —
-/// returns the assembled summary — but fires `on_chunk` per content delta so
-/// the UI shows tokens landing, and, crucially, keeps bytes moving on the wire
-/// so no middlebox reaps the connection while a reasoning model thinks.
+/// Cloud-OpenAI or custom-endpoint summary, streamed. Same contract as
+/// `summarize_with_base` — returns the assembled summary — but fires
+/// `on_chunk` per content delta so the UI shows tokens landing, and, crucially,
+/// keeps bytes moving on the wire so no middlebox reaps the connection while a
+/// reasoning model thinks.
 ///
 /// Cloud `/chat/completions` doesn't expose reasoning tokens in its SSE
 /// deltas, so `StreamChunk::Thinking` is never emitted here — only the Ollama
 /// native path produces those.
-async fn summarize_cloud_stream<F>(
+async fn summarize_stream<F>(
+    ep: Endpoint<'_>,
     api_key: &str,
     model: &str,
     system_prompt: &str,
@@ -709,10 +740,13 @@ where
             ChatMessage { role: "user", content: transcript },
         ],
         stream: true,
-        // Reasoning models (gpt-5 and later / o-series) reject a custom temperature.
-        temperature: if is_reasoning_model(model) { None } else { Some(0.2) },
+        // Reasoning models (gpt-5 and later / o-series) reject a custom
+        // temperature, and a custom endpoint is sent none at all.
+        temperature: match ep {
+            Endpoint::Cloud if !is_reasoning_model(model) => Some(0.2),
+            _ => None,
+        },
     };
-    let ep = Endpoint::Cloud;
     let started = std::time::Instant::now();
     eprintln!(
         "[llm] POST {} (stream) model={model} system_chars={} user_chars={}",
@@ -735,6 +769,24 @@ where
         return Err(anyhow!("{model} returned an empty response"));
     }
     Ok(summary)
+}
+
+/// A summary from the user's own endpoint (#173), streamed like cloud OpenAI.
+/// `api_key` is optional; without one the request carries no Authorization
+/// header.
+pub async fn summarize_custom<F>(
+    base_url: &str,
+    api_key: Option<&str>,
+    model: &str,
+    system_prompt: &str,
+    transcript: &str,
+    on_chunk: F,
+) -> Result<String>
+where
+    F: FnMut(StreamChunk) + Send,
+{
+    let ep = Endpoint::Custom(base_url);
+    summarize_stream(ep, api_key.unwrap_or(""), model, system_prompt, transcript, on_chunk).await
 }
 
 /// Same shape as `summarize` but takes an explicit base URL. Used to route
@@ -791,7 +843,8 @@ where
     // TCP idle rather than time-to-first-byte, the window is narrowed rather
     // than closed.
     if !is_local {
-        return summarize_cloud_stream(api_key, model, system_prompt, transcript, on_chunk).await;
+        return summarize_stream(Endpoint::Cloud, api_key, model, system_prompt, transcript, on_chunk)
+            .await;
     }
     // Local OpenAI-compat servers (LM Studio, llama-server, vLLM) stay
     // non-streaming — they're on localhost, with no middlebox to reap the
@@ -1489,7 +1542,7 @@ pub(crate) async fn openai_chat_step<F>(
     model: &str,
     messages: &[Value],
     tools: &[Value],
-    mut on_delta: F,
+    on_delta: F,
 ) -> Result<(String, Vec<RawToolCall>)>
 where
     F: FnMut(&str) -> bool + Send,
@@ -1517,7 +1570,46 @@ where
         }
         r => r?,
     };
+    read_tool_stream(r, model, on_delta).await
+}
 
+/// One chat step against the user's own endpoint (#173): `model`, `messages`,
+/// `stream` and the tools, nothing else. Same `on_delta` contract as
+/// [`openai_chat_step`].
+pub(crate) async fn custom_chat_step<F>(
+    base_url: &str,
+    api_key: Option<&str>,
+    model: &str,
+    messages: &[Value],
+    tools: &[Value],
+    on_delta: F,
+) -> Result<(String, Vec<RawToolCall>)>
+where
+    F: FnMut(&str) -> bool + Send,
+{
+    let req = ToolChatRequest {
+        model,
+        messages,
+        stream: true,
+        tools: if tools.is_empty() { None } else { Some(tools) },
+        temperature: None,
+        max_tokens: None,
+    };
+    let ep = Endpoint::Custom(base_url);
+    let r = post_chat(&ep, api_key.unwrap_or(""), &req, std::time::Instant::now()).await?;
+    read_tool_stream(r, model, on_delta).await
+}
+
+/// Read a streamed chat-completions step: answer deltas through `on_delta`
+/// (which returns whether to keep reading), tool-call fragments assembled.
+async fn read_tool_stream<F>(
+    r: reqwest::Response,
+    model: &str,
+    mut on_delta: F,
+) -> Result<(String, Vec<RawToolCall>)>
+where
+    F: FnMut(&str) -> bool + Send,
+{
     use futures_util::StreamExt;
     let mut byte_stream = r.bytes_stream();
     let mut lines = LineBuf::default();
@@ -2324,6 +2416,122 @@ data: [DONE]
             .await;
             assert_eq!(summarize(&base(port)).await.unwrap(), "Referat");
             assert!(request_json(&server.await.unwrap()[1]).get("max_tokens").is_none());
+        }
+    }
+
+    mod custom_endpoint {
+        use super::*;
+        use crate::chat::test_server::serve;
+        use serde_json::json;
+
+        fn base(port: u16) -> String {
+            format!("http://127.0.0.1:{port}/api/v1")
+        }
+
+        fn split(raw: &str) -> (String, Value) {
+            let (head, body) = raw.split_once("\r\n\r\n").unwrap();
+            (head.to_lowercase(), serde_json::from_str(body).unwrap())
+        }
+
+        fn keys(body: &Value) -> Vec<String> {
+            let mut keys: Vec<String> = body.as_object().unwrap().keys().cloned().collect();
+            keys.sort();
+            keys
+        }
+
+        const ANSWER: &str = r#"data: {"choices":[{"delta":{"content":"Referat"},"finish_reason":"stop"}]}
+
+data: [DONE]
+
+"#;
+
+        #[tokio::test]
+        async fn a_summary_sends_only_model_messages_and_stream() {
+            let (port, server) = serve(vec![(200, "text/event-stream", ANSWER.into())]).await;
+            let mut streamed = String::new();
+            let out = summarize_custom(&base(port), Some("sk-or-test"), "openai/o3", "sys", "transcript", |c| {
+                if let StreamChunk::Content(t) = c {
+                    streamed.push_str(t);
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(out, "Referat");
+            assert_eq!(streamed, "Referat");
+            let raw = &server.await.unwrap()[0];
+            assert!(raw.starts_with("POST /api/v1/chat/completions "), "{raw}");
+            let (head, body) = split(raw);
+            assert!(head.contains("authorization: bearer sk-or-test"), "{head}");
+            assert_eq!(keys(&body), ["messages", "model", "stream"]);
+            assert_eq!(body["model"], "openai/o3");
+            assert_eq!(body["stream"], true);
+            assert_eq!(
+                body["messages"],
+                json!([{"role": "system", "content": "sys"}, {"role": "user", "content": "transcript"}])
+            );
+        }
+
+        #[tokio::test]
+        async fn a_keyless_endpoint_gets_no_authorization_header() {
+            let (port, server) = serve(vec![(200, "text/event-stream", ANSWER.into())]).await;
+            summarize_custom(&base(port), None, "m", "sys", "t", |_| {}).await.unwrap();
+            let (head, _) = split(&server.await.unwrap()[0]);
+            assert!(!head.contains("authorization"), "{head}");
+        }
+
+        #[tokio::test]
+        async fn a_wrong_root_names_the_url_that_was_requested() {
+            let (port, _server) =
+                serve(vec![(404, "text/html", "<html>Not Found</html>".into())]).await;
+            let root = format!("http://127.0.0.1:{port}");
+            let err = summarize_custom(&root, Some("k"), "m", "sys", "t", |_| {})
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(&format!("{root}/chat/completions")), "{err}");
+            assert!(err.contains("404"), "{err}");
+            assert!(err.contains("base URL"), "{err}");
+        }
+
+        #[tokio::test]
+        async fn a_refused_key_says_so() {
+            let (port, _server) =
+                serve(vec![(401, "application/json", r#"{"error":"bad key"}"#.into())]).await;
+            let err = summarize_custom(&base(port), Some("k"), "m", "sys", "t", |_| {})
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("API key"), "{err}");
+            assert!(err.contains("bad key"), "{err}");
+        }
+
+        #[tokio::test]
+        async fn a_chat_step_adds_only_the_tools_and_reads_their_calls() {
+            let frames = [
+                json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_7","function":{"name":"search_notes","arguments":"{\"query\":"}}]}}]}),
+                json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"Acme\"}"}}]},"finish_reason":"tool_calls"}]}),
+            ];
+            let mut body: String = frames.iter().map(|f| format!("data: {f}\n\n")).collect();
+            body.push_str("data: [DONE]\n\n");
+            let (port, server) = serve(vec![(200, "text/event-stream", body)]).await;
+            let msgs = [json!({"role": "user", "content": "What did Acme decide?"})];
+            let tools = [json!({"type": "function", "function": {"name": "search_notes"}})];
+            let (text, calls) =
+                custom_chat_step(&base(port), None, "deepseek-chat", &msgs, &tools, |_| true)
+                    .await
+                    .unwrap();
+            assert_eq!(text, "");
+            assert_eq!(
+                calls,
+                vec![RawToolCall {
+                    id: "call_7".into(),
+                    name: "search_notes".into(),
+                    arguments: r#"{"query":"Acme"}"#.into(),
+                }]
+            );
+            let (head, sent) = split(&server.await.unwrap()[0]);
+            assert!(!head.contains("authorization"), "{head}");
+            assert_eq!(keys(&sent), ["messages", "model", "stream", "tools"]);
         }
     }
 }

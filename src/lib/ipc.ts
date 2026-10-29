@@ -182,6 +182,13 @@ export type SettingsKey =
   // the same thing. Unset means "auto".
   | "copilot_model"
   | "copilot_chat_model"
+  // The custom OpenAI-compatible endpoint (#173): one base URL, used as typed
+  // and shared by summaries, chat and transcription, and a model per surface
+  // (transcription's lives in its `transcribe_config` entry). The key is in the
+  // Keychain under the `custom` provider.
+  | "custom_base_url"
+  | "custom_model"
+  | "custom_chat_model"
   | "summary_provider"
   | "local_llm_base_url"
   | "local_llm_model"
@@ -232,14 +239,18 @@ export type SettingsKey =
 
 export type TranscribeProvider = Provider;
 
-// Mirror of the Rust `crate::stt::ProviderConfig` tagged union. The four
-// variants match the four supported STT providers; `local` carries the
-// extra preset + GPU fields it needs.
+// Mirror of the Rust `crate::stt::ProviderConfig` tagged union, one variant
+// per STT provider; `local` carries the extra preset + GPU fields it needs.
+// `custom` takes its base URL from the `custom_base_url` setting.
 export type ProviderConfig =
   | { provider: "openai"; model: string; base_url?: string }
   | { provider: "local"; model_id: string; preset: string; use_gpu: boolean }
   | { provider: "deepgram"; model: string; base_url?: string }
-  | { provider: "groq"; model: string };
+  | { provider: "groq"; model: string }
+  | { provider: "custom"; model: string };
+
+/** One half of the custom endpoint's Test (`custom_endpoint::Probe`). */
+export type CustomProbe = { outcome: "ok" | "failed" | "skipped"; message: string };
 
 // Mirror of the Rust `crate::stt::TranscribeConfig`. Wraps a default
 // ProviderConfig plus a map of per-language overrides keyed by ISO 639-1
@@ -654,6 +665,16 @@ export const ipc = {
 
   /** Chat-capable models the stored OpenAI key can reach. */
   openaiListModels: () => invoke<string[]>("openai_list_models"),
+
+  /** Every model the custom endpoint lists (#173). A help for the model field
+   *  only: plenty of gateways serve no listing. */
+  customListModels: () => invoke<string[]>("custom_list_models"),
+  /** The custom endpoint's listing and a completion with `model`, reported
+   *  separately. Without a model the completion is skipped. */
+  customEndpointTest: (model?: string) =>
+    invoke<{ listing: CustomProbe; completion: CustomProbe }>("custom_endpoint_test", {
+      model: model || null,
+    }),
 
   // Dimensionality of one real embedding, or the server's own error. The model
   // listing can't answer this (#179): a server can list a model and serve no

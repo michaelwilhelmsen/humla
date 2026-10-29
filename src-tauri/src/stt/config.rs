@@ -19,6 +19,8 @@ pub enum ProviderConfig {
     Deepgram(DeepgramConfig),
     #[serde(rename = "groq")]
     Groq(GroqConfig),
+    #[serde(rename = "custom")]
+    Custom(CustomConfig),
 }
 
 impl ProviderConfig {
@@ -28,6 +30,7 @@ impl ProviderConfig {
             ProviderConfig::Local(_) => ProviderId::Local,
             ProviderConfig::Deepgram(_) => ProviderId::Deepgram,
             ProviderConfig::Groq(_) => ProviderId::Groq,
+            ProviderConfig::Custom(_) => ProviderId::Custom,
         }
     }
 
@@ -41,6 +44,7 @@ impl ProviderConfig {
             ProviderConfig::Local(c) => &c.model_id,
             ProviderConfig::Deepgram(c) => &c.model,
             ProviderConfig::Groq(c) => &c.model,
+            ProviderConfig::Custom(c) => &c.model,
         }
     }
 
@@ -53,6 +57,9 @@ impl ProviderConfig {
             // hosted Groq-compat server they'd switch to the OpenAI
             // provider with a custom base_url.
             ProviderConfig::Groq(_) => None,
+            // The one custom endpoint's URL is a setting shared with summaries
+            // and chat (`custom_endpoint::base_url`), read at dispatch.
+            ProviderConfig::Custom(_) => None,
         }
     }
 }
@@ -80,6 +87,11 @@ pub struct DeepgramConfig {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GroqConfig {
+    pub model: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CustomConfig {
     pub model: String,
 }
 
@@ -177,6 +189,16 @@ mod tests {
         let back: ProviderConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(cfg, back);
         assert!(json.contains(r#""provider":"local""#));
+    }
+
+    #[test]
+    fn custom_round_trips_and_takes_its_base_url_from_settings() {
+        let json = r#"{"provider":"custom","model":"elevenlabs/scribe-v2"}"#;
+        let cfg: ProviderConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.provider(), ProviderId::Custom);
+        assert_eq!(cfg.model(), "elevenlabs/scribe-v2");
+        assert_eq!(cfg.base_url(), None);
+        assert_eq!(serde_json::to_string(&cfg).unwrap(), json);
     }
 
     #[test]

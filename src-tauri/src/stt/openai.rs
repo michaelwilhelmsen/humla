@@ -53,7 +53,7 @@ impl BatchSttAdapter for OpenAiAdapter {
         // gpt-4o-transcribe family never reports a language (issue #167).
         openai_compat::transcribe(
             base_url,
-            api_key,
+            Some(api_key),
             ctx.model,
             Some(ctx.language),
             ctx.bias_terms,

@@ -12,6 +12,11 @@
 //     `openai` outright and so could never resume the likeliest cloud pick).
 //
 // — so the rule lives here once rather than being spelled out at each of them.
+//
+// A custom default is the exception the key can't decide: its key is optional,
+// so what makes it a working choice is its base URL and model
+// (`customDefaultWorking`). The onboarding step offers only key-only providers
+// and leaves a custom default as it is.
 
 import { ipc, type ProviderConfig } from "./ipc";
 import { isTranscribeKeyProvider, type TranscribeKeyProvider } from "./providers";
@@ -20,6 +25,14 @@ import { isTranscribeKeyProvider, type TranscribeKeyProvider } from "./providers
 export type CloudTranscribeProvider = TranscribeKeyProvider;
 
 export const isCloudProvider = isTranscribeKeyProvider;
+
+/** Whether a custom default can transcribe: a base URL and a model, any key. */
+export async function customDefaultWorking(
+  def: Extract<ProviderConfig, { provider: "custom" }>,
+): Promise<boolean> {
+  const url = await ipc.getSetting("custom_base_url").catch(() => null);
+  return !!url?.trim() && def.model.trim().length > 0;
+}
 
 /**
  * The cloud provider this default represents an actual choice of, or null —

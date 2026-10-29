@@ -10,7 +10,9 @@ mod providers;
 mod tools;
 
 pub use adapter::{CancelFlag, ChatAdapter, ChatCtx, ChatStreamEvent, ChatTurn, ToolSpec};
-pub use providers::{AnthropicChatAdapter, CopilotChatAdapter, OllamaChatAdapter, OpenAiChatAdapter};
+pub use providers::{
+    AnthropicChatAdapter, CopilotChatAdapter, CustomChatAdapter, OllamaChatAdapter, OpenAiChatAdapter,
+};
 
 /// A stand-in OpenAI-compat server, shared by every test here that needs one on
 /// the wire rather than behind a fake adapter.
@@ -34,9 +36,7 @@ pub mod test_server {
             let mut seen = Vec::new();
             for (status, content_type, body) in responses {
                 let (mut sock, _) = listener.accept().await.unwrap();
-                let mut buf = vec![0u8; 262_144];
-                let n = sock.read(&mut buf).await.unwrap();
-                seen.push(String::from_utf8_lossy(&buf[..n]).to_string());
+                seen.push(read_request(&mut sock).await);
                 let resp = format!(
                     "HTTP/1.1 {status} \r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(),
@@ -48,6 +48,32 @@ pub mod test_server {
             seen
         });
         (port, handle)
+    }
+
+    /// Read one request whole: a multipart upload arrives over several reads.
+    async fn read_request(sock: &mut tokio::net::TcpStream) -> String {
+        let mut request = Vec::new();
+        let mut buf = vec![0u8; 65_536];
+        loop {
+            let n = sock.read(&mut buf).await.unwrap();
+            request.extend_from_slice(&buf[..n]);
+            let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+                if n == 0 {
+                    break;
+                }
+                continue;
+            };
+            let head = String::from_utf8_lossy(&request[..end]).to_lowercase();
+            let length: usize = head
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length:"))
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0);
+            if n == 0 || request.len() >= end + 4 + length {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&request).to_string()
     }
 }
 pub use tools::{client_pin_applies, execute_tool, tool_specs, Citation, Pins, ToolScope};
@@ -558,6 +584,7 @@ pub fn build_chat_adapter(provider: ProviderId) -> Result<Box<dyn ChatAdapter>> 
         ProviderId::Copilot => {
             anyhow::bail!("Copilot chat runs on a started CLI; build CopilotChatAdapter::new instead")
         }
+        ProviderId::Custom => Ok(Box::new(CustomChatAdapter)),
         ProviderId::Deepgram | ProviderId::Groq => {
             anyhow::bail!("{provider} is a transcription provider and can't chat")
         }

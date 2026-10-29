@@ -16,6 +16,9 @@ pub enum ProviderId {
     /// Local Whisper for transcription; any OpenAI-compatible server (Ollama,
     /// LM Studio, llama-server) for summaries and chat.
     Local,
+    /// One OpenAI-compatible endpoint the user names: their own base URL and an
+    /// optional key, for summaries, chat and transcription alike.
+    Custom,
 }
 
 /// How a provider's key rides on a request.
@@ -128,6 +131,14 @@ pub const REGISTRY: &[ProviderSpec] = &[
         key_test: None,
         capabilities: Capabilities { summarize: true, chat: true, transcribe: true },
     },
+    ProviderSpec {
+        id: ProviderId::Custom,
+        id_str: "custom",
+        label: "Custom",
+        keychain_account: Some("custom_api_key"),
+        key_test: None,
+        capabilities: Capabilities { summarize: true, chat: true, transcribe: true },
+    },
 ];
 
 /// The chat setting stores the local provider as `ollama` from before the
@@ -221,8 +232,27 @@ mod tests {
     }
 
     #[test]
-    fn a_key_test_exists_exactly_where_a_key_does() {
+    fn custom_does_everything_on_an_optional_key_of_its_own() {
+        assert_eq!(ProviderId::parse("custom"), Some(ProviderId::Custom));
+        assert_eq!(ProviderId::Custom.keychain_account(), Some("custom_api_key"));
+        assert_eq!(
+            ProviderId::Custom.capabilities(),
+            Capabilities { summarize: true, chat: true, transcribe: true }
+        );
+        // `local` keeps its "stays on your Mac" promise; a hosted endpoint is
+        // never reached through it.
+        assert_eq!(ProviderId::Local.keychain_account(), None);
+    }
+
+    #[test]
+    fn a_fixed_key_test_exists_wherever_a_key_does_but_custom() {
         for spec in REGISTRY {
+            // Custom has no fixed URL to test; its test reads the endpoint
+            // from settings (`custom_endpoint::check`).
+            if spec.id == ProviderId::Custom {
+                assert!(spec.key_test.is_none());
+                continue;
+            }
             assert_eq!(spec.key_test.is_some(), spec.keychain_account.is_some(), "{}", spec.id_str);
         }
     }

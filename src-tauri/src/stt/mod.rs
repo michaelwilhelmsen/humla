@@ -3,6 +3,7 @@
 mod adapter;
 mod auth;
 mod config;
+mod custom;
 mod deepgram;
 mod groq;
 mod keychain;
@@ -15,9 +16,10 @@ use std::path::PathBuf;
 pub use adapter::{BatchSttAdapter, TranscribeCtx, TranscribeResult, Word};
 pub use auth::Auth;
 pub use config::{
-    from_legacy_settings, DeepgramConfig, GroqConfig, LocalWhisperConfig, OpenAiConfig,
-    ProviderConfig, TranscribeConfig,
+    from_legacy_settings, CustomConfig, DeepgramConfig, GroqConfig, LocalWhisperConfig,
+    OpenAiConfig, ProviderConfig, TranscribeConfig,
 };
+pub use custom::CustomAdapter;
 pub use keychain::{keychain_account_for, requires_api_key};
 pub use deepgram::DeepgramAdapter;
 pub use groq::GroqAdapter;
@@ -61,6 +63,7 @@ pub fn build_adapter(
         }
         ProviderConfig::Groq(_) => Box::new(GroqAdapter::new()),
         ProviderConfig::Deepgram(_) => Box::new(DeepgramAdapter::new()),
+        ProviderConfig::Custom(_) => Box::new(CustomAdapter::new()),
     }
 }
 
