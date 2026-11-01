@@ -11,6 +11,20 @@ export type Release = {
 
 export const releases: Release[] = [
   {
+    version: "0.74.0",
+    date: "2026-11-01",
+    title: "Start a team workspace from a link",
+    summary: "Links on humla.team and in our emails now open Humla right where you create a team workspace.",
+    paragraphs: [
+      "When you click a link to start a team workspace, for example from humla.team or one of our emails, Humla now opens and goes straight to creating the workspace. That works whether Humla is already running or not. If you're still setting Humla up, it waits until you're done.",
+    ],
+    highlights: [
+      "Links can open Humla straight to Create team workspace.",
+      "Works whether Humla is open or not.",
+    ],
+    issues: [],
+  },
+  {
     version: "0.73.0",
     date: "2026-10-29",
     title: "Use any OpenAI-compatible API",
