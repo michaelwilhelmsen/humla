@@ -169,7 +169,10 @@ export type CheckoutSource =
    *  a sheet with a deliberate entrance — worth telling apart, because the whole
    *  question a hint raises is whether it produces trials or just noise. */
   | "team_hint_switcher"
-  | "team_hint_export";
+  | "team_hint_export"
+  /** A `humla://new-workspace?source=…` link from an email or the website. */
+  | "email"
+  | "web";
 
 export const cloudApi = {
   status: () => invoke<CloudStatus>("cloud_status"),

@@ -119,6 +119,7 @@ where
         // `menubar::install` registers it from there.
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_deep_link::init())
         // Open at login (#207). Only the Settings toggle turns it on; the
         // argument is how `menubar::present_at_launch` recognises the launch.
         .plugin(
@@ -325,6 +326,13 @@ where
                 }
             };
             menubar::present_at_launch(app.handle(), tray_installed);
+            // The frontend reads the link itself; here it only needs the window.
+            {
+                use tauri_plugin_deep_link::DeepLinkExt;
+                let handle = app.handle().clone();
+                app.deep_link()
+                    .on_open_url(move |_| menubar::show_main_window(&handle));
+            }
 
             Ok(())
         })

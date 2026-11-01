@@ -48,6 +48,9 @@
     }
   },
   "plugins": {
+    "deep-link": {
+      "desktop": { "schemes": ["humla"] }
+    },
     "updater": {
       "endpoints": [
         "https://github.com/michaelwilhelmsen/humla/releases/latest/download/latest.json"

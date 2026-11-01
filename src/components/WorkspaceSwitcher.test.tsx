@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { WorkspaceSwitcher } from "./WorkspaceSwitcher";
 import {
@@ -11,6 +11,7 @@ import {
 import { MemoryRouter } from "react-router-dom";
 import { mockTauri } from "../test/tauri";
 import { LocationProbe } from "../test/app";
+import { useDeepLinkStore } from "../lib/deepLink";
 
 function seed(over: Partial<CloudStatus> = {}, handlers: Parameters<typeof mockTauri>[0] = {}) {
   const status = { ...DISCONNECTED, ...over };
@@ -124,6 +125,52 @@ describe("the ambient team hint", () => {
 
     await waitFor(() => expect(checkouts).toHaveLength(1));
     expect(checkouts[0]).toMatchObject({ workspaceId: "w9", source: "team_hint_switcher" });
+  });
+});
+
+describe("a humla://new-workspace link", () => {
+  beforeEach(() => {
+    useDeepLinkStore.setState({ newWorkspace: null });
+  });
+
+  it("opens the create sheet for a request queued before it mounted, and clears it", async () => {
+    useDeepLinkStore.setState({ newWorkspace: { source: "web" } });
+    seed();
+    expect(await screen.findByRole("dialog", { name: /create a team workspace/i })).toBeInTheDocument();
+    expect(useDeepLinkStore.getState().newWorkspace).toBeNull();
+  });
+
+  it("carries the link's source to checkout", async () => {
+    const checkouts: unknown[] = [];
+    const created: CloudWorkspace = { id: "w9", name: "Acme", role: "owner", plan_status: "none" };
+    const live = {
+      ...DISCONNECTED,
+      configured: true,
+      logged_in: true,
+      billing_enabled: true,
+      user: { id: "u1", email: "m@example.no", name: "Michael", verified: true },
+    };
+    mockTauri({
+      cloud_status: () => ({ ...live, current_workspace: created, workspaces: [created] }),
+      cloud_create_workspace: () => created,
+      cloud_billing_checkout: (args) => {
+        checkouts.push(args);
+        return "https://checkout.stripe.test/x";
+      },
+    });
+    useCloudStore.setState({ status: live, ready: true });
+    render(
+      <MemoryRouter>
+        <WorkspaceSwitcher />
+      </MemoryRouter>,
+    );
+
+    act(() => useDeepLinkStore.setState({ newWorkspace: { source: "email" } }));
+    await userEvent.type(await screen.findByLabelText(/workspace name/i), "Acme{Enter}");
+    await userEvent.click(await screen.findByRole("button", { name: /start free trial/i }));
+
+    await waitFor(() => expect(checkouts).toHaveLength(1));
+    expect(checkouts[0]).toMatchObject({ workspaceId: "w9", source: "email" });
   });
 });
 

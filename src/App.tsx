@@ -20,6 +20,7 @@ import { ipc } from "./lib/ipc";
 import { useGlobalShortcuts } from "./lib/shortcuts";
 import { bindBackendListeners, useNotesStore } from "./lib/store";
 import { useCloudStore } from "./lib/cloud";
+import { bindDeepLinks } from "./lib/deepLink";
 import { useThemeBoot } from "./lib/theme";
 import { usePaletteBoot } from "./lib/palette";
 import { useZoomBoot } from "./lib/zoom";
@@ -64,6 +65,7 @@ export default function App() {
     // useDownloadStore through these). Idempotent via a module-level flag, so
     // Layout's own call stays a harmless no-op.
     bindBackendListeners();
+    bindDeepLinks();
     refresh();
     refreshCloud();
   }, [refresh, refreshCloud]);

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { Check, ChevronsUpDown, Cloud, CloudOff, Lock, Plus, RefreshCw, User, Users } from "lucide-react";
 import {
@@ -9,6 +9,7 @@ import {
   type CloudRole,
 } from "../lib/cloud";
 import { useNotesStore } from "../lib/store";
+import { useDeepLinkStore } from "../lib/deepLink";
 import type { SyncStatus } from "../lib/ipc";
 import { Menu, MenuContent, MenuItem, MenuLabel, MenuSeparator, MenuTrigger } from "./ui/Menu";
 import { NewWorkspaceModal } from "./NewWorkspaceModal";
@@ -119,6 +120,12 @@ export function WorkspaceSwitcher() {
     setCreatingSource(source);
     setCreatingOpen(true);
   }
+
+  const linkRequest = useDeepLinkStore((s) => s.newWorkspace);
+  useEffect(() => {
+    const req = linkRequest && useDeepLinkStore.getState().take();
+    if (req) startCreating(req.source ?? "new_workspace");
+  }, [linkRequest]);
 
   const current = status.current_workspace;
   // A selected workspace that requires two-factor authentication the user lacks
