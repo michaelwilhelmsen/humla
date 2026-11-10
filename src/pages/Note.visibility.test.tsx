@@ -78,12 +78,25 @@ describe("who can read a note inside a workspace", () => {
     });
 
     await userEvent.click(await chip());
-    await userEvent.type(await screen.findByRole("textbox", { name: "Add people" }), "sti");
-    const list = await screen.findByRole("list", { name: "Matching members" });
-    await userEvent.click(within(list).getByRole("button", { name: /Stian Berg/ }));
+    await userEvent.type(await screen.findByRole("combobox", { name: "Add people" }), "sti");
+    const list = await screen.findByRole("listbox", { name: "Matching members" });
+    await userEvent.click(within(list).getByRole("option", { name: "Stian Berg" }));
 
     expect(setAccess).toHaveBeenCalledWith({ id: "n1", private: true, sharedWith: ["u-stian"] });
     expect(await chip()).toHaveTextContent("Michael, Stian");
+  });
+
+  it("adds a member from the keyboard", async () => {
+    const setAccess = vi.fn(() => null);
+    openNote(makeNote({ id: "n1", title: "Board", workspace_id: "ws1", private: true }), "ws1", {
+      notes_set_access: setAccess,
+    });
+
+    await userEvent.click(await chip());
+    await userEvent.type(await screen.findByRole("combobox", { name: "Add people" }), "e");
+    await userEvent.keyboard("{ArrowDown}{ArrowDown}{Enter}");
+
+    expect(setAccess).toHaveBeenCalledWith({ id: "n1", private: true, sharedWith: ["u-stian"] });
   });
 
   it("removes a member", async () => {
@@ -120,7 +133,7 @@ describe("who can read a note inside a workspace", () => {
     const people = await screen.findByRole("list", { name: "People with access" });
     expect(within(people).getByText(/Stian Berg/)).toBeInTheDocument();
     expect(within(people).getByText("(you)")).toBeInTheDocument();
-    expect(screen.queryByRole("textbox", { name: "Add people" })).toBeNull();
+    expect(screen.queryByRole("combobox", { name: "Add people" })).toBeNull();
     expect(screen.queryByRole("radio")).toBeNull();
     expect(screen.queryByRole("button", { name: /Remove/ })).toBeNull();
   });

@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { Building2, Check, Lock, Search, Users, X } from "lucide-react";
 import { Popover, PopoverContent, PopoverTrigger } from "./ui/Popover";
+import { Combobox } from "./ui/Combobox";
 import { useCloudStore, type CloudMember } from "../lib/cloud";
 import { accessLabel, addableMembers, withMember, withoutMember, type NoteAccess } from "../lib/noteAccess";
 import { cn } from "../lib/cn";
@@ -53,40 +54,31 @@ export function NoteAccessPicker({
       </PopoverTrigger>
       <PopoverContent aria-label="Who can read this note" className="w-[300px] p-3" maxHeight={460}>
         {editable && (
-          <div className="mb-3">
-            <label className="flex items-center gap-2 px-2.5 py-1.5 rounded-md border border-[var(--color-line-visible)] text-sm">
-              <Search size={14} strokeWidth={1.7} aria-hidden className="shrink-0 text-[var(--color-text-muted)]" />
-              <input
-                aria-label="Add people"
-                className="nd-bare flex-1 min-w-0 bg-transparent outline-none"
-                placeholder={workspace ? `Add people from ${workspace}` : "Add people"}
-                value={query}
-                onChange={(e) => setQuery(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter" && matches[0]) {
-                    e.preventDefault();
-                    add(matches[0].id);
-                  }
-                }}
-              />
-            </label>
-            {matches.length > 0 && (
-              <ul aria-label="Matching members" className="mt-1">
-                {matches.map((m) => (
-                  <li key={m.id}>
-                    <button
-                      type="button"
-                      className="flex w-full items-center gap-2 px-2 py-1.5 rounded-md text-sm text-left hover:bg-[var(--color-pill-hover)]"
-                      onClick={() => add(m.id)}
-                    >
-                      <Avatar member={m} />
-                      <span className="truncate">{m.name || m.email}</span>
-                    </button>
-                  </li>
-                ))}
-              </ul>
-            )}
-          </div>
+          <label className="mb-3 flex items-center gap-2 px-2.5 py-1.5 rounded-md border border-[var(--color-line-visible)] text-sm">
+            <Search size={14} strokeWidth={1.7} aria-hidden className="shrink-0 text-[var(--color-text-muted)]" />
+            <Combobox
+              aria-label="Add people"
+              listLabel="Matching members"
+              className="nd-bare flex-1 min-w-0 bg-transparent outline-none"
+              placeholder={workspace ? `Add people from ${workspace}` : "Add people"}
+              value={query}
+              onValueChange={setQuery}
+              options={matches.map((m) => ({
+                value: m.id,
+                label: m.name || m.email,
+                content: (
+                  <>
+                    <Avatar member={m} />
+                    <span className="truncate">{m.name || m.email}</span>
+                  </>
+                ),
+              }))}
+              // Enter with nothing highlighted, or a blur, commits the typed text,
+              // which is a member only if it is one's id.
+              onCommit={(v) => (known[v] ? add(v) : undefined)}
+              onCancel={() => setQuery("")}
+            />
+          </label>
         )}
 
         <div className="nd-label mb-1">People with access</div>
