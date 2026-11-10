@@ -80,6 +80,9 @@ export type Note = {
   // flipped private is WITHDRAWN from teammates: their local copy is deleted on
   // their next pull, not merely hidden.
   private: boolean;
+  // Members a private note is also readable by (#232), as user ids. Empty on a
+  // private note = its author alone; always empty on a shared one.
+  shared_with: string[];
   // Soft-delete timestamp (ms) when the note is in the Trash; null/absent = live.
   deleted_at?: number | null;
   // Optional Client tag (issue #43). null = untagged. Independent of folder_id.
@@ -417,10 +420,11 @@ export const ipc = {
   // Reassign a note to a workspace ("" = Personal/local-only).
   setNoteWorkspace: (id: string, workspaceId: string) =>
     invoke<void>("notes_set_workspace", { id, workspaceId }),
-  // Visibility inside the workspace (#191). Also banks the choice as that
+  // Who can read the note inside its workspace (#191, #232): everyone, or its
+  // author plus `sharedWith`. Also banks everyone-or-restricted as that
   // workspace's default for the next note.
-  setNotePrivate: (id: string, isPrivate: boolean) =>
-    invoke<void>("notes_set_private", { id, private: isPrivate }),
+  setNoteAccess: (id: string, isPrivate: boolean, sharedWith: string[]) =>
+    invoke<void>("notes_set_access", { id, private: isPrivate, sharedWith }),
   // When the note happened, epoch ms.
   setNoteDate: (id: string, createdAt: number) =>
     invoke<void>("notes_set_date", { id, createdAt }),

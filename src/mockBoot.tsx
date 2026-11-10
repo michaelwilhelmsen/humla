@@ -341,6 +341,49 @@ function noteTranscribeCase(withText: boolean, replay?: ReplayRun): Scenario {
   };
 }
 
+// #232: the Share popover on a note in a workspace. `owner` decides whether the
+// reader is its author (controls) or a member it was shared with (read-only).
+function noteShareCase(owner: string, isPrivate: boolean, sharedWith: string[]): Scenario {
+  const note = makeNote({
+    id: "n1",
+    title: "Styremøte 10. november 2026",
+    body: "<p>Møtedeltagere: Stian, Michael, Petter</p>",
+    workspace_id: "ws1",
+    owner,
+    private: isPrivate,
+    shared_with: sharedWith,
+  });
+  const ws = { id: "ws1", name: "Screenpartner", role: "owner", plan_status: "active" };
+  return {
+    route: "/note/n1",
+    render: () => null, // unused — `route` renders the app
+    ipc: {
+      notes_list: () => [note],
+      notes_get: () => note,
+      note_timeline: () => [],
+      note_sessions: () => [],
+      notes_set_access: () => null,
+      cloud_status: () => ({
+        ...DISCONNECTED,
+        configured: true,
+        logged_in: true,
+        base_url: "https://sync.humla.team",
+        user: { id: "u1", email: "michael@example.no", name: "Michael Wilhelmsen", verified: true },
+        current_workspace: ws,
+        workspaces: [ws],
+      }),
+      cloud_workspace_members: () => [
+        { id: "u1", email: "michael@example.no", name: "Michael Wilhelmsen", role: "owner" },
+        { id: "u-stian", email: "stian@example.no", name: "Stian Berg", role: "member" },
+        { id: "u-petter", email: "petter@example.no", name: "Petter Hansen", role: "member" },
+        { id: "u-anne", email: "anne@example.no", name: "Anne Kristiansen", role: "member" },
+        { id: "u-ola", email: "ola@example.no", name: "Ola Nordmann", role: "viewer" },
+        { id: "u-kari", email: "kari@example.no", name: "Kari Lie", role: "member" },
+      ],
+    },
+  };
+}
+
 // ---- #146 axis: the note toolbar at the widths the body column really gets --
 // The toolbar sits in the BODY column, whose width is the window minus the
 // context panel (clamped 320–720) — so at the 720px minimum window it can be
@@ -1445,6 +1488,11 @@ const CASES: Record<string, Scenario> = {
   "panel-nothing": panelEmptyCase(false),
   // The same two states in the real note, where the action has to hold its own
   // beside the toolbar's copy of it and the panel's pickers.
+  // --- #232: who can read a note.
+  "note-share-everyone": noteShareCase("u1", false, []),
+  "note-share-people": noteShareCase("u1", true, ["u-stian"]),
+  "note-share-only-me": noteShareCase("u1", true, []),
+  "note-share-readonly": noteShareCase("u-stian", true, ["u1", "u-petter"]),
   "note-pending": noteTranscribeCase(false),
   "note-pending-text": noteTranscribeCase(true),
   // #146: the same note mid-replay. Two surfaces report the one run — the

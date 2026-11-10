@@ -26,6 +26,7 @@ function makeNote(id: string, title: string): Note {
     owner: "",
     workspace_id: "",
     private: false,
+    shared_with: [],
   };
 }
 

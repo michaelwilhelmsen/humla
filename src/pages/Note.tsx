@@ -20,7 +20,6 @@ import {
   FileText,
   Folder,
   Languages,
-  Lock,
   MessageCircle,
   MessageSquare,
   MoreHorizontal,
@@ -89,6 +88,7 @@ import {
   renameSpeakerAcrossNotes,
 } from "../lib/crossNoteRename";
 import { cn } from "../lib/cn";
+import { NoteAccessPicker } from "../components/NoteAccess";
 import {
   PANEL_FLOOR,
   PANEL_MAX,
@@ -1275,15 +1275,17 @@ export function Note() {
               </span>
             )
           )}
-          {draft.workspace_id && isMine && (
-            <VisibilityPicker
-              value={draft.private}
+          {draft.workspace_id && (isMine || draft.private) && (
+            <NoteAccessPicker
+              access={{ private: draft.private, shared_with: draft.shared_with ?? [] }}
+              owner={draft.owner}
+              editable={isMine}
               disabled={readOnly}
-              onChange={async (isPrivate) => {
-                if (!draft || readOnly || isPrivate === draft.private) return;
-                const next = { ...draft, private: isPrivate };
+              onChange={async (access) => {
+                if (!draft || readOnly || !isMine) return;
+                const next = { ...draft, ...access };
                 setDraft(next);
-                await ipc.setNotePrivate(draft.id, isPrivate);
+                await ipc.setNoteAccess(draft.id, access.private, access.shared_with);
                 upsert(next);
               }}
             />
@@ -2278,47 +2280,6 @@ function CtlSelect({
               </MenuRadioItem>
             </Fragment>
           ))}
-        </MenuRadioGroup>
-      </MenuContent>
-    </Menu>
-  );
-}
-
-/** Visibility inside a workspace (#191).
- *
- *  Rendered only for a note that has a workspace AND that the reader wrote. A
- *  Personal note is private by definition, and on someone else's note this is not
- *  the reader's call to make — not even a workspace owner's, or the word means
- *  nothing. The server refuses the write either way; this is the surface agreeing
- *  with it rather than offering a control that fails.
- */
-function VisibilityPicker({
-  value,
-  disabled,
-  onChange,
-}: {
-  value: boolean;
-  disabled?: boolean;
-  onChange: (isPrivate: boolean) => void;
-}) {
-  return (
-    <Menu>
-      <MenuTrigger
-        className="nd-meta is-interactive"
-        disabled={disabled}
-        title={value ? "Only you can read this note" : "Everyone in the workspace can read this note"}
-        aria-label="Visibility"
-      >
-        {value ? <Lock size={14} strokeWidth={1.7} /> : <Users size={14} strokeWidth={1.7} />}
-        <span>{value ? "Private" : "Shared"}</span>
-      </MenuTrigger>
-      <MenuContent aria-label="Visibility">
-        <MenuRadioGroup
-          value={value ? "private" : "shared"}
-          onValueChange={(v) => onChange(v === "private")}
-        >
-          <MenuRadioItem value="shared">Shared</MenuRadioItem>
-          <MenuRadioItem value="private">Private</MenuRadioItem>
         </MenuRadioGroup>
       </MenuContent>
     </Menu>

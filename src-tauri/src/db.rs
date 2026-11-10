@@ -64,6 +64,11 @@ pub struct Note {
     // `updated_at` so it wins last-write-wins against a stale copy.
     #[serde(default)]
     pub private: bool,
+    // The members a private note is also readable by (#232), as PocketBase user
+    // ids. Empty on a private note = its author alone; ignored on a shared one.
+    // A decision like `private`: it syncs and moves `updated_at`.
+    #[serde(default)]
+    pub shared_with: Vec<String>,
     // Soft-delete timestamp (ms). NULL = live; set = in Trash (recoverable).
     // Deleting a note sets this instead of dropping the row, so an accidental
     // delete can be restored; a remote tombstone also lands here.
@@ -306,6 +311,11 @@ pub fn open(path: &Path) -> Result<Connection> {
         "ALTER TABLE notes ADD COLUMN private INTEGER NOT NULL DEFAULT 0",
         [],
     );
+    // Who a private note is shared with (#232), a JSON array of user ids.
+    let _ = conn.execute(
+        "ALTER TABLE notes ADD COLUMN shared_with TEXT NOT NULL DEFAULT '[]'",
+        [],
+    );
     let _ = conn.execute(
         "ALTER TABLE folders ADD COLUMN workspace_id TEXT NOT NULL DEFAULT ''",
         [],
@@ -440,7 +450,7 @@ pub fn now_ms() -> i64 {
 // note would clobber a local tag.
 // Appended-only: `map_note` reads by position, so new columns go on the end
 // to keep every existing index stable.
-const NOTE_COLS: &str = "id, title, body, transcript, summary, audio_path, summary_preset, folder_id, language, summary_provider, expected_speakers, created_at, updated_at, owner, workspace_id, deleted_at, client_id, detected_language, private";
+const NOTE_COLS: &str = "id, title, body, transcript, summary, audio_path, summary_preset, folder_id, language, summary_provider, expected_speakers, created_at, updated_at, owner, workspace_id, deleted_at, client_id, detected_language, private, shared_with";
 
 /// List live notes in the active workspace (`""` = Personal / local-only).
 /// Excludes trashed notes (`deleted_at` set). Scoping by workspace keeps one
@@ -509,6 +519,16 @@ pub fn set_note_private(conn: &Connection, id: &str, private: bool) -> Result<()
     conn.execute(
         "UPDATE notes SET private = ?1, updated_at = ?2 WHERE id = ?3",
         params![private, now_ms(), id],
+    )?;
+    Ok(())
+}
+
+/// Set who a private note is shared with (#232). A decision, so it bumps
+/// `updated_at` like `set_note_private`.
+pub fn set_note_shared_with(conn: &Connection, id: &str, shared_with: &[String]) -> Result<()> {
+    conn.execute(
+        "UPDATE notes SET shared_with = ?1, updated_at = ?2 WHERE id = ?3",
+        params![serde_json::to_string(shared_with)?, now_ms(), id],
     )?;
     Ok(())
 }
@@ -3207,6 +3227,7 @@ fn map_note(row: &rusqlite::Row) -> rusqlite::Result<Note> {
         client_id: row.get(16)?,
         detected_language: row.get(17)?,
         private: row.get(18)?,
+        shared_with: serde_json::from_str(&row.get::<_, String>(19)?).unwrap_or_default(),
     })
 }
 
@@ -3240,6 +3261,21 @@ mod tests {
 
         set_note_private(&conn, &note.id, false).unwrap();
         assert!(!get_note(&conn, &note.id).unwrap().private);
+    }
+
+    /// #232 — who a note is shared with is stored, read back, and a real edit.
+    #[test]
+    fn shared_with_round_trips_and_is_a_real_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("shared.sqlite")).unwrap();
+        let note = create_note(&conn, "en", "meeting", "wsA").unwrap();
+        assert!(note.shared_with.is_empty());
+
+        let ids = vec!["u-bob".to_string(), "u-carol".to_string()];
+        set_note_shared_with(&conn, &note.id, &ids).unwrap();
+        let after = get_note(&conn, &note.id).unwrap();
+        assert_eq!(after.shared_with, ids);
+        assert!(after.updated_at >= note.updated_at);
     }
 
     /// #222 — moving a note to the day it was actually recorded is a real edit:

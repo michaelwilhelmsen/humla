@@ -26,6 +26,7 @@ function makeNote(over: Partial<Note> = {}): Note {
     owner: "",
     workspace_id: "",
     private: false,
+    shared_with: [],
     ...over,
   };
 }

@@ -23,6 +23,7 @@ export function makeNote(overrides: Partial<Note> & { id: string }): Note {
     owner: "",
     workspace_id: "",
     private: false,
+    shared_with: [],
     ...overrides,
   };
 }

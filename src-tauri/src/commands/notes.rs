@@ -287,21 +287,55 @@ pub(crate) fn may_change_visibility(owner: &str, me: &str) -> bool {
     owner.is_empty() || (!me.is_empty() && owner == me)
 }
 
-/// Set a note's visibility inside its workspace (#191).
+/// Whether a change of who can read a note leaves anyone out who could read it
+/// before (#232). Only then does the sync layer withdraw it, since a withdrawal
+/// makes every other member ask the server whether they may keep their copy.
+pub(crate) fn access_narrowed(
+    was_private: bool,
+    was_shared_with: &[String],
+    private: bool,
+    shared_with: &[String],
+) -> bool {
+    if !private {
+        return false;
+    }
+    !was_private || was_shared_with.iter().any(|id| !shared_with.contains(id))
+}
+
+/// The list as it is stored: no duplicates, never the author, and empty on a
+/// note the whole workspace can read.
+pub(crate) fn normalize_shared_with(private: bool, shared_with: Vec<String>, me: &str) -> Vec<String> {
+    if !private {
+        return Vec::new();
+    }
+    let mut out: Vec<String> = Vec::new();
+    for id in shared_with {
+        if !id.is_empty() && id != me && !out.contains(&id) {
+            out.push(id);
+        }
+    }
+    out
+}
+
+/// Set who can read a note inside its workspace (#191, #232): everyone
+/// (`private` false), or its author plus the members in `shared_with`.
 ///
-/// Two things happen on the way to private and only one of them is the note
-/// itself: teammates who already synced it hold a complete copy, and a record
-/// that leaves their view produces no pull event — so the sync layer is told
-/// about the TRANSITION, not just the new value.
+/// When that leaves someone out who could read it before, the sync layer is told
+/// about the TRANSITION, not just the new value: teammates who already synced it
+/// hold a complete copy, and a record that leaves their view produces no pull
+/// event.
 ///
-/// Also remembers the choice as this workspace's default for the next note.
+/// Also remembers everyone-or-restricted as this workspace's default for the next
+/// note. The people are not remembered: who belongs on a note is decided per
+/// meeting.
 #[tauri::command]
-pub fn notes_set_private(
+pub fn notes_set_access(
     state: State<AppState>,
     id: String,
     private: bool,
+    shared_with: Vec<String>,
 ) -> Result<(), String> {
-    {
+    let narrowed = {
         let conn = state.db.lock();
         let note = db::get_note(&conn, &id).map_err(err)?;
         // A Personal note is private already and has no workspace to be private
@@ -310,28 +344,30 @@ pub fn notes_set_private(
         if note.workspace_id.is_empty() {
             return Err("A note outside a workspace is already private.".into());
         }
+        let me = super::cloud_auth::current_user_id();
         // The server refuses a non-author's write too; refusing here keeps the local
         // row from disagreeing with it until the next pull, and keeps a revocation
         // the server will reject out of the outbox, where it would retry forever.
-        if !may_change_visibility(&note.owner, &super::cloud_auth::current_user_id()) {
+        if !may_change_visibility(&note.owner, &me) {
             return Err("Only the note's author can change who can read it.".into());
         }
         // Banked BEFORE the no-op check: the default follows what the user CHOSE,
-        // and choosing the answer a note already has is still choosing it. Behind
-        // the check, picking Shared on an already-shared note recorded nothing and
-        // the next note stayed private.
+        // and choosing the answer a note already has is still choosing it.
         db::set_setting(
             &conn,
             &visibility_default_key(&note.workspace_id),
             if private { "1" } else { "0" },
         )
         .map_err(err)?;
-        if note.private == private {
+        let shared_with = normalize_shared_with(private, shared_with, &me);
+        if note.private == private && note.shared_with == shared_with {
             return Ok(());
         }
         db::set_note_private(&conn, &id, private).map_err(err)?;
-    }
-    if private {
+        db::set_note_shared_with(&conn, &id, &shared_with).map_err(err)?;
+        access_narrowed(note.private, &note.shared_with, private, &shared_with)
+    };
+    if narrowed {
         state.sync.note_withdrawn(&id);
     } else {
         state.sync.note_upserted(&id);
@@ -342,6 +378,30 @@ pub fn notes_set_private(
 #[cfg(test)]
 mod tests {
     use super::{check_note_date, purge_note_assets};
+
+    fn ids(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// #232 — only a change that leaves someone out withdraws the note.
+    #[test]
+    fn access_narrows_only_when_someone_loses_it() {
+        use super::access_narrowed as n;
+        assert!(n(false, &[], true, &[]), "everyone → only me");
+        assert!(n(false, &[], true, &ids(&["b"])), "everyone → me and b");
+        assert!(n(true, &ids(&["b", "c"]), true, &ids(&["b"])), "c removed");
+        assert!(!n(true, &ids(&["b"]), true, &ids(&["b", "c"])), "c added");
+        assert!(!n(true, &[], true, &ids(&["b"])), "only me → me and b");
+        assert!(!n(true, &ids(&["b"]), false, &[]), "restricted → everyone");
+        assert!(!n(true, &ids(&["b"]), true, &ids(&["b"])), "unchanged");
+    }
+
+    #[test]
+    fn the_stored_list_has_no_author_no_duplicates_and_nothing_when_shared() {
+        use super::normalize_shared_with as norm;
+        assert_eq!(norm(true, ids(&["me", "b", "b", "", "c"]), "me"), ids(&["b", "c"]));
+        assert!(norm(false, ids(&["b"]), "me").is_empty());
+    }
 
     #[test]
     fn a_note_can_be_dated_up_to_now_and_no_later() {
