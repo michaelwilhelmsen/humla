@@ -55,3 +55,21 @@ describe("the note's context panel", () => {
     expect(panel?.style.width).toBe("520px");
   });
 });
+
+describe("the context panel's window cap", () => {
+  it("gives way to the body column on a narrow window, keeping the saved width", async () => {
+    // 900px of columns leaves the panel 900 - BODY_MIN (420) = 480px.
+    const clientWidth = Object.getOwnPropertyDescriptor(Element.prototype, "clientWidth");
+    Object.defineProperty(Element.prototype, "clientWidth", { configurable: true, get: () => 900 });
+    try {
+      localStorage.setItem("humla.panelWidth", "600");
+      openNote("n1");
+      await toggle();
+      const panel = document.querySelector<HTMLElement>("[aria-hidden='false'][style*='width']");
+      expect(panel?.style.width).toBe("480px");
+      expect(localStorage.getItem("humla.panelWidth")).toBe("600");
+    } finally {
+      if (clientWidth) Object.defineProperty(Element.prototype, "clientWidth", clientWidth);
+    }
+  });
+});

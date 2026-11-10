@@ -1,5 +1,5 @@
 import { Link, useNavigate, useOutletContext, useParams } from "react-router-dom";
-import { Fragment, memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { useVirtualizer } from "@tanstack/react-virtual";
@@ -407,17 +407,18 @@ export function Note() {
   // The width the two columns share, watched rather than derived: it is the
   // window minus the nav card, and the nav card collapses. Drives the clamp
   // that keeps the panel from squeezing the body column past what its toolbar
-  // can survive — see PANEL_MIN / BODY_MIN.
-  const columnsRef = useRef<HTMLDivElement | null>(null);
+  // can survive — see PANEL_MIN / BODY_MIN. A state ref, because the columns
+  // only mount once the note has loaded; measured before paint, or the panel
+  // draws uncapped and then animates down to the cap.
+  const [columnsEl, setColumnsEl] = useState<HTMLDivElement | null>(null);
   const [columnsWidth, setColumnsWidth] = useState(0);
-  useEffect(() => {
-    const el = columnsRef.current;
-    if (!el) return;
-    setColumnsWidth(el.clientWidth);
+  useLayoutEffect(() => {
+    if (!columnsEl) return;
+    setColumnsWidth(columnsEl.clientWidth);
     const ro = new ResizeObserver(([entry]) => setColumnsWidth(entry.contentRect.width));
-    ro.observe(el);
+    ro.observe(columnsEl);
     return () => ro.disconnect();
-  }, []);
+  }, [columnsEl]);
   // How wide the panel may actually be right now. Before #146 the drag handler
   // clamped to a flat 320–720 with no regard for the window, so on a
   // minimum-size window the panel could be dragged over the whole view and
@@ -1127,7 +1128,7 @@ export function Note() {
   const wsInitial = noteWsName.slice(0, 1).toUpperCase();
 
   return (
-    <div ref={columnsRef} className="h-full flex min-h-0">
+    <div ref={setColumnsEl} className="h-full flex min-h-0">
       {/* Body column — toolbar + scrollable writing area. The context
           panel is a sibling card to the right; closing it widens the body
           into a focus-writing mode. */}
