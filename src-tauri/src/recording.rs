@@ -684,9 +684,43 @@ pub struct LiveCapture {
     pub lock_heartbeat: Option<JoinHandle<()>>,
     // Where the capture slot is in its stop sequence. See [`StopState`].
     pub stop: StopState,
+    // A start has claimed the slot and is still running its checks; `note_id`
+    // and `child` are set only once it commits. See [`StartClaim`].
+    pub starting: bool,
 }
 
 impl LiveCapture {
+    /// Claim the slot for a new capture, or refuse with `busy` when a start is
+    /// already claimed or a capture is genuinely running. A session left
+    /// behind without a running child, or whose reader has gone, is cleared,
+    /// and its child is handed back for the caller to stop.
+    pub fn claim_start(&mut self, busy: &'static str) -> Result<Option<Child>, &'static str> {
+        if let Some(msg) = self.stop_in_progress() {
+            return Err(msg);
+        }
+        if self.starting {
+            return Err(busy);
+        }
+        let mut stale = None;
+        if self.note_id.is_some() {
+            let child_dead = match self.child.as_mut() {
+                Some(c) => matches!(c.try_wait(), Ok(Some(_)) | Err(_)),
+                None => true,
+            };
+            let reader_dead = self.reader.as_ref().map_or(true, |r| r.is_finished());
+            if !child_dead && !reader_dead {
+                return Err(busy);
+            }
+            stale = self.child.take();
+            self.note_id = None;
+            self.temp_dir = None;
+            self.reader = None;
+            self.inflight = Arc::new(Mutex::new(Vec::new()));
+        }
+        self.starting = true;
+        Ok(stale)
+    }
+
     /// The refusal a caller trying to take the capture slot must return, or
     /// `None` when the slot is takeable. The invariant it protects: a new
     /// capture can never clear `chunk_log` before the previous stop has
@@ -710,6 +744,42 @@ impl LiveCapture {
         let note_id = self.note_id.clone().ok_or("not recording")?;
         self.stop = StopState::Draining;
         Ok(note_id)
+    }
+}
+
+/// A start's claim on the capture slot, taken before checks that can take
+/// seconds so a second start in that gap is refused. Dropping it gives the
+/// slot back, which covers every early return; [`StartClaim::commit`] hands
+/// it to the capture once `note_id` and `child` are set.
+pub struct StartClaim {
+    slot: Arc<Mutex<LiveCapture>>,
+    held: bool,
+}
+
+impl StartClaim {
+    /// Claim the slot (see [`LiveCapture::claim_start`]). The returned child,
+    /// if any, belongs to a stale session and must be stopped by the caller.
+    pub fn take(
+        slot: &Arc<Mutex<LiveCapture>>,
+        busy: &'static str,
+    ) -> Result<(Self, Option<Child>), &'static str> {
+        let stale = slot.lock().claim_start(busy)?;
+        Ok((Self { slot: slot.clone(), held: true }, stale))
+    }
+
+    /// Hand the slot to the capture. Takes the slot's guard because the
+    /// caller is already holding it while it fills in the capture.
+    pub fn commit(mut self, cap: &mut LiveCapture) {
+        cap.starting = false;
+        self.held = false;
+    }
+}
+
+impl Drop for StartClaim {
+    fn drop(&mut self) {
+        if self.held {
+            self.slot.lock().starting = false;
+        }
     }
 }
 
@@ -1562,6 +1632,91 @@ mod tests {
         assert_eq!(cap.note_id.as_deref(), Some("n1"), "the tail still appends");
         assert_eq!(cap.stop_in_progress(), Some(STOP_IN_PROGRESS));
         assert_eq!(cap.begin_stop(), Err(STOP_IN_PROGRESS), "no second stop");
+    }
+
+    const BUSY: &str = "already recording";
+
+    fn a_sleeping_child() -> Child {
+        tokio::process::Command::new("sleep")
+            .arg("30")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn sleep")
+    }
+
+    #[test]
+    fn a_claimed_start_refuses_a_second_one() {
+        let mut cap = LiveCapture::default();
+        assert!(matches!(cap.claim_start(BUSY), Ok(None)));
+        assert!(matches!(cap.claim_start(BUSY), Err(BUSY)));
+        assert!(cap.starting, "the refusal leaves the first claim in place");
+    }
+
+    #[test]
+    fn a_stop_in_progress_refuses_a_claim() {
+        let mut cap = LiveCapture::default();
+        cap.note_id = Some("n1".to_string());
+        cap.stop = StopState::Draining;
+        assert!(matches!(cap.claim_start(BUSY), Err(STOP_IN_PROGRESS)));
+        assert!(!cap.starting);
+        assert_eq!(cap.note_id.as_deref(), Some("n1"));
+    }
+
+    #[test]
+    fn a_session_with_no_child_is_stale_and_cleared() {
+        let mut cap = LiveCapture::default();
+        cap.note_id = Some("n1".to_string());
+        cap.temp_dir = Some(PathBuf::from("/tmp/x"));
+        assert!(matches!(cap.claim_start(BUSY), Ok(None)));
+        assert!(cap.starting);
+        assert_eq!(cap.note_id, None);
+        assert_eq!(cap.temp_dir, None);
+    }
+
+    #[tokio::test]
+    async fn a_live_child_with_a_live_reader_refuses_a_claim() {
+        let mut cap = LiveCapture::default();
+        cap.note_id = Some("n1".to_string());
+        cap.child = Some(a_sleeping_child());
+        cap.reader = Some(tokio::spawn(std::future::pending::<()>()));
+        assert!(matches!(cap.claim_start(BUSY), Err(BUSY)));
+        assert!(!cap.starting);
+        assert!(cap.child.is_some(), "a genuine capture keeps its sidecar");
+        cap.reader.take().unwrap().abort();
+    }
+
+    #[tokio::test]
+    async fn a_live_child_whose_reader_is_gone_is_handed_back_to_kill() {
+        let mut cap = LiveCapture::default();
+        cap.note_id = Some("n1".to_string());
+        cap.child = Some(a_sleeping_child());
+        let stale = cap.claim_start(BUSY).expect("an orphan is taken over");
+        assert!(stale.is_some(), "the caller must stop the orphaned sidecar");
+        assert!(cap.child.is_none());
+        assert!(cap.starting);
+    }
+
+    #[test]
+    fn dropping_a_claim_frees_the_slot() {
+        let slot = Arc::new(Mutex::new(LiveCapture::default()));
+        let (claim, _) = StartClaim::take(&slot, BUSY).unwrap();
+        assert!(matches!(StartClaim::take(&slot, BUSY), Err(BUSY)));
+        drop(claim);
+        assert!(!slot.lock().starting);
+        assert!(StartClaim::take(&slot, BUSY).is_ok());
+    }
+
+    #[test]
+    fn a_committed_claim_hands_the_slot_to_the_capture() {
+        let slot = Arc::new(Mutex::new(LiveCapture::default()));
+        let (claim, _) = StartClaim::take(&slot, BUSY).unwrap();
+        {
+            let mut s = slot.lock();
+            s.note_id = Some("n1".to_string());
+            claim.commit(&mut s);
+            assert!(!s.starting);
+        }
+        assert_eq!(slot.lock().note_id.as_deref(), Some("n1"));
     }
 
     #[test]

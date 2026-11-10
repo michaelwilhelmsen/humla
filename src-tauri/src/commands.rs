@@ -3,7 +3,7 @@ use crate::diarize;
 use crate::local_whisper;
 use crate::sessions;
 use crate::wav;
-use crate::recording::{CaptureSink, ChunkRecord, ChunkSource, DiagnosticPayload, ErrorPayload, Inflight, Phase, RecordingStatus, ReplayProgress, ReplayTakeTimings, ReplayTimings, SidecarEvent, SinkMode, Step, StepReport, TakeWork, TranscriptPayload};
+use crate::recording::{CaptureSink, ChunkRecord, ChunkSource, DiagnosticPayload, ErrorPayload, Inflight, Phase, RecordingStatus, ReplayProgress, ReplayTakeTimings, ReplayTimings, SidecarEvent, SinkMode, StartClaim, Step, StepReport, TakeWork, TranscriptPayload};
 use crate::AppState;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -2529,65 +2529,33 @@ pub fn recording_state(state: State<AppState>) -> Result<&'static str, String> {
     Ok(if s.note_id.is_some() { "recording" } else { "idle" })
 }
 
+/// Stop a sidecar left behind by a session that never went through
+/// `recording_stop`: SIGTERM, a short grace, then kill.
+async fn stop_stale_child(mut c: tokio::process::Child) {
+    if let Some(pid) = c.id() {
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(pid as i32, libc::SIGTERM);
+        }
+    }
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), c.wait()).await;
+    let _ = c.kill().await;
+}
+
 #[tauri::command]
 pub async fn recording_start(
     app: AppHandle,
     state: State<'_, AppState>,
     note_id: String,
 ) -> Result<(), String> {
-    // A stop in progress owns the slot until its chain lands on Idle (#182).
-    // Refused here, in the backend, and not only in the UI: the self-heal
-    // below reads a taken `child` as a dead one, so without this check a
-    // `recording_start` arriving mid-drain would take over and clear
-    // `chunk_log` before the previous stop had snapshotted it — losing the
-    // tail of that meeting's audio.
-    if let Some(msg) = state.recording.lock().stop_in_progress() {
-        return Err(msg.into());
-    }
-
-    // Self-heal stale sessions before refusing. We get here when the
-    // session struct still has note_id set — could be a real recording
-    // in progress, or a zombie left behind by a dev reload / app crash
-    // that didn't flow through recording_stop.
-    //
-    // - If the tracked child has already exited → pure garbage, clear it.
-    // - If the child is still running but its reader handle is gone (the
-    //   stdout pipe was closed without recording_stop running) → orphan,
-    //   SIGTERM it and take over.
-    // - Only when both child AND reader are alive do we treat it as a
-    //   genuine concurrent recording and refuse.
-    let stale_child: Option<tokio::process::Child> = {
-        let mut s = state.recording.lock();
-        if s.note_id.is_some() {
-            let child_dead = match s.child.as_mut() {
-                Some(c) => matches!(c.try_wait(), Ok(Some(_)) | Err(_)),
-                None => true,
-            };
-            let reader_dead = s.reader.as_ref().map_or(true, |r| r.is_finished());
-
-            if !child_dead && !reader_dead {
-                return Err("already recording".into());
-            }
-
-            let stale = s.child.take();
-            s.note_id = None;
-            s.temp_dir = None;
-            s.reader = None;
-            s.inflight = Arc::new(parking_lot::Mutex::new(Vec::new()));
-            stale
-        } else {
-            None
-        }
-    };
-    if let Some(mut c) = stale_child {
-        if let Some(pid) = c.id() {
-            #[cfg(unix)]
-            unsafe {
-                libc::kill(pid as i32, libc::SIGTERM);
-            }
-        }
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), c.wait()).await;
-        let _ = c.kill().await;
+    // Claimed before any of the checks below, which can take seconds: a second
+    // start inside that gap must find the slot taken, or its sidecar would
+    // replace this one's. A stop in progress refuses too (#182), since the
+    // self-heal reads a taken `child` as a dead one and would clear
+    // `chunk_log` before that stop had snapshotted it.
+    let (claim, stale_child) = StartClaim::take(&state.recording, "already recording")?;
+    if let Some(c) = stale_child {
+        stop_stale_child(c).await;
     }
 
     // A deferred transcription on *this* note is the one thing that can't
@@ -2845,7 +2813,13 @@ pub async fn recording_start(
         }
     });
 
-    state.recording.lock().reader = Some(reader_handle);
+    // Committed only with the reader in place: until then a start would read
+    // this capture's live child with no reader as an orphan and stop it.
+    {
+        let mut s = state.recording.lock();
+        s.reader = Some(reader_handle);
+        claim.commit(&mut s);
+    }
 
     // Attach the shared-note lock to the live session + start its heartbeat so a
     // long meeting keeps the lock fresh. Stored on the session so recording_stop
@@ -3877,40 +3851,12 @@ pub async fn import_audio(
         return Err(format!("File not found: {path}"));
     }
 
-    // Same single-slot self-heal + refusal as recording_start: import and live
-    // recording share the one capture slot — including while the previous
-    // capture's stop chain still holds it (#182).
-    if let Some(msg) = state.recording.lock().stop_in_progress() {
-        return Err(msg.into());
-    }
-    let stale_child: Option<tokio::process::Child> = {
-        let mut s = state.recording.lock();
-        if s.note_id.is_some() {
-            let child_dead = match s.child.as_mut() {
-                Some(c) => matches!(c.try_wait(), Ok(Some(_)) | Err(_)),
-                None => true,
-            };
-            let reader_dead = s.reader.as_ref().map_or(true, |r| r.is_finished());
-            if !child_dead && !reader_dead {
-                return Err("already recording or importing".into());
-            }
-            let stale = s.child.take();
-            s.note_id = None;
-            s.temp_dir = None;
-            s.reader = None;
-            s.inflight = Arc::new(parking_lot::Mutex::new(Vec::new()));
-            stale
-        } else {
-            None
-        }
-    };
-    if let Some(mut c) = stale_child {
-        if let Some(pid) = c.id() {
-            #[cfg(unix)]
-            unsafe { libc::kill(pid as i32, libc::SIGTERM); }
-        }
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), c.wait()).await;
-        let _ = c.kill().await;
+    // Import and live recording share the one capture slot, claimed the same
+    // way `recording_start` claims it.
+    let (claim, stale_child) =
+        StartClaim::take(&state.recording, "already recording or importing")?;
+    if let Some(c) = stale_child {
+        stop_stale_child(c).await;
     }
 
     // Create the destination note now so provider-prereq errors can attach to
@@ -4063,7 +4009,13 @@ pub async fn import_audio(
         finish_import(&app_clone, &note_id_clone).await;
     });
 
-    state.recording.lock().reader = Some(reader_handle);
+    // Committed only with the reader in place: until then a start would read
+    // this capture's live child with no reader as an orphan and stop it.
+    {
+        let mut s = state.recording.lock();
+        s.reader = Some(reader_handle);
+        claim.commit(&mut s);
+    }
 
     Ok(note)
 }
