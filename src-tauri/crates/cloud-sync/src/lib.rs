@@ -824,11 +824,9 @@ impl Worker {
 
     /// Queue one pulled revocation for `settle_revocations`, which decides it.
     ///
-    /// Queued rather than applied, because a revocation no longer says that the
-    /// note is gone for everyone (#232): narrowing a note from the whole
-    /// workspace to two people writes one, and those two keep it. Only the server
-    /// can say which side of the line this member is on, and asking it can fail,
-    /// so the question has to survive until it gets an answer.
+    /// A revocation says only that someone lost access (#232); members still on
+    /// the note's list keep it. The server decides which side this member is on,
+    /// and asking it can fail, so the question is kept until it gets an answer.
     fn queue_revocation(&self, v: &serde_json::Value) -> Result<()> {
         let r: RemoteRevocation = serde_json::from_value(v.clone())?;
         if !is_safe_id(&r.note_client_id) {
@@ -869,12 +867,15 @@ impl Worker {
         }
         let mut keep = Vec::new();
         let mut changed = false;
-        let locked = self.requires_two_factor(&self.config.workspace_id).await;
+        let mut locked: Option<bool> = None;
         for r in pending {
             if !self.revocation_applies(&r, me)? {
                 continue;
             }
-            if !matches!(locked, Ok(false)) {
+            if locked.is_none() {
+                locked = Some(!matches!(self.requires_two_factor(&self.config.workspace_id).await, Ok(false)));
+            }
+            if locked == Some(true) {
                 keep.push(r);
                 continue;
             }
