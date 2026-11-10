@@ -3,9 +3,9 @@ import { getCurrent, onOpenUrl } from "@tauri-apps/plugin-deep-link";
 import type { CheckoutSource } from "./cloud";
 
 /**
- * What a `humla://` link asks for. The backend has already brought the window
- * forward by the time the frontend sees a link, so anything unrecognised is a
- * `focus` and needs no further work.
+ * What a `humla://` link asks for. The backend acts on every link itself — it
+ * brings the window forward, or starts or stops a recording (`deep_link.rs`) —
+ * so anything unrecognised here is a `focus` and needs no further work.
  */
 export type DeepLinkAction =
   | { kind: "new-workspace"; source?: CheckoutSource }
@@ -30,7 +30,8 @@ export function parseDeepLink(raw: string): DeepLinkAction | null {
   }
   if (url.protocol !== "humla:") return null;
   // `humla://new-workspace` puts the route in the host; `humla:///new-workspace`
-  // and `humla:new-workspace` put it in the path.
+  // and `humla:new-workspace` put it in the path. `deep_link::parse` (Rust)
+  // reads the recording routes the same way; change both.
   const route = `${url.host}${url.pathname}`.replace(/^\/+|\/+$/g, "").toLowerCase();
   if (route === "new-workspace") {
     return { kind: "new-workspace", source: linkSource(url.searchParams.get("source")) };

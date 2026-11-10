@@ -138,7 +138,7 @@ fn strip_wrapping_quotes(t: &str) -> &str {
 /// Cut to at most `max` chars, on a `char` boundary and, where one is close
 /// enough, on a word boundary — so a cap that lands mid-word doesn't leave a
 /// half word behind.
-fn truncate_chars(t: &str, max: usize) -> String {
+pub(crate) fn truncate_chars(t: &str, max: usize) -> String {
     if t.chars().count() <= max {
         return t.to_string();
     }

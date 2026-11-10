@@ -77,8 +77,9 @@ pub struct MenuBar {
     tray: TrayIcon,
     start: MenuItem<tauri::Wry>,
     stop: MenuItem<tauri::Wry>,
-    /// Note id of a recording started with no window on screen, cleared when
-    /// that recording finishes. `None` for anything the user started in-app.
+    /// Note id of the recording to name in a "saved" notification: one started
+    /// with no window on screen, or started or stopped by a link. Cleared when
+    /// that recording finishes.
     headless_note: Mutex<Option<String>>,
     /// The glyph the tray is showing. Tracked so a phase change that doesn't
     /// change the glyph doesn't re-upload an identical image on every status
@@ -617,17 +618,17 @@ pub fn toggle_recording(app: &AppHandle) {
         return;
     }
     // The same rule the tray items are drawn from, so a hotkey press can't do
-    // what a greyed-out menu item refuses to. Deciding from `note_id.is_some()`
-    // instead would call every mid-transition phase "idle" — `recording_stop`
-    // clears the id before the post-stop chain runs — and a second recording
-    // started on top of a diarize in flight is the shape that used to hand the
-    // finishing take's notification to the new one.
-    let Some(mb) = app.try_state::<MenuBar>() else { return };
-    let want = tray_menu_state(*mb.phase.lock());
+    // what a greyed-out menu item refuses to. `note_id.is_some()` can't stand in
+    // for it: `recording_stop` clears the id before the post-stop chain runs.
+    let Some(phase) = current_phase(app) else { return };
+    let want = tray_menu_state(phase);
     if !want.start_enabled && !want.stop_enabled {
         return;
     }
     let stopping = want.stop_enabled;
+    if !stopping && !claim_start(app) {
+        return;
+    }
 
     let app = app.clone();
     // `async_runtime::spawn`, not `tokio::spawn`: this can be reached from the
@@ -637,27 +638,65 @@ pub fn toggle_recording(app: &AppHandle) {
         if stopping {
             headless_stop(&app).await;
         } else {
-            headless_start(&app).await;
+            headless_start(&app, &headless_note_title(chrono::Local::now())).await;
         }
     });
 }
 
-async fn headless_start(app: &AppHandle) {
-    let note = match create_headless_note(app) {
-        Ok(note) => note,
+/// What the tray and the hotkey are acting on right now. `None` when the menu
+/// bar never installed.
+pub(crate) fn current_phase(app: &AppHandle) -> Option<Phase> {
+    app.try_state::<MenuBar>().map(|mb| *mb.phase.lock())
+}
+
+/// Take the start the tray offers, so a second trigger racing this one finds it
+/// taken: `recording_start` marks the slot only after checks that can take
+/// seconds. False when the tray offers no start.
+pub(crate) fn claim_start(app: &AppHandle) -> bool {
+    let Some(mb) = app.try_state::<MenuBar>() else { return false };
+    {
+        let mut phase = mb.phase.lock();
+        if !tray_menu_state(*phase).start_enabled {
+            return false;
+        }
+        *phase = Phase::Starting;
+    }
+    on_phase(app, Phase::Starting);
+    true
+}
+
+/// Name the live recording's note in a "saved" notification once it is saved.
+pub(crate) fn announce_when_saved(app: &AppHandle) {
+    let (Some(mb), Some(state)) = (app.try_state::<MenuBar>(), app.try_state::<AppState>())
+    else {
+        return;
+    };
+    let live = state.recording.lock().note_id.clone();
+    if let Some(note_id) = live {
+        mb.headless_note.lock().get_or_insert(note_id);
+    }
+}
+
+/// Record into a new note titled `title`, once [`claim_start`] has taken the
+/// start; a start that fails gives it back. Returns whether the recording
+/// started; a failure has already been reported.
+pub(crate) async fn headless_start(app: &AppHandle, title: &str) -> bool {
+    let note_id = match create_headless_note(app, title) {
+        Ok(id) => id,
         Err(e) => {
+            on_phase(app, Phase::Idle);
             notify(app, "Couldn't start recording", &e);
-            return;
+            return false;
         }
     };
     // Remember the note before starting: a start that fails still needs to be
     // named, and a start that succeeds won't come back through here.
-    *app.state::<MenuBar>().headless_note.lock() = Some(note.0.clone());
-    // The window is closed, so refresh whenever it comes back.
+    *app.state::<MenuBar>().headless_note.lock() = Some(note_id.clone());
+    // Lists refresh now if the window is open, or when it comes back.
     let _ = app.emit("notes_changed", ());
 
     let state = app.state::<AppState>();
-    if let Err(e) = crate::commands::recording_start(app.clone(), state, note.0.clone()).await {
+    if let Err(e) = crate::commands::recording_start(app.clone(), state, note_id).await {
         app.state::<MenuBar>().headless_note.lock().take();
         // `recording_start` backs out of Phase::Starting on the paths that
         // reach it, but the early refusals (already recording, permissions,
@@ -668,10 +707,12 @@ async fn headless_start(app: &AppHandle) {
         // revoked mic permission or a missing key/model normally surfaces as an
         // in-app toast, and there is no app on screen to show one.
         notify(app, "Couldn't start recording", &e);
+        return false;
     }
+    true
 }
 
-async fn headless_stop(app: &AppHandle) {
+pub(crate) async fn headless_stop(app: &AppHandle) {
     let state = app.state::<AppState>();
     if let Err(e) = crate::commands::recording_stop(app.clone(), state).await {
         notify(app, "Couldn't stop recording", &e);
@@ -680,16 +721,10 @@ async fn headless_stop(app: &AppHandle) {
     // isn't written until the post-stop chain finishes.
 }
 
-/// Create the note a headless recording records into: the user's defaults,
-/// in the active workspace, titled with the start time.
-///
-/// The title is what makes the note findable — both in the sidebar and in the
-/// notification that names it. #90's automatic titler replaces it once the
-/// recording has content; [`is_replaceable_title`] is the seam for recognising
-/// a title as ours to overwrite.
-fn create_headless_note(app: &AppHandle) -> Result<(String, String), String> {
+/// Create the note a headless recording records into: the user's defaults, in
+/// the active workspace, titled `title`.
+fn create_headless_note(app: &AppHandle, title: &str) -> Result<String, String> {
     let state = app.state::<AppState>();
-    let title = headless_note_title(chrono::Local::now());
     let id = {
         let conn = state.db.lock();
         let language = db::get_setting(&conn, "language")
@@ -705,7 +740,7 @@ fn create_headless_note(app: &AppHandle) -> Result<(String, String), String> {
         db::update_note(
             &conn,
             &note.id,
-            &db::NotePatch { title: Some(title.clone()), ..Default::default() },
+            &db::NotePatch { title: Some(title.to_string()), ..Default::default() },
         )
         .map_err(|e| format!("{e}"))?;
         // The menu-bar recorder gets the same sticky visibility as the note view
@@ -716,7 +751,7 @@ fn create_headless_note(app: &AppHandle) -> Result<(String, String), String> {
         note.id
     }; // drop the db guard before pinging sync (see the SyncObserver contract)
     state.sync.note_upserted(&id);
-    Ok((id, title))
+    Ok(id)
 }
 
 /// `"Recording 19 Aug 14:32"` — the start time, since it's the only thing we
@@ -815,7 +850,7 @@ fn note_title(app: &AppHandle, note_id: &str) -> String {
     }
 }
 
-fn notify(app: &AppHandle, title: &str, body: &str) {
+pub(crate) fn notify(app: &AppHandle, title: &str, body: &str) {
     if let Err(e) = app.notification().builder().title(title).body(body).show() {
         eprintln!("[menubar] notification failed: {e}");
     }

@@ -423,7 +423,9 @@ export function bindBackendListeners() {
     } else if (s.noteId) {
       recordingNoteId = s.noteId; // an active recording — remember which note
     }
-  });
+  })
+    .then(() => ipc.deepLinksReady())
+    .catch((e) => console.warn("recording links not released", e));
   onTitleStatus(({ noteId, active }) => {
     useRecordingStore.getState().setTitling(noteId, active);
   });

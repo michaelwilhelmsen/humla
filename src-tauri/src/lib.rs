@@ -13,6 +13,7 @@ mod presets;
 mod wav;
 mod recording;
 mod menubar;
+mod deep_link;
 mod sessions;
 mod commands;
 mod stt;
@@ -326,12 +327,18 @@ where
                 }
             };
             menubar::present_at_launch(app.handle(), tray_installed);
-            // The frontend reads the link itself; here it only needs the window.
             {
                 use tauri_plugin_deep_link::DeepLinkExt;
+                app.manage(deep_link::Held::default());
+                deep_link::release_after_limit(app.handle());
                 let handle = app.handle().clone();
                 app.deep_link()
-                    .on_open_url(move |_| menubar::show_main_window(&handle));
+                    .on_open_url(move |event| deep_link::open(&handle, event.urls()));
+                // The link a cold launch was opened with can arrive before the
+                // listener exists; the plugin then holds it as the current link.
+                if let Ok(Some(urls)) = app.deep_link().get_current() {
+                    deep_link::open(app.handle(), urls);
+                }
             }
 
             Ok(())
@@ -494,6 +501,7 @@ where
             commands::permissions_open_settings,
             commands::record_hotkey_get,
             commands::record_hotkey_set,
+            commands::deep_links_ready,
             commands::launch_at_login_get,
             commands::launch_at_login_set,
             app_relaunch,

@@ -24,6 +24,13 @@ pub async fn record_hotkey_set(app: AppHandle, accel: String) -> Result<(), Stri
     menubar::set_hotkey(&app, &accel)
 }
 
+/// The frontend hears `recording_status` now, so held recording links can be
+/// followed (`deep_link::Held`).
+#[tauri::command]
+pub fn deep_links_ready(app: AppHandle) {
+    crate::deep_link::release(&app);
+}
+
 /// Whether Humla's own login item is installed (#207). The LaunchAgent on disk
 /// is the record; nothing is stored in the settings table.
 #[tauri::command]
