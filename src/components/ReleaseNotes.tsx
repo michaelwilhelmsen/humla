@@ -52,6 +52,7 @@ const VISUAL_CAPTION: Record<NonNullable<Release["visual"]>, string> = {
   audio: "Save a meeting’s recording.",
   copilot: "Use the Copilot subscription you already have.",
   custom: "Bring any OpenAI-compatible API.",
+  share: "Share a note with the people who need it.",
 };
 
 function ReleaseVisual({ kind }: { kind: NonNullable<Release["visual"]> }) {
@@ -87,6 +88,21 @@ function ReleaseVisual({ kind }: { kind: NonNullable<Release["visual"]> }) {
             </div>
           </div>
           <p className="release-preview-body">A few ideas to think through before our next team meeting.</p>
+        </>}
+        {kind === "share" && <>
+          <div className="release-demo-heading"><span>Board meeting</span></div>
+          <div className="release-preview-meta">
+            <span className="nd-meta"><Building2 size={14} strokeWidth={1.7} />Design team</span>
+            <div className="release-preview-visibility">
+              <span className="nd-meta"><Users size={14} strokeWidth={1.7} />Alex, Sam</span>
+              <div className="release-preview-menu release-preview-share">
+                <div className="release-preview-person"><span>A</span>Alex<small>Owner</small></div>
+                <div className="release-preview-person"><span>S</span>Sam<X size={12} strokeWidth={1.8} /></div>
+                <div className={rowClass}><span className="release-preview-check"><Check size={14} strokeWidth={2} /></span>Only people added</div>
+              </div>
+            </div>
+          </div>
+          <p className="release-preview-body">Decisions on the budget and the hire.</p>
         </>}
         {kind === "activity" && <>
           <div className="release-demo-heading"><span>All notes</span><small>8 notes</small></div>

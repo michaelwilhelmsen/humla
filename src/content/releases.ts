@@ -3,13 +3,34 @@ export type Release = {
   date: string;
   title: string;
   summary: string;
-  visual?: "filters" | "privacy" | "activity" | "updates" | "speakers" | "webhook" | "export" | "two-factor" | "date" | "audio" | "copilot" | "custom";
+  visual?: "filters" | "privacy" | "activity" | "updates" | "speakers" | "webhook" | "export" | "two-factor" | "date" | "audio" | "copilot" | "custom" | "share";
   paragraphs: string[];
   highlights: string[];
   issues: { title: string; reference: string; status: "Open" | "Closed"; url: string }[];
 };
 
 export const releases: Release[] = [
+  {
+    version: "0.75.0",
+    date: "2026-11-10",
+    title: "Share a note with chosen people",
+    summary: "A note in a team workspace can now be shared with just the people who need it.",
+    visual: "share",
+    paragraphs: [
+      "Until now a note in a team workspace was either shared with everyone or private to you. Now you can pick who gets it: click the chip under the title, add people from the workspace, and only they can open the note, its transcript and its recording. Everyone else in the workspace doesn't see it, and it doesn't show up when they chat with their notes.",
+      "Only the person who wrote the note can change who has it. The people you add can read and edit it like any other note in the workspace, and they see who else has it. If you take someone off the list, the note is removed from their Mac the next time Humla syncs.",
+      "Also in this release: a microphone with many inputs, like the Focusrite Vocaster Two, now records from its first input instead of silence, and Humla remembers whether you left the side panel open or closed.",
+    ],
+    highlights: [
+      "Share a note with chosen people in your workspace.",
+      "Only you decide who has your note.",
+      "Multichannel microphones record from their first input.",
+    ],
+    issues: [
+      { title: "Share a note with chosen people in a workspace", reference: "#232", status: "Closed", url: "https://github.com/michaelwilhelmsen/humla/issues/232" },
+      { title: "Silent microphone capture from Vocaster Two USB (14-channel input) on macOS", reference: "#231", status: "Closed", url: "https://github.com/michaelwilhelmsen/humla/issues/231" },
+    ],
+  },
   {
     version: "0.74.0",
     date: "2026-11-01",

@@ -52,6 +52,11 @@
 .release-preview-visibility { position: relative; }
 .release-preview-menu { position: absolute; top: calc(100% + 4px); right: 0; width: 160px; padding: 4px; border: 1px solid var(--color-line-visible); border-radius: 8px; background: var(--color-canvas); box-shadow: 0 10px 15px -3px #0000001a, 0 4px 6px -4px #0000001a; }
 .release-preview-menu > div:first-child { color: var(--color-text-muted); }
+.release-preview-share { width: 190px; }
+.release-preview-share > div:first-child { color: inherit; }
+.release-preview-person { display: flex; align-items: center; gap: 8px; padding: 5px 8px; font-size: 13px; }
+.release-preview-person > span { display: grid; place-items: center; width: 18px; height: 18px; border-radius: 999px; font-size: 10px; font-weight: 600; background: var(--color-surface-raised); }
+.release-preview-person > small, .release-preview-person > svg { margin-left: auto; color: var(--color-text-muted); }
 .release-preview-check { display: grid; place-items: center; width: 14px; height: 14px; color: var(--color-accent-text); }
 .release-preview-body { margin-top: 22px; max-width: 140px; font-size: 13px; line-height: 1.65; color: var(--color-text-muted); min-height: 96px; }
 .release-visual-caption { font-size: 11px; color: var(--color-text-muted); }
