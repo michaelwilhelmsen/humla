@@ -1,28 +1,12 @@
-// Step 2 — Permissions (design/ONBOARDING.md § 2. Permissions).
-//
-// Deliberately the FIRST real step: if Screen Recording forces a relaunch,
-// it's far better to hit that on step 2 than on step 6. One screen, two rows:
-//
-//   - Microphone (required)   — native prompt via permissions_request. The
-//     Continue button is gated on this; the wizard can't record without it.
-//   - System audio (skippable) — macOS has no native prompt for Screen
-//     Recording; the flow is request (registers the app in the TCC list) then
-//     deep-link to System Settings, the user toggles Humla on and returns; a
-//     window-focus re-poll flips the pill. Skipping is a fully supported mode
-//     (mic-only, in-person meetings) and must never block anything.
-//
-// The hard part — the restart. Screen Recording granted *during this app run*
-// doesn't take effect until relaunch. Heuristic: snapshot the screen status at
-// mount; if it was NOT granted at mount and becomes granted while the app is
-// running, a restart is required. Already-granted-at-mount → no restart. The
-// wizard owns this: it persists the resume cursor (belt-and-suspenders on top
-// of the shell's own write-through) then offers a Restart Humla button that
-// relaunches via `ipc.relaunchApp` — NOT the Tauri process plugin, whose
-// relaunch closes this app without bringing it back (see the note on
-// `relaunchApp` in lib/ipc.ts). The resume machinery lands the user back on
-// this step showing the granted state.
+// Step 2 — Permissions (design/ONBOARDING.md § 2). The microphone gates
+// Continue; system audio and notifications are optional and never block it.
+// Screen Recording has no prompt of its own (request registers the app, then
+// System Settings opens and a focus re-poll picks up the switch), and a grant
+// made during this run only works after a relaunch through `ipc.relaunchApp`,
+// which brings the app back where the Tauri process plugin's would not. The
+// notifications prompt waits for an answer, so asking never holds the rest.
 import { useEffect, useRef, useState } from "react";
-import { ShieldCheck, Mic, MonitorSpeaker, RotateCw, ArrowRight } from "lucide-react";
+import { ShieldCheck, Mic, MonitorSpeaker, Bell, RotateCw, ArrowRight } from "lucide-react";
 import { ipc, type PermissionStatus, type PermissionsStatus } from "../../../lib/ipc";
 import type { StepContext } from "../types";
 import { StepShell } from "../StepShell";
@@ -70,6 +54,7 @@ function StatusPill({ status }: { status: PermissionStatus }) {
 export function PermissionsStep({ ctx }: { ctx: StepContext }) {
   const [status, setStatus] = useState<PermissionsStatus | null>(null);
   const [busy, setBusy] = useState<"microphone" | "screen" | null>(null);
+  const [askingNotifications, setAskingNotifications] = useState(false);
 
   // The restart heuristic's memory. `screenGrantedAtMount` is captured from the
   // FIRST status read; if screen was already granted when we arrived, no restart
@@ -147,9 +132,20 @@ export function PermissionsStep({ ctx }: { ctx: StepContext }) {
     }
   }
 
-  async function openMicSettings() {
+  async function requestNotifications() {
+    setAskingNotifications(true);
     try {
-      await ipc.permissionsOpenSettings("microphone");
+      setStatus(await ipc.permissionsRequest("notifications"));
+    } catch {
+      await refresh();
+    } finally {
+      setAskingNotifications(false);
+    }
+  }
+
+  async function openSettings(kind: "microphone" | "notifications") {
+    try {
+      await ipc.permissionsOpenSettings(kind);
     } catch (e) {
       console.warn("[onboarding] failed to open settings:", e);
     }
@@ -215,7 +211,7 @@ export function PermissionsStep({ ctx }: { ctx: StepContext }) {
               {micGranted ? null : micBlocked ? (
                 <button
                   type="button"
-                  onClick={openMicSettings}
+                  onClick={() => openSettings("microphone")}
                   className="nd-btn"
                 >
                   Open System Settings
@@ -295,6 +291,49 @@ export function PermissionsStep({ ctx }: { ctx: StepContext }) {
               </button>
             </div>
           )}
+        </div>
+
+        {/* Notifications — optional */}
+        <div className="rounded-[var(--radius)] border border-[var(--color-line)] bg-[var(--color-surface)] px-4 py-3.5">
+          <div className="flex items-start justify-between gap-4">
+            <div className="min-w-0">
+              <div className="flex items-center gap-2">
+                <Bell
+                  size={16}
+                  strokeWidth={1.8}
+                  className="shrink-0 text-[var(--color-text-muted)]"
+                />
+                <span className="text-sm font-semibold text-[var(--color-text)]">
+                  Notifications
+                </span>
+                <StatusPill status={status.notifications} />
+              </div>
+              <p className="mt-1.5 text-xs leading-relaxed text-[var(--color-text-muted)]">
+                Optional — lets Humla tell you when a recording started from the
+                menu bar or a link begins, is saved, or can't start.
+              </p>
+            </div>
+            <div className="shrink-0">
+              {status.notifications === "not_determined" ? (
+                <button
+                  type="button"
+                  onClick={requestNotifications}
+                  disabled={askingNotifications}
+                  className="nd-btn"
+                >
+                  {askingNotifications ? "Waiting for macOS…" : "Allow notifications"}
+                </button>
+              ) : status.notifications === "denied" ? (
+                <button
+                  type="button"
+                  onClick={() => openSettings("notifications")}
+                  className="nd-btn"
+                >
+                  Open System Settings
+                </button>
+              ) : null}
+            </div>
+          </div>
         </div>
       </div>
 

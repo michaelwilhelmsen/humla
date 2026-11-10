@@ -853,7 +853,7 @@ export const ipc = {
   permissionsOpenSettings: (kind: PermissionKind) => invoke<void>("permissions_open_settings", { kind }),
 };
 
-export type PermissionKind = "microphone" | "screen";
+export type PermissionKind = "microphone" | "screen" | "notifications";
 export type PermissionStatus =
   | "granted"
   | "denied"
@@ -863,6 +863,7 @@ export type PermissionStatus =
 export type PermissionsStatus = {
   microphone: PermissionStatus;
   screen: PermissionStatus;
+  notifications: PermissionStatus;
 };
 
 // ── AI chat (issues #46, #47) ────────────────────────────────────────────

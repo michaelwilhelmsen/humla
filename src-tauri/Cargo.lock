@@ -2040,6 +2040,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "base64 0.22.1",
+ "block2",
  "chrono",
  "cloud-sync",
  "dirs 5.0.1",
@@ -2050,6 +2051,9 @@ dependencies = [
  "keyring",
  "krilla",
  "libc",
+ "objc2",
+ "objc2-foundation",
+ "objc2-user-notifications",
  "parking_lot",
  "pulldown-cmark",
  "qrcodegen",
@@ -3085,6 +3089,18 @@ dependencies = [
  "bitflags 2.11.1",
  "objc2",
  "objc2-core-foundation",
+ "objc2-foundation",
+]
+
+[[package]]
+name = "objc2-user-notifications"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9df9128cbbfef73cda168416ccf7f837b62737d748333bfe9ab71c245d76613e"
+dependencies = [
+ "bitflags 2.11.1",
+ "block2",
+ "objc2",
  "objc2-foundation",
 ]
 

@@ -14,6 +14,7 @@ mod wav;
 mod recording;
 mod menubar;
 mod deep_link;
+mod notification_permission;
 mod sessions;
 mod commands;
 mod stt;

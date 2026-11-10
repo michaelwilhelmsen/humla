@@ -54,8 +54,9 @@ says why:
 - **Start while a file is being imported.** Try again once the import is done.
 - **Stop when nothing is recording**, or while a recording is still starting.
 
-These notifications only appear if notifications are allowed for Humla in
-**System Settings → Notifications**.
+These notifications only appear once you have allowed notifications for
+Humla. A new install asks during setup; otherwise allow them in **Settings →
+Recording → Permissions** in Humla, or in **System Settings → Notifications**.
 
 ## Links and privacy
 

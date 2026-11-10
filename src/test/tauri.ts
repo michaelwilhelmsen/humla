@@ -59,7 +59,7 @@ export function mockTauri(
       case "chat_get_pin":
         return "";
       case "permissions_status":
-        return { microphone: "granted", screen: "granted" };
+        return { microphone: "granted", screen: "granted", notifications: "granted" };
       case "cloud_status":
         return {
           configured: false,

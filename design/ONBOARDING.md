@@ -72,8 +72,9 @@ Single CTA: "Get started."
 ### 2. Permissions
 
 **First real step deliberately** — if screen recording forces a relaunch, better on step 2 than
-step 6. One screen, two rows (Microphone / System audio), each with a status pill and action
-button; reuse the guts of `src/components/Permissions.tsx` (which already re-polls on window
+step 6. One screen, three rows (Microphone / System audio / Notifications), each with a status
+pill and action button. Notifications is optional, like system audio: it lets the menu bar and
+`humla://` links (#91) report what they did, and asking never blocks Continue; reuse the guts of `src/components/Permissions.tsx` (which already re-polls on window
 focus — the user returns from System Settings and the pill has flipped).
 
 - **Microphone — required.** `permissions_request("microphone")` fires the native prompt.

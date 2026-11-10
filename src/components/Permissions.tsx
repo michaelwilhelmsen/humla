@@ -4,11 +4,14 @@ import { ipc, type PermissionKind, type PermissionStatus, type PermissionsStatus
 const LABEL: Record<PermissionKind, string> = {
   microphone: "Microphone",
   screen: "Screen Recording",
+  notifications: "Notifications",
 };
 
 const HELP: Record<PermissionKind, string> = {
   microphone: "Required to record your voice.",
   screen: "Required to capture system audio (the other side of meetings).",
+  notifications:
+    "Lets Humla tell you when a recording started from the menu bar or a link begins, is saved, or can't start.",
 };
 
 function statusLabel(s: PermissionStatus): { text: string; tone: "ok" | "bad" | "muted" } {
@@ -24,6 +27,9 @@ function statusLabel(s: PermissionStatus): { text: string; tone: "ok" | "bad" | 
 export function Permissions() {
   const [status, setStatus] = useState<PermissionsStatus | null>(null);
   const [busy, setBusy] = useState<PermissionKind | null>(null);
+  // macOS's notification prompt waits for an answer, so it never holds the
+  // other rows.
+  const [askingNotifications, setAskingNotifications] = useState(false);
 
   async function refresh() {
     try {
@@ -50,7 +56,9 @@ export function Permissions() {
   }, []);
 
   async function request(kind: PermissionKind) {
-    setBusy(kind);
+    const mark = (on: boolean) =>
+      kind === "notifications" ? setAskingNotifications(on) : setBusy(on ? kind : null);
+    mark(true);
     try {
       const s = await ipc.permissionsRequest(kind);
       setStatus(s);
@@ -63,7 +71,7 @@ export function Permissions() {
     } catch {
       await refresh();
     } finally {
-      setBusy(null);
+      mark(false);
     }
   }
 
@@ -75,7 +83,7 @@ export function Permissions() {
 
   return (
     <div className="flex flex-col gap-3">
-      {(["microphone", "screen"] as PermissionKind[]).map((kind) => {
+      {(["microphone", "screen", "notifications"] as PermissionKind[]).map((kind) => {
         const s = statusLabel(status[kind]);
         // Microphone can be prompted only when it's "not_determined". Screen
         // Recording always reports "denied" until CGRequestScreenCaptureAccess
@@ -85,6 +93,8 @@ export function Permissions() {
           status[kind] === "not_determined" ||
           (kind === "screen" && status[kind] !== "granted");
         const showOpen = status[kind] !== "granted";
+        const asking = kind === "notifications" ? askingNotifications : busy === kind;
+        const blocked = kind === "notifications" ? askingNotifications : busy !== null;
         return (
           <div
             key={kind}
@@ -119,10 +129,10 @@ export function Permissions() {
               {showRequest && (
                 <button
                   onClick={() => request(kind)}
-                  disabled={busy !== null}
+                  disabled={blocked}
                   className="px-3 py-1.5 rounded-md text-sm border border-[var(--color-line-visible)] bg-[var(--color-surface)] hover:border-[var(--color-text)] disabled:opacity-50 transition-colors"
                 >
-                  {busy === kind ? "Requesting…" : "Request"}
+                  {asking ? "Requesting…" : "Request"}
                 </button>
               )}
               {showOpen && (

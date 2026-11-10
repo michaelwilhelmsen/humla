@@ -1,17 +1,19 @@
-//! macOS TCC permission commands (microphone + screen recording). Query
-//! / request via the audio-capture sidecar, plus a deep-link into System
-//! Settings. Surfaced to the frontend via `commands::permissions_*`
-//! (re-exported from the parent module). `run_sidecar_cmd` reaches the
-//! sidecar binary path via `super::sidecar_path`, which stays in the
-//! parent module alongside the recording lifecycle.
+//! macOS permission commands: the microphone and screen recording through the
+//! audio-capture sidecar, notifications in this process
+//! (`crate::notification_permission`), plus a deep-link into System Settings.
 
 use std::process::Stdio;
 use tauri::AppHandle;
+
+use crate::notification_permission;
 
 #[derive(serde::Serialize, serde::Deserialize, Default)]
 pub struct PermissionsStatus {
     pub microphone: String,
     pub screen: String,
+    /// Not in the sidecar's answer.
+    #[serde(default)]
+    pub notifications: String,
 }
 
 async fn run_sidecar_cmd(app: &AppHandle, mode: &str) -> Result<String, String> {
@@ -31,11 +33,24 @@ async fn run_sidecar_cmd(app: &AppHandle, mode: &str) -> Result<String, String> 
     }
 }
 
-#[tauri::command]
-pub async fn permissions_status(app: AppHandle) -> Result<PermissionsStatus, String> {
-    let stdout = run_sidecar_cmd(&app, "status").await?;
+/// The microphone and the screen only, which is all a recording needs to know.
+pub(crate) async fn capture_permissions(app: &AppHandle) -> Result<PermissionsStatus, String> {
+    let stdout = run_sidecar_cmd(app, "status").await?;
     let line = stdout.lines().last().unwrap_or("");
     serde_json::from_str(line).map_err(|e| format!("parse: {e}: {line}"))
+}
+
+/// A failed sidecar reads as `unknown` for its two, so the notifications
+/// answer still arrives.
+#[tauri::command]
+pub async fn permissions_status(app: AppHandle) -> Result<PermissionsStatus, String> {
+    let mut status = capture_permissions(&app).await.unwrap_or_else(|_| PermissionsStatus {
+        microphone: "unknown".into(),
+        screen: "unknown".into(),
+        ..Default::default()
+    });
+    status.notifications = notification_permission::status().await.to_string();
+    Ok(status)
 }
 
 #[tauri::command]
@@ -43,6 +58,10 @@ pub async fn permissions_request(app: AppHandle, kind: String) -> Result<Permiss
     let mode = match kind.as_str() {
         "microphone" => "request-microphone",
         "screen" => "request-screen",
+        "notifications" => {
+            notification_permission::request().await;
+            return permissions_status(app).await;
+        }
         _ => return Err("unknown kind".into()),
     };
     let _ = run_sidecar_cmd(&app, mode).await; // result ignored; we re-query
@@ -54,6 +73,7 @@ pub async fn permissions_open_settings(kind: String) -> Result<(), String> {
     let url = match kind.as_str() {
         "microphone" => "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone",
         "screen" => "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture",
+        "notifications" => "x-apple.systempreferences:com.apple.Notifications-Settings.extension?id=no.humla.app",
         _ => return Err("unknown kind".into()),
     };
     tokio::process::Command::new("open")

@@ -2631,7 +2631,7 @@ pub async fn recording_start(
     };
 
     // Pre-check microphone permission — without it we can't capture anything useful.
-    if let Ok(p) = permissions_status(app.clone()).await {
+    if let Ok(p) = capture_permissions(&app).await {
         if p.microphone != "granted" {
             let msg = "Microphone permission required. Open Settings → Permissions to grant.".to_string();
             emit_error(&app, Some(&note_id), &msg);

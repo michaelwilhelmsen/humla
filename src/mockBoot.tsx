@@ -726,7 +726,7 @@ function menubarCase(closeToTray: boolean, hotkey: string): Scenario {
       record_hotkey_set: () => null,
       launch_at_login_get: () => closeToTray,
       launch_at_login_set: () => null,
-      permissions_status: () => ({ microphone: "granted", screen: "granted" }),
+      permissions_status: () => ({ microphone: "granted", screen: "granted", notifications: "granted" }),
       stored_audio_stats: () => ({ notes: 0, files: 0, bytes: 0, noteIds: [] }),
     },
   };
@@ -750,7 +750,7 @@ function retentionCase(keepAudio: boolean, manual: boolean): Scenario {
     ipc: {
       record_hotkey_get: () => "Command+Control+KeyR",
       record_hotkey_set: () => null,
-      permissions_status: () => ({ microphone: "granted", screen: "granted" }),
+      permissions_status: () => ({ microphone: "granted", screen: "granted", notifications: "granted" }),
       stored_audio_stats: () => ({ notes: 0, files: 0, bytes: 0, noteIds: [] }),
     },
   };
