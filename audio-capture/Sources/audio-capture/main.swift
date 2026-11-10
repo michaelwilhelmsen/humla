@@ -724,6 +724,44 @@ func makeBuffer(_ samples: [Float]) -> AVAudioPCMBuffer? {
     return buf
 }
 
+// MARK: - Downmix to mono
+
+// AVAudioConverter fills a mono output only from a channel it can place as mono,
+// centre or left, so an input whose channels carry no position (a multichannel
+// USB interface, a discrete-layout file) converts to silence, even with
+// `downmix` on. `firstChannel` reads input 1 instead: the channel a stereo
+// input already gives.
+func monoConverter(from inFormat: AVAudioFormat, firstChannel: Bool) -> AVAudioConverter? {
+    guard let conv = AVAudioConverter(from: inFormat, to: targetFormat) else { return nil }
+    if firstChannel { conv.channelMap = [0] }
+    return conv
+}
+
+func hasPlacedMonoSource(_ format: AVAudioFormat) -> Bool {
+    guard format.channelCount > 1 else { return true }
+    guard let layout = format.channelLayout else { return false }
+    let tag = layout.layoutTag
+    switch tag {
+    case kAudioChannelLayoutTag_UseChannelDescriptions:
+        let acl = layout.layout
+        let count = Int(acl.pointee.mNumberChannelDescriptions)
+        guard count > 0,
+              let offset = MemoryLayout<AudioChannelLayout>.offset(of: \AudioChannelLayout.mChannelDescriptions) else {
+            return false
+        }
+        let first = UnsafeRawPointer(acl).advanced(by: offset)
+            .assumingMemoryBound(to: AudioChannelDescription.self)
+        let placed: Set<AudioChannelLabel> = [kAudioChannelLabel_Mono, kAudioChannelLabel_Center, kAudioChannelLabel_Left]
+        return UnsafeBufferPointer(start: first, count: count).contains { placed.contains($0.mChannelLabel) }
+    case kAudioChannelLayoutTag_UseChannelBitmap:
+        let bitmap = layout.layout.pointee.mChannelBitmap
+        return bitmap.contains(.bit_Left) || bitmap.contains(.bit_Center)
+    default:
+        let family = tag & 0xFFFF_0000
+        return family != kAudioChannelLayoutTag_DiscreteInOrder && family != kAudioChannelLayoutTag_Unknown
+    }
+}
+
 // MARK: - Mic via AVAudioEngine
 
 let engine = AVAudioEngine()
@@ -733,7 +771,9 @@ var micConverter: AVAudioConverter?
 // out so both initial setup and post-device-change recovery install an
 // identical tap against whatever the current input format happens to be.
 func installMicTap(_ input: AVAudioInputNode, format inFormat: AVAudioFormat) {
-    micConverter = AVAudioConverter(from: inFormat, to: targetFormat)
+    // Input 1 whenever there are more than two channels, whatever the layout:
+    // an interface's layout says nothing about which input the mic is on.
+    micConverter = monoConverter(from: inFormat, firstChannel: inFormat.channelCount > 2)
     // Both callers are on the main thread (startup, and device-change
     // recovery). Cached rather than re-resolved per heartbeat — see `InputDevice`.
     inputDevice.set(resolveInputDeviceName())
@@ -1276,7 +1316,8 @@ func runImport(_ path: String) {
     }
 
     let inFormat = file.processingFormat
-    guard let converter = AVAudioConverter(from: inFormat, to: targetFormat) else {
+    // A surround file keeps its centre channel, where the dialogue is.
+    guard let converter = monoConverter(from: inFormat, firstChannel: !hasPlacedMonoSource(inFormat)) else {
         emitError("import: could not build converter from \(inFormat)")
         emit(["event": "stopped"])
         exit(1)
