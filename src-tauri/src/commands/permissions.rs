@@ -1,11 +1,11 @@
 //! macOS permission commands: the microphone and screen recording through the
 //! audio-capture sidecar, notifications in this process
-//! (`crate::notification_permission`), plus a deep-link into System Settings.
+//! (`crate::notifications`), plus a deep-link into System Settings.
 
 use std::process::Stdio;
 use tauri::AppHandle;
 
-use crate::notification_permission;
+use crate::notifications;
 
 #[derive(serde::Serialize, serde::Deserialize, Default)]
 pub struct PermissionsStatus {
@@ -49,7 +49,7 @@ pub async fn permissions_status(app: AppHandle) -> Result<PermissionsStatus, Str
         screen: "unknown".into(),
         ..Default::default()
     });
-    status.notifications = notification_permission::status().await.to_string();
+    status.notifications = notifications::status().await.label().to_string();
     Ok(status)
 }
 
@@ -59,7 +59,7 @@ pub async fn permissions_request(app: AppHandle, kind: String) -> Result<Permiss
         "microphone" => "request-microphone",
         "screen" => "request-screen",
         "notifications" => {
-            notification_permission::request().await;
+            notifications::request().await;
             return permissions_status(app).await;
         }
         _ => return Err("unknown kind".into()),

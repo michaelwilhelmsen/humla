@@ -14,7 +14,7 @@ mod wav;
 mod recording;
 mod menubar;
 mod deep_link;
-mod notification_permission;
+mod notifications;
 mod sessions;
 mod commands;
 mod stt;
@@ -317,6 +317,7 @@ where
                     commands::embed_backfill(app_handle).await;
                 });
             }
+            notifications::install(app.handle());
             // Tray + global hotkey. Last in setup so a failure here can't stop
             // the app from coming up — the menu bar is an extra surface, not a
             // precondition for using Humla.

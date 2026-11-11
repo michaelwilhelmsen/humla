@@ -55,8 +55,9 @@ says why:
 - **Stop when nothing is recording**, or while a recording is still starting.
 
 These notifications only appear once you have allowed notifications for
-Humla. A new install asks during setup; otherwise allow them in **Settings →
-Recording → Permissions** in Humla, or in **System Settings → Notifications**.
+Humla. Humla asks during setup, or with its first notification if it hasn't
+asked before. If you said no, allow them in **Settings → Recording →
+Permissions** in Humla, or in **System Settings → Notifications**.
 
 ## Links and privacy
 

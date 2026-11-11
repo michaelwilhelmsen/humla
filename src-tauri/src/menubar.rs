@@ -27,7 +27,6 @@ use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{TrayIcon, TrayIconBuilder};
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_global_shortcut::GlobalShortcutExt;
-use tauri_plugin_notification::NotificationExt;
 
 use crate::recording::Phase;
 use crate::{db, AppState};
@@ -851,9 +850,7 @@ fn note_title(app: &AppHandle, note_id: &str) -> String {
 }
 
 pub(crate) fn notify(app: &AppHandle, title: &str, body: &str) {
-    if let Err(e) = app.notification().builder().title(title).body(body).show() {
-        eprintln!("[menubar] notification failed: {e}");
-    }
+    crate::notifications::notify(app, &uuid::Uuid::new_v4().to_string(), title, body, &[]);
 }
 
 #[cfg(test)]
