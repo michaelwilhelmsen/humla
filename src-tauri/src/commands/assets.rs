@@ -121,16 +121,13 @@ pub fn open_in_finder(app: AppHandle, path: String) -> Result<(), String> {
 /// builds that include the playback feature; missing for older notes.
 #[tauri::command]
 pub fn note_playback_path(app: AppHandle, note_id: String) -> Result<Option<String>, String> {
-    // Back-compat single-file resolver: the latest session's playback.wav
+    // Back-compat single-file resolver: the latest session's playback audio
     // (falling back to the flat legacy path for pre-#16 notes). The
     // session-aware player prefers `note_session_playback_path`.
     let app_dir = app.path().app_data_dir().map_err(err)?;
     let recordings = crate::sessions::recordings_dir(&app_dir, &note_id);
-    let path = crate::sessions::latest_session_dir(&recordings).join("playback.wav");
-    if !path.exists() {
-        return Ok(None);
-    }
-    Ok(path.to_str().map(|s| s.to_string()))
+    Ok(crate::sessions::playback_file(&crate::sessions::latest_session_dir(&recordings))
+        .and_then(|p| p.to_str().map(str::to_string)))
 }
 
 /// What a "delete stored audio for existing notes" sweep would remove (#24):

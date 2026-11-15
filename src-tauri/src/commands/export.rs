@@ -207,24 +207,59 @@ pub struct TakeAudio {
     pub duration_ms: Option<u64>,
 }
 
-/// A note's takes in order, each with the `playback.wav` it still has and that
+/// A note's takes in order, each with the playback audio it still has and that
 /// file's length. Index 0 is the "Earlier transcript" repair session, which was
-/// never a take and has no audio, so it isn't listed. `playback.wav` is the file
-/// the player plays: both streams mixed, and the one a take keeps whichever way
-/// it was captured, imported or synced. A file the join couldn't copy through
-/// counts as missing, so the list and the saved file always agree.
+/// never a take and has no audio, so it isn't listed. The playback audio is the
+/// file the player plays: both streams mixed, and the one a take keeps
+/// whichever way it was captured, imported or synced. A file the join couldn't
+/// copy through counts as missing, so the list and the saved file always agree.
 fn note_audio_takes(recordings: &Path) -> Vec<(u32, Option<(PathBuf, u64)>)> {
     crate::sessions::resolve_sessions(recordings)
         .into_iter()
         .filter(|(entry, _)| entry.index > 0)
         .map(|(entry, dir)| {
-            let path = dir.join("playback.wav");
-            let audio = crate::wav::pcm16_mono_16k_data(&path)
-                .ok()
-                .map(|(_, bytes)| (path, bytes / 32));
+            let audio = crate::sessions::playback_file(&dir).and_then(|path| {
+                let ms = if is_m4a(&path) {
+                    m4a_duration_ms(&path)
+                } else {
+                    crate::wav::pcm16_mono_16k_data(&path).ok().map(|(_, bytes)| bytes / 32)
+                }?;
+                Some((path, ms))
+            });
             (entry.index, audio)
         })
         .collect()
+}
+
+fn is_m4a(path: &Path) -> bool {
+    path.extension().is_some_and(|e| e.eq_ignore_ascii_case("m4a"))
+}
+
+/// A take's AAC playback length, from `afinfo`. Only 16 kHz mono counts, the
+/// format the join decodes it to.
+fn m4a_duration_ms(path: &Path) -> Option<u64> {
+    let out = std::process::Command::new("/usr/bin/afinfo").arg(path).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    afinfo_duration_ms(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// `afinfo` reports the frames left once the encoder's priming and padding are
+/// trimmed, which is what a decode gives back.
+fn afinfo_duration_ms(text: &str) -> Option<u64> {
+    let format = text.lines().find(|l| l.trim_start().starts_with("Data format:"))?;
+    if !(format.contains(" 1 ch,") && format.contains(" 16000 Hz")) {
+        return None;
+    }
+    let frames: u64 = text
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("audio ")?.split_once(" valid frames"))?
+        .0
+        .trim()
+        .parse()
+        .ok()?;
+    Some(frames / 16)
 }
 
 pub(crate) fn note_audio_info(recordings: &Path) -> Vec<TakeAudio> {
@@ -261,8 +296,27 @@ pub(crate) fn write_note_audio(sources: &[PathBuf], format: AudioFormat, dest: &
     }
     let scratch = Scratch(std::env::temp_dir().join(format!("humla-audio-{}", uuid::Uuid::new_v4())));
     std::fs::create_dir_all(&scratch.0).map_err(|e| format!("prepare audio: {e}"))?;
+    let mut pcm = Vec::with_capacity(sources.len());
+    for (i, source) in sources.iter().enumerate() {
+        if !is_m4a(source) {
+            pcm.push(source.clone());
+            continue;
+        }
+        let decoded = scratch.0.join(format!("take-{i}.wav"));
+        let result = std::process::Command::new("/usr/bin/afconvert")
+            .args(["-f", "WAVE", "-d", "LEI16@16000"])
+            .arg(source)
+            .arg(&decoded)
+            .output()
+            .map_err(|e| format!("decode audio: {e}"))?;
+        if !result.status.success() {
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            return Err(format!("decode audio: {}", stderr.trim()));
+        }
+        pcm.push(decoded);
+    }
     let wav = scratch.0.join("audio.wav");
-    crate::wav::concat_pcm16_mono_16k(sources, &wav).map_err(|e| format!("join audio: {e}"))?;
+    crate::wav::concat_pcm16_mono_16k(&pcm, &wav).map_err(|e| format!("join audio: {e}"))?;
     let out = match format {
         AudioFormat::Wav => wav,
         AudioFormat::M4a => {
@@ -393,6 +447,44 @@ mod tests {
         write_note_audio(&sources, AudioFormat::Wav, &dest).unwrap();
         let saved = crate::wav::read_i16_mono_16k(&dest).await.unwrap();
         assert!(saved == [vec![1i16; 16_000], vec![3i16; 8_000]].concat());
+    }
+
+    #[tokio::test]
+    async fn audio_joins_aac_takes_beside_wav_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let recordings = recorded_note(dir.path()).await;
+        // Take 3 as a take since #226 holds it: AAC, with no WAV beside it.
+        let third = recordings.join("third");
+        let tone: Vec<i16> = (0..8_000).map(|i| ((i as f32 * 0.07).sin() * 8_000.0) as i16).collect();
+        crate::wav::write_i16_mono_16k(&third.join("playback.wav"), &tone).await.unwrap();
+        let status = std::process::Command::new("/usr/bin/afconvert")
+            .args(["-f", "m4af", "-d", "aac", "-b", "32000"])
+            .arg(third.join("playback.wav"))
+            .arg(third.join("playback.m4a"))
+            .status()
+            .unwrap();
+        assert!(status.success());
+        std::fs::remove_file(third.join("playback.wav")).unwrap();
+
+        assert_eq!(note_audio_info(&recordings)[2], TakeAudio { index: 3, duration_ms: Some(500) });
+        let sources = note_audio_sources(&recordings);
+        assert_eq!(sources[1], third.join("playback.m4a"));
+        let dest = dir.path().join("out.wav");
+        write_note_audio(&sources, AudioFormat::Wav, &dest).unwrap();
+        let saved = crate::wav::read_i16_mono_16k(&dest).await.unwrap();
+        assert_eq!(saved.len(), 16_000 + 8_000, "the AAC take decodes to its own length");
+        assert!(saved[..16_000].iter().all(|&s| s == 1));
+    }
+
+    #[test]
+    fn afinfo_length_is_its_valid_frames() {
+        let text = "File type ID:   m4af\nData format:     1 ch,  16000 Hz, aac  (0x00000000) 0 bits/channel\n\
+                    estimated duration: 2153.983313 sec\n\
+                    audio 34463733 valid frames + 2112 priming + 971 remainder = 34466816\n";
+        assert_eq!(afinfo_duration_ms(text), Some(2_153_983));
+        let stereo = text.replace(" 1 ch,", " 2 ch,");
+        assert_eq!(afinfo_duration_ms(&stereo), None, "the join only takes mono");
+        assert_eq!(afinfo_duration_ms("Data format:     1 ch,  16000 Hz, aac\n"), None);
     }
 
     #[test]

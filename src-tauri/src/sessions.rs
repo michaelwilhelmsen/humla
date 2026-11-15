@@ -43,7 +43,8 @@ const MANIFEST_VERSION: u32 = 1;
 
 /// Per-chunk / per-source asset filenames living inside a session dir (or,
 /// for a legacy note, flat in the recordings dir).
-pub const ASSET_FILES: [&str; 5] = [
+pub const ASSET_FILES: [&str; 6] = [
+    "playback.m4a",
     "playback.wav",
     "timeline.jsonl",
     "mic.wav",
@@ -233,6 +234,15 @@ fn flat_streams(recordings_dir: &Path) -> Vec<String> {
         out.push("mic".to_string());
     }
     out
+}
+
+/// The audio the player plays for one take (#226): `playback.m4a`, or the
+/// `playback.wav` every take written before it has.
+pub fn playback_file(session_dir: &Path) -> Option<PathBuf> {
+    ["playback.m4a", "playback.wav"]
+        .into_iter()
+        .map(|f| session_dir.join(f))
+        .find(|p| p.exists())
 }
 
 /// Ordered `(entry, asset_dir)` pairs for a note, with legacy fallback.
@@ -459,6 +469,10 @@ pub fn existing_session_count(recordings_dir: &Path) -> usize {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AssetField {
     Playback,
+    /// The AAC playback a take has had since #226, in a field of its own: a
+    /// client from before it writes the `playback` field to `playback.wav`
+    /// whatever it holds.
+    PlaybackM4a,
     Mic,
     Sys,
     Timeline,
@@ -467,8 +481,9 @@ pub enum AssetField {
 
 impl AssetField {
     /// All five fields, in a stable order.
-    pub const ALL: [AssetField; 5] = [
+    pub const ALL: [AssetField; 6] = [
         AssetField::Playback,
+        AssetField::PlaybackM4a,
         AssetField::Mic,
         AssetField::Sys,
         AssetField::Timeline,
@@ -479,6 +494,7 @@ impl AssetField {
     pub fn field(self) -> &'static str {
         match self {
             AssetField::Playback => "playback",
+            AssetField::PlaybackM4a => "playback_m4a",
             AssetField::Mic => "mic",
             AssetField::Sys => "sys",
             AssetField::Timeline => "timeline",
@@ -490,6 +506,7 @@ impl AssetField {
     pub fn file_name(self) -> &'static str {
         match self {
             AssetField::Playback => "playback.wav",
+            AssetField::PlaybackM4a => "playback.m4a",
             AssetField::Mic => "mic.wav",
             AssetField::Sys => "sys.wav",
             AssetField::Timeline => "timeline.jsonl",
@@ -504,7 +521,7 @@ impl AssetField {
     pub fn is_audio(self) -> bool {
         matches!(
             self,
-            AssetField::Playback | AssetField::Mic | AssetField::Sys
+            AssetField::Playback | AssetField::PlaybackM4a | AssetField::Mic | AssetField::Sys
         )
     }
 
@@ -514,6 +531,7 @@ impl AssetField {
     pub fn mime(self) -> &'static str {
         match self {
             AssetField::Playback | AssetField::Mic | AssetField::Sys => "audio/wav",
+            AssetField::PlaybackM4a => "audio/mp4",
             AssetField::Timeline | AssetField::Chunks => "application/octet-stream",
         }
     }
@@ -688,18 +706,24 @@ pub fn keep_awake(setting: Option<&str>) -> bool {
 /// rule is *device-scoped*: a Mac with `keep_audio` off doesn't download
 /// someone else's recording either, so the setting describes the machine
 /// rather than just its own captures. The timeline comes down either way — it
-/// is text, and the reader needs it.
-pub fn session_download_plan(keep_audio: bool) -> Vec<AssetField> {
+/// is text, and the reader needs it. Of a take's two playback fields only one
+/// is fetched, the AAC one where the server has it.
+pub fn session_download_plan(keep_audio: bool, remote: &[AssetField]) -> Vec<AssetField> {
     let mut plan = Vec::new();
     if keep_audio {
-        plan.push(AssetField::Playback);
+        plan.push(if remote.contains(&AssetField::PlaybackM4a) {
+            AssetField::PlaybackM4a
+        } else {
+            AssetField::Playback
+        });
     }
     plan.push(AssetField::Timeline);
     plan
 }
 
-/// Every stored audio file under one note's recordings dir: `*.wav` flat in the
-/// dir and in every immediate subdir, sorted for stable output.
+/// Every stored audio file under one note's recordings dir: `*.wav` and
+/// `*.m4a` flat in the dir and in every immediate subdir, sorted for stable
+/// output.
 ///
 /// Deliberately a filesystem sweep rather than a walk of
 /// [`resolve_sessions`] × [`AssetField`]. Once a `sessions.json` exists the
@@ -719,7 +743,7 @@ pub fn stored_audio_files(recordings_dir: &Path) -> Vec<PathBuf> {
             if path.is_file()
                 && path
                     .extension()
-                    .is_some_and(|e| e.eq_ignore_ascii_case("wav"))
+                    .is_some_and(|e| e.eq_ignore_ascii_case("wav") || e.eq_ignore_ascii_case("m4a"))
             {
                 out.push(path);
             }
@@ -1545,12 +1569,12 @@ mod tests {
     // ---- honest keep_audio (#24) ------------------------------------------
 
     #[test]
-    fn audio_assets_are_the_three_wavs() {
+    fn audio_assets_are_both_playbacks_and_the_raw_streams() {
         let audio: Vec<AssetField> =
             AssetField::ALL.into_iter().filter(|f| f.is_audio()).collect();
         assert_eq!(
             audio,
-            vec![AssetField::Playback, AssetField::Mic, AssetField::Sys]
+            vec![AssetField::Playback, AssetField::PlaybackM4a, AssetField::Mic, AssetField::Sys]
         );
         // The text assets are word timings and chunk timings — never audio.
         assert!(!AssetField::Timeline.is_audio());
@@ -1581,13 +1605,52 @@ mod tests {
     #[test]
     fn download_plan_drops_audio_when_not_storing() {
         // A device that stores audio pulls a teammate's playback + timeline.
+        let remote = [AssetField::Playback, AssetField::Timeline];
         assert_eq!(
-            session_download_plan(true),
+            session_download_plan(true, &remote),
             vec![AssetField::Playback, AssetField::Timeline]
         );
         // A device with keep_audio off pulls only the text timeline, so the
         // reader and session dividers still work with no WAV on disk.
-        assert_eq!(session_download_plan(false), vec![AssetField::Timeline]);
+        assert_eq!(session_download_plan(false, &remote), vec![AssetField::Timeline]);
+    }
+
+    #[test]
+    fn download_plan_fetches_one_playback_preferring_aac() {
+        let both = [AssetField::Playback, AssetField::PlaybackM4a, AssetField::Timeline];
+        assert_eq!(
+            session_download_plan(true, &both),
+            vec![AssetField::PlaybackM4a, AssetField::Timeline]
+        );
+        let aac = [AssetField::PlaybackM4a, AssetField::Timeline];
+        assert_eq!(
+            session_download_plan(true, &aac),
+            vec![AssetField::PlaybackM4a, AssetField::Timeline]
+        );
+        assert_eq!(session_download_plan(false, &aac), vec![AssetField::Timeline]);
+    }
+
+    #[test]
+    fn playback_file_prefers_aac_and_falls_back_to_wav() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        assert_eq!(playback_file(dir), None);
+        touch(&dir.join("playback.wav"));
+        assert_eq!(playback_file(dir), Some(dir.join("playback.wav")));
+        touch(&dir.join("playback.m4a"));
+        assert_eq!(playback_file(dir), Some(dir.join("playback.m4a")));
+    }
+
+    #[test]
+    fn stored_audio_counts_aac_playback() {
+        let tmp = TempDir::new().unwrap();
+        let rec = tmp.path().join("note1");
+        let take = session_dir(&rec, "take-1");
+        std::fs::create_dir_all(&take).unwrap();
+        touch(&take.join("playback.m4a"));
+        touch(&take.join("timeline.jsonl"));
+        assert_eq!(stored_audio_files(&rec), vec![take.join("playback.m4a")]);
+        assert!(session_has_audio(&take));
     }
 
     #[test]

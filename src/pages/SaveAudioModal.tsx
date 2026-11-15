@@ -9,7 +9,7 @@ import { Segmented } from "./settings/components/Segmented";
 import { Btn } from "./settings/components/Btn";
 
 // ⋯ → Save audio… (#224). A note's audio lives under
-// `recordings/<note id>/<take id>/playback.wav`, which nobody can be expected to
+// `recordings/<note id>/<take id>/playback.m4a`, which nobody can be expected to
 // find, so this saves it wherever the user picks: every take joined in order
 // into one file, since what they want is "the meeting", not a folder of takes.
 //

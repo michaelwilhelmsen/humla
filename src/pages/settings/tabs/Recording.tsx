@@ -31,12 +31,12 @@ export function RecordingSection({
           label="Keep recorded audio"
           // The copy states which regime is in force rather than describing
           // the knob (#24). Before that issue this setting was a half-truth:
-          // the mixed playback.wav was written either way, so "off keeps
+          // the mixed playback audio was written either way, so "off keeps
           // nothing" was false. It's now literal, which is also why the off
           // text names the cost — no playback, no re-detection.
           description={
             keeping
-              ? "Keep recordings for playback and speaker re-detection. Roughly 1 MB per minute per channel."
+              ? "Keep recordings for playback and speaker re-detection. Roughly 2 MB per minute for the microphone, and as much again for system audio."
               : "No audio is stored on this Mac — transcript only; playback and speaker re-detection unavailable."
           }
           control={
