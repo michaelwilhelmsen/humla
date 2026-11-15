@@ -11,6 +11,7 @@ mod echo;
 mod languages;
 mod presets;
 mod wav;
+mod playback_mix;
 mod recording;
 mod menubar;
 mod deep_link;

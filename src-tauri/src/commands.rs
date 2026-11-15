@@ -5477,37 +5477,31 @@ async fn write_playback_assets(
 }
 
 /// Combine the per-source full WAVs into a single mono 16-kHz WAV the
-/// `<audio>` element can play. Mixes equal-weight when both streams are
-/// present; copies the byte stream when only one exists. Equal weight
-/// is the right default — the user is more interested in hearing both
-/// sides at the same level than in any acoustic faithfulness, and the
-/// upstream streams have already gone through their own gain stages.
+/// `<audio>` element can play, at a level meant for listening
+/// (`playback_mix`).
 async fn build_playback_wav(
     mic: Option<&std::path::Path>,
     sys: Option<&std::path::Path>,
     out: &std::path::Path,
 ) -> anyhow::Result<()> {
-    match (mic, sys) {
-        (Some(m), Some(s)) => {
-            let mic_samples = wav::read_f32_mono_16k(m).await?;
-            let sys_samples = wav::read_f32_mono_16k(s).await?;
-            let n = mic_samples.len().max(sys_samples.len());
-            let mut mixed = Vec::with_capacity(n);
-            for i in 0..n {
-                let a = mic_samples.get(i).copied().unwrap_or(0.0);
-                let b = sys_samples.get(i).copied().unwrap_or(0.0);
-                mixed.push((a + b) * 0.5);
-            }
-            wav::write_pcm16_mono_16k(out, &mixed).await?;
-        }
-        (Some(m), None) => {
-            tokio::fs::copy(m, out).await?;
-        }
-        (None, Some(s)) => {
-            tokio::fs::copy(s, out).await?;
-        }
-        (None, None) => {}
+    if mic.is_none() && sys.is_none() {
+        return Ok(());
     }
+    let mic_samples = match mic {
+        Some(m) => wav::read_f32_mono_16k(m).await?,
+        None => Vec::new(),
+    };
+    let sys_samples = match sys {
+        Some(s) => wav::read_f32_mono_16k(s).await?,
+        None => Vec::new(),
+    };
+    let mixed = tokio::task::spawn_blocking(move || {
+        let mut mixed = crate::playback_mix::mix(mic_samples, sys_samples);
+        crate::playback_mix::level(&mut mixed);
+        mixed
+    })
+    .await?;
+    wav::write_pcm16_mono_16k(out, &mixed).await?;
     Ok(())
 }
 
