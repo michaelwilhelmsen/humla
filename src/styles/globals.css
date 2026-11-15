@@ -997,3 +997,62 @@ input::placeholder, textarea::placeholder {
 kbd {
   font-family: inherit;
 }
+
+/* The transcript player's volume is PlaybackVolume, which can go past 100%;
+   the element's own mute button and slider would be a second control for it. */
+.nd-player::-webkit-media-controls-mute-button,
+.nd-player::-webkit-media-controls-volume-slider,
+.nd-player::-webkit-media-controls-volume-control-container {
+  display: none;
+}
+
+/* PlaybackVolume's slider (#234): a tick at 100%, and the range past it in
+   the danger tone, filled or not, so a boost reads as one without a caption.
+   `--value` and `--unity-at` are fractions of the range, set inline. */
+@layer components {
+  .nd-volume {
+    --thumb: 14px;
+    --bar: 4px;
+    --rail: 12px;
+    --pos: calc(var(--thumb) / 2 + (100% - var(--thumb)) * var(--value));
+    --unity: calc(var(--thumb) / 2 + (100% - var(--thumb)) * var(--unity-at));
+    -webkit-appearance: none;
+    appearance: none;
+    height: 20px;
+    background: transparent;
+    cursor: pointer;
+  }
+  .nd-volume::-webkit-slider-runnable-track {
+    height: var(--rail);
+    background:
+      linear-gradient(var(--color-text-muted), var(--color-text-muted))
+        var(--unity) 50% / 2px var(--rail) no-repeat,
+      linear-gradient(
+          to right,
+          var(--color-accent-text) 0 min(var(--pos), var(--unity)),
+          var(--color-danger) min(var(--pos), var(--unity)) var(--pos),
+          var(--color-text-disabled) var(--pos) var(--unity),
+          color-mix(in srgb, var(--color-danger) 28%, var(--color-line-visible))
+            max(var(--pos), var(--unity)) 100%
+        )
+        0 50% / 100% var(--bar) no-repeat;
+  }
+  .nd-volume::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: var(--thumb);
+    height: var(--thumb);
+    margin-top: calc((var(--rail) - var(--thumb)) / 2);
+    border-radius: 50%;
+    background: var(--color-surface);
+    border: 2px solid var(--color-accent-text);
+  }
+  .nd-volume.is-boost::-webkit-slider-thumb {
+    border-color: var(--color-danger);
+  }
+  .nd-volume:focus-visible {
+    outline: 2px solid var(--color-interactive);
+    outline-offset: 2px;
+    border-radius: 4px;
+  }
+}

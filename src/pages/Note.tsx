@@ -47,6 +47,8 @@ import { Popover, PopoverContent, PopoverTrigger } from "../components/ui/Popove
 import { shouldAdoptRemoteBody, shouldAdoptRemoteTitle, shouldRequestTitleForBody } from "../lib/noteSync";
 import { SpeakerLabels, speakerColorMap } from "../components/SpeakerLabels";
 import { RecordingSessions } from "../components/RecordingSessions";
+import { PlaybackVolume } from "../components/PlaybackVolume";
+import { resumePlaybackVolume } from "../lib/playbackVolume";
 import {
   formatDuration,
   groupTimeline,
@@ -3714,18 +3716,24 @@ export const TranscriptPlayer = memo(function TranscriptPlayer({
             is reads as nagging. The greyed re-diarize control's tooltip still
             names it, for the case where someone wants the capability back. */}
         {audioAvailable ? (
-          <audio
-            ref={audioRef}
-            src={activeUrl ?? undefined}
-            controls
-            // preload="auto" so the whole WAV streams in up-front and
-            // every subsequent seek is in-memory. With "metadata" each
-            // user click triggered a range-request through Tauri's
-            // asset protocol; rapid clicking flooded I/O and on at
-            // least one user's machine made the whole system lag.
-            preload="auto"
-            className="flex-1 h-8"
-          />
+          <>
+            <audio
+              ref={audioRef}
+              src={activeUrl ?? undefined}
+              controls
+              // preload="auto" so the whole WAV streams in up-front and
+              // every subsequent seek is in-memory. With "metadata" each
+              // user click triggered a range-request through Tauri's
+              // asset protocol; rapid clicking flooded I/O and on at
+              // least one user's machine made the whole system lag.
+              preload="auto"
+              // Lets the volume boost read the samples; the asset protocol answers CORS.
+              crossOrigin="anonymous"
+              onPlay={(e) => resumePlaybackVolume(e.currentTarget)}
+              className="nd-player flex-1 h-8"
+            />
+            <PlaybackVolume audioRef={audioRef} src={activeUrl} />
+          </>
         ) : (
           <p className="flex-1 text-xs text-[var(--color-text-muted)]">
             {keepAudio

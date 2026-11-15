@@ -341,6 +341,80 @@ function noteTranscribeCase(withText: boolean, replay?: ReplayRun): Scenario {
   };
 }
 
+// #234: the transcript player with its volume control, playing a quiet tone
+// from a blob URL so the boost's Web Audio routing runs as it would in the app.
+function notePlayerCase(): Scenario {
+  const note = makeNote({
+    id: "n1",
+    title: "Kvartalsgjennomgang",
+    transcript: "Michael: Skal vi ta gjennomgangen nå?\nHege: Ja, jeg har notatene klare",
+    language: "no",
+  });
+  const entry = (i: number, label: string, text: string) => ({
+    startMs: i * 4000,
+    endMs: i * 4000 + 3500,
+    label,
+    text,
+    words: [],
+    sessionId: "s1",
+    sessionIndex: 1,
+    chunkIdx: i,
+  });
+  const take = {
+    id: "s1",
+    index: 1,
+    startedAt: new Date(1_755_000_000_000).toISOString(),
+    durationMs: 8000,
+    streams: ["mic"],
+    hasPlayback: true,
+    canTranscribe: false,
+    canRetranscribe: true,
+  };
+  return {
+    route: "/note/n1",
+    render: () => null, // unused — `route` renders the app
+    ipc: {
+      notes_list: () => [note],
+      notes_get: () => note,
+      note_timeline: () => [
+        entry(0, "Michael", "Skal vi ta gjennomgangen nå?"),
+        entry(1, "Hege", "Ja, jeg har notatene klare"),
+      ],
+      note_timeline_repair: () => ({ repaired: false, coversTranscript: true }),
+      note_sessions: () => [take],
+      note_session_playback_path: () => "/mock/playback.wav",
+    },
+    seed: () => {
+      const url = URL.createObjectURL(quietToneWav(8));
+      (window as unknown as { __TAURI_INTERNALS__: { convertFileSrc: () => string } })
+        .__TAURI_INTERNALS__.convertFileSrc = () => url;
+    },
+  };
+}
+
+function quietToneWav(seconds: number): Blob {
+  const rate = 16_000;
+  const n = rate * seconds;
+  const buf = new DataView(new ArrayBuffer(44 + n * 2));
+  const text = (at: number, s: string) => [...s].forEach((c, i) => buf.setUint8(at + i, c.charCodeAt(0)));
+  text(0, "RIFF");
+  buf.setUint32(4, 36 + n * 2, true);
+  text(8, "WAVEfmt ");
+  buf.setUint32(16, 16, true);
+  buf.setUint16(20, 1, true);
+  buf.setUint16(22, 1, true);
+  buf.setUint32(24, rate, true);
+  buf.setUint32(28, rate * 2, true);
+  buf.setUint16(32, 2, true);
+  buf.setUint16(34, 16, true);
+  text(36, "data");
+  buf.setUint32(40, n * 2, true);
+  for (let i = 0; i < n; i++) {
+    buf.setInt16(44 + i * 2, Math.round(300 * Math.sin((2 * Math.PI * 220 * i) / rate)), true);
+  }
+  return new Blob([buf], { type: "audio/wav" });
+}
+
 // #232: the Share popover on a note in a workspace. `owner` decides whether the
 // reader is its author (controls) or a member it was shared with (read-only).
 function noteShareCase(owner: string, isPrivate: boolean, sharedWith: string[]): Scenario {
@@ -1493,6 +1567,7 @@ const CASES: Record<string, Scenario> = {
   "note-share-people": noteShareCase("u1", true, ["u-stian"]),
   "note-share-only-me": noteShareCase("u1", true, []),
   "note-share-readonly": noteShareCase("u-stian", true, ["u1", "u-petter"]),
+  "note-player": notePlayerCase(),
   "note-pending": noteTranscribeCase(false),
   "note-pending-text": noteTranscribeCase(true),
   // #146: the same note mid-replay. Two surfaces report the one run — the
