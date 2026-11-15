@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { open as openExternal } from "@tauri-apps/plugin-shell";
 import { ipc } from "../../../lib/ipc";
 import { CommandSnippet } from "../../../components/CommandSnippet";
 import { Row, Section } from "../components/Section";
@@ -20,6 +21,8 @@ import { WebhookRows } from "./Webhook";
 // Snippets rather than a one-click install: `.mcpb` bundles target the GUI
 // Claude apps and don't work with Claude Code in the terminal, and a Claude Code
 // plugin would serve only one of the two clients this is for.
+const MCP_GUIDE_URL = "https://humla.team/docs/integrations/mcp";
+
 export function IntegrationsSection({
   s,
   update,
@@ -55,7 +58,19 @@ export function IntegrationsSection({
     <Section title="Integrations">
       <Row
         label="Model Context Protocol server"
-        description="Let Claude Code, Codex or any other MCP client search and read your notes. Read-only: nothing can change or delete a note, and recorded audio is never reachable."
+        description={
+          <>
+            Let Claude Code, Codex or any other MCP client search and read your notes. Read-only:
+            nothing can change or delete a note, and recorded audio is never reachable.{" "}
+            <button
+              type="button"
+              onClick={() => void openExternal(MCP_GUIDE_URL)}
+              className="underline hover:text-[var(--color-text)]"
+            >
+              Setup guide
+            </button>
+          </>
+        }
         control={
           <Toggle
             checked={enabled}

@@ -92,6 +92,7 @@ Six read-only tools: `search_notes`, `get_note`, `get_transcript`, `list_notes`,
 - **Off until you turn it on.** Settings → General → Integrations, which then hands you a ready-to-paste config line for Claude Code and for Codex. Installing an update never quietly opens your meetings to anything.
 - **Read-only, and no audio.** Nothing an agent does can change or delete a note, and no tool returns or references a recording — the same absolute rule the rest of the app follows.
 - **No key, no network, no server.** It's a small local binary that reads your SQLite database directly, so search is keyword-based rather than embedding-based: nothing to pay for, nothing to send anywhere, and no Keychain prompt. There's no port and no token — the file permissions on your own machine are the authorization.
+- **Setup guide:** [humla.team/docs/integrations/mcp](https://humla.team/docs/integrations/mcp) walks through Claude Code, Codex and checking that it works.
 - **Works whether or not Humla is open**, and always reads the workspace you're currently in. The workspace is resolved on Humla's side, never passed in, so a client can't ask its way from Personal notes into a shared workspace or back.
 
 ### Stays out of your way
@@ -105,7 +106,7 @@ Six read-only tools: `search_notes`, `get_note`, `get_transcript`, `list_notes`,
 
 ## Privacy
 
-The defaults are designed so nothing you write leaves your machine unless you tell it to.
+The defaults are designed so nothing you write leaves your machine unless you tell it to. [Where your data lives](https://humla.team/docs/privacy/your-data) lists what goes where.
 
 - **No backend by default.** Your notes, transcripts and audio never leave this Mac unless you turn on sync. Outbound traffic is limited to the API endpoints you've configured, the update check against GitHub on launch, and — *if* you opt into sync — the server you connect to (Humla Cloud or your own).
 - **Anonymous counters, and you can switch them off.** To find out whether people actually get the app working, Humla counts a few milestones: first launch, and whether onboarding was finished or skipped. Each is sent at most once per install and carries nothing else — no identifier, no account, no version, nothing about what you configured or recorded. They're stored as plain daily tallies, so there's nothing to tie back to you even in principle. The setup wizard says so on every step and lets you turn it off there; afterwards it lives in Settings → General → **Send anonymous usage counters**. If you installed Humla before this existed, you're not counted unless you switch it on yourself.
@@ -113,7 +114,7 @@ The defaults are designed so nothing you write leaves your machine unless you te
 - **Recorded audio is not kept unless you ask for it.**
   - While recording, audio lives in a per-recording temp directory, deleted once transcription and the speaker pass are finished.
   - By default **nothing survives that** — no playback file, no raw streams. The note keeps its transcript and word timings, so it still renders in full; you just don't get a player.
-  - Turn on Settings → Recording → **Keep recorded audio** to store meetings under `~/Library/Application Support/no.humla.app/recordings/<note_id>/`: a mixed `playback.wav` for playing the meeting back with word-by-word highlight, plus the raw per-source mic and system WAVs, useful for re-running speaker detection. Roughly 1 MB per minute per channel.
+  - Turn on Settings → Recording → **Keep recorded audio** to store meetings under `~/Library/Application Support/no.humla.app/recordings/<note_id>/`: the mixed playback audio (AAC) for playing the meeting back with word-by-word highlight, plus the raw per-source mic and system WAVs, useful for re-running speaker detection. Roughly 2 MB per minute for the microphone, and as much again for system audio.
   - The setting describes **this Mac**, not just its own recordings — with it off, a teammate's synced audio isn't downloaded here either.
   - Turning it off is going-forward only. **Delete stored audio…**, in the same settings section, sweeps what's already on disk and keeps every transcript and timeline.
 - **The MCP server is off until you enable it**, and read-only when you do. It's a local binary reading the same SQLite database — no port, no network, and no tool that can reach a recording. Turning it off in Settings takes effect on the next tool call, not at the client's next restart.
