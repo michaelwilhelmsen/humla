@@ -19,7 +19,7 @@ import { inputClass, type EditableKey } from "../types";
 // Nothing here reads the Keychain until the switch is on, so a user who never
 // turns it on is never asked for Keychain access on its behalf.
 
-const DOCS_URL = "https://github.com/michaelwilhelmsen/humla/blob/main/docs/webhooks.md";
+const DOCS_URL = "https://humla.team/docs/integrations/webhooks#payload-schema-version-1";
 
 /** One header row. A header loaded from the saved endpoint arrives with its
  *  name only (`stored`); left empty, its value stays what was saved. */

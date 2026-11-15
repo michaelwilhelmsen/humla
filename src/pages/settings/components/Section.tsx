@@ -30,7 +30,7 @@ export function Row({
   children,
 }: {
   label: string;
-  description?: string;
+  description?: React.ReactNode;
   control?: React.ReactNode;
   children?: React.ReactNode;
 }) {
