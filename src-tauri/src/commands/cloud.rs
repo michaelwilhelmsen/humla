@@ -1275,18 +1275,13 @@ async fn find_note_remote(
     }))
 }
 
-/// Local path for the note's single synced `playback.wav`.
-///
-/// Per-session storage (#16) keeps each take in its own subdir, but the cloud
-/// contract is still one audio file per note (the per-session sync is a
-/// separate follow-up). So the upload source is the *latest* session's
-/// playback.wav, and the download target is the same resolved path — which
-/// for a note never recorded locally (no manifest) falls back to the flat
-/// `recordings/<note_id>/playback.wav`, exactly as before this feature.
-fn playback_path(app: &tauri::AppHandle, note_id: &str) -> Result<std::path::PathBuf, String> {
+/// The latest session's dir: where `notes.audio`, the legacy one-file-per-note
+/// slot, is read from and written to. For a note never recorded locally (no
+/// manifest) that is the flat `recordings/<note_id>/`, as before #16.
+fn latest_session(app: &tauri::AppHandle, note_id: &str) -> Result<std::path::PathBuf, String> {
     let app_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     let recordings = crate::sessions::recordings_dir(&app_dir, note_id);
-    Ok(crate::sessions::latest_session_dir(&recordings).join("playback.wav"))
+    Ok(crate::sessions::latest_session_dir(&recordings))
 }
 
 /// Upload a finished recording's mixed `playback.wav` to its workspace note
@@ -1314,18 +1309,21 @@ pub(crate) async fn upload_note_audio(app: &tauri::AppHandle, note_id: &str) -> 
 
     // Wait for write_playback_assets to produce the file (post-stop diarize can
     // take a while on long recordings). Bounded; give up quietly if never ready.
-    let path = playback_path(app, note_id)?;
-    let mut ready = false;
+    let dir = latest_session(app, note_id)?;
+    let mut found = None;
     for _ in 0..40 {
-        if path.exists() {
-            ready = true;
+        found = crate::sessions::playback_file(&dir);
+        if found.is_some() {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
     }
-    if !ready {
+    // `notes.audio` stays WAV (#226): a client from before AAC playback writes
+    // it to `playback.wav` whatever it holds. Such a client plays this take
+    // from nowhere, which beats a file it can't decode.
+    let Some(path) = found.filter(|p| p.ends_with("playback.wav")) else {
         return Ok(());
-    }
+    };
     let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
 
     let (base, session) = ensure_session(&state).await?;
@@ -1378,10 +1376,11 @@ pub(crate) async fn download_note_audio(app: &tauri::AppHandle, note_id: &str) -
     if workspace.is_empty() {
         return Ok(false);
     }
-    let path = playback_path(app, note_id)?;
-    if path.exists() {
+    let dir = latest_session(app, note_id)?;
+    if crate::sessions::playback_file(&dir).is_some() {
         return Ok(true); // already local
     }
+    let path = dir.join("playback.wav");
     let (base, session) = ensure_session(&state).await?;
     let Some((pb_id, filename)) = find_note_remote(&base, &session.token, note_id, &workspace).await?
     else {
@@ -1462,7 +1461,7 @@ struct RemoteSession {
 fn parse_remote_session(it: &serde_json::Value) -> RemoteSession {
     let s = |k: &str| it.get(k).and_then(|v| v.as_str()).unwrap_or_default().to_string();
     let mut files = std::collections::HashMap::new();
-    for f in ["playback", "mic", "sys", "timeline", "chunks"] {
+    for f in crate::sessions::AssetField::ALL.map(|f| f.field()) {
         files.insert(f, it.get(f).and_then(|v| v.as_str()).unwrap_or_default().to_string());
     }
     RemoteSession {
@@ -1687,7 +1686,7 @@ pub(crate) async fn upload_note_sessions(
 /// (honouring tombstones), then fetches each live session's assets — via the
 /// protected file-token flow. Which assets is `session_download_plan`'s call:
 /// `timeline.jsonl` always (text, and the reader is built from it),
-/// `playback.wav` only when this device stores audio (#24). Heavy raw
+/// the take's playback audio only when this device stores audio (#24). Heavy raw
 /// `mic`/`sys`/`chunks` are left on the server (fetched only if a future
 /// re-diarize needs them). Returns true when at least one session was
 /// reconstructed — including on a no-audio device, where the note still becomes
@@ -1758,7 +1757,7 @@ pub(crate) async fn download_note_sessions(app: &tauri::AppHandle, note_id: &str
             continue;
         }
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        for field in crate::sessions::session_download_plan(keep_audio) {
+        for field in crate::sessions::session_download_plan(keep_audio, &remote_present_assets(rec)) {
             let filename = rec.files.get(field.field()).cloned().unwrap_or_default();
             if !filename.is_empty() && !safe_path_seg(&filename) {
                 continue;
@@ -1792,6 +1791,10 @@ pub(crate) async fn download_note_sessions(app: &tauri::AppHandle, note_id: &str
             }
             let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
             std::fs::write(&dest, &bytes).map_err(|e| e.to_string())?;
+            if field == crate::sessions::AssetField::PlaybackM4a {
+                // The take's WAV playback from an earlier pull is the same audio.
+                let _ = std::fs::remove_file(dir.join(crate::sessions::AssetField::Playback.file_name()));
+            }
             // Record which upload this copy came from, so the next open can tell
             // "same file" from "the author changed the labels". Best-effort: a
             // missing stamp just costs one redundant fetch.
