@@ -113,7 +113,6 @@ where
     F: FnOnce(sync::SyncContext) -> Arc<dyn sync::SyncObserver> + Send + 'static,
 {
     tauri::Builder::default()
-        .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
@@ -543,8 +542,8 @@ where
 
 /// Start a fresh copy of ourselves, then hard-exit this one.
 ///
-/// This exists because `tauri_plugin_process::relaunch` (and `AppHandle::restart`,
-/// which it calls) cannot work in this app: Tauri performs the re-exec *after*
+/// This exists because Tauri's own restart (`AppHandle::restart`, which the
+/// process plugin's `relaunch` calls) cannot work in this app: Tauri performs the re-exec *after*
 /// the `RunEvent::Exit` callback returns, and ours never returns — it `_exit(0)`s
 /// to skip whisper.cpp's GGML Metal static destructor (see the note in `run()`).
 /// So `relaunch()` set the restart flag, asked the loop to exit, and the process

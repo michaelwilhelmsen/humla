@@ -200,7 +200,7 @@ export function AboutTab() {
             <code className="nd-code px-2 py-1 rounded bg-[var(--color-pill-hover)] flex-1 break-all">
               {dataDir || "—"}
             </code>
-            <Btn onClick={() => dataDir && openExternal(dataDir)} disabled={!dataDir}>
+            <Btn onClick={() => dataDir && ipc.openInFinder(dataDir)} disabled={!dataDir}>
               Open in Finder
             </Btn>
           </div>

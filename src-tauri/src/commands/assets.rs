@@ -82,11 +82,8 @@ pub fn note_audio_files(app: AppHandle, note_id: String) -> Result<Vec<String>, 
 }
 
 /// Open a local path (file or directory) in Finder via macOS's `open`
-/// command. The shell plugin's frontend `open()` is scoped to a few
-/// allowed HTTPS URLs by default; opening arbitrary user-data paths
-/// from the renderer is rejected silently. We bypass that by invoking
-/// the system `open` directly from the backend, matching the pattern
-/// used by `permissions_open_settings`.
+/// command. The shell plugin's frontend `open()` accepts only http(s),
+/// mailto and tel links, so a local path has to come through here.
 ///
 /// Constrained to paths under the app's data directory: a compromised
 /// renderer otherwise gets a generic file/URL opener via macOS `open`,

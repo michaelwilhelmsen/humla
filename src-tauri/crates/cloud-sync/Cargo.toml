@@ -7,10 +7,10 @@ description = "PocketBase-backed sync engine for Humla. Framework-agnostic."
 license = "MIT"
 
 [dependencies]
-# rusqlite MUST match the public humla core (0.32) so the
+# rusqlite MUST match the public humla core's version so the
 # Arc<Mutex<rusqlite::Connection>> handed across the seam unifies to the same
 # concrete type. Do not bump independently of the core.
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.43", features = ["bundled"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tokio = { version = "1", features = ["rt", "macros", "time", "sync"] }
 serde = { version = "1", features = ["derive"] }

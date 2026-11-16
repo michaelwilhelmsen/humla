@@ -1,6 +1,7 @@
-import { useEditor, EditorContent, BubbleMenu } from "@tiptap/react";
+import { useEditor, useEditorState, EditorContent, type Editor } from "@tiptap/react";
+import { BubbleMenu } from "@tiptap/react/menus";
 import StarterKit from "@tiptap/starter-kit";
-import Placeholder from "@tiptap/extension-placeholder";
+import { Placeholder } from "@tiptap/extensions";
 import { useEffect, useRef } from "react";
 import { SlashCommand, makeSlashSuggestion } from "../lib/slash";
 import { cn } from "../lib/cn";
@@ -23,8 +24,11 @@ export function NoteEditor({
 
   const editor = useEditor({
     extensions: [
+      // A clickable link would navigate the app's own webview.
       StarterKit.configure({
         heading: { levels: [1, 2, 3, 4] },
+        link: false,
+        underline: false,
       }),
       Placeholder.configure({
         placeholder,
@@ -50,7 +54,7 @@ export function NoteEditor({
   // Toggle editability live (e.g. when the active workspace role changes to/from
   // read-only viewer).
   useEffect(() => {
-    if (editor) editor.setEditable(editable);
+    if (editor && editor.isEditable !== editable) editor.setEditable(editable, false);
   }, [editor, editable]);
 
   // Re-sync content if the note id changes (parent passes a new initialHTML).
@@ -58,7 +62,7 @@ export function NoteEditor({
     if (!editor) return;
     const current = editor.getHTML();
     if ((initialHTML || "") !== current) {
-      editor.commands.setContent(initialHTML || "", false);
+      editor.commands.setContent(initialHTML || "", { emitUpdate: false });
     }
   }, [editor, initialHTML]);
 
@@ -68,7 +72,7 @@ export function NoteEditor({
     <>
       <BubbleMenu
         editor={editor}
-        tippyOptions={{ duration: 100, placement: "top" }}
+        options={{ placement: "top", offset: 8 }}
         shouldShow={({ editor, from, to }) => from !== to && !editor.isActive("horizontalRule")}
       >
         <div className="bubble-menu flex items-center gap-0.5 p-1 rounded-md bg-[var(--color-surface)] border border-[var(--color-line)] shadow-md text-[var(--color-text)]">
@@ -97,23 +101,15 @@ function BubbleBtn({
   label,
   className,
 }: {
-  editor: NonNullable<ReturnType<typeof useEditor>>;
+  editor: Editor;
   action: Action;
   label: string;
   className?: string;
 }) {
-  const isActive = (() => {
-    switch (action) {
-      case "bold": return editor.isActive("bold");
-      case "italic": return editor.isActive("italic");
-      case "strike": return editor.isActive("strike");
-      case "code": return editor.isActive("code");
-      case "heading1": return editor.isActive("heading", { level: 1 });
-      case "heading2": return editor.isActive("heading", { level: 2 });
-      case "bulletList": return editor.isActive("bulletList");
-      case "orderedList": return editor.isActive("orderedList");
-    }
-  })();
+  const isActive = useEditorState({
+    editor,
+    selector: ({ editor }) => isActionActive(editor, action),
+  });
 
   function onClick() {
     const c = editor.chain().focus();
@@ -144,4 +140,17 @@ function BubbleBtn({
       {label}
     </button>
   );
+}
+
+function isActionActive(editor: Editor, action: Action): boolean {
+  switch (action) {
+    case "bold": return editor.isActive("bold");
+    case "italic": return editor.isActive("italic");
+    case "strike": return editor.isActive("strike");
+    case "code": return editor.isActive("code");
+    case "heading1": return editor.isActive("heading", { level: 1 });
+    case "heading2": return editor.isActive("heading", { level: 2 });
+    case "bulletList": return editor.isActive("bulletList");
+    case "orderedList": return editor.isActive("orderedList");
+  }
 }
