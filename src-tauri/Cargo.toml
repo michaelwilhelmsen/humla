@@ -41,7 +41,7 @@ tokio = { version = "1", features = ["full"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 reqwest = { version = "0.12", features = ["json", "multipart", "rustls-tls", "stream"], default-features = false }
 futures-util = "0.3"
-whisper-rs = { version = "0.16", features = ["metal", "raw-api"] }
+whisper-rs = { version = "0.16", features = ["raw-api"] }
 # Local LLM inference is delegated to whichever OpenAI-compatible HTTP server
 # the user runs (Ollama, LM Studio, llama-server, vLLM, …). We reuse the
 # existing reqwest client; no in-process GGML runtime to avoid the static
@@ -115,6 +115,9 @@ custom-protocol = ["tauri/custom-protocol"]
 tauri-plugin-updater = "2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
+# Metal exists only on macOS; elsewhere whisper.cpp builds for the CPU, which is
+# what lets the crate compile and test on Linux.
+whisper-rs = { version = "0.16", features = ["metal"] }
 block2 = "0.6"
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSError", "NSSet", "NSString"] }

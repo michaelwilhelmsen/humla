@@ -1,6 +1,7 @@
 //! Whether macOS lets Humla post notifications. The permission belongs to the
 //! app bundle, so it is read and requested in this process.
 
+#[cfg(target_os = "macos")]
 use objc2_user_notifications::UNAuthorizationStatus;
 
 /// macOS's answer to whether Humla may post notifications.
@@ -24,6 +25,7 @@ impl Authorization {
     }
 }
 
+#[cfg(target_os = "macos")]
 impl From<UNAuthorizationStatus> for Authorization {
     fn from(status: UNAuthorizationStatus) -> Self {
         match status {
@@ -37,7 +39,7 @@ impl From<UNAuthorizationStatus> for Authorization {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
 

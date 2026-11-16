@@ -46,5 +46,7 @@ marketing/
 brag-output/
 x-posts/
 
-# Claude Code per-project skills/settings
-.claude/
+# Claude Code: the shared settings (cloud session hook) are tracked; the
+# rest is per machine.
+.claude/*
+!.claude/settings.json

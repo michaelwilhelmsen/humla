@@ -11326,6 +11326,8 @@ mod device_name_tests {
 mod playback_tests {
     use super::*;
 
+    // Runs `/usr/bin/afconvert`, which only macOS has.
+    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn a_take_s_playback_is_written_as_aac_and_replaces_its_wav() {
         let dir = tempfile::tempdir().unwrap();

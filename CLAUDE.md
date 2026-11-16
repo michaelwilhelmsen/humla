@@ -330,6 +330,10 @@ Default vocabulary — `needs-triage` / `needs-info` / `ready-for-agent` / `read
 
 User-facing guides live at **humla.team/docs**, written in `content/docs/<section>/<page>.md` in the sibling `humla-landing` repo. A change to something a guide describes (a setting's name, a payload, a link) updates that page too. `docs/` here is for developers: ADRs, research and agent notes.
 
+### Cloud sessions
+
+Claude Code cloud sessions run on Linux, readied by `scripts/cloud-session-start.sh`. What builds and tests there, and what still needs a Mac, is in `docs/agents/cloud.md`.
+
 ### Domain docs
 
 Single-context: one `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.

@@ -449,6 +449,8 @@ mod tests {
         assert!(saved == [vec![1i16; 16_000], vec![3i16; 8_000]].concat());
     }
 
+    // Runs `/usr/bin/afconvert`, which only macOS has.
+    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn audio_joins_aac_takes_beside_wav_ones() {
         let dir = tempfile::tempdir().unwrap();
