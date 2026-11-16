@@ -613,7 +613,7 @@ mod tests {
             "an absent anchor must not become a key at all"
         );
         // An EMPTY anchor is a caller bug, not "absent" — the same strictness
-        // `ChatTarget::from_note_id` applies at the IPC boundary, so `""` can't
+        // `ChatTarget::from_ids` applies at the IPC boundary, so `""` can't
         // mean "a note" at one layer and "the library" at another.
         let err = req(CloudScope { breadth: "all", note_id: Some(""), ..Default::default() }).unwrap_err();
         assert!(err.contains("empty note id"), "got: {err}");

@@ -18,7 +18,7 @@ pub struct PermissionsStatus {
 
 async fn run_sidecar_cmd(app: &AppHandle, mode: &str) -> Result<String, String> {
     let path = super::sidecar_path(app)?;
-    let mut child = tokio::process::Command::new(&path)
+    let child = tokio::process::Command::new(&path)
         .arg(mode)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

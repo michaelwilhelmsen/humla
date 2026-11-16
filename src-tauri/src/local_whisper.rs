@@ -262,28 +262,6 @@ pub async fn prewarm(shared: SharedContext, model_path: PathBuf, use_gpu: bool) 
     .map_err(|e| anyhow!("prewarm task: {e}"))?
 }
 
-pub async fn transcribe_file(
-    shared: SharedContext,
-    model_path: PathBuf,
-    use_gpu: bool,
-    language: &str,
-    initial_prompt: Option<&str>,
-    preset: Preset,
-    audio_path: &Path,
-) -> Result<String> {
-    let (text, _words, _lang) = transcribe_file_with_words(
-        shared,
-        model_path,
-        use_gpu,
-        language,
-        initial_prompt,
-        preset,
-        audio_path,
-    )
-    .await?;
-    Ok(text)
-}
-
 /// Variant that returns the joined transcript text *and* a flat list
 /// of word-level timestamps across the whole file. Used by the live
 /// chunk path so each chunk's words can be persisted into
@@ -326,8 +304,6 @@ pub async fn transcribe_file_with_words(
 #[derive(Clone, Debug)]
 pub struct TextSegment {
     pub text: String,
-    pub start_ms: u64,
-    pub end_ms: u64,
     pub words: Vec<Word>,
 }
 
@@ -420,11 +396,6 @@ pub async fn transcribe_file_segments(
             let text = seg
                 .to_str_lossy()
                 .map_err(|e| anyhow!("segment text: {e}"))?;
-            // whisper.cpp returns t0/t1 in centiseconds (10ms units).
-            // Negative values shouldn't occur for valid segments but we
-            // saturate to 0 just in case.
-            let t0 = seg.start_timestamp().max(0) as u64;
-            let t1 = seg.end_timestamp().max(0) as u64;
             // Strip whisper specials like <|nocaptions|>, <|nospeech|>,
             // language tokens, etc. `set_print_special(false)` only
             // affects the verbose-print path — segment text still embeds
@@ -451,8 +422,6 @@ pub async fn transcribe_file_segments(
             let words = extract_words_for_segment(&seg);
             out.push(TextSegment {
                 text: trimmed,
-                start_ms: t0.saturating_mul(10),
-                end_ms: t1.saturating_mul(10),
                 words,
             });
         }

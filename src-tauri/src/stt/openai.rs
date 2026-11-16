@@ -20,16 +20,9 @@ impl OpenAiAdapter {
 
 #[async_trait]
 impl BatchSttAdapter for OpenAiAdapter {
+    #[cfg(test)]
     fn provider_id(&self) -> &'static str {
         "openai"
-    }
-
-    fn label(&self) -> &'static str {
-        "OpenAI"
-    }
-
-    fn supports_language(&self, _lang: &str) -> bool {
-        true
     }
 
     fn supports_word_timestamps(&self, model: &str) -> bool {
@@ -75,7 +68,6 @@ mod tests {
     fn metadata_matches_legacy_behavior() {
         let a = OpenAiAdapter::new();
         assert_eq!(a.provider_id(), "openai");
-        assert_eq!(a.label(), "OpenAI");
         assert!(a.supports_word_timestamps("whisper-1"));
         assert!(!a.supports_word_timestamps("gpt-4o-transcribe"));
         assert!(!a.supports_word_timestamps("gpt-4o-transcribe-diarize"));

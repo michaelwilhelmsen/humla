@@ -336,6 +336,7 @@ pub(crate) enum LabelFallback {
 }
 
 /// A channel one chain's progress goes on.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Channel {
     /// The global `recording_status`.
@@ -383,6 +384,7 @@ pub(crate) enum ChainProgress {
 
 impl ChainProgress {
     /// The one channel this chain reports on, bracket and steps alike.
+    #[cfg(test)]
     pub(crate) fn channel(&self) -> Channel {
         match self {
             Self::PostStop { .. } => Channel::RecordingStatus,
@@ -2644,7 +2646,6 @@ pub async fn recording_start(
     // and is silently denied even though its own binary is granted.
     #[cfg(unix)]
     unsafe {
-        use std::os::unix::process::CommandExt;
         cmd.pre_exec(|| {
             if libc::setsid() == -1 {
                 // Non-fatal: continue without detaching.
@@ -3918,7 +3919,6 @@ pub async fn import_audio(
     // import needs no TCC-bound permissions).
     #[cfg(unix)]
     unsafe {
-        use std::os::unix::process::CommandExt;
         cmd.pre_exec(|| {
             if libc::setsid() == -1 {
                 // Non-fatal: continue without detaching.

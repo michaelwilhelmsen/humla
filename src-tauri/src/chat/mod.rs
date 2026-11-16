@@ -78,7 +78,7 @@ pub mod test_server {
 }
 pub use tools::{client_pin_applies, execute_tool, tool_specs, Citation, Pins, ToolScope};
 #[cfg(test)]
-pub use providers::{FakeChatAdapter, StallingChatAdapter};
+pub use providers::StallingChatAdapter;
 
 use anyhow::Result;
 use parking_lot::Mutex;

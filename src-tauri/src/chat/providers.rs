@@ -352,8 +352,8 @@ impl ChatAdapter for CopilotChatAdapter {
     }
 }
 
-/// Anthropic's Messages API. The base URL is a constructor argument so tests
-/// can point one at a loopback server; production always uses the cloud base.
+/// Anthropic's Messages API. Tests point one at a loopback server through
+/// `with_base`; production always uses the cloud base.
 pub struct AnthropicChatAdapter {
     base_url: String,
 }
@@ -363,6 +363,7 @@ impl AnthropicChatAdapter {
         Self { base_url: crate::anthropic::BASE.to_string() }
     }
 
+    #[cfg(test)]
     pub fn with_base(base_url: impl Into<String>) -> Self {
         Self { base_url: base_url.into() }
     }

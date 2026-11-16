@@ -1,7 +1,6 @@
 //! STT provider abstraction. See docs/design/stt-adapter.md for rationale.
 
 mod adapter;
-mod auth;
 mod config;
 mod custom;
 mod deepgram;
@@ -14,13 +13,11 @@ mod openai_compat;
 use std::path::PathBuf;
 
 pub use adapter::{BatchSttAdapter, TranscribeCtx, TranscribeResult, Word};
-pub use auth::Auth;
-pub use config::{
-    from_legacy_settings, CustomConfig, DeepgramConfig, GroqConfig, LocalWhisperConfig,
-    OpenAiConfig, ProviderConfig, TranscribeConfig,
-};
+pub use config::{from_legacy_settings, ProviderConfig, TranscribeConfig};
+#[cfg(test)]
+pub use config::{LocalWhisperConfig, OpenAiConfig};
 pub use custom::CustomAdapter;
-pub use keychain::{keychain_account_for, requires_api_key};
+pub use keychain::keychain_account_for;
 pub use deepgram::DeepgramAdapter;
 pub use groq::GroqAdapter;
 pub use local::LocalWhisperAdapter;
