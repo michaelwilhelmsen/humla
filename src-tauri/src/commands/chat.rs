@@ -15,7 +15,7 @@ use crate::AppState;
 /// A user-set display name for chat's first-person referent (#103). Empty/unset
 /// falls back to the macOS account name — see [`asker_name`].
 pub(crate) const SETTING_DISPLAY_NAME: &str = "user_display_name";
-use parking_lot::Mutex;
+use parking_lot::{Mutex, MutexGuard};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -136,17 +136,15 @@ pub(crate) fn reindex_note_content(conn: &rusqlite::Connection, note_id: &str) {
 /// created before #47 become searchable. Cheap and idempotent — reruns index
 /// only the still-missing ones. Runs off-thread at startup.
 pub fn backfill_note_chunks(db: &std::sync::Arc<parking_lot::Mutex<rusqlite::Connection>>) {
-    let ids = {
-        let conn = db.lock();
-        db::note_ids_needing_reindex(&conn).unwrap_or_default()
-    };
+    let mut conn = db.lock();
+    let ids = db::note_ids_needing_reindex(&conn).unwrap_or_default();
     if ids.is_empty() {
         return;
     }
     eprintln!("[chat] backfilling retrieval chunks for {} note(s)", ids.len());
     for id in ids {
-        let conn = db.lock();
         reindex_note_content(&conn, &id);
+        MutexGuard::bump(&mut conn);
     }
 }
 
@@ -257,16 +255,14 @@ pub async fn chat_rebuild_index(app: AppHandle) -> Result<usize, String> {
         state.db.clone()
     };
     let rebuilt = tauri::async_runtime::spawn_blocking(move || {
-        let ids = {
-            let conn = db.lock();
-            db::live_note_ids(&conn).map_err(super::err)?
-        };
-        // One lock acquisition per note, not one around the loop: a large library
-        // would otherwise hold the connection long enough to stall every other
-        // command that needs the database.
+        let mut conn = db.lock();
+        let ids = db::live_note_ids(&conn).map_err(super::err)?;
+        // `bump` hands the connection to any command waiting on it after each
+        // note; without it a large library would stall every one of them until
+        // the rebuild finishes.
         for id in &ids {
-            let conn = db.lock();
             reindex_note_content(&conn, id);
+            MutexGuard::bump(&mut conn);
         }
         Ok::<usize, String>(ids.len())
     })
@@ -2843,6 +2839,38 @@ mod tests {
             db::move_note(conn, &note.id, Some(f)).unwrap();
         }
         db::get_note(conn, &note.id).unwrap()
+    }
+
+    // A command waiting on the database gets it between notes, not only once
+    // the whole backfill has finished.
+    #[test]
+    fn backfill_lets_a_waiting_command_in_between_notes() {
+        const NOTES: usize = 400;
+        let dir = tempfile::tempdir().unwrap();
+        let conn = db::open(&dir.path().join("fair.sqlite")).unwrap();
+        for i in 0..NOTES {
+            let note = db::create_note(&conn, "en", "meeting", "").unwrap();
+            let patch = db::NotePatch { transcript: Some(format!("Budget line {i}.")), ..Default::default() };
+            db::update_note(&conn, &note.id, &patch).unwrap();
+        }
+        assert_eq!(db::note_ids_needing_reindex(&conn).unwrap().len(), NOTES);
+        let db = Arc::new(Mutex::new(conn));
+
+        let worker = {
+            let db = db.clone();
+            std::thread::spawn(move || backfill_note_chunks(&db))
+        };
+        let pending = loop {
+            let conn = db.lock();
+            let pending = db::note_ids_needing_reindex(&conn).unwrap().len();
+            if pending < NOTES {
+                break pending;
+            }
+            drop(conn);
+            std::thread::yield_now();
+        };
+        worker.join().unwrap();
+        assert!(pending > 0, "the waiting command only got the database after the whole backfill");
     }
 
     #[test]
