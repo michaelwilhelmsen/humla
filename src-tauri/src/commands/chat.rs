@@ -749,7 +749,7 @@ fn resolved_title(c: &db::Conversation) -> String {
 /// Whether a conversation has no stored title yet — the first user message
 /// should set it (issue #61).
 fn resolved_title_is_unset(c: &db::Conversation) -> bool {
-    c.title.as_deref().map_or(true, |t| t.trim().is_empty())
+    c.title.as_deref().is_none_or(|t| t.trim().is_empty())
 }
 
 /// Build a session-list entry for a local (personal or workspace-handle) row.

@@ -446,9 +446,7 @@ fn sidecar_error(stderr: &str, exit: impl std::fmt::Display) -> String {
     let tagged = stderr
         .lines()
         .filter_map(|l| l.strip_prefix(TAG))
-        .map(str::trim)
-        .filter(|m| !m.is_empty())
-        .last();
+        .map(str::trim).rfind(|m| !m.is_empty());
     if let Some(message) = tagged {
         return message.to_string();
     }

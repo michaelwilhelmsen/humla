@@ -2377,7 +2377,7 @@ fn vec_to_blob(v: &[f32]) -> Vec<u8> {
 /// Decode a stored little-endian f32 blob back to a vector. A blob whose length
 /// isn't a multiple of 4 (corrupt) decodes to what fits, ignoring the tail.
 fn blob_to_vec(b: &[u8]) -> Vec<f32> {
-    b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+    b.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
 }
 
 /// Distinct (text_hash, text) for a Note's chunks that have no embedding under

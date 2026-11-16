@@ -1249,7 +1249,7 @@ mod tests {
     fn the_setup_qr_code_is_a_path_of_its_dark_modules() {
         let qr = qr_code("otpauth://totp/Humla:m%40example.no?secret=JBSWY3DPEHPK3PXP&issuer=Humla")
             .expect("fits in a QR code");
-        assert!(qr.size >= 21 && (qr.size - 17) % 4 == 0, "a valid version's size: {}", qr.size);
+        assert!(qr.size >= 21 && (qr.size - 17).is_multiple_of(4), "a valid version's size: {}", qr.size);
         assert!(qr.path.starts_with("M0 0h7v1h-7z"), "{}", &qr.path[..40.min(qr.path.len())]);
         // The finder pattern's second row: dark, five light, dark.
         assert!(qr.path.contains("M0 1h1v1h-1zM6 1h1v1h-1z"));

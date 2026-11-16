@@ -103,18 +103,12 @@ impl Default for TranscriptTrail {
 /// distinct labels.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum ChunkSource {
+    /// A sidecar event with no `source` is read as mic, the stream that always exists.
+    #[default]
     Mic,
     Sys,
-}
-
-impl Default for ChunkSource {
-    fn default() -> Self {
-        // Pre-v0.8.0 sidecars didn't emit `source`. If we ever load an old
-        // sidecar event for any reason (stale dev cache mid-upgrade), treat
-        // the chunk as mic — the safer default since mic always exists.
-        ChunkSource::Mic
-    }
 }
 
 impl ChunkSource {
@@ -707,7 +701,7 @@ impl LiveCapture {
                 Some(c) => matches!(c.try_wait(), Ok(Some(_)) | Err(_)),
                 None => true,
             };
-            let reader_dead = self.reader.as_ref().map_or(true, |r| r.is_finished());
+            let reader_dead = self.reader.as_ref().is_none_or(|r| r.is_finished());
             if !child_dead && !reader_dead {
                 return Err(busy);
             }
@@ -1581,8 +1575,7 @@ mod tests {
 
     #[test]
     fn only_a_stop_in_progress_refuses_a_new_capture() {
-        let mut cap = LiveCapture::default();
-        cap.note_id = Some("n1".to_string());
+        let mut cap = LiveCapture { note_id: Some("n1".to_string()), ..Default::default() };
         assert_eq!(cap.stop_in_progress(), None, "a live slot is takeable");
         cap.stop = StopState::Draining;
         assert_eq!(cap.stop_in_progress(), Some(STOP_IN_PROGRESS));
@@ -1605,8 +1598,7 @@ mod tests {
             cap.sink = Arc::new(CaptureSink::new(SinkMode::Live));
             Ok(())
         };
-        let mut cap = LiveCapture::default();
-        cap.note_id = Some("n1".to_string());
+        let mut cap = LiveCapture { note_id: Some("n1".to_string()), ..Default::default() };
         cap.sink.chunk_log.lock().push(a_chunk());
         for stop in [StopState::Draining, StopState::Finishing] {
             cap.stop = stop;
@@ -1625,8 +1617,7 @@ mod tests {
         // `finish_import` drains too, and its child and reader are already
         // finished — so without the same lifecycle `recording_start`'s
         // self-heal reads a zombie and takes over mid-drain.
-        let mut cap = LiveCapture::default();
-        cap.note_id = Some("n1".to_string());
+        let mut cap = LiveCapture { note_id: Some("n1".to_string()), ..Default::default() };
         assert_eq!(cap.begin_stop(), Ok("n1".to_string()));
         assert_eq!(cap.stop, StopState::Draining);
         assert_eq!(cap.note_id.as_deref(), Some("n1"), "the tail still appends");
@@ -1654,8 +1645,7 @@ mod tests {
 
     #[test]
     fn a_stop_in_progress_refuses_a_claim() {
-        let mut cap = LiveCapture::default();
-        cap.note_id = Some("n1".to_string());
+        let mut cap = LiveCapture { note_id: Some("n1".to_string()), ..Default::default() };
         cap.stop = StopState::Draining;
         assert!(matches!(cap.claim_start(BUSY), Err(STOP_IN_PROGRESS)));
         assert!(!cap.starting);
@@ -1664,8 +1654,7 @@ mod tests {
 
     #[test]
     fn a_session_with_no_child_is_stale_and_cleared() {
-        let mut cap = LiveCapture::default();
-        cap.note_id = Some("n1".to_string());
+        let mut cap = LiveCapture { note_id: Some("n1".to_string()), ..Default::default() };
         cap.temp_dir = Some(PathBuf::from("/tmp/x"));
         assert!(matches!(cap.claim_start(BUSY), Ok(None)));
         assert!(cap.starting);
@@ -1675,8 +1664,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_live_child_with_a_live_reader_refuses_a_claim() {
-        let mut cap = LiveCapture::default();
-        cap.note_id = Some("n1".to_string());
+        let mut cap = LiveCapture { note_id: Some("n1".to_string()), ..Default::default() };
         cap.child = Some(a_sleeping_child());
         cap.reader = Some(tokio::spawn(std::future::pending::<()>()));
         assert!(matches!(cap.claim_start(BUSY), Err(BUSY)));
@@ -1687,8 +1675,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_live_child_whose_reader_is_gone_is_handed_back_to_kill() {
-        let mut cap = LiveCapture::default();
-        cap.note_id = Some("n1".to_string());
+        let mut cap = LiveCapture { note_id: Some("n1".to_string()), ..Default::default() };
         cap.child = Some(a_sleeping_child());
         let stale = cap.claim_start(BUSY).expect("an orphan is taken over");
         assert!(stale.is_some(), "the caller must stop the orphaned sidecar");
