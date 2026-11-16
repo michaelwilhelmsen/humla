@@ -136,7 +136,7 @@ Recording in short: `recording_start` spawns `audio-capture` (via `setsid`); eac
 
 ## Tech stack
 
-- **Frontend**: React 19, TypeScript, Vite 6, Tauri 2, React Router 7, Zustand (`useNotesStore`, `useRecordingStore`, events bound once in `bindBackendListeners`), Tiptap v2, Tailwind v4, Radix, lucide-react, react-markdown + remark-gfm. Two themes (warm, graphite) × light/dark. → [frontend](docs/architecture/frontend.md)
+- **Frontend**: React 19, TypeScript, Vite 6, Tauri 2, React Router 7, Zustand (`useNotesStore`, `useRecordingStore`, events bound once in `bindBackendListeners`), Tiptap 3, Tailwind v4, Radix, lucide-react, react-markdown + remark-gfm. Two themes (warm, graphite) × light/dark. → [frontend](docs/architecture/frontend.md)
 - **Backend**: Rust 1.94 (`github-copilot-sdk`'s floor), Tauri 2, rusqlite (`bundled`, WAL, idempotent ALTER TABLE migrations, indexes created after migrations), reqwest (`rustls-tls` + `stream`), tokio (`spawn_blocking` for local Whisper), whisper-rs 0.16 (`metal` on macOS only; `large-v3-turbo-q5_0` ~547 MB; NB Whisper Large for Norwegian), parking_lot, keyring 3 (`apple-native`), serde/serde_json/chrono/uuid/anyhow/async-trait.
 
 ### Module map (`src-tauri/src/`)

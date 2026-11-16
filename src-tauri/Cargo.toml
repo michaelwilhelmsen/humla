@@ -51,7 +51,7 @@ anyhow = "1"
 async-trait = "0.1"
 chrono = "0.4"
 parking_lot = "0.12"
-dirs = "5"
+dirs = "7"
 libc = "0.2"
 # Native save panel for the note-export flow (issue #18). Frontend picks the
 # target path via the JS `save()` dialog; `export_note` writes to it.
@@ -92,8 +92,8 @@ github-copilot-sdk = { version = "=1.0.27", default-features = false, features =
 # The Copilot CLI download: an npm tarball, checked against a pinned sha512.
 tar = "0.4"
 flate2 = "1"
-sha2 = "0.10"
-base64 = "0.22"
+sha2 = "0.11"
+base64 = "0.23"
 # `humla://` links. Same minor as `@tauri-apps/plugin-deep-link` in package.json.
 tauri-plugin-deep-link = "~2.4"
 
