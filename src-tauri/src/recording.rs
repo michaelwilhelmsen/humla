@@ -101,9 +101,8 @@ impl Default for TranscriptTrail {
 /// mic chunks (system is silent → no chunks emitted) and the diarizer runs
 /// on the mic stream instead so multiple humans in the same room get
 /// distinct labels.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
-#[derive(Default)]
 pub enum ChunkSource {
     /// A sidecar event with no `source` is read as mic, the stream that always exists.
     #[default]

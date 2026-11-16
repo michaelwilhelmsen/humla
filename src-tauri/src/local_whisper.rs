@@ -239,12 +239,11 @@ pub fn unload(shared: &SharedContext) {
     *shared.lock() = None;
 }
 
+/// DTW alignment must stay off (the default): its output (`t_dtw`) is unread
+/// here, and whisper.cpp's `median_filter` aborts the process on a decode
+/// window shorter than 140 ms.
 fn context_params(use_gpu: bool) -> WhisperContextParameters<'static> {
-    let params = WhisperContextParameters { use_gpu, ..Default::default() };
-    // DTW alignment must stay off: its output (`t_dtw`) is unread here, and
-    // whisper.cpp's `median_filter` aborts the process on a decode window
-    // shorter than 140 ms.
-    params
+    WhisperContextParameters { use_gpu, ..Default::default() }
 }
 
 /// Load the model into memory + Metal context if it isn't already. Cheap

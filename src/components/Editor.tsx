@@ -24,11 +24,14 @@ export function NoteEditor({
 
   const editor = useEditor({
     extensions: [
-      // A clickable link would navigate the app's own webview.
+      // Link would make a click navigate the app's own webview. TrailingNode
+      // appends a paragraph to a body ending in a heading or list on the first
+      // transaction, which saves and syncs an edit nobody made.
       StarterKit.configure({
         heading: { levels: [1, 2, 3, 4] },
         link: false,
         underline: false,
+        trailingNode: false,
       }),
       Placeholder.configure({
         placeholder,
@@ -72,8 +75,9 @@ export function NoteEditor({
     <>
       <BubbleMenu
         editor={editor}
-        options={{ placement: "top", offset: 8 }}
-        shouldShow={({ editor, from, to }) => from !== to && !editor.isActive("horizontalRule")}
+        options={BUBBLE_OPTIONS}
+        shouldShow={showBubble}
+        className="z-50"
       >
         <div className="bubble-menu flex items-center gap-0.5 p-1 rounded-md bg-[var(--color-surface)] border border-[var(--color-line)] shadow-md text-[var(--color-text)]">
           <BubbleBtn editor={editor} action="bold" label="B" className="font-bold" />
@@ -92,6 +96,12 @@ export function NoteEditor({
     </>
   );
 }
+
+// Module-level so a re-render doesn't hand BubbleMenu new values, which it
+// answers with a transaction.
+const BUBBLE_OPTIONS = { placement: "top", offset: 8 } as const;
+const showBubble = ({ editor, from, to }: { editor: Editor; from: number; to: number }) =>
+  from !== to && !editor.isActive("horizontalRule");
 
 type Action = "bold" | "italic" | "strike" | "code" | "heading1" | "heading2" | "bulletList" | "orderedList";
 
