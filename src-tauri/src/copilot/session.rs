@@ -620,7 +620,7 @@ mod tests {
         ];
         let turn = ChatTurnSession::default();
         let cancel = CancelFlag::new();
-        let first = turn.step(&client, "auto", &turns, &[tool.clone()], &cancel, &mut |_| {}).await.unwrap();
+        let first = turn.step(&client, "auto", &turns, std::slice::from_ref(&tool), &cancel, &mut |_| {}).await.unwrap();
         assert!(!first.tool_calls.is_empty(), "{first:?}");
         assert_eq!(first.tool_calls[0].name, "search_notes");
         assert!(turn.live.lock().await.is_some(), "the session waits for the results");
@@ -630,14 +630,14 @@ mod tests {
         for call in &first.tool_calls {
             followed.push(ChatTurn::tool_result(&call.id, "Acme kept the budget at 2 MNOK (meeting 3 Oct)."));
         }
-        let mut answer = turn.step(&client, "auto", &followed, &[tool.clone()], &cancel, &mut |_| {}).await.unwrap();
+        let mut answer = turn.step(&client, "auto", &followed, std::slice::from_ref(&tool), &cancel, &mut |_| {}).await.unwrap();
         // The model may search once more; answer it the same way.
         while !answer.tool_calls.is_empty() {
             followed.push(ChatTurn::assistant_tool_calls("", answer.tool_calls.clone()));
             for call in &answer.tool_calls {
                 followed.push(ChatTurn::tool_result(&call.id, "Nothing more about Acme."));
             }
-            answer = turn.step(&client, "auto", &followed, &[tool.clone()], &cancel, &mut |_| {}).await.unwrap();
+            answer = turn.step(&client, "auto", &followed, std::slice::from_ref(&tool), &cancel, &mut |_| {}).await.unwrap();
         }
         assert!(answer.text.contains('2'), "{}", answer.text);
         assert!(turn.live.lock().await.is_none(), "an answered turn closes its session");

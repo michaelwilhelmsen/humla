@@ -101,7 +101,7 @@ fn heading(markdown: bool, level: u8, text: &str) -> String {
         return format!("{} {}", "#".repeat(level as usize), text);
     }
     let bar = if level <= 1 { '=' } else { '-' };
-    let underline: String = std::iter::repeat(bar).take(text.chars().count().max(1)).collect();
+    let underline: String = std::iter::repeat_n(bar, text.chars().count().max(1)).collect();
     format!("{text}\n{underline}")
 }
 

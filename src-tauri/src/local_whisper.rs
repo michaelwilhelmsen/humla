@@ -41,7 +41,7 @@ pub struct ModelInfo {
 pub const DEFAULT_MODEL_ID: &str = "large-v3-turbo-q5";
 
 pub fn models() -> &'static [ModelInfo] {
-    &MODELS
+    MODELS
 }
 
 pub fn find_model(id: &str) -> Option<&'static ModelInfo> {
@@ -239,13 +239,11 @@ pub fn unload(shared: &SharedContext) {
     *shared.lock() = None;
 }
 
+/// DTW alignment must stay off (the default): its output (`t_dtw`) is unread
+/// here, and whisper.cpp's `median_filter` aborts the process on a decode
+/// window shorter than 140 ms.
 fn context_params(use_gpu: bool) -> WhisperContextParameters<'static> {
-    let mut params = WhisperContextParameters::default();
-    params.use_gpu = use_gpu;
-    // DTW alignment must stay off: its output (`t_dtw`) is unread here, and
-    // whisper.cpp's `median_filter` aborts the process on a decode window
-    // shorter than 140 ms.
-    params
+    WhisperContextParameters { use_gpu, ..Default::default() }
 }
 
 /// Load the model into memory + Metal context if it isn't already. Cheap
@@ -650,7 +648,7 @@ mod model_tests {
         let mut paths: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
             .map(|e| e.unwrap().path())
-            .filter(|p| p.extension().map_or(false, |e| e == "wav"))
+            .filter(|p| p.extension().is_some_and(|e| e == "wav"))
             .collect();
         paths.sort();
         assert!(!paths.is_empty(), "no WAVs in {dir}");

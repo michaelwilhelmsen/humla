@@ -698,7 +698,7 @@ where
             eprintln!(
                 "[llm] could not parse response as ChatResponse: {e}\n\
                  [llm] body (first 500 chars): {}",
-                &body_text.chars().take(500).collect::<String>()
+                body_text.chars().take(500).collect::<String>()
             );
             return Err(anyhow!("unexpected response shape from {base_url}: {e}"));
         }

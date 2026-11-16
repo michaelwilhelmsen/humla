@@ -613,8 +613,8 @@ mod local_compat_tests {
             cancel: &cancel,
         };
         let tools = [ToolSpec {
-            name: "search_notes".into(),
-            description: "search".into(),
+            name: "search_notes",
+            description: "search",
             parameters: json!({"type": "object", "properties": {}}),
         }];
         let mut calls = Vec::new();

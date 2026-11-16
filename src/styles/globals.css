@@ -987,10 +987,10 @@ input::placeholder, textarea::placeholder {
   box-shadow: none;
 }
 
-/* The slash menu and bubble menu render outside the React tree (tippy
-   appends to body), so make sure they inherit the live theme variables. */
+/* The slash menu and bubble menu render outside the React tree, so make sure
+   they inherit the live theme variables. */
 .slash-menu,
-.tippy-box .bubble-menu {
+.bubble-menu {
   color: var(--color-text);
 }
 

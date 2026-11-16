@@ -928,7 +928,7 @@ pub fn reconcile_manifest(
         // carries no field for it. Preserve whatever the local entry said, and
         // treat a session arriving for the first time as transcribed: its text
         // came down with the note, and this device holds no audio to replay.
-        let transcribed = by_id.get(&r.client_id).map_or(true, |e| e.transcribed);
+        let transcribed = by_id.get(&r.client_id).is_none_or(|e| e.transcribed);
         by_id.insert(
             r.client_id.clone(),
             SessionEntry {

@@ -19,7 +19,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 # cloud-sync joins this package's workspace as a sibling member so the live sync
 # engine builds from source in-tree (it was extracted from the private
 # humla-cloud repo when the client was consolidated into the public app). Its
-# rusqlite is pinned to 0.32 to match the core — the Arc<Mutex<Connection>>
+# rusqlite version must match the core's — the Arc<Mutex<Connection>>
 # handed across the sync seam must unify to the same concrete type.
 #
 # echo-probe measures stream alignment and echo (see
@@ -38,7 +38,7 @@ tauri-plugin-shell = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.43", features = ["bundled"] }
 reqwest = { version = "0.12", features = ["json", "multipart", "rustls-tls", "stream"], default-features = false }
 futures-util = "0.3"
 whisper-rs = { version = "0.16", features = ["raw-api"] }
@@ -48,13 +48,11 @@ whisper-rs = { version = "0.16", features = ["raw-api"] }
 # duplicate-GGML conflict with whisper-rs.
 uuid = { version = "1", features = ["v4", "v5"] }
 anyhow = "1"
-thiserror = "2"
 async-trait = "0.1"
 chrono = "0.4"
 parking_lot = "0.12"
 dirs = "5"
 libc = "0.2"
-tauri-plugin-process = "2"
 # Native save panel for the note-export flow (issue #18). Frontend picks the
 # target path via the JS `save()` dialog; `export_note` writes to it.
 tauri-plugin-dialog = "2"

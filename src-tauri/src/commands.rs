@@ -5222,7 +5222,7 @@ fn offset_speaker_numbers(text: &str, offset: u32) -> String {
 /// contains it; falls back to the closest segment by edge distance when
 /// the chunk lands in a gap (silence between turns, or before/after the
 /// segmented region). Returns None only when `segments` is empty.
-fn assign_speaker<'a>(chunk_start_ms: u64, segments: &'a [diarize::Segment]) -> Option<&'a str> {
+fn assign_speaker(chunk_start_ms: u64, segments: &[diarize::Segment]) -> Option<&str> {
     for seg in segments {
         if chunk_start_ms >= seg.start_ms && chunk_start_ms < seg.end_ms {
             return Some(&seg.speaker_id);
@@ -6613,7 +6613,7 @@ fn piece_ends_terminator(text: &str) -> bool {
         }
     }
     let core = trimmed
-        .trim_end_matches(|c: char| matches!(c, '"' | '\'' | ')' | ']' | '»' | '”' | '’'));
+        .trim_end_matches(['"', '\'', ')', ']', '»', '”', '’']);
     matches!(
         core.chars().last(),
         Some('.') | Some('!') | Some('?') | Some(':') | Some(';')
@@ -6694,9 +6694,9 @@ fn absorb_text_continuation_chains(pieces: &mut [LabelledPiece]) {
             };
             let mut word_count_by_label: std::collections::HashMap<String, usize> =
                 std::collections::HashMap::new();
-            for k in i..=end {
-                if let Some(label) = &pieces[k].label {
-                    let wc = pieces[k].text.split_whitespace().count();
+            for piece in &pieces[i..=end] {
+                if let Some(label) = &piece.label {
+                    let wc = piece.text.split_whitespace().count();
                     *word_count_by_label.entry(label.clone()).or_insert(0) += wc;
                 }
             }
@@ -6713,9 +6713,9 @@ fn absorb_text_continuation_chains(pieces: &mut [LabelledPiece]) {
                             .map(|(k, _)| k.clone())
                     });
                 if let Some(winner) = chosen {
-                    for k in i..=end {
-                        if pieces[k].label.is_some() {
-                            pieces[k].label = Some(winner.clone());
+                    for piece in &mut pieces[i..=end] {
+                        if piece.label.is_some() {
+                            piece.label = Some(winner.clone());
                         }
                     }
                 }
@@ -6913,7 +6913,7 @@ fn last_terminator_index(s: &str) -> Option<usize> {
     s.char_indices()
         .filter(|(_, c)| matches!(c, '.' | '!' | '?' | '…'))
         .map(|(i, _)| i)
-        .last()
+        .next_back()
 }
 
 /// Byte offset of the *first* sentence-terminator (`.!?…`) in `s`,
@@ -7301,7 +7301,7 @@ async fn transcribe_chunk(
     // keyword/prompt biaser ("am" appearing where the user said "an"
     // etc.).
     let vocab_terms: Vec<&str> = vocabulary
-        .split(|c: char| c == '\n' || c == ',')
+        .split(['\n', ','])
         .map(str::trim)
         .filter(|s| s.len() >= 3)
         .collect();
@@ -7642,7 +7642,7 @@ fn strip_attribution_tail(text: &str) -> String {
             // Back up to the nearest sentence boundary before the trigger so
             // we drop the whole offending phrase, not just the trigger word.
             let start = text[..pos]
-                .rfind(|c: char| matches!(c, '.' | '!' | '?' | '\n'))
+                .rfind(['.', '!', '?', '\n'])
                 .map(|p| p + 1)
                 .unwrap_or(pos);
             cut = Some(cut.map_or(start, |c| c.min(start)));
@@ -9713,7 +9713,7 @@ mod diarize_tests {
         };
         let split = whole_chunk_pieces(labeller);
 
-        let combined = combine_with_snapshot(&snapshot, &build_labelled_transcript(&chunks, &split));
+        let combined = combine_with_snapshot(snapshot, &build_labelled_transcript(&chunks, &split));
         let session_two = serialize_timeline(&chunks, &split, session_speaker_offset(snapshot));
 
         // What opening the note does: project the sessions that exist, find

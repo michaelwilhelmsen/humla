@@ -7,7 +7,7 @@ import { mockLayoutBox } from "../test/layout";
 
 // The context panel opens on every note the way the user last left it.
 
-beforeAll(() => mockLayoutBox());
+beforeAll(() => mockLayoutBox({ clientBox: false }));
 beforeEach(() => localStorage.clear());
 
 function openNote(id: string) {

@@ -84,7 +84,7 @@ pub async fn read_i16_mono_16k(path: &std::path::Path) -> anyhow::Result<Vec<i16
     while left > 0 {
         let n = left.min(buf.len());
         file.read_exact(&mut buf[..n]).await?;
-        samples.extend(buf[..n].chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])));
+        samples.extend(buf[..n].as_chunks::<2>().0.iter().map(|b| i16::from_le_bytes([b[0], b[1]])));
         left -= n;
     }
     Ok(samples)
