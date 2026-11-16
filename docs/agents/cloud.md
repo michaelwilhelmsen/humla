@@ -21,7 +21,11 @@ host it reaches.
 | Frontend tests, lint, types + bundle | `pnpm test`, `pnpm lint`, `pnpm build` |
 | Every Rust test in the workspace | `cd src-tauri && cargo test --workspace` |
 | The local-only build | `cd src-tauri && cargo check -p humla --no-default-features` |
-| A component against the mock IPC | `pnpm mock`, then headless Chrome (`$CHROME_PATH`) on `/mock.html?case=…` |
+| A component against the mock IPC | `pnpm exec vite --port 1420`, then headless Chrome (`$CHROME_PATH`) on `/mock.html?case=…` |
+
+Start the mock server with `pnpm exec vite` rather than `pnpm mock`: stopping
+the `pnpm` wrapper leaves its Vite child holding the port, while a bare `vite`
+is one process to stop.
 
 Off macOS, whisper.cpp builds for the CPU instead of Metal, notifications only
 ever take the plugin's plain-banner path, and the tests that run

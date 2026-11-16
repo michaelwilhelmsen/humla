@@ -23,18 +23,9 @@ impl GroqAdapter {
 
 #[async_trait]
 impl BatchSttAdapter for GroqAdapter {
+    #[cfg(test)]
     fn provider_id(&self) -> &'static str {
         "groq"
-    }
-
-    fn label(&self) -> &'static str {
-        "Groq"
-    }
-
-    fn supports_language(&self, _lang: &str) -> bool {
-        // Groq's whisper-large-v3-turbo supports the full Whisper language
-        // set plus auto-detect.
-        true
     }
 
     fn supports_word_timestamps(&self, _model: &str) -> bool {
@@ -76,7 +67,6 @@ mod tests {
     fn metadata_is_correct() {
         let a = GroqAdapter::new();
         assert_eq!(a.provider_id(), "groq");
-        assert_eq!(a.label(), "Groq");
         assert!(a.supports_word_timestamps("whisper-large-v3-turbo"));
     }
 }

@@ -56,16 +56,9 @@ impl DeepgramAdapter {
 
 #[async_trait]
 impl BatchSttAdapter for DeepgramAdapter {
+    #[cfg(test)]
     fn provider_id(&self) -> &'static str {
         "deepgram"
-    }
-
-    fn label(&self) -> &'static str {
-        "Deepgram"
-    }
-
-    fn supports_language(&self, _lang: &str) -> bool {
-        true
     }
 
     fn supports_word_timestamps(&self, _model: &str) -> bool {
@@ -186,7 +179,6 @@ mod tests {
     fn metadata_is_correct() {
         let a = DeepgramAdapter::new();
         assert_eq!(a.provider_id(), "deepgram");
-        assert_eq!(a.label(), "Deepgram");
         assert!(a.supports_word_timestamps("nova-3"));
     }
 

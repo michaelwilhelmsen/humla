@@ -10,10 +10,6 @@ pub fn keychain_account_for(provider_id: &str) -> Option<&'static str> {
     ProviderId::parse(provider_id)?.keychain_account()
 }
 
-pub fn requires_api_key(provider_id: &str) -> bool {
-    keychain_account_for(provider_id).is_some()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

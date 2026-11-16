@@ -35,14 +35,12 @@ use tauri::{AppHandle, Emitter, Manager, State};
 fn resolve_embed(resolved: &ResolvedChat) -> Option<embed::EmbedConfig> {
     match resolved.provider {
         ProviderId::Local => Some(embed::EmbedConfig {
-            provider: "ollama",
             model: resolved.embed.model.clone().unwrap_or_else(|| OLLAMA_EMBED_MODEL.to_string()),
             base_url: resolved.embed.base_url.clone().unwrap_or_else(|| resolved.base_url.clone()),
             api_key: None,
         }),
         ProviderId::Anthropic | ProviderId::Copilot | ProviderId::Custom => None,
         _ => Some(embed::EmbedConfig {
-            provider: "openai",
             model: OPENAI_EMBED_MODEL.to_string(),
             base_url: resolved.base_url.clone(),
             api_key: resolved.api_key.clone(),

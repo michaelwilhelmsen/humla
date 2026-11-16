@@ -1,6 +1,10 @@
 //! Notifications Humla posts through macOS's UserNotifications: whether it
 //! may, posting one with buttons, taking one back, and what the user clicked.
 
+// Off macOS there is no UserNotifications, so its click and permission paths
+// have no caller there.
+#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
+
 #[cfg(target_os = "macos")]
 mod center;
 #[cfg(not(target_os = "macos"))]
@@ -14,7 +18,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(target_os = "macos")]
 use objc2_user_notifications::UNNotificationDefaultActionIdentifier;
 use serde::Serialize;
-use tauri::{AppHandle, Emitter};
+use tauri::AppHandle;
+#[cfg(target_os = "macos")]
+use tauri::Emitter;
 use tauri_plugin_notification::NotificationExt;
 
 use center::Center;

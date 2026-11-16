@@ -52,7 +52,6 @@ impl EmbeddingAdapter for HttpEmbeddingAdapter {
 /// no embedder is available (e.g. cloud chat with no API key) → retrieval
 /// degrades to keyword-only.
 pub struct EmbedConfig {
-    pub provider: &'static str,
     pub model: String,
     pub base_url: String,
     pub api_key: Option<String>,
@@ -68,31 +67,3 @@ impl EmbedConfig {
     }
 }
 
-#[cfg(test)]
-pub struct FakeEmbeddingAdapter {
-    pub model: String,
-    /// Fixed dimensionality of the returned vectors.
-    pub dims: usize,
-}
-
-#[cfg(test)]
-#[async_trait]
-impl EmbeddingAdapter for FakeEmbeddingAdapter {
-    fn model_id(&self) -> &str {
-        &self.model
-    }
-    async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        // Deterministic: a simple bag-of-chars projection so identical text →
-        // identical vector and different text → (usually) different vector.
-        Ok(texts
-            .iter()
-            .map(|t| {
-                let mut v = vec![0.0f32; self.dims];
-                for b in t.bytes() {
-                    v[(b as usize) % self.dims] += 1.0;
-                }
-                v
-            })
-            .collect())
-    }
-}

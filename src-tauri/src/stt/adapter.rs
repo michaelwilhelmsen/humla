@@ -9,13 +9,8 @@ use std::path::Path;
 
 #[async_trait]
 pub trait BatchSttAdapter: Send + Sync {
+    #[cfg(test)]
     fn provider_id(&self) -> &'static str;
-
-    fn label(&self) -> &'static str;
-
-    /// True when this adapter accepts the given language code. "auto" means
-    /// the provider does language detection itself.
-    fn supports_language(&self, lang: &str) -> bool;
 
     /// True when this adapter returns word-level timestamps for the given
     /// model. Drives whether the playback view's karaoke-style highlight

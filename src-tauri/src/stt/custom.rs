@@ -28,16 +28,9 @@ impl CustomAdapter {
 
 #[async_trait]
 impl BatchSttAdapter for CustomAdapter {
+    #[cfg(test)]
     fn provider_id(&self) -> &'static str {
         "custom"
-    }
-
-    fn label(&self) -> &'static str {
-        "Custom"
-    }
-
-    fn supports_language(&self, _lang: &str) -> bool {
-        true
     }
 
     fn supports_word_timestamps(&self, _model: &str) -> bool {
