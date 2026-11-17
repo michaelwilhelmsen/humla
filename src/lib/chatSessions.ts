@@ -145,11 +145,11 @@ export function liveChatErrorCopy(
   switch (reason) {
     case "byok_key_invalid":
       return isOwner
-        ? "This workspace's OpenAI key was rejected. Re-enter it in Organization → Workspace chat."
+        ? "This workspace's OpenAI key was rejected. Re-enter it in Settings → Account → Workspace chat."
         : `This workspace's OpenAI key was rejected — ask ${ownerName} to fix it.`;
     case "byok_provider_quota":
       return isOwner
-        ? "This workspace's OpenAI account is out of quota. Check it in Organization → Workspace chat."
+        ? "This workspace's OpenAI account is out of quota. Check it in Settings → Account → Workspace chat."
         : `This workspace's OpenAI account is out of quota — ask ${ownerName} to check it.`;
     case "byok_key_unavailable":
       return "Workspace chat is temporarily unavailable — try again shortly.";

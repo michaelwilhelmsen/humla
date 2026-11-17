@@ -1932,6 +1932,14 @@ const CASES: Record<string, Scenario> = {
     },
   },
 
+  // --- The whole Settings dialog over the app, on the unit tests' defaults.
+  // Switch sections from its own sidebar; `?tab=` is not read from the page URL.
+  settings: {
+    route: "/settings?tab=recording",
+    render: () => null, // unused — `route` renders the app
+    ipc: {},
+  },
+
   // --- Two-factor authentication. Settings → Account, signed in to a
   // workspace you administer. `-off` also has a workspace waiting for it, so the
   // switcher's locked row and the section's notice show; click "Turn on…" for

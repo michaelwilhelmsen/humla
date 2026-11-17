@@ -105,7 +105,7 @@ export function ChatTab({ s, update }: Pick<SettingsHook, "s" | "update">) {
     <Section title="AI Chat">
       <p className="text-xs text-[var(--color-text-muted)] leading-relaxed py-3.5">
         These settings cover chat over your personal notes. Workspace (Teams) chat is configured
-        per workspace under Organization → Workspace chat.
+        per workspace under Account → Workspace chat.
       </p>
       <Row
         label="Provider"

@@ -110,7 +110,7 @@ describe("liveChatErrorCopy", () => {
   const member = { isOwner: false, ownerName: "Ada" };
 
   it("gives the owner a fix path and the member an ask-owner line for a rejected key", () => {
-    expect(liveChatErrorCopy("byok_key_invalid", owner)).toMatch(/Organization → Workspace chat/);
+    expect(liveChatErrorCopy("byok_key_invalid", owner)).toMatch(/Settings → Account → Workspace chat/);
     expect(liveChatErrorCopy("byok_key_invalid", member)).toMatch(/ask Ada/);
   });
 

@@ -3,6 +3,16 @@
 // source of truth; legacy tab ids from old deep links resolve to their
 // new home so none of them 404.
 
+import {
+  AudioLines,
+  Mic,
+  MessageCircle,
+  Settings2,
+  Sparkles,
+  UserRound,
+  type LucideIcon,
+} from "lucide-react";
+
 export type SectionId =
   | "recording"
   | "transcription"
@@ -11,13 +21,13 @@ export type SectionId =
   | "account"
   | "general";
 
-export const SECTIONS: { id: SectionId; label: string }[] = [
-  { id: "recording", label: "Recording" },
-  { id: "transcription", label: "Transcription" },
-  { id: "summaries", label: "Summaries" },
-  { id: "chat", label: "Chat" },
-  { id: "account", label: "Account" },
-  { id: "general", label: "General" },
+export const SECTIONS: { id: SectionId; label: string; icon: LucideIcon }[] = [
+  { id: "recording", label: "Recording", icon: Mic },
+  { id: "transcription", label: "Transcription", icon: AudioLines },
+  { id: "summaries", label: "Summaries", icon: Sparkles },
+  { id: "chat", label: "Chat", icon: MessageCircle },
+  { id: "account", label: "Account", icon: UserRound },
+  { id: "general", label: "General", icon: Settings2 },
 ];
 
 const LEGACY_TAB_MAP: Record<string, SectionId> = {
