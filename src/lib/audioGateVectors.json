@@ -1,0 +1,11 @@
+[
+  { "setting": "true", "forbidden": false, "retains": true },
+  { "setting": "false", "forbidden": false, "retains": false },
+  { "setting": null, "forbidden": false, "retains": false },
+  { "setting": "", "forbidden": false, "retains": false },
+  { "setting": "1", "forbidden": false, "retains": false },
+  { "setting": "TRUE", "forbidden": false, "retains": false },
+  { "setting": "true", "forbidden": true, "retains": false },
+  { "setting": "false", "forbidden": true, "retains": false },
+  { "setting": null, "forbidden": true, "retains": false }
+]

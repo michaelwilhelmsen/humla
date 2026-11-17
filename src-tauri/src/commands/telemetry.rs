@@ -58,10 +58,16 @@ const ALLOWED: &[&str] = &[
     "onboarding_reached_done",
 ];
 
-/// True when this event may be sent right now: enabled, and not already sent.
-/// Separate from the command so the gating is testable without a network.
-pub(crate) fn should_send(enabled: Option<String>, already_sent: Option<String>, event: &str) -> bool {
-    if !ALLOWED.contains(&event) {
+/// True when this event may be sent right now: enabled, not already sent, and no
+/// organisation's `telemetry_off` in force (`policy_off`). Separate from the
+/// command so the gating is testable without a network.
+pub(crate) fn should_send(
+    enabled: Option<String>,
+    already_sent: Option<String>,
+    event: &str,
+    policy_off: bool,
+) -> bool {
+    if policy_off || !ALLOWED.contains(&event) {
         return false;
     }
     // Unset is NO, not "default on" — see gate 1 in the module docs.
@@ -80,15 +86,16 @@ fn sent_key(event: &str) -> String {
 /// could tell would be a caller that could be used to probe the setting.
 #[tauri::command]
 pub fn telemetry_event(app: tauri::AppHandle, event: String) {
-    let (enabled, already) = {
+    let (enabled, already, policy_off) = {
         let state = app.state::<AppState>();
         let conn = state.db.lock();
         (
             db::get_setting(&conn, "telemetry_enabled").ok().flatten(),
             db::get_setting(&conn, &sent_key(&event)).ok().flatten(),
+            crate::org_policy::effective_or_strictest(&conn).telemetry_off,
         )
     };
-    if !should_send(enabled, already, &event) {
+    if !should_send(enabled, already, &event, policy_off) {
         return;
     }
 
@@ -124,33 +131,33 @@ mod tests {
     fn unset_enabled_never_sends() {
         // The grandfathering rule: an install predating this feature has no
         // `telemetry_enabled` row and must stay silent.
-        assert!(!should_send(None, None, "app_first_run"));
+        assert!(!should_send(None, None, "app_first_run", false));
     }
 
     #[test]
     fn explicit_false_never_sends() {
-        assert!(!should_send(Some("false".into()), None, "app_first_run"));
+        assert!(!should_send(Some("false".into()), None, "app_first_run", false));
     }
 
     #[test]
     fn anything_but_true_is_off() {
         // Guards against a truthy-ish value being written by mistake.
         for v in ["1", "yes", "TRUE", "", "on"] {
-            assert!(!should_send(Some(v.into()), None, "app_first_run"), "{v} should be off");
+            assert!(!should_send(Some(v.into()), None, "app_first_run", false), "{v} should be off");
         }
     }
 
     #[test]
     fn enabled_and_unsent_sends_once() {
-        assert!(should_send(Some("true".into()), None, "app_first_run"));
+        assert!(should_send(Some("true".into()), None, "app_first_run", false));
         // Marked → never again on this install.
-        assert!(!should_send(Some("true".into()), Some("1".into()), "app_first_run"));
+        assert!(!should_send(Some("true".into()), Some("1".into()), "app_first_run", false));
     }
 
     #[test]
     fn unknown_event_never_sends() {
-        assert!(!should_send(Some("true".into()), None, "note_created"));
-        assert!(!should_send(Some("true".into()), None, ""));
+        assert!(!should_send(Some("true".into()), None, "note_created", false));
+        assert!(!should_send(Some("true".into()), None, "", false));
     }
 
     #[test]
@@ -160,5 +167,24 @@ mod tests {
             let ev = format!("onboarding_reached_{step}");
             assert!(ALLOWED.contains(&ev.as_str()), "missing event for step {step}");
         }
+    }
+
+    #[test]
+    fn an_organisations_telemetry_off_sends_nothing() {
+        for event in ALLOWED {
+            assert!(!should_send(Some("true".into()), None, event, true), "{event}");
+        }
+    }
+
+    #[test]
+    fn without_a_policy_the_gates_are_unchanged() {
+        let conn_dir = tempfile::tempdir().unwrap();
+        let conn = db::open(&conn_dir.path().join("t.sqlite")).unwrap();
+        assert!(!crate::org_policy::effective_or_strictest(&conn).telemetry_off, "nothing cached");
+        let empty = crate::org_policy::classify(200, r#"{"orgs":[]}"#);
+        crate::org_policy::store(&conn, &empty).unwrap();
+        assert!(!crate::org_policy::effective_or_strictest(&conn).telemetry_off, "in no organisation");
+        db::set_setting(&conn, crate::org_policy::SETTING_ORG_CONFIG, "{not json").unwrap();
+        assert!(crate::org_policy::effective_or_strictest(&conn).telemetry_off, "unreadable");
     }
 }

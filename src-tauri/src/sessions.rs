@@ -656,7 +656,14 @@ const KEEP_AUDIO_DEFAULT: bool = false;
 /// now means no audio, which costs cross-session unification (#17) on those
 /// notes. That trade-off is what the setting buys; it is not a regression to
 /// route around with another force-retain exception.
-pub fn retain_audio(keep_setting: Option<&str>) -> bool {
+///
+/// `forbidden` is an organisation's `audio_forbidden`, which closes the gate
+/// whatever the setting says. `src/lib/audioGate.ts` mirrors this, pinned by
+/// `src/lib/audioGateVectors.json`.
+pub fn retain_audio(keep_setting: Option<&str>, forbidden: bool) -> bool {
+    if forbidden {
+        return false;
+    }
     match keep_setting {
         Some(v) => v == "true",
         None => KEEP_AUDIO_DEFAULT,
@@ -1583,14 +1590,43 @@ mod tests {
 
     #[test]
     fn retain_audio_follows_the_setting() {
-        assert!(retain_audio(Some("true")));
-        assert!(!retain_audio(Some("false")));
+        assert!(retain_audio(Some("true"), false));
+        assert!(!retain_audio(Some("false"), false));
         // Unset falls back to the shipped default (off).
-        assert!(!retain_audio(None));
+        assert!(!retain_audio(None, false));
         // Anything that isn't the literal "true" is off — the setting is stored
         // as a string and a garbled value must fail closed, not open.
-        assert!(!retain_audio(Some("")));
-        assert!(!retain_audio(Some("1")));
+        assert!(!retain_audio(Some(""), false));
+        assert!(!retain_audio(Some("1"), false));
+    }
+
+    #[test]
+    fn audio_forbidden_closes_the_gate_whatever_the_setting() {
+        for setting in [Some("true"), Some("false"), None, Some("")] {
+            assert!(!retain_audio(setting, true), "{setting:?}");
+        }
+    }
+
+    #[test]
+    fn retain_audio_matches_the_shared_vectors() {
+        #[derive(serde::Deserialize)]
+        struct Vector {
+            setting: Option<String>,
+            forbidden: bool,
+            retains: bool,
+        }
+        let vectors: Vec<Vector> =
+            serde_json::from_str(include_str!("../../src/lib/audioGateVectors.json")).unwrap();
+        assert!(vectors.len() >= 8);
+        for v in vectors {
+            assert_eq!(
+                retain_audio(v.setting.as_deref(), v.forbidden),
+                v.retains,
+                "{:?} forbidden={}",
+                v.setting,
+                v.forbidden
+            );
+        }
     }
 
     #[test]

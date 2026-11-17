@@ -401,6 +401,8 @@ where
             commands::cloud_delete_workspace,
             commands::cloud_leave_workspace,
             commands::org_status,
+            commands::org_audio_notice,
+            commands::org_audio_sweep,
             commands::cloud_transfer_workspace,
             commands::cloud_workspace_members,
             commands::cloud_speaker_roster,

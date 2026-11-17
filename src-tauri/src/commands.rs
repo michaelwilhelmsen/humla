@@ -316,7 +316,15 @@ fn raw_setting(app: &AppHandle, key: &str) -> Option<String> {
 /// Read the device's `keep_audio` decision (#24). The single gate consulted by
 /// every path that would write, upload or download a WAV.
 pub(crate) fn keep_audio_enabled(app: &AppHandle) -> bool {
-    sessions::retain_audio(raw_setting(app, "keep_audio").as_deref())
+    sessions::retain_audio(raw_setting(app, "keep_audio").as_deref(), audio_forbidden(app))
+}
+
+/// Whether an organisation's `audio_forbidden` is in force. A policy that
+/// can't be read counts as forbidding audio.
+pub(crate) fn audio_forbidden(app: &AppHandle) -> bool {
+    let state: State<AppState> = app.state();
+    let conn = state.db.lock();
+    crate::org_policy::effective_or_strictest(&conn).audio_forbidden
 }
 
 /// Whether a capture starting now should keep the Mac from idle sleep (#180).
@@ -331,8 +339,7 @@ pub(crate) fn keep_awake_enabled(app: &AppHandle) -> bool {
 /// `keep_audio` gates it.
 pub(crate) fn deferred_transcription_enabled(app: &AppHandle) -> bool {
     let manual = raw_setting(app, "transcribe_manually");
-    let keep = raw_setting(app, "keep_audio");
-    sessions::defer_transcription(manual.as_deref(), sessions::retain_audio(keep.as_deref()))
+    sessions::defer_transcription(manual.as_deref(), keep_audio_enabled(app))
 }
 
 /// How far the run has got, on the same per-note channel. Measured in audio

@@ -351,9 +351,18 @@ fn note_recordings(app: &AppHandle, note_id: &str) -> Result<PathBuf, String> {
 #[tauri::command]
 pub async fn note_audio_export_info(app: AppHandle, note_id: String) -> Result<Vec<TakeAudio>, String> {
     let recordings = note_recordings(&app, &note_id)?;
-    tauri::async_runtime::spawn_blocking(move || note_audio_info(&recordings))
+    let forbidden = super::audio_forbidden(&app);
+    tauri::async_runtime::spawn_blocking(move || without_audio_if(forbidden, note_audio_info(&recordings)))
         .await
         .map_err(|e| format!("audio info task failed: {e}"))
+}
+
+/// Under `audio_forbidden`, every take reads as having no audio to save.
+fn without_audio_if(forbidden: bool, takes: Vec<TakeAudio>) -> Vec<TakeAudio> {
+    if !forbidden {
+        return takes;
+    }
+    takes.into_iter().map(|t| TakeAudio { duration_ms: None, ..t }).collect()
 }
 
 /// Save a note's audio to the path chosen in the native save panel. Like
@@ -363,6 +372,9 @@ pub async fn note_audio_export_info(app: AppHandle, note_id: String) -> Result<V
 /// let this device store, at the user's request, to a place the user chose.
 #[tauri::command]
 pub async fn export_note_audio(app: AppHandle, note_id: String, spec: AudioExportSpec) -> Result<(), String> {
+    if super::audio_forbidden(&app) {
+        return Err("Your organisation doesn't allow saving audio.".into());
+    }
     let recordings = note_recordings(&app, &note_id)?;
     tauri::async_runtime::spawn_blocking(move || {
         let sources = note_audio_sources(&recordings);
@@ -647,5 +659,14 @@ mod tests {
         assert_eq!(f, ExportFormat::Markdown);
         let f: ExportFormat = serde_json::from_str("\"txt\"").unwrap();
         assert_eq!(f, ExportFormat::Txt);
+    }
+
+    #[test]
+    fn audio_forbidden_leaves_no_take_with_audio_to_save() {
+        let takes = vec![TakeAudio { index: 1, duration_ms: Some(1000) }, TakeAudio { index: 2, duration_ms: None }];
+        let kept = without_audio_if(false, takes.clone());
+        assert_eq!(kept.iter().map(|t| t.duration_ms).collect::<Vec<_>>(), [Some(1000), None]);
+        let forbidden = without_audio_if(true, takes);
+        assert_eq!(forbidden.iter().map(|t| (t.index, t.duration_ms)).collect::<Vec<_>>(), [(1, None), (2, None)]);
     }
 }

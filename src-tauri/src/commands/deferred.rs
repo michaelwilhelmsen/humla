@@ -95,6 +95,59 @@ fn emit_transcribe_status(app: &AppHandle, note_id: &str, active: bool) {
     );
 }
 
+/// One take to replay and where its streams are.
+struct TakeSource {
+    entry: sessions::SessionEntry,
+    mic: Option<std::path::PathBuf>,
+    sys: Option<std::path::PathBuf>,
+    /// Whether its audio stays on disk after the replay.
+    retained: bool,
+}
+
+impl TakeSource {
+    /// A retained take, from its session directory.
+    fn retained(entry: sessions::SessionEntry, dir: &std::path::Path) -> Self {
+        let stream = |name: &str| Some(dir.join(name)).filter(|p| p.exists());
+        TakeSource { entry, mic: stream("mic.wav"), sys: stream("sys.wav"), retained: true }
+    }
+}
+
+/// Transcribe a "Transcribe manually" take whose audio may no longer be kept:
+/// the audio gate closed while it was recording. Called by the post-stop chain
+/// with the capture's temp streams, which it deletes afterwards, so the take
+/// still gets its text and nothing of it stays on disk.
+pub(super) async fn transcribe_unretained_take(
+    app: &AppHandle,
+    note_id: &str,
+    session_id: &str,
+    mic: Option<&std::path::Path>,
+    sys: Option<&std::path::Path>,
+) {
+    let Ok(app_dir) = app.path().app_data_dir() else { return };
+    let recordings = sessions::recordings_dir(&app_dir, note_id);
+    let Some((entry, _)) = sessions::resolve_sessions(&recordings).into_iter().find(|(e, _)| e.id == session_id)
+    else {
+        eprintln!("transcribe: take {session_id} has no manifest row");
+        return;
+    };
+    let state: State<AppState> = app.state();
+    if !state.transcribing.lock().insert(note_id.to_string()) {
+        return;
+    }
+    emit_transcribe_status(app, note_id, true);
+    let take = TakeSource {
+        entry,
+        mic: mic.map(|p| p.to_path_buf()),
+        sys: sys.map(|p| p.to_path_buf()),
+        retained: false,
+    };
+    if let Err(e) = transcribe_take_sources(app, note_id, vec![take]).await {
+        emit_error(app, Some(note_id), &e);
+    }
+    state.transcribing.lock().remove(note_id);
+    emit_transcribe_status(app, note_id, false);
+}
+
 async fn transcribe_takes(
     app: &AppHandle,
     note_id: &str,
@@ -102,7 +155,10 @@ async fn transcribe_takes(
 ) -> Result<(), String> {
     let app_dir = app.path().app_data_dir().map_err(err)?;
     let recordings = sessions::recordings_dir(&app_dir, note_id);
-    let takes = sessions::takes_to_transcribe(&recordings, scope);
+    let takes: Vec<TakeSource> = sessions::takes_to_transcribe(&recordings, scope)
+        .into_iter()
+        .map(|(entry, dir)| TakeSource::retained(entry, &dir))
+        .collect();
     if takes.is_empty() {
         // Nothing to do — a stale button, or a second press that lost the race.
         // Not an error: there is no bad state to report.
@@ -127,6 +183,11 @@ async fn transcribe_takes(
             eprintln!("transcribe: could not snapshot a revision for {note_id} before a re-transcribe; the run will not be undoable: {e}");
         }
     }
+    transcribe_take_sources(app, note_id, takes).await
+}
+
+async fn transcribe_take_sources(app: &AppHandle, note_id: &str, takes: Vec<TakeSource>) -> Result<(), String> {
+    let state: State<AppState> = app.state();
     // The provider that runs now is the one configured now, which may not be
     // the one that was configured when the audio was captured. Check before
     // replaying an hour of it.
@@ -139,9 +200,9 @@ async fn transcribe_takes(
     let progress = Arc::new(parking_lot::Mutex::new(ReplayProgress::new(
         takes
             .iter()
-            .map(|(entry, dir)| TakeWork {
-                streams: sessions::replayable_stream_count(dir),
-                duration_ms: entry.duration_ms,
+            .map(|t| TakeWork {
+                streams: t.mic.is_some() as u32 + t.sys.is_some() as u32,
+                duration_ms: t.entry.duration_ms,
             })
             .collect(),
     )));
@@ -164,7 +225,7 @@ async fn transcribe_takes(
     // reported once below, so a take abandoned mid-run is still measured.
     let run_started = std::time::Instant::now();
     let mut timings = ReplayTimings::default();
-    for (take_index, (entry, dir)) in takes.into_iter().enumerate() {
+    for (take_index, TakeSource { entry, mic: mic_wav, sys: sys_wav, retained }) in takes.into_iter().enumerate() {
         // Emitted, not just recorded: this is where the step goes back to
         // transcribing after the previous take's diarize.
         let snapshot = {
@@ -174,13 +235,6 @@ async fn transcribe_takes(
         };
         emit_transcribe_progress(app, note_id, snapshot);
         let t_transcribe = std::time::Instant::now();
-        // At least one of these exists — `takes_to_transcribe` filtered on it,
-        // so a take whose audio was swept away by "Delete stored audio" never
-        // reaches here and never produced a button either.
-        let mic = dir.join("mic.wav");
-        let sys = dir.join("sys.wav");
-        let mic_wav = mic.exists().then_some(mic);
-        let sys_wav = sys.exists().then_some(sys);
 
         // One sink for the whole take: its two streams share a chunk log (the
         // diarize pass has to see both to tell an in-person meeting from a
@@ -218,10 +272,11 @@ async fn transcribe_takes(
             // chunk failed" (provider outage, revoked key) are indistinguishable,
             // and the second has to stay retryable — the audio is still on disk,
             // so the action stays available for this take.
-            failures.push(format!(
-                "Recording {} produced no text. Its audio is still saved — try again.",
-                entry.index
-            ));
+            failures.push(if retained {
+                format!("Recording {} produced no text. Its audio is still saved — try again.", entry.index)
+            } else {
+                format!("Recording {} produced no text.", entry.index)
+            });
             continue;
         }
         // chunks.json beside the audio, so a later re-diarize has its anchor.

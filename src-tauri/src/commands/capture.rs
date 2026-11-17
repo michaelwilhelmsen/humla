@@ -1124,6 +1124,31 @@ async fn post_stop_chain_inner(
     };
     let transcribed_nothing = post_stop.chunks.is_empty();
 
+    if deferred && !keep_audio_enabled(&app) && (post_stop.mic_wav.is_some() || post_stop.sys_wav.is_some()) {
+        // The audio gate closed during the capture, so this take can't wait
+        // for the Transcribe action: transcribe it now from the temp streams.
+        finalize_session(
+            &app,
+            &note_id,
+            &session_id,
+            &session_started_at,
+            streams,
+            post_stop.captured_duration_ms,
+            sessions::Transcribed::No,
+        )
+        .await;
+        session_changed_for_sync(&app, &note_id, &session_id);
+        super::deferred::transcribe_unretained_take(
+            &app,
+            &note_id,
+            &session_id,
+            post_stop.mic_wav.as_deref(),
+            post_stop.sys_wav.as_deref(),
+        )
+        .await;
+        clear_temp_dir(temp_dir, clock).await;
+        return;
+    }
     if deferred {
         // Nothing to diarize, label, title or detect a language from — there
         // is no text yet. What this take needs is to be *playable* and to be

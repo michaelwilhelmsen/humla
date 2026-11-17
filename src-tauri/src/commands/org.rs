@@ -8,7 +8,7 @@ use serde::Serialize;
 use tauri::{Emitter, State};
 use tokio::sync::Notify;
 
-use crate::org_policy::{self, EffectivePolicy, FetchOutcome, OrgSummary};
+use crate::org_policy::{self, AudioSweep, EffectivePolicy, FetchOutcome, OrgSummary};
 use crate::{db, AppState};
 
 #[derive(Serialize)]
@@ -24,6 +24,30 @@ pub fn org_status(state: State<'_, AppState>) -> Result<OrgStatus, String> {
     let policy = org_policy::effective(&conn).map_err(|e| format!("organisation policy: {e}"))?;
     let config = org_policy::cached(&conn).map_err(|e| format!("organisation policy: {e}"))?;
     Ok(OrgStatus { policy, orgs: org_policy::summaries(config.as_ref()) })
+}
+
+/// The organisation whose `audio_forbidden` still owes the sweep of audio on
+/// this Mac, for the one-time notice.
+#[tauri::command]
+pub fn org_audio_notice(state: State<'_, AppState>) -> Option<AudioSweep> {
+    org_policy::audio_sweep_due(&state.db.lock())
+}
+
+/// Delete every note's stored audio for `org_id`'s `audio_forbidden` and record
+/// that it ran. Refused unless that organisation's sweep is due right now.
+#[tauri::command]
+pub fn org_audio_sweep(app: tauri::AppHandle, state: State<'_, AppState>, org_id: String) -> Result<usize, String> {
+    authorise_audio_sweep(&state.db.lock(), &org_id)?;
+    let removed = super::delete_stored_audio(app)?;
+    org_policy::record_audio_sweep(&state.db.lock(), &org_id).map_err(|e| format!("organisation policy: {e}"))?;
+    Ok(removed)
+}
+
+fn authorise_audio_sweep(conn: &rusqlite::Connection, org_id: &str) -> Result<(), String> {
+    match org_policy::audio_sweep_due(conn) {
+        Some(due) if due.org_id == org_id => Ok(()),
+        _ => Err("No organisation asks for stored audio to be deleted.".into()),
+    }
 }
 
 /// How often the worker refreshes the organisation config, and the longest it
@@ -60,7 +84,8 @@ impl Attempt {
 pub(crate) struct Changes {
     /// The policy in force differs (`org_policy_changed`).
     pub policy: bool,
-    /// `apply_local_only` rewrote settings (`org_settings_rewritten`).
+    /// `apply_local_only` or `apply_device_policies` rewrote settings
+    /// (`org_settings_rewritten`).
     pub settings: bool,
     /// The organisations' templates, terms or names differ
     /// (`org_content_changed`).
@@ -112,7 +137,7 @@ pub(crate) async fn refresh_org_config(
     attempt
 }
 
-/// Cache a fetch and apply `local_only` to settings. Never clears the cache on
+/// Cache a fetch and move settings the policy refuses to their enforced values. Never clears the cache on
 /// anything but an authenticated answer (`org_policy::store`).
 pub(crate) fn apply_fetch(conn: &rusqlite::Connection, outcome: &FetchOutcome) -> Changes {
     let before = org_policy::effective(conn).ok();
@@ -129,10 +154,15 @@ pub(crate) fn apply_fetch(conn: &rusqlite::Connection, outcome: &FetchOutcome) -
         }),
         _ => false,
     };
-    let settings = apply_local_only(conn).unwrap_or_else(|e| {
+    let local_only = apply_local_only(conn).unwrap_or_else(|e| {
         eprintln!("org policy: couldn't apply local_only to settings: {e:#}");
         false
     });
+    let device = apply_device_policies(conn).unwrap_or_else(|e| {
+        eprintln!("org policy: couldn't apply audio and telemetry policies to settings: {e:#}");
+        false
+    });
+    let settings = local_only || device;
     Changes { policy: before != after, settings, content: templates || orgs_before != orgs_after }
 }
 
@@ -219,6 +249,21 @@ pub(crate) fn apply_local_only(conn: &rusqlite::Connection) -> anyhow::Result<bo
     if crate::mcp::is_switched_on(conn) {
         db::set_setting(conn, crate::mcp::SETTING_ENABLED, "false")?;
         wrote = true;
+    }
+    Ok(wrote)
+}
+
+/// Under `audio_forbidden`, turn `keep_audio` off; under `telemetry_off`, turn
+/// `telemetry_enabled` off. Only an explicit "true" is rewritten: unset already
+/// means off for both. Returns whether anything was written.
+pub(crate) fn apply_device_policies(conn: &rusqlite::Connection) -> anyhow::Result<bool> {
+    let policy = org_policy::effective(conn)?;
+    let mut wrote = false;
+    for (on, key) in [(policy.audio_forbidden, "keep_audio"), (policy.telemetry_off, "telemetry_enabled")] {
+        if on && db::get_setting(conn, key)?.as_deref() == Some("true") {
+            db::set_setting(conn, key, "false")?;
+            wrote = true;
+        }
     }
     Ok(wrote)
 }
@@ -417,5 +462,91 @@ mod tests {
         apply_local_only(&conn).unwrap();
         assert_eq!(db::get_setting(&conn, "summary_provider").unwrap().as_deref(), Some("custom"));
         assert_eq!(db::get_setting(&conn, "chat_provider").unwrap().as_deref(), Some("custom"));
+    }
+    fn device_body(audio_forbidden: bool, telemetry_off: bool) -> String {
+        format!(
+            r#"{{"orgs":[{{"id":"o1","name":"Northwind","policy":{{"local_only":false,"retention_days":0,"telemetry_off":{telemetry_off},"audio_forbidden":{audio_forbidden}}}}}]}}"#
+        )
+    }
+
+    fn get(conn: &rusqlite::Connection, key: &str) -> Option<String> {
+        db::get_setting(conn, key).unwrap()
+    }
+
+    #[test]
+    fn without_an_organisation_audio_and_telemetry_settings_are_untouched() {
+        for (keep, telemetry) in [(Some("true"), Some("true")), (Some("false"), Some("false")), (None, None)] {
+            let (_d, conn) = conn();
+            if let Some(v) = keep {
+                db::set_setting(&conn, "keep_audio", v).unwrap();
+            }
+            if let Some(v) = telemetry {
+                db::set_setting(&conn, "telemetry_enabled", v).unwrap();
+            }
+            for outcome in [
+                org_policy::classify(200, EMPTY),
+                org_policy::classify(200, EMPTY),
+                FetchOutcome::Failed("offline".into()),
+                FetchOutcome::Unsupported,
+                FetchOutcome::SignedOut,
+            ] {
+                assert_eq!(apply_fetch(&conn, &outcome), Changes::default(), "{outcome:?}");
+            }
+            assert!(!apply_device_policies(&conn).unwrap());
+            assert_eq!(get(&conn, "keep_audio").as_deref(), keep);
+            assert_eq!(get(&conn, "telemetry_enabled").as_deref(), telemetry);
+            assert_eq!(org_policy::audio_sweep_due(&conn), None);
+            assert!(authorise_audio_sweep(&conn, "o1").is_err());
+            assert!(authorise_audio_sweep(&conn, "").is_err());
+        }
+    }
+
+    #[test]
+    fn audio_forbidden_arriving_turns_keep_audio_off_once() {
+        let (_d, conn) = conn();
+        db::set_setting(&conn, "keep_audio", "true").unwrap();
+        db::set_setting(&conn, "transcribe_manually", "true").unwrap();
+        assert_eq!(
+            apply_fetch(&conn, &org_policy::classify(200, &device_body(true, false))),
+            Changes { policy: true, settings: true, content: true }
+        );
+        assert_eq!(get(&conn, "keep_audio").as_deref(), Some("false"));
+        assert_eq!(get(&conn, "transcribe_manually").as_deref(), Some("true"), "the closed gate defers nothing");
+        assert_eq!(apply_fetch(&conn, &org_policy::classify(200, &device_body(true, false))), Changes::default());
+        assert!(authorise_audio_sweep(&conn, "o1").is_ok());
+        assert!(authorise_audio_sweep(&conn, "o2").is_err());
+    }
+
+    #[test]
+    fn telemetry_off_arriving_turns_telemetry_off_and_leaves_unset_alone() {
+        let (_d, conn) = conn();
+        db::set_setting(&conn, "telemetry_enabled", "true").unwrap();
+        assert!(apply_fetch(&conn, &org_policy::classify(200, &device_body(false, true))).settings);
+        assert_eq!(get(&conn, "telemetry_enabled").as_deref(), Some("false"));
+
+        let (_d2, unset) = super::tests::conn();
+        assert!(!apply_fetch(&unset, &org_policy::classify(200, &device_body(false, true))).settings);
+        assert_eq!(get(&unset, "telemetry_enabled"), None);
+    }
+
+    #[test]
+    fn an_unreadable_cache_rewrites_nothing_and_authorises_no_sweep() {
+        let (_d, conn) = conn();
+        db::set_setting(&conn, "keep_audio", "true").unwrap();
+        db::set_setting(&conn, "telemetry_enabled", "true").unwrap();
+        db::set_setting(&conn, org_policy::SETTING_ORG_CONFIG, "{not json").unwrap();
+        assert!(apply_device_policies(&conn).is_err());
+        assert_eq!(get(&conn, "keep_audio").as_deref(), Some("true"));
+        assert_eq!(get(&conn, "telemetry_enabled").as_deref(), Some("true"));
+        assert!(authorise_audio_sweep(&conn, "o1").is_err());
+        assert!(authorise_audio_sweep(&conn, "").is_err());
+    }
+
+    #[test]
+    fn a_swept_organisation_authorises_no_second_sweep() {
+        let (_d, conn) = conn();
+        apply_fetch(&conn, &org_policy::classify(200, &device_body(true, false)));
+        org_policy::record_audio_sweep(&conn, "o1").unwrap();
+        assert!(authorise_audio_sweep(&conn, "o1").is_err());
     }
 }
