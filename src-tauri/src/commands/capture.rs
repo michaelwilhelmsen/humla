@@ -409,6 +409,13 @@ pub async fn recording_start(
         emit_error(&app, Some(&note_id), &msg);
         return Err(msg);
     }
+    // After the claim, so a retention sweep that saw the slot free can't purge
+    // a note this start then records into.
+    let past = super::org::refuse_past_retention(&state.db.lock(), &note_id, crate::db::now_ms());
+    if let Err(msg) = past {
+        emit_error(&app, Some(&note_id), &msg);
+        return Err(msg);
+    }
 
     // Pre-check the configured provider's prerequisites (API key / local model
     // present) and fire the local-Whisper prewarm. Shared with `import_audio`.

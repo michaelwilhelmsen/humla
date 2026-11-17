@@ -77,6 +77,13 @@ pub async fn transcribe_note(
     if replay_owed(&note_id) || !state.transcribing.lock().insert(note_id.clone()) {
         return Err("Already transcribing this note.".into());
     }
+    // After joining `transcribing`, so a retention sweep can't purge the note
+    // between this check and the replay.
+    let past = super::org::refuse_past_retention(&state.db.lock(), &note_id, crate::db::now_ms());
+    if let Err(msg) = past {
+        state.transcribing.lock().remove(&note_id);
+        return Err(msg);
+    }
     emit_transcribe_status(&app, &note_id, true);
     let result = transcribe_takes(&app, &note_id, scope).await;
     notes::purge_note_assets_if_gone(&app, &note_id);

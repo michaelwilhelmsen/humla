@@ -1,6 +1,6 @@
 //! Organisation policies over IPC, and the one refresh of their cache.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -290,44 +290,111 @@ pub(crate) const RETENTION_SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 6
 
 /// Purge every note past its organisation's `retention_days`, then remove the
 /// notes' files and tell the UI. Purge, never Trash, and nothing is pushed: the
-/// server runs its own retention. Skipped while a capture holds the slot, so a
-/// recording or its stop chain never loses its note mid-write. Takes the
+/// server runs its own retention. Busy notes ([`note_busy`]) wait for the next
+/// sweep; `recording_start` and `transcribe_note` refuse a note past its
+/// cutoff, which closes the gap between that check and the purge. Takes the
 /// database rather than `AppState`, which the org refresh loop may run before.
 pub(crate) fn org_retention_sweep(app: &tauri::AppHandle, db: &Arc<Mutex<rusqlite::Connection>>) -> usize {
-    let busy = match app.try_state::<AppState>() {
-        Some(state) => {
-            let capture = state.recording.lock();
-            if capture.note_id.is_some() || capture.stop != crate::recording::StopState::None {
-                return 0;
-            }
-            drop(capture);
-            state.transcribing.lock().clone()
-        }
-        None => HashSet::new(),
-    };
-    let purged = purge_expired_notes(&db.lock(), db::now_ms(), &busy);
+    let now = db::now_ms();
+    let candidates = expired_notes(&db.lock(), now);
+    let idle: Vec<String> = candidates.into_iter().filter(|id| !note_busy(app, id)).collect();
+    let purged = purge_notes(&db.lock(), &idle);
     announce_purged(app, &purged);
     purged.len()
 }
 
-/// The database half of the sweep: purge each note `org_policy::retention_in_force`
-/// puts past its cutoff at `now_ms`, except `busy` ones. Returns the purged ids.
-pub(crate) fn purge_expired_notes(conn: &rusqlite::Connection, now_ms: i64, busy: &HashSet<String>) -> Vec<String> {
-    let mut purged = Vec::new();
-    for (workspace, days) in org_policy::retention_in_force(conn) {
-        let cutoff = org_policy::retention_cutoff(now_ms, days);
-        let ids = db::notes_created_before(conn, &workspace, cutoff).unwrap_or_else(|e| {
-            eprintln!("retention: couldn't list expired notes: {e:#}");
-            Vec::new()
-        });
-        for id in ids.into_iter().filter(|id| !busy.contains(id)) {
-            match db::purge_note(conn, &id) {
-                Ok(()) => purged.push(id),
-                Err(e) => eprintln!("retention: couldn't purge note {id}: {e:#}"),
-            }
+/// Whether a note is in use. A capture that is starting or stopping doesn't
+/// say which note it holds, so it makes every note busy.
+pub(crate) fn note_busy(app: &tauri::AppHandle, note_id: &str) -> bool {
+    let Some(state) = app.try_state::<AppState>() else { return false };
+    {
+        let capture = state.recording.lock();
+        if capture.starting
+            || capture.stop != crate::recording::StopState::None
+            || capture.note_id.as_deref() == Some(note_id)
+        {
+            return true;
         }
     }
-    purged
+    state.transcribing.lock().contains(note_id) || super::deferred::replay_owed(note_id)
+}
+
+/// Every note `org_policy::retention_in_force` puts past its cutoff at `now_ms`.
+pub(crate) fn expired_notes(conn: &rusqlite::Connection, now_ms: i64) -> Vec<String> {
+    let mut ids = Vec::new();
+    for (workspace, rule) in org_policy::retention_in_force(conn) {
+        let cutoff = org_policy::retention_cutoff(now_ms, rule.days);
+        match db::notes_created_before(conn, &workspace, cutoff) {
+            Ok(found) => ids.extend(found),
+            Err(e) => eprintln!("retention: couldn't list expired notes: {e:#}"),
+        }
+    }
+    ids
+}
+
+/// Purge `ids`, returning those that went.
+pub(crate) fn purge_notes(conn: &rusqlite::Connection, ids: &[String]) -> Vec<String> {
+    ids.iter()
+        .filter(|id| match db::purge_note(conn, id) {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!("retention: couldn't purge note {id}: {e:#}");
+                false
+            }
+        })
+        .cloned()
+        .collect()
+}
+
+fn days_phrase(days: u32) -> String {
+    format!("{days} {}", if days == 1 { "day" } else { "days" })
+}
+
+/// Refuse to record into or transcribe a note past its organisation's
+/// retention: the next sweep purges it. A missing note is left to the caller.
+pub(crate) fn refuse_past_retention(conn: &rusqlite::Connection, note_id: &str, now_ms: i64) -> Result<(), String> {
+    let Ok(note) = db::get_note(conn, note_id) else { return Ok(()) };
+    let Some(rule) = org_policy::retention_rule(conn, &note.workspace_id) else { return Ok(()) };
+    if org_policy::is_past(note.created_at, org_policy::retention_cutoff(now_ms, rule.days)) {
+        return Err(format!("This note is past {}'s retention and will be deleted.", rule.source));
+    }
+    Ok(())
+}
+
+/// Refuse to move a note into a workspace whose retention it is already past:
+/// the server would refuse it and the sweep would purge the only copy.
+pub(crate) fn check_move(
+    conn: &rusqlite::Connection,
+    note: &db::Note,
+    to: &str,
+    to_name: Option<&str>,
+    now_ms: i64,
+) -> Result<(), String> {
+    let Some(rule) = org_policy::retention_rule(conn, to) else { return Ok(()) };
+    if org_policy::is_past(note.created_at, org_policy::retention_cutoff(now_ms, rule.days)) {
+        let name = to_name.map(str::trim).filter(|n| !n.is_empty()).unwrap_or("this workspace");
+        return Err(format!("Notes older than {} can't be moved to {name}.", days_phrase(rule.days)));
+    }
+    Ok(())
+}
+
+/// Under retention a note may only be dated earlier, as on the server, and no
+/// further back than the cutoff (`org_policy::redate_bounds`).
+pub(crate) fn check_redate(
+    conn: &rusqlite::Connection,
+    note: &db::Note,
+    created_at: i64,
+    now_ms: i64,
+) -> Result<(), String> {
+    let Some(rule) = org_policy::retention_rule(conn, &note.workspace_id) else { return Ok(()) };
+    let (min, max) = org_policy::redate_bounds(rule.days, note.created_at, now_ms);
+    if created_at > max {
+        return Err(format!("Blocked by {}: a note can't be dated later.", rule.source));
+    }
+    if created_at < min {
+        return Err(format!("Blocked by {}: notes are deleted after {}.", rule.source, days_phrase(rule.days)));
+    }
+    Ok(())
 }
 
 /// After notes were purged: remove their files and tell the UI, which closes
@@ -628,7 +695,7 @@ mod tests {
     // ---- retention ----
 
     const DAY: i64 = org_policy::DAY_MS;
-    const NOW: i64 = 1_000 * DAY;
+    const NOW: i64 = 1_800_000_000_000;
 
     fn retention_body(days: u32, workspaces: &str) -> String {
         format!(
@@ -648,7 +715,7 @@ mod tests {
     }
 
     fn sweep(conn: &rusqlite::Connection) -> Vec<String> {
-        purge_expired_notes(conn, NOW, &HashSet::new())
+        purge_notes(conn, &expired_notes(conn, NOW))
     }
 
     fn exists(conn: &rusqlite::Connection, id: &str) -> bool {
@@ -698,6 +765,9 @@ mod tests {
         let outside = aged_note(&conn, "w2", 5_000);
         let undated = aged_note(&conn, "w1", 0);
         conn.execute("UPDATE notes SET created_at = 0 WHERE id = ?1", [&undated]).unwrap();
+        let in_seconds = aged_note(&conn, "w1", 0);
+        conn.execute("UPDATE notes SET created_at = ?1 WHERE id = ?2", rusqlite::params![org_policy::MIN_EPOCH_MS - 1, in_seconds])
+            .unwrap();
         let patch = db::NotePatch { transcript: Some("Hege: the case".into()), ..Default::default() };
         db::update_note(&conn, &expired, &patch).unwrap();
         assert_eq!(db::list_note_revisions(&conn, &expired).unwrap().len(), 1);
@@ -710,21 +780,11 @@ mod tests {
         for id in [&expired, &trashed] {
             assert!(!exists(&conn, id), "purged, not moved to the Trash");
         }
-        for id in [&young, &personal, &outside, &undated] {
+        for id in [&young, &personal, &outside, &undated, &in_seconds] {
             assert!(exists(&conn, id));
         }
         assert!(db::list_note_revisions(&conn, &expired).unwrap().is_empty());
         assert!(sweep(&conn).is_empty(), "a second run finds nothing");
-    }
-
-    #[test]
-    fn a_busy_note_waits_for_the_next_sweep() {
-        let (_d, conn) = conn();
-        apply_fetch(&conn, &org_policy::classify(200, &retention_body(30, r#""w1""#)));
-        let busy = aged_note(&conn, "w1", 31);
-        assert!(purge_expired_notes(&conn, NOW, &HashSet::from([busy.clone()])).is_empty());
-        assert!(exists(&conn, &busy));
-        assert_eq!(sweep(&conn), [busy]);
     }
 
     #[test]
@@ -736,5 +796,122 @@ mod tests {
         assert!(apply_fetch(&conn, &org_policy::classify(200, &retention_body(7, r#""w1","w2""#))).retention);
         assert!(!apply_fetch(&conn, &FetchOutcome::Failed("offline".into())).retention);
         assert!(apply_fetch(&conn, &org_policy::classify(200, EMPTY)).retention);
+    }
+
+    fn get_note(conn: &rusqlite::Connection, id: &str) -> db::Note {
+        db::get_note(conn, id).unwrap()
+    }
+
+    /// Every input the refusals could see, with no organisation in force: no
+    /// cache, an empty answer, an unreadable cache, and a 0-day policy.
+    fn without_retention(conn: &rusqlite::Connection, state: usize) {
+        match state {
+            0 => {}
+            1 => {
+                apply_fetch(conn, &org_policy::classify(200, EMPTY));
+            }
+            2 => db::set_setting(conn, org_policy::SETTING_ORG_CONFIG, "{not json").unwrap(),
+            _ => {
+                apply_fetch(conn, &org_policy::classify(200, &retention_body(0, r#""w1""#)));
+            }
+        }
+    }
+
+    #[test]
+    fn without_retention_record_transcribe_move_and_redate_refuse_nothing() {
+        for state in 0..4 {
+            let (_d, conn) = conn();
+            without_retention(&conn, state);
+            for (ws, age) in [("w1", 5_000), ("", 5_000), ("w1", 0), ("w2", 31)] {
+                let id = aged_note(&conn, ws, age);
+                let note = get_note(&conn, &id);
+                assert_eq!(refuse_past_retention(&conn, &id, NOW), Ok(()), "state {state}");
+                for to in ["w1", "w2", ""] {
+                    assert_eq!(check_move(&conn, &note, to, Some("Team"), NOW), Ok(()), "state {state}");
+                }
+                for date in [NOW, NOW - 10_000 * DAY, note.created_at + DAY, 1, org_policy::MIN_EPOCH_MS - 1] {
+                    assert_eq!(check_redate(&conn, &note, date, NOW), Ok(()), "state {state}, date {date}");
+                }
+            }
+            assert_eq!(refuse_past_retention(&conn, "missing", NOW), Ok(()));
+        }
+    }
+
+    #[test]
+    fn a_note_past_retention_refuses_recording_and_transcription() {
+        let (_d, conn) = conn();
+        apply_fetch(&conn, &org_policy::classify(200, &retention_body(30, r#""w1""#)));
+        let past = aged_note(&conn, "w1", 31);
+        let young = aged_note(&conn, "w1", 29);
+        let personal = aged_note(&conn, "", 5_000);
+        let undated = aged_note(&conn, "w1", 0);
+        conn.execute("UPDATE notes SET created_at = 5 WHERE id = ?1", [&undated]).unwrap();
+        assert_eq!(
+            refuse_past_retention(&conn, &past, NOW),
+            Err("This note is past Northwind's retention and will be deleted.".into())
+        );
+        for id in [&young, &personal, &undated] {
+            assert_eq!(refuse_past_retention(&conn, id, NOW), Ok(()));
+        }
+    }
+
+    #[test]
+    fn a_note_past_a_workspace_retention_cant_move_there() {
+        let (_d, conn) = conn();
+        apply_fetch(&conn, &org_policy::classify(200, &retention_body(30, r#""w1""#)));
+        let old = get_note(&conn, &aged_note(&conn, "", 31));
+        let young = get_note(&conn, &aged_note(&conn, "", 29));
+        assert_eq!(
+            check_move(&conn, &old, "w1", Some("Case work"), NOW),
+            Err("Notes older than 30 days can't be moved to Case work.".into())
+        );
+        assert_eq!(
+            check_move(&conn, &old, "w1", None, NOW),
+            Err("Notes older than 30 days can't be moved to this workspace.".into())
+        );
+        assert_eq!(check_move(&conn, &young, "w1", Some("Case work"), NOW), Ok(()));
+        assert_eq!(check_move(&conn, &old, "w2", Some("Other"), NOW), Ok(()), "outside the organisation");
+        assert_eq!(check_move(&conn, &old, "", None, NOW), Ok(()), "to Personal");
+    }
+
+    #[test]
+    fn under_retention_a_note_moves_only_earlier_and_not_past_the_cutoff() {
+        let (_d, conn) = conn();
+        apply_fetch(&conn, &org_policy::classify(200, &retention_body(30, r#""w1""#)));
+        let note = get_note(&conn, &aged_note(&conn, "w1", 10));
+        assert_eq!(check_redate(&conn, &note, note.created_at - DAY, NOW), Ok(()));
+        assert_eq!(check_redate(&conn, &note, NOW - 30 * DAY, NOW), Ok(()), "the cutoff itself");
+        assert_eq!(
+            check_redate(&conn, &note, note.created_at + 1, NOW),
+            Err("Blocked by Northwind: a note can't be dated later.".into())
+        );
+        assert_eq!(
+            check_redate(&conn, &note, NOW - 30 * DAY - 1, NOW),
+            Err("Blocked by Northwind: notes are deleted after 30 days.".into())
+        );
+        let personal = get_note(&conn, &aged_note(&conn, "", 10));
+        assert_eq!(check_redate(&conn, &personal, NOW, NOW), Ok(()), "Personal is unchanged");
+    }
+
+    /// The commands themselves take Tauri state, so these pin where each calls
+    /// its refusal: after the slot claim or the `transcribing` insert, and in
+    /// `notes_set_date` only for a note that exists, as on main.
+    #[test]
+    fn the_commands_call_their_refusals_in_the_right_place() {
+        let capture = include_str!("capture.rs");
+        let start = &capture[capture.find("pub async fn recording_start").unwrap()..];
+        let claim = start.find("StartClaim::take").unwrap();
+        let refuse = start.find("refuse_past_retention").unwrap();
+        assert!(claim < refuse && refuse < start.find("ensure_provider_ready").unwrap());
+
+        let deferred = include_str!("deferred.rs");
+        let tn = &deferred[deferred.find("pub async fn transcribe_note").unwrap()..];
+        assert!(tn.find("transcribing.lock().insert").unwrap() < tn.find("refuse_past_retention").unwrap());
+
+        let notes = include_str!("notes.rs");
+        let date = &notes[notes.find("pub fn notes_set_date").unwrap()..];
+        assert!(date.contains("if let Ok(note) = db::get_note(&conn, &id) {\n            super::org::check_redate"));
+        let mv = &notes[notes.find("pub fn notes_set_workspace").unwrap()..];
+        assert!(mv.find("already there").unwrap() < mv.find("check_move").unwrap());
     }
 }

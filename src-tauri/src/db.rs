@@ -1025,36 +1025,43 @@ pub fn restore_note(conn: &Connection, id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Permanently delete a note and everything derived from it: its chunks and
-/// their search index, its version history, and its Chat tab's conversations
-/// (ADR-0002: erasing a note erases what it said). `chunk_embeddings` is keyed
-/// by text hash, not note, and holds vectors only, so it stays. The server copy
-/// is not touched.
+/// Permanently delete a note and everything derived from it, in one
+/// transaction (see [`purge_note_rows`]). The server copy is not touched.
 pub fn purge_note(conn: &Connection, id: &str) -> Result<()> {
     let tx = conn.unchecked_transaction()?;
-    remove_note_chunks(&tx, id)?;
-    tx.execute("DELETE FROM note_revisions WHERE note_id = ?1", params![id])?;
-    tx.execute(
-        "DELETE FROM messages WHERE conversation_id IN
-           (SELECT id FROM conversations WHERE scope = ?1 AND scope_id = ?2)",
-        params![CHAT_SCOPE_NOTE, id],
-    )?;
-    tx.execute("DELETE FROM conversations WHERE scope = ?1 AND scope_id = ?2", params![CHAT_SCOPE_NOTE, id])?;
-    tx.execute("DELETE FROM notes WHERE id = ?1", params![id])?;
+    purge_note_rows(&tx, id)?;
     tx.commit()?;
     Ok(())
 }
 
+/// Delete a note and what is keyed to it: its chunks and their search index,
+/// its version history, and its Chat tab's conversations (ADR-0002: erasing a
+/// note erases what it said). `chunk_embeddings` is keyed by text hash, not
+/// note, and holds vectors only, so it stays. Opens no transaction; the caller
+/// holds one (`purge_note`, or the sync worker's).
+pub fn purge_note_rows(conn: &Connection, id: &str) -> Result<()> {
+    remove_note_chunks(conn, id)?;
+    conn.execute("DELETE FROM note_revisions WHERE note_id = ?1", params![id])?;
+    conn.execute(
+        "DELETE FROM messages WHERE conversation_id IN
+           (SELECT id FROM conversations WHERE scope = ?1 AND scope_id = ?2)",
+        params![CHAT_SCOPE_NOTE, id],
+    )?;
+    conn.execute("DELETE FROM conversations WHERE scope = ?1 AND scope_id = ?2", params![CHAT_SCOPE_NOTE, id])?;
+    conn.execute("DELETE FROM notes WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
 /// Ids of the notes in `workspace_id`, live or in the Trash, created before
-/// `cutoff`. A blank workspace (Personal) and a note without a creation time
-/// never match.
+/// `cutoff`. A blank workspace (Personal) never matches, nor does a note whose
+/// `created_at` isn't a real time (`org_policy::MIN_EPOCH_MS`).
 pub fn notes_created_before(conn: &Connection, workspace_id: &str, cutoff: i64) -> Result<Vec<String>> {
     if workspace_id.trim().is_empty() {
         return Ok(Vec::new());
     }
     let mut stmt =
-        conn.prepare("SELECT id FROM notes WHERE workspace_id = ?1 AND created_at > 0 AND created_at < ?2 ORDER BY id")?;
-    let ids = stmt.query_map(params![workspace_id, cutoff], |r| r.get(0))?;
+        conn.prepare("SELECT id FROM notes WHERE workspace_id = ?1 AND created_at >= ?3 AND created_at < ?2 ORDER BY id")?;
+    let ids = stmt.query_map(params![workspace_id, cutoff, crate::org_policy::MIN_EPOCH_MS], |r| r.get(0))?;
     Ok(ids.collect::<rusqlite::Result<_>>()?)
 }
 
@@ -4652,25 +4659,27 @@ mod tests {
     fn notes_created_before_reads_one_workspace_trash_included() {
         let dir = tempfile::tempdir().unwrap();
         let conn = open(&dir.path().join("t.sqlite")).unwrap();
+        const T: i64 = 1_800_000_000_000;
         let note = |ws: &str, created_at: i64| {
             let id = create_note(&conn, "en", "meeting", ws).unwrap().id;
             conn.execute("UPDATE notes SET created_at = ?1 WHERE id = ?2", params![created_at, id]).unwrap();
             id
         };
-        let old = note("w1", 10);
-        let trashed = note("w1", 20);
+        let old = note("w1", T - 10);
+        let trashed = note("w1", T - 20);
         delete_note(&conn, &trashed).unwrap();
-        let _young = note("w1", 100);
-        let _at_cutoff = note("w1", 50);
+        let _young = note("w1", T + 10);
+        let _at_cutoff = note("w1", T);
         let _undated = note("w1", 0);
-        let _elsewhere = note("w2", 10);
-        let _personal = note("", 10);
+        let _in_seconds = note("w1", crate::org_policy::MIN_EPOCH_MS - 1);
+        let _elsewhere = note("w2", T - 10);
+        let _personal = note("", T - 10);
 
         let mut expected = vec![old, trashed];
         expected.sort();
-        assert_eq!(notes_created_before(&conn, "w1", 50).unwrap(), expected);
-        assert!(notes_created_before(&conn, "", 50).unwrap().is_empty(), "Personal never");
-        assert!(notes_created_before(&conn, " ", 50).unwrap().is_empty());
+        assert_eq!(notes_created_before(&conn, "w1", T).unwrap(), expected);
+        assert!(notes_created_before(&conn, "", T).unwrap().is_empty(), "Personal never");
+        assert!(notes_created_before(&conn, " ", T).unwrap().is_empty());
     }
 
     /// The line a chain's end-of-run purge draws: a trashed note still counts, or a
