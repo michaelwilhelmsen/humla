@@ -1,11 +1,12 @@
 //! Organisation policies over IPC, and the one refresh of their cache.
 
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use serde::Serialize;
-use tauri::{Emitter, State};
+use tauri::{Emitter, Manager, State};
 use tokio::sync::Notify;
 
 use crate::org_policy::{self, AudioSweep, EffectivePolicy, FetchOutcome, OrgSummary};
@@ -16,6 +17,8 @@ pub struct OrgStatus {
     pub policy: EffectivePolicy,
     /// The organisations whose templates and terms apply here.
     pub orgs: Vec<OrgSummary>,
+    /// Days of retention per workspace (`org_policy::retention_scope`).
+    pub retention: BTreeMap<String, u32>,
 }
 
 #[tauri::command]
@@ -23,7 +26,8 @@ pub fn org_status(state: State<'_, AppState>) -> Result<OrgStatus, String> {
     let conn = state.db.lock();
     let policy = org_policy::effective(&conn).map_err(|e| format!("organisation policy: {e}"))?;
     let config = org_policy::cached(&conn).map_err(|e| format!("organisation policy: {e}"))?;
-    Ok(OrgStatus { policy, orgs: org_policy::summaries(config.as_ref()) })
+    let retention = config.as_ref().map(org_policy::retention_scope).unwrap_or_default();
+    Ok(OrgStatus { policy, orgs: org_policy::summaries(config.as_ref()), retention })
 }
 
 /// The organisation whose `audio_forbidden` still owes the sweep of audio on
@@ -90,6 +94,8 @@ pub(crate) struct Changes {
     /// The organisations' templates, terms or names differ
     /// (`org_content_changed`).
     pub content: bool,
+    /// Which workspaces retention covers, or for how long, differs: sweep now.
+    pub retention: bool,
 }
 
 /// When the last refresh from any caller finished, so a restarted worker
@@ -120,7 +126,7 @@ pub(crate) async fn refresh_org_config(
         let conn = db.lock();
         apply_fetch(&conn, &outcome)
     };
-    if changes.policy {
+    if changes.policy || changes.retention {
         let _ = app.emit("org_policy_changed", ());
     }
     if changes.settings {
@@ -128,6 +134,10 @@ pub(crate) async fn refresh_org_config(
     }
     if changes.content {
         let _ = app.emit("org_content_changed", ());
+    }
+    if changes.retention {
+        let (db, app) = (db.clone(), app.clone());
+        let _ = tauri::async_runtime::spawn_blocking(move || org_retention_sweep(&app, &db)).await;
     }
     *LAST_ATTEMPT.lock() = Some(Instant::now());
     let attempt = Attempt::of(&outcome);
@@ -141,6 +151,7 @@ pub(crate) async fn refresh_org_config(
 /// anything but an authenticated answer (`org_policy::store`).
 pub(crate) fn apply_fetch(conn: &rusqlite::Connection, outcome: &FetchOutcome) -> Changes {
     let before = org_policy::effective(conn).ok();
+    let retention_before = org_policy::retention_in_force(conn);
     let orgs_before = org_policy::cached(conn).ok().map(|c| org_policy::summaries(c.as_ref()));
     let stored = org_policy::store(conn, outcome).inspect_err(|e| {
         eprintln!("cloud: couldn't cache the organisation config: {e:#}");
@@ -163,7 +174,12 @@ pub(crate) fn apply_fetch(conn: &rusqlite::Connection, outcome: &FetchOutcome) -
         false
     });
     let settings = local_only || device;
-    Changes { policy: before != after, settings, content: templates || orgs_before != orgs_after }
+    Changes {
+        policy: before != after,
+        settings,
+        content: templates || orgs_before != orgs_after,
+        retention: retention_before != org_policy::retention_in_force(conn),
+    }
 }
 
 /// The line to log for this outcome, or `None` when it repeats the last
@@ -268,6 +284,65 @@ pub(crate) fn apply_device_policies(conn: &rusqlite::Connection) -> anyhow::Resu
     Ok(wrote)
 }
 
+/// How often the retention sweep runs after the one at launch. Hourly rather
+/// than daily: the timer doesn't advance while the Mac sleeps.
+pub(crate) const RETENTION_SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+/// Purge every note past its organisation's `retention_days`, then remove the
+/// notes' files and tell the UI. Purge, never Trash, and nothing is pushed: the
+/// server runs its own retention. Skipped while a capture holds the slot, so a
+/// recording or its stop chain never loses its note mid-write. Takes the
+/// database rather than `AppState`, which the org refresh loop may run before.
+pub(crate) fn org_retention_sweep(app: &tauri::AppHandle, db: &Arc<Mutex<rusqlite::Connection>>) -> usize {
+    let busy = match app.try_state::<AppState>() {
+        Some(state) => {
+            let capture = state.recording.lock();
+            if capture.note_id.is_some() || capture.stop != crate::recording::StopState::None {
+                return 0;
+            }
+            drop(capture);
+            state.transcribing.lock().clone()
+        }
+        None => HashSet::new(),
+    };
+    let purged = purge_expired_notes(&db.lock(), db::now_ms(), &busy);
+    announce_purged(app, &purged);
+    purged.len()
+}
+
+/// The database half of the sweep: purge each note `org_policy::retention_in_force`
+/// puts past its cutoff at `now_ms`, except `busy` ones. Returns the purged ids.
+pub(crate) fn purge_expired_notes(conn: &rusqlite::Connection, now_ms: i64, busy: &HashSet<String>) -> Vec<String> {
+    let mut purged = Vec::new();
+    for (workspace, days) in org_policy::retention_in_force(conn) {
+        let cutoff = org_policy::retention_cutoff(now_ms, days);
+        let ids = db::notes_created_before(conn, &workspace, cutoff).unwrap_or_else(|e| {
+            eprintln!("retention: couldn't list expired notes: {e:#}");
+            Vec::new()
+        });
+        for id in ids.into_iter().filter(|id| !busy.contains(id)) {
+            match db::purge_note(conn, &id) {
+                Ok(()) => purged.push(id),
+                Err(e) => eprintln!("retention: couldn't purge note {id}: {e:#}"),
+            }
+        }
+    }
+    purged
+}
+
+/// After notes were purged: remove their files and tell the UI, which closes
+/// an open one. Nothing is sent when nothing went.
+pub(crate) fn announce_purged(app: &tauri::AppHandle, ids: &[String]) {
+    if ids.is_empty() {
+        return;
+    }
+    for id in ids {
+        super::notes::purge_note_assets_best_effort(app, id);
+    }
+    let _ = app.emit("notes_purged", ids);
+    let _ = app.emit("notes_changed", ());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -335,12 +410,12 @@ mod tests {
         let body = r#"{"orgs":[{"id":"o1","name":"Northwind","policy":{"local_only":false,"retention_days":30,"telemetry_off":true,"audio_forbidden":false}}]}"#;
         assert_eq!(
             apply_fetch(&conn, &org_policy::classify(200, body)),
-            Changes { policy: true, settings: false, content: true }
+            Changes { policy: true, settings: false, content: true, retention: false }
         );
         let local_only = body.replace(r#""local_only":false"#, r#""local_only":true"#);
         assert_eq!(
             apply_fetch(&conn, &org_policy::classify(200, &local_only)),
-            Changes { policy: true, settings: false, content: false },
+            Changes { policy: true, settings: false, content: false, retention: false },
             "summaries and chat are already local"
         );
     }
@@ -352,7 +427,7 @@ mod tests {
         let body = r#"{"orgs":[{"id":"o1","name":"Northwind","policy":{"local_only":true,"retention_days":0,"telemetry_off":false,"audio_forbidden":false}}]}"#;
         assert_eq!(
             apply_fetch(&conn, &org_policy::classify(200, body)),
-            Changes { policy: true, settings: true, content: true }
+            Changes { policy: true, settings: true, content: true, retention: false }
         );
     }
 
@@ -508,7 +583,7 @@ mod tests {
         db::set_setting(&conn, "transcribe_manually", "true").unwrap();
         assert_eq!(
             apply_fetch(&conn, &org_policy::classify(200, &device_body(true, false))),
-            Changes { policy: true, settings: true, content: true }
+            Changes { policy: true, settings: true, content: true, retention: false }
         );
         assert_eq!(get(&conn, "keep_audio").as_deref(), Some("false"));
         assert_eq!(get(&conn, "transcribe_manually").as_deref(), Some("true"), "the closed gate defers nothing");
@@ -548,5 +623,118 @@ mod tests {
         apply_fetch(&conn, &org_policy::classify(200, &device_body(true, false)));
         org_policy::record_audio_sweep(&conn, "o1").unwrap();
         assert!(authorise_audio_sweep(&conn, "o1").is_err());
+    }
+
+    // ---- retention ----
+
+    const DAY: i64 = org_policy::DAY_MS;
+    const NOW: i64 = 1_000 * DAY;
+
+    fn retention_body(days: u32, workspaces: &str) -> String {
+        format!(
+            r#"{{"orgs":[{{"id":"o1","name":"Northwind","policy":{{"local_only":false,"retention_days":{days},"telemetry_off":false,"audio_forbidden":false}},"workspaces":[{workspaces}]}}]}}"#
+        )
+    }
+
+    /// One note in `workspace`, created `age_days` before `NOW`.
+    fn aged_note(conn: &rusqlite::Connection, workspace: &str, age_days: i64) -> String {
+        let id = db::create_note(conn, "en", "meeting", workspace).unwrap().id;
+        conn.execute(
+            "UPDATE notes SET created_at = ?1 WHERE id = ?2",
+            rusqlite::params![NOW - age_days * DAY, id],
+        )
+        .unwrap();
+        id
+    }
+
+    fn sweep(conn: &rusqlite::Connection) -> Vec<String> {
+        purge_expired_notes(conn, NOW, &HashSet::new())
+    }
+
+    fn exists(conn: &rusqlite::Connection, id: &str) -> bool {
+        db::note_exists(conn, id).unwrap()
+    }
+
+    #[test]
+    fn without_an_organisation_the_sweep_purges_nothing() {
+        let (_d, conn) = conn();
+        let old = aged_note(&conn, "w1", 5_000);
+        let personal = aged_note(&conn, "", 5_000);
+        assert!(sweep(&conn).is_empty(), "nothing cached");
+        apply_fetch(&conn, &org_policy::classify(200, EMPTY));
+        assert!(sweep(&conn).is_empty(), "no organisation");
+        assert!(exists(&conn, &old) && exists(&conn, &personal));
+    }
+
+    #[test]
+    fn an_unreadable_cache_purges_nothing() {
+        let (_d, conn) = conn();
+        apply_fetch(&conn, &org_policy::classify(200, &retention_body(30, r#""w1""#)));
+        let old = aged_note(&conn, "w1", 31);
+        db::set_setting(&conn, org_policy::SETTING_ORG_CONFIG, r#"{"orgs":[{"id":"o1""#).unwrap();
+        assert!(sweep(&conn).is_empty());
+        assert!(exists(&conn, &old));
+    }
+
+    #[test]
+    fn zero_days_purges_nothing() {
+        let (_d, conn) = conn();
+        apply_fetch(&conn, &org_policy::classify(200, &retention_body(0, r#""w1""#)));
+        let old = aged_note(&conn, "w1", 5_000);
+        assert!(sweep(&conn).is_empty());
+        assert!(exists(&conn, &old));
+    }
+
+    #[test]
+    fn the_sweep_purges_only_expired_notes_in_the_organisation_workspaces() {
+        let (_d, conn) = conn();
+        let changes = apply_fetch(&conn, &org_policy::classify(200, &retention_body(30, r#""w1","""#)));
+        assert!(changes.retention);
+        let expired = aged_note(&conn, "w1", 31);
+        let trashed = aged_note(&conn, "w1", 40);
+        db::delete_note(&conn, &trashed).unwrap();
+        let young = aged_note(&conn, "w1", 29);
+        let personal = aged_note(&conn, "", 5_000);
+        let outside = aged_note(&conn, "w2", 5_000);
+        let undated = aged_note(&conn, "w1", 0);
+        conn.execute("UPDATE notes SET created_at = 0 WHERE id = ?1", [&undated]).unwrap();
+        let patch = db::NotePatch { transcript: Some("Hege: the case".into()), ..Default::default() };
+        db::update_note(&conn, &expired, &patch).unwrap();
+        assert_eq!(db::list_note_revisions(&conn, &expired).unwrap().len(), 1);
+
+        let mut purged = sweep(&conn);
+        purged.sort();
+        let mut expected = vec![expired.clone(), trashed.clone()];
+        expected.sort();
+        assert_eq!(purged, expected);
+        for id in [&expired, &trashed] {
+            assert!(!exists(&conn, id), "purged, not moved to the Trash");
+        }
+        for id in [&young, &personal, &outside, &undated] {
+            assert!(exists(&conn, id));
+        }
+        assert!(db::list_note_revisions(&conn, &expired).unwrap().is_empty());
+        assert!(sweep(&conn).is_empty(), "a second run finds nothing");
+    }
+
+    #[test]
+    fn a_busy_note_waits_for_the_next_sweep() {
+        let (_d, conn) = conn();
+        apply_fetch(&conn, &org_policy::classify(200, &retention_body(30, r#""w1""#)));
+        let busy = aged_note(&conn, "w1", 31);
+        assert!(purge_expired_notes(&conn, NOW, &HashSet::from([busy.clone()])).is_empty());
+        assert!(exists(&conn, &busy));
+        assert_eq!(sweep(&conn), [busy]);
+    }
+
+    #[test]
+    fn retention_changes_are_reported_and_repeats_are_not() {
+        let (_d, conn) = conn();
+        assert!(apply_fetch(&conn, &org_policy::classify(200, &retention_body(30, r#""w1""#))).retention);
+        assert!(!apply_fetch(&conn, &org_policy::classify(200, &retention_body(30, r#""w1""#))).retention);
+        assert!(apply_fetch(&conn, &org_policy::classify(200, &retention_body(7, r#""w1""#))).retention);
+        assert!(apply_fetch(&conn, &org_policy::classify(200, &retention_body(7, r#""w1","w2""#))).retention);
+        assert!(!apply_fetch(&conn, &FetchOutcome::Failed("offline".into())).retention);
+        assert!(apply_fetch(&conn, &org_policy::classify(200, EMPTY)).retention);
     }
 }

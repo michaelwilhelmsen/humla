@@ -323,6 +323,21 @@ where
             tauri::async_runtime::spawn(async {
                 let _ = tauri::async_runtime::spawn_blocking(commands::sweep_unretained_streams).await;
             });
+            // Organisation retention: at launch, then on an interval.
+            {
+                let app_handle = app.handle().clone();
+                let db = app.state::<AppState>().db.clone();
+                tauri::async_runtime::spawn(async move {
+                    loop {
+                        let (app, db) = (app_handle.clone(), db.clone());
+                        let _ = tauri::async_runtime::spawn_blocking(move || {
+                            commands::org_retention_sweep(&app, &db)
+                        })
+                        .await;
+                        tokio::time::sleep(commands::RETENTION_SWEEP_INTERVAL).await;
+                    }
+                });
+            }
             notifications::install(app.handle());
             // Tray + global hotkey. Last in setup so a failure here can't stop
             // the app from coming up — the menu bar is an extra surface, not a
