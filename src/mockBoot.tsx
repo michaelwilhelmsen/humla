@@ -1972,6 +1972,30 @@ const CASES: Record<string, Scenario> = {
     ipc: accountIpc({ signedIn: false, policies: true }),
   },
 
+  // --- local_only: an organisation keeps processing on this Mac. The stored
+  // settings point at cloud providers, as they would on a Mac the policy has
+  // just reached; each section shows the enforced value as a managed row.
+  "summaries-local-only": {
+    route: "/settings?tab=summaries",
+    render: () => null, // unused — `route` renders the app
+    ipc: localOnlyIpc(),
+  },
+  "chat-local-only": {
+    route: "/settings?tab=chat",
+    render: () => null, // unused — `route` renders the app
+    ipc: localOnlyIpc(),
+  },
+  "transcription-local-only": {
+    route: "/settings?tab=transcription",
+    render: () => null, // unused — `route` renders the app
+    ipc: localOnlyIpc(),
+  },
+  "general-local-only": {
+    route: "/settings?tab=general",
+    render: () => null, // unused — `route` renders the app
+    ipc: localOnlyIpc(),
+  },
+
   // --- Two-factor authentication. Settings → Account, signed in to a
   // workspace you administer. `-off` also has a workspace waiting for it, so the
   // switcher's locked row and the section's notice show; click "Turn on…" for
@@ -2102,6 +2126,55 @@ function accountIpc({ signedIn, policies }: { signedIn: boolean; policies: boole
             rules: [],
           },
     }),
+  };
+}
+
+function localOnlyIpc(): Record<string, Handler> {
+  const reason = "Nothing leaves this Mac.";
+  const stored: Record<string, string> = {
+    summary_provider: "anthropic",
+    chat_provider: "openai",
+    local_llm_model: "gemma4:12b-mlx",
+    mcp_enabled: "true",
+    webhook_enabled: "true",
+  };
+  return {
+    org_status: () => ({
+      policy: {
+        org_name: "Northwind",
+        reason,
+        local_only: true,
+        retention_days: 0,
+        telemetry_off: false,
+        audio_forbidden: false,
+        rules: [{ kind: "local_only", source: "Northwind", reason }],
+      },
+    }),
+    settings_get: (args) => stored[(args as { key: string }).key] ?? null,
+    get_transcribe_config: () => ({
+      default: { provider: "deepgram", model: "nova-3" },
+      per_language: {
+        no: { provider: "groq", model: "whisper-large-v3-turbo" },
+        sv: { provider: "local", model_id: "large-v3-turbo-q5", preset: "balanced", use_gpu: true },
+      },
+    }),
+    local_whisper_models: () => [
+      {
+        id: "large-v3-turbo-q5",
+        label: "Large v3 Turbo (quantized)",
+        description: "The recommended default for almost all use.",
+        filename: "ggml-large-v3-turbo-q5_0.bin",
+        sizeBytesHint: 574_000_000,
+        kind: "multilingual",
+        specificLanguage: null,
+        downloaded: true,
+        sizeBytes: 574_000_000,
+        path: "/x",
+      },
+    ],
+    mcp_server_path: () => "/Applications/Humla.app/Contents/MacOS/humla-mcp",
+    webhook_get_endpoint: () => ({ url: "http://localhost:8787/ingest", headers: [] }),
+    local_llm_list_models: () => ["gemma4:12b-mlx"],
   };
 }
 
