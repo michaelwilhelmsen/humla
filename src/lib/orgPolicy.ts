@@ -34,9 +34,17 @@ export type OrgSummary = {
 
 export type OrgStatus = { policy: EffectivePolicy; orgs?: OrgSummary[] };
 
+/** Mirrors `org_policy::AudioSweep`. */
+export type AudioSweep = { org_id: string; org_name: string };
+
+/** Who set `kind`, or null when no rule enforces it. */
+export function policySource(policy: EffectivePolicy, kind: PolicyKind): PolicyRule | null {
+  return policy.rules.find((r) => r.kind === kind) ?? null;
+}
+
 /** Who set `local_only`, or null when it is off. */
 export function localOnlySource(policy: EffectivePolicy): PolicyRule | null {
-  return policy.local_only ? (policy.rules.find((r) => r.kind === "local_only") ?? null) : null;
+  return policy.local_only ? policySource(policy, "local_only") : null;
 }
 
 /** The one transcriber `local_only` always allows. Mirrors the fallback in

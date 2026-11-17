@@ -3,7 +3,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { Provider, SummaryProvider } from "./providers";
 import type { SpeakerLabelStat } from "./speakerSuggest";
 import { targetFolderId, targetNoteId, type ChatTarget } from "./chatTarget";
-import type { OrgStatus } from "./orgPolicy";
+import type { AudioSweep, OrgStatus } from "./orgPolicy";
 
 export type CopilotStatus = {
   login: string | null;
@@ -860,6 +860,9 @@ export const ipc = {
   permissionsOpenSettings: (kind: PermissionKind) => invoke<void>("permissions_open_settings", { kind }),
 
   orgStatus: () => invoke<OrgStatus>("org_status"),
+  orgAudioNotice: () => invoke<AudioSweep | null>("org_audio_notice"),
+  /** Deletes every note's stored audio for `orgId`'s policy; returns the file count. */
+  orgAudioSweep: (orgId: string) => invoke<number>("org_audio_sweep", { orgId }),
 };
 
 export type PermissionKind = "microphone" | "screen" | "notifications";

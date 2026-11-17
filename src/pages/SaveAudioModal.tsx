@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { save } from "@tauri-apps/plugin-dialog";
 import { ipc, type AudioFormat, type Note, type TakeAudio } from "../lib/ipc";
 import { useRecordingStore } from "../lib/store";
+import { useOrgPolicy } from "../lib/orgPolicy";
 import { formatDurationWords, sessionTitle } from "../lib/sessions";
 import { slug } from "./ExportModal";
 import { Modal } from "./settings/components/Modal";
@@ -63,6 +64,7 @@ export function SaveAudioModal({
   keepAudio: boolean;
 }) {
   const pushError = useRecordingStore((s) => s.pushError);
+  const audioForbidden = useOrgPolicy().audio_forbidden;
   const [takes, setTakes] = useState<TakeAudio[] | null>(null);
   const [format, setFormat] = useState<AudioFormat>("m4a");
   const [busy, setBusy] = useState(false);
@@ -129,7 +131,7 @@ export function SaveAudioModal({
             </ul>
           )}
 
-          {takes.length > 0 && !hasAudio && !keepAudio && (
+          {takes.length > 0 && !hasAudio && !keepAudio && !audioForbidden && (
             <p className="text-xs text-[var(--color-text-muted)]">
               Turn on Keep recorded audio in Settings → Recording to keep the audio of your next
               recording.

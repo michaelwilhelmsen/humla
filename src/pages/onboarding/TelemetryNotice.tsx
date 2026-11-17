@@ -12,36 +12,65 @@
 // would name a control the reader cannot use. The control is here. Settings takes over
 // afterwards, and the README says so.
 import { useEffect, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { ipc } from "../../lib/ipc";
+import { policySource, type PolicyRule } from "../../lib/orgPolicy";
+import { ManagedBadge } from "../settings/ManagedRow";
+
+// A policy that can't be read counts as `telemetry_off`, as it does in the backend.
+const UNREADABLE: PolicyRule = { kind: "telemetry_off", source: "your organisation", reason: "" };
 
 export function TelemetryNotice() {
   // null = still reading; true/false = known.
   const [on, setOn] = useState<boolean | null>(null);
+  const [managed, setManaged] = useState<PolicyRule | null>(null);
 
   useEffect(() => {
     let cancelled = false;
-    ipc
-      .getSetting("telemetry_enabled")
-      .then((v) => {
-        if (cancelled) return;
-        if (v === null) {
-          // First time through the wizard: this render IS the disclosure, so opt the
-          // install in and report the first launch. An install that never reaches
-          // this footer is never enrolled.
-          setOn(true);
-          void ipc.setSetting("telemetry_enabled", "true").then(() => {
-            void ipc.telemetryEvent("app_first_run");
-          });
-          return;
-        }
-        setOn(v === "true");
-      })
-      .catch(() => {
+    const load = async () => {
+      const rule = await ipc.orgStatus().then(
+        (s) => (s?.policy ? policySource(s.policy, "telemetry_off") : null),
+        () => UNREADABLE,
+      );
+      if (cancelled) return;
+      if (rule) {
+        // An organisation's `telemetry_off` is never opted into.
+        setManaged(rule);
+        setOn(false);
+        return;
+      }
+      setManaged(null);
+      let v: string | null;
+      try {
+        v = await ipc.getSetting("telemetry_enabled");
+      } catch {
         // Unreadable setting → show nothing rather than claim a state we don't know.
         if (!cancelled) setOn(null);
-      });
+        return;
+      }
+      if (cancelled) return;
+      if (v === null) {
+        // First time through the wizard: this render IS the disclosure, so opt the
+        // install in and report the first launch. An install that never reaches
+        // this footer is never enrolled.
+        setOn(true);
+        void ipc.setSetting("telemetry_enabled", "true").then(() => {
+          void ipc.telemetryEvent("app_first_run");
+        });
+        return;
+      }
+      setOn(v === "true");
+    };
+    void load();
+    // Signing in during setup can bring a policy that turns the counters off.
+    let unlisten: (() => void) | undefined;
+    void listen("org_policy_changed", () => void load()).then((u) => {
+      if (cancelled) u();
+      else unlisten = u;
+    });
     return () => {
       cancelled = true;
+      unlisten?.();
     };
   }, []);
 
@@ -55,6 +84,17 @@ export function TelemetryNotice() {
       // once-per-install marker keeps this from double counting.
       if (next) void ipc.telemetryEvent("app_first_run");
     });
+  }
+
+  if (managed) {
+    return (
+      <p className="flex items-center justify-center gap-1 text-[11px] leading-relaxed text-[var(--color-text-muted)] text-center max-w-md">
+        Anonymous setup counters are off
+        <span className="no-drag">
+          <ManagedBadge source={managed.source} reason={managed.reason} />
+        </span>
+      </p>
+    );
   }
 
   return (

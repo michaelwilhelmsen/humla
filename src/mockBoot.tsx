@@ -2004,6 +2004,24 @@ const CASES: Record<string, Scenario> = {
     ipc: localOnlyIpc(),
   },
 
+  // --- audio_forbidden and telemetry_off from an organisation. `org-audio-notice`
+  // is the one-time notice before the sweep of audio already on this Mac.
+  "recording-audio-forbidden": {
+    route: "/settings?tab=recording",
+    render: () => null, // unused — `route` renders the app
+    ipc: devicePolicyIpc({ notice: false }),
+  },
+  "general-telemetry-off": {
+    route: "/settings?tab=general",
+    render: () => null, // unused — `route` renders the app
+    ipc: devicePolicyIpc({ notice: false }),
+  },
+  "org-audio-notice": {
+    route: "/",
+    render: () => null, // unused — `route` renders the app
+    ipc: { ...devicePolicyIpc({ notice: true }), notes_list: () => demoNotes(), folders_list: () => DEMO_FOLDERS },
+  },
+
   // --- Two-factor authentication. Settings → Account, signed in to a
   // workspace you administer. `-off` also has a workspace waiting for it, so the
   // switcher's locked row and the section's notice show; click "Turn on…" for
@@ -2188,6 +2206,37 @@ function accountIpc({ signedIn, policies }: { signedIn: boolean; policies: boole
             rules: [],
           },
     }),
+  };
+}
+
+function devicePolicyIpc({ notice }: { notice: boolean }): Record<string, Handler> {
+  const reason = "Recordings are not kept.";
+  let due: { org_id: string; org_name: string } | null = notice ? { org_id: "o1", org_name: "Northwind" } : null;
+  return {
+    org_status: () => ({
+      policy: {
+        org_name: "Northwind",
+        reason,
+        local_only: false,
+        retention_days: 0,
+        telemetry_off: true,
+        audio_forbidden: true,
+        rules: [
+          { kind: "telemetry_off", source: "Northwind", reason },
+          { kind: "audio_forbidden", source: "Northwind", reason },
+        ],
+      },
+    }),
+    org_audio_notice: () => due,
+    org_audio_sweep: () => {
+      due = null;
+      return 9;
+    },
+    settings_get: (args) => {
+      const key = (args as { key: string }).key;
+      return key === "onboarding_completed" ? "true" : key === "keep_audio" || key === "telemetry_enabled" ? "false" : null;
+    },
+    stored_audio_stats: () => ({ notes: 4, files: 9, bytes: 312_000_000, noteIds: ["n1", "n2", "n3", "n4"] }),
   };
 }
 
