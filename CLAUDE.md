@@ -65,6 +65,8 @@ Feature detail lives in `docs/features/` and `docs/architecture/`; read the link
 - `notes.speakers`, `note_chunks.speakers` and `notes.detected_language` are derived, local-only, never synced, and their writes leave `updated_at` alone (`db::set_detected_language`, not `NotePatch`). See [ADR-0002](docs/adr/0002-no-person-entity-speakers-are-derived.md).
 - **Bump `CHUNKER_VERSION` whenever chunk boundaries change.**
 - `notes.private` syncs and bumps `updated_at`; only the author may change it or `shared_with`. Applying a pulled revocation is guarded three ways (same workspace, non-empty `owner`, owner not us). The chat index's `IndexStore.viewerSql` is fail-closed. → [cloud and private notes](docs/features/cloud-and-private-notes.md)
+- `db::purge_note` owns what a note takes with it (chunks, FTS rows, revisions, its Chat tab's conversations); `cloud-sync`'s `purge_note_rows` takes the rows it can see and its `purged` callback runs `purge_note`. A new note-keyed table joins `purge_note`.
+- **Organisation retention deletes only through `org_policy::retention_in_force`**, which reads a cache that parses cleanly and never `effective_or_strictest`. It covers notes whose `workspace_id` an organisation with `retention_days > 0` lists, never Personal, by `created_at`, Trash included. It purges, never trashes, and pushes nothing: the server's cron handles the server. A pulled note or tombstone past the cutoff is purged in `cloud-sync` (`purge_if_expired`), never inserted or trashed.
 
 ### Chat
 
