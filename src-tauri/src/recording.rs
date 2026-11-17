@@ -1509,7 +1509,7 @@ pub enum SidecarEvent {
     },
     // Non-fatal notice from the sidecar — e.g. it recovered mic capture after
     // an audio device change mid-recording. Surfaced to the user as a transient
-    // toast (see the reader loop in commands.rs).
+    // toast (see the reader loop in commands/capture.rs).
     Diagnostic {
         message: String,
         // Device the sidecar resumed on, sent separately so `message` stays

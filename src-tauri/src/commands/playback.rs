@@ -1,7 +1,8 @@
 //! Writing a take's playback assets: the mixed, levelled audio encoded as AAC
 //! (only with `keep_audio` on) and the `timeline.jsonl` the reader is built from.
 
-use super::{keep_audio_enabled, session_write_dir};
+use super::capture::session_write_dir;
+use super::keep_audio_enabled;
 use crate::wav;
 use tauri::AppHandle;
 

@@ -13,10 +13,10 @@ use super::transcript::{
     build_pieces_unbridged, single_piece, split_by_labels, split_by_segments, LabelledPiece,
 };
 use super::unify::unify_note_speakers;
+use super::capture::{ms_since, record_timing, PostStopSnapshot, StopClock};
 use super::{
-    chat, emit_error, err, ms_since, notes, record_timing, selected_diarize_engine,
-    serialize_timeline, session_changed_for_sync, ChainProgress, PostStopSnapshot, StopClock,
-    StreamSteps, DEFAULT_COMMUNITY1_THRESHOLD,
+    chat, emit_error, err, notes, selected_diarize_engine, serialize_timeline,
+    session_changed_for_sync, ChainProgress, StreamSteps, DEFAULT_COMMUNITY1_THRESHOLD,
 };
 use crate::recording::{ChunkRecord, ChunkSource, Step, TranscriptPayload};
 use crate::{db, diarize, sessions, wav, AppState};

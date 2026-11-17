@@ -2,11 +2,11 @@
 //! the sidecar's `--import` replay through the live chunk pipeline, and the
 //! completion path into the shared post-stop chain.
 
-use super::{
-    dispatch_sidecar_event, drain_inflight, emit_status, ensure_provider_ready, err, ms_since,
-    redact_sidecar_line, run_post_stop_chain, sidecar_path, stop_stale_child,
-    take_post_stop_snapshot, StopClock, DEFAULT_LANGUAGE, IMPORT_BACKLOG_PERMITS,
+use super::capture::{
+    dispatch_sidecar_event, drain_inflight, ensure_provider_ready, ms_since, redact_sidecar_line,
+    run_post_stop_chain, stop_stale_child, take_post_stop_snapshot, StopClock,
 };
+use super::{emit_status, err, sidecar_path, DEFAULT_LANGUAGE, IMPORT_BACKLOG_PERMITS};
 use crate::recording::{CaptureSink, ErrorPayload, Inflight, Phase, SidecarEvent, SinkMode, StartClaim};
 use crate::{db, AppState};
 use std::path::PathBuf;

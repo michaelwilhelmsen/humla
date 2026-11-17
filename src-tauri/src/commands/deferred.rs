@@ -1,16 +1,18 @@
 //! Transcribing a note's retained takes after the fact: the `transcribe_note`
 //! command, the replay of each take's streams and the per-take bookkeeping.
 
-use super::transcribe::record_detected_language;
-use super::unify::unify_note_speakers;
+use super::capture::{
+    dispatch_sidecar_event, drain_inflight, ensure_provider_ready, ms_since, redact_sidecar_line,
+    session_write_dir, write_chunks_json,
+};
 #[cfg(feature = "cloud")]
 use super::cloud;
 use super::diarization::{note_diarize_settings, rediarize_apply_to_chunks, LabelFallback};
+use super::transcribe::record_detected_language;
+use super::unify::unify_note_speakers;
 use super::{
-    chat, dispatch_sidecar_event, drain_inflight, emit_error, emit_transcribe_progress,
-    ensure_provider_ready, err, ms_since, notes, redact_sidecar_line, session_changed_for_sync,
-    session_write_dir, sidecar_path, title, write_chunks_json, ChainProgress,
-    IMPORT_BACKLOG_PERMITS,
+    chat, emit_error, emit_transcribe_progress, err, notes, session_changed_for_sync,
+    sidecar_path, title, ChainProgress, IMPORT_BACKLOG_PERMITS,
 };
 use crate::recording::{
     CaptureSink, ChunkRecord, ChunkSource, ErrorPayload, Inflight, ReplayProgress, ReplayTakeTimings,

@@ -45,7 +45,7 @@ describe("noAudioWarning", () => {
   });
 
   // MIRROR: these two vectors are pinned identically against Rust's
-  // `clamp_device_name` (src-tauri/src/commands.rs, `device_name_tests`), which
+  // `clamp_device_name` (src-tauri/src/commands/capture.rs, `device_name_tests`), which
   // clamps the same name for the device-change toast. The same device must not
   // read differently in the warning pill and the toast. Change both.
   it("clamps the mirrored vectors exactly as the Rust side does", () => {
