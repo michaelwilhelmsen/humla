@@ -973,10 +973,36 @@ final class SystemAudioOutput: NSObject, SCStreamOutput {
             }
         }
 
-        let ratio = targetSampleRate / inFormat.sampleRate
+        let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        convertAndWrite(inBuffer, converter: conv, stamp: pts.isNumeric ? pts.seconds : nil, arrival: arrival)
+    }
+
+    /// Tap path entry point (macOS 14.2+): the same conversion and writers as
+    /// a ScreenCaptureKit buffer, for a buffer already copied out of the
+    /// tap's IOProc. Rebuilds the converter whenever the tap's format changes
+    /// (an output device switch, or AirPods dropping into call mode).
+    func ingest(_ inBuffer: AVAudioPCMBuffer, stamp: Double?, arrival: Double) {
+        bufferCount += 1
+        let f = inBuffer.format
+        if inFormat == nil || inFormat?.sampleRate != f.sampleRate ||
+            inFormat?.channelCount != f.channelCount ||
+            inFormat?.isInterleaved != f.isInterleaved ||
+            inFormat?.commonFormat != f.commonFormat {
+            inFormat = f
+            converter = AVAudioConverter(from: f, to: targetFormat)
+            FileHandle.standardError.write(Data("tap: built converter inFormat=\(f) → target\n".utf8))
+        }
+        guard let conv = converter else { return }
+        convertAndWrite(inBuffer, converter: conv, stamp: stamp, arrival: arrival)
+    }
+
+    private func convertAndWrite(_ inBuffer: AVAudioPCMBuffer, converter conv: AVAudioConverter, stamp: Double?, arrival: Double) {
+        let frames = inBuffer.frameLength
+        let inRate = inBuffer.format.sampleRate
+        let ratio = targetSampleRate / inRate
         let cap = AVAudioFrameCount(Double(frames) * ratio + 1024)
         guard let out = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: cap) else {
-            FileHandle.standardError.write(Data("scstream: out PCMBuffer alloc failed\n".utf8))
+            FileHandle.standardError.write(Data("sys: out PCMBuffer alloc failed\n".utf8))
             return
         }
 
@@ -991,13 +1017,13 @@ final class SystemAudioOutput: NSObject, SCStreamOutput {
         if convStatus == .error {
             if bufferCount <= 3 {
                 let msg = error?.localizedDescription ?? "unknown"
-                FileHandle.standardError.write(Data("scstream: conv.convert error: \(msg)\n".utf8))
+                FileHandle.standardError.write(Data("sys: conv.convert error: \(msg)\n".utf8))
             }
             return
         }
         guard let chans = out.floatChannelData else {
             if bufferCount <= 3 {
-                FileHandle.standardError.write(Data("scstream: no floatChannelData on out buffer\n".utf8))
+                FileHandle.standardError.write(Data("sys: no floatChannelData on out buffer\n".utf8))
             }
             return
         }
@@ -1011,23 +1037,22 @@ final class SystemAudioOutput: NSObject, SCStreamOutput {
             written = n
             if bufferCount == 1 {
                 FileHandle.standardError.write(Data(
-                    "scstream: first buffer written to sysWriter (n=\(n) samples)\n".utf8
+                    "sys: first buffer written to sysWriter (n=\(n) samples)\n".utf8
                 ))
             }
         } else {
             if bufferCount <= 3 {
-                FileHandle.standardError.write(Data("scstream: makeBuffer returned nil (n=\(n))\n".utf8))
+                FileHandle.standardError.write(Data("sys: makeBuffer returned nil (n=\(n))\n".utf8))
             }
         }
         // Only a buffer that got this far is noted, so one dropped on any of
         // the early returns above shows up as a gap in what was written —
         // which is the timeline the WAV actually has.
-        let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         sysTiming.note(
-            stamp: pts.isNumeric ? pts.seconds : nil,
+            stamp: stamp,
             arrival: arrival,
             inFrames: Int(frames),
-            inRate: inFormat.sampleRate,
+            inRate: inRate,
             outFrames: written
         )
     }
@@ -1035,8 +1060,39 @@ final class SystemAudioOutput: NSObject, SCStreamOutput {
 
 let systemOutput = SystemAudioOutput()
 var scStream: SCStream?
+/// The process tap feeding the sys stream on macOS 14.2+ (#220). `Any` so the
+/// global can exist on macOS 13, where the type is unavailable.
+var systemTap: Any?
+
+/// `HUMLA_SYS_CAPTURE=sck` forces the ScreenCaptureKit path, for comparing the
+/// two on one machine.
+let forceScreenCaptureKit = ProcessInfo.processInfo.environment["HUMLA_SYS_CAPTURE"] == "sck"
 
 func startSystemAudio() async {
+    if #available(macOS 14.2, *), !forceScreenCaptureKit {
+        let tap = SystemAudioTap(output: systemOutput)
+        do {
+            try tap.start()
+            systemTap = tap
+            holdSystemAwake()
+            return
+        } catch {
+            // Fall through to ScreenCaptureKit: a take with SCK's failure mode
+            // still beats a take with no far side at all.
+            FileHandle.standardError.write(Data("tap: \(error); falling back to ScreenCaptureKit\n".utf8))
+        }
+    }
+    await startScreenCaptureAudio()
+}
+
+func stopSystemTap() {
+    if #available(macOS 14.2, *), let tap = systemTap as? SystemAudioTap {
+        tap.stop()
+    }
+    systemTap = nil
+}
+
+func startScreenCaptureAudio() async {
     do {
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
         guard let display = content.displays.first else {
@@ -1121,6 +1177,7 @@ func pauseCapture() {
     if paused { return }
     paused = true
     engine.pause()
+    stopSystemTap()
     if let s = scStream {
         Task { try? await s.stopCapture() }
         scStream = nil
@@ -1262,6 +1319,9 @@ let shutdown: () -> Void = {
         // engine.stop() is synchronous and returns immediately;
         // ChunkWriter.close() is also synchronous (queue.sync).
         engine.stop()
+        // The tap stops synchronously and fast, unlike stopCapture(), so it
+        // goes before the writers close rather than after.
+        stopSystemTap()
         micFullWriter.close()
         sysFullWriter.close()
         micWriter.close()
