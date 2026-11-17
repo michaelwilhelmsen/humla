@@ -297,8 +297,10 @@ pub(crate) const RETENTION_SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 6
 pub(crate) fn org_retention_sweep(app: &tauri::AppHandle, db: &Arc<Mutex<rusqlite::Connection>>) -> usize {
     let now = db::now_ms();
     let candidates = expired_notes(&db.lock(), now);
-    let idle: Vec<String> = candidates.into_iter().filter(|id| !note_busy(app, id)).collect();
-    let purged = purge_notes(&db.lock(), &idle);
+    let purged: Vec<String> = candidates
+        .into_iter()
+        .filter(|id| !note_busy(app, id) && purge_if_still_expired(&db.lock(), id, now))
+        .collect();
     announce_purged(app, &purged);
     purged.len()
 }
@@ -332,18 +334,28 @@ pub(crate) fn expired_notes(conn: &rusqlite::Connection, now_ms: i64) -> Vec<Str
     ids
 }
 
-/// Purge `ids`, returning those that went.
-pub(crate) fn purge_notes(conn: &rusqlite::Connection, ids: &[String]) -> Vec<String> {
-    ids.iter()
-        .filter(|id| match db::purge_note(conn, id) {
-            Ok(()) => true,
-            Err(e) => {
-                eprintln!("retention: couldn't purge note {id}: {e:#}");
-                false
-            }
-        })
-        .cloned()
-        .collect()
+/// Purge `ids` that are still expired, returning those that went.
+#[cfg(test)]
+pub(crate) fn purge_notes(conn: &rusqlite::Connection, ids: &[String], now_ms: i64) -> Vec<String> {
+    ids.iter().filter(|id| purge_if_still_expired(conn, id, now_ms)).cloned().collect()
+}
+
+/// Purge one note found by [`expired_notes`] if, read again under this lock,
+/// it is still in a retention workspace and still past that workspace's
+/// cutoff: it may have moved (to Personal, say) or been re-dated since.
+pub(crate) fn purge_if_still_expired(conn: &rusqlite::Connection, id: &str, now_ms: i64) -> bool {
+    let Ok(note) = db::get_note(conn, id) else { return false };
+    let Some(rule) = org_policy::retention_rule(conn, &note.workspace_id) else { return false };
+    if !org_policy::is_past(note.created_at, org_policy::retention_cutoff(now_ms, rule.days)) {
+        return false;
+    }
+    match db::purge_note(conn, id) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("retention: couldn't purge note {id}: {e:#}");
+            false
+        }
+    }
 }
 
 fn days_phrase(days: u32) -> String {
@@ -351,9 +363,16 @@ fn days_phrase(days: u32) -> String {
 }
 
 /// Refuse to record into or transcribe a note past its organisation's
-/// retention: the next sweep purges it. A missing note is left to the caller.
+/// retention: the next sweep purges it. Under retention a missing note is
+/// refused too, since a sweep may just have purged it; without retention a
+/// missing note is left to the caller, as before.
 pub(crate) fn refuse_past_retention(conn: &rusqlite::Connection, note_id: &str, now_ms: i64) -> Result<(), String> {
-    let Ok(note) = db::get_note(conn, note_id) else { return Ok(()) };
+    let Ok(note) = db::get_note(conn, note_id) else {
+        if org_policy::retention_in_force(conn).is_empty() {
+            return Ok(());
+        }
+        return Err("This note has been deleted.".into());
+    };
     let Some(rule) = org_policy::retention_rule(conn, &note.workspace_id) else { return Ok(()) };
     if org_policy::is_past(note.created_at, org_policy::retention_cutoff(now_ms, rule.days)) {
         return Err(format!("This note is past {}'s retention and will be deleted.", rule.source));
@@ -715,7 +734,7 @@ mod tests {
     }
 
     fn sweep(conn: &rusqlite::Connection) -> Vec<String> {
-        purge_notes(conn, &expired_notes(conn, NOW))
+        purge_notes(conn, &expired_notes(conn, NOW), NOW)
     }
 
     fn exists(conn: &rusqlite::Connection, id: &str) -> bool {
@@ -913,5 +932,34 @@ mod tests {
         assert!(date.contains("if let Ok(note) = db::get_note(&conn, &id) {\n            super::org::check_redate"));
         let mv = &notes[notes.find("pub fn notes_set_workspace").unwrap()..];
         assert!(mv.find("already there").unwrap() < mv.find("check_move").unwrap());
+    }
+
+    #[test]
+    fn a_note_that_moved_or_was_redated_after_listing_survives() {
+        let (_d, conn) = conn();
+        apply_fetch(&conn, &org_policy::classify(200, &retention_body(30, r#""w1""#)));
+        let moved = aged_note(&conn, "w1", 31);
+        let redated = aged_note(&conn, "w1", 31);
+        let gone = aged_note(&conn, "w1", 31);
+        let still = aged_note(&conn, "w1", 31);
+        let ids = expired_notes(&conn, NOW);
+        assert_eq!(ids.len(), 4);
+
+        db::set_note_workspace(&conn, &moved, "").unwrap();
+        db::set_note_created_at(&conn, &redated, NOW - DAY).unwrap();
+        db::purge_note(&conn, &gone).unwrap();
+
+        assert_eq!(purge_notes(&conn, &ids, NOW), [still]);
+        assert!(exists(&conn, &moved), "Personal is never purged");
+        assert!(exists(&conn, &redated));
+    }
+
+    #[test]
+    fn under_retention_a_missing_note_is_refused() {
+        let (_d, conn) = conn();
+        apply_fetch(&conn, &org_policy::classify(200, &retention_body(30, r#""w1""#)));
+        assert_eq!(refuse_past_retention(&conn, "purged", NOW), Err("This note has been deleted.".into()));
+        let personal = aged_note(&conn, "", 5_000);
+        assert_eq!(refuse_past_retention(&conn, &personal, NOW), Ok(()));
     }
 }
