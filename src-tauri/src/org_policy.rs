@@ -151,18 +151,21 @@ pub(crate) fn cached(conn: &Connection) -> anyhow::Result<Option<OrgConfig>> {
 
 /// Bring the organisation rows in `summary_prompts` in line with `config`:
 /// upsert each live template whose name, text or departments differ, and delete
-/// tombstoned ones and every org row the config no longer lists. A template
-/// keeps its `client_id` as its row id, so a note's `custom:<id>` resolves it.
-/// A row the user owns is never overwritten. Returns whether anything changed.
+/// tombstoned ones and every org row the config no longer lists. The row id
+/// comes from the organisation and the template's `client_id` alone, so a
+/// synced note's `custom:<id>` resolves on every member's Mac. A row the user
+/// owns is never overwritten. Returns whether anything changed.
 pub(crate) fn apply_templates(conn: &Connection, config: &OrgConfig) -> anyhow::Result<bool> {
     let tx = conn.unchecked_transaction()?;
     let mut changed = false;
     let mut live: Vec<(String, String)> = Vec::new();
     for org in &config.orgs {
         for t in &org.templates {
-            if !is_template_id(&t.client_id) || t.deleted {
+            let Some(id) = template_row_id(&org.id, &t.client_id) else { continue };
+            if t.deleted {
                 continue;
             }
+            let content = plain_text(&t.content);
             let departments = serde_json::to_string(&t.workspaces)?;
             let now = crate::db::now_ms();
             changed |= tx.execute(
@@ -176,9 +179,9 @@ pub(crate) fn apply_templates(conn: &Connection, config: &OrgConfig) -> anyhow::
                    AND (summary_prompts.name IS NOT excluded.name
                         OR summary_prompts.content IS NOT excluded.content
                         OR summary_prompts.org_workspaces IS NOT excluded.org_workspaces)",
-                rusqlite::params![t.client_id, t.name, t.content, now, org.id, departments],
+                rusqlite::params![id, t.name, content, now, org.id, departments],
             )? > 0;
-            live.push((org.id.clone(), t.client_id.clone()));
+            live.push((org.id.clone(), id));
         }
     }
     let rows: Vec<(String, String)> = {
@@ -197,9 +200,86 @@ pub(crate) fn apply_templates(conn: &Connection, config: &OrgConfig) -> anyhow::
     Ok(changed)
 }
 
-/// A `client_id` that is safe as a row id and inside `custom:<id>`.
-fn is_template_id(id: &str) -> bool {
-    !id.is_empty() && id.len() <= 64 && id.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+/// The local row id of an organisation's template: `org_<org id>_<client_id>`.
+/// PocketBase ids are alphanumeric, so the first `_` after the prefix ends the
+/// org id. `None` for ids unsafe as a row id or inside `custom:<id>`.
+pub(crate) fn template_row_id(org_id: &str, client_id: &str) -> Option<String> {
+    let org_ok = !org_id.is_empty() && org_id.len() <= 32 && org_id.bytes().all(|c| c.is_ascii_alphanumeric());
+    let client_ok = !client_id.is_empty()
+        && client_id.len() <= 64
+        && client_id.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_');
+    (org_ok && client_ok).then(|| format!("org_{org_id}_{client_id}"))
+}
+
+/// A template's text from PocketBase's editor field: paragraphs, headings,
+/// list items and `<br>` end a line, other tags are dropped and entities are
+/// decoded. A `<` not followed by a letter, `/` or `!` is kept as text.
+pub(crate) fn plain_text(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    while let Some(i) = rest.find('<') {
+        out.push_str(&rest[..i]);
+        let after = &rest[i + 1..];
+        let is_tag = after.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '/' || c == '!');
+        match after.find('>').filter(|_| is_tag) {
+            Some(end) => {
+                let tag = after[..end].trim_start_matches('/').trim().to_ascii_lowercase();
+                let name: String = tag.chars().take_while(|c| c.is_ascii_alphanumeric()).collect();
+                let closing = after.starts_with('/');
+                let breaks = name == "br"
+                    || (closing && matches!(name.as_str(), "p" | "div" | "li" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6"));
+                if breaks {
+                    out.push('\n');
+                }
+                rest = &after[end + 1..];
+            }
+            None => {
+                out.push('<');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    decode_entities(&out).trim().to_string()
+}
+
+fn decode_entities(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find('&') {
+        out.push_str(&rest[..i]);
+        let after = &rest[i + 1..];
+        let decoded = after.find(';').filter(|&end| end <= 10).and_then(|end| {
+            let name = &after[..end];
+            let c = match name {
+                "amp" => Some('&'),
+                "lt" => Some('<'),
+                "gt" => Some('>'),
+                "quot" => Some('"'),
+                "apos" => Some('\''),
+                "nbsp" => Some(' '),
+                _ => name
+                    .strip_prefix("#x")
+                    .or_else(|| name.strip_prefix("#X"))
+                    .and_then(|h| u32::from_str_radix(h, 16).ok())
+                    .or_else(|| name.strip_prefix('#').and_then(|d| d.parse().ok()))
+                    .and_then(char::from_u32),
+            };
+            c.map(|c| (c, end))
+        });
+        match decoded {
+            Some((c, end)) => {
+                out.push(c);
+                rest = &after[end + 1..];
+            }
+            None => {
+                out.push('&');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// What the Templates and Vocabulary sections show of one organisation.
@@ -714,15 +794,15 @@ mod tests {
         assert_eq!(
             org_rows(&conn),
             [
-                ("t1".into(), "Case meeting".into(), "Decisions.".into(), "[]".into()),
-                ("t2".into(), "Intake".into(), "Needs.".into(), r#"["w1"]"#.into()),
+                ("org_o1_t1".into(), "Case meeting".into(), "Decisions.".into(), "[]".into()),
+                ("org_o1_t2".into(), "Intake".into(), "Needs.".into(), r#"["w1"]"#.into()),
             ]
         );
-        let row = crate::db::get_summary_prompt(&conn, "t2").unwrap();
+        let row = crate::db::get_summary_prompt(&conn, "org_o1_t2").unwrap();
         assert_eq!((row.org_id.as_str(), row.workspace_id.as_str()), ("o1", ""));
         assert_eq!(row.org_workspaces, ["w1"]);
-        assert!(crate::db::update_summary_prompt(&conn, "t1", "Mine", "x").is_err());
-        assert!(crate::db::delete_summary_prompt(&conn, "t1").is_err());
+        assert!(crate::db::update_summary_prompt(&conn, "org_o1_t1", "Mine", "x").is_err());
+        assert!(crate::db::delete_summary_prompt(&conn, "org_o1_t1").is_err());
         assert_eq!(org_rows(&conn).len(), 2);
     }
 
@@ -731,9 +811,9 @@ mod tests {
         let (_d, conn) = conn();
         let config = template_body(CASE);
         apply_templates(&conn, &config).unwrap();
-        let before = crate::db::get_summary_prompt(&conn, "t1").unwrap().updated_at;
+        let before = crate::db::get_summary_prompt(&conn, "org_o1_t1").unwrap().updated_at;
         assert!(!apply_templates(&conn, &config).unwrap());
-        assert_eq!(crate::db::get_summary_prompt(&conn, "t1").unwrap().updated_at, before);
+        assert_eq!(crate::db::get_summary_prompt(&conn, "org_o1_t1").unwrap().updated_at, before);
     }
 
     // The org record's `updated` doesn't move when a template is edited.
@@ -743,10 +823,10 @@ mod tests {
         apply_templates(&conn, &template_body(CASE)).unwrap();
         let edited = CASE.replace("Decisions.", "Decisions and owners.");
         assert!(apply_templates(&conn, &template_body(&edited)).unwrap());
-        assert_eq!(crate::db::get_summary_prompt(&conn, "t1").unwrap().content, "Decisions and owners.");
+        assert_eq!(crate::db::get_summary_prompt(&conn, "org_o1_t1").unwrap().content, "Decisions and owners.");
         let narrowed = edited.replace(r#""workspaces":[]"#, r#""workspaces":["w2"]"#);
         assert!(apply_templates(&conn, &template_body(&narrowed)).unwrap());
-        assert_eq!(crate::db::get_summary_prompt(&conn, "t1").unwrap().org_workspaces, ["w2"]);
+        assert_eq!(crate::db::get_summary_prompt(&conn, "org_o1_t1").unwrap().org_workspaces, ["w2"]);
     }
 
     #[test]
@@ -773,13 +853,58 @@ mod tests {
     #[test]
     fn a_users_own_row_is_never_overwritten() {
         let (_d, conn) = conn();
-        let mine = crate::db::create_summary_prompt(&conn, "Mine", "My text", "").unwrap();
-        let clash = CASE.replace(r#""client_id":"t1""#, &format!(r#""client_id":"{}""#, mine.id));
-        apply_templates(&conn, &template_body(&clash)).unwrap();
-        let row = crate::db::get_summary_prompt(&conn, &mine.id).unwrap();
+        let now = crate::db::now_ms();
+        conn.execute(
+            "INSERT INTO summary_prompts (id, name, content, created_at, updated_at) VALUES ('org_o1_t1', 'Mine', 'My text', ?1, ?1)",
+            [now],
+        )
+        .unwrap();
+        apply_templates(&conn, &template_body(CASE)).unwrap();
+        let row = crate::db::get_summary_prompt(&conn, "org_o1_t1").unwrap();
         assert_eq!((row.name.as_str(), row.org_id.as_str()), ("Mine", ""));
         apply_templates(&conn, &OrgConfig::default()).unwrap();
-        assert!(crate::db::get_summary_prompt(&conn, &mine.id).is_ok());
+        assert!(crate::db::get_summary_prompt(&conn, "org_o1_t1").is_ok());
+    }
+
+    #[test]
+    fn two_organisations_may_share_a_client_id() {
+        let (_d, conn) = conn();
+        let org = |id: &str, content: &str| {
+            format!(
+                r#"{{"id":"{id}","name":"{id}","policy":{{"local_only":false,"retention_days":0,"telemetry_off":false,"audio_forbidden":false}},"templates":[{{"client_id":"t1","name":"Case meeting","content":"{content}","workspaces":[],"deleted":false}}]}}"#
+            )
+        };
+        let body = format!(r#"{{"orgs":[{},{}]}}"#, org("o1", "First"), org("o2", "Second"));
+        let FetchOutcome::Fetched(config) = classify(200, &body) else { panic!() };
+        assert!(apply_templates(&conn, &config).unwrap());
+        assert_eq!(crate::db::get_summary_prompt(&conn, "org_o1_t1").unwrap().content, "First");
+        assert_eq!(crate::db::get_summary_prompt(&conn, "org_o2_t1").unwrap().content, "Second");
+        assert!(!apply_templates(&conn, &config).unwrap());
+    }
+
+    #[test]
+    fn row_ids_are_deterministic_and_never_ambiguous() {
+        assert_eq!(template_row_id("c0kb400ij62hde6", "all").as_deref(), Some("org_c0kb400ij62hde6_all"));
+        assert_eq!(template_row_id("o1", "a_b").as_deref(), Some("org_o1_a_b"));
+        assert_eq!(template_row_id("o_1", "b"), None, "an org id with `_` would be ambiguous");
+        assert_eq!(template_row_id("", "t1"), None);
+        assert_eq!(template_row_id("o1", "../x"), None);
+    }
+
+    #[test]
+    fn editor_html_is_stored_as_plain_text() {
+        // The server's real sample body.
+        let sample = CASE.replace("Decisions.", "<p>OnlyA</p>");
+        let (_d, conn) = conn();
+        apply_templates(&conn, &template_body(&sample)).unwrap();
+        assert_eq!(crate::db::get_summary_prompt(&conn, "org_o1_t1").unwrap().content, "OnlyA");
+
+        assert_eq!(plain_text("<p>List the decisions.</p><p>Then owners &amp; dates.</p>"), "List the decisions.\nThen owners & dates.");
+        assert_eq!(plain_text("Line one<br>Line two<BR />three"), "Line one\nLine two\nthree");
+        assert_eq!(plain_text("<ul><li>One</li><li>Two</li></ul>"), "One\nTwo");
+        assert_eq!(plain_text("<p><strong>Bold</strong> and <em>soft</em>&nbsp;text</p>"), "Bold and soft text");
+        assert_eq!(plain_text("&lt;tag&gt; &#229; &#xE6; &quot;q&quot; &unknown; a & b"), "<tag> å æ \"q\" &unknown; a & b");
+        assert_eq!(plain_text("Keep x < y and plain text"), "Keep x < y and plain text");
     }
 
     #[test]

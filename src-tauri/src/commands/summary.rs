@@ -503,7 +503,7 @@ mod tests {
         let body = r#"{"orgs":[{"id":"o1","name":"Northwind","policy":{"local_only":false,"retention_days":0,"telemetry_off":false,"audio_forbidden":false},"templates":[{"client_id":"t1","name":"Case meeting","content":"ORG PROMPT","workspaces":[],"deleted":false}]}]}"#;
         let FetchOutcome::Fetched(config) = classify(200, body) else { panic!() };
         apply_templates(&conn, &config).unwrap();
-        let note = db::create_note(&conn, "no", "custom:t1", "").unwrap();
+        let note = db::create_note(&conn, "no", "custom:org_o1_t1", "").unwrap();
         assert_eq!(resolve_prompt(&conn, &note, "no"), "ORG PROMPT");
         apply_templates(&conn, &OrgConfig::default()).unwrap();
         assert_eq!(resolve_prompt(&conn, &note, "no"), presets::prompt(DEFAULT_SUMMARY_PRESET, "no"));
