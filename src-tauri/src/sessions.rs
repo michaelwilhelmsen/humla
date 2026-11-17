@@ -372,6 +372,18 @@ pub fn append_session(
     Ok(index)
 }
 
+/// Remove one take's row from the manifest. Returns whether there was one.
+pub fn remove_session(recordings_dir: &Path, id: &str) -> std::io::Result<bool> {
+    let Some(mut manifest) = read_manifest(recordings_dir) else { return Ok(false) };
+    let before = manifest.sessions.len();
+    manifest.sessions.retain(|e| e.id != id);
+    if manifest.sessions.len() == before {
+        return Ok(false);
+    }
+    write_manifest(recordings_dir, &manifest)?;
+    Ok(true)
+}
+
 /// Record that one take has been transcribed (#146): flip
 /// [`SessionEntry::transcribed`] to `true`. Returns `false` when the note has
 /// no manifest entry with that id — the caller has nothing to correct, and
@@ -2037,5 +2049,17 @@ mod tests {
         assert_eq!(replayable_stream_count(&dir), 1);
         touch(&dir.join("sys.wav"));
         assert_eq!(replayable_stream_count(&dir), 2);
+    }
+    #[test]
+    fn remove_session_drops_one_row_and_keeps_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        append_session(dir.path(), "a", "", 0, vec!["mic".into()], Transcribed::Yes).unwrap();
+        append_session(dir.path(), "b", "", 0, vec!["mic".into()], Transcribed::No).unwrap();
+        assert!(remove_session(dir.path(), "b").unwrap());
+        let ids: Vec<String> = read_manifest(dir.path()).unwrap().sessions.into_iter().map(|e| e.id).collect();
+        assert_eq!(ids, ["a"]);
+        assert!(!remove_session(dir.path(), "b").unwrap());
+        let empty = tempfile::tempdir().unwrap();
+        assert!(!remove_session(empty.path(), "a").unwrap());
     }
 }

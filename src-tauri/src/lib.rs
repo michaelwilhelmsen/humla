@@ -319,6 +319,10 @@ where
                     commands::embed_backfill(app_handle).await;
                 });
             }
+            // Unretained streams a quit or crash left in the temp dir.
+            tauri::async_runtime::spawn(async {
+                let _ = tauri::async_runtime::spawn_blocking(commands::sweep_unretained_streams).await;
+            });
             notifications::install(app.handle());
             // Tray + global hotkey. Last in setup so a failure here can't stop
             // the app from coming up — the menu bar is an extra surface, not a

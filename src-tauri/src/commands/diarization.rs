@@ -2,7 +2,7 @@
 //! fallback and the echo pass), re-diarizing a saved note, numbering speakers
 //! across streams and takes, and the per-pass diagnostics dumps.
 
-use super::playback::write_playback_assets;
+use super::playback::{write_playback_assets, PlaybackAudio};
 use super::timeline::{
     commit_rebuilt_transcript, group_values_to_transcript, read_timeline_values,
     rebuild_note_transcript, serialize_timeline,
@@ -124,6 +124,7 @@ async fn rediarize_note_inner(app: AppHandle, note_id: String) -> Result<(), Str
         settings,
         LabelFallback::Abort,
         &progress,
+        PlaybackAudio::FollowGate,
     )
     .await
     .map(|_| ())
@@ -255,6 +256,7 @@ pub(super) async fn rediarize_apply_to_chunks(
     settings: NoteDiarizeSettings,
     fallback: LabelFallback,
     progress: &ChainProgress,
+    audio: PlaybackAudio,
 ) -> anyhow::Result<TakeStepCosts> {
     let NoteDiarizeSettings { choice, thresholds, expected_speakers } = settings;
     // Before deciding the capture mode — a hallucinated chunk on an otherwise
@@ -540,6 +542,7 @@ pub(super) async fn rediarize_apply_to_chunks(
         timeline,
         mic_wav.as_deref(),
         sys_wav.as_deref(),
+        audio,
     )
     .await;
     let playback_ms = ms_since(t_playback);
@@ -1434,6 +1437,7 @@ pub(super) async fn diarize_and_apply(
         timeline,
         mic_wav.as_deref(),
         sys_wav.as_deref(),
+        PlaybackAudio::FollowGate,
     )
     .await;
     record_timing(clock, |x| x.playback_assets_ms = ms_since(t_playback));

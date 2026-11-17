@@ -6,7 +6,7 @@ use super::api_keys::read_provider_api_key;
 use super::diarization::diarize_and_apply;
 use super::models::local_model_path;
 use super::permissions::capture_permissions;
-use super::playback::write_playback_assets;
+use super::playback::{write_playback_assets, PlaybackAudio};
 use super::transcribe::{record_detected_language, transcribe_chunk};
 use super::transcription_config::read_transcribe_config;
 use super::unify::unify_note_speakers;
@@ -404,7 +404,7 @@ pub async fn recording_start(
     // rewrite would then combine against a snapshot the replay had already
     // replaced. A replay on any *other* note is deliberately no obstacle —
     // that is why it never takes the capture slot.
-    if state.transcribing.lock().contains(&note_id) {
+    if state.transcribing.lock().contains(&note_id) || super::deferred::replay_owed(&note_id) {
         let msg = "This note is being transcribed — wait for that to finish before recording it again.".to_string();
         emit_error(&app, Some(&note_id), &msg);
         return Err(msg);
@@ -1138,6 +1138,9 @@ async fn post_stop_chain_inner(
             .await
         {
             Ok(Some(streams_to_replay)) => {
+                // Before the slot is released, so no recording or Transcribe
+                // on this note can start until the replay is done.
+                let owed = super::deferred::OwedReplay::mark(&note_id);
                 let take = super::deferred::PendingTake {
                     session_id: session_id.clone(),
                     started_at: session_started_at.clone(),
@@ -1151,6 +1154,7 @@ async fn post_stop_chain_inner(
                     take,
                     streams_to_replay,
                     slot,
+                    owed,
                 ));
             }
             Ok(None) => {}
@@ -1175,6 +1179,7 @@ async fn post_stop_chain_inner(
             String::new(),
             post_stop.mic_wav.as_deref(),
             post_stop.sys_wav.as_deref(),
+            PlaybackAudio::FollowGate,
         )
         .await;
         clock.record(|t| t.playback_assets_ms = ms_since(t_playback));

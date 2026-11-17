@@ -9,6 +9,7 @@ use super::capture::{
 #[cfg(feature = "cloud")]
 use super::cloud;
 use super::diarization::{note_diarize_settings, rediarize_apply_to_chunks, LabelFallback};
+use super::playback::PlaybackAudio;
 use super::transcribe::record_detected_language;
 use super::unify::unify_note_speakers;
 use super::{
@@ -73,7 +74,7 @@ pub async fn transcribe_note(
             return Err("This note is recording — stop the recording first.".into());
         }
     }
-    if !state.transcribing.lock().insert(note_id.clone()) {
+    if replay_owed(&note_id) || !state.transcribing.lock().insert(note_id.clone()) {
         return Err("Already transcribing this note.".into());
     }
     emit_transcribe_status(&app, &note_id, true);
@@ -151,7 +152,7 @@ impl UnretainedStreams {
         if mic.is_none() && sys.is_none() {
             return Ok(None);
         }
-        let dir = parent.join(format!("humla-unretained-{}", uuid::Uuid::new_v4()));
+        let dir = parent.join(format!("{UNRETAINED_PREFIX}{}", uuid::Uuid::new_v4()));
         tokio::fs::create_dir_all(&dir).await?;
         let mut out = UnretainedStreams { dir, mic: None, sys: None };
         if let Some(src) = mic {
@@ -223,19 +224,90 @@ pub(super) async fn transcribe_unretained_take(
     take: PendingTake,
     streams: UnretainedStreams,
     slot: Option<TranscribeSlot>,
+    owed: OwedReplay,
 ) {
     let _slot = match slot {
         Some(slot) => slot,
         None => TranscribeSlot::wait_for(&app, &note_id).await,
     };
-    emit_transcribe_status(&app, &note_id, true);
+    let _status = TranscribeStatus::start(&app, &note_id);
     let result = transcribe_pending_take(&app, &note_id, take, &streams).await;
     drop(streams);
+    drop(owed);
     if let Err(e) = result {
         emit_error(&app, Some(&note_id), &e);
     }
     notes::purge_note_assets_if_gone(&app, &note_id);
-    emit_transcribe_status(&app, &note_id, false);
+}
+
+/// `transcribe_status` for one run: on when made, off when dropped, a panic
+/// included.
+struct TranscribeStatus {
+    app: AppHandle,
+    note_id: String,
+}
+
+impl TranscribeStatus {
+    fn start(app: &AppHandle, note_id: &str) -> Self {
+        emit_transcribe_status(app, note_id, true);
+        TranscribeStatus { app: app.clone(), note_id: note_id.to_string() }
+    }
+}
+
+impl Drop for TranscribeStatus {
+    fn drop(&mut self) {
+        emit_transcribe_status(&self.app, &self.note_id, false);
+    }
+}
+
+/// Notes whose unretained take is still to be replayed, with how many. While a
+/// note is here, `recording_start` and `transcribe_note` refuse it.
+static OWED_REPLAYS: parking_lot::Mutex<std::collections::BTreeMap<String, usize>> =
+    parking_lot::Mutex::new(std::collections::BTreeMap::new());
+
+/// One owed replay of a note, released when dropped.
+pub(super) struct OwedReplay(String);
+
+impl OwedReplay {
+    pub(super) fn mark(note_id: &str) -> Self {
+        *OWED_REPLAYS.lock().entry(note_id.to_string()).or_insert(0) += 1;
+        OwedReplay(note_id.to_string())
+    }
+}
+
+impl Drop for OwedReplay {
+    fn drop(&mut self) {
+        let mut owed = OWED_REPLAYS.lock();
+        if let Some(n) = owed.get_mut(&self.0) {
+            *n -= 1;
+            if *n == 0 {
+                owed.remove(&self.0);
+            }
+        }
+    }
+}
+
+pub(super) fn replay_owed(note_id: &str) -> bool {
+    OWED_REPLAYS.lock().contains_key(note_id)
+}
+
+/// The prefix of the directories [`UnretainedStreams`] makes.
+const UNRETAINED_PREFIX: &str = "humla-unretained-";
+
+/// Delete unretained streams a quit or crash left behind. Run once at launch,
+/// before any replay can have started.
+pub fn sweep_unretained_streams() -> usize {
+    sweep_unretained_streams_in(&std::env::temp_dir())
+}
+
+fn sweep_unretained_streams_in(parent: &std::path::Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(parent) else { return 0 };
+    entries
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with(UNRETAINED_PREFIX))
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .filter(|e| std::fs::remove_dir_all(e.path()).is_ok())
+        .count()
 }
 
 async fn transcribe_pending_take(
@@ -395,7 +467,8 @@ async fn transcribe_take_sources(app: &AppHandle, note_id: &str, takes: Vec<Take
             }
             continue;
         }
-        if let (PendingStep::Finalize, Some(p)) = (pending_take_step(pending.is_some(), false), pending) {
+        let is_pending = pending.is_some();
+        if let (PendingStep::Finalize, Some(p)) = (pending_take_step(is_pending, false), pending) {
             finalize_session(
                 app,
                 note_id,
@@ -438,6 +511,7 @@ async fn transcribe_take_sources(app: &AppHandle, note_id: &str, takes: Vec<Take
             settings,
             LabelFallback::Unlabelled,
             &chain,
+            replay_audio(is_pending),
         )
         .await;
         take_timings.diarize_ms = ms_since(t_diarize);
@@ -447,6 +521,10 @@ async fn transcribe_take_sources(app: &AppHandle, note_id: &str, takes: Vec<Take
         }
         timings.takes.push(take_timings);
         if let Err(e) = diarized {
+            if is_pending {
+                // Nothing of it reached the transcript, so it leaves no row.
+                forget_pending_take(app, note_id, &entry.id).await;
+            }
             fatal = Some(format!("Recording {} failed to transcribe: {e}", entry.index));
             break;
         }
@@ -559,6 +637,37 @@ fn pending_take_step(pending: bool, produced_no_text: bool) -> PendingStep {
         (false, _) => PendingStep::None,
         (true, true) => PendingStep::Discard,
         (true, false) => PendingStep::Finalize,
+    }
+}
+
+/// What a replayed take's playback may hold: a take that was never retained
+/// keeps no audio, even if the gate reopened during its replay.
+fn replay_audio(pending: bool) -> PlaybackAudio {
+    if pending {
+        PlaybackAudio::Never
+    } else {
+        PlaybackAudio::FollowGate
+    }
+}
+
+/// Take a pending take back out: its manifest row and whatever its failed
+/// diarize wrote. The transcript is only committed on success, so it holds
+/// nothing of this take.
+async fn forget_pending_take(app: &AppHandle, note_id: &str, session_id: &str) {
+    let Ok(app_dir) = app.path().app_data_dir() else { return };
+    let recordings = sessions::recordings_dir(&app_dir, note_id);
+    let lock = app.state::<AppState>().manifest_lock.clone();
+    let _manifest_guard = lock.lock().await;
+    let dir = sessions::session_dir(&recordings, session_id);
+    let id = session_id.to_string();
+    let removed = tokio::task::spawn_blocking(move || {
+        let row = sessions::remove_session(&recordings, &id);
+        let _ = std::fs::remove_dir_all(&dir);
+        row
+    })
+    .await;
+    if let Ok(Err(e)) = removed {
+        eprintln!("transcribe: couldn't remove take {session_id} from the manifest: {e}");
     }
 }
 
@@ -801,5 +910,68 @@ mod tests {
         let after = &chain[call..];
         let close = after.find("));").unwrap();
         assert!(!after[..close + 3].contains(".await"));
+    }
+    #[test]
+    fn the_launch_sweep_deletes_only_leftover_unretained_streams() {
+        let parent = tempfile::tempdir().unwrap();
+        let left = parent.path().join(format!("{UNRETAINED_PREFIX}abc"));
+        std::fs::create_dir_all(&left).unwrap();
+        std::fs::write(left.join("mic.wav"), b"RIFF").unwrap();
+        let other = parent.path().join("humla-replay-n1-xyz");
+        std::fs::create_dir_all(&other).unwrap();
+        let file = parent.path().join(format!("{UNRETAINED_PREFIX}not-a-dir"));
+        std::fs::write(&file, b"x").unwrap();
+        assert_eq!(sweep_unretained_streams_in(parent.path()), 1);
+        assert!(!left.exists());
+        assert!(other.exists() && file.exists());
+        assert_eq!(sweep_unretained_streams_in(parent.path()), 0);
+    }
+
+    #[tokio::test]
+    async fn the_launch_sweep_finds_what_a_replay_leaves_behind() {
+        let capture = tempfile::tempdir().unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let mic = wav(capture.path(), "mic-full.wav").await;
+        let streams = UnretainedStreams::take_into(parent.path(), Some(&mic), None).await.unwrap().unwrap();
+        std::mem::forget(streams);
+        assert_eq!(sweep_unretained_streams_in(parent.path()), 1);
+        assert_eq!(std::fs::read_dir(parent.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn an_owed_replay_holds_the_note_until_every_mark_is_dropped() {
+        let note = format!("owed-{}", uuid::Uuid::new_v4());
+        assert!(!replay_owed(&note));
+        let first = OwedReplay::mark(&note);
+        let second = OwedReplay::mark(&note);
+        assert!(replay_owed(&note));
+        drop(first);
+        assert!(replay_owed(&note), "one replay still owed");
+        drop(second);
+        assert!(!replay_owed(&note));
+    }
+
+    #[test]
+    fn an_unretained_replay_never_writes_audio() {
+        assert_eq!(replay_audio(true), PlaybackAudio::Never, "even if the gate reopened during the replay");
+        assert_eq!(replay_audio(false), PlaybackAudio::FollowGate);
+    }
+
+    #[test]
+    fn the_chain_marks_the_replay_owed_before_handing_it_off() {
+        let capture = include_str!("capture.rs");
+        let chain = &capture[capture.find("async fn post_stop_chain_inner").unwrap()..];
+        let mark = chain.find("OwedReplay::mark(&note_id)").expect("marked in the chain");
+        let spawn = chain.find("spawn(super::deferred::transcribe_unretained_take(").unwrap();
+        assert!(mark < spawn);
+        let start = &capture[capture.find("pub async fn recording_start").unwrap()..];
+        assert!(start.contains("super::deferred::replay_owed(&note_id)"), "recording_start refuses an owed note");
+    }
+    #[test]
+    fn a_pending_take_whose_diarize_fails_is_taken_back_out() {
+        let source = include_str!("deferred.rs");
+        let fail = source.find("if let Err(e) = diarized {").unwrap();
+        let branch = &source[fail..fail + source[fail..].find("break;").unwrap()];
+        assert!(branch.contains("if is_pending") && branch.contains("forget_pending_take(app, note_id, &entry.id)"));
     }
 }
