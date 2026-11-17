@@ -90,7 +90,7 @@ Feature detail lives in `docs/features/` and `docs/architecture/`; read the link
 - **Use `tauri::async_runtime::spawn`, not `tokio::spawn`, in anything run from Tauri's `setup`** — bare `tokio::spawn` panics there and aborts the app on launch.
 - **The sync observer is built before `AppState` is managed** (`run_with_sync` → `make_sync`): nothing it runs while being built, or spawns then, may call `app.state::<AppState>()`. It takes the DB and Keychain cache from `SyncContext`.
 - **Never hold a `parking_lot` guard across an `.await`** (the future becomes non-Send). Use `tokio::sync::Mutex` for state held across awaits (e.g. `transcribe_gate`).
-- Secrets go through `crate::keychain` (`read` / `read_or` / `write`), cached per account on `AppState.keychain_cache`; not `keyring::Entry` directly.
+- Secrets go through `crate::keychain` (`read` / `read_or` / `write`), cached per account on `AppState.keychain_cache`; not `keyring_core::Entry` directly; `keychain::entry` sets the store first.
 - HTTP clients come from `crate::http::client` / `client_builder` (cloud-sync: its own `http::client`), never `reqwest::Client::new` / `builder`: they turn proxies off (macOS proxy settings would catch local servers) and install ring, without which reqwest panics. A test enforces it.
 - `window.prompt` / `confirm` / `alert` are blocked in the Tauri webview; use inline UI or the Modal component.
 
@@ -138,7 +138,7 @@ Recording in short: `recording_start` spawns `audio-capture` (via `setsid`); eac
 ## Tech stack
 
 - **Frontend**: React 19, TypeScript, Vite 8, Tauri 2, React Router 7, Zustand (`useNotesStore`, `useRecordingStore`, events bound once in `bindBackendListeners`), Tiptap 3, Tailwind v4, Radix, lucide-react, react-markdown + remark-gfm. Two themes (warm, graphite) × light/dark. → [frontend](docs/architecture/frontend.md)
-- **Backend**: Rust 1.94 (`github-copilot-sdk`'s floor), Tauri 2, rusqlite (`bundled`, WAL, idempotent ALTER TABLE migrations, indexes created after migrations), reqwest 0.13 (rustls on ring, `stream`), tokio (`spawn_blocking` for local Whisper), whisper-rs 0.16 (`metal` on macOS only; `large-v3-turbo-q5_0` ~547 MB; NB Whisper Large for Norwegian), parking_lot, keyring 3 (`apple-native`), serde/serde_json/chrono/uuid/anyhow/async-trait.
+- **Backend**: Rust 1.94 (`github-copilot-sdk`'s floor), Tauri 2, rusqlite (`bundled`, WAL, idempotent ALTER TABLE migrations, indexes created after migrations), reqwest 0.13 (rustls on ring, `stream`), tokio (`spawn_blocking` for local Whisper), whisper-rs 0.16 (`metal` on macOS only; `large-v3-turbo-q5_0` ~547 MB; NB Whisper Large for Norwegian), parking_lot, keyring-core + `apple-native-keyring-store`, serde/serde_json/chrono/uuid/anyhow/async-trait.
 
 ### Module map (`src-tauri/src/`)
 
