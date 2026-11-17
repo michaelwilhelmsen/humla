@@ -275,7 +275,7 @@ pub(crate) fn local_only_rule(id: ProviderId) -> LocalOnly {
 }
 
 /// Whether `url` is an http(s) URL whose host is `localhost`, in 127.0.0.0/8, or
-/// `::1`. Mirrored by `isLoopbackUrl` in `src/lib/orgPolicy.ts`, with the vectors
+/// `::1`. Mirrored by `isLoopbackUrl` in `src/lib/loopback.ts`, with the vectors
 /// in `src/lib/loopbackVectors.json` pinning both.
 pub(crate) fn is_loopback_url(url: &str) -> bool {
     use std::net::{IpAddr, Ipv6Addr};

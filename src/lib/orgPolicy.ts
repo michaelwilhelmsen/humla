@@ -1,7 +1,10 @@
 import { useEffect, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { ipc } from "./ipc";
+import { ipc, type ProviderConfig } from "./ipc";
 import { useCloudStore } from "./cloud";
+import { allowedUnderLocalOnly } from "./providers";
+
+export { isLoopbackUrl } from "./loopback";
 
 // Mirrors `org_policy::EffectivePolicy` and `commands::org::OrgStatus`.
 export type PolicyKind = "local_only" | "retention_days" | "telemetry_off" | "audio_forbidden";
@@ -20,6 +23,40 @@ export type EffectivePolicy = {
 };
 
 export type OrgStatus = { policy: EffectivePolicy };
+
+/** Who set `local_only`, or null when it is off. */
+export function localOnlySource(policy: EffectivePolicy): PolicyRule | null {
+  return policy.local_only ? (policy.rules.find((r) => r.kind === "local_only") ?? null) : null;
+}
+
+/** The one transcriber `local_only` always allows. Mirrors the fallback in
+ *  `stt::from_legacy_settings(Some("local"), …)`. */
+export const ON_DEVICE_WHISPER: ProviderConfig = {
+  provider: "local",
+  model_id: "large-v3-turbo-q5",
+  preset: "quality",
+  use_gpu: true,
+};
+
+/** Where a transcription config sends audio: null for on-device Whisper. */
+export function transcribeEndpoint(cfg: ProviderConfig, customBaseUrl: string): string | null {
+  switch (cfg.provider) {
+    case "custom":
+      return customBaseUrl.trim() || null;
+    case "openai":
+    case "deepgram":
+      return cfg.base_url ?? null;
+    case "local":
+    case "groq":
+      return null;
+  }
+}
+
+/** `cfg` itself when `local_only` allows it, else on-device Whisper. Mirrors
+ *  `transcription_config::enforce` for one slot. */
+export function enforceLocalOnly(cfg: ProviderConfig, customBaseUrl: string): ProviderConfig {
+  return allowedUnderLocalOnly(cfg.provider, transcribeEndpoint(cfg, customBaseUrl)) ? cfg : ON_DEVICE_WHISPER;
+}
 
 export const NO_POLICY: EffectivePolicy = {
   org_name: null,
@@ -63,7 +100,18 @@ export function policyRows(policy: EffectivePolicy): PolicyRow[] {
  * A failed read shows nothing; nothing enforces from this value.
  */
 export function useOrgPolicy(): EffectivePolicy {
-  const [policy, setPolicy] = useState<EffectivePolicy>(NO_POLICY);
+  return useOrgPolicyStatus().policy;
+}
+
+/** Who sets `local_only` (null when off), and whether the policy has loaded.
+ *  Until it has, a settings tab touches no cloud provider's key or models. */
+export function useLocalOnly(): { managed: PolicyRule | null; known: boolean } {
+  const { policy, known } = useOrgPolicyStatus();
+  return { managed: localOnlySource(policy), known };
+}
+
+function useOrgPolicyStatus(): { policy: EffectivePolicy; known: boolean } {
+  const [state, setState] = useState({ policy: NO_POLICY, known: false });
   const cloudStatus = useCloudStore((s) => s.status);
 
   useEffect(() => {
@@ -71,8 +119,8 @@ export function useOrgPolicy(): EffectivePolicy {
     const load = () =>
       ipc
         .orgStatus()
-        .then((s) => !cancelled && setPolicy(s?.policy ?? NO_POLICY))
-        .catch(() => !cancelled && setPolicy(NO_POLICY));
+        .then((s) => !cancelled && setState({ policy: s?.policy ?? NO_POLICY, known: true }))
+        .catch(() => !cancelled && setState({ policy: NO_POLICY, known: true }));
     void load();
     let unlisten: (() => void) | undefined;
     void listen("org_policy_changed", () => void load()).then((u) => {
@@ -85,5 +133,5 @@ export function useOrgPolicy(): EffectivePolicy {
     };
   }, [cloudStatus]);
 
-  return policy;
+  return state;
 }
