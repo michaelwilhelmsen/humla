@@ -646,7 +646,7 @@ pub async fn cloud_status(
         });
     };
 
-    let (workspaces, billing, two_factor, ()) = tokio::join!(
+    let (workspaces, billing, two_factor, _) = tokio::join!(
         list_workspaces_inner(&base_url, &session),
         fetch_billing_config(&base_url),
         super::cloud_auth::fetch_two_factor_status(&base_url, &session.token),

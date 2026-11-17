@@ -52,7 +52,7 @@ describe("useSettings after an organisation policy rewrites settings", () => {
       default: { provider: "local", model_id: "large-v3-turbo-q5", preset: "quality", use_gpu: true },
       per_language: {},
     };
-    await act(() => emit("org_policy_changed"));
+    await act(() => emit("org_settings_rewritten"));
     await waitFor(() => expect(result.current.s.summary_provider).toBe("local"));
     await waitFor(() => expect(result.current.transcribeConfig.default.provider).toBe("local"));
 
@@ -66,5 +66,22 @@ describe("useSettings after an organisation policy rewrites settings", () => {
     );
     expect(configWrites.at(-1)?.default.provider).toBe("local");
     expect(result.current.s.chat_provider).toBe("ollama");
+  });
+
+  it("doesn't reload on a policy change that rewrote nothing", async () => {
+    const stored: Record<string, string> = { summary_provider: "local" };
+    const config = {
+      current: { default: { provider: "deepgram", model: "nova-3" }, per_language: {} } as TranscribeConfig,
+    };
+    backend(stored, config);
+    const { result } = renderHook(() => useSettings());
+    await waitFor(() => expect(result.current.s.summary_provider).toBe("local"));
+    // Behind the hook's back; a reload would pick it up.
+    stored.summary_provider = "custom";
+    config.current = { default: { provider: "groq", model: "whisper-large-v3-turbo" }, per_language: {} };
+    await act(() => emit("org_policy_changed"));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(result.current.s.summary_provider).toBe("local");
+    expect(result.current.transcribeConfig.default.provider).toBe("deepgram");
   });
 });

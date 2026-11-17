@@ -79,12 +79,13 @@ export function useSettings() {
     };
   }, [loadDiarizeStatuses, loadStored]);
 
-  // An arriving policy can rewrite settings in the backend (`apply_local_only`);
-  // reload them, or the next edit here writes the stale value back.
+  // An arriving policy can rewrite settings in the backend (`apply_local_only`),
+  // which says so with its own event; reload them, or the next edit here writes
+  // the stale value back. Nothing else reloads them.
   useEffect(() => {
     let cancelled = false;
     let unlisten: (() => void) | undefined;
-    void listen("org_policy_changed", () => void loadStored(() => !cancelled)).then((u) => {
+    void listen("org_settings_rewritten", () => void loadStored(() => !cancelled)).then((u) => {
       if (cancelled) u();
       else unlisten = u;
     });
