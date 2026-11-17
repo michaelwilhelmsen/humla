@@ -1952,6 +1952,14 @@ const CASES: Record<string, Scenario> = {
     render: () => null, // unused — `route` renders the app
     ipc: settingsContentIpc("viewer"),
   },
+  // `settings-org` is a member of two departments of an organisation that
+  // supplies templates (one for every department, one for two) and terms.
+  // Try `&section=vocabulary` and `&section=summaries`.
+  "settings-org": {
+    route: `/settings?tab=${new URLSearchParams(location.search).get("section") ?? "templates"}`,
+    render: () => null, // unused — `route` renders the app
+    ipc: settingsOrgIpc(),
+  },
 
   // --- Settings → Account, signed in to a workspace. `account-policies` adds an
   // organisation enforcing every policy; `-signed-out` is the same after
@@ -2077,6 +2085,59 @@ function settingsContentIpc(
           }),
         }
       : {}),
+  };
+}
+
+function settingsOrgIpc(): Record<string, Handler> {
+  const base = settingsContentIpc("member");
+  const intake: CloudWorkspace = { id: "w1", name: "Intake", role: "member", plan_status: "active" };
+  const homeCare: CloudWorkspace = { id: "w2", name: "Home care", role: "member", plan_status: "active" };
+  const org = (id: string, name: string, content: string, departments: string[]) => ({
+    id,
+    name,
+    content,
+    created_at: 0,
+    updated_at: 0,
+    workspace_id: "",
+    org_id: "o1",
+    org_workspaces: departments,
+  });
+  const own = (base.summary_prompts_list({}) as unknown[]) ?? [];
+  return {
+    ...base,
+    summary_prompts_list: () => [
+      org("org-case", "Case meeting", "Record the decision, who owns each action, and the deadline.", []),
+      org("org-intake", "Intake review", "List the needs raised, the services offered, and the next contact.", ["w1", "w2"]),
+      ...own,
+    ],
+    cloud_status: () => ({
+      ...DISCONNECTED,
+      configured: true,
+      logged_in: true,
+      base_url: "https://sync.humla.team",
+      user: { id: "u1", email: "m@example.no", name: "Michael", verified: true },
+      current_workspace: intake,
+      workspaces: [intake, homeCare],
+    }),
+    org_status: () => ({
+      policy: {
+        org_name: null,
+        reason: null,
+        local_only: false,
+        retention_days: 0,
+        telemetry_off: false,
+        audio_forbidden: false,
+        rules: [],
+      },
+      orgs: [
+        {
+          id: "o1",
+          name: "Northwind",
+          reason: "Approved for every department.",
+          vocabulary: ["Northwind", "IPLOS", "Individual plan", "Coordinating unit"],
+        },
+      ],
+    }),
   };
 }
 
