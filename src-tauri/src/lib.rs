@@ -25,6 +25,7 @@ mod custom_endpoint;
 mod chat;
 mod embed;
 mod import_date;
+mod org_policy;
 // Public so the `humla-mcp` binary (#172) can drive it. Everything below it —
 // `db`, `html_text` — stays private to the crate.
 pub mod mcp;
@@ -399,6 +400,7 @@ where
             commands::cloud_rename_workspace,
             commands::cloud_delete_workspace,
             commands::cloud_leave_workspace,
+            commands::org_status,
             commands::cloud_transfer_workspace,
             commands::cloud_workspace_members,
             commands::cloud_speaker_roster,
