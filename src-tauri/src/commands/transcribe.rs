@@ -31,7 +31,7 @@ pub(super) async fn transcribe_chunk(
     // (drives per-language override resolution), then the resolved
     // provider config, then custom vocabulary + API key. The order
     // matters — provider_cfg depends on language for the resolve.
-    let (language, vocabulary) = {
+    let (language, vocabulary, org_terms) = {
         let state: State<AppState> = app.state();
         let conn = state.db.lock();
         let global_language = db::get_setting(&conn, "language")?
@@ -46,7 +46,7 @@ pub(super) async fn transcribe_chunk(
         };
         let vocabulary = db::get_setting(&conn, "custom_vocabulary")?
             .unwrap_or_default();
-        (language, vocabulary)
+        (language, vocabulary, crate::org_policy::vocabulary(&conn))
     };
     let provider_cfg = {
         let state: State<AppState> = app.state();
@@ -129,16 +129,8 @@ pub(super) async fn transcribe_chunk(
     // decode toward remote-side vocabulary (or vice versa) and cause
     // language drift on bilingual calls.
     let trail_snapshot = sink.trail(source).lock().as_prompt();
-    // Vocabulary is stored as a newline-or-comma-separated string. Split
-    // into individual terms for the bias_terms field. Drop short tokens
-    // (< 3 chars) — they create false positives in every provider's
-    // keyword/prompt biaser ("am" appearing where the user said "an"
-    // etc.).
-    let vocab_terms: Vec<&str> = vocabulary
-        .split(['\n', ','])
-        .map(str::trim)
-        .filter(|s| s.len() >= 3)
-        .collect();
+    let vocab_owned = merge_vocabulary(&org_terms, &vocabulary, VocabCap::for_provider(provider_cfg.provider()));
+    let vocab_terms: Vec<&str> = vocab_owned.iter().map(String::as_str).collect();
 
     // Build the right STT adapter for this chunk. Local Whisper needs
     // runtime state (shared model context, resolved model file path, GPU
@@ -328,6 +320,110 @@ pub(super) async fn transcribe_chunk(
 // regularly appends "Subtitles by …" / "Undertekster av …" / "Thanks for
 // watching" at the end of real speech. If we see one of these markers
 // anywhere in the text, strip it back to the preceding sentence boundary.
+/// How much vocabulary a provider takes. Deepgram counts terms; Whisper-shaped
+/// providers keep only the tail of a ~224-token prompt, which would drop the
+/// front of the list, so the list is cut to a length that fits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VocabCap {
+    Terms(usize),
+    Chars(usize),
+}
+
+impl VocabCap {
+    fn for_provider(id: crate::providers::ProviderId) -> Self {
+        match id {
+            crate::providers::ProviderId::Deepgram => VocabCap::Terms(100),
+            _ => VocabCap::Chars(500),
+        }
+    }
+}
+
+/// The terms sent to the transcriber: the organisations' first, then the
+/// user's `custom_vocabulary` (newline- or comma-separated), without duplicates
+/// regardless of case, cut to `cap` so the user's terms go before the
+/// organisation's. Terms under three characters are dropped: every provider's
+/// biaser turns them into false positives. Without organisation terms the
+/// user's list is used exactly as stored.
+fn merge_vocabulary(org: &[String], user: &str, cap: VocabCap) -> Vec<String> {
+    let usable = |t: &&str| t.len() >= 3;
+    let user = user.split(['\n', ',']).map(str::trim).filter(usable);
+    let org: Vec<&str> = org.iter().map(|t| t.trim()).filter(usable).collect();
+    if org.is_empty() {
+        return user.map(String::from).collect();
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut out: Vec<String> = Vec::new();
+    let mut chars = 0usize;
+    for term in org.into_iter().chain(user) {
+        if !seen.insert(term.to_lowercase()) {
+            continue;
+        }
+        let added = term.chars().count() + if out.is_empty() { 0 } else { 2 };
+        let fits = match cap {
+            VocabCap::Terms(n) => out.len() < n,
+            VocabCap::Chars(n) => chars + added <= n,
+        };
+        if !fits {
+            break;
+        }
+        chars += added;
+        out.push(term.to_string());
+    }
+    out
+}
+
+#[cfg(test)]
+mod vocabulary_tests {
+    use super::*;
+
+    fn org(terms: &[&str]) -> Vec<String> {
+        terms.iter().map(|t| t.to_string()).collect()
+    }
+
+    #[test]
+    fn without_organisation_terms_the_users_list_is_unchanged() {
+        let user = "Humla, Tauri\nTauri, ab, humla";
+        assert_eq!(
+            merge_vocabulary(&[], user, VocabCap::Terms(1)),
+            ["Humla", "Tauri", "Tauri", "humla"],
+            "no cap and no dedup: what transcribe_chunk sent before"
+        );
+        assert_eq!(merge_vocabulary(&org(&["ab"]), user, VocabCap::Chars(5)).len(), 4);
+    }
+
+    #[test]
+    fn organisation_terms_come_first_without_duplicates() {
+        assert_eq!(
+            merge_vocabulary(&org(&["Northwind", "Fjord"]), "fjord, Humla\nNORTHWIND, Humla", VocabCap::Terms(100)),
+            ["Northwind", "Fjord", "Humla"]
+        );
+    }
+
+    #[test]
+    fn a_term_cap_cuts_the_users_terms_first() {
+        let many: Vec<String> = (0..98).map(|i| format!("org{i}")).collect();
+        let merged = merge_vocabulary(&many, "alpha, beta, gamma", VocabCap::Terms(100));
+        assert_eq!(merged.len(), 100);
+        assert_eq!(&merged[98..], ["alpha", "beta"]);
+    }
+
+    #[test]
+    fn a_length_cap_cuts_the_users_terms_first() {
+        let merged = merge_vocabulary(&org(&["Northwind", "Fjord"]), "Humla, Tauri", VocabCap::Chars(25));
+        assert_eq!(merged, ["Northwind", "Fjord", "Humla"], "Northwind, Fjord, Humla is 23 characters");
+        assert_eq!(merged.join(", ").len(), 23);
+    }
+
+    #[test]
+    fn deepgram_counts_terms_and_whisper_counts_characters() {
+        use crate::providers::ProviderId;
+        assert_eq!(VocabCap::for_provider(ProviderId::Deepgram), VocabCap::Terms(100));
+        for id in [ProviderId::OpenAi, ProviderId::Local, ProviderId::Groq, ProviderId::Custom] {
+            assert_eq!(VocabCap::for_provider(id), VocabCap::Chars(500));
+        }
+    }
+}
+
 fn strip_attribution_tail(text: &str) -> String {
     // Triggers are ASCII so to_ascii_lowercase keeps byte offsets aligned
     // with the original string for slicing.
