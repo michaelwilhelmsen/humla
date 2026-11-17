@@ -237,6 +237,10 @@ mod tests {
         crate::db::set_setting(&conn, SETTING_ENABLED, "true").unwrap();
         crate::db::set_setting(&conn, "org_config", "{not json").unwrap();
         assert!(!is_enabled(&conn));
+        assert_eq!(
+            refusal(&conn).unwrap(),
+            "Blocked by your organisation: processing stays on this Mac."
+        );
     }
 
     /// The fast path: a database the app has already created opens without the

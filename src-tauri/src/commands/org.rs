@@ -135,6 +135,17 @@ mod tests {
     }
 
     #[test]
+    fn an_unreadable_cache_writes_nothing() {
+        let (_d, conn) = conn();
+        db::set_setting(&conn, "summary_provider", "anthropic").unwrap();
+        db::set_setting(&conn, crate::mcp::SETTING_ENABLED, "true").unwrap();
+        db::set_setting(&conn, org_policy::SETTING_ORG_CONFIG, "{not json").unwrap();
+        assert!(apply_local_only(&conn).is_err());
+        assert_eq!(db::get_setting(&conn, "summary_provider").unwrap().as_deref(), Some("anthropic"));
+        assert_eq!(db::get_setting(&conn, crate::mcp::SETTING_ENABLED).unwrap().as_deref(), Some("true"));
+    }
+
+    #[test]
     fn a_loopback_custom_endpoint_is_kept() {
         let (_d, conn) = conn();
         db::set_setting(&conn, "summary_provider", "custom").unwrap();

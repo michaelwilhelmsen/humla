@@ -35,7 +35,7 @@ pub fn set_transcribe_config(
 ) -> Result<(), String> {
     let json = serde_json::to_string(&config).map_err(err)?;
     let conn = state.db.lock();
-    let policy = org_policy::effective_or_refuse(&conn).map_err(err)?;
+    let policy = org_policy::effective_or_strictest(&conn);
     if !validate(&config, &policy, custom_base_url(&conn).as_deref()).is_empty() {
         return Err(policy.blocked().to_string());
     }

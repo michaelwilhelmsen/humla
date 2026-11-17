@@ -323,16 +323,24 @@ impl EffectivePolicy {
 }
 
 pub(crate) fn blocked_message(source: Option<&str>) -> String {
-    format!("Blocked by {}: processing stays on this Mac.", source.unwrap_or("your organisation"))
+    format!("Blocked by {}: processing stays on this Mac.", source.unwrap_or(UNKNOWN_SOURCE))
 }
 
-/// The policy, or the refusal an enforcing caller returns when it can't be read.
-pub(crate) fn effective_or_refuse(conn: &Connection) -> anyhow::Result<EffectivePolicy> {
-    effective(conn).map_err(|e| {
-        eprintln!("org policy: unreadable, refusing: {e:#}");
-        anyhow::anyhow!(blocked_message(None))
+/// The policy for a caller that enforces. A cache that can't be read is read as
+/// `local_only` on, the strictest setting this module can enforce: it only
+/// narrows processing to this Mac, so on-device and loopback work carries on.
+pub(crate) fn effective_or_strictest(conn: &Connection) -> EffectivePolicy {
+    effective(conn).unwrap_or_else(|e| {
+        eprintln!("org policy: unreadable, enforcing local_only: {e:#}");
+        merge(&[Layer {
+            source: UNKNOWN_SOURCE.into(),
+            reason: String::new(),
+            policy: OrgPolicy { local_only: true, ..OrgPolicy::default() },
+        }])
     })
 }
+
+const UNKNOWN_SOURCE: &str = "your organisation";
 
 /// Refuse unless the policy lets note content go to `id` at `base_url`.
 pub(crate) fn check_endpoint(
@@ -340,7 +348,7 @@ pub(crate) fn check_endpoint(
     id: ProviderId,
     base_url: Option<&str>,
 ) -> anyhow::Result<EffectivePolicy> {
-    let policy = effective_or_refuse(conn)?;
+    let policy = effective_or_strictest(conn);
     if policy.allows(id, base_url) {
         Ok(policy)
     } else {
@@ -351,7 +359,7 @@ pub(crate) fn check_endpoint(
 /// Refuse when note content would leave this Mac at all (workspace chat, the
 /// MCP server).
 pub(crate) fn check_leaves_mac(conn: &Connection) -> anyhow::Result<()> {
-    let policy = effective_or_refuse(conn)?;
+    let policy = effective_or_strictest(conn);
     if policy.local_only {
         Err(policy.blocked())
     } else {
@@ -570,13 +578,19 @@ mod tests {
     }
 
     #[test]
-    fn an_unreadable_cache_refuses_every_endpoint() {
+    fn an_unreadable_cache_reads_as_local_only() {
         let (_d, conn) = conn();
         crate::db::set_setting(&conn, SETTING_ORG_CONFIG, "{not json").unwrap();
+        assert!(check_endpoint(&conn, ProviderId::Local, None).is_ok(), "on-device Whisper");
+        assert!(check_endpoint(&conn, ProviderId::Local, Some("http://localhost:11434/v1")).is_ok());
+        assert!(check_endpoint(&conn, ProviderId::Custom, Some("http://127.0.0.1:1234/v1")).is_ok());
         for spec in REGISTRY {
-            let err = check_endpoint(&conn, spec.id, Some("http://localhost:11434/v1")).unwrap_err();
-            assert_eq!(err.to_string(), "Blocked by your organisation: processing stays on this Mac.");
+            if !matches!(spec.id, ProviderId::Local | ProviderId::Custom) {
+                let err = check_endpoint(&conn, spec.id, None).unwrap_err();
+                assert_eq!(err.to_string(), "Blocked by your organisation: processing stays on this Mac.");
+            }
         }
+        assert!(check_endpoint(&conn, ProviderId::Custom, Some("https://api.example.com")).is_err());
         assert!(check_leaves_mac(&conn).is_err());
     }
 

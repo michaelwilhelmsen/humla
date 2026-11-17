@@ -154,7 +154,7 @@ fn validate(endpoint: &Endpoint) -> Result<(Url, HeaderMap), String> {
 
 /// Under `local_only` a note may go only to a receiver on this Mac.
 fn check_policy(conn: &rusqlite::Connection, url: &Url) -> Result<(), String> {
-    let policy = crate::org_policy::effective_or_refuse(conn).map_err(err)?;
+    let policy = crate::org_policy::effective_or_strictest(conn);
     if policy.local_only && !crate::org_policy::is_loopback_url(url.as_str()) {
         return Err(policy.blocked().to_string());
     }
@@ -549,7 +549,8 @@ mod tests {
         assert!(check_policy(&conn, &url("http://localhost:8787/ingest")).is_ok());
         assert!(check_policy(&conn, &url("http://127.0.0.1:8787/ingest")).is_ok());
         db::set_setting(&conn, "org_config", "{not json").unwrap();
-        assert!(check_policy(&conn, &url("http://localhost:8787/ingest")).is_err());
+        assert!(check_policy(&conn, &url("http://localhost:8787/ingest")).is_ok());
+        assert!(check_policy(&conn, &url("https://hooks.example.com/x")).is_err());
     }
 
     fn facts() -> NoteFacts {
