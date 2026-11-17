@@ -126,6 +126,17 @@ pub struct Config {
     /// session assets are uploaded/downloaded separately by the app's cloud
     /// commands — the crate only syncs the metadata records.)
     pub recordings_dir: PathBuf,
+    /// When this workspace is under an organisation's retention: the time
+    /// (epoch ms) before which a note's `created_at` puts it past that
+    /// retention. Read once at the start of each pull.
+    pub retention_cutoff: RetentionCutoff,
+}
+
+pub type RetentionCutoff = Arc<dyn Fn() -> Option<i64> + Send + Sync>;
+
+/// No retention: every pulled note follows the usual path.
+pub fn no_retention() -> RetentionCutoff {
+    Arc::new(|| None)
 }
 
 /// Cheap handle the observer glue calls. Sends ops to the worker; never blocks.
@@ -982,19 +993,44 @@ impl Worker {
     /// Delete this device's copy of a note it may no longer read.
     ///
     /// Hard, not a tombstone: it was never this device's note to restore, and a
-    /// Trash entry would leave the transcript readable. Takes the derived index
-    /// with it for the same reason `db::purge_note` does (ADR-0002) — the chunks
-    /// hold the transcript text, speaker names included.
+    /// Trash entry would leave the transcript readable.
     fn purge_withdrawn(&self, id: &str) -> Result<()> {
         {
             let conn = self.db.lock();
-            conn.execute("DELETE FROM note_chunks WHERE note_id = ?1", rusqlite::params![id])?;
-            conn.execute("DELETE FROM note_revisions WHERE note_id = ?1", rusqlite::params![id])?;
-            conn.execute("DELETE FROM note_chunks_fts WHERE note_id = ?1", rusqlite::params![id])?;
-            conn.execute("DELETE FROM notes WHERE id = ?1", rusqlite::params![id])?;
+            purge_note_rows(&conn, id)?;
         }
         (self.purged)(id);
         Ok(())
+    }
+
+    /// Under retention, a pulled note or tombstone created before `cutoff` is
+    /// neither inserted nor moved to the Trash: this workspace's copy, if any,
+    /// is purged. Returns whether the note was past the cutoff. The pulled
+    /// `created_at` decides, as on the server; a tombstone without one falls
+    /// back to the local copy's. A note with no creation time is never past it.
+    fn purge_if_expired(&self, n: &RemoteNote, cutoff: i64) -> Result<bool> {
+        let held = {
+            let conn = self.lock_db_fairly();
+            let local: Option<i64> = conn
+                .query_row(
+                    "SELECT created_at FROM notes WHERE id = ?1 AND workspace_id = ?2",
+                    rusqlite::params![n.client_id, self.config.workspace_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let created = if n.created_at > 0 { n.created_at } else { local.unwrap_or(0) };
+            if !(created > 0 && created < cutoff) {
+                return Ok(false);
+            }
+            if local.is_some() {
+                purge_note_rows(&conn, &n.client_id)?;
+            }
+            local.is_some()
+        };
+        if held {
+            (self.purged)(&n.client_id);
+        }
+        Ok(true)
     }
 
     /// Create the record, or PATCH it if one with this `client_id` already
@@ -1074,9 +1110,10 @@ impl Worker {
     /// Pull every entity changed since its cursor and apply locally.
     async fn pull(&self) -> Result<()> {
         let auth = self.ensure_auth().await?;
+        let cutoff = (self.config.retention_cutoff)();
         let mut changed = false;
         changed |= self
-            .pull_collection("notes", "notes_cursor", &auth.token, |v| self.apply_remote_note_json(v))
+            .pull_collection("notes", "notes_cursor", &auth.token, |v| self.apply_remote_note_json(v, cutoff))
             .await?;
         changed |= self
             .pull_collection("folders", "folders_cursor", &auth.token, |v| self.apply_remote_folder_json(v))
@@ -1204,9 +1241,9 @@ impl Worker {
         FairGuard(Some(self.db.lock()))
     }
 
-    fn apply_remote_note_json(&self, v: &serde_json::Value) -> Result<()> {
+    fn apply_remote_note_json(&self, v: &serde_json::Value, cutoff: Option<i64>) -> Result<()> {
         let n: RemoteNote = serde_json::from_value(v.clone())?;
-        self.apply_remote_note(&n)
+        self.apply_remote_note(&n, cutoff)
     }
 
     fn apply_remote_folder_json(&self, v: &serde_json::Value) -> Result<()> {
@@ -1228,7 +1265,7 @@ impl Worker {
     /// commands (no observer re-ping) and writes the server's timestamp as
     /// `updated_at` (NOT now()), with a last-write-wins guard so a stale pull
     /// can't clobber a newer local edit.
-    fn apply_remote_note(&self, n: &RemoteNote) -> Result<()> {
+    fn apply_remote_note(&self, n: &RemoteNote, cutoff: Option<i64>) -> Result<()> {
         // Reject a non-UUID client_id from the server: it would become a local
         // primary key and later be interpolated into PocketBase filters. Our
         // client only ever creates UUID ids, so anything else is malformed or
@@ -1237,6 +1274,11 @@ impl Worker {
         if !is_safe_id(&n.client_id) {
             eprintln!("cloud-sync: skipping pulled note with unsafe client_id");
             return Ok(());
+        }
+        if let Some(cutoff) = cutoff {
+            if self.purge_if_expired(n, cutoff)? {
+                return Ok(());
+            }
         }
         let conn = self.lock_db_fairly();
         if n.deleted {
@@ -1606,6 +1648,17 @@ struct PromptRow {
     name: String,
     content: String,
     updated_at: i64,
+}
+
+/// Delete a note's row with its derived index and version history, which hold
+/// its text (ADR-0002). The app's `purged` callback finishes the job with
+/// `db::purge_note` and the note's files.
+fn purge_note_rows(conn: &Connection, id: &str) -> Result<()> {
+    conn.execute("DELETE FROM note_chunks WHERE note_id = ?1", rusqlite::params![id])?;
+    conn.execute("DELETE FROM note_revisions WHERE note_id = ?1", rusqlite::params![id])?;
+    conn.execute("DELETE FROM note_chunks_fts WHERE note_id = ?1", rusqlite::params![id])?;
+    conn.execute("DELETE FROM notes WHERE id = ?1", rusqlite::params![id])?;
+    Ok(())
 }
 
 #[derive(Deserialize, Default)]
@@ -2037,6 +2090,7 @@ mod it {
             workspace_id: std::env::var("HUMLA_TEST_WORKSPACE").ok()?,
             poll_interval: Duration::from_secs(60),
             recordings_dir: std::env::temp_dir(),
+            retention_cutoff: no_retention(),
         })
     }
 
@@ -2116,6 +2170,7 @@ mod it {
             workspace_id: workspace.to_string(),
             poll_interval: Duration::from_secs(60),
             recordings_dir: std::path::PathBuf::new(),
+            retention_cutoff: no_retention(),
         }
     }
 
@@ -2231,7 +2286,7 @@ mod it {
             std::thread::spawn(move || {
                 let w = worker(db, offline_config("wsF"));
                 for note in &notes {
-                    w.apply_remote_note(note).unwrap();
+                    w.apply_remote_note(note, None).unwrap();
                 }
             })
         };
@@ -2264,7 +2319,7 @@ mod it {
             client_updated_at: 10,
             ..Default::default()
         };
-        w.apply_remote_note(&remote).unwrap();
+        w.apply_remote_note(&remote, None).unwrap();
         assert_eq!(
             scalar(&db, "SELECT shared_with FROM notes WHERE id = ?1", "board").as_deref(),
             Some(r#"["u-me","u-carol"]"#)
@@ -2559,7 +2614,7 @@ mod it {
             client_updated_at: 10,
             owner: "u1".into(),
             ..Default::default()
-        })
+        }, None)
         .unwrap();
         assert_eq!(
             scalar(&db, "SELECT client_id FROM notes WHERE id = ?1", "n1").as_deref(),
@@ -2576,7 +2631,7 @@ mod it {
             client_updated_at: 20,
             owner: "u1".into(),
             ..Default::default()
-        })
+        }, None)
         .unwrap();
         let is_null: bool = {
             let conn = db.lock();
@@ -2603,15 +2658,15 @@ mod it {
             ..Default::default()
         };
 
-        w.apply_remote_note(&note(1_000, 10)).unwrap();
-        w.apply_remote_note(&note(500, 20)).unwrap();
+        w.apply_remote_note(&note(1_000, 10), None).unwrap();
+        w.apply_remote_note(&note(500, 20), None).unwrap();
         assert_eq!(
             scalar(&db, "SELECT CAST(created_at AS TEXT) FROM notes WHERE id = ?1", "n1").as_deref(),
             Some("500")
         );
 
         // A stale copy doesn't move it back.
-        w.apply_remote_note(&note(1_000, 15)).unwrap();
+        w.apply_remote_note(&note(1_000, 15), None).unwrap();
         assert_eq!(
             scalar(&db, "SELECT CAST(created_at AS TEXT) FROM notes WHERE id = ?1", "n1").as_deref(),
             Some("500")
@@ -2918,7 +2973,7 @@ mod it {
             client_updated_at: 200,
             ..Default::default()
         };
-        w.apply_remote_note(&remote).unwrap();
+        w.apply_remote_note(&remote, None).unwrap();
 
         let conn = db.lock();
         let title: String =
@@ -2972,7 +3027,7 @@ mod it {
 
         { let conn = db.lock(); conn.execute("DELETE FROM notes WHERE id = ?1", rusqlite::params![uuid]).unwrap(); }
         w.write_state("notes_cursor", "").unwrap();
-        w.pull_collection("notes", "notes_cursor", &auth.token, |v| w.apply_remote_note_json(v)).await.expect("pull");
+        w.pull_collection("notes", "notes_cursor", &auth.token, |v| w.apply_remote_note_json(v, None)).await.expect("pull");
         assert_eq!(scalar(&db, "SELECT title FROM notes WHERE id = ?1", &uuid).as_deref(), Some("IT title"));
         // Transcript + summary must survive the push → PB → pull roundtrip too
         // (guards against the PB schema dropping those fields, and against a
@@ -2986,7 +3041,7 @@ mod it {
 
         w.push_delete("notes", &uuid, &ws).await.expect("delete");
         w.write_state("notes_cursor", "").unwrap();
-        w.pull_collection("notes", "notes_cursor", &auth.token, |v| w.apply_remote_note_json(v)).await.expect("pull2");
+        w.pull_collection("notes", "notes_cursor", &auth.token, |v| w.apply_remote_note_json(v, None)).await.expect("pull2");
         assert_eq!(
             scalar(&db, "SELECT title FROM notes WHERE id = ?1 AND deleted_at IS NULL", &uuid),
             None,
@@ -3052,7 +3107,7 @@ mod it {
         w.push_note(&note, &ws).await.expect("push_note");
         { let conn = db.lock(); conn.execute("DELETE FROM notes WHERE id = ?1", rusqlite::params![note]).unwrap(); }
         w.write_state("notes_cursor", "").unwrap();
-        w.pull_collection("notes", "notes_cursor", &auth.token, |v| w.apply_remote_note_json(v)).await.expect("pull note");
+        w.pull_collection("notes", "notes_cursor", &auth.token, |v| w.apply_remote_note_json(v, None)).await.expect("pull note");
         assert_eq!(
             scalar(&db, "SELECT client_id FROM notes WHERE id = ?1", &note).as_deref(),
             Some(uuid.as_str()),
@@ -3382,5 +3437,99 @@ mod it {
 
         assert!(w.drain_outbox().await.is_ok());
         assert_eq!(outbox_attempts(&db, "n1"), None, "dropped as un-pushable");
+    }
+
+    // ---- retention ----
+
+    const CUTOFF: i64 = 1_000;
+
+    fn retained(created_at: i64, deleted: bool) -> RemoteNote {
+        RemoteNote {
+            client_id: "n1".into(),
+            title: "Case".into(),
+            transcript: "Hege: the case".into(),
+            deleted,
+            created_at,
+            client_updated_at: 5_000,
+            owner: "u1".into(),
+            ..Default::default()
+        }
+    }
+
+    fn local_note(db: &Db, id: &str, workspace: &str, created_at: i64, updated_at: i64) {
+        let conn = db.lock();
+        conn.execute(
+            "INSERT INTO notes (id, title, workspace_id, created_at, updated_at) VALUES (?1, 'Case', ?2, ?3, ?4)",
+            rusqlite::params![id, workspace, created_at, updated_at],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO note_chunks (id, note_id, text) VALUES ('c1', ?1, 'Hege')", [id]).unwrap();
+    }
+
+    fn row(db: &Db, id: &str) -> Option<String> {
+        scalar(db, "SELECT CAST(deleted_at IS NOT NULL AS TEXT) FROM notes WHERE id = ?1", id)
+    }
+
+    #[test]
+    fn an_expired_pulled_note_is_never_inserted() {
+        let db = test_db();
+        let (w, purged) = worker_collecting_purges(db.clone(), offline_config("wsR"));
+        w.apply_remote_note(&retained(CUTOFF - 1, false), Some(CUTOFF)).unwrap();
+        assert_eq!(row(&db, "n1"), None);
+        assert!(purged.lock().is_empty(), "nothing was held, so no files to remove");
+        w.apply_remote_note(&retained(CUTOFF, false), Some(CUTOFF)).unwrap();
+        assert_eq!(row(&db, "n1").as_deref(), Some("0"), "at the cutoff it is still in retention");
+    }
+
+    #[test]
+    fn an_expired_pulled_note_purges_the_local_copy() {
+        let db = test_db();
+        local_note(&db, "n1", "wsR", CUTOFF - 1, 9_000);
+        let (w, purged) = worker_collecting_purges(db.clone(), offline_config("wsR"));
+        w.apply_remote_note(&retained(CUTOFF - 1, false), Some(CUTOFF)).unwrap();
+        assert_eq!(row(&db, "n1"), None, "purged, though the local copy is newer");
+        assert_eq!(scalar(&db, "SELECT CAST(COUNT(*) AS TEXT) FROM note_chunks WHERE note_id = ?1", "n1").as_deref(), Some("0"));
+        assert_eq!(*purged.lock(), ["n1"]);
+    }
+
+    #[test]
+    fn an_expired_tombstone_purges_instead_of_trashing() {
+        let db = test_db();
+        local_note(&db, "n1", "wsR", CUTOFF - 1, 9_000);
+        let (w, purged) = worker_collecting_purges(db.clone(), offline_config("wsR"));
+        w.apply_remote_note(&retained(0, true), Some(CUTOFF)).unwrap();
+        assert_eq!(row(&db, "n1"), None, "a tombstone without created_at falls back to the local copy's");
+        assert_eq!(*purged.lock(), ["n1"]);
+    }
+
+    #[test]
+    fn retention_reaches_only_this_workspace_copy() {
+        let db = test_db();
+        local_note(&db, "n1", "wsOther", CUTOFF - 1, 1);
+        let (w, purged) = worker_collecting_purges(db.clone(), offline_config("wsR"));
+        w.apply_remote_note(&retained(CUTOFF - 1, true), Some(CUTOFF)).unwrap();
+        assert_eq!(row(&db, "n1").as_deref(), Some("0"), "the copy moved to another workspace stays");
+        assert!(purged.lock().is_empty());
+    }
+
+    #[test]
+    fn without_retention_tombstones_still_go_to_the_trash() {
+        let db = test_db();
+        local_note(&db, "n1", "wsR", CUTOFF - 1, 1);
+        let (w, purged) = worker_collecting_purges(db.clone(), offline_config("wsR"));
+        w.apply_remote_note(&retained(CUTOFF - 1, true), None).unwrap();
+        assert_eq!(row(&db, "n1").as_deref(), Some("1"));
+        assert!(purged.lock().is_empty());
+    }
+
+    #[test]
+    fn a_note_inside_retention_follows_the_usual_path() {
+        let db = test_db();
+        local_note(&db, "n1", "wsR", CUTOFF + 1, 1);
+        let (w, purged) = worker_collecting_purges(db.clone(), offline_config("wsR"));
+        w.apply_remote_note(&retained(CUTOFF + 1, true), Some(CUTOFF)).unwrap();
+        assert_eq!(row(&db, "n1").as_deref(), Some("1"), "moved to the Trash as before");
+        w.apply_remote_note(&retained(0, false), Some(CUTOFF)).unwrap();
+        assert!(purged.lock().is_empty(), "no creation time is never past the cutoff");
     }
 }

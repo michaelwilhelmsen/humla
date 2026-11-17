@@ -95,6 +95,7 @@ impl Manager {
         let app_status = self.app.clone();
         let app_conflict = self.app.clone();
         let app_purged = self.app.clone();
+        let db_purged = self.db.clone();
         match cloud_sync::start(
             self.db.clone(),
             cfg,
@@ -120,9 +121,13 @@ impl Manager {
                 let _ = app_conflict.emit("sync_conflict", title);
             },
             move |note_id| {
-                // A pull deleted a note outright (its author withdrew it), so its
-                // files go the same way a Trash purge takes them.
-                super::notes::purge_note_assets_best_effort(&app_purged, note_id);
+                // A pull deleted a note outright (its author withdrew it, or it is
+                // past its organisation's retention). The crate took the row; this
+                // takes the rest a Trash purge would, and closes the note if open.
+                if let Err(e) = crate::db::purge_note(&db_purged.lock(), note_id) {
+                    eprintln!("cloud-sync: couldn't finish purging a note: {e:#}");
+                }
+                super::org::announce_purged(&app_purged, &[note_id.to_string()]);
             },
         ) {
             Ok((handle, fut)) => {
@@ -209,6 +214,10 @@ impl Manager {
                 db: self.db.clone(),
                 keychain_cache: self.keychain_cache.clone(),
             }),
+            retention_cutoff: {
+                let (db, workspace) = (self.db.clone(), workspace_id.clone());
+                Arc::new(move || crate::org_policy::workspace_cutoff(&db.lock(), &workspace, crate::db::now_ms()))
+            },
             workspace_id,
             poll_interval: POLL_INTERVAL,
             recordings_dir,
