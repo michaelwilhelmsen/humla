@@ -96,9 +96,6 @@ export function VocabularySection({ s, update }: Pick<SettingsHook, "s" | "updat
           </button>
         </div>
         <p className="text-xs text-[var(--color-text-muted)]">Limit: {VOCABULARY_LIMIT}</p>
-        <p className="text-xs text-[var(--color-text-muted)]">
-          <code>gpt-4o-transcribe-diarize</code> ignores them.
-        </p>
       </div>
     </Section>
   );
