@@ -9,6 +9,7 @@ import {
   localOnlySource,
   policySource,
   policyRows,
+  retentionDaysFor,
   type EffectivePolicy,
 } from "./orgPolicy";
 
@@ -44,6 +45,25 @@ describe("policyRows", () => {
   it("says one day in the singular", () => {
     const policy = { ...NO_POLICY, retention_days: 1, rules: [rule("retention_days")] };
     expect(policyRows(policy)[0].value).toBe("Deleted after 1 day");
+  });
+});
+
+describe("retentionDaysFor", () => {
+  const scope = { w1: 30, w2: 7 };
+
+  it("reads the workspace's days from the backend's map", () => {
+    expect(retentionDaysFor(scope, "w1")).toBe(30);
+    expect(retentionDaysFor(scope, "w2")).toBe(7);
+  });
+
+  it("is 0 for Personal, an unknown workspace and no organisation", () => {
+    expect(retentionDaysFor(scope, "")).toBe(0);
+    expect(retentionDaysFor(scope, " ")).toBe(0);
+    expect(retentionDaysFor(scope, null)).toBe(0);
+    expect(retentionDaysFor(scope, undefined)).toBe(0);
+    expect(retentionDaysFor(scope, "w3")).toBe(0);
+    expect(retentionDaysFor(scope, "constructor")).toBe(0);
+    expect(retentionDaysFor({}, "w1")).toBe(0);
   });
 });
 

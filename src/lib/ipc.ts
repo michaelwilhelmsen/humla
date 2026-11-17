@@ -1153,6 +1153,12 @@ export function onNotesChanged(cb: () => void): Promise<UnlistenFn> {
   return listen("notes_changed", () => cb());
 }
 
+// Notes deleted for good under the UI: past an organisation's retention, or
+// withdrawn by their author. Followed by `notes_changed`.
+export function onNotesPurged(cb: (ids: string[]) => void): Promise<UnlistenFn> {
+  return listen<string[]>("notes_purged", (e) => cb(e.payload));
+}
+
 // The tray or the global hotkey fired while the window was on screen. The
 // backend deliberately doesn't decide what to do in that case: with a note
 // open the hotkey is that note's Record button, which only the frontend knows.

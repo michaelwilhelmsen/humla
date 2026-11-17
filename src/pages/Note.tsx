@@ -30,7 +30,8 @@ import {
   Users,
   X,
 } from "lucide-react";
-import { ipc, onSummaryThinkingDelta, onSummaryContentDelta, type Note as TNote, type NoteRevision, type NoteSession, type SummaryPrompt, type TimelineEntry } from "../lib/ipc";
+import { deletedAfter, useRetentionDays } from "../lib/orgPolicy";
+import { ipc, onNotesPurged, onSummaryThinkingDelta, onSummaryContentDelta, type Note as TNote, type NoteRevision, type NoteSession, type SummaryPrompt, type TimelineEntry } from "../lib/ipc";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { SUMMARY_CAPABLE, type SummaryProvider } from "../lib/providers";
 import { useLiveSetting } from "../lib/settingsBus";
@@ -314,6 +315,7 @@ export function Note() {
   const { sidebarCollapsed } = useOutletContext<LayoutOutletContext>();
   const upsert = useNotesStore((s) => s.upsertLocal);
   const refreshNotes = useNotesStore((s) => s.refresh);
+  const removeNote = useNotesStore((s) => s.removeLocal);
   const folders = useNotesStore((s) => s.folders);
   const note = useNotesStore((s) => s.notes.find((n) => n.id === id));
   // Every note in the active workspace. `notes_list` includes each one's full
@@ -472,6 +474,10 @@ export function Note() {
   // capturing a stale snapshot.
   const draftRef = useRef<TNote | null>(null);
   draftRef.current = draft;
+  // Set once the note is deleted for good under this view: nothing may save
+  // to it or put it back in the store.
+  const purged = useRef(false);
+  const retentionDays = useRetentionDays(draft?.workspace_id);
 
   useEffect(() => {
     let cancelled = false;
@@ -503,14 +509,14 @@ export function Note() {
     const changes = pendingChanges.current;
     pendingChanges.current = {};
     const noteId = draftRef.current?.id;
-    if (noteId && Object.keys(changes).length > 0) {
+    if (noteId && !purged.current && Object.keys(changes).length > 0) {
       const save: Promise<void> = ipc
         .updateNote(noteId, changes as Parameters<typeof ipc.updateNote>[1])
         .then(() => {
           // The draft as it is now, which may hold newer edits than this batch
           // (their own batch saves them).
           const latest = draftRef.current;
-          if (latest) upsert({ ...latest, ...changes });
+          if (latest && !purged.current) upsert({ ...latest, ...changes });
         })
         .finally(() => inFlightSaves.current.delete(save));
       inFlightSaves.current.set(save, changes);
@@ -554,6 +560,29 @@ export function Note() {
     }
     return () => { cancelled = true; };
   }, [id, upsert]);
+
+  // Deleted for good (organisation retention, or withdrawn by its author):
+  // close it, dropping edits that have nowhere left to go.
+  useEffect(() => {
+    if (!id) return;
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    void onNotesPurged((ids) => {
+      if (!ids.includes(id)) return;
+      purged.current = true;
+      pendingChanges.current = {};
+      removeNote(id);
+      const folderId = draftRef.current?.folder_id;
+      navigate(folderId ? `/folder/${folderId}` : "/all-notes");
+    }).then((u) => {
+      if (cancelled) u();
+      else unlisten = u;
+    });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [id, navigate, removeNote]);
 
   // Resolved summary provider for *this* note: per-note override beats global.
   // Used to gate the live-reasoning panel — cloud OpenAI never streams
@@ -1310,6 +1339,7 @@ export function Note() {
               }
             }}
           />
+          {retentionDays > 0 && <span className="nd-meta">{deletedAfter(retentionDays)}</span>}
           <FolderPicker
             value={draft.folder_id}
             onChange={async (folderId) => {

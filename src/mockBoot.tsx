@@ -458,6 +458,32 @@ function noteShareCase(owner: string, isPrivate: boolean, sharedWith: string[]):
   };
 }
 
+// A note in a workspace under its organisation's 90-day retention: the meta row
+// says when it goes.
+function noteRetentionCase(): Scenario {
+  const base = noteShareCase("u1", false, []);
+  const reason = "Case notes are kept for 90 days.";
+  return {
+    ...base,
+    ipc: {
+      ...base.ipc,
+      org_status: () => ({
+        policy: {
+          org_name: "Northwind",
+          reason,
+          local_only: false,
+          retention_days: 90,
+          telemetry_off: false,
+          audio_forbidden: false,
+          rules: [{ kind: "retention_days", source: "Northwind", reason }],
+        },
+        orgs: [],
+        retention: { ws1: 90 },
+      }),
+    },
+  };
+}
+
 // ---- #146 axis: the note toolbar at the widths the body column really gets --
 // The toolbar sits in the BODY column, whose width is the window minus the
 // context panel (clamped 320–720) — so at the 720px minimum window it can be
@@ -1567,6 +1593,7 @@ const CASES: Record<string, Scenario> = {
   "note-share-people": noteShareCase("u1", true, ["u-stian"]),
   "note-share-only-me": noteShareCase("u1", true, []),
   "note-share-readonly": noteShareCase("u-stian", true, ["u1", "u-petter"]),
+  "note-retention": noteRetentionCase(),
   "note-player": notePlayerCase(),
   "note-pending": noteTranscribeCase(false),
   "note-pending-text": noteTranscribeCase(true),
@@ -2205,6 +2232,7 @@ function accountIpc({ signedIn, policies }: { signedIn: boolean; policies: boole
             audio_forbidden: false,
             rules: [],
           },
+      retention: policies ? { w1: 90 } : {},
     }),
   };
 }
