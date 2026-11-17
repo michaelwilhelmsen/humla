@@ -30,7 +30,8 @@ import {
   Users,
   X,
 } from "lucide-react";
-import { ipc, onSummaryThinkingDelta, onSummaryContentDelta, type Note as TNote, type NoteRevision, type NoteSession, type SummaryPrompt, type TimelineEntry } from "../lib/ipc";
+import { deletedAfter, redateBounds, useRetentionDays } from "../lib/orgPolicy";
+import { ipc, onNotesPurged, onSummaryThinkingDelta, onSummaryContentDelta, type Note as TNote, type NoteRevision, type NoteSession, type SummaryPrompt, type TimelineEntry } from "../lib/ipc";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { SUMMARY_CAPABLE, type SummaryProvider } from "../lib/providers";
 import { useLiveSetting } from "../lib/settingsBus";
@@ -314,6 +315,7 @@ export function Note() {
   const { sidebarCollapsed } = useOutletContext<LayoutOutletContext>();
   const upsert = useNotesStore((s) => s.upsertLocal);
   const refreshNotes = useNotesStore((s) => s.refresh);
+  const removeNote = useNotesStore((s) => s.removeLocal);
   const folders = useNotesStore((s) => s.folders);
   const note = useNotesStore((s) => s.notes.find((n) => n.id === id));
   // Every note in the active workspace. `notes_list` includes each one's full
@@ -472,6 +474,10 @@ export function Note() {
   // capturing a stale snapshot.
   const draftRef = useRef<TNote | null>(null);
   draftRef.current = draft;
+  // Set once the note is deleted for good under this view: nothing may save
+  // to it or put it back in the store.
+  const purged = useRef(false);
+  const retentionDays = useRetentionDays(draft?.workspace_id);
 
   useEffect(() => {
     let cancelled = false;
@@ -503,14 +509,14 @@ export function Note() {
     const changes = pendingChanges.current;
     pendingChanges.current = {};
     const noteId = draftRef.current?.id;
-    if (noteId && Object.keys(changes).length > 0) {
+    if (noteId && !purged.current && Object.keys(changes).length > 0) {
       const save: Promise<void> = ipc
         .updateNote(noteId, changes as Parameters<typeof ipc.updateNote>[1])
         .then(() => {
           // The draft as it is now, which may hold newer edits than this batch
           // (their own batch saves them).
           const latest = draftRef.current;
-          if (latest) upsert({ ...latest, ...changes });
+          if (latest && !purged.current) upsert({ ...latest, ...changes });
         })
         .finally(() => inFlightSaves.current.delete(save));
       inFlightSaves.current.set(save, changes);
@@ -554,6 +560,29 @@ export function Note() {
     }
     return () => { cancelled = true; };
   }, [id, upsert]);
+
+  // Deleted for good (organisation retention, or withdrawn by its author):
+  // close it, dropping edits that have nowhere left to go.
+  useEffect(() => {
+    if (!id) return;
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    void onNotesPurged((ids) => {
+      if (!ids.includes(id)) return;
+      purged.current = true;
+      pendingChanges.current = {};
+      removeNote(id);
+      const folderId = draftRef.current?.folder_id;
+      navigate(folderId ? `/folder/${folderId}` : "/all-notes");
+    }).then((u) => {
+      if (cancelled) u();
+      else unlisten = u;
+    });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [id, navigate, removeNote]);
 
   // Resolved summary provider for *this* note: per-note override beats global.
   // Used to gate the live-reasoning panel — cloud OpenAI never streams
@@ -1247,12 +1276,16 @@ export function Note() {
                 // A note moved out of the active workspace is no longer in any
                 // list this view belongs to, so the view leaves with it.
                 const leaving = workspaceId !== activeWorkspaceId;
+                const name = myWorkspaces.find((w) => w.id === workspaceId)?.name;
                 await flushSave().catch(warnSaveFailed);
-                await ipc.setNoteWorkspace(draft.id, workspaceId);
+                try {
+                  await ipc.setNoteWorkspace(draft.id, workspaceId, name);
+                } catch (e) {
+                  useRecordingStore.getState().pushFlash(String(e));
+                  return;
+                }
                 if (leaving) {
-                  const dest = workspaceId
-                    ? (myWorkspaces.find((w) => w.id === workspaceId)?.name ?? "another workspace")
-                    : "Personal";
+                  const dest = workspaceId ? (name ?? "another workspace") : "Personal";
                   const title = draft.title.trim();
                   navigate(backTo);
                   useRecordingStore
@@ -1297,6 +1330,7 @@ export function Note() {
             value={draft.created_at}
             label={dateChip}
             disabled={readOnly}
+            bounds={retentionDays > 0 ? () => redateBounds(retentionDays, draft.created_at, Date.now()) : null}
             onChange={async (createdAt) => {
               if (!draft || readOnly || createdAt === draft.created_at) return;
               const next = { ...draft, created_at: createdAt };
@@ -1310,6 +1344,7 @@ export function Note() {
               }
             }}
           />
+          {retentionDays > 0 && <span className="nd-meta">{deletedAfter(retentionDays)}</span>}
           <FolderPicker
             value={draft.folder_id}
             onChange={async (folderId) => {
@@ -2294,21 +2329,29 @@ function DatePicker({
   value,
   label,
   disabled,
+  bounds,
   onChange,
 }: {
   value: number;
   label: string;
   disabled?: boolean;
+  /** The earliest and latest dates allowed, read when the picker opens; null
+   *  for any date up to now. */
+  bounds: (() => { min: number; max: number }) | null;
   onChange: (createdAt: number) => void;
 }) {
   const [open, setOpen] = useState(false);
   const [day, setDay] = useState(() => startOfDay(value));
   const [month, setMonth] = useState(() => startOfDay(value));
   const [time, setTime] = useState("");
+  const [range, setRange] = useState<{ min: number; max: number } | null>(null);
+  const latest = range ? Math.min(range.max, Date.now()) : Date.now();
   const picked = withTime(day, time);
-  const future = picked !== null && picked > Date.now();
+  const outside = picked !== null && (picked > latest || (range !== null && picked < range.min));
   const today = startOfDay(Date.now());
-  const atThisMonth = new Date(month.getFullYear(), month.getMonth() + 1, 1) > today;
+  const lastDay = startOfDay(latest);
+  const firstDay = range ? startOfDay(range.min) : null;
+  const atThisMonth = new Date(month.getFullYear(), month.getMonth() + 1, 1) > lastDay;
   const grid = monthGrid(month.getFullYear(), month.getMonth());
   // A last week that is all next month is dead height.
   const days = grid[35].getMonth() === month.getMonth() ? grid : grid.slice(0, 35);
@@ -2321,6 +2364,7 @@ function DatePicker({
           setDay(startOfDay(value));
           setMonth(startOfDay(value));
           setTime(toTimeInput(value));
+          setRange(bounds?.() ?? null);
         }
         setOpen(next);
       }}
@@ -2342,7 +2386,7 @@ function DatePicker({
           className="flex flex-col gap-4"
           onSubmit={(e) => {
             e.preventDefault();
-            if (picked === null || future) return;
+            if (picked === null || outside) return;
             // The picker has no seconds, so an untouched Save would still move the note.
             if (picked !== withTime(startOfDay(value), toTimeInput(value))) onChange(picked);
             setOpen(false);
@@ -2378,12 +2422,12 @@ function DatePicker({
                 const selected = d.getTime() === day.getTime();
                 const inMonth = d.getMonth() === month.getMonth();
                 const isToday = d.getTime() === today.getTime();
-                const afterToday = d.getTime() > today.getTime();
+                const unavailable = d.getTime() > lastDay.getTime() || (firstDay !== null && d.getTime() < firstDay.getTime());
                 return (
                   <button
                     key={d.getTime()}
                     type="button"
-                    disabled={afterToday}
+                    disabled={unavailable}
                     aria-label={d.toLocaleDateString(undefined, { dateStyle: "full" })}
                     aria-pressed={selected}
                     onClick={() => {
@@ -2392,7 +2436,7 @@ function DatePicker({
                     }}
                     className={cn(
                       "h-8 rounded-md text-[13px] tabular-nums transition-colors",
-                      afterToday
+                      unavailable
                         ? "opacity-30"
                         : selected
                           ? "bg-[var(--color-accent)] text-[var(--color-on-accent)] font-semibold cursor-pointer"
@@ -2429,7 +2473,7 @@ function DatePicker({
             <button type="button" className="nd-btn" onClick={() => setOpen(false)}>
               Cancel
             </button>
-            <button type="submit" className="nd-btn nd-btn-primary" disabled={picked === null || future}>
+            <button type="submit" className="nd-btn nd-btn-primary" disabled={picked === null || outside}>
               Save
             </button>
           </div>

@@ -120,9 +120,9 @@ impl Manager {
                 let _ = app_conflict.emit("sync_conflict", title);
             },
             move |note_id| {
-                // A pull deleted a note outright (its author withdrew it), so its
-                // files go the same way a Trash purge takes them.
-                super::notes::purge_note_assets_best_effort(&app_purged, note_id);
+                // A pull purged a note (its author withdrew it, or it is past its
+                // organisation's retention): its files go too, and the UI closes it.
+                super::org::announce_purged(&app_purged, &[note_id.to_string()]);
             },
         ) {
             Ok((handle, fut)) => {
@@ -209,6 +209,15 @@ impl Manager {
                 db: self.db.clone(),
                 keychain_cache: self.keychain_cache.clone(),
             }),
+            retention_cutoff: {
+                let (db, workspace) = (self.db.clone(), workspace_id.clone());
+                Arc::new(move || crate::org_policy::workspace_cutoff(&db.lock(), &workspace, crate::db::now_ms()))
+            },
+            note_busy: {
+                let app = self.app.clone();
+                Arc::new(move |note_id: &str| super::org::note_busy(&app, note_id))
+            },
+            purge_note: Arc::new(|conn: &rusqlite::Connection, id: &str| crate::db::purge_note_rows(conn, id)),
             workspace_id,
             poll_interval: POLL_INTERVAL,
             recordings_dir,

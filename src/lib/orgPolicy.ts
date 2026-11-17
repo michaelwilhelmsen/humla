@@ -32,7 +32,10 @@ export type OrgSummary = {
   workspaces: string[];
 };
 
-export type OrgStatus = { policy: EffectivePolicy; orgs?: OrgSummary[] };
+/** Days of retention per workspace, from `org_policy::retention_scope`. */
+export type RetentionScope = Record<string, number>;
+
+export type OrgStatus = { policy: EffectivePolicy; orgs?: OrgSummary[]; retention?: RetentionScope };
 
 /** Mirrors `org_policy::AudioSweep`. */
 export type AudioSweep = { org_id: string; org_name: string };
@@ -76,6 +79,31 @@ export function enforceLocalOnly(cfg: ProviderConfig, customBaseUrl: string): Pr
   return allowedUnderLocalOnly(cfg.provider, transcribeEndpoint(cfg, customBaseUrl)) ? cfg : ON_DEVICE_WHISPER;
 }
 
+const DAY_MS = 86_400_000;
+
+/** The smallest `created_at` read as a real time. Mirrors `org_policy::MIN_EPOCH_MS`. */
+export const MIN_EPOCH_MS = 1_000_000_000_000;
+
+/** Under `days` of retention, the dates a note created at `createdAt` may be
+ *  moved to at `now`, inclusive: never later than it is, never past the cutoff.
+ *  Mirrors `org_policy::redate_bounds`; `redateVectors.json` pins both. */
+export function redateBounds(days: number, createdAt: number, now: number): { min: number; max: number } {
+  const min = Math.max(now - days * DAY_MS, MIN_EPOCH_MS);
+  const max = createdAt >= MIN_EPOCH_MS ? createdAt : now;
+  return { min, max };
+}
+
+export function deletedAfter(days: number): string {
+  return `Deleted after ${days} ${days === 1 ? "day" : "days"}`;
+}
+
+/** Days before a note in `workspaceId` is deleted; 0 when none applies. A
+ *  Personal note (blank workspace) never has one. */
+export function retentionDaysFor(scope: RetentionScope, workspaceId: string | null | undefined): number {
+  if (!workspaceId?.trim()) return 0;
+  return Object.prototype.hasOwnProperty.call(scope, workspaceId) ? scope[workspaceId] : 0;
+}
+
 export const NO_POLICY: EffectivePolicy = {
   org_name: null,
   reason: null,
@@ -96,10 +124,8 @@ export function policyRows(policy: EffectivePolicy): PolicyRow[] {
     switch (kind) {
       case "local_only":
         return { label: "AI processing", value: "On this Mac only" };
-      case "retention_days": {
-        const n = policy.retention_days;
-        return { label: "Note retention", value: `Deleted after ${n} ${n === 1 ? "day" : "days"}` };
-      }
+      case "retention_days":
+        return { label: "Note retention", value: deletedAfter(policy.retention_days) };
       case "audio_forbidden":
         return { label: "Keep recorded audio", value: "Off" };
       case "telemetry_off":
@@ -121,6 +147,12 @@ export function useOrgPolicy(): EffectivePolicy {
   return useOrgPolicyStatus().policy;
 }
 
+/** Days before a note in `workspaceId` is deleted under its organisation's
+ *  retention; 0 when none applies. */
+export function useRetentionDays(workspaceId: string | null | undefined): number {
+  return retentionDaysFor(useOrgPolicyStatus().retention, workspaceId);
+}
+
 /** Who sets `local_only` (null when off), and whether the policy has loaded.
  *  Until it has, a settings tab touches no cloud provider's key or models. */
 export function useLocalOnly(): { managed: PolicyRule | null; known: boolean } {
@@ -128,8 +160,10 @@ export function useLocalOnly(): { managed: PolicyRule | null; known: boolean } {
   return { managed: localOnlySource(policy), known };
 }
 
-function useOrgPolicyStatus(): { policy: EffectivePolicy; known: boolean } {
-  const [state, setState] = useState({ policy: NO_POLICY, known: false });
+type PolicyStatus = { policy: EffectivePolicy; retention: RetentionScope; known: boolean };
+
+function useOrgPolicyStatus(): PolicyStatus {
+  const [state, setState] = useState<PolicyStatus>({ policy: NO_POLICY, retention: {}, known: false });
   const cloudStatus = useCloudStore((s) => s.status);
 
   useEffect(() => {
@@ -137,8 +171,11 @@ function useOrgPolicyStatus(): { policy: EffectivePolicy; known: boolean } {
     const load = () =>
       ipc
         .orgStatus()
-        .then((s) => !cancelled && setState({ policy: s?.policy ?? NO_POLICY, known: true }))
-        .catch(() => !cancelled && setState({ policy: NO_POLICY, known: true }));
+        .then(
+          (s) =>
+            !cancelled && setState({ policy: s?.policy ?? NO_POLICY, retention: s?.retention ?? {}, known: true }),
+        )
+        .catch(() => !cancelled && setState({ policy: NO_POLICY, retention: {}, known: true }));
     void load();
     let unlisten: (() => void) | undefined;
     void listen("org_policy_changed", () => void load()).then((u) => {

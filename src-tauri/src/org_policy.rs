@@ -8,6 +8,8 @@
 //! factor leaves it in force. [`effective`] reads it and merges every source
 //! strictest-wins.
 
+use std::collections::BTreeMap;
+
 use rusqlite::Connection;
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -594,6 +596,99 @@ pub(crate) fn record_audio_sweep(conn: &Connection, org_id: &str) -> anyhow::Res
     Ok(())
 }
 
+// ---- retention_days ---------------------------------------------------------
+
+pub(crate) const DAY_MS: i64 = 86_400_000;
+
+/// The smallest `created_at` read as a real time (2001-09-09). Anything below is
+/// garbage or seconds: retention never deletes on it and leaves the note to the
+/// server, which uses the same floor. `cloud-sync` holds its own copy.
+pub(crate) const MIN_EPOCH_MS: i64 = 1_000_000_000_000;
+
+/// The retention one workspace is under, and the organisation that sets it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RetentionRule {
+    pub days: u32,
+    pub source: String,
+}
+
+/// Each workspace under an organisation's `retention_days`, with the rule that
+/// applies to it: the fewest days when several organisations list it. A blank
+/// workspace id is never covered, so Personal notes (`workspace_id = ''`) are
+/// out of reach.
+pub(crate) fn retention_rules(config: &OrgConfig) -> BTreeMap<String, RetentionRule> {
+    let mut rules: BTreeMap<String, RetentionRule> = BTreeMap::new();
+    for org in config.orgs.iter().filter(|o| o.policy.retention_days > 0 && !o.id.trim().is_empty()) {
+        let rule = RetentionRule { days: org.policy.retention_days, source: org.name.clone() };
+        for ws in org.workspaces.iter().filter(|w| !w.trim().is_empty()) {
+            match rules.get(ws) {
+                Some(have) if have.days <= rule.days => {}
+                _ => {
+                    rules.insert(ws.clone(), rule.clone());
+                }
+            }
+        }
+    }
+    rules
+}
+
+/// [`retention_rules`] as days alone, for the UI through `org_status`.
+pub(crate) fn retention_scope(config: &OrgConfig) -> BTreeMap<String, u32> {
+    retention_rules(config).into_iter().map(|(ws, r)| (ws, r.days)).collect()
+}
+
+/// The retention rules that may delete notes or refuse an edit. Only a cache
+/// that reads cleanly can name one; nothing cached, or a cache that can't be
+/// read, covers nothing.
+pub(crate) fn retention_in_force(conn: &Connection) -> BTreeMap<String, RetentionRule> {
+    match cached(conn) {
+        Ok(Some(config)) => retention_rules(&config),
+        Ok(None) => Default::default(),
+        Err(e) => {
+            eprintln!("org policy: unreadable, no retention: {e:#}");
+            Default::default()
+        }
+    }
+}
+
+/// The rule for notes in `workspace_id`, or `None` (Personal included).
+pub(crate) fn retention_rule(conn: &Connection, workspace_id: &str) -> Option<RetentionRule> {
+    if workspace_id.trim().is_empty() {
+        return None;
+    }
+    retention_in_force(conn).remove(workspace_id)
+}
+
+/// Notes created before the returned time are past `days` at `now_ms`.
+pub(crate) fn retention_cutoff(now_ms: i64, days: u32) -> i64 {
+    now_ms.saturating_sub(i64::from(days).saturating_mul(DAY_MS))
+}
+
+/// Whether a note created at `created_at` is past `cutoff`. An implausible
+/// `created_at` never is.
+pub(crate) fn is_past(created_at: i64, cutoff: i64) -> bool {
+    created_at >= MIN_EPOCH_MS && created_at < cutoff
+}
+
+/// Under `days` of retention, the dates a note created at `created_at` may be
+/// moved to at `now_ms`, inclusive: never later than it is (the server keeps
+/// the stored date) and never past the cutoff. A note with an implausible
+/// date may go up to now. An empty range means none. Mirrored by
+/// `redateBounds` in `src/lib/orgPolicy.ts`; `src/lib/redateVectors.json`
+/// pins both.
+pub(crate) fn redate_bounds(days: u32, created_at: i64, now_ms: i64) -> (i64, i64) {
+    let min = retention_cutoff(now_ms, days).max(MIN_EPOCH_MS);
+    let max = if created_at >= MIN_EPOCH_MS { created_at } else { now_ms };
+    (min, max)
+}
+
+/// The cutoff for notes in `workspace_id` at `now_ms`, or `None` when no
+/// retention covers that workspace.
+#[cfg_attr(not(feature = "cloud"), allow(dead_code))]
+pub(crate) fn workspace_cutoff(conn: &Connection, workspace_id: &str, now_ms: i64) -> Option<i64> {
+    retention_rule(conn, workspace_id).map(|r| retention_cutoff(now_ms, r.days))
+}
+
 /// Cache one organisation with only `local_only` on, for other modules' tests.
 #[cfg(test)]
 pub(crate) fn cache_local_only(conn: &Connection, org: &str) {
@@ -634,6 +729,100 @@ mod tests {
 
     fn cache_one_org(conn: &Connection) {
         assert!(store(conn, &classify(200, ONE_ORG)).unwrap());
+    }
+
+    #[test]
+    fn retention_scope_takes_the_fewest_days_per_workspace() {
+        let config: OrgConfig = serde_json::from_str(
+            r#"{"orgs":[
+              {"id":"a","name":"A","policy":{"local_only":false,"retention_days":30,"telemetry_off":false,"audio_forbidden":false},"workspaces":["w1","w2",""," "]},
+              {"id":"b","name":"B","policy":{"local_only":false,"retention_days":7,"telemetry_off":false,"audio_forbidden":false},"workspaces":["w2"]},
+              {"id":"c","name":"C","policy":{"local_only":true,"retention_days":0,"telemetry_off":false,"audio_forbidden":false},"workspaces":["w3"]},
+              {"id":" ","name":"D","policy":{"local_only":false,"retention_days":1,"telemetry_off":false,"audio_forbidden":false},"workspaces":["w4"]}
+            ]}"#,
+        )
+        .unwrap();
+        let scope = retention_scope(&config);
+        let expected: std::collections::BTreeMap<String, u32> = [("w1".to_string(), 30), ("w2".to_string(), 7)].into();
+        assert_eq!(scope, expected, "0 days covers nothing; blank ids never");
+    }
+
+    #[derive(serde::Deserialize)]
+    struct RedateVectors {
+        now: i64,
+        cases: Vec<RedateCase>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct RedateCase {
+        days: u32,
+        created_at: i64,
+        min: i64,
+        max: i64,
+    }
+
+    /// The vectors `orgPolicy.test.ts` runs against `redateBounds`.
+    #[test]
+    fn redate_bounds_match_the_shared_vectors() {
+        let v: RedateVectors = serde_json::from_str(include_str!("../../src/lib/redateVectors.json")).unwrap();
+        assert!(v.cases.len() >= 7);
+        for c in v.cases {
+            assert_eq!(redate_bounds(c.days, c.created_at, v.now), (c.min, c.max), "{} days, created {}", c.days, c.created_at);
+        }
+    }
+
+    #[test]
+    fn a_rule_names_the_organisation_with_the_fewest_days() {
+        let config: OrgConfig = serde_json::from_str(
+            r#"{"orgs":[
+              {"id":"a","name":"A","policy":{"local_only":false,"retention_days":30,"telemetry_off":false,"audio_forbidden":false},"workspaces":["w1"]},
+              {"id":"b","name":"B","policy":{"local_only":false,"retention_days":7,"telemetry_off":false,"audio_forbidden":false},"workspaces":["w1"]},
+              {"id":"c","name":"C","policy":{"local_only":false,"retention_days":7,"telemetry_off":false,"audio_forbidden":false},"workspaces":["w1"]}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(retention_rules(&config)["w1"], RetentionRule { days: 7, source: "B".into() });
+    }
+
+    #[test]
+    fn an_implausible_creation_time_is_never_past() {
+        let cutoff = 1_800_000_000_000;
+        assert!(is_past(MIN_EPOCH_MS, cutoff));
+        assert!(!is_past(MIN_EPOCH_MS - 1, cutoff));
+        assert!(!is_past(0, cutoff));
+        assert!(!is_past(cutoff, cutoff));
+        assert!(is_past(cutoff - 1, cutoff));
+    }
+
+    #[test]
+    fn retention_covers_nothing_without_a_clean_cache() {
+        let (_d, conn) = conn();
+        assert!(retention_in_force(&conn).is_empty(), "nothing cached");
+        assert_eq!(workspace_cutoff(&conn, "w1", 10 * DAY_MS), None);
+        store(&conn, &classify(200, r#"{"orgs":[]}"#)).unwrap();
+        assert!(retention_in_force(&conn).is_empty(), "no organisation");
+        crate::db::set_setting(&conn, SETTING_ORG_CONFIG, "{not json").unwrap();
+        assert!(retention_in_force(&conn).is_empty(), "unreadable");
+        assert_eq!(workspace_cutoff(&conn, "w1", 10 * DAY_MS), None);
+        assert_eq!(effective_or_strictest(&conn).retention_days, 0);
+    }
+
+    #[test]
+    fn retention_reaches_only_the_organisation_workspaces() {
+        let (_d, conn) = conn();
+        cache_one_org(&conn);
+        let now = 100 * DAY_MS;
+        assert_eq!(workspace_cutoff(&conn, "w1", now), Some(70 * DAY_MS));
+        assert_eq!(retention_rule(&conn, "w1"), Some(RetentionRule { days: 30, source: "Northwind".into() }));
+        assert_eq!(workspace_cutoff(&conn, "", now), None, "Personal");
+        assert_eq!(workspace_cutoff(&conn, "  ", now), None);
+        assert_eq!(workspace_cutoff(&conn, "w2", now), None, "a workspace outside the organisation");
+    }
+
+    #[test]
+    fn the_cutoff_is_days_before_now_and_saturates() {
+        assert_eq!(retention_cutoff(100 * DAY_MS, 30), 70 * DAY_MS);
+        assert_eq!(retention_cutoff(i64::MIN + 1, u32::MAX), i64::MIN);
     }
 
     #[test]

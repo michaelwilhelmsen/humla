@@ -32,8 +32,11 @@ const cloud = (active: string | null) => {
   };
 };
 
-function openNote(note: ReturnType<typeof makeNote>, active: string | null) {
-  const setWorkspace = vi.fn(() => null);
+function openNote(
+  note: ReturnType<typeof makeNote>,
+  active: string | null,
+  setWorkspace: (args: unknown) => unknown = vi.fn(() => null),
+) {
   renderApp("/note/n1", {
     notes_list: () => [note],
     notes_get: () => note,
@@ -54,7 +57,7 @@ describe("moving a note to another workspace", () => {
     await userEvent.click(await screen.findByRole("button", { name: "Workspace" }));
     await userEvent.click(await screen.findByRole("menuitemradio", { name: "Acme" }));
 
-    expect(setWorkspace).toHaveBeenCalledWith({ id: "n1", workspaceId: "ws2" });
+    expect(setWorkspace).toHaveBeenCalledWith({ id: "n1", workspaceId: "ws2", workspaceName: "Acme" });
     expect(await screen.findByText("Moved “Weekly sync” to Acme")).toBeInTheDocument();
     await waitFor(() => expect(screen.getByTestId("location")).toHaveTextContent("/all-notes"));
   });
@@ -84,5 +87,20 @@ describe("moving a note to another workspace", () => {
     );
     expect(screen.getByTestId("location")).toHaveTextContent("/note/n1");
     expect(screen.queryByText(/^Moved /)).toBeNull();
+  });
+});
+
+describe("a move the backend refuses", () => {
+  it("stays on the note and says why", async () => {
+    const refuse = vi.fn(() => {
+      throw "Notes older than 30 days can't be moved to Acme.";
+    });
+    openNote(makeNote({ id: "n1", title: "Weekly sync", workspace_id: "ws1" }), "ws1", refuse);
+
+    await userEvent.click(await screen.findByRole("button", { name: "Workspace" }));
+    await userEvent.click(await screen.findByRole("menuitemradio", { name: "Acme" }));
+
+    expect(await screen.findByText("Notes older than 30 days can't be moved to Acme.")).toBeInTheDocument();
+    expect(screen.getByTestId("location")).toHaveTextContent("/note/n1");
   });
 });

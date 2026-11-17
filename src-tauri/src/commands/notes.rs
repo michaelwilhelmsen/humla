@@ -235,6 +235,9 @@ pub fn notes_set_date(
     check_note_date(created_at, db::now_ms())?;
     {
         let conn = state.db.lock();
+        if let Ok(note) = db::get_note(&conn, &id) {
+            super::org::check_redate(&conn, &note, created_at, db::now_ms())?;
+        }
         db::set_note_created_at(&conn, &id, created_at).map_err(err)?;
     }
     state.sync.note_upserted(&id);
@@ -262,6 +265,8 @@ pub fn notes_set_workspace(
     state: State<AppState>,
     id: String,
     workspace_id: String,
+    // Only for the refusal's wording; the backend keeps no workspace names.
+    workspace_name: Option<String>,
 ) -> Result<(), String> {
     let from = {
         let conn = state.db.lock();
@@ -269,6 +274,7 @@ pub fn notes_set_workspace(
         if note.workspace_id == workspace_id {
             return Ok(()); // already there — nothing to do
         }
+        super::org::check_move(&conn, &note, &workspace_id, workspace_name.as_deref(), db::now_ms())?;
         db::set_note_workspace(&conn, &id, &workspace_id).map_err(err)?;
         note.workspace_id
     };
