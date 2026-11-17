@@ -22,7 +22,10 @@ export type EffectivePolicy = {
   rules: PolicyRule[];
 };
 
-export type OrgStatus = { policy: EffectivePolicy };
+/** Mirrors `org_policy::OrgSummary`. */
+export type OrgSummary = { id: string; name: string; reason: string; vocabulary: string[] };
+
+export type OrgStatus = { policy: EffectivePolicy; orgs?: OrgSummary[] };
 
 /** Who set `local_only`, or null when it is off. */
 export function localOnlySource(policy: EffectivePolicy): PolicyRule | null {

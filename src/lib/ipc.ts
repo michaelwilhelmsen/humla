@@ -277,6 +277,10 @@ export type SummaryPrompt = {
   updated_at: number;
   /** The workspace it is shared in; empty for a personal template. */
   workspace_id?: string;
+  /** Set on an organisation's template, which is read-only. */
+  org_id?: string;
+  /** The departments an organisation template is offered in; empty is all. */
+  org_workspaces?: string[];
 };
 
 export type LocalWhisperModelStatus = {

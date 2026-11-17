@@ -7,7 +7,6 @@ import { OllamaConnect } from "../../../components/provider/OllamaConnect";
 import { ProviderKeyCard } from "../../../components/provider/ProviderKeyCard";
 import { CommandSnippet } from "../../../components/CommandSnippet";
 import { RECOMMENDED_OLLAMA_MODEL, RECOMMENDED_OLLAMA_MODEL_16GB } from "../../../lib/localModels";
-import { SUMMARY_PRESETS, presetLabel } from "../../../lib/presets";
 import { useCloudModels } from "../../../components/provider/useCloudModels";
 import { useProviderKey } from "../../../components/provider/useProviderKey";
 import { CopilotCard } from "../../../components/provider/CopilotCard";
@@ -16,6 +15,7 @@ import { useCopilotStatus } from "../../../components/provider/useCopilot";
 import { SUMMARY_PROVIDERS } from "../types";
 import { ipc, type SummaryPrompt } from "../../../lib/ipc";
 import { useLocalOnly } from "../../../lib/orgPolicy";
+import { templateOptions, useActiveWorkspaceId, useOrgContentVersion } from "../../../lib/orgContent";
 import { allowedUnderLocalOnly } from "../../../lib/providers";
 import { ManagedRow } from "../ManagedRow";
 import type { SettingsHook } from "../useSettings";
@@ -26,6 +26,8 @@ export function SummaryTab({
   onOpenTemplates,
 }: Pick<SettingsHook, "s" | "update"> & { onOpenTemplates?: () => void }) {
   const [templates, setTemplates] = useState<SummaryPrompt[]>([]);
+  const activeWorkspaceId = useActiveWorkspaceId();
+  const orgVersion = useOrgContentVersion();
   useEffect(() => {
     let cancelled = false;
     ipc
@@ -37,7 +39,7 @@ export function SummaryTab({
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [orgVersion]);
   const { managed, known } = useLocalOnly();
   const provider = managed ? enforcedLlmProvider(s.summary_provider, s.custom_base_url, "local") : s.summary_provider;
   const isLocal = provider === "local";
@@ -199,10 +201,7 @@ export function SummaryTab({
             <Select
               value={s.default_summary_preset}
               onChange={(v) => update("default_summary_preset", v)}
-              options={[
-                ...SUMMARY_PRESETS.map((p) => ({ value: p.value, label: presetLabel(p) })),
-                ...templates.map((t) => ({ value: `custom:${t.id}`, label: t.name })),
-              ]}
+              options={templateOptions(templates, activeWorkspaceId).map(({ value, label }) => ({ value, label }))}
             />
           }
         />

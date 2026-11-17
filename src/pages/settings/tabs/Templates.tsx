@@ -1,7 +1,14 @@
 import { useEffect, useState, type ReactNode } from "react";
-import { Copy, Eye, Pencil, Plus, Trash2 } from "lucide-react";
+import { Copy, Eye, Lock, Pencil, Plus, Trash2 } from "lucide-react";
 import { ipc, type SummaryPrompt } from "../../../lib/ipc";
 import { useCloudStore } from "../../../lib/cloud";
+import {
+  pickerTemplates,
+  useActiveWorkspaceId,
+  useOrgContentVersion,
+  useOrgs,
+} from "../../../lib/orgContent";
+import { ManagedBadge } from "../ManagedRow";
 import {
   SUMMARY_PRESETS,
   presetLabel,
@@ -20,7 +27,9 @@ type Draft = { id: string | null; name: string; content: string };
 // active belongs to that workspace and syncs to every member, who can all edit
 // it; personal ones stay on this Mac. The server refuses every template write
 // from a viewer, and a new template always lands in the active workspace, so a
-// viewer there can neither edit shared templates nor create one.
+// viewer there can neither edit shared templates nor create one. An
+// organisation's templates are read-only and listed only in the departments
+// they are offered to.
 export function TemplatesSection({ language }: { language: string }) {
   const [templates, setTemplates] = useState<SummaryPrompt[]>([]);
   const [viewing, setViewing] = useState<{ name: string; content: string; template: string } | null>(null);
@@ -32,6 +41,9 @@ export function TemplatesSection({ language }: { language: string }) {
   );
   const currentRole = useCloudStore((s) => s.status.current_workspace?.role);
   const workspaces = useCloudStore((s) => s.status.workspaces);
+  const activeWorkspaceId = useActiveWorkspaceId();
+  const orgs = useOrgs();
+  const orgVersion = useOrgContentVersion();
 
   useEffect(() => {
     let cancelled = false;
@@ -46,7 +58,7 @@ export function TemplatesSection({ language }: { language: string }) {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [orgVersion]);
 
   async function refresh() {
     setTemplates(await ipc.summaryPromptsList());
@@ -84,8 +96,12 @@ export function TemplatesSection({ language }: { language: string }) {
     setEditing({ id: null, name: `${name} (copy)`, content });
   }
 
-  const shared = templates.filter((t) => t.workspace_id);
-  const personal = templates.filter((t) => !t.workspace_id);
+  const { org: fromOrg, own } = pickerTemplates(templates, activeWorkspaceId);
+  const shared = own.filter((t) => t.workspace_id);
+  const personal = own.filter((t) => !t.workspace_id);
+  const orgsShown = orgs.filter((o) => fromOrg.some((t) => t.org_id === o.id));
+  const departmentNames = (t: SummaryPrompt) =>
+    (t.org_workspaces ?? []).flatMap((id) => workspaces.find((w) => w.id === id)?.name ?? []);
   const inWorkspace = workspaceName !== null || shared.length > 0;
   const canCreate = !(inWorkspace && currentRole === "viewer");
   const canEdit = (t: SummaryPrompt) =>
@@ -163,6 +179,50 @@ export function TemplatesSection({ language }: { language: string }) {
 
   return (
     <>
+      {fromOrg.length > 0 && (
+        <GroupSection
+          title="From your organisation"
+          aside={
+            <div className="flex flex-wrap justify-end gap-1">
+              {orgsShown.map((o) => (
+                <ManagedBadge key={o.id} source={o.name} reason={o.reason} />
+              ))}
+            </div>
+          }
+        >
+          {fromOrg.map((t) => (
+            <TemplateRow
+              key={t.id}
+              name={t.name}
+              locked
+              departments={departmentNames(t)}
+              actions={
+                <>
+                  <button
+                    type="button"
+                    className={quietBtnClass}
+                    aria-label={`View ${t.name}`}
+                    onClick={() => setViewing({ name: t.name, content: t.content, template: t.content })}
+                  >
+                    <Eye size={13} aria-hidden /> View
+                  </button>
+                  {canCreate && (
+                    <button
+                      type="button"
+                      className={quietBtnClass}
+                      aria-label={`Duplicate ${t.name}`}
+                      onClick={() => duplicate(t.name, t.content)}
+                    >
+                      <Copy size={13} aria-hidden /> Duplicate
+                    </button>
+                  )}
+                </>
+              }
+            />
+          ))}
+        </GroupSection>
+      )}
+
       <GroupSection title="Built-in">
         {SUMMARY_PRESETS.map((p) => {
           const name = presetLabel(p);
@@ -292,10 +352,33 @@ function GroupSection({
   );
 }
 
-function TemplateRow({ name, actions }: { name: string; actions: ReactNode }) {
+function TemplateRow({
+  name,
+  actions,
+  locked = false,
+  departments = [],
+}: {
+  name: string;
+  actions: ReactNode;
+  locked?: boolean;
+  departments?: string[];
+}) {
   return (
     <div className="flex items-center justify-between gap-4 py-2.5">
-      <span className="text-sm truncate min-w-0">{name}</span>
+      <div className="min-w-0 flex flex-wrap items-center gap-x-2 gap-y-1">
+        {locked && (
+          <Lock size={12} strokeWidth={2} aria-hidden className="shrink-0 text-[var(--color-text-muted)]" />
+        )}
+        <span className="text-sm truncate min-w-0">{name}</span>
+        {departments.map((d) => (
+          <span
+            key={d}
+            className="px-1.5 py-0.5 rounded-md text-xs text-[var(--color-text-muted)] bg-[var(--color-pill-hover)]"
+          >
+            {d}
+          </span>
+        ))}
+      </div>
       <div className="flex gap-0.5 shrink-0">{actions}</div>
     </div>
   );
