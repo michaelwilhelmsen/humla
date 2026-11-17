@@ -12,7 +12,6 @@ import { CustomEndpointCard } from "../../../components/provider/CustomEndpoint"
 import { NEMOTRON_MAX_SPEAKERS } from "../../../lib/diarizeEngine";
 import { KEY_ONLY_PROVIDERS } from "../../../lib/providers";
 import { LANGUAGES, languageOptionLabel } from "../../../lib/languages";
-import { inputClass } from "../types";
 import type { SettingsHook } from "../useSettings";
 
 // The selected cloud provider's key card renders right under the picker;
@@ -282,23 +281,6 @@ export function TranscriptionTab({
             used (#116 part 2). In Transcription rather than Chat because the row
             is about what transcripts say. */}
         <RenameYouRow />
-      </Section>
-
-      <Section title="Vocabulary">
-        <Row label="Custom terms">
-          <textarea
-            value={s.custom_vocabulary}
-            onChange={(e) => update("custom_vocabulary", e.target.value)}
-            rows={3}
-            placeholder="Tauri, Humla, ScreenCaptureKit, Granola"
-            className={inputClass + " leading-relaxed"}
-            style={{ fontFamily: "var(--font-mono)" }}
-          />
-          <p className="text-xs text-[var(--color-text-muted)] mt-2">
-            Comma- or newline-separated.
-            <code> gpt-4o-transcribe-diarize </code> ignores it.
-          </p>
-        </Row>
       </Section>
     </>
   );

@@ -86,6 +86,13 @@ export function presetPromptForLang(preset: PresetSpec, lang: string): string {
   return preset.prompt_en.replace("{LANGUAGE}", label);
 }
 
+// A built-in's instructions without its language clause: the summary run
+// appends the note's language directive to every template, so a copy must
+// not pin one of its own.
+export function presetTemplateText(preset: PresetSpec): string {
+  return preset.prompt_en.replace("Reply in {LANGUAGE} using Markdown.", "Use Markdown.");
+}
+
 export function presetLabelForLang(preset: PresetSpec, lang: string): string {
   return lang === "no" ? preset.label_no : preset.label_en;
 }

@@ -59,6 +59,12 @@ export function Modal({
   padded?: boolean;
 }) {
   const panelRef = useRef<HTMLDivElement>(null);
+  // Callers pass inline closures; keyed on them, the effect would re-run on every
+  // render and pull focus back to the first field while the user types.
+  const onCloseRef = useRef(onClose);
+  useEffect(() => {
+    onCloseRef.current = onClose;
+  });
 
   useEffect(() => {
     if (!open) return;
@@ -85,7 +91,7 @@ export function Modal({
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         e.stopPropagation();
-        onClose();
+        onCloseRef.current();
         return;
       }
       if (e.key === "Tab") {
@@ -120,7 +126,7 @@ export function Modal({
       // Restore focus to the trigger (no-op if it's been unmounted).
       previouslyFocused?.focus?.();
     };
-  }, [open, onClose]);
+  }, [open]);
 
   if (!open) return null;
 

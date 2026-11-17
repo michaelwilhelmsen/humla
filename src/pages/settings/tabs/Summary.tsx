@@ -1,8 +1,8 @@
+import { useEffect, useState } from "react";
 import { open as openExternal } from "@tauri-apps/plugin-shell";
 import { Row, Section } from "../components/Section";
 import { Select } from "../../../components/ui/Select";
 import { Toggle } from "../components/Toggle";
-import { SummaryPromptsManager } from "../components/SummaryPromptsManager";
 import { OllamaConnect } from "../../../components/provider/OllamaConnect";
 import { ProviderKeyCard } from "../../../components/provider/ProviderKeyCard";
 import { CommandSnippet } from "../../../components/CommandSnippet";
@@ -14,12 +14,27 @@ import { CopilotCard } from "../../../components/provider/CopilotCard";
 import { CustomEndpointCard, CustomModelField } from "../../../components/provider/CustomEndpoint";
 import { useCopilotStatus } from "../../../components/provider/useCopilot";
 import { SUMMARY_PROVIDERS } from "../types";
+import { ipc, type SummaryPrompt } from "../../../lib/ipc";
 import type { SettingsHook } from "../useSettings";
 
 export function SummaryTab({
   s,
   update,
-}: Pick<SettingsHook, "s" | "update">) {
+  onOpenTemplates,
+}: Pick<SettingsHook, "s" | "update"> & { onOpenTemplates?: () => void }) {
+  const [templates, setTemplates] = useState<SummaryPrompt[]>([]);
+  useEffect(() => {
+    let cancelled = false;
+    ipc
+      .summaryPromptsList()
+      .then((next) => {
+        if (!cancelled) setTemplates(next);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
   const isLocal = s.summary_provider === "local";
   const isAnthropic = s.summary_provider === "anthropic";
   // Called unconditionally (rules of hooks) and inert until that provider is
@@ -154,23 +169,29 @@ export function SummaryTab({
         )}
 
         <Row
-          label="Default preset"
-          description="For new notes."
+          label="Default template"
+          description={
+            onOpenTemplates && (
+              <button
+                type="button"
+                onClick={onOpenTemplates}
+                className="underline hover:text-[var(--color-text)]"
+              >
+                Edit templates
+              </button>
+            )
+          }
           control={
             <Select
               value={s.default_summary_preset}
               onChange={(v) => update("default_summary_preset", v)}
-              options={SUMMARY_PRESETS.map((p) => ({
-                value: p.value,
-                label: presetLabel(p),
-              }))}
+              options={[
+                ...SUMMARY_PRESETS.map((p) => ({ value: p.value, label: presetLabel(p) })),
+                ...templates.map((t) => ({ value: `custom:${t.id}`, label: t.name })),
+              ]}
             />
           }
         />
-      </Section>
-
-      <Section title="Summary prompts">
-        <SummaryPromptsManager language={s.language} />
       </Section>
     </>
   );

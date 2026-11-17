@@ -301,6 +301,12 @@ fn resolve_prompt(conn: &rusqlite::Connection, note: &Note, language: &str) -> S
     }
 }
 
+/// The template followed by the note's language directive. Every template gets
+/// the directive, the user's own included, so none has to name a language.
+fn system_prompt(conn: &rusqlite::Connection, note: &Note, language: &str) -> String {
+    format!("{}\n\n{}", resolve_prompt(conn, note, language), language_directive(language))
+}
+
 /// Turn `auto` into the language the recording was actually in, when the
 /// STT provider told us (issue #167).
 ///
@@ -362,9 +368,9 @@ async fn run_summary(app: AppHandle, note_id: String) -> anyhow::Result<()> {
         return Ok(());
     }
     attach_copilot(&app, &mut provider).await?;
-    let prompt = {
+    let full_prompt = {
         let conn = state.db.lock();
-        resolve_prompt(&conn, &note, &language)
+        system_prompt(&conn, &note, &language)
     };
     let body_text = crate::html_text::html_to_text(&note.body);
     // Always send both labels even when one side is empty. Sending only
@@ -384,9 +390,6 @@ async fn run_summary(app: AppHandle, note_id: String) -> anyhow::Result<()> {
         format!("[Transkripsjon]\n{}", note.transcript)
     };
     let user_message = format!("{notes_block}\n\n{transcript_block}");
-    // Hard language directive in case the prompt was authored in a different
-    // language than the user has now chosen.
-    let full_prompt = format!("{prompt}\n\n{}", language_directive(&language));
     // Stream thinking + content deltas to the frontend so the user sees
     // the model working in real time. Especially valuable when think=true
     // on Qwen 3.5+ — without live feedback users wait minutes wondering if
@@ -478,6 +481,20 @@ mod tests {
         let row = db::create_summary_prompt(&conn, "Mine", "MY CUSTOM PROMPT", "").unwrap();
         let note = db::create_note(&conn, "no", &format!("custom:{}", row.id), "").unwrap();
         assert_eq!(resolve_prompt(&conn, &note, "no"), "MY CUSTOM PROMPT");
+    }
+
+    #[test]
+    fn a_custom_template_gets_the_notes_language_directive() {
+        let (_dir, conn) = temp_conn();
+        let row = db::create_summary_prompt(&conn, "Mine", "List the decisions.", "").unwrap();
+        let preset = format!("custom:{}", row.id);
+        for (lang, directive) in [("no", "Skriv hele svaret på norsk"), ("en", "English"), ("auto", "transcript")] {
+            let note = db::create_note(&conn, lang, &preset, "").unwrap();
+            let p = system_prompt(&conn, &note, lang);
+            assert!(p.starts_with("List the decisions."), "{lang}: {p}");
+            assert!(p.ends_with(&language_directive(lang)), "{lang}: {p}");
+            assert!(p.contains(directive), "{lang}: {p}");
+        }
     }
 
     #[test]
