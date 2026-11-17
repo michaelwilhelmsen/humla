@@ -30,7 +30,7 @@ import {
   Users,
   X,
 } from "lucide-react";
-import { deletedAfter, useRetentionDays } from "../lib/orgPolicy";
+import { deletedAfter, redateBounds, useRetentionDays } from "../lib/orgPolicy";
 import { ipc, onNotesPurged, onSummaryThinkingDelta, onSummaryContentDelta, type Note as TNote, type NoteRevision, type NoteSession, type SummaryPrompt, type TimelineEntry } from "../lib/ipc";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { SUMMARY_CAPABLE, type SummaryProvider } from "../lib/providers";
@@ -1276,12 +1276,16 @@ export function Note() {
                 // A note moved out of the active workspace is no longer in any
                 // list this view belongs to, so the view leaves with it.
                 const leaving = workspaceId !== activeWorkspaceId;
+                const name = myWorkspaces.find((w) => w.id === workspaceId)?.name;
                 await flushSave().catch(warnSaveFailed);
-                await ipc.setNoteWorkspace(draft.id, workspaceId);
+                try {
+                  await ipc.setNoteWorkspace(draft.id, workspaceId, name);
+                } catch (e) {
+                  useRecordingStore.getState().pushFlash(String(e));
+                  return;
+                }
                 if (leaving) {
-                  const dest = workspaceId
-                    ? (myWorkspaces.find((w) => w.id === workspaceId)?.name ?? "another workspace")
-                    : "Personal";
+                  const dest = workspaceId ? (name ?? "another workspace") : "Personal";
                   const title = draft.title.trim();
                   navigate(backTo);
                   useRecordingStore
@@ -1326,6 +1330,7 @@ export function Note() {
             value={draft.created_at}
             label={dateChip}
             disabled={readOnly}
+            bounds={retentionDays > 0 ? () => redateBounds(retentionDays, draft.created_at, Date.now()) : null}
             onChange={async (createdAt) => {
               if (!draft || readOnly || createdAt === draft.created_at) return;
               const next = { ...draft, created_at: createdAt };
@@ -2324,21 +2329,29 @@ function DatePicker({
   value,
   label,
   disabled,
+  bounds,
   onChange,
 }: {
   value: number;
   label: string;
   disabled?: boolean;
+  /** The earliest and latest dates allowed, read when the picker opens; null
+   *  for any date up to now. */
+  bounds: (() => { min: number; max: number }) | null;
   onChange: (createdAt: number) => void;
 }) {
   const [open, setOpen] = useState(false);
   const [day, setDay] = useState(() => startOfDay(value));
   const [month, setMonth] = useState(() => startOfDay(value));
   const [time, setTime] = useState("");
+  const [range, setRange] = useState<{ min: number; max: number } | null>(null);
+  const latest = range ? Math.min(range.max, Date.now()) : Date.now();
   const picked = withTime(day, time);
-  const future = picked !== null && picked > Date.now();
+  const outside = picked !== null && (picked > latest || (range !== null && picked < range.min));
   const today = startOfDay(Date.now());
-  const atThisMonth = new Date(month.getFullYear(), month.getMonth() + 1, 1) > today;
+  const lastDay = startOfDay(latest);
+  const firstDay = range ? startOfDay(range.min) : null;
+  const atThisMonth = new Date(month.getFullYear(), month.getMonth() + 1, 1) > lastDay;
   const grid = monthGrid(month.getFullYear(), month.getMonth());
   // A last week that is all next month is dead height.
   const days = grid[35].getMonth() === month.getMonth() ? grid : grid.slice(0, 35);
@@ -2351,6 +2364,7 @@ function DatePicker({
           setDay(startOfDay(value));
           setMonth(startOfDay(value));
           setTime(toTimeInput(value));
+          setRange(bounds?.() ?? null);
         }
         setOpen(next);
       }}
@@ -2372,7 +2386,7 @@ function DatePicker({
           className="flex flex-col gap-4"
           onSubmit={(e) => {
             e.preventDefault();
-            if (picked === null || future) return;
+            if (picked === null || outside) return;
             // The picker has no seconds, so an untouched Save would still move the note.
             if (picked !== withTime(startOfDay(value), toTimeInput(value))) onChange(picked);
             setOpen(false);
@@ -2408,12 +2422,12 @@ function DatePicker({
                 const selected = d.getTime() === day.getTime();
                 const inMonth = d.getMonth() === month.getMonth();
                 const isToday = d.getTime() === today.getTime();
-                const afterToday = d.getTime() > today.getTime();
+                const unavailable = d.getTime() > lastDay.getTime() || (firstDay !== null && d.getTime() < firstDay.getTime());
                 return (
                   <button
                     key={d.getTime()}
                     type="button"
-                    disabled={afterToday}
+                    disabled={unavailable}
                     aria-label={d.toLocaleDateString(undefined, { dateStyle: "full" })}
                     aria-pressed={selected}
                     onClick={() => {
@@ -2422,7 +2436,7 @@ function DatePicker({
                     }}
                     className={cn(
                       "h-8 rounded-md text-[13px] tabular-nums transition-colors",
-                      afterToday
+                      unavailable
                         ? "opacity-30"
                         : selected
                           ? "bg-[var(--color-accent)] text-[var(--color-on-accent)] font-semibold cursor-pointer"
@@ -2459,7 +2473,7 @@ function DatePicker({
             <button type="button" className="nd-btn" onClick={() => setOpen(false)}>
               Cancel
             </button>
-            <button type="submit" className="nd-btn nd-btn-primary" disabled={picked === null || future}>
+            <button type="submit" className="nd-btn nd-btn-primary" disabled={picked === null || outside}>
               Save
             </button>
           </div>

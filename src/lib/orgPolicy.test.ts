@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import sttConfig from "../../src-tauri/src/stt/config.rs?raw";
 import vectors from "./loopbackVectors.json";
+import redate from "./redateVectors.json";
 import {
   NO_POLICY,
   ON_DEVICE_WHISPER,
@@ -9,6 +10,7 @@ import {
   localOnlySource,
   policySource,
   policyRows,
+  redateBounds,
   retentionDaysFor,
   type EffectivePolicy,
 } from "./orgPolicy";
@@ -64,6 +66,12 @@ describe("retentionDaysFor", () => {
     expect(retentionDaysFor(scope, "w3")).toBe(0);
     expect(retentionDaysFor(scope, "constructor")).toBe(0);
     expect(retentionDaysFor({}, "w1")).toBe(0);
+  });
+});
+
+describe("redateBounds mirrors org_policy::redate_bounds", () => {
+  it.each(redate.cases)("$days days, created $created_at", (c) => {
+    expect(redateBounds(c.days, c.created_at, redate.now)).toEqual({ min: c.min, max: c.max });
   });
 });
 

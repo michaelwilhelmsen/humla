@@ -425,8 +425,9 @@ export const ipc = {
   moveNote: (id: string, folderId: string | null) =>
     invoke<void>("notes_move", { id, folderId }),
   // Reassign a note to a workspace ("" = Personal/local-only).
-  setNoteWorkspace: (id: string, workspaceId: string) =>
-    invoke<void>("notes_set_workspace", { id, workspaceId }),
+  // `workspaceName` only words a refusal; the backend keeps no names.
+  setNoteWorkspace: (id: string, workspaceId: string, workspaceName?: string) =>
+    invoke<void>("notes_set_workspace", { id, workspaceId, workspaceName: workspaceName ?? null }),
   // Who can read the note inside its workspace (#191, #232): everyone, or its
   // author plus `sharedWith`. Also banks everyone-or-restricted as that
   // workspace's default for the next note.

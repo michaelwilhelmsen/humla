@@ -73,3 +73,25 @@ describe("a note under its organisation's retention", () => {
     expect(screen.getByTestId("location")).toHaveTextContent("/note/n1");
   });
 });
+
+describe("the date picker", () => {
+  const DAY = 86_400_000;
+  const created = Date.now() - 10 * DAY;
+  const dayButton = (ts: number) =>
+    screen.getByRole("button", { name: new Date(ts).toLocaleDateString(undefined, { dateStyle: "full" }) });
+
+  it("under retention offers only earlier days", async () => {
+    open(makeNote({ id: "n1", title: "Case", workspace_id: "w1", created_at: created }), { w1: 30 });
+    await userEvent.click(await screen.findByRole("button", { name: "Date" }));
+    expect(dayButton(created + DAY)).toBeDisabled();
+    expect(dayButton(created - DAY)).toBeEnabled();
+  });
+
+  it("without retention offers any day up to today, as before", async () => {
+    open(makeNote({ id: "n1", title: "Case", workspace_id: "w2", created_at: created }), { w1: 30 });
+    await userEvent.click(await screen.findByRole("button", { name: "Date" }));
+    expect(dayButton(created + DAY)).toBeEnabled();
+    expect(dayButton(created - DAY)).toBeEnabled();
+  });
+});
+

@@ -79,6 +79,20 @@ export function enforceLocalOnly(cfg: ProviderConfig, customBaseUrl: string): Pr
   return allowedUnderLocalOnly(cfg.provider, transcribeEndpoint(cfg, customBaseUrl)) ? cfg : ON_DEVICE_WHISPER;
 }
 
+const DAY_MS = 86_400_000;
+
+/** The smallest `created_at` read as a real time. Mirrors `org_policy::MIN_EPOCH_MS`. */
+export const MIN_EPOCH_MS = 1_000_000_000_000;
+
+/** Under `days` of retention, the dates a note created at `createdAt` may be
+ *  moved to at `now`, inclusive: never later than it is, never past the cutoff.
+ *  Mirrors `org_policy::redate_bounds`; `redateVectors.json` pins both. */
+export function redateBounds(days: number, createdAt: number, now: number): { min: number; max: number } {
+  const min = Math.max(now - days * DAY_MS, MIN_EPOCH_MS);
+  const max = createdAt >= MIN_EPOCH_MS ? createdAt : now;
+  return { min, max };
+}
+
 export function deletedAfter(days: number): string {
   return `Deleted after ${days} ${days === 1 ? "day" : "days"}`;
 }
