@@ -1953,6 +1953,25 @@ const CASES: Record<string, Scenario> = {
     ipc: settingsContentIpc("viewer"),
   },
 
+  // --- Settings → Account, signed in to a workspace. `account-policies` adds an
+  // organisation enforcing every policy; `-signed-out` is the same after
+  // sign-out, when the cached policies stay in force.
+  account: {
+    route: "/settings?tab=account",
+    render: () => null, // unused — `route` renders the app
+    ipc: accountIpc({ signedIn: true, policies: false }),
+  },
+  "account-policies": {
+    route: "/settings?tab=account",
+    render: () => null, // unused — `route` renders the app
+    ipc: accountIpc({ signedIn: true, policies: true }),
+  },
+  "account-policies-signed-out": {
+    route: "/settings?tab=account",
+    render: () => null, // unused — `route` renders the app
+    ipc: accountIpc({ signedIn: false, policies: true }),
+  },
+
   // --- Two-factor authentication. Settings → Account, signed in to a
   // workspace you administer. `-off` also has a workspace waiting for it, so the
   // switcher's locked row and the section's notice show; click "Turn on…" for
@@ -2034,6 +2053,55 @@ function settingsContentIpc(
           }),
         }
       : {}),
+  };
+}
+
+function accountIpc({ signedIn, policies }: { signedIn: boolean; policies: boolean }) {
+  const team: CloudWorkspace = { id: "w1", name: "Northwind Health", role: "member", plan_status: "active" };
+  const reason = "Nothing leaves this Mac.";
+  const kinds = ["local_only", "retention_days", "telemetry_off", "audio_forbidden"] as const;
+  return {
+    cloud_status: () =>
+      signedIn
+        ? {
+            ...DISCONNECTED,
+            configured: true,
+            logged_in: true,
+            base_url: "https://sync.humla.team",
+            user: { id: "u1", email: "m@example.no", name: "Michael", verified: true },
+            current_workspace: team,
+            workspaces: [team],
+          }
+        : {
+            ...DISCONNECTED,
+            configured: true,
+            base_url: "https://sync.humla.team",
+          },
+    cloud_workspace_members: () => [
+      { id: "u1", email: "m@example.no", name: "Michael", role: "member" },
+      { id: "u2", email: "kari@example.no", name: "Kari", role: "owner" },
+    ],
+    org_status: () => ({
+      policy: policies
+        ? {
+            org_name: "Northwind",
+            reason,
+            local_only: true,
+            retention_days: 90,
+            telemetry_off: true,
+            audio_forbidden: true,
+            rules: kinds.map((kind) => ({ kind, source: "Northwind", reason })),
+          }
+        : {
+            org_name: null,
+            reason: null,
+            local_only: false,
+            retention_days: 0,
+            telemetry_off: false,
+            audio_forbidden: false,
+            rules: [],
+          },
+    }),
   };
 }
 
