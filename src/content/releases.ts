@@ -11,6 +11,26 @@ export type Release = {
 
 export const releases: Release[] = [
   {
+    version: "0.76.1",
+    date: "2026-11-17",
+    title: "Housekeeping and security fixes",
+    summary: "Updated dependencies, a few security fixes and a tidier codebase. Nothing changes in how you use Humla.",
+    paragraphs: [
+      "This release is mostly housekeeping. Humla's dependencies are updated across the board, which clears every known security advisory in them. One of those let pasted HTML run script inside the note editor. Humla's window also had more control over the recording helper than it needed, and that's gone now too.",
+      "A couple of small things you might notice: Settings → About → Open in Finder works again, and the MCP server and webhook settings now link to the setup guides at humla.team/docs. If you use GitHub Copilot, Humla moves to a newer version of the Copilot CLI.",
+      "Under the hood, the biggest file in the app is split into smaller pieces and type-checking runs on the new TypeScript compiler, which is several times faster. You won't see either directly, but they make the next changes quicker and safer to build.",
+    ],
+    highlights: [
+      "Dependencies updated, with every known security advisory cleared.",
+      "Open in Finder in Settings → About works again.",
+      "Setup guides for MCP and webhooks are linked from Settings.",
+      "Newer Copilot CLI.",
+    ],
+    issues: [
+      { title: "Docs: a linkable MCP setup guide for Claude Code / Codex", reference: "#184", status: "Closed", url: "https://github.com/michaelwilhelmsen/humla/issues/184" },
+    ],
+  },
+  {
     version: "0.76.0",
     date: "2026-11-15",
     title: "Start recording from a link",
