@@ -3,7 +3,7 @@
    generic over the editor and not exported in a usable shape; typing them by hand
    restates the plugin's internals and drifts on every Tiptap bump. */
 import { Extension, ReactRenderer, type Editor, type Range } from "@tiptap/react";
-import Suggestion from "@tiptap/suggestion";
+import Suggestion, { type SuggestionOptions } from "@tiptap/suggestion";
 import tippy, { type Instance as TippyInstance } from "tippy.js";
 import { useEffect, useImperativeHandle, useState, forwardRef } from "react";
 
@@ -139,7 +139,9 @@ const SlashList = forwardRef<ListHandle, ListProps>(({ items, command }, ref) =>
 
 SlashList.displayName = "SlashList";
 
-export const SlashCommand = Extension.create({
+type SlashOptions = { suggestion: Omit<SuggestionOptions<SlashItem, SlashItem>, "editor"> };
+
+export const SlashCommand = Extension.create<SlashOptions>({
   name: "slashCommand",
   addOptions() {
     return {

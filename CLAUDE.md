@@ -104,6 +104,7 @@ Feature detail lives in `docs/features/` and `docs/architecture/`; read the link
 - A theme is one CSS file + one `PALETTE_REGISTRY` row + one `@import`; `themes.contract.test.ts` enforces the contract in `src/lib/themeContract.ts`.
 - `NoteToolbar` thresholds, `BODY_MIN` and `ROW_STEPS` come from `scripts/measure-toolbar.js` / `scripts/measure-recording-bar.js`; re-derive them after changing those rows or a theme's control metrics.
 - In the mock harness (`pnpm mock`) a scenario wrapper must mirror the real container, or it shows layout bugs that aren't real.
+- `tsc` is TypeScript 7 (the Go compiler, installed as `@typescript/native`). The `typescript` package is TypeScript 6 (`@typescript/typescript6`, binary `tsc6`), because typescript-eslint and `scripts/check-release-notes.mjs` need the JavaScript compiler API, which 7 doesn't have. Don't point `typescript` at 7.
 - `clamp_device_name` (Rust) ↔ `noAudioWarning` (TS) share pinned test vectors — change both.
 
 ## Architecture overview
@@ -137,7 +138,7 @@ Recording in short: `recording_start` spawns `audio-capture` (via `setsid`); eac
 
 ## Tech stack
 
-- **Frontend**: React 19, TypeScript, Vite 8, Tauri 2, React Router 7, Zustand (`useNotesStore`, `useRecordingStore`, events bound once in `bindBackendListeners`), Tiptap 3, Tailwind v4, Radix, lucide-react, react-markdown + remark-gfm. Two themes (warm, graphite) × light/dark. → [frontend](docs/architecture/frontend.md)
+- **Frontend**: React 19, TypeScript 7, Vite 8, Tauri 2, React Router 7, Zustand (`useNotesStore`, `useRecordingStore`, events bound once in `bindBackendListeners`), Tiptap 3, Tailwind v4, Radix, lucide-react, react-markdown + remark-gfm. Two themes (warm, graphite) × light/dark. → [frontend](docs/architecture/frontend.md)
 - **Backend**: Rust 1.94 (`github-copilot-sdk`'s floor), Tauri 2, rusqlite (`bundled`, WAL, idempotent ALTER TABLE migrations, indexes created after migrations), reqwest 0.13 (rustls on ring, `stream`), tokio (`spawn_blocking` for local Whisper), whisper-rs 0.16 (`metal` on macOS only; `large-v3-turbo-q5_0` ~547 MB; NB Whisper Large for Norwegian), parking_lot, keyring-core + `apple-native-keyring-store`, serde/serde_json/chrono/uuid/anyhow/async-trait.
 
 ### Module map (`src-tauri/src/`)
