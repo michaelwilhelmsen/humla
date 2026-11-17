@@ -267,8 +267,6 @@ impl<'a> StreamSteps<'a> {
     }
 }
 
-// ---- Speaker diarization model management ---------------------------------
-
 /// The diarization engine selected in Settings.
 pub(crate) fn selected_diarize_engine(state: &State<AppState>) -> diarize::Engine {
     let conn = state.db.lock();
