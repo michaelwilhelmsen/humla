@@ -5,6 +5,7 @@ import { Sidebar } from "./Sidebar";
 import { TopBar } from "./TopBar";
 import { Toaster } from "./Toaster";
 import { Updater } from "./Updater";
+import { OrgAudioNotice } from "./OrgAudioNotice";
 import { CaptureIndicator, indicatorState } from "./RecordingBar";
 import { useCaptureElapsed } from "../lib/captureClock";
 import { ErrorBoundary } from "./ErrorBoundary";
@@ -110,6 +111,7 @@ export function Layout() {
       </main>
       <Toaster />
       <Updater />
+      <OrgAudioNotice />
       {!onCaptureNote && (
         <CaptureIndicator
           variant="compact"

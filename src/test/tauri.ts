@@ -70,6 +70,8 @@ export function mockTauri(
           workspaces: [],
           billing_enabled: false,
         };
+      case "org_audio_notice":
+        return null;
       case "org_status":
         return {
           policy: {

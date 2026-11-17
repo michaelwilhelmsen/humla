@@ -502,15 +502,16 @@ pub(crate) fn blocked_message(source: Option<&str>) -> String {
 }
 
 /// The policy for a caller that enforces. A cache that can't be read is read as
-/// `local_only` on, the strictest setting this module can enforce: it only
-/// narrows processing to this Mac, so on-device and loopback work carries on.
+/// `local_only`, `telemetry_off` and `audio_forbidden` on: each only stops
+/// something leaving or staying on this Mac. Retention is left off, since it
+/// deletes notes, and nothing read through here may start a deletion.
 pub(crate) fn effective_or_strictest(conn: &Connection) -> EffectivePolicy {
     effective(conn).unwrap_or_else(|e| {
-        eprintln!("org policy: unreadable, enforcing local_only: {e:#}");
+        eprintln!("org policy: unreadable, enforcing the strictest policy: {e:#}");
         merge(&[Layer {
             source: UNKNOWN_SOURCE.into(),
             reason: String::new(),
-            policy: OrgPolicy { local_only: true, ..OrgPolicy::default() },
+            policy: OrgPolicy { local_only: true, telemetry_off: true, audio_forbidden: true, retention_days: 0 },
         }])
     })
 }
@@ -540,6 +541,57 @@ pub(crate) fn check_leaves_mac(conn: &Connection) -> anyhow::Result<()> {
     } else {
         Ok(())
     }
+}
+
+// ---- audio_forbidden: the one-time sweep ------------------------------------
+
+/// The organisations whose `audio_forbidden` has already swept this Mac's
+/// stored audio, as a JSON array of ids.
+pub(crate) const SETTING_AUDIO_SWEPT: &str = "org_audio_swept";
+
+/// An organisation whose `audio_forbidden` still owes the sweep of audio
+/// already on this Mac.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct AudioSweep {
+    pub org_id: String,
+    pub org_name: String,
+}
+
+/// The first organisation that forbids audio and hasn't swept yet. Only a
+/// cache that reads cleanly can name one, and only an organisation with an id
+/// and a name: a policy that can't be read closes the audio gate through
+/// [`effective_or_strictest`] but never deletes anything.
+pub(crate) fn audio_sweep_due(conn: &Connection) -> Option<AudioSweep> {
+    let Ok(Some(config)) = cached(conn) else { return None };
+    let swept = swept_orgs(conn);
+    config
+        .orgs
+        .into_iter()
+        .find(|o| {
+            o.policy.audio_forbidden
+                && !o.id.trim().is_empty()
+                && !o.name.trim().is_empty()
+                && !swept.contains(&o.id)
+        })
+        .map(|o| AudioSweep { org_id: o.id, org_name: o.name })
+}
+
+fn swept_orgs(conn: &Connection) -> Vec<String> {
+    crate::db::get_setting(conn, SETTING_AUDIO_SWEPT)
+        .ok()
+        .flatten()
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default()
+}
+
+/// Record that `org_id`'s sweep ran, so its notice doesn't come back.
+pub(crate) fn record_audio_sweep(conn: &Connection, org_id: &str) -> anyhow::Result<()> {
+    let mut swept = swept_orgs(conn);
+    if !swept.iter().any(|id| id == org_id) {
+        swept.push(org_id.to_string());
+        crate::db::set_setting(conn, SETTING_AUDIO_SWEPT, &serde_json::to_string(&swept)?)?;
+    }
+    Ok(())
 }
 
 /// Cache one organisation with only `local_only` on, for other modules' tests.
@@ -950,5 +1002,72 @@ mod tests {
         let (_d, conn) = conn();
         assert!(check_endpoint(&conn, ProviderId::OpenAi, None).is_ok());
         assert!(check_leaves_mac(&conn).is_ok());
+    }
+    fn cache_audio(conn: &Connection, id: &str, name: &str, forbidden: bool) {
+        let body = format!(
+            r#"{{"orgs":[{{"id":"{id}","name":"{name}","policy":{{"local_only":false,"retention_days":0,"telemetry_off":false,"audio_forbidden":{forbidden}}}}}]}}"#
+        );
+        assert!(matches!(classify(200, &body), FetchOutcome::Fetched(_)), "{body}");
+        store(conn, &classify(200, &body)).unwrap();
+    }
+
+    #[test]
+    fn no_organisation_owes_no_sweep_and_forbids_nothing() {
+        let (_d, conn) = conn();
+        assert_eq!(audio_sweep_due(&conn), None, "nothing cached");
+        let p = effective_or_strictest(&conn);
+        assert!(!p.audio_forbidden && !p.telemetry_off);
+        store(&conn, &classify(200, r#"{"orgs":[]}"#)).unwrap();
+        assert_eq!(audio_sweep_due(&conn), None, "an empty answer");
+        let p = effective_or_strictest(&conn);
+        assert!(!p.audio_forbidden && !p.telemetry_off);
+        cache_audio(&conn, "o1", "Northwind", false);
+        assert_eq!(audio_sweep_due(&conn), None, "an organisation that allows audio");
+    }
+
+    #[test]
+    fn an_unreadable_cache_closes_the_audio_gate_but_never_sweeps() {
+        let (_d, conn) = conn();
+        crate::db::set_setting(&conn, SETTING_ORG_CONFIG, "{not json").unwrap();
+        let p = effective_or_strictest(&conn);
+        assert!(p.audio_forbidden && p.telemetry_off);
+        assert_eq!(p.retention_days, 0, "an unreadable policy deletes no notes");
+        assert_eq!(audio_sweep_due(&conn), None);
+        let garbled = r#"{"orgs":[{"id":"o1","name":"Northwind","policy":{"audio_forbidden":true}}]}"#;
+        crate::db::set_setting(&conn, SETTING_ORG_CONFIG, garbled).unwrap();
+        assert!(effective_or_strictest(&conn).audio_forbidden);
+        assert_eq!(audio_sweep_due(&conn), None, "a policy missing fields is unreadable");
+    }
+
+    #[test]
+    fn audio_forbidden_from_a_named_organisation_owes_one_sweep() {
+        let (_d, conn) = conn();
+        cache_audio(&conn, "o1", "Northwind", true);
+        let due = audio_sweep_due(&conn).unwrap();
+        assert_eq!((due.org_id.as_str(), due.org_name.as_str()), ("o1", "Northwind"));
+        record_audio_sweep(&conn, "o1").unwrap();
+        record_audio_sweep(&conn, "o1").unwrap();
+        assert_eq!(audio_sweep_due(&conn), None);
+        assert_eq!(crate::db::get_setting(&conn, SETTING_AUDIO_SWEPT).unwrap().as_deref(), Some(r#"["o1"]"#));
+        assert!(effective_or_strictest(&conn).audio_forbidden, "the gate stays closed after the sweep");
+    }
+
+    #[test]
+    fn a_second_organisation_owes_its_own_sweep() {
+        let (_d, conn) = conn();
+        cache_audio(&conn, "o1", "Northwind", true);
+        record_audio_sweep(&conn, "o1").unwrap();
+        cache_audio(&conn, "o2", "Fjordby", true);
+        assert_eq!(audio_sweep_due(&conn).map(|d| d.org_id), Some("o2".into()));
+    }
+
+    #[test]
+    fn an_organisation_without_an_id_or_name_never_sweeps() {
+        let (_d, conn) = conn();
+        cache_audio(&conn, "o1", " ", true);
+        assert_eq!(audio_sweep_due(&conn), None);
+        cache_audio(&conn, "", "Northwind", true);
+        assert_eq!(audio_sweep_due(&conn), None);
+        assert!(effective_or_strictest(&conn).audio_forbidden);
     }
 }

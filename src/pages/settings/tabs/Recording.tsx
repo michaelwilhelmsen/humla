@@ -7,6 +7,9 @@ import { LaunchAtLoginField } from "../components/LaunchAtLoginField";
 import { Row, Section } from "../components/Section";
 import { Toggle } from "../components/Toggle";
 import type { SettingsHook } from "../useSettings";
+import { retainsAudio } from "../../../lib/audioGate";
+import { policySource, useOrgPolicy } from "../../../lib/orgPolicy";
+import { ManagedRow } from "../ManagedRow";
 
 // Recording section: capture permissions, audio retention, and menu-bar mode
 // (#21) — the triggers that start a recording from outside the window.
@@ -14,7 +17,9 @@ export function RecordingSection({
   s,
   update,
 }: Pick<SettingsHook, "s" | "update">) {
-  const keeping = s.keep_audio === "true";
+  const policy = useOrgPolicy();
+  const audioManaged = policySource(policy, "audio_forbidden");
+  const keeping = retainsAudio(s.keep_audio, policy.audio_forbidden);
   const manualTranscription = s.transcribe_manually === "true";
   const closeToTray = s.close_to_tray === "true";
   const keepAwake = s.keep_awake !== "false";
@@ -25,26 +30,35 @@ export function RecordingSection({
       </Section>
 
       <Section title="Audio retention">
-        <Row
-          label="Keep recorded audio"
-          // The copy states which regime is in force rather than describing
-          // the knob (#24). Before that issue this setting was a half-truth:
-          // the mixed playback audio was written either way, so "off keeps
-          // nothing" was false. It's now literal, which is also why the off
-          // text names the cost — no playback, no re-detection.
-          description={
-            keeping
-              ? "For playback and speaker re-detection. About 2 MB per minute per source."
-              : "Transcript only. No playback or speaker re-detection."
-          }
-          control={
-            <Toggle
-              label="Keep recorded audio"
-              checked={keeping}
-              onChange={(on) => update("keep_audio", on ? "true" : "false")}
-            />
-          }
-        />
+        {audioManaged ? (
+          <ManagedRow
+            label="Keep recorded audio"
+            source={audioManaged.source}
+            reason={audioManaged.reason}
+            control={<Toggle label="Keep recorded audio" checked={false} onChange={() => {}} disabled />}
+          />
+        ) : (
+          <Row
+            label="Keep recorded audio"
+            // The copy states which regime is in force rather than describing
+            // the knob (#24). Before that issue this setting was a half-truth:
+            // the mixed playback audio was written either way, so "off keeps
+            // nothing" was false. It's now literal, which is also why the off
+            // text names the cost — no playback, no re-detection.
+            description={
+              keeping
+                ? "For playback and speaker re-detection. About 2 MB per minute per source."
+                : "Transcript only. No playback or speaker re-detection."
+            }
+            control={
+              <Toggle
+                label="Keep recorded audio"
+                checked={keeping}
+                onChange={(on) => update("keep_audio", on ? "true" : "false")}
+              />
+            }
+          />
+        )}
         {/* Progressive disclosure, not a disabled control (#146): deferring
             transcription only makes sense when the audio survives the
             recording, so with retention off there is nothing here to explain

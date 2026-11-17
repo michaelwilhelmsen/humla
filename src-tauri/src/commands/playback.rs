@@ -3,6 +3,15 @@
 
 use super::capture::session_write_dir;
 use super::keep_audio_enabled;
+
+/// Whether a playback write may include audio.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PlaybackAudio {
+    /// As the `keep_audio` gate says when the write happens.
+    FollowGate,
+    /// Never: the caller already decided this take keeps no audio.
+    Never,
+}
 use crate::wav;
 use tauri::AppHandle;
 
@@ -23,6 +32,7 @@ pub(super) async fn write_playback_assets(
     timeline: String,
     mic_wav: Option<&std::path::Path>,
     sys_wav: Option<&std::path::Path>,
+    audio: PlaybackAudio,
 ) {
     if mic_wav.is_none() && sys_wav.is_none() && timeline.is_empty() {
         return;
@@ -32,7 +42,7 @@ pub(super) async fn write_playback_assets(
         return;
     };
 
-    if keep_audio_enabled(app) {
+    if audio == PlaybackAudio::FollowGate && keep_audio_enabled(app) {
         if let Err(e) = build_playback(mic_wav, sys_wav, &target).await {
             eprintln!("playback: build_playback: {e}");
         }

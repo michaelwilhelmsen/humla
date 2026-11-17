@@ -1597,6 +1597,9 @@ pub(crate) async fn upload_note_sessions(
     if workspace.is_empty() {
         return Ok(()); // Personal — never leaves the device
     }
+    // Audio recorded before `audio_forbidden` arrived stays on disk until the
+    // sweep runs; it must not upload meanwhile.
+    let sync_audio = sync_audio && !crate::commands::audio_forbidden(app);
     let app_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     let recordings = crate::sessions::recordings_dir(&app_dir, note_id);
     // Only real (manifest-backed) sessions sync per-session; a legacy flat note

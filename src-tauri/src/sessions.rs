@@ -372,6 +372,18 @@ pub fn append_session(
     Ok(index)
 }
 
+/// Remove one take's row from the manifest. Returns whether there was one.
+pub fn remove_session(recordings_dir: &Path, id: &str) -> std::io::Result<bool> {
+    let Some(mut manifest) = read_manifest(recordings_dir) else { return Ok(false) };
+    let before = manifest.sessions.len();
+    manifest.sessions.retain(|e| e.id != id);
+    if manifest.sessions.len() == before {
+        return Ok(false);
+    }
+    write_manifest(recordings_dir, &manifest)?;
+    Ok(true)
+}
+
 /// Record that one take has been transcribed (#146): flip
 /// [`SessionEntry::transcribed`] to `true`. Returns `false` when the note has
 /// no manifest entry with that id — the caller has nothing to correct, and
@@ -656,7 +668,14 @@ const KEEP_AUDIO_DEFAULT: bool = false;
 /// now means no audio, which costs cross-session unification (#17) on those
 /// notes. That trade-off is what the setting buys; it is not a regression to
 /// route around with another force-retain exception.
-pub fn retain_audio(keep_setting: Option<&str>) -> bool {
+///
+/// `forbidden` is an organisation's `audio_forbidden`, which closes the gate
+/// whatever the setting says. `src/lib/audioGate.ts` mirrors this, pinned by
+/// `src/lib/audioGateVectors.json`.
+pub fn retain_audio(keep_setting: Option<&str>, forbidden: bool) -> bool {
+    if forbidden {
+        return false;
+    }
     match keep_setting {
         Some(v) => v == "true",
         None => KEEP_AUDIO_DEFAULT,
@@ -1583,14 +1602,43 @@ mod tests {
 
     #[test]
     fn retain_audio_follows_the_setting() {
-        assert!(retain_audio(Some("true")));
-        assert!(!retain_audio(Some("false")));
+        assert!(retain_audio(Some("true"), false));
+        assert!(!retain_audio(Some("false"), false));
         // Unset falls back to the shipped default (off).
-        assert!(!retain_audio(None));
+        assert!(!retain_audio(None, false));
         // Anything that isn't the literal "true" is off — the setting is stored
         // as a string and a garbled value must fail closed, not open.
-        assert!(!retain_audio(Some("")));
-        assert!(!retain_audio(Some("1")));
+        assert!(!retain_audio(Some(""), false));
+        assert!(!retain_audio(Some("1"), false));
+    }
+
+    #[test]
+    fn audio_forbidden_closes_the_gate_whatever_the_setting() {
+        for setting in [Some("true"), Some("false"), None, Some("")] {
+            assert!(!retain_audio(setting, true), "{setting:?}");
+        }
+    }
+
+    #[test]
+    fn retain_audio_matches_the_shared_vectors() {
+        #[derive(serde::Deserialize)]
+        struct Vector {
+            setting: Option<String>,
+            forbidden: bool,
+            retains: bool,
+        }
+        let vectors: Vec<Vector> =
+            serde_json::from_str(include_str!("../../src/lib/audioGateVectors.json")).unwrap();
+        assert!(vectors.len() >= 8);
+        for v in vectors {
+            assert_eq!(
+                retain_audio(v.setting.as_deref(), v.forbidden),
+                v.retains,
+                "{:?} forbidden={}",
+                v.setting,
+                v.forbidden
+            );
+        }
     }
 
     #[test]
@@ -2001,5 +2049,17 @@ mod tests {
         assert_eq!(replayable_stream_count(&dir), 1);
         touch(&dir.join("sys.wav"));
         assert_eq!(replayable_stream_count(&dir), 2);
+    }
+    #[test]
+    fn remove_session_drops_one_row_and_keeps_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        append_session(dir.path(), "a", "", 0, vec!["mic".into()], Transcribed::Yes).unwrap();
+        append_session(dir.path(), "b", "", 0, vec!["mic".into()], Transcribed::No).unwrap();
+        assert!(remove_session(dir.path(), "b").unwrap());
+        let ids: Vec<String> = read_manifest(dir.path()).unwrap().sessions.into_iter().map(|e| e.id).collect();
+        assert_eq!(ids, ["a"]);
+        assert!(!remove_session(dir.path(), "b").unwrap());
+        let empty = tempfile::tempdir().unwrap();
+        assert!(!remove_session(empty.path(), "a").unwrap());
     }
 }

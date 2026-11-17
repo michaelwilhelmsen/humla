@@ -319,6 +319,10 @@ where
                     commands::embed_backfill(app_handle).await;
                 });
             }
+            // Unretained streams a quit or crash left in the temp dir.
+            tauri::async_runtime::spawn(async {
+                let _ = tauri::async_runtime::spawn_blocking(commands::sweep_unretained_streams).await;
+            });
             notifications::install(app.handle());
             // Tray + global hotkey. Last in setup so a failure here can't stop
             // the app from coming up — the menu bar is an extra surface, not a
@@ -401,6 +405,8 @@ where
             commands::cloud_delete_workspace,
             commands::cloud_leave_workspace,
             commands::org_status,
+            commands::org_audio_notice,
+            commands::org_audio_sweep,
             commands::cloud_transfer_workspace,
             commands::cloud_workspace_members,
             commands::cloud_speaker_roster,

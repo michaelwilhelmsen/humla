@@ -7,6 +7,7 @@ import {
   enforceLocalOnly,
   isLoopbackUrl,
   localOnlySource,
+  policySource,
   policyRows,
   type EffectivePolicy,
 } from "./orgPolicy";
@@ -80,5 +81,18 @@ describe("localOnlySource", () => {
     expect(localOnlySource(NO_POLICY)).toBeNull();
     const policy = { ...NO_POLICY, local_only: true, rules: [rule("telemetry_off", "Contoso"), rule("local_only")] };
     expect(localOnlySource(policy)?.source).toBe("Northwind");
+  });
+});
+
+describe("policySource", () => {
+  it("names who sets each policy, and nobody without a rule", () => {
+    const policy: EffectivePolicy = {
+      ...NO_POLICY,
+      audio_forbidden: true,
+      rules: [rule("audio_forbidden", "Contoso")],
+    };
+    expect(policySource(policy, "audio_forbidden")?.source).toBe("Contoso");
+    expect(policySource(policy, "telemetry_off")).toBeNull();
+    expect(policySource(NO_POLICY, "audio_forbidden")).toBeNull();
   });
 });
