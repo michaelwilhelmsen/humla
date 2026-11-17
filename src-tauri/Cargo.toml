@@ -39,7 +39,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 rusqlite = { version = "0.43", features = ["bundled"] }
-reqwest = { version = "0.12", features = ["json", "multipart", "rustls-tls", "stream"], default-features = false }
+reqwest = { version = "0.13", features = ["json", "multipart", "query", "form", "rustls-no-provider", "stream"], default-features = false }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 futures-util = "0.3"
 whisper-rs = { version = "0.16", features = ["raw-api"] }
 # Local LLM inference is delegated to whichever OpenAI-compatible HTTP server

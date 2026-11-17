@@ -93,7 +93,7 @@ pub fn telemetry_event(app: tauri::AppHandle, event: String) {
     }
 
     tauri::async_runtime::spawn(async move {
-        let client = match reqwest::Client::builder()
+        let client = match crate::http::client_builder()
             .timeout(std::time::Duration::from_secs(5))
             .build()
         {

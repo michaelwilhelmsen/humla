@@ -2227,7 +2227,7 @@ async fn stream_cloud_turn(
     cancel: &chat::CancelFlag,
 ) -> Result<CloudTurn, String> {
     use futures_util::StreamExt;
-    let resp = reqwest::Client::new()
+    let resp = crate::http::client()
         .post(format!("{}/api/chat", base.trim_end_matches('/')))
         .bearer_auth(token)
         .json(body)
@@ -3656,7 +3656,7 @@ mod tests {
             eprintln!("cloud_chat_roundtrip: skipped (set HUMLA_TEST_PB_URL/CHAT_URL/EMAIL/PASSWORD/WORKSPACE)");
             return;
         };
-        let client = reqwest::Client::new();
+        let client = crate::http::client();
 
         // 1. Authenticate against PocketBase for a real user token.
         let auth: serde_json::Value = client

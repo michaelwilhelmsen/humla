@@ -76,7 +76,7 @@ impl BatchSttAdapter for DeepgramAdapter {
         let base_url = ctx.base_url.unwrap_or(DEEPGRAM_BASE);
         let bytes = tokio::fs::read(audio).await?;
 
-        let client = reqwest::Client::builder()
+        let client = crate::http::client_builder()
             .timeout(std::time::Duration::from_secs(120))
             .build()?;
         let mut req = client
@@ -125,13 +125,13 @@ impl BatchSttAdapter for DeepgramAdapter {
             }
         }
 
-        let r = req.body(bytes).send().await?;
+        let r = req.body(bytes).send().await.map_err(|e| e.without_url())?;
         if !r.status().is_success() {
             let s = r.status();
             let body = r.text().await.unwrap_or_default();
             return Err(anyhow!("Deepgram {s}: {body}"));
         }
-        let body: ListenResponse = r.json().await?;
+        let body: ListenResponse = r.json().await.map_err(|e| e.without_url())?;
         let alt = body
             .results
             .channels

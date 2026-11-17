@@ -1,4 +1,5 @@
 mod db;
+mod http;
 mod html_text;
 mod export_doc;
 mod keychain;

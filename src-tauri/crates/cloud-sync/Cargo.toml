@@ -11,7 +11,8 @@ license = "MIT"
 # Arc<Mutex<rusqlite::Connection>> handed across the seam unifies to the same
 # concrete type. Do not bump independently of the core.
 rusqlite = { version = "0.43", features = ["bundled"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 tokio = { version = "1", features = ["rt", "macros", "time", "sync"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

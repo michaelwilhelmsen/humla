@@ -20,7 +20,7 @@ pub(crate) fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
 }
 
 pub fn client() -> reqwest::Client {
-    reqwest::Client::builder()
+    crate::http::client_builder()
         .timeout(std::time::Duration::from_secs(120))
         .build()
         .expect("reqwest client")
@@ -32,7 +32,7 @@ pub fn client() -> reqwest::Client {
 // complete, while still surfacing a wedged server as an error rather than
 // hanging the UI indefinitely.
 fn local_client() -> reqwest::Client {
-    reqwest::Client::builder()
+    crate::http::client_builder()
         .timeout(std::time::Duration::from_secs(600))
         .build()
         .expect("reqwest client")
@@ -43,7 +43,7 @@ fn local_client() -> reqwest::Client {
 // transcript through a reasoning model can legitimately need 2–3 minutes,
 // and the default 120s timeout was tripping on those.
 fn summary_cloud_client() -> reqwest::Client {
-    reqwest::Client::builder()
+    crate::http::client_builder()
         .timeout(std::time::Duration::from_secs(300))
         .build()
         .expect("reqwest client")

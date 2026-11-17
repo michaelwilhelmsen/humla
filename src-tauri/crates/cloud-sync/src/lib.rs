@@ -26,6 +26,8 @@
 //! access is a scoped lock/snapshot/unlock before any network call. That keeps
 //! the worker future `Send`.
 
+mod http;
+
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -277,7 +279,7 @@ where
     let worker = Worker {
         db,
         config,
-        http: reqwest::Client::new(),
+        http: crate::http::client(),
         notify: Arc::new(notify),
         status: Arc::new(status),
         conflict: Arc::new(conflict),
@@ -1996,7 +1998,7 @@ mod it {
     impl Session for PasswordSession {
         fn token(&self) -> TokenFuture<'_> {
             Box::pin(async move {
-                let resp = reqwest::Client::new()
+                let resp = crate::http::client()
                     .post(format!("{}/api/collections/users/auth-with-password", self.base_url))
                     .json(&json!({ "identity": self.email, "password": self.password }))
                     .send()
@@ -2069,7 +2071,7 @@ mod it {
         Worker {
             db,
             config,
-            http: reqwest::Client::new(),
+            http: crate::http::client(),
             notify: Arc::new(|| {}) as Arc<dyn Fn() + Send + Sync>,
             status: Arc::new(|_| {}) as Arc<dyn Fn(SyncState) + Send + Sync>,
             conflict: Arc::new(|_: &str| {}) as Arc<dyn Fn(&str) + Send + Sync>,
@@ -2800,7 +2802,7 @@ mod it {
         let w = Worker {
             db: db.clone(),
             config: offline_config("wsA"),
-            http: reqwest::Client::new(),
+            http: crate::http::client(),
             notify: Arc::new(|| {}),
             status: Arc::new(|_| {}),
             conflict: Arc::new(move |_: &str| f.store(true, Ordering::SeqCst)),

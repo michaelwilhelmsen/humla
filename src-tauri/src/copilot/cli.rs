@@ -242,7 +242,7 @@ pub async fn download(
     let (package, integrity) =
         pinned(arch()).ok_or_else(|| anyhow!("Copilot isn't available for this Mac"))?;
     let url = format!("https://registry.npmjs.org/@github/{package}/-/{package}-{VERSION}.tgz");
-    let r = reqwest::Client::new()
+    let r = crate::http::client()
         .get(&url)
         .header("User-Agent", super::auth::user_agent())
         .send()
