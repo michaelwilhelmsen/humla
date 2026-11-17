@@ -316,10 +316,6 @@ pub(super) async fn transcribe_chunk(
     Ok(())
 }
 
-// Whisper's training data contained millions of subtitle files, so it
-// regularly appends "Subtitles by …" / "Undertekster av …" / "Thanks for
-// watching" at the end of real speech. If we see one of these markers
-// anywhere in the text, strip it back to the preceding sentence boundary.
 /// How much vocabulary a provider takes. Deepgram counts terms; Whisper-shaped
 /// providers keep only the tail of a ~224-token prompt, which would drop the
 /// front of the list, so the list is cut to a length that fits.
@@ -424,6 +420,10 @@ mod vocabulary_tests {
     }
 }
 
+// Whisper's training data contained millions of subtitle files, so it
+// regularly appends "Subtitles by …" / "Undertekster av …" / "Thanks for
+// watching" at the end of real speech. If we see one of these markers
+// anywhere in the text, strip it back to the preceding sentence boundary.
 fn strip_attribution_tail(text: &str) -> String {
     // Triggers are ASCII so to_ascii_lowercase keeps byte offsets aligned
     // with the original string for slicing.

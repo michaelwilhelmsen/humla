@@ -417,11 +417,6 @@ impl Worker {
         }
     }
 
-    /// Enqueue an upsert/delete for a single row, capturing its target workspace.
-    /// Upsert reads the row's own `workspace_id` so it pushes to the right tenant
-    /// even if the active workspace changes before it drains; delete uses the
-    /// active workspace (the row is gone, and reads are workspace-scoped). Empty
-    /// workspace = Personal → dropped without a network call when it drains.
     /// An organisation's template, cached from the org config. Never synced.
     fn is_org_prompt(&self, id: &str) -> Result<bool> {
         let conn = self.db.lock();
@@ -431,6 +426,11 @@ impl Worker {
         Ok(org.is_some_and(|o| !o.is_empty()))
     }
 
+    /// Enqueue an upsert/delete for a single row, capturing its target workspace.
+    /// Upsert reads the row's own `workspace_id` so it pushes to the right tenant
+    /// even if the active workspace changes before it drains; delete uses the
+    /// active workspace (the row is gone, and reads are workspace-scoped). Empty
+    /// workspace = Personal → dropped without a network call when it drains.
     fn enqueue_simple(&self, entity: &str, table: &str, id: &str, delete: bool) -> Result<()> {
         let workspace = if delete {
             self.config.workspace_id.clone()
