@@ -9,9 +9,30 @@ import { Btn } from "../components/Btn";
 import { ValuePill } from "../components/ValuePill";
 import { Toggle } from "../components/Toggle";
 import type { SettingsHook } from "../useSettings";
+import { ManagedRow } from "../ManagedRow";
+import { policyRows, useOrgPolicy } from "../../../lib/orgPolicy";
 
 const inputCls =
   "w-full text-sm px-3 py-2 rounded-md border border-[var(--color-line-visible)] bg-[var(--color-surface)] focus:border-[var(--color-text-muted)] transition-colors";
+
+// Policies stay in force after sign-out, so the list shows in every state.
+export function PoliciesSection() {
+  const rows = policyRows(useOrgPolicy());
+  if (rows.length === 0) return null;
+  return (
+    <Section title="Policies">
+      {rows.map((r) => (
+        <ManagedRow
+          key={r.kind}
+          label={r.label}
+          source={r.source}
+          reason={r.reason}
+          control={<ValuePill>{r.value}</ValuePill>}
+        />
+      ))}
+    </Section>
+  );
+}
 
 // Account section: connect to a Humla Cloud server, sign in/out. The server
 // URL + credentials drive everything else (workspace management renders
