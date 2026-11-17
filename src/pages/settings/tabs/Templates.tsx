@@ -18,7 +18,9 @@ type Draft = { id: string | null; name: string; content: string };
 
 // Templates are `summary_prompts` rows. One created while a team workspace is
 // active belongs to that workspace and syncs to every member, who can all edit
-// it; personal ones stay on this Mac.
+// it; personal ones stay on this Mac. The server refuses every template write
+// from a viewer, and a new template always lands in the active workspace, so a
+// viewer there can neither edit shared templates nor create one.
 export function TemplatesSection({ language }: { language: string }) {
   const [templates, setTemplates] = useState<SummaryPrompt[]>([]);
   const [viewing, setViewing] = useState<{ name: string; content: string; template: string } | null>(null);
@@ -28,6 +30,8 @@ export function TemplatesSection({ language }: { language: string }) {
   const workspaceName = useCloudStore(
     (s) => s.status.current_workspace?.name ?? s.status.locked_current_workspace?.name ?? null,
   );
+  const currentRole = useCloudStore((s) => s.status.current_workspace?.role);
+  const workspaces = useCloudStore((s) => s.status.workspaces);
 
   useEffect(() => {
     let cancelled = false;
@@ -83,7 +87,10 @@ export function TemplatesSection({ language }: { language: string }) {
   const shared = templates.filter((t) => t.workspace_id);
   const personal = templates.filter((t) => !t.workspace_id);
   const inWorkspace = workspaceName !== null || shared.length > 0;
-  const newButton = (
+  const canCreate = !(inWorkspace && currentRole === "viewer");
+  const canEdit = (t: SummaryPrompt) =>
+    !t.workspace_id || workspaces.find((w) => w.id === t.workspace_id)?.role !== "viewer";
+  const newButton = canCreate && (
     <button
       type="button"
       className="nd-btn"
@@ -121,24 +128,35 @@ export function TemplatesSection({ language }: { language: string }) {
         key={t.id}
         name={t.name}
         actions={
-          <>
+          !canEdit(t) ? (
             <button
               type="button"
               className={quietBtnClass}
-              aria-label={`Edit ${t.name}`}
-              onClick={() => setEditing({ id: t.id, name: t.name, content: t.content })}
+              aria-label={`View ${t.name}`}
+              onClick={() => setViewing({ name: t.name, content: t.content, template: t.content })}
             >
-              <Pencil size={13} aria-hidden /> Edit
+              <Eye size={13} aria-hidden /> View
             </button>
-            <button
-              type="button"
-              className={quietBtnClass}
-              aria-label={`Delete ${t.name}`}
-              onClick={() => setConfirmDeleteId(t.id)}
-            >
-              <Trash2 size={13} aria-hidden />
-            </button>
-          </>
+          ) : (
+            <>
+              <button
+                type="button"
+                className={quietBtnClass}
+                aria-label={`Edit ${t.name}`}
+                onClick={() => setEditing({ id: t.id, name: t.name, content: t.content })}
+              >
+                <Pencil size={13} aria-hidden /> Edit
+              </button>
+              <button
+                type="button"
+                className={quietBtnClass}
+                aria-label={`Delete ${t.name}`}
+                onClick={() => setConfirmDeleteId(t.id)}
+              >
+                <Trash2 size={13} aria-hidden />
+              </button>
+            </>
+          )
         }
       />
     );
@@ -168,14 +186,16 @@ export function TemplatesSection({ language }: { language: string }) {
                   >
                     <Eye size={13} aria-hidden /> View
                   </button>
-                  <button
-                    type="button"
-                    className={quietBtnClass}
-                    aria-label={`Duplicate ${name}`}
-                    onClick={() => duplicate(name, presetTemplateText(p))}
-                  >
-                    <Copy size={13} aria-hidden /> Duplicate
-                  </button>
+                  {canCreate && (
+                    <button
+                      type="button"
+                      className={quietBtnClass}
+                      aria-label={`Duplicate ${name}`}
+                      onClick={() => duplicate(name, presetTemplateText(p))}
+                    >
+                      <Copy size={13} aria-hidden /> Duplicate
+                    </button>
+                  )}
                 </>
               }
             />
@@ -210,18 +230,20 @@ export function TemplatesSection({ language }: { language: string }) {
             <pre className="whitespace-pre-wrap text-sm leading-relaxed rounded-md border border-[var(--color-line)] bg-[var(--color-canvas)] p-3 font-[var(--font-sans)]">
               {viewing.content}
             </pre>
-            <div className="flex justify-end">
-              <button
-                type="button"
-                className="nd-btn"
-                onClick={() => {
-                  duplicate(viewing.name, viewing.template);
-                  setViewing(null);
-                }}
-              >
-                <Copy size={14} aria-hidden /> Duplicate
-              </button>
-            </div>
+            {canCreate && (
+              <div className="flex justify-end">
+                <button
+                  type="button"
+                  className="nd-btn"
+                  onClick={() => {
+                    duplicate(viewing.name, viewing.template);
+                    setViewing(null);
+                  }}
+                >
+                  <Copy size={14} aria-hidden /> Duplicate
+                </button>
+              </div>
+            )}
           </div>
         )}
       </Modal>

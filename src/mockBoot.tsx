@@ -1935,16 +1935,22 @@ const CASES: Record<string, Scenario> = {
   // --- The whole Settings dialog over the app, on the unit tests' defaults plus
   // a few templates and terms. `&section=<id>` opens on a section; `?tab=` is
   // not read from the page URL. `settings-workspace` is the same inside a team
-  // workspace, where shared templates get their own group.
+  // workspace, where shared templates get their own group;
+  // `settings-workspace-viewer` is that as a viewer, who can't edit them.
   settings: {
     route: `/settings?tab=${new URLSearchParams(location.search).get("section") ?? "templates"}`,
     render: () => null, // unused — `route` renders the app
-    ipc: settingsContentIpc(false),
+    ipc: settingsContentIpc(null),
   },
   "settings-workspace": {
     route: `/settings?tab=${new URLSearchParams(location.search).get("section") ?? "templates"}`,
     render: () => null, // unused — `route` renders the app
-    ipc: settingsContentIpc(true),
+    ipc: settingsContentIpc("member"),
+  },
+  "settings-workspace-viewer": {
+    route: `/settings?tab=${new URLSearchParams(location.search).get("section") ?? "templates"}`,
+    render: () => null, // unused — `route` renders the app
+    ipc: settingsContentIpc("viewer"),
   },
 
   // --- Two-factor authentication. Settings → Account, signed in to a
@@ -1988,8 +1994,10 @@ const CASES: Record<string, Scenario> = {
   },
 };
 
-function settingsContentIpc(workspace: boolean): Record<string, (args: unknown) => unknown> {
-  const team: CloudWorkspace = { id: "w1", name: "Acme", role: "member", plan_status: "active" };
+function settingsContentIpc(
+  workspace: CloudWorkspace["role"] | null,
+): Record<string, (args: unknown) => unknown> {
+  const team: CloudWorkspace = { id: "w1", name: "Acme", role: workspace ?? "member", plan_status: "active" };
   const row = (id: string, name: string, content: string, workspace_id = "") => ({
     id,
     name,

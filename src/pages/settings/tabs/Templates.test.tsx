@@ -10,13 +10,15 @@ function prompt(id: string, name: string, workspace_id = ""): SummaryPrompt {
   return { id, name, content: `${name} instructions`, created_at: 0, updated_at: 0, workspace_id };
 }
 
-function inWorkspace(name: string) {
+function inWorkspace(name: string, role: CloudWorkspace["role"] = "member") {
+  const ws = { id: "ws1", name, role } as CloudWorkspace;
   useCloudStore.setState({
     status: {
       ...DISCONNECTED,
       configured: true,
       logged_in: true,
-      current_workspace: { id: "ws1", name } as CloudWorkspace,
+      current_workspace: ws,
+      workspaces: [ws],
     },
     ready: true,
   });
@@ -113,5 +115,33 @@ describe("TemplatesSection", () => {
     render(<TemplatesSection language="en" />);
     expect(await screen.findByRole("heading", { name: "Shared in Team" })).toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: "Your templates" })).toBeNull();
+  });
+
+  // humla-cloud refuses every template write from a viewer, and anything new
+  // lands in the active workspace.
+  it("gives a viewer read-only shared templates and nothing that creates one", async () => {
+    inWorkspace("Rana kommune", "viewer");
+    mockTauri({
+      summary_prompts_list: () => [prompt("p1", "Standup"), prompt("p2", "Journal note", "ws1")],
+    });
+    render(<TemplatesSection language="en" />);
+    const shared = (
+      await screen.findByRole("heading", { name: "Shared in Rana kommune" })
+    ).closest("section")!;
+    expect(await within(shared).findByText("Journal note")).toBeInTheDocument();
+    expect(within(shared).queryByRole("button", { name: /new template/i })).toBeNull();
+    expect(within(shared).queryByRole("button", { name: "Edit Journal note" })).toBeNull();
+    expect(within(shared).queryByRole("button", { name: "Delete Journal note" })).toBeNull();
+    expect(screen.queryByRole("button", { name: /^Duplicate / })).toBeNull();
+
+    await userEvent.click(within(shared).getByRole("button", { name: "View Journal note" }));
+    const viewer = await screen.findByRole("dialog", { name: "Journal note" });
+    expect(viewer).toHaveTextContent("Journal note instructions");
+    expect(within(viewer).queryByRole("button", { name: "Duplicate" })).toBeNull();
+    await userEvent.keyboard("{Escape}");
+
+    const yours = screen.getByRole("heading", { name: "Your templates" }).closest("section")!;
+    expect(within(yours).getByRole("button", { name: "Edit Standup" })).toBeInTheDocument();
+    expect(within(yours).getByRole("button", { name: "Delete Standup" })).toBeInTheDocument();
   });
 });
