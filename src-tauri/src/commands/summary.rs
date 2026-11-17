@@ -497,6 +497,19 @@ mod tests {
     }
 
     #[test]
+    fn an_organisation_template_resolves_and_falls_back_once_removed() {
+        use crate::org_policy::{apply_templates, classify, FetchOutcome, OrgConfig};
+        let (_dir, conn) = temp_conn();
+        let body = r#"{"orgs":[{"id":"o1","name":"Northwind","policy":{"local_only":false,"retention_days":0,"telemetry_off":false,"audio_forbidden":false},"templates":[{"client_id":"t1","name":"Case meeting","content":"ORG PROMPT","workspaces":[],"deleted":false}]}]}"#;
+        let FetchOutcome::Fetched(config) = classify(200, body) else { panic!() };
+        apply_templates(&conn, &config).unwrap();
+        let note = db::create_note(&conn, "no", "custom:t1", "").unwrap();
+        assert_eq!(resolve_prompt(&conn, &note, "no"), "ORG PROMPT");
+        apply_templates(&conn, &OrgConfig::default()).unwrap();
+        assert_eq!(resolve_prompt(&conn, &note, "no"), presets::prompt(DEFAULT_SUMMARY_PRESET, "no"));
+    }
+
+    #[test]
     fn deleted_custom_row_falls_back_to_the_builtin_default() {
         // A note pointing at a custom prompt row that has since been
         // deleted must still summarise — using the built-in default, not

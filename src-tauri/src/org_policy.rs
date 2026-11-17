@@ -147,6 +147,98 @@ pub(crate) fn cached(conn: &Connection) -> anyhow::Result<Option<OrgConfig>> {
     }
 }
 
+// ---- templates and vocabulary ------------------------------------------------
+
+/// Bring the organisation rows in `summary_prompts` in line with `config`:
+/// upsert each live template whose name, text or departments differ, and delete
+/// tombstoned ones and every org row the config no longer lists. A template
+/// keeps its `client_id` as its row id, so a note's `custom:<id>` resolves it.
+/// A row the user owns is never overwritten. Returns whether anything changed.
+pub(crate) fn apply_templates(conn: &Connection, config: &OrgConfig) -> anyhow::Result<bool> {
+    let tx = conn.unchecked_transaction()?;
+    let mut changed = false;
+    let mut live: Vec<(String, String)> = Vec::new();
+    for org in &config.orgs {
+        for t in &org.templates {
+            if !is_template_id(&t.client_id) || t.deleted {
+                continue;
+            }
+            let departments = serde_json::to_string(&t.workspaces)?;
+            let now = crate::db::now_ms();
+            changed |= tx.execute(
+                "INSERT INTO summary_prompts
+                     (id, name, content, created_at, updated_at, workspace_id, org_id, org_workspaces)
+                 VALUES (?1, ?2, ?3, ?4, ?4, '', ?5, ?6)
+                 ON CONFLICT(id) DO UPDATE SET
+                     name = excluded.name, content = excluded.content,
+                     org_workspaces = excluded.org_workspaces, updated_at = excluded.updated_at
+                 WHERE summary_prompts.org_id = excluded.org_id
+                   AND (summary_prompts.name IS NOT excluded.name
+                        OR summary_prompts.content IS NOT excluded.content
+                        OR summary_prompts.org_workspaces IS NOT excluded.org_workspaces)",
+                rusqlite::params![t.client_id, t.name, t.content, now, org.id, departments],
+            )? > 0;
+            live.push((org.id.clone(), t.client_id.clone()));
+        }
+    }
+    let rows: Vec<(String, String)> = {
+        let mut stmt = tx.prepare("SELECT org_id, id FROM summary_prompts WHERE org_id != ''")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    for (org_id, id) in rows.into_iter().filter(|row| !live.contains(row)) {
+        tx.execute(
+            "DELETE FROM summary_prompts WHERE id = ?1 AND org_id = ?2",
+            rusqlite::params![id, org_id],
+        )?;
+        changed = true;
+    }
+    tx.commit()?;
+    Ok(changed)
+}
+
+/// A `client_id` that is safe as a row id and inside `custom:<id>`.
+fn is_template_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 64 && id.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+}
+
+/// What the Templates and Vocabulary sections show of one organisation.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct OrgSummary {
+    pub id: String,
+    pub name: String,
+    pub reason: String,
+    pub vocabulary: Vec<String>,
+}
+
+pub(crate) fn summaries(config: Option<&OrgConfig>) -> Vec<OrgSummary> {
+    config
+        .map(|c| {
+            c.orgs
+                .iter()
+                .map(|o| OrgSummary {
+                    id: o.id.clone(),
+                    name: o.name.clone(),
+                    reason: o.policy_reason.clone(),
+                    vocabulary: o.vocabulary.clone(),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Every organisation's terms in order. Nothing cached, or a cache that can't
+/// be read, adds none.
+pub(crate) fn vocabulary(conn: &Connection) -> Vec<String> {
+    match cached(conn) {
+        Ok(config) => config.into_iter().flat_map(|c| c.orgs).flat_map(|o| o.vocabulary).collect(),
+        Err(e) => {
+            eprintln!("org policy: unreadable, no organisation terms: {e:#}");
+            Vec::new()
+        }
+    }
+}
+
 // ---- the effective policy ---------------------------------------------------
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -592,6 +684,129 @@ mod tests {
         }
         assert!(check_endpoint(&conn, ProviderId::Custom, Some("https://api.example.com")).is_err());
         assert!(check_leaves_mac(&conn).is_err());
+    }
+
+    fn template_body(templates: &str) -> OrgConfig {
+        let body = format!(
+            r#"{{"orgs":[{{"id":"o1","name":"Northwind","policy":{{"local_only":false,"retention_days":0,"telemetry_off":false,"audio_forbidden":false}},"templates":[{templates}]}}]}}"#
+        );
+        let FetchOutcome::Fetched(config) = classify(200, &body) else { panic!("{body}") };
+        config
+    }
+
+    fn org_rows(conn: &Connection) -> Vec<(String, String, String, String)> {
+        let mut stmt = conn
+            .prepare("SELECT id, name, content, org_workspaces FROM summary_prompts WHERE org_id != '' ORDER BY id")
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    const CASE: &str = r#"{"client_id":"t1","name":"Case meeting","content":"Decisions.","workspaces":[],"deleted":false}"#;
+    const INTAKE: &str = r#"{"client_id":"t2","name":"Intake","content":"Needs.","workspaces":["w1"],"deleted":false}"#;
+
+    #[test]
+    fn templates_are_cached_as_read_only_prompt_rows() {
+        let (_d, conn) = conn();
+        assert!(apply_templates(&conn, &template_body(&format!("{CASE},{INTAKE}"))).unwrap());
+        assert_eq!(
+            org_rows(&conn),
+            [
+                ("t1".into(), "Case meeting".into(), "Decisions.".into(), "[]".into()),
+                ("t2".into(), "Intake".into(), "Needs.".into(), r#"["w1"]"#.into()),
+            ]
+        );
+        let row = crate::db::get_summary_prompt(&conn, "t2").unwrap();
+        assert_eq!((row.org_id.as_str(), row.workspace_id.as_str()), ("o1", ""));
+        assert_eq!(row.org_workspaces, ["w1"]);
+        assert!(crate::db::update_summary_prompt(&conn, "t1", "Mine", "x").is_err());
+        assert!(crate::db::delete_summary_prompt(&conn, "t1").is_err());
+        assert_eq!(org_rows(&conn).len(), 2);
+    }
+
+    #[test]
+    fn an_unchanged_config_writes_nothing() {
+        let (_d, conn) = conn();
+        let config = template_body(CASE);
+        apply_templates(&conn, &config).unwrap();
+        let before = crate::db::get_summary_prompt(&conn, "t1").unwrap().updated_at;
+        assert!(!apply_templates(&conn, &config).unwrap());
+        assert_eq!(crate::db::get_summary_prompt(&conn, "t1").unwrap().updated_at, before);
+    }
+
+    // The org record's `updated` doesn't move when a template is edited.
+    #[test]
+    fn an_edited_template_is_seen_by_its_content() {
+        let (_d, conn) = conn();
+        apply_templates(&conn, &template_body(CASE)).unwrap();
+        let edited = CASE.replace("Decisions.", "Decisions and owners.");
+        assert!(apply_templates(&conn, &template_body(&edited)).unwrap());
+        assert_eq!(crate::db::get_summary_prompt(&conn, "t1").unwrap().content, "Decisions and owners.");
+        let narrowed = edited.replace(r#""workspaces":[]"#, r#""workspaces":["w2"]"#);
+        assert!(apply_templates(&conn, &template_body(&narrowed)).unwrap());
+        assert_eq!(crate::db::get_summary_prompt(&conn, "t1").unwrap().org_workspaces, ["w2"]);
+    }
+
+    #[test]
+    fn tombstones_and_missing_templates_are_removed() {
+        let (_d, conn) = conn();
+        apply_templates(&conn, &template_body(&format!("{CASE},{INTAKE}"))).unwrap();
+        let tombstone = CASE.replace(r#""deleted":false"#, r#""deleted":true"#);
+        assert!(apply_templates(&conn, &template_body(&tombstone)).unwrap());
+        assert!(org_rows(&conn).is_empty(), "t1 tombstoned, t2 no longer listed");
+    }
+
+    #[test]
+    fn a_released_config_removes_every_org_row_and_nothing_else() {
+        let (_d, conn) = conn();
+        let mine = crate::db::create_summary_prompt(&conn, "Mine", "My text", "").unwrap();
+        let shared = crate::db::create_summary_prompt(&conn, "Shared", "Team text", "w1").unwrap();
+        apply_templates(&conn, &template_body(CASE)).unwrap();
+        assert!(apply_templates(&conn, &OrgConfig::default()).unwrap());
+        assert!(org_rows(&conn).is_empty());
+        assert!(crate::db::get_summary_prompt(&conn, &mine.id).is_ok());
+        assert!(crate::db::get_summary_prompt(&conn, &shared.id).is_ok());
+    }
+
+    #[test]
+    fn a_users_own_row_is_never_overwritten() {
+        let (_d, conn) = conn();
+        let mine = crate::db::create_summary_prompt(&conn, "Mine", "My text", "").unwrap();
+        let clash = CASE.replace(r#""client_id":"t1""#, &format!(r#""client_id":"{}""#, mine.id));
+        apply_templates(&conn, &template_body(&clash)).unwrap();
+        let row = crate::db::get_summary_prompt(&conn, &mine.id).unwrap();
+        assert_eq!((row.name.as_str(), row.org_id.as_str()), ("Mine", ""));
+        apply_templates(&conn, &OrgConfig::default()).unwrap();
+        assert!(crate::db::get_summary_prompt(&conn, &mine.id).is_ok());
+    }
+
+    #[test]
+    fn an_unsafe_client_id_is_skipped() {
+        let (_d, conn) = conn();
+        let bad = CASE.replace(r#""client_id":"t1""#, r#""client_id":"../x""#);
+        assert!(!apply_templates(&conn, &template_body(&bad)).unwrap());
+        assert!(org_rows(&conn).is_empty());
+    }
+
+    #[test]
+    fn no_organisation_adds_no_rows_and_no_terms() {
+        let (_d, conn) = conn();
+        assert!(vocabulary(&conn).is_empty());
+        assert!(!apply_templates(&conn, &OrgConfig::default()).unwrap());
+        store(&conn, &classify(200, r#"{"orgs":[]}"#)).unwrap();
+        assert!(vocabulary(&conn).is_empty());
+        assert!(summaries(cached(&conn).unwrap().as_ref()).is_empty());
+    }
+
+    #[test]
+    fn terms_come_from_every_organisation_in_order() {
+        let (_d, conn) = conn();
+        cache_one_org(&conn);
+        assert_eq!(vocabulary(&conn), ["Northwind"]);
+        crate::db::set_setting(&conn, SETTING_ORG_CONFIG, "{not json").unwrap();
+        assert!(vocabulary(&conn).is_empty());
     }
 
     #[test]

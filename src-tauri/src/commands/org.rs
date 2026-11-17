@@ -8,19 +8,22 @@ use serde::Serialize;
 use tauri::{Emitter, State};
 use tokio::sync::Notify;
 
-use crate::org_policy::{self, EffectivePolicy, FetchOutcome};
+use crate::org_policy::{self, EffectivePolicy, FetchOutcome, OrgSummary};
 use crate::{db, AppState};
 
 #[derive(Serialize)]
 pub struct OrgStatus {
     pub policy: EffectivePolicy,
+    /// The organisations whose templates and terms apply here.
+    pub orgs: Vec<OrgSummary>,
 }
 
 #[tauri::command]
 pub fn org_status(state: State<'_, AppState>) -> Result<OrgStatus, String> {
     let conn = state.db.lock();
     let policy = org_policy::effective(&conn).map_err(|e| format!("organisation policy: {e}"))?;
-    Ok(OrgStatus { policy })
+    let config = org_policy::cached(&conn).map_err(|e| format!("organisation policy: {e}"))?;
+    Ok(OrgStatus { policy, orgs: org_policy::summaries(config.as_ref()) })
 }
 
 /// How often the worker refreshes the organisation config, and the longest it
@@ -59,6 +62,9 @@ pub(crate) struct Changes {
     pub policy: bool,
     /// `apply_local_only` rewrote settings (`org_settings_rewritten`).
     pub settings: bool,
+    /// The organisations' templates, terms or names differ
+    /// (`org_content_changed`).
+    pub content: bool,
 }
 
 /// When the last refresh from any caller finished, so a restarted worker
@@ -95,6 +101,9 @@ pub(crate) async fn refresh_org_config(
     if changes.settings {
         let _ = app.emit("org_settings_rewritten", ());
     }
+    if changes.content {
+        let _ = app.emit("org_content_changed", ());
+    }
     *LAST_ATTEMPT.lock() = Some(Instant::now());
     let attempt = Attempt::of(&outcome);
     if attempt == Attempt::Answered {
@@ -107,15 +116,24 @@ pub(crate) async fn refresh_org_config(
 /// anything but an authenticated answer (`org_policy::store`).
 pub(crate) fn apply_fetch(conn: &rusqlite::Connection, outcome: &FetchOutcome) -> Changes {
     let before = org_policy::effective(conn).ok();
-    if let Err(e) = org_policy::store(conn, outcome) {
+    let orgs_before = org_policy::cached(conn).ok().map(|c| org_policy::summaries(c.as_ref()));
+    let stored = org_policy::store(conn, outcome).inspect_err(|e| {
         eprintln!("cloud: couldn't cache the organisation config: {e:#}");
-    }
+    });
     let after = org_policy::effective(conn).ok();
+    let orgs_after = org_policy::cached(conn).ok().map(|c| org_policy::summaries(c.as_ref()));
+    let templates = match (outcome, stored) {
+        (FetchOutcome::Fetched(config), Ok(_)) => org_policy::apply_templates(conn, config).unwrap_or_else(|e| {
+            eprintln!("org policy: couldn't cache the organisation's templates: {e:#}");
+            false
+        }),
+        _ => false,
+    };
     let settings = apply_local_only(conn).unwrap_or_else(|e| {
         eprintln!("org policy: couldn't apply local_only to settings: {e:#}");
         false
     });
-    Changes { policy: before != after, settings }
+    Changes { policy: before != after, settings, content: templates || orgs_before != orgs_after }
 }
 
 /// The line to log for this outcome, or `None` when it repeats the last
@@ -227,6 +245,43 @@ mod tests {
         assert_eq!(apply_fetch(&conn, &org_policy::classify(200, EMPTY)), Changes::default());
     }
 
+    const WITH_TEMPLATE: &str = r#"{"orgs":[{"id":"o1","name":"Northwind","policy":{"local_only":false,"retention_days":0,"telemetry_off":false,"audio_forbidden":false},"vocabulary":["Northwind"],"templates":[{"client_id":"t1","name":"Case meeting","content":"Decisions.","workspaces":[],"deleted":false}]}]}"#;
+
+    fn prompts(conn: &rusqlite::Connection) -> Vec<db::SummaryPrompt> {
+        db::list_summary_prompts(conn, "").unwrap()
+    }
+
+    #[test]
+    fn without_an_organisation_no_template_rows_appear() {
+        let (_d, conn) = conn();
+        let mine = db::create_summary_prompt(&conn, "Mine", "My text", "").unwrap();
+        let before = prompts(&conn);
+        apply_fetch(&conn, &org_policy::classify(200, EMPTY));
+        apply_fetch(&conn, &FetchOutcome::Failed("offline".into()));
+        let after = prompts(&conn);
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].id, mine.id);
+        assert_eq!(after[0].updated_at, before[0].updated_at);
+    }
+
+    #[test]
+    fn templates_arrive_and_leave_with_the_config() {
+        let (_d, conn) = conn();
+        let arrived = apply_fetch(&conn, &org_policy::classify(200, WITH_TEMPLATE));
+        assert!(arrived.content && !arrived.policy);
+        assert_eq!(prompts(&conn)[0].org_id, "o1");
+        assert_eq!(apply_fetch(&conn, &org_policy::classify(200, WITH_TEMPLATE)), Changes::default());
+        for outcome in [FetchOutcome::SignedOut, FetchOutcome::Failed("offline".into()), FetchOutcome::Unsupported] {
+            assert_eq!(apply_fetch(&conn, &outcome), Changes::default(), "{outcome:?}");
+            assert_eq!(prompts(&conn).len(), 1, "{outcome:?}");
+        }
+        let edited = WITH_TEMPLATE.replace(r#""vocabulary":["Northwind"]"#, r#""vocabulary":["Northwind","Fjord"]"#);
+        assert!(apply_fetch(&conn, &org_policy::classify(200, &edited)).content, "terms changed");
+        let released = apply_fetch(&conn, &org_policy::classify(200, EMPTY));
+        assert!(released.content);
+        assert!(prompts(&conn).is_empty());
+    }
+
     #[test]
     fn a_policy_that_rewrites_nothing_reports_no_settings_change() {
         let (_d, conn) = conn();
@@ -235,12 +290,12 @@ mod tests {
         let body = r#"{"orgs":[{"id":"o1","name":"Northwind","policy":{"local_only":false,"retention_days":30,"telemetry_off":true,"audio_forbidden":false}}]}"#;
         assert_eq!(
             apply_fetch(&conn, &org_policy::classify(200, body)),
-            Changes { policy: true, settings: false }
+            Changes { policy: true, settings: false, content: true }
         );
         let local_only = body.replace(r#""local_only":false"#, r#""local_only":true"#);
         assert_eq!(
             apply_fetch(&conn, &org_policy::classify(200, &local_only)),
-            Changes { policy: true, settings: false },
+            Changes { policy: true, settings: false, content: false },
             "summaries and chat are already local"
         );
     }
@@ -252,7 +307,7 @@ mod tests {
         let body = r#"{"orgs":[{"id":"o1","name":"Northwind","policy":{"local_only":true,"retention_days":0,"telemetry_off":false,"audio_forbidden":false}}]}"#;
         assert_eq!(
             apply_fetch(&conn, &org_policy::classify(200, body)),
-            Changes { policy: true, settings: true }
+            Changes { policy: true, settings: true, content: true }
         );
     }
 
