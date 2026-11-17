@@ -67,7 +67,7 @@ When a call plays through the speakers, the mic records every remote voice again
 
 Guards: under 5 s of sys silence judges nothing; a take never loses every voice. The unify pass judges each hybrid take inside its own span of the joined mic, and does so before the system stream's count hint is taken from the mic's voice count.
 
-- Code: `analyze_take`, `TakeAnalysis::check`, `check_joined` in `echo.rs` (pure); `commands.rs`'s `EchoPass` reads the WAVs, runs it off the async runtime and writes the temp WAV.
+- Code: `analyze_take`, `TakeAnalysis::check`, `check_joined` in `echo.rs` (pure); `commands/diarization.rs`'s `EchoPass` reads the WAVs, runs it off the async runtime and writes the temp WAV.
 - The thresholds were fitted on two podcast takes from one Mac; the diarize dump (`echo`, and `<engine>-unify.json`) keeps per-take lag and echo removed and per-voice seconds, ratio, energy removed and verdict. `echo_ms` / `unify_echo_ms` time it.
 - Performance (#200): ~7–8 s and 470 MB per hour on an M1 Max. Lag windows run on threads, both streams stay 16-bit samples, and the suppressor and report run block by block inside the canceller (`aec::cancel_threaded`).
 - Takes up to ten minutes are cancelled exactly as two whole passes would. Longer takes converge on their last three minutes of far-end signal (ending on the last block where the far end sounds), then split into ranges of at least three minutes on up to eight threads, each started 20 s ahead of its range. Past ten minutes output is no longer bit-identical and diarizers flip on borderline 7–15 s fragments, so judge changes there against several baselines, never one.

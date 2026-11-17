@@ -200,7 +200,7 @@ Requires macOS 13+, Apple Silicon recommended.
 
 Prerequisites:
 - Rust toolchain (`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`)
-- Node 20+ and `pnpm`
+- Node 22.22.2+ or 24.15+, and `pnpm`
 - Xcode command line tools (`xcode-select --install`)
 - `cmake` (for `whisper.cpp`)
 
@@ -232,9 +232,9 @@ humla/
 ├── src/                        # React frontend (Tiptap + Zustand)
 ├── src-tauri/                  # Rust backend (Tauri 2)
 │   ├── src/
-│   │   ├── commands.rs         # recording lifecycle, chunk transcription, diarize-on-stop
-│   │   ├── commands/           # command groups: notes, folders, settings, chat, clients,
-│   │   │                       #   cloud, export, models, summary, api_keys, …
+│   │   ├── commands.rs         # module root: shared helpers and defaults
+│   │   ├── commands/           # capture (recording lifecycle), transcribe, diarization,
+│   │   │                       #   timeline, notes, chat, cloud, summary, export, …
 │   │   ├── recording.rs        # session state, per-source trails
 │   │   ├── stt/                # STT adapter abstraction (OpenAI/Local/Deepgram/Groq)
 │   │   ├── chat/               # agentic note-chat: tool loop, retrieval, providers
@@ -250,7 +250,7 @@ humla/
 
 ## Tech stack
 
-- **Frontend** — React 19 + Vite 6 + Tailwind v4 + Tiptap + Zustand + react-markdown + lucide-react
+- **Frontend** — React 19 + Vite 8 + Tailwind v4 + Tiptap + Zustand + react-markdown + lucide-react
 - **App shell** — Tauri 2, Rust 1.85, reqwest (rustls-tls), rusqlite (bundled), tokio
 - **Local Whisper** — `whisper-rs` 0.16 (binds `whisper.cpp`) with the `metal` feature; `large-v3-turbo-q5` default plus alternative multilingual models and NB Whisper Large for Norwegian
 - **Speaker diarization** — FluidAudio Swift package; NVIDIA Nemotron 3 Diarization, *or* pyannote community-1 + VBx clustering with PLDA; CoreML on Apple Neural Engine

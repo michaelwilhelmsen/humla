@@ -349,7 +349,7 @@ async fn deliver(endpoint: &Endpoint, payload: &Value) -> Result<(), String> {
     let body = serde_json::to_vec(payload)
         .map_err(|_| "Could not encode the webhook JSON.".to_string())?;
     let payload_bytes = body.len();
-    let client = reqwest::Client::builder()
+    let client = crate::http::client_builder()
         .user_agent(concat!("Humla/", env!("CARGO_PKG_VERSION")))
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(10))

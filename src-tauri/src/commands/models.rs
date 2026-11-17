@@ -184,7 +184,7 @@ async fn local_whisper_download_inner(app: &AppHandle, model_id: &str) -> Result
     // crash mid-download never leaves a half-written model in place.
     let tmp_path = dir.join(format!("{}.partial", info.filename));
 
-    let resp = reqwest::Client::builder()
+    let resp = crate::http::client_builder()
         .timeout(std::time::Duration::from_secs(60 * 30))
         .build()
         .map_err(|e| format!("client: {e}"))?

@@ -7,9 +7,14 @@ const host = process.env.TAURI_DEV_HOST;
 export default defineConfig({
   plugins: [react(), tailwindcss()],
   clearScreen: false,
-  // The bundle loads from the app's own disk, not over a network, so Vite's
-  // web-sized chunk warning doesn't apply.
-  build: { chunkSizeWarningLimit: 2000 },
+  build: {
+    // The oldest webview the app runs in: WKWebView on macOS 13.0, the
+    // bundle's minimumSystemVersion.
+    target: "safari16",
+    // The bundle loads from the app's own disk, not over a network, so Vite's
+    // web-sized chunk warning doesn't apply.
+    chunkSizeWarningLimit: 2000,
+  },
   server: {
     port: 1420,
     strictPort: true,

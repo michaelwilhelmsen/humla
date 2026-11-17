@@ -164,7 +164,7 @@ pub fn user_agent() -> String {
 }
 
 fn client() -> reqwest::Client {
-    reqwest::Client::builder()
+    crate::http::client_builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .expect("reqwest client")

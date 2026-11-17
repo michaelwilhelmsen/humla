@@ -2,7 +2,7 @@
 
 ## Stack
 
-React 19, TypeScript, Vite 6, Tauri 2 (`@tauri-apps/api`), React Router 7 (`/note/:id`, settings, home), Zustand, Tiptap v2 (StarterKit + Placeholder + Suggestion + BubbleMenu), react-markdown + remark-gfm, Tailwind v4 (`@tailwindcss/vite`), lucide-react, Radix primitives. Auto-update polls `latest.json` from GitHub releases on launch.
+React 19, TypeScript 7 (`tsc` is the Go compiler; `typescript` stays on 6 for typescript-eslint), Vite 8, Tauri 2 (`@tauri-apps/api`), React Router 7 (`/note/:id`, settings, home), Zustand, Tiptap 3 (StarterKit + Placeholder + Suggestion + BubbleMenu), react-markdown + remark-gfm, Tailwind v4 (`@tailwindcss/vite`), lucide-react, Radix primitives. Auto-update polls `latest.json` from GitHub releases on launch.
 
 ## Stores and events
 

@@ -47,7 +47,7 @@ pub(crate) fn read_provider_api_key(
 
 fn migrate_legacy_api_key(
     state: &State<AppState>,
-    entry: &keyring::Entry,
+    entry: &keyring_core::Entry,
 ) -> Result<Option<String>, String> {
     let legacy = {
         let conn = state.db.lock();

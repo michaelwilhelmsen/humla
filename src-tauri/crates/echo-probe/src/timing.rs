@@ -1,6 +1,6 @@
 //! The capture-timing file the app writes beside a take's diagnostics —
 //! `diagnostics/<note_id>/capture-<session_id>.json`, from
-//! `write_capture_timing` in `src-tauri/src/commands.rs`, over the sidecar's
+//! `write_capture_timing` in `src-tauri/src/commands/capture.rs`, over the sidecar's
 //! `capture_timing` event. Only the fields this tool reads, all defaulted, so a
 //! file from a newer or older app still loads.
 

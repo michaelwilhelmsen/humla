@@ -9,9 +9,10 @@
 //! Keyed by Keychain account rather than by whatever names the secret, so two
 //! callers can't cache one account under two keys and disagree after a write.
 
+use keyring_core::{Entry, Error};
 use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 pub const SERVICE: &str = "no.humla.app";
 
@@ -23,8 +24,21 @@ pub fn new_cache() -> Cache {
     Arc::new(Mutex::new(HashMap::new()))
 }
 
-pub fn entry(account: &str) -> Result<keyring::Entry, String> {
-    keyring::Entry::new(SERVICE, account).map_err(|e| format!("keychain entry: {e}"))
+/// keyring-core reads and writes through a process-wide store that has to be
+/// set before the first entry is made. Off macOS there is no Keychain; an
+/// in-memory store keeps builds and tests there working.
+static STORE: LazyLock<Result<(), String>> = LazyLock::new(|| {
+    #[cfg(target_os = "macos")]
+    let store = apple_native_keyring_store::keychain::Store::new();
+    #[cfg(not(target_os = "macos"))]
+    let store = keyring_core::mock::Store::new();
+    keyring_core::set_default_store(store.map_err(|e| format!("keychain store: {e}"))?);
+    Ok(())
+});
+
+pub fn entry(account: &str) -> Result<Entry, String> {
+    STORE.clone()?;
+    Entry::new(SERVICE, account).map_err(|e| format!("keychain entry: {e}"))
 }
 
 /// Read `account`, from the cache when this session already has. A missing or
@@ -39,7 +53,7 @@ pub fn read(cache: &Cache, account: &'static str) -> Result<Option<String>, Stri
 pub fn read_or(
     cache: &Cache,
     account: &'static str,
-    on_missing: impl FnOnce(&keyring::Entry) -> Result<Option<String>, String>,
+    on_missing: impl FnOnce(&Entry) -> Result<Option<String>, String>,
 ) -> Result<Option<String>, String> {
     if let Some(cached) = cache.lock().get(account).cloned() {
         return Ok(cached);
@@ -47,7 +61,7 @@ pub fn read_or(
     let entry = entry(account)?;
     let value = match entry.get_password() {
         Ok(s) => non_blank(&s),
-        Err(keyring::Error::NoEntry) => on_missing(&entry)?,
+        Err(Error::NoEntry) => on_missing(&entry)?,
         Err(e) => return Err(format!("keychain read: {e}")),
     };
     cache.lock().insert(account, value.clone());
@@ -64,7 +78,7 @@ pub fn write(cache: &Cache, account: &'static str, value: Option<&str>) -> Resul
             .set_password(v)
             .map_err(|e| format!("keychain write: {e}"))?,
         None => match entry.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => {}
+            Ok(()) | Err(Error::NoEntry) => {}
             Err(e) => return Err(format!("keychain delete: {e}")),
         },
     }

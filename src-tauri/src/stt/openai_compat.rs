@@ -106,7 +106,7 @@ pub async fn transcribe(
         }
     }
 
-    let client = reqwest::Client::builder()
+    let client = crate::http::client_builder()
         .timeout(std::time::Duration::from_secs(120))
         .build()?;
     let url = format!("{base_url}/audio/transcriptions");

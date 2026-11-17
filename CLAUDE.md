@@ -79,7 +79,7 @@ Feature detail lives in `docs/features/` and `docs/architecture/`; read the link
 - Ollama goes through native `/api/chat` (detected by `:11434`), mirrored in TS by `isOllamaUrl`. Qwen-specific sampling applies only to Qwen models.
 - Anthropic: never send `thinking`, `temperature`, `top_p` or `top_k`.
 - Custom endpoint: base URL used exactly as typed; send only `model`, `messages`, `stream` (and `tools`). Nothing is guessed about the server.
-- Copilot: always through the CLI (never the Copilot API directly), started with `--no-auto-update`, `--disable-builtin-mcps`, `--disable-client-telemetry`; one SDK session per chat turn; log usage lines, never content. Copilot uses `copilot_model` / `copilot_chat_model`, not `chat_model`.
+- Copilot: always through the CLI (never the Copilot API directly), started with `--no-auto-update`, `--disable-builtin-mcps`, `--disable-client-telemetry` and the SDK's `disable_client_telemetry`; one SDK session per chat turn; log usage lines, never content. Copilot uses `copilot_model` / `copilot_chat_model`, not `chat_model`.
 
 ### Cloud session
 
@@ -90,7 +90,8 @@ Feature detail lives in `docs/features/` and `docs/architecture/`; read the link
 - **Use `tauri::async_runtime::spawn`, not `tokio::spawn`, in anything run from Tauri's `setup`** — bare `tokio::spawn` panics there and aborts the app on launch.
 - **The sync observer is built before `AppState` is managed** (`run_with_sync` → `make_sync`): nothing it runs while being built, or spawns then, may call `app.state::<AppState>()`. It takes the DB and Keychain cache from `SyncContext`.
 - **Never hold a `parking_lot` guard across an `.await`** (the future becomes non-Send). Use `tokio::sync::Mutex` for state held across awaits (e.g. `transcribe_gate`).
-- Secrets go through `crate::keychain` (`read` / `read_or` / `write`), cached per account on `AppState.keychain_cache`; not `keyring::Entry` directly.
+- Secrets go through `crate::keychain` (`read` / `read_or` / `write`), cached per account on `AppState.keychain_cache`; not `keyring_core::Entry` directly; `keychain::entry` sets the store first.
+- HTTP clients come from `crate::http::client` / `client_builder` (cloud-sync: its own `http::client`), never `reqwest::Client::new` / `builder`: they turn proxies off (macOS proxy settings would catch local servers) and install ring, without which reqwest panics. A test enforces it.
 - `window.prompt` / `confirm` / `alert` are blocked in the Tauri webview; use inline UI or the Modal component.
 
 ### Frontend and design
@@ -103,6 +104,7 @@ Feature detail lives in `docs/features/` and `docs/architecture/`; read the link
 - A theme is one CSS file + one `PALETTE_REGISTRY` row + one `@import`; `themes.contract.test.ts` enforces the contract in `src/lib/themeContract.ts`.
 - `NoteToolbar` thresholds, `BODY_MIN` and `ROW_STEPS` come from `scripts/measure-toolbar.js` / `scripts/measure-recording-bar.js`; re-derive them after changing those rows or a theme's control metrics.
 - In the mock harness (`pnpm mock`) a scenario wrapper must mirror the real container, or it shows layout bugs that aren't real.
+- `tsc` is TypeScript 7 (the Go compiler, installed as `@typescript/native`). The `typescript` package is TypeScript 6 (`@typescript/typescript6`, binary `tsc6`), because typescript-eslint and `scripts/check-release-notes.mjs` need the JavaScript compiler API, which 7 doesn't have. Don't point `typescript` at 7.
 - `clamp_device_name` (Rust) ↔ `noAudioWarning` (TS) share pinned test vectors — change both.
 
 ## Architecture overview
@@ -136,16 +138,16 @@ Recording in short: `recording_start` spawns `audio-capture` (via `setsid`); eac
 
 ## Tech stack
 
-- **Frontend**: React 19, TypeScript, Vite 6, Tauri 2, React Router 7, Zustand (`useNotesStore`, `useRecordingStore`, events bound once in `bindBackendListeners`), Tiptap v2, Tailwind v4, Radix, lucide-react, react-markdown + remark-gfm. Two themes (warm, graphite) × light/dark. → [frontend](docs/architecture/frontend.md)
-- **Backend**: Rust 1.94 (`github-copilot-sdk`'s floor), Tauri 2, rusqlite (`bundled`, WAL, idempotent ALTER TABLE migrations, indexes created after migrations), reqwest (`rustls-tls` + `stream`), tokio (`spawn_blocking` for local Whisper), whisper-rs 0.16 (`metal` on macOS only; `large-v3-turbo-q5_0` ~547 MB; NB Whisper Large for Norwegian), parking_lot, keyring 3 (`apple-native`), serde/serde_json/chrono/uuid/anyhow/async-trait.
+- **Frontend**: React 19, TypeScript 7, Vite 8, Tauri 2, React Router 7, Zustand (`useNotesStore`, `useRecordingStore`, events bound once in `bindBackendListeners`), Tiptap 3, Tailwind v4, Radix, lucide-react, react-markdown + remark-gfm. Two themes (warm, graphite) × light/dark. → [frontend](docs/architecture/frontend.md)
+- **Backend**: Rust 1.94 (`github-copilot-sdk`'s floor), Tauri 2, rusqlite (`bundled`, WAL, idempotent ALTER TABLE migrations, indexes created after migrations), reqwest 0.13 (rustls on ring, `stream`), tokio (`spawn_blocking` for local Whisper), whisper-rs 0.16 (`metal` on macOS only; `large-v3-turbo-q5_0` ~547 MB; NB Whisper Large for Norwegian), parking_lot, keyring-core + `apple-native-keyring-store`, serde/serde_json/chrono/uuid/anyhow/async-trait.
 
 ### Module map (`src-tauri/src/`)
 
 | File | Responsibility |
 |---|---|
 | `lib.rs` / `main.rs` | `AppState`, command registration, plugin setup, startup migrations / Tauri entry |
-| `commands.rs` | Module root of `crate::commands`. Core: recording lifecycle (`dispatch_sidecar_event`), `transcribe_chunk` + hallucination/repetition/attribution guards, deferred transcription (`transcribe_note`, `replay_retained_stream`), diarize on stop (`diarize_and_apply`, `rediarize_note`), `build_labelled_transcript`, `serialize_timeline` + `note_timeline*`, playback/diagnostics writers, shared helpers (`err`, `emit_*`, `sidecar_path`, `DEFAULT_*`) |
-| `commands/` | `#[tauri::command]` groups, each `mod x;` + `pub use x::*;` so `generate_handler!` paths stay `commands::<name>`: `notes`, `folders`, `settings`, `summary_prompts`, `assets`, `api_keys`, `transcription_config`, `models`, `summary` (`summarize_note` / `run_summary`), `title`, `permissions`, `local_llm`, `chat`, `clients`, `cloud` + `cloud_worker` + `cloud_auth`, `export` (incl. `note_audio_export_info` / `export_note_audio`), `mcp`, `webhook` (`webhook_destination`, `webhook_send_note`), `copilot`. Helpers used by the core are `pub(crate)` (`read_provider_api_key`, `read_transcribe_config`, `local_model_path`) |
+| `commands.rs` | Module root of `crate::commands`: module declarations, `ChainProgress` / `StreamSteps`, settings readers (`keep_audio_enabled`, `selected_diarize_engine`, …), shared helpers (`err`, `emit_*`, sync pings, `sidecar_path`, `DEFAULT_*`) |
+| `commands/` | `#[tauri::command]` groups, each `mod x;` + `pub use x::*;` so `generate_handler!` paths stay `commands::<name>`: `notes`, `capture` (the recording lifecycle: `recording_start` / `stop` / `pause` / `resume` / `state`, `dispatch_sidecar_event`, the post-stop chain, stop and capture timing writers, `clamp_device_name`, `redact_sidecar_line`), `timeline` (`serialize_timeline`, `note_timeline*`, `note_sessions`, transcript repair and per-chunk edits), `import` (`import_audio`, `finish_import`, `title_from_filename`), `deferred` (deferred transcription, #146: `transcribe_note`, `replay_retained_stream`, `record_transcribed_take`), `diarization` (diarize on stop and re-diarize: `diarize_and_apply`, `rediarize_note`, `diarize_and_maybe_clean`, the echo pass `EchoPass`, speaker numbering across streams and takes, diagnostics dumps), `folders`, `settings`, `summary_prompts`, `assets`, `api_keys`, `transcription_config`, `models`, `summary` (`summarize_note` / `run_summary`), `title`, `permissions`, `local_llm`, `chat`, `clients`, `cloud` + `cloud_worker` + `cloud_auth`, `export` (incl. `note_audio_export_info` / `export_note_audio`), `mcp`, `webhook` (`webhook_destination`, `webhook_send_note`), `copilot`. These hold no commands and aren't glob re-exported: `transcribe` (`transcribe_chunk` + hallucination/repetition/attribution guards, the detected-language vote), `transcript` (`build_labelled_transcript`: per-speaker pieces, mic-echo dedup, interjection bridging, run-on merging), `playback` (`write_playback_assets`: the AAC playback mix and `timeline.jsonl`) and `unify` (`unify_note_speakers`: cross-take speaker unification, #17). Helpers used by the core are `pub(crate)` (`read_provider_api_key`, `read_transcribe_config`, `local_model_path`) |
 | `chat/` | Agentic retrieval loop, adapters, Personal-only tools, workspace turns via humla-cloud. → [chat](docs/features/chat.md) |
 | `mcp/` | The `humla-mcp` server (`src/bin/humla-mcp.rs`); `tools.rs` is the seam, `server.rs` adapts to `rmcp`. → [integrations](docs/features/integrations.md) |
 | `db.rs` | Schema, CRUD, settings helpers (`get_setting`, `set_setting`, `delete_setting`), migrations (`migrate_summary_prompts`, `migrate_transcribe_config`, `migrate_per_language_v4`, `migrate_diarize_engine`) |

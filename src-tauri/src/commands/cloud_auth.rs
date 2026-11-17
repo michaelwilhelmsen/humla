@@ -593,7 +593,7 @@ pub(crate) fn server_changed(state: &State<'_, AppState>) {
 }
 
 fn http() -> reqwest::Client {
-    reqwest::Client::new()
+    crate::http::client()
 }
 
 /// Read a response as `(status, JSON body)`; a body that isn't JSON reads as null.

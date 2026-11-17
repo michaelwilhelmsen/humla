@@ -60,6 +60,7 @@ impl Runtime {
         opts.github_token = Some(token.to_string());
         opts.use_logged_in_user = Some(false);
         opts.working_directory = std::env::temp_dir();
+        opts.disable_client_telemetry = true;
         opts.extra_args = vec![
             // The SDK refuses a CLI outside its protocol range, so the CLI
             // must not swap itself for a newer download.

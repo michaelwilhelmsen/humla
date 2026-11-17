@@ -153,7 +153,7 @@ fn clear_all_roster_caches(state: &State<'_, AppState>) {
 }
 
 fn http() -> reqwest::Client {
-    reqwest::Client::new()
+    crate::http::client()
 }
 
 // ---- persisted config (settings table) -------------------------------------
@@ -1407,11 +1407,11 @@ pub(crate) async fn download_note_audio(app: &tauri::AppHandle, note_id: &str) -
         .query(&[("token", file_token)])
         .send()
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.without_url().to_string())?;
     if !resp.status().is_success() {
         return Err(format!("audio download failed ({})", resp.status()));
     }
-    let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
+    let bytes = resp.bytes().await.map_err(|e| e.without_url().to_string())?;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
@@ -1784,12 +1784,12 @@ pub(crate) async fn download_note_sessions(app: &tauri::AppHandle, note_id: &str
                 .query(&[("token", file_token.as_str())])
                 .send()
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| e.without_url().to_string())?;
             if !resp.status().is_success() {
                 eprintln!("session asset download failed ({}) for {}", resp.status(), field.field());
                 continue;
             }
-            let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
+            let bytes = resp.bytes().await.map_err(|e| e.without_url().to_string())?;
             std::fs::write(&dest, &bytes).map_err(|e| e.to_string())?;
             if field == crate::sessions::AssetField::PlaybackM4a {
                 // The take's WAV playback from an earlier pull is the same audio.

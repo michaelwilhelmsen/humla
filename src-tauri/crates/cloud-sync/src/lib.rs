@@ -26,6 +26,8 @@
 //! access is a scoped lock/snapshot/unlock before any network call. That keeps
 //! the worker future `Send`.
 
+mod http;
+
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -33,7 +35,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, MutexGuard};
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -42,6 +44,24 @@ use tokio::sync::mpsc;
 /// Shared handle to the app's SQLite connection. Same concrete type as the
 /// public core because rusqlite is pinned to the same version.
 pub type Db = Arc<Mutex<Connection>>;
+
+/// Hands the lock to a waiting thread, if there is one, when dropped.
+struct FairGuard<'a>(Option<MutexGuard<'a, Connection>>);
+
+impl std::ops::Deref for FairGuard<'_> {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        self.0.as_ref().expect("held until drop")
+    }
+}
+
+impl Drop for FairGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(guard) = self.0.take() {
+            MutexGuard::unlock_fair(guard);
+        }
+    }
+}
 
 
 /// The token the worker sends, and who it belongs to.
@@ -259,7 +279,7 @@ where
     let worker = Worker {
         db,
         config,
-        http: reqwest::Client::new(),
+        http: crate::http::client(),
         notify: Arc::new(notify),
         status: Arc::new(status),
         conflict: Arc::new(conflict),
@@ -1163,6 +1183,13 @@ impl Worker {
         }
     }
 
+    /// The database guard for applying one pulled item. A pull applies items
+    /// back to back, and a plain unlock lets the next item take the lock again
+    /// ahead of a command already waiting for it.
+    fn lock_db_fairly(&self) -> FairGuard<'_> {
+        FairGuard(Some(self.db.lock()))
+    }
+
     fn apply_remote_note_json(&self, v: &serde_json::Value) -> Result<()> {
         let n: RemoteNote = serde_json::from_value(v.clone())?;
         self.apply_remote_note(&n)
@@ -1197,7 +1224,7 @@ impl Worker {
             eprintln!("cloud-sync: skipping pulled note with unsafe client_id");
             return Ok(());
         }
-        let conn = self.db.lock();
+        let conn = self.lock_db_fairly();
         if n.deleted {
             // Soft-delete (move to Trash) rather than dropping the row: the
             // deletion stays recoverable, and re-pulling our own tombstone is
@@ -1328,7 +1355,7 @@ impl Worker {
             eprintln!("cloud-sync: skipping pulled folder with unsafe client_id");
             return Ok(());
         }
-        let conn = self.db.lock();
+        let conn = self.lock_db_fairly();
         if f.deleted {
             conn.execute(
                 "DELETE FROM folders WHERE id = ?1 AND workspace_id = ?2",
@@ -1353,7 +1380,7 @@ impl Worker {
             eprintln!("cloud-sync: skipping pulled client with unsafe client_id");
             return Ok(());
         }
-        let conn = self.db.lock();
+        let conn = self.lock_db_fairly();
         if c.deleted {
             // Hard local delete (clients has no local `deleted_at`), scoped to the
             // pulled workspace, mirroring `apply_remote_folder`. A note that still
@@ -1383,7 +1410,7 @@ impl Worker {
             eprintln!("cloud-sync: skipping pulled prompt with unsafe client_id");
             return Ok(());
         }
-        let conn = self.db.lock();
+        let conn = self.lock_db_fairly();
         if p.deleted {
             conn.execute(
                 "DELETE FROM summary_prompts WHERE id = ?1 AND workspace_id = ?2",
@@ -1971,7 +1998,7 @@ mod it {
     impl Session for PasswordSession {
         fn token(&self) -> TokenFuture<'_> {
             Box::pin(async move {
-                let resp = reqwest::Client::new()
+                let resp = crate::http::client()
                     .post(format!("{}/api/collections/users/auth-with-password", self.base_url))
                     .json(&json!({ "identity": self.email, "password": self.password }))
                     .send()
@@ -2044,7 +2071,7 @@ mod it {
         Worker {
             db,
             config,
-            http: reqwest::Client::new(),
+            http: crate::http::client(),
             notify: Arc::new(|| {}) as Arc<dyn Fn() + Send + Sync>,
             status: Arc::new(|_| {}) as Arc<dyn Fn(SyncState) + Send + Sync>,
             conflict: Arc::new(|_: &str| {}) as Arc<dyn Fn(&str) + Send + Sync>,
@@ -2167,6 +2194,47 @@ mod it {
         assert!(purged.lock().is_empty(), "no files to remove");
         w.queue_revocation(&json!({ "note_client_id": "../../etc/passwd", "at": 1 })).unwrap();
         assert!(w.pending_revocations().unwrap().is_empty(), "a hostile id is never queued");
+    }
+
+    // A command waiting on the database gets it between pulled items, not only
+    // once the whole page has been applied.
+    #[test]
+    fn pulled_items_let_a_waiting_command_in_between() {
+        const ITEMS: usize = 400;
+        let db = test_db();
+        let transcript = "Speaker 1: the budget line moves to next quarter.\n".repeat(2000);
+        let notes: Vec<RemoteNote> = (0..ITEMS)
+            .map(|i| RemoteNote {
+                client_id: format!("note-{i}"),
+                transcript: transcript.clone(),
+                created_at: 1,
+                client_updated_at: 1,
+                ..Default::default()
+            })
+            .collect();
+        let applier = {
+            let db = db.clone();
+            std::thread::spawn(move || {
+                let w = worker(db, offline_config("wsF"));
+                for note in &notes {
+                    w.apply_remote_note(note).unwrap();
+                }
+            })
+        };
+        let count = |conn: &Connection| -> usize {
+            conn.query_row("SELECT COUNT(*) FROM notes", [], |r| r.get::<_, i64>(0)).unwrap() as usize
+        };
+        let applied = loop {
+            let conn = db.lock();
+            let applied = count(&conn);
+            if applied > 0 {
+                break applied;
+            }
+            drop(conn);
+            std::thread::yield_now();
+        };
+        applier.join().unwrap();
+        assert!(applied < ITEMS, "the waiting command only got the database after the whole pull");
     }
 
     /// #232 — who a note is shared with arrives with the note.
@@ -2734,7 +2802,7 @@ mod it {
         let w = Worker {
             db: db.clone(),
             config: offline_config("wsA"),
-            http: reqwest::Client::new(),
+            http: crate::http::client(),
             notify: Arc::new(|| {}),
             status: Arc::new(|_| {}),
             conflict: Arc::new(move |_: &str| f.store(true, Ordering::SeqCst)),
