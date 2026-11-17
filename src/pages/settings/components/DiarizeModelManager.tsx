@@ -20,7 +20,7 @@ export function DiarizeModelManager({
     const { label, value } = downloadProgress(state.phase, state.fraction);
     return (
       <div className="flex flex-col gap-2">
-        <div className="text-sm">{label}</div>
+        <div className="text-xs text-[var(--color-text-muted)]">{label}</div>
         <ProgressTrack value={value} label={label} />
       </div>
     );
@@ -29,7 +29,7 @@ export function DiarizeModelManager({
   if (state.status?.downloaded) {
     return (
       <div className="flex flex-col gap-2">
-        <div className="text-sm">
+        <div className="text-xs text-[var(--color-text-muted)]">
           Downloaded
           {state.status.sizeBytes ? ` (${formatBytes(state.status.sizeBytes)})` : ""}
         </div>
@@ -52,7 +52,7 @@ export function DiarizeModelManager({
     const failed = state.status.warmUpError;
     return (
       <div className="flex flex-col gap-2">
-        <div className="text-sm">
+        <div className="text-xs text-[var(--color-text-muted)]">
           {failed != null
             ? `Couldn’t be prepared for this version of macOS${failed ? `: ${failed}` : "."}`
             : "Downloaded, and being prepared for this version of macOS, which takes about two minutes."}
@@ -68,7 +68,7 @@ export function DiarizeModelManager({
 
   return (
     <div className="flex flex-col gap-2">
-      <div className="text-sm">Not downloaded. {cost}</div>
+      <div className="text-xs text-[var(--color-text-muted)]">Not downloaded. {cost}</div>
       <div className="flex gap-2">
         <Btn onClick={onDownload}>Download model</Btn>
       </div>

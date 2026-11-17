@@ -108,16 +108,13 @@ input::placeholder, textarea::placeholder {
 }
 
 /* UI helpers ---------------------------------------------------------------
-   Use .nd-label for section/group micro-labels (Hanken 600, lightly tracked
-   uppercase — the "FOLDERS" / "TODAY" caption style from the prototype). Use
-   .nd-chip for tags, statuses, and pickers — a 1px-bordered pill with no
-   fill. */
+   Use .nd-label for section/group captions ("Folders", "Today"), written in
+   sentence case. Use .nd-chip for tags, statuses, and pickers — a 1px-bordered
+   pill with no fill. */
 .nd-label {
   font-family: var(--font-sans);
   font-size: var(--text-label-size);
   font-weight: 600;
-  letter-spacing: 0.05em;
-  text-transform: uppercase;
   color: var(--color-text-disabled);
   line-height: 1.2;
 }
@@ -201,10 +198,8 @@ input::placeholder, textarea::placeholder {
   border: 1px solid var(--color-line-visible);
   border-radius: 999px;
   background: var(--color-surface);
-  font-family: var(--font-mono);
+  font-family: var(--font-sans);
   font-size: 11px;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
   color: var(--color-text-muted);
   line-height: 1.2;
   transition: color 200ms cubic-bezier(0.25, 0.1, 0.25, 1),

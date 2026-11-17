@@ -383,6 +383,17 @@ describe("settings dialog", () => {
     ]);
   });
 
+  it("gives every sidebar section a decorative icon", async () => {
+    renderApp("/settings");
+    const dialog = await screen.findByRole("dialog", { name: /settings/i });
+
+    for (const tab of within(dialog).getAllByRole("tab")) {
+      const icon = tab.querySelector("svg");
+      expect(icon).not.toBeNull();
+      expect(icon).toHaveAttribute("aria-hidden", "true");
+    }
+  });
+
   it("moves focus into the dialog on open and back to the trigger on close", async () => {
     renderApp("/");
     await screen.findByRole("button", { name: /new note/i });

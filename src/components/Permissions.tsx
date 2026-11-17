@@ -81,8 +81,10 @@ export function Permissions() {
 
   if (!status) return null;
 
+  // Rows, not cards: the settings Section around this draws the card and the
+  // hairlines between its children.
   return (
-    <div className="flex flex-col gap-3">
+    <>
       {(["microphone", "screen", "notifications"] as PermissionKind[]).map((kind) => {
         const s = statusLabel(status[kind]);
         // Microphone can be prompted only when it's "not_determined". Screen
@@ -98,7 +100,7 @@ export function Permissions() {
         return (
           <div
             key={kind}
-            className="flex items-start justify-between gap-4 px-4 py-3 rounded-lg bg-[var(--color-surface)] border border-[var(--color-line)]"
+            className="flex items-start justify-between gap-4 py-3.5"
           >
             <div className="min-w-0">
               <div className="flex items-center gap-2">
@@ -147,9 +149,9 @@ export function Permissions() {
           </div>
         );
       })}
-      <p className="text-xs text-[var(--color-text-muted)] mt-1">
+      <p className="text-xs text-[var(--color-text-muted)] py-3.5">
         After enabling Screen Recording in System Settings, you must restart the app for the change to take effect.
       </p>
-    </div>
+    </>
   );
 }

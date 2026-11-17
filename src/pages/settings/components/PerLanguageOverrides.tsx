@@ -148,7 +148,7 @@ function AddOverrideForm({
 
   return (
     <div className="flex flex-col gap-3 px-3 py-3 rounded-md border border-[var(--color-line)] bg-[var(--color-canvas)]">
-      <div className="text-xs uppercase tracking-wide text-[var(--color-text-muted)]">
+      <div className="text-xs font-medium text-[var(--color-text-muted)]">
         New override
       </div>
       <Select

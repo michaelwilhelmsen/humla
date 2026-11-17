@@ -6,12 +6,14 @@
 // none of them 404 (e.g. `?tab=keys` lands on Transcription).
 
 import type { ReactNode } from "react";
+import type { LucideIcon } from "lucide-react";
 import { useSearchParams } from "react-router-dom";
 import { resolveSectionId, type SectionId } from "./sections";
 
 export type SettingsSection = {
   id: SectionId;
   label: string;
+  icon: LucideIcon;
   content: ReactNode;
 };
 
@@ -31,20 +33,17 @@ export function SettingsLayout({ sections }: { sections: SettingsSection[] }) {
         <nav className="flex flex-col gap-0.5" role="tablist">
           {sections.map((section) => {
             const isActive = section.id === active?.id;
+            const Icon = section.icon;
             return (
               <button
                 key={section.id}
                 role="tab"
                 aria-selected={isActive}
                 onClick={() => setParams({ tab: section.id }, { replace: true })}
-                className={
-                  "text-left px-3 py-1.5 rounded-md text-sm transition-colors " +
-                  (isActive
-                    ? "bg-[var(--color-pill-hover)] text-[var(--color-text)]"
-                    : "text-[var(--color-text-muted)] hover:text-[var(--color-text)] hover:bg-[var(--color-pill-hover)]")
-                }
+                className={"nd-navrow text-left" + (isActive ? " is-active font-medium" : "")}
               >
-                {section.label}
+                <Icon size={16} strokeWidth={1.6} aria-hidden className="shrink-0 opacity-85" />
+                <span className="truncate">{section.label}</span>
               </button>
             );
           })}

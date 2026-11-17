@@ -81,9 +81,9 @@ export function SummaryPromptsManager({ language }: { language: string }) {
   }
 
   return (
-    <div className="flex flex-col gap-5">
+    <div className="flex flex-col gap-5 py-3.5">
       <div className="flex flex-col gap-2">
-        <p className="text-xs uppercase tracking-wide text-[var(--color-text-muted)]">
+        <p className="text-xs font-medium text-[var(--color-text-muted)]">
           Built-in
         </p>
         <p className="text-xs text-[var(--color-text-muted)]">
@@ -105,7 +105,7 @@ export function SummaryPromptsManager({ language }: { language: string }) {
 
       <div className="flex flex-col gap-2">
         <div className="flex items-center justify-between">
-          <p className="text-xs uppercase tracking-wide text-[var(--color-text-muted)]">
+          <p className="text-xs font-medium text-[var(--color-text-muted)]">
             Your prompts
           </p>
           <Btn onClick={startNew}>+ New prompt</Btn>
@@ -222,7 +222,7 @@ function PromptEditor({
   return (
     <div className="flex flex-col gap-4">
       <div className="flex flex-col gap-1.5">
-        <label className="text-xs uppercase tracking-wide text-[var(--color-text-muted)]">
+        <label className="text-xs font-medium text-[var(--color-text-muted)]">
           Name
         </label>
         <input
@@ -236,7 +236,7 @@ function PromptEditor({
       </div>
 
       <div className="flex flex-col gap-1.5">
-        <label className="text-xs uppercase tracking-wide text-[var(--color-text-muted)]">
+        <label className="text-xs font-medium text-[var(--color-text-muted)]">
           Content
         </label>
         {/*

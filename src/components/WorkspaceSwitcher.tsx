@@ -41,7 +41,7 @@ function SyncIndicator({ status }: { status: SyncStatus }) {
 }
 
 const PILL_CLS =
-  "shrink-0 px-1 text-[9px] uppercase tracking-[0.08em] rounded border border-[var(--color-line)] text-[var(--color-text-muted)]";
+  "shrink-0 px-1 text-[10px] rounded border border-[var(--color-line)] text-[var(--color-text-muted)]";
 
 function RolePill({ role }: { role: CloudRole }) {
   return <span className={PILL_CLS}>{roleLabel(role)}</span>;

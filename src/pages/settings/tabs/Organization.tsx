@@ -27,7 +27,7 @@ const inputCls =
 function RolePill({ role }: { role: CloudRole }) {
   return (
     <span
-      className="shrink-0 px-1.5 py-0.5 text-[10px] uppercase tracking-[0.06em] rounded border"
+      className="shrink-0 px-1.5 py-0.5 text-[11px] rounded border"
       style={{ color: roleColorVar(role), borderColor: "var(--color-line)" }}
     >
       {roleLabel(role)}

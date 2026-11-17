@@ -23,3 +23,11 @@ describe("resolveSectionId", () => {
     expect(resolveSectionId("nonsense")).toBe(SECTIONS[0].id);
   });
 });
+
+describe("SECTIONS", () => {
+  it("gives every section its own icon", () => {
+    const icons = SECTIONS.map((s) => s.icon);
+    expect(icons.every(Boolean)).toBe(true);
+    expect(new Set(icons).size).toBe(icons.length);
+  });
+});
