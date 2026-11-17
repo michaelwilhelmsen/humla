@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { SECTIONS, resolveSectionId } from "./sections";
+import { SECTIONS, SECTION_GROUPS, resolveSectionId } from "./sections";
 
 describe("resolveSectionId", () => {
   it("maps every legacy tab id to its new section", () => {
@@ -10,6 +10,9 @@ describe("resolveSectionId", () => {
     expect(resolveSectionId("transcription")).toBe("transcription");
     expect(resolveSectionId("keys")).toBe("transcription");
     expect(resolveSectionId("summary")).toBe("summaries");
+    expect(resolveSectionId("prompts")).toBe("templates");
+    expect(resolveSectionId("summary-prompts")).toBe("templates");
+    expect(resolveSectionId("custom-vocabulary")).toBe("vocabulary");
   });
 
   it("passes through current section ids", () => {
@@ -29,5 +32,15 @@ describe("SECTIONS", () => {
     const icons = SECTIONS.map((s) => s.icon);
     expect(icons.every(Boolean)).toBe(true);
     expect(new Set(icons).size).toBe(icons.length);
+  });
+});
+
+describe("SECTION_GROUPS", () => {
+  it("puts every section in exactly one group, in sidebar order", () => {
+    expect(SECTION_GROUPS.map((g) => g.label)).toEqual(["Content", "Setup", "Account"]);
+    expect(SECTION_GROUPS.flatMap((g) => g.sections.map((s) => s.id))).toEqual(
+      SECTIONS.map((s) => s.id),
+    );
+    expect(new Set(SECTIONS.map((s) => s.id)).size).toBe(SECTIONS.length);
   });
 });

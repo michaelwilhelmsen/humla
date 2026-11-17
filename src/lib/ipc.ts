@@ -274,6 +274,8 @@ export type SummaryPrompt = {
   // or display "edited X ago" later if useful.
   created_at: number;
   updated_at: number;
+  /** The workspace it is shared in; empty for a personal template. */
+  workspace_id?: string;
 };
 
 export type LocalWhisperModelStatus = {

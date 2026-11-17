@@ -1932,12 +1932,19 @@ const CASES: Record<string, Scenario> = {
     },
   },
 
-  // --- The whole Settings dialog over the app, on the unit tests' defaults.
-  // Switch sections from its own sidebar; `?tab=` is not read from the page URL.
+  // --- The whole Settings dialog over the app, on the unit tests' defaults plus
+  // a few templates and terms. `&section=<id>` opens on a section; `?tab=` is
+  // not read from the page URL. `settings-workspace` is the same inside a team
+  // workspace, where shared templates get their own group.
   settings: {
-    route: "/settings?tab=recording",
+    route: `/settings?tab=${new URLSearchParams(location.search).get("section") ?? "templates"}`,
     render: () => null, // unused — `route` renders the app
-    ipc: {},
+    ipc: settingsContentIpc(false),
+  },
+  "settings-workspace": {
+    route: `/settings?tab=${new URLSearchParams(location.search).get("section") ?? "templates"}`,
+    render: () => null, // unused — `route` renders the app
+    ipc: settingsContentIpc(true),
   },
 
   // --- Two-factor authentication. Settings → Account, signed in to a
@@ -1980,6 +1987,47 @@ const CASES: Record<string, Scenario> = {
     ipc: {},
   },
 };
+
+function settingsContentIpc(workspace: boolean): Record<string, (args: unknown) => unknown> {
+  const team: CloudWorkspace = { id: "w1", name: "Acme", role: "member", plan_status: "active" };
+  const row = (id: string, name: string, content: string, workspace_id = "") => ({
+    id,
+    name,
+    content,
+    created_at: 0,
+    updated_at: 0,
+    workspace_id,
+  });
+  const templates = [
+    row("t1", "Team standup", "List what each person did, what they will do next, and anything blocking them."),
+    ...(workspace
+      ? [
+          row("t2", "Customer call", "Record the customer's questions, what we promised, and follow-ups.", "w1"),
+          row("t3", "Retro", "What went well, what didn't, and what we change next sprint.", "w1"),
+        ]
+      : []),
+  ];
+  return {
+    summary_prompts_list: () => templates,
+    settings_get: (args) =>
+      (args as { key: string }).key === "custom_vocabulary"
+        ? "Humla, Hege Nilsen, ScreenCaptureKit, Tauri, Nemotron"
+        : null,
+    ...(workspace
+      ? {
+          cloud_status: () => ({
+            ...DISCONNECTED,
+            configured: true,
+            logged_in: true,
+            base_url: "https://sync.humla.team",
+            user: { id: "u1", email: "m@example.no", name: "Michael", verified: true },
+            current_workspace: team,
+            workspaces: [team],
+          }),
+        }
+      : {}),
+  };
+}
 
 function twoFactorIpc(enabled: boolean) {
   const acme: CloudWorkspace = {

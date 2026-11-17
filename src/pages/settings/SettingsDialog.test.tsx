@@ -289,14 +289,14 @@ describe("settings dialog", () => {
   });
 
   it("Escape in a nested modal closes only that modal, not the dialog", async () => {
-    renderApp("/settings?tab=summaries");
+    renderApp("/settings?tab=templates");
     const dialog = await screen.findByRole("dialog", { name: /settings/i });
 
-    // The summary-prompt editor is a Modal nested inside the dialog.
+    // The template editor is a Modal nested inside the dialog.
     await userEvent.click(
-      await within(dialog).findByRole("button", { name: /new prompt/i }),
+      await within(dialog).findByRole("button", { name: /new template/i }),
     );
-    const editor = await screen.findByRole("dialog", { name: /new prompt/i });
+    const editor = await screen.findByRole("dialog", { name: /new template/i });
     expect(editor).toBeInTheDocument();
 
     await userEvent.keyboard("{Escape}");
@@ -304,7 +304,7 @@ describe("settings dialog", () => {
     // Editor dismissed; the settings dialog (and any typed work behind it)
     // survives.
     expect(
-      screen.queryByRole("dialog", { name: /new prompt/i }),
+      screen.queryByRole("dialog", { name: /new template/i }),
     ).not.toBeInTheDocument();
     expect(
       screen.getByRole("dialog", { name: /settings/i }),
@@ -366,21 +366,24 @@ describe("settings dialog", () => {
     expect(within(dialog).queryByRole("searchbox")).not.toBeInTheDocument();
   });
 
-  it("shows the six sections in the sidebar nav", async () => {
+  it("groups the sections under Content, Setup and Account", async () => {
     renderApp("/settings");
     const dialog = await screen.findByRole("dialog", { name: /settings/i });
 
-    const tabs = within(dialog)
-      .getAllByRole("tab")
-      .map((t) => t.textContent);
-    expect(tabs).toEqual([
-      "Recording",
-      "Transcription",
-      "Summaries",
-      "Chat",
-      "Account",
-      "General",
+    const groups = within(dialog)
+      .getAllByRole("group")
+      .map((g) => ({
+        label: g.getAttribute("aria-label"),
+        tabs: within(g).getAllByRole("tab").map((t) => t.textContent),
+      }));
+    expect(groups).toEqual([
+      { label: "Content", tabs: ["Templates", "Vocabulary"] },
+      { label: "Setup", tabs: ["Recording", "Transcription", "Summaries", "Chat"] },
+      { label: "Account", tabs: ["Account", "General"] },
     ]);
+    // Captions are text, not something to click.
+    expect(within(dialog).queryByRole("button", { name: "Content" })).toBeNull();
+    expect(within(dialog).queryByRole("tab", { name: "Setup" })).toBeNull();
   });
 
   it("gives every sidebar section a decorative icon", async () => {
@@ -441,6 +444,35 @@ describe("settings dialog", () => {
     expect(
       within(dialog).getByLabelText(/groq api key/i),
     ).toBeInTheDocument();
+  });
+
+  it("sends links aimed at the prompts or vocabulary to their new sections", async () => {
+    renderApp("/settings?tab=prompts");
+    const dialog = await screen.findByRole("dialog", { name: /settings/i });
+    expect(within(dialog).getByRole("tab", { name: "Templates" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+  });
+
+  it("the summaries link opens Templates", async () => {
+    renderApp("/settings?tab=summaries");
+    const dialog = await screen.findByRole("dialog", { name: /settings/i });
+    await userEvent.click(await within(dialog).findByRole("button", { name: "Edit templates" }));
+    expect(within(dialog).getByRole("tab", { name: "Templates" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+  });
+
+  it("vocabulary lives in its own section, not Transcription", async () => {
+    renderApp("/settings?tab=transcription");
+    const dialog = await screen.findByRole("dialog", { name: /settings/i });
+    await within(dialog).findByRole("tab", { name: "Transcription" });
+    expect(within(within(dialog).getByRole("tabpanel")).queryByText(/vocabulary|custom terms/i)).toBeNull();
+
+    await userEvent.click(within(dialog).getByRole("tab", { name: "Vocabulary" }));
+    expect(await within(dialog).findByLabelText("Add a term")).toBeInTheDocument();
   });
 
   it("the default language lives in Transcription and persists", async () => {
@@ -682,10 +714,12 @@ describe("settings dialog", () => {
     expect(
       await within(dialog).findByLabelText(/openai api key/i),
     ).toBeInTheDocument();
-    // Default preset moved here from General.
+    // Default template moved here from General.
     expect(
       within(dialog).getByRole("combobox", { name: /meeting/i }),
     ).toBeInTheDocument();
+    // The templates themselves live in Content → Templates.
+    expect(within(dialog).queryByRole("button", { name: /new template/i })).toBeNull();
 
     await userEvent.click(within(dialog).getByRole("tab", { name: "General" }));
     expect(
@@ -744,12 +778,12 @@ describe("settings dialog", () => {
   it("switches sections from the nav and reflects it in the URL", async () => {
     renderApp("/settings");
     const dialog = await screen.findByRole("dialog", { name: /settings/i });
-    // Default landing is the first section, Recording.
+    // Default landing is the first section, Templates.
     expect(
-      within(dialog).getByRole("tab", { name: "Recording" }),
+      within(dialog).getByRole("tab", { name: "Templates" }),
     ).toHaveAttribute("aria-selected", "true");
     expect(
-      await within(dialog).findByRole("heading", { name: /audio retention/i }),
+      await within(dialog).findByRole("heading", { name: "Built-in" }),
     ).toBeInTheDocument();
 
     await userEvent.click(within(dialog).getByRole("tab", { name: "General" }));
