@@ -73,7 +73,7 @@ export function RecordingSection({
       <Section title="Power">
         <Row
           label="Keep Mac awake while recording"
-          description="A closed lid still sleeps."
+          description="Stops your Mac from going to sleep during a recording."
           control={
             <Toggle
               label="Keep Mac awake while recording"
@@ -97,7 +97,7 @@ export function RecordingSection({
           // rather than describing the switch.
           description={
             closeToTray
-              ? "Closing the window keeps Humla in the menu bar. Quit from there."
+              ? "Closing the window keeps Humla in the menu bar."
               : "Closing the window quits Humla."
           }
           control={
@@ -110,7 +110,7 @@ export function RecordingSection({
         />
         <Row
           label="Record shortcut"
-          description="Works in any app. Records into the open note, or a new one."
+          description="Start and stop a recording from any app."
           control={<HotkeyField />}
         />
       </Section>

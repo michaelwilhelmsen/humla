@@ -236,7 +236,8 @@ export function ChatTab({ s, update }: Pick<SettingsHook, "s" | "update">) {
               /v1/embeddings at all, and llama-server wants its own process. */}
           <div className="py-3 space-y-3 border-t border-[var(--color-line)]">
             <p className="text-xs text-[var(--color-text-muted)]">
-              For search by meaning. Leave blank to use {EMBEDDING_OLLAMA_MODEL} on the chat server.
+              Semantic search finds answers by meaning, yielding much better results when searching. It
+              needs an embedding model.
             </p>
             <Row
               label="Embedding server"

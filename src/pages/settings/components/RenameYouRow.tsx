@@ -161,7 +161,7 @@ export function RenameYouRow() {
         </p>
       )}
       <p className="text-xs text-[color:var(--color-text-muted)] mt-1">
-        Summaries are left alone. Each note keeps a restorable version.
+        Rewrites each transcript and its playback labels.
       </p>
     </Row>
   );

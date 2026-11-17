@@ -635,7 +635,7 @@ describe("settings dialog", () => {
         "Use Nemotron 3 (end-to-end) for new recordings",
         "Use Community-1 (clustering) for new recordings",
       ]);
-      expect(within(dialog).getByText(/counts speakers itself\. limit: 8 speakers/i)).toBeInTheDocument();
+      expect(within(dialog).getByText(/limit: 8 speakers/i)).toBeInTheDocument();
       expect(within(dialog).getByText(/193 MB/)).toBeInTheDocument();
     });
 

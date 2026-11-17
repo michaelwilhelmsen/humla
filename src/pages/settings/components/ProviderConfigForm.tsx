@@ -25,14 +25,14 @@ type LocalModelSummary = {
 // Model-row description per provider; an empty string shows none.
 const MODEL_DESCRIPTIONS: Record<TranscribeProvider, string> = {
   openai:
-    "gpt-4o-transcribe-diarize ignores vocabulary and treats language as a hint.",
+    "",
   deepgram:
     "",
   groq: "",
   local:
     "Downloaded models only.",
   custom:
-    "As the endpoint names it, e.g. elevenlabs/scribe-v2. Without word timings there is no per-word highlighting.",
+    "Enter exactly as the endpoint names it, e.g. elevenlabs/scribe-v2.",
 };
 
 // Reusable provider+model picker rendered as self-describing rows. Used by
@@ -184,6 +184,7 @@ export function ProviderConfigForm({
           />
           <Row
             label="Use Metal (Apple GPU)"
+            description="Optimize speed for Apple Silicon."
             control={
               <Toggle
                 label="Use Metal (Apple GPU) for Whisper inference"

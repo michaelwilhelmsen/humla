@@ -225,7 +225,7 @@ export function TranscriptionTab({
       <Section title="Speaker labels">
         <EngineOption
           label="Nemotron 3 (end-to-end)"
-          description={`Counts speakers itself. Limit: ${NEMOTRON_MAX_SPEAKERS} speakers. Notes set higher use Community-1.`}
+          description={`Limit: ${NEMOTRON_MAX_SPEAKERS} speakers.`}
           checked={s.diarize_model === "nemotron3"}
           disabled={!diarize.nemotron3.status?.downloaded}
           onPick={() => update("diarize_model", "nemotron3")}
