@@ -62,8 +62,8 @@ impl HumlaMcp {
     /// protocol layer above needs to know.
     fn dispatch(&self, name: &str, args: Value) -> (String, bool) {
         let conn = self.db.lock();
-        if !super::is_enabled(&conn) {
-            return (super::disabled_message(), true);
+        if let Some(refusal) = super::refusal(&conn) {
+            return (refusal, true);
         }
         let workspace = super::active_workspace(&conn);
         let out = tools::execute(&conn, &workspace, name, &args, crate::db::now_ms());
@@ -77,7 +77,7 @@ impl HumlaMcp {
     /// its answer names a note) is exactly what needs pinning.
     fn resources(&self) -> Vec<Resource> {
         let conn = self.db.lock();
-        if !super::is_enabled(&conn) {
+        if let Some(refusal) = super::refusal(&conn) {
             // A PLACEHOLDER, not an empty list — for exactly the reason resources are
             // implemented at all. Codex has reported a server whose resource list is
             // empty as unavailable, and "off" is the DEFAULT state, so answering an
@@ -90,7 +90,7 @@ impl HumlaMcp {
             // is that nothing from the library is readable until the user opts in,
             // and a resource list is readable without any tool being called.
             return vec![Resource::new(RESOURCE_DISABLED, "Humla — integration turned off")
-                .with_description(super::disabled_message())
+                .with_description(refusal)
                 .with_mime_type("text/plain")];
         }
         let workspace = super::active_workspace(&conn);
@@ -114,7 +114,8 @@ impl HumlaMcp {
         // server is broken, which is the opposite of the message — and the message is
         // the entire point of offering it.
         if uri == RESOURCE_DISABLED {
-            return Ok(super::disabled_message());
+            let refusal = super::refusal(&self.db.lock());
+            return Ok(refusal.unwrap_or_else(super::disabled_message));
         }
         let Some(note_id) = uri.strip_prefix(RESOURCE_PREFIX) else {
             return Err(ErrorData::resource_not_found(format!("Not a Humla note URI: {uri}"), None));
@@ -420,5 +421,31 @@ mod tests {
         let (text, is_error) = server.dispatch(tools::TOOL_LIST, serde_json::json!({}));
         assert!(!is_error);
         assert!(text.contains("Secret meeting"));
+    }
+
+    #[test]
+    fn local_only_answers_nothing_from_the_library_even_when_switched_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("t.sqlite")).unwrap();
+        let note = crate::db::create_note(&conn, "en", "meeting", "").unwrap();
+        crate::db::update_note(
+            &conn,
+            &note.id,
+            &crate::db::NotePatch { title: Some("Secret meeting".into()), ..Default::default() },
+        )
+        .unwrap();
+        crate::db::set_setting(&conn, super::super::SETTING_ENABLED, "true").unwrap();
+        crate::org_policy::cache_local_only(&conn, "Northwind");
+        let server = HumlaMcp::new(conn);
+
+        for spec in tools::specs() {
+            let (text, is_error) =
+                server.dispatch(spec.name, serde_json::json!({ "query": "secret", "note_id": note.id }));
+            assert!(is_error, "{}", spec.name);
+            assert!(text.starts_with("Blocked by Northwind"), "{}: {text}", spec.name);
+        }
+        let rendered = serde_json::to_string(&server.resources()).unwrap();
+        assert!(!rendered.contains("Secret meeting"), "{rendered}");
+        assert!(server.read_uri(RESOURCE_DISABLED).unwrap().starts_with("Blocked by Northwind"));
     }
 }
