@@ -460,7 +460,7 @@ fn split_label(line: &str) -> (Option<&str>, &str) {
 /// rules differ on purpose (Rust groups on label, `groupTimeline` on label
 /// *and* session), and never by raw text, because a cross-note speaker rename
 /// rewrites the transcript and leaves the timeline alone.
-pub(super) fn comparable_words(transcript: &str) -> Vec<String> {
+fn comparable_words(transcript: &str) -> Vec<String> {
     let mut out = Vec::new();
     for line in transcript.lines() {
         let (_, rest) = split_label(line);
@@ -486,7 +486,7 @@ pub(super) fn comparable_words(transcript: &str) -> Vec<String> {
 /// only words the transcript has and the projection lacks are invisible. A
 /// subsequence test says exactly that, and it is insensitive to the two
 /// grouping rules disagreeing about where lines break (they do, on purpose).
-pub(super) fn projection_covers(transcript: &str, projection: &str) -> bool {
+fn projection_covers(transcript: &str, projection: &str) -> bool {
     let pw = comparable_words(projection);
     let mut p = pw.iter();
     comparable_words(transcript)
@@ -502,7 +502,7 @@ pub(super) fn projection_covers(transcript: &str, projection: &str) -> bool {
 /// the transcript in word order. Returns `None` when nothing is orphaned, or
 /// when the gap can't be attributed to a whole run of leading lines — the
 /// render-time guard covers those shapes rather than guessing at a repair.
-pub(super) fn orphaned_prefix<'a>(transcript: &'a str, projection: &str) -> Option<Vec<&'a str>> {
+fn orphaned_prefix<'a>(transcript: &'a str, projection: &str) -> Option<Vec<&'a str>> {
     let tw = comparable_words(transcript);
     let pw = comparable_words(projection);
     if pw.is_empty() || tw.len() <= pw.len() {
@@ -568,7 +568,7 @@ fn repair_session_id(note_id: &str, lines: &[&str]) -> String {
 /// whatever speaker label it carried and loses nothing else; there are no word
 /// timings to recover, and none are invented (ADR-0004 — a stale mapping is
 /// worse than none).
-pub(super) fn synthesize_orphan_timeline(lines: &[&str]) -> String {
+fn synthesize_orphan_timeline(lines: &[&str]) -> String {
     let mut out = String::new();
     for (i, line) in lines.iter().enumerate() {
         let (label, text) = split_label(line);

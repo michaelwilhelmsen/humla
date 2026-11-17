@@ -232,9 +232,9 @@ humla/
 ├── src/                        # React frontend (Tiptap + Zustand)
 ├── src-tauri/                  # Rust backend (Tauri 2)
 │   ├── src/
-│   │   ├── commands.rs         # recording lifecycle, chunk transcription, diarize-on-stop
-│   │   ├── commands/           # command groups: notes, folders, settings, chat, clients,
-│   │   │                       #   cloud, export, models, summary, api_keys, …
+│   │   ├── commands.rs         # module root: shared helpers and defaults
+│   │   ├── commands/           # capture (recording lifecycle), transcribe, diarization,
+│   │   │                       #   timeline, notes, chat, cloud, summary, export, …
 │   │   ├── recording.rs        # session state, per-source trails
 │   │   ├── stt/                # STT adapter abstraction (OpenAI/Local/Deepgram/Groq)
 │   │   ├── chat/               # agentic note-chat: tool loop, retrieval, providers
