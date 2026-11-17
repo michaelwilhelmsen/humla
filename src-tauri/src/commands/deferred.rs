@@ -5,11 +5,12 @@ use super::transcribe::record_detected_language;
 use super::unify::unify_note_speakers;
 #[cfg(feature = "cloud")]
 use super::cloud;
+use super::diarization::{note_diarize_settings, rediarize_apply_to_chunks, LabelFallback};
 use super::{
     chat, dispatch_sidecar_event, drain_inflight, emit_error, emit_transcribe_progress,
-    ensure_provider_ready, err, ms_since, note_diarize_settings, notes, redact_sidecar_line,
-    rediarize_apply_to_chunks, session_changed_for_sync, session_write_dir, sidecar_path, title,
-    write_chunks_json, ChainProgress, LabelFallback, IMPORT_BACKLOG_PERMITS,
+    ensure_provider_ready, err, ms_since, notes, redact_sidecar_line, session_changed_for_sync,
+    session_write_dir, sidecar_path, title, write_chunks_json, ChainProgress,
+    IMPORT_BACKLOG_PERMITS,
 };
 use crate::recording::{
     CaptureSink, ChunkRecord, ChunkSource, ErrorPayload, Inflight, ReplayProgress, ReplayTakeTimings,

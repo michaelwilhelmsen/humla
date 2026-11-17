@@ -3,7 +3,7 @@
 //! short interjections and continuation chains folded into the surrounding
 //! speaker, and run-on sentences mended across line boundaries.
 
-use super::assign_speaker;
+use super::diarization::assign_speaker;
 use crate::diarize;
 use crate::recording::{ChunkRecord, ChunkSource};
 

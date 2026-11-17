@@ -3,11 +3,12 @@
 
 use super::timeline::{commit_rebuilt_transcript, read_timeline_values, rebuild_note_transcript};
 use super::transcript::{single_piece, split_by_labels, LabelledPiece};
-use super::{
-    assign_speaker, diarize_and_maybe_clean, distinct_speaker_count, emit_error,
-    finalise_stream_labels, log_echo_check, note_diarize_settings, parse_chunks_json,
-    serialize_timeline, ChainProgress, EchoPass, HybridLabels, NoteDiarizeSettings, StreamSteps,
+use super::diarization::{
+    assign_speaker, diarize_and_maybe_clean, distinct_speaker_count, finalise_stream_labels,
+    log_echo_check, note_diarize_settings, parse_chunks_json, EchoPass, HybridLabels,
+    NoteDiarizeSettings,
 };
+use super::{emit_error, serialize_timeline, ChainProgress, StreamSteps};
 use crate::recording::{ChunkRecord, ChunkSource, Step, StepReport};
 use crate::{diarize, sessions, wav, AppState};
 use std::path::PathBuf;
