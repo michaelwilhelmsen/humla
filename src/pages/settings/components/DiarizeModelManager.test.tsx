@@ -37,7 +37,7 @@ describe("DiarizeModelManager", () => {
 
   it("says a model awaiting its warm-up is being prepared, not missing", async () => {
     const { onDownload } = renderWith({ needsWarmUp: true });
-    expect(screen.getByText(/being prepared for this version of macOS/)).toBeInTheDocument();
+    expect(screen.getByText(/Preparing for this Mac/)).toBeInTheDocument();
     expect(screen.queryByText(/Not downloaded/)).not.toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "Prepare now" }));
     expect(onDownload).toHaveBeenCalled();

@@ -72,9 +72,6 @@ export function Trash() {
             <h1 className="nd-heading truncate">Trash</h1>
             <span className="text-[14px] text-[var(--color-text-disabled)] tabular-nums shrink-0">{count}</span>
           </div>
-          <p className="px-2 pt-2 text-[13px] text-[var(--color-text-muted)]">
-            Deleted notes are kept here. Restore them, or delete permanently.
-          </p>
         </div>
       </div>
 

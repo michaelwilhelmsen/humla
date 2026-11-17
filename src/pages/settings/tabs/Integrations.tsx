@@ -60,8 +60,7 @@ export function IntegrationsSection({
         label="Model Context Protocol server"
         description={
           <>
-            Let Claude Code, Codex or any other MCP client search and read your notes. Read-only:
-            nothing can change or delete a note, and recorded audio is never reachable.{" "}
+            Read-only access for Claude Code, Codex and other MCP clients. Audio is never reachable.{" "}
             <button
               type="button"
               onClick={() => void openExternal(MCP_GUIDE_URL)}
@@ -98,9 +97,8 @@ export function IntegrationsSection({
           </Row>
           <Row label="Anything else">
             <p className="text-xs text-[var(--color-text-muted)]">
-              Any MCP client that speaks stdio can run this command directly. It
-              works whether or not Humla is open, and reads whichever workspace
-              you're currently in.
+              Any stdio MCP client can run the same command. It reads your current workspace, whether
+              or not Humla is open.
             </p>
           </Row>
         </>

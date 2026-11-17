@@ -165,7 +165,7 @@ export function PermissionsStep({ ctx }: { ctx: StepContext }) {
       <StepShell
         icon={<ShieldCheck size={26} strokeWidth={1.6} />}
         title="Grant recording permissions"
-        subtitle="Humla needs microphone access to record. System audio is optional."
+        subtitle="System audio is only needed for remote calls."
       />
     );
   }
@@ -179,7 +179,7 @@ export function PermissionsStep({ ctx }: { ctx: StepContext }) {
     <StepShell
       icon={<ShieldCheck size={26} strokeWidth={1.6} />}
       title="Grant recording permissions"
-      subtitle="Humla needs microphone access to record. System audio is optional — grant it only if you record remote calls."
+      subtitle="System audio is only needed for remote calls."
     >
       <div className="w-full max-w-md flex flex-col gap-3 text-left">
         {/* Microphone — required */}
@@ -198,7 +198,7 @@ export function PermissionsStep({ ctx }: { ctx: StepContext }) {
                 <StatusPill status={status.microphone} />
               </div>
               <p className="mt-1.5 text-xs leading-relaxed text-[var(--color-text-muted)]">
-                Required — captures your voice. Humla can't record without it.
+                Required.
               </p>
               {micBlocked && (
                 <p className="mt-1.5 text-xs leading-relaxed text-[var(--color-danger)]">
@@ -309,8 +309,7 @@ export function PermissionsStep({ ctx }: { ctx: StepContext }) {
                 <StatusPill status={status.notifications} />
               </div>
               <p className="mt-1.5 text-xs leading-relaxed text-[var(--color-text-muted)]">
-                Optional — lets Humla tell you when a recording started from the
-                menu bar or a link begins, is saved, or can't start.
+                Optional. For recordings started from the menu bar or a link.
               </p>
             </div>
             <div className="shrink-0">

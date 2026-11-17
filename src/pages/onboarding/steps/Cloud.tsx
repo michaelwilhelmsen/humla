@@ -152,7 +152,7 @@ export function CloudStep({ ctx }: { ctx: StepContext }) {
         <OptionCard
           icon={<LogIn size={18} strokeWidth={1.8} />}
           title="Join an existing team"
-          blurb="Your team already uses Humla Cloud. Sign in — or create an account and get added by your workspace admin."
+          blurb="Sign in, or create an account for your admin to add."
           selected={option === "existing"}
           onSelect={() => setOption("existing")}
         >
@@ -173,11 +173,6 @@ export function CloudStep({ ctx }: { ctx: StepContext }) {
           Continue
           <ArrowRight size={15} strokeWidth={2} />
         </button>
-        {option === "solo" && (
-          <p className="text-xs text-[var(--color-text-muted)] text-center max-w-xs">
-            You can set up a team workspace anytime in Settings → Account.
-          </p>
-        )}
       </div>
     </StepShell>
   );
@@ -657,8 +652,7 @@ function TrialStage({ ws, ctx }: { ws: CloudWorkspace; ctx: StepContext }) {
           style={{ background: "var(--color-accent-soft)" }}
         >
           <p className="text-xs leading-relaxed text-[var(--color-text-muted)]">
-            No rush — you can finish setting up billing anytime in Settings →
-            Organization. Your workspace is saved.
+            Your workspace is saved. Finish billing in Settings → Organization.
           </p>
           <button
             type="button"
@@ -690,9 +684,6 @@ function SuccessStage({ ws }: { ws: CloudWorkspace }) {
         </span>
       </div>
       <p className="text-xs text-[var(--color-success)]">{label} — you're all set.</p>
-      <p className="text-xs leading-relaxed text-[var(--color-text-muted)]">
-        Manage members and billing anytime in Settings → Account.
-      </p>
     </div>
   );
 }

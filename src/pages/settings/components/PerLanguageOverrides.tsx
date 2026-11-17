@@ -28,12 +28,6 @@ export function PerLanguageOverrides({
 
   return (
     <div className="flex flex-col gap-3">
-      <p className="text-xs text-[var(--color-text-muted)]">
-        Override the default provider for specific recording languages.
-        Useful when one model is materially better for a given language —
-        e.g. NB Whisper for Norwegian, Deepgram Nova-3 for English.
-      </p>
-
       {entries.length > 0 ? (
         <div className="flex flex-col gap-2">
           {entries.map(([language, cfg]) => (
@@ -47,7 +41,7 @@ export function PerLanguageOverrides({
         </div>
       ) : (
         <p className="text-xs text-[var(--color-text-muted)] italic">
-          No overrides — every recording uses the default provider.
+          No overrides.
         </p>
       )}
 

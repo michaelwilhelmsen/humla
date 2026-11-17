@@ -77,8 +77,7 @@ export function ImportDialog({
         </div>
 
         <p className="text-sm text-[var(--color-text-muted)]">
-          Pick the language spoken in this file. Transcription runs once and
-          can’t be re-run per language afterward.
+          Transcription runs once. It can’t be re-run in another language.
         </p>
 
         <div className="flex items-center justify-between gap-4">

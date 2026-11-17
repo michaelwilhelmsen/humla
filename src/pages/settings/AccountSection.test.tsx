@@ -164,7 +164,7 @@ describe("Account section", () => {
     const dialog = await screen.findByRole("dialog", { name: /settings/i });
 
     expect(
-      await within(dialog).findByText(/isn't verified yet/i),
+      await within(dialog).findByText(/email not verified/i),
     ).toBeInTheDocument();
     await userEvent.click(
       within(dialog).getByRole("button", { name: /resend verification/i }),

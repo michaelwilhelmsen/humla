@@ -37,9 +37,7 @@ export function LocalModelManager({
   return (
     <>
       <p className="text-xs text-[var(--color-text-muted)] py-3">
-        Pick a multilingual model as the default for transcription. Language-
-        specific models (e.g. NB Whisper for Norwegian) sit alongside but are
-        picked via per-language overrides. All models run on-device via Metal.
+        Language-specific models are used through per-language overrides.
       </p>
       {state.models.map((m) => {
         const selectable = m.kind === "multilingual";
@@ -64,7 +62,7 @@ export function LocalModelManager({
               // where the user is already looking, instead of letting
               // Record fail.
               isActive && !m.downloaded
-                ? "Selected as the default but not downloaded — recording won't start until you download it."
+                ? "Not downloaded. Recording won't start until it is."
                 : undefined
             }
           />

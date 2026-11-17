@@ -55,7 +55,7 @@ export function DiarizeModelManager({
         <div className="text-xs text-[var(--color-text-muted)]">
           {failed != null
             ? `Couldn’t be prepared for this version of macOS${failed ? `: ${failed}` : "."}`
-            : "Downloaded, and being prepared for this version of macOS, which takes about two minutes."}
+            : "Preparing for this Mac. About 2 minutes."}
         </div>
         <div className="flex gap-2">
           <Btn onClick={onDownload}>{failed != null ? "Try again" : "Prepare now"}</Btn>

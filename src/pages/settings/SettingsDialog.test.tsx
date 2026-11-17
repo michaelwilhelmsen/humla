@@ -150,15 +150,15 @@ describe("settings dialog", () => {
       name: /keep recorded audio/i,
     });
 
-    expect(within(dialog).getByText(/no audio is stored on this mac/i)).toBeInTheDocument();
+    expect(within(dialog).getByText(/transcript only/i)).toBeInTheDocument();
 
     await userEvent.click(toggle);
 
     expect(
-      within(dialog).getByText(/keep recordings for playback and speaker re-detection/i),
+      within(dialog).getByText(/for playback and speaker re-detection/i),
     ).toBeInTheDocument();
     expect(
-      within(dialog).queryByText(/no audio is stored on this mac/i),
+      within(dialog).queryByText(/transcript only/i),
     ).not.toBeInTheDocument();
   });
 
@@ -482,7 +482,7 @@ describe("settings dialog", () => {
       within(dialog).queryByText("Per-language overrides"),
     ).not.toBeInTheDocument();
     expect(
-      within(dialog).queryByText(/pick a multilingual model/i),
+      within(dialog).queryByText(/used through per-language overrides/i),
     ).not.toBeInTheDocument();
 
     await userEvent.click(
@@ -493,7 +493,7 @@ describe("settings dialog", () => {
       await within(dialog).findByText("Per-language overrides"),
     ).toBeInTheDocument();
     expect(
-      within(dialog).getByText(/pick a multilingual model/i),
+      within(dialog).getByText(/used through per-language overrides/i),
     ).toBeInTheDocument();
   });
 
@@ -635,7 +635,7 @@ describe("settings dialog", () => {
         "Use Nemotron 3 (end-to-end) for new recordings",
         "Use Community-1 (clustering) for new recordings",
       ]);
-      expect(within(dialog).getByText(/up to 8 speakers, counts them itself/i)).toBeInTheDocument();
+      expect(within(dialog).getByText(/limit: 8 speakers/i)).toBeInTheDocument();
       expect(within(dialog).getByText(/193 MB/)).toBeInTheDocument();
     });
 

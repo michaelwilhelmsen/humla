@@ -42,7 +42,7 @@ export function SummaryTab({
       <Section title="Summaries">
         <Row
           label="Provider"
-          description="Local keeps the transcript on your Mac — pick this for confidential meetings. The cloud providers (OpenAI, Anthropic, GitHub Copilot) are faster and produce better summaries, but send the transcript to them. Custom sends it to whichever OpenAI-compatible API you name."
+          description="Local keeps the transcript on your Mac. The others send it to the provider."
           control={
             <Select
               value={s.summary_provider}
@@ -56,7 +56,6 @@ export function SummaryTab({
           <>
             <Row
               label="Model"
-              description="Reasoning models (gpt-5 and later, o-series) are handled automatically."
               control={
                 <Select
                   value={s.summary_model}
@@ -73,7 +72,6 @@ export function SummaryTab({
           <>
             <Row
               label="Model"
-              description="Claude models. Each model's own adaptive thinking decides how much it reasons."
               control={
                 <Select
                   value={s.anthropic_model}
@@ -91,7 +89,7 @@ export function SummaryTab({
             copilot={copilot}
             model={s.copilot_model}
             onModelChange={(v) => update("copilot_model", v)}
-            modelDescription="Used for summaries and titles. Auto lets Copilot pick."
+            modelDescription="Also used for titles."
           />
         )}
 
@@ -105,7 +103,7 @@ export function SummaryTab({
             <CustomModelField
               value={s.custom_model}
               onChange={(v) => update("custom_model", v)}
-              description="Used for summaries and titles. Sent with no temperature or token limit, so the endpoint's own defaults apply."
+              description="Also used for titles. The endpoint's own defaults apply."
             />
           </>
         )}
@@ -120,8 +118,7 @@ export function SummaryTab({
             />
             <div className="py-3 space-y-2">
               <p className="text-xs text-[var(--color-text-muted)]">
-                Works with Ollama, LM Studio (<code>http://localhost:1234/v1</code>),
-                <code> llama-server</code>, and vLLM. Don't have one yet?{" "}
+                Don't have a server?{" "}
                 <button
                   type="button"
                   onClick={() => openExternal("https://ollama.com/download")}
@@ -136,13 +133,13 @@ export function SummaryTab({
                 ariaLabel="Copy Ollama pull command"
               />
               <p className="text-xs text-[var(--color-text-muted)]">
-                On a 16 GB Mac use <code>ollama pull {RECOMMENDED_OLLAMA_MODEL_16GB}</code> instead —{" "}
-                {RECOMMENDED_OLLAMA_MODEL} needs ~24 GB+; 9B and up will OOM during summary.
+                On a 16 GB Mac use <code>ollama pull {RECOMMENDED_OLLAMA_MODEL_16GB}</code> instead.{" "}
+                {RECOMMENDED_OLLAMA_MODEL} needs 24 GB.
               </p>
             </div>
             <Row
               label="Thinking mode"
-              description="Qwen 3+ reasons internally before answering — sometimes higher quality, but can take many minutes on a long meeting. Ollama only; other servers ignore it."
+              description="Qwen 3+ on Ollama. Can take many minutes on a long meeting."
               control={
                 <Toggle
                   label="Enable thinking mode"
@@ -158,7 +155,7 @@ export function SummaryTab({
 
         <Row
           label="Default preset"
-          description='Which preset new notes start with. Each note can switch to a different preset (or "Custom") from its own header.'
+          description="For new notes."
           control={
             <Select
               value={s.default_summary_preset}

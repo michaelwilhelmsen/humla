@@ -162,9 +162,7 @@ export function AboutTab() {
             </p>
           )}
           <p className="text-xs text-[var(--color-text-muted)] mt-2">
-            Updates are checked automatically on launch and can be triggered
-            manually from <code>Humla → Check for Updates…</code> in the
-            menu bar.
+            Checked on launch, or from <code>Humla → Check for Updates…</code>.
           </p>
         </Row>
         <Row label="Source code">
@@ -205,9 +203,7 @@ export function AboutTab() {
             </Btn>
           </div>
           <p className="text-xs text-[var(--color-text-muted)] mt-2">
-            Notes, settings, downloaded models, and the audio temp dir all
-            live here. Back up <code>notes.sqlite</code> from this folder
-            to copy your library to another Mac.
+            Back up <code>notes.sqlite</code> to move your library to another Mac.
           </p>
         </Row>
       </Section>
@@ -215,9 +211,6 @@ export function AboutTab() {
       <Section title="Setup">
         <Row label="Setup assistant">
           <Btn onClick={() => navigate("/onboarding")}>Run setup again</Btn>
-          <p className="text-xs text-[var(--color-text-muted)] mt-2">
-            Reruns the setup assistant with your current configuration.
-          </p>
         </Row>
       </Section>
     </>

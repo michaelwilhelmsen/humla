@@ -34,8 +34,8 @@ export function RecordingSection({
           // text names the cost — no playback, no re-detection.
           description={
             keeping
-              ? "Keep recordings for playback and speaker re-detection. Roughly 2 MB per minute for the microphone, and as much again for system audio."
-              : "No audio is stored on this Mac — transcript only; playback and speaker re-detection unavailable."
+              ? "For playback and speaker re-detection. About 2 MB per minute per source."
+              : "Transcript only. No playback or speaker re-detection."
           }
           control={
             <Toggle
@@ -55,7 +55,7 @@ export function RecordingSection({
         {keeping && (
           <Row
             label="Transcribe manually"
-            description="Skip transcription while recording and run it later with a Transcribe button instead. Lighter on your Mac."
+            description="Lighter on your Mac while recording."
             control={
               <Toggle
                 label="Transcribe manually"
@@ -73,7 +73,7 @@ export function RecordingSection({
       <Section title="Power">
         <Row
           label="Keep Mac awake while recording"
-          description="Stops your Mac from going to sleep during a recording. The display can still turn off, and a closed lid still sleeps."
+          description="Stops your Mac from going to sleep during a recording."
           control={
             <Toggle
               label="Keep Mac awake while recording"
@@ -87,7 +87,7 @@ export function RecordingSection({
       <Section title="Menu bar">
         <Row
           label="Open at login"
-          description="Humla starts in the menu bar when you log in, without opening its window. If you added Humla to Login Items in System Settings, remove it there."
+          description="Starts in the menu bar, without a window. If Humla is in Login Items in System Settings, remove it there."
           control={<LaunchAtLoginField />}
         />
         <Row
@@ -97,8 +97,8 @@ export function RecordingSection({
           // rather than describing the switch.
           description={
             closeToTray
-              ? "Closing the window hides Humla in the menu bar and drops its Dock icon. Quit from the menu-bar icon."
-              : "Closing the window quits Humla. The menu-bar icon is still there while it runs."
+              ? "Closing the window keeps Humla in the menu bar."
+              : "Closing the window quits Humla."
           }
           control={
             <Toggle
@@ -110,7 +110,7 @@ export function RecordingSection({
         />
         <Row
           label="Record shortcut"
-          description="Starts and stops a recording from any app. With a note open it records that note; otherwise it starts a new one."
+          description="Start and stop a recording from any app."
           control={<HotkeyField />}
         />
       </Section>
@@ -167,7 +167,7 @@ function StoredAudioCleanup() {
     return (
       <Row label="Stored audio">
         <p className="text-xs text-[var(--color-text-muted)]">
-          No audio stored — transcripts and speaker labels are untouched.
+          No audio stored.
         </p>
       </Row>
     );
@@ -176,7 +176,7 @@ function StoredAudioCleanup() {
   return (
     <Row
       label="Stored audio"
-      description={`${stats.notes} note${plural(stats.notes)} · ${formatBytes(stats.bytes)}. Deleting keeps every transcript, speaker label and timeline — only the audio goes.`}
+      description={`${stats.notes} note${plural(stats.notes)} · ${formatBytes(stats.bytes)}. Transcripts stay.`}
       control={
         <div className="flex flex-col items-end gap-1">
           {armed ? (
