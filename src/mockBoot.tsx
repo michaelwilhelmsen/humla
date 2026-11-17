@@ -2135,6 +2135,7 @@ function settingsOrgIpc(): Record<string, Handler> {
           name: "Northwind",
           reason: "Approved for every department.",
           vocabulary: ["Northwind", "IPLOS", "Individual plan", "Coordinating unit"],
+          workspaces: ["w1", "w2"],
         },
       ],
     }),

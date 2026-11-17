@@ -156,7 +156,7 @@ describe("TemplatesSection", () => {
         audio_forbidden: false,
         rules: [],
       },
-      orgs: [{ id: "o1", name: "Northwind", reason: "Approved by the council.", vocabulary: [] }],
+      orgs: [{ id: "o1", name: "Northwind", reason: "Approved for every department.", vocabulary: [], workspaces: ["ws1"] }],
     };
     const orgTemplate = (id: string, name: string, departments: string[]): SummaryPrompt => ({
       ...prompt(id, name),
@@ -201,6 +201,20 @@ describe("TemplatesSection", () => {
       const editor = await screen.findByRole("dialog", { name: "New template" });
       expect(within(editor).getByLabelText("Name")).toHaveValue("Case meeting (copy)");
       expect(within(editor).getByLabelText("Instructions")).toHaveValue("Case meeting instructions");
+    });
+
+    it("offers none in a team workspace outside the organisation, so none can be duplicated there", async () => {
+      inWorkspace("Book club");
+      mockTauri({
+        org_status: () => ({ ...orgStatus, orgs: [{ ...orgStatus.orgs[0], workspaces: ["ws9"] }] }),
+        summary_prompts_list: () => [prompt("p1", "Standup"), orgTemplate("t1", "Case meeting", [])],
+      });
+      render(<TemplatesSection language="en" />);
+      await screen.findByText("Standup");
+      await new Promise((r) => setTimeout(r, 0));
+      expect(screen.queryByRole("heading", { name: "From your organisation" })).toBeNull();
+      expect(screen.queryByText("Case meeting")).toBeNull();
+      expect(screen.queryByRole("button", { name: "Duplicate Case meeting" })).toBeNull();
     });
 
     it("shows no organisation group without one", async () => {

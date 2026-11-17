@@ -15,7 +15,7 @@ import { useCopilotStatus } from "../../../components/provider/useCopilot";
 import { SUMMARY_PROVIDERS } from "../types";
 import { ipc, type SummaryPrompt } from "../../../lib/ipc";
 import { useLocalOnly } from "../../../lib/orgPolicy";
-import { templateOptions, useActiveWorkspaceId, useOrgContentVersion } from "../../../lib/orgContent";
+import { templateOptions, useActiveWorkspaceId, useOrgContentVersion, useOrgs } from "../../../lib/orgContent";
 import { allowedUnderLocalOnly } from "../../../lib/providers";
 import { ManagedRow } from "../ManagedRow";
 import type { SettingsHook } from "../useSettings";
@@ -28,6 +28,7 @@ export function SummaryTab({
   const [templates, setTemplates] = useState<SummaryPrompt[]>([]);
   const activeWorkspaceId = useActiveWorkspaceId();
   const orgVersion = useOrgContentVersion();
+  const orgs = useOrgs();
   useEffect(() => {
     let cancelled = false;
     ipc
@@ -201,7 +202,7 @@ export function SummaryTab({
             <Select
               value={s.default_summary_preset}
               onChange={(v) => update("default_summary_preset", v)}
-              options={templateOptions(templates, activeWorkspaceId).map(({ value, label }) => ({ value, label }))}
+              options={templateOptions(templates, activeWorkspaceId, orgs).map(({ value, label }) => ({ value, label }))}
             />
           }
         />

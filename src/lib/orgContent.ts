@@ -9,10 +9,15 @@ export function isOrgTemplate(t: SummaryPrompt): boolean {
   return !!t.org_id;
 }
 
-/** Whether an organisation template is offered in `workspaceId` ("" is
- *  Personal): its department list is empty or names that workspace. */
-export function offeredIn(t: SummaryPrompt, workspaceId: string): boolean {
+/** Whether an organisation template is offered in `workspaceId`. In Personal
+ *  ("") that is a template for every department; in a workspace, only one of
+ *  its organisation's departments that the template's list (empty is all of
+ *  them) includes. A team workspace outside the organisation gets none. */
+export function offeredIn(t: SummaryPrompt, workspaceId: string, orgs: OrgSummary[]): boolean {
   const departments = t.org_workspaces ?? [];
+  if (workspaceId === "") return departments.length === 0;
+  const org = orgs.find((o) => o.id === t.org_id);
+  if (!org?.workspaces.includes(workspaceId)) return false;
   return departments.length === 0 || departments.includes(workspaceId);
 }
 
@@ -21,9 +26,10 @@ export function offeredIn(t: SummaryPrompt, workspaceId: string): boolean {
 export function pickerTemplates(
   all: SummaryPrompt[],
   workspaceId: string,
+  orgs: OrgSummary[],
 ): { org: SummaryPrompt[]; own: SummaryPrompt[] } {
   return {
-    org: all.filter((t) => isOrgTemplate(t) && offeredIn(t, workspaceId)),
+    org: all.filter((t) => isOrgTemplate(t) && offeredIn(t, workspaceId, orgs)),
     own: all.filter((t) => !isOrgTemplate(t)),
   };
 }
@@ -33,8 +39,12 @@ export type TemplateOption = { value: string; label: string; separatorBefore?: b
 /** A template picker's options in `workspaceId`: the organisations' templates
  *  offered there, then the built-ins, then the user's own, with a divider
  *  before each group after the first. */
-export function templateOptions(all: SummaryPrompt[], workspaceId: string): TemplateOption[] {
-  const { org, own } = pickerTemplates(all, workspaceId);
+export function templateOptions(
+  all: SummaryPrompt[],
+  workspaceId: string,
+  orgs: OrgSummary[],
+): TemplateOption[] {
+  const { org, own } = pickerTemplates(all, workspaceId, orgs);
   return [
     ...org.map((t) => ({ value: `custom:${t.id}`, label: t.name })),
     ...SUMMARY_PRESETS.map((p, i) => ({

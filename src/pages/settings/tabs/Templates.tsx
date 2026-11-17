@@ -96,7 +96,7 @@ export function TemplatesSection({ language }: { language: string }) {
     setEditing({ id: null, name: `${name} (copy)`, content });
   }
 
-  const { org: fromOrg, own } = pickerTemplates(templates, activeWorkspaceId);
+  const { org: fromOrg, own } = pickerTemplates(templates, activeWorkspaceId, orgs);
   const shared = own.filter((t) => t.workspace_id);
   const personal = own.filter((t) => !t.workspace_id);
   const orgsShown = orgs.filter((o) => fromOrg.some((t) => t.org_id === o.id));

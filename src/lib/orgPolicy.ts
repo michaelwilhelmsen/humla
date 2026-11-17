@@ -23,7 +23,14 @@ export type EffectivePolicy = {
 };
 
 /** Mirrors `org_policy::OrgSummary`. */
-export type OrgSummary = { id: string; name: string; reason: string; vocabulary: string[] };
+export type OrgSummary = {
+  id: string;
+  name: string;
+  reason: string;
+  vocabulary: string[];
+  /** The organisation's departments the user is in. */
+  workspaces: string[];
+};
 
 export type OrgStatus = { policy: EffectivePolicy; orgs?: OrgSummary[] };
 

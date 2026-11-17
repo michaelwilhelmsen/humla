@@ -289,6 +289,8 @@ pub struct OrgSummary {
     pub name: String,
     pub reason: String,
     pub vocabulary: Vec<String>,
+    /// The organisation's departments the user is in.
+    pub workspaces: Vec<String>,
 }
 
 pub(crate) fn summaries(config: Option<&OrgConfig>) -> Vec<OrgSummary> {
@@ -301,6 +303,7 @@ pub(crate) fn summaries(config: Option<&OrgConfig>) -> Vec<OrgSummary> {
                     name: o.name.clone(),
                     reason: o.policy_reason.clone(),
                     vocabulary: o.vocabulary.clone(),
+                    workspaces: o.workspaces.clone(),
                 })
                 .collect()
         })
@@ -923,6 +926,14 @@ mod tests {
         store(&conn, &classify(200, r#"{"orgs":[]}"#)).unwrap();
         assert!(vocabulary(&conn).is_empty());
         assert!(summaries(cached(&conn).unwrap().as_ref()).is_empty());
+    }
+
+    #[test]
+    fn a_summary_carries_the_organisations_departments() {
+        let (_d, conn) = conn();
+        cache_one_org(&conn);
+        let s = summaries(cached(&conn).unwrap().as_ref());
+        assert_eq!((s[0].name.as_str(), s[0].workspaces.as_slice()), ("Northwind", &["w1".to_string()][..]));
     }
 
     #[test]

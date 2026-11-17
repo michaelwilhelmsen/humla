@@ -81,7 +81,7 @@ import { SendToWebhookModal } from "./SendToWebhookModal";
 import { SaveAudioModal } from "./SaveAudioModal";
 import { useWebhookSends } from "../lib/webhook";
 import { SUMMARY_PRESETS, presetLabel } from "../lib/presets";
-import { templateOptions, useOrgContentVersion } from "../lib/orgContent";
+import { templateOptions, useOrgContentVersion, useOrgs } from "../lib/orgContent";
 import { LANGUAGES, languageOptionLabel } from "../lib/languages";
 import { useDeveloperMode } from "../lib/useDeveloperMode";
 import { useSpeakerSuggestions } from "../lib/useSpeakerSuggestions";
@@ -2601,11 +2601,12 @@ function PresetPicker({
 }) {
   const [userPrompts, setUserPrompts] = useState<SummaryPrompt[]>([]);
   const orgVersion = useOrgContentVersion();
+  const orgs = useOrgs();
 
   useEffect(() => {
     ipc.summaryPromptsList().then(setUserPrompts).catch(() => setUserPrompts([]));
   }, [orgVersion]);
-  const options = templateOptions(userPrompts, workspaceId);
+  const options = templateOptions(userPrompts, workspaceId, orgs);
 
   // If the note's saved value points at a deleted user prompt, surface a
   // "(missing)" entry so the user notices and can re-pick. Without this

@@ -60,7 +60,7 @@ describe("VocabularySection with an organisation", () => {
     mockTauri({
       org_status: () => ({
         policy: { org_name: null, reason: null, local_only: false, retention_days: 0, telemetry_off: false, audio_forbidden: false, rules: [] },
-        orgs: [{ id: "o1", name: "Northwind", reason: "", vocabulary: ["Northwind", "Fjord"] }],
+        orgs: [{ id: "o1", name: "Northwind", reason: "", vocabulary: ["Northwind", "Fjord"], workspaces: [] }],
       }),
     });
     renderWith("Tauri");
