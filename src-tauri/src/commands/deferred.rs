@@ -2,7 +2,8 @@
 //! command, the replay of each take's streams and the per-take bookkeeping.
 
 use super::capture::{
-    dispatch_sidecar_event, drain_inflight, ensure_provider_ready, ms_since, redact_sidecar_line,
+    check_provider_ready, discard_empty_take, dispatch_sidecar_event, drain_inflight, ensure_provider_ready,
+    finalize_session, ms_since, redact_sidecar_line, NotReady,
     session_write_dir, write_chunks_json,
 };
 #[cfg(feature = "cloud")]
@@ -100,52 +101,161 @@ struct TakeSource {
     entry: sessions::SessionEntry,
     mic: Option<std::path::PathBuf>,
     sys: Option<std::path::PathBuf>,
-    /// Whether its audio stays on disk after the replay.
-    retained: bool,
+    /// Set for a take not yet in the manifest: it is added once it has text.
+    pending: Option<PendingTake>,
 }
 
 impl TakeSource {
     /// A retained take, from its session directory.
     fn retained(entry: sessions::SessionEntry, dir: &std::path::Path) -> Self {
         let stream = |name: &str| Some(dir.join(name)).filter(|p| p.exists());
-        TakeSource { entry, mic: stream("mic.wav"), sys: stream("sys.wav"), retained: true }
+        TakeSource { entry, mic: stream("mic.wav"), sys: stream("sys.wav"), pending: None }
     }
 }
 
-/// Transcribe a "Transcribe manually" take whose audio may no longer be kept:
-/// the audio gate closed while it was recording. Called by the post-stop chain
-/// with the capture's temp streams, which it deletes afterwards, so the take
-/// still gets its text and nothing of it stays on disk.
+/// What the manifest row of a take that isn't in it yet will hold.
+#[derive(Clone, Debug)]
+pub(super) struct PendingTake {
+    pub session_id: String,
+    pub started_at: String,
+    pub streams: Vec<String>,
+    pub captured_duration_ms: u64,
+}
+
+/// A capture's streams moved out of its temp dir into one of their own in the
+/// system temp dir, for a replay that outlives the post-stop chain. The
+/// directory is deleted when this is dropped, however the replay ends.
+#[derive(Debug)]
+pub(super) struct UnretainedStreams {
+    dir: std::path::PathBuf,
+    pub mic: Option<std::path::PathBuf>,
+    pub sys: Option<std::path::PathBuf>,
+}
+
+impl UnretainedStreams {
+    /// `None` when there is no stream to move.
+    pub(super) async fn take(
+        mic: Option<&std::path::Path>,
+        sys: Option<&std::path::Path>,
+    ) -> std::io::Result<Option<Self>> {
+        Self::take_into(&std::env::temp_dir(), mic, sys).await
+    }
+
+    async fn take_into(
+        parent: &std::path::Path,
+        mic: Option<&std::path::Path>,
+        sys: Option<&std::path::Path>,
+    ) -> std::io::Result<Option<Self>> {
+        let mic = mic.filter(|p| p.exists());
+        let sys = sys.filter(|p| p.exists());
+        if mic.is_none() && sys.is_none() {
+            return Ok(None);
+        }
+        let dir = parent.join(format!("humla-unretained-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir).await?;
+        let mut out = UnretainedStreams { dir, mic: None, sys: None };
+        if let Some(src) = mic {
+            out.mic = Some(move_file(src, &out.dir.join("mic.wav")).await?);
+        }
+        if let Some(src) = sys {
+            out.sys = Some(move_file(src, &out.dir.join("sys.wav")).await?);
+        }
+        Ok(Some(out))
+    }
+}
+
+impl Drop for UnretainedStreams {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+async fn move_file(src: &std::path::Path, dest: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    if tokio::fs::rename(src, dest).await.is_err() {
+        tokio::fs::copy(src, dest).await?;
+        let _ = tokio::fs::remove_file(src).await;
+    }
+    Ok(dest.to_path_buf())
+}
+
+/// A note's place in `AppState.transcribing`, given back when dropped.
+pub(super) struct TranscribeSlot {
+    set: Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
+    note_id: String,
+}
+
+impl TranscribeSlot {
+    pub(super) fn try_take(app: &AppHandle, note_id: &str) -> Option<Self> {
+        Self::try_take_in(&app.state::<AppState>().transcribing, note_id)
+    }
+
+    fn try_take_in(set: &Arc<parking_lot::Mutex<std::collections::HashSet<String>>>, note_id: &str) -> Option<Self> {
+        set.lock()
+            .insert(note_id.to_string())
+            .then(|| TranscribeSlot { set: set.clone(), note_id: note_id.to_string() })
+    }
+
+    /// Wait for whatever is transcribing the note to finish, then take its place.
+    async fn wait_for(app: &AppHandle, note_id: &str) -> Self {
+        loop {
+            if let Some(slot) = Self::try_take(app, note_id) {
+                return slot;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    }
+}
+
+impl Drop for TranscribeSlot {
+    fn drop(&mut self) {
+        self.set.lock().remove(&self.note_id);
+    }
+}
+
+/// Transcribe a "Transcribe manually" take whose audio may not be kept: the
+/// audio gate closed while it was recording. Spawned by the post-stop chain, so
+/// it holds no capture slot and reports on `transcribe_status`. `slot` is the
+/// note's transcribe slot when the chain could take it; otherwise this waits
+/// for the run holding it. The streams are deleted when it returns.
 pub(super) async fn transcribe_unretained_take(
+    app: AppHandle,
+    note_id: String,
+    take: PendingTake,
+    streams: UnretainedStreams,
+    slot: Option<TranscribeSlot>,
+) {
+    let _slot = match slot {
+        Some(slot) => slot,
+        None => TranscribeSlot::wait_for(&app, &note_id).await,
+    };
+    emit_transcribe_status(&app, &note_id, true);
+    let result = transcribe_pending_take(&app, &note_id, take, &streams).await;
+    drop(streams);
+    if let Err(e) = result {
+        emit_error(&app, Some(&note_id), &e);
+    }
+    notes::purge_note_assets_if_gone(&app, &note_id);
+    emit_transcribe_status(&app, &note_id, false);
+}
+
+async fn transcribe_pending_take(
     app: &AppHandle,
     note_id: &str,
-    session_id: &str,
-    mic: Option<&std::path::Path>,
-    sys: Option<&std::path::Path>,
-) {
-    let Ok(app_dir) = app.path().app_data_dir() else { return };
-    let recordings = sessions::recordings_dir(&app_dir, note_id);
-    let Some((entry, _)) = sessions::resolve_sessions(&recordings).into_iter().find(|(e, _)| e.id == session_id)
-    else {
-        eprintln!("transcribe: take {session_id} has no manifest row");
-        return;
-    };
+    take: PendingTake,
+    streams: &UnretainedStreams,
+) -> Result<(), String> {
     let state: State<AppState> = app.state();
-    if !state.transcribing.lock().insert(note_id.to_string()) {
-        return;
-    }
-    emit_transcribe_status(app, note_id, true);
-    let take = TakeSource {
-        entry,
-        mic: mic.map(|p| p.to_path_buf()),
-        sys: sys.map(|p| p.to_path_buf()),
-        retained: false,
+    check_provider_ready(app, &state, note_id).await.map_err(NotReady::message)?;
+    let entry = sessions::SessionEntry {
+        id: take.session_id.clone(),
+        index: 0,
+        started_at: take.started_at.clone(),
+        duration_ms: take.captured_duration_ms,
+        streams: take.streams.clone(),
+        transcribed: false,
     };
-    if let Err(e) = transcribe_take_sources(app, note_id, vec![take]).await {
-        emit_error(app, Some(note_id), &e);
-    }
-    state.transcribing.lock().remove(note_id);
-    emit_transcribe_status(app, note_id, false);
+    let source = TakeSource { entry, mic: streams.mic.clone(), sys: streams.sys.clone(), pending: Some(take) };
+    transcribe_take_sources(app, note_id, vec![source]).await
 }
 
 async fn transcribe_takes(
@@ -183,15 +293,16 @@ async fn transcribe_takes(
             eprintln!("transcribe: could not snapshot a revision for {note_id} before a re-transcribe; the run will not be undoable: {e}");
         }
     }
-    transcribe_take_sources(app, note_id, takes).await
-}
-
-async fn transcribe_take_sources(app: &AppHandle, note_id: &str, takes: Vec<TakeSource>) -> Result<(), String> {
-    let state: State<AppState> = app.state();
     // The provider that runs now is the one configured now, which may not be
     // the one that was configured when the audio was captured. Check before
     // replaying an hour of it.
     ensure_provider_ready(app, &state, note_id).await?;
+    transcribe_take_sources(app, note_id, takes).await
+}
+
+/// Replay, diarize and commit `takes`. The caller has checked the provider.
+async fn transcribe_take_sources(app: &AppHandle, note_id: &str, takes: Vec<TakeSource>) -> Result<(), String> {
+    let state: State<AppState> = app.state();
 
     // The run's shape, settled before a single chunk decodes: each take's
     // retained streams are replayed one after the other, so a take that kept
@@ -225,7 +336,7 @@ async fn transcribe_take_sources(app: &AppHandle, note_id: &str, takes: Vec<Take
     // reported once below, so a take abandoned mid-run is still measured.
     let run_started = std::time::Instant::now();
     let mut timings = ReplayTimings::default();
-    for (take_index, TakeSource { entry, mic: mic_wav, sys: sys_wav, retained }) in takes.into_iter().enumerate() {
+    for (take_index, TakeSource { mut entry, mic: mic_wav, sys: sys_wav, pending }) in takes.into_iter().enumerate() {
         // Emitted, not just recorded: this is where the step goes back to
         // transcribing after the previous take's diarize.
         let snapshot = {
@@ -272,12 +383,32 @@ async fn transcribe_take_sources(app: &AppHandle, note_id: &str, takes: Vec<Take
             // chunk failed" (provider outage, revoked key) are indistinguishable,
             // and the second has to stay retryable — the audio is still on disk,
             // so the action stays available for this take.
-            failures.push(if retained {
-                format!("Recording {} produced no text. Its audio is still saved — try again.", entry.index)
+            if pending_take_step(pending.is_some(), true) == PendingStep::Discard {
+                // Never in the manifest, and nothing of it to keep.
+                discard_empty_take(app, note_id, &entry.id).await;
+                failures.push("The recording produced no text.".to_string());
             } else {
-                format!("Recording {} produced no text.", entry.index)
-            });
+                failures.push(format!(
+                    "Recording {} produced no text. Its audio is still saved — try again.",
+                    entry.index
+                ));
+            }
             continue;
+        }
+        if let (PendingStep::Finalize, Some(p)) = (pending_take_step(pending.is_some(), false), pending) {
+            finalize_session(
+                app,
+                note_id,
+                &p.session_id,
+                &p.started_at,
+                p.streams,
+                p.captured_duration_ms,
+                sessions::Transcribed::No,
+            )
+            .await;
+            if let Some(index) = take_index_of(app, note_id, &entry.id) {
+                entry.index = index;
+            }
         }
         // chunks.json beside the audio, so a later re-diarize has its anchor.
         if let Some(target) = session_write_dir(app, note_id, &entry.id).await {
@@ -411,6 +542,33 @@ async fn transcribe_take_sources(app: &AppHandle, note_id: &str, takes: Vec<Take
         return Err(msg);
     }
     Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PendingStep {
+    /// Already in the manifest, or nothing to decide yet.
+    None,
+    /// Not in the manifest and produced no text: drop what was written for it.
+    Discard,
+    /// Not in the manifest and has text: add it before its timeline is written.
+    Finalize,
+}
+
+fn pending_take_step(pending: bool, produced_no_text: bool) -> PendingStep {
+    match (pending, produced_no_text) {
+        (false, _) => PendingStep::None,
+        (true, true) => PendingStep::Discard,
+        (true, false) => PendingStep::Finalize,
+    }
+}
+
+/// A take's number in the note's manifest.
+fn take_index_of(app: &AppHandle, note_id: &str, session_id: &str) -> Option<u32> {
+    let app_dir = app.path().app_data_dir().ok()?;
+    sessions::resolve_sessions(&sessions::recordings_dir(&app_dir, note_id))
+        .into_iter()
+        .find(|(e, _)| e.id == session_id)
+        .map(|(e, _)| e.index)
 }
 
 /// A replay run's timings, at `diagnostics/<note_id>/replay-timings.json`.
@@ -563,4 +721,85 @@ async fn replay_retained_stream(
     // WAV, not this copy).
     let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn wav(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+        let p = dir.join(name);
+        crate::wav::write_i16_mono_16k(&p, &[1i16; 1600]).await.unwrap();
+        p
+    }
+
+    #[tokio::test]
+    async fn streams_move_out_of_the_capture_dir_and_are_deleted_on_drop() {
+        let capture = tempfile::tempdir().unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let mic = wav(capture.path(), "mic-full.wav").await;
+        let sys = wav(capture.path(), "sys-full.wav").await;
+        let streams = UnretainedStreams::take_into(parent.path(), Some(&mic), Some(&sys)).await.unwrap().unwrap();
+        assert!(!mic.exists() && !sys.exists(), "moved, not copied");
+        let (moved_mic, moved_sys) = (streams.mic.clone().unwrap(), streams.sys.clone().unwrap());
+        assert!(moved_mic.exists() && moved_sys.exists());
+        assert!(moved_mic.starts_with(parent.path()));
+        drop(streams);
+        assert!(!moved_mic.exists() && !moved_sys.exists());
+        assert_eq!(std::fs::read_dir(parent.path()).unwrap().count(), 0, "its directory is gone too");
+    }
+
+    #[tokio::test]
+    async fn streams_are_deleted_when_the_replay_fails() {
+        let capture = tempfile::tempdir().unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let mic = wav(capture.path(), "mic-full.wav").await;
+        async fn failing_replay(streams: UnretainedStreams) -> Result<(), String> {
+            let _held = streams;
+            Err("provider refused".into())
+        }
+        let streams = UnretainedStreams::take_into(parent.path(), Some(&mic), None).await.unwrap().unwrap();
+        assert!(streams.sys.is_none());
+        assert!(failing_replay(streams).await.is_err());
+        assert_eq!(std::fs::read_dir(parent.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn no_stream_means_nothing_to_replay() {
+        let parent = tempfile::tempdir().unwrap();
+        let gone = parent.path().join("missing.wav");
+        assert!(UnretainedStreams::take_into(parent.path(), None, None).await.unwrap().is_none());
+        assert!(UnretainedStreams::take_into(parent.path(), Some(&gone), None).await.unwrap().is_none());
+        assert_eq!(std::fs::read_dir(parent.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn a_notes_transcribe_slot_is_held_once_and_given_back_on_drop() {
+        let set = Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new()));
+        let held = TranscribeSlot::try_take_in(&set, "n1").unwrap();
+        assert!(TranscribeSlot::try_take_in(&set, "n1").is_none(), "a second run waits");
+        assert!(TranscribeSlot::try_take_in(&set, "n2").is_some(), "other notes are free");
+        drop(held);
+        assert!(TranscribeSlot::try_take_in(&set, "n1").is_some());
+    }
+
+    #[test]
+    fn a_pending_take_enters_the_manifest_only_with_text() {
+        assert_eq!(pending_take_step(true, true), PendingStep::Discard);
+        assert_eq!(pending_take_step(true, false), PendingStep::Finalize);
+        assert_eq!(pending_take_step(false, true), PendingStep::None, "a retained take keeps its row and audio");
+        assert_eq!(pending_take_step(false, false), PendingStep::None);
+    }
+
+    #[test]
+    fn the_post_stop_chain_hands_the_replay_off_instead_of_awaiting_it() {
+        let capture = include_str!("capture.rs");
+        let chain = &capture[capture.find("async fn post_stop_chain_inner").unwrap()..];
+        let call = chain.find("transcribe_unretained_take(").expect("the chain hands the take off");
+        let before = &chain[..call];
+        assert!(before.trim_end().ends_with("spawn(super::deferred::"), "spawned, so the capture slot is released");
+        let after = &chain[call..];
+        let close = after.find("));").unwrap();
+        assert!(!after[..close + 3].contains(".await"));
+    }
 }

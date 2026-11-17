@@ -140,7 +140,7 @@ async fn prepare_sessions_for_new_take(app: &AppHandle, note_id: &str) -> usize 
 /// so it reflects the actual content; 0 when the timeline is missing/empty.
 /// Best-effort — a missing manifest entry only hides the take from the
 /// carousel, it never loses the audio.
-async fn finalize_session(
+pub(super) async fn finalize_session(
     app: &AppHandle,
     note_id: &str,
     session_id: &str,
@@ -198,7 +198,7 @@ async fn finalize_session(
 ///
 /// The legacy flat layout is never touched — a legacy session id resolves to the
 /// note's whole recordings dir, and deleting that would take every take with it.
-async fn discard_empty_take(app: &AppHandle, note_id: &str, session_id: &str) -> bool {
+pub(super) async fn discard_empty_take(app: &AppHandle, note_id: &str, session_id: &str) -> bool {
     if session_id == sessions::LEGACY_SESSION_ID {
         return false;
     }
@@ -241,10 +241,11 @@ async fn maybe_keep_audio(
     note_id: &str,
     snapshot: &PostStopSnapshot,
     progress: &ChainProgress,
+    keep_audio: bool,
 ) {
     // No exceptions above the setting — not even #16's "second take force-
     // retains the sources so #17 can unify them". See `sessions::retain_audio`.
-    if !keep_audio_enabled(app) {
+    if !keep_audio {
         // Chunk timings are text and stay: re-diarize needs them as its
         // alignment anchor, and they cost nothing to keep. Without the WAVs
         // they can't resurrect audio, only re-label a transcript.
@@ -1105,8 +1106,11 @@ async fn post_stop_chain_inner(
     // has to happen before it runs. (#16's "a 2nd+ session force-retains its
     // sources" exception is gone — #24 made the setting absolute, so a
     // multi-take note recorded with keep_audio off simply can't be unified.)
+    // One gate decision for the whole chain, so retention and the deferred
+    // branch below can't disagree.
+    let keep_audio = keep_audio_enabled(&app);
     let t_keep = std::time::Instant::now();
-    maybe_keep_audio(&app, &note_id, &post_stop, &progress).await;
+    maybe_keep_audio(&app, &note_id, &post_stop, &progress, keep_audio).await;
     clock.record(|t| t.keep_audio_ms = ms_since(t_keep));
 
     let session_id = post_stop.session_id.clone();
@@ -1124,28 +1128,34 @@ async fn post_stop_chain_inner(
     };
     let transcribed_nothing = post_stop.chunks.is_empty();
 
-    if deferred && !keep_audio_enabled(&app) && (post_stop.mic_wav.is_some() || post_stop.sys_wav.is_some()) {
-        // The audio gate closed during the capture, so this take can't wait
-        // for the Transcribe action: transcribe it now from the temp streams.
-        finalize_session(
-            &app,
-            &note_id,
-            &session_id,
-            &session_started_at,
-            streams,
-            post_stop.captured_duration_ms,
-            sessions::Transcribed::No,
-        )
-        .await;
-        session_changed_for_sync(&app, &note_id, &session_id);
-        super::deferred::transcribe_unretained_take(
-            &app,
-            &note_id,
-            &session_id,
-            post_stop.mic_wav.as_deref(),
-            post_stop.sys_wav.as_deref(),
-        )
-        .await;
+    if deferred && !keep_audio {
+        // The audio gate closed during the capture, so this take can't wait for
+        // the Transcribe action. Its streams move out of the capture's temp dir
+        // and are transcribed after this chain has released the capture slot.
+        // The take reaches the manifest only once it has text.
+        discard_empty_take(&app, &note_id, &session_id).await;
+        match super::deferred::UnretainedStreams::take(post_stop.mic_wav.as_deref(), post_stop.sys_wav.as_deref())
+            .await
+        {
+            Ok(Some(streams_to_replay)) => {
+                let take = super::deferred::PendingTake {
+                    session_id: session_id.clone(),
+                    started_at: session_started_at.clone(),
+                    streams,
+                    captured_duration_ms: post_stop.captured_duration_ms,
+                };
+                let slot = super::deferred::TranscribeSlot::try_take(&app, &note_id);
+                tauri::async_runtime::spawn(super::deferred::transcribe_unretained_take(
+                    app.clone(),
+                    note_id.clone(),
+                    take,
+                    streams_to_replay,
+                    slot,
+                ));
+            }
+            Ok(None) => {}
+            Err(e) => emit_error(&app, Some(&note_id), &format!("This recording couldn't be transcribed: {e}")),
+        }
         clear_temp_dir(temp_dir, clock).await;
         return;
     }
@@ -1315,6 +1325,42 @@ pub(super) async fn ensure_provider_ready(
     state: &State<'_, AppState>,
     note_id: &str,
 ) -> Result<crate::stt::ProviderConfig, String> {
+    check_provider_ready(app, state, note_id).await.map_err(|e| match e {
+        NotReady::Missing(msg) => {
+            emit_error(app, Some(note_id), &msg);
+            msg
+        }
+        NotReady::Failed(msg) => msg,
+    })
+}
+
+/// Why the provider can't run: a missing key, model or URL the user can fix,
+/// or a failure reading what is configured.
+pub(super) enum NotReady {
+    Missing(String),
+    Failed(String),
+}
+
+impl From<String> for NotReady {
+    fn from(msg: String) -> Self {
+        NotReady::Failed(msg)
+    }
+}
+
+impl NotReady {
+    pub(super) fn message(self) -> String {
+        match self {
+            NotReady::Missing(msg) | NotReady::Failed(msg) => msg,
+        }
+    }
+}
+
+/// [`ensure_provider_ready`] without the toast.
+pub(super) async fn check_provider_ready(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+    note_id: &str,
+) -> Result<crate::stt::ProviderConfig, NotReady> {
     // Resolve the per-language override (if any) up front: both the prereq
     // check and the prewarm use the resolved provider — otherwise a user with a
     // Norwegian override (Local) and an English default (Deepgram) would prewarm
@@ -1375,8 +1421,7 @@ pub(super) async fn ensure_provider_ready(
         }
     };
     if let Some(msg) = pre_err {
-        emit_error(app, Some(note_id), &msg);
-        return Err(msg);
+        return Err(NotReady::Missing(msg));
     }
 
     // Race a Whisper model load against the sidecar startup so the first chunk
