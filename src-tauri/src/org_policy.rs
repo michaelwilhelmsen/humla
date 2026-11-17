@@ -11,6 +11,8 @@
 use rusqlite::Connection;
 use serde::{Deserialize, Deserializer, Serialize};
 
+use crate::providers::ProviderId;
+
 pub(crate) const SETTING_ORG_CONFIG: &str = "org_config";
 pub(crate) const CONFIG_PATH: &str = "/api/humla/org/config";
 
@@ -246,9 +248,130 @@ pub(crate) fn effective(conn: &Connection) -> anyhow::Result<EffectivePolicy> {
     Ok(merge(&layers))
 }
 
+// ---- local_only -------------------------------------------------------------
+
+/// What `local_only` lets a provider reach. `src/lib/providers.ts`
+/// (`LOCAL_ONLY_RULE`) mirrors [`local_only_rule`]; `providers.test.ts` reads
+/// this file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LocalOnly {
+    /// On this Mac with no URL at all (on-device Whisper), or a loopback URL.
+    OnDeviceOrLoopback,
+    /// A loopback URL only.
+    Loopback,
+    Refused,
+}
+
+pub(crate) fn local_only_rule(id: ProviderId) -> LocalOnly {
+    match id {
+        ProviderId::Local => LocalOnly::OnDeviceOrLoopback,
+        ProviderId::Custom => LocalOnly::Loopback,
+        ProviderId::OpenAi => LocalOnly::Refused,
+        ProviderId::Anthropic => LocalOnly::Refused,
+        ProviderId::Copilot => LocalOnly::Refused,
+        ProviderId::Deepgram => LocalOnly::Refused,
+        ProviderId::Groq => LocalOnly::Refused,
+    }
+}
+
+/// Whether `url` is an http(s) URL whose host is `localhost`, in 127.0.0.0/8, or
+/// `::1`. Mirrored by `isLoopbackUrl` in `src/lib/orgPolicy.ts`, with the vectors
+/// in `src/lib/loopbackVectors.json` pinning both.
+pub(crate) fn is_loopback_url(url: &str) -> bool {
+    use std::net::{IpAddr, Ipv6Addr};
+    let Ok(url) = reqwest::Url::parse(url.trim()) else { return false };
+    if !matches!(url.scheme(), "http" | "https") {
+        return false;
+    }
+    // The parser has already normalised the host: lowercase, IPv4 in dotted
+    // quads, IPv6 in brackets.
+    let Some(host) = url.host_str() else { return false };
+    if host == "localhost" {
+        return true;
+    }
+    match host.trim_start_matches('[').trim_end_matches(']').parse::<IpAddr>() {
+        Ok(IpAddr::V4(ip)) => ip.is_loopback(),
+        Ok(IpAddr::V6(ip)) => ip == Ipv6Addr::LOCALHOST,
+        Err(_) => false,
+    }
+}
+
+/// Whether `local_only` lets note content go to this provider at `base_url`.
+/// `None` means the provider is reached without a URL: on-device Whisper for
+/// `Local`, never allowed for `Custom`.
+pub(crate) fn allows_endpoint(id: ProviderId, base_url: Option<&str>) -> bool {
+    match local_only_rule(id) {
+        LocalOnly::OnDeviceOrLoopback => base_url.is_none_or(is_loopback_url),
+        LocalOnly::Loopback => base_url.is_some_and(is_loopback_url),
+        LocalOnly::Refused => false,
+    }
+}
+
+impl EffectivePolicy {
+    pub(crate) fn allows(&self, id: ProviderId, base_url: Option<&str>) -> bool {
+        !self.local_only || allows_endpoint(id, base_url)
+    }
+
+    /// Who set `local_only`, if anyone.
+    pub(crate) fn local_only_source(&self) -> Option<&str> {
+        self.rules.iter().find(|r| r.kind == PolicyKind::LocalOnly).map(|r| r.source.as_str())
+    }
+
+    pub(crate) fn blocked(&self) -> anyhow::Error {
+        anyhow::anyhow!(blocked_message(self.local_only_source()))
+    }
+}
+
+pub(crate) fn blocked_message(source: Option<&str>) -> String {
+    format!("Blocked by {}: processing stays on this Mac.", source.unwrap_or("your organisation"))
+}
+
+/// The policy, or the refusal an enforcing caller returns when it can't be read.
+pub(crate) fn effective_or_refuse(conn: &Connection) -> anyhow::Result<EffectivePolicy> {
+    effective(conn).map_err(|e| {
+        eprintln!("org policy: unreadable, refusing: {e:#}");
+        anyhow::anyhow!(blocked_message(None))
+    })
+}
+
+/// Refuse unless the policy lets note content go to `id` at `base_url`.
+pub(crate) fn check_endpoint(
+    conn: &Connection,
+    id: ProviderId,
+    base_url: Option<&str>,
+) -> anyhow::Result<EffectivePolicy> {
+    let policy = effective_or_refuse(conn)?;
+    if policy.allows(id, base_url) {
+        Ok(policy)
+    } else {
+        Err(policy.blocked())
+    }
+}
+
+/// Refuse when note content would leave this Mac at all (workspace chat, the
+/// MCP server).
+pub(crate) fn check_leaves_mac(conn: &Connection) -> anyhow::Result<()> {
+    let policy = effective_or_refuse(conn)?;
+    if policy.local_only {
+        Err(policy.blocked())
+    } else {
+        Ok(())
+    }
+}
+
+/// Cache one organisation with only `local_only` on, for other modules' tests.
+#[cfg(test)]
+pub(crate) fn cache_local_only(conn: &Connection, org: &str) {
+    let body = format!(
+        r#"{{"orgs":[{{"id":"o1","name":"{org}","policy":{{"local_only":true,"retention_days":0,"telemetry_off":false,"audio_forbidden":false}}}}]}}"#
+    );
+    store(conn, &classify(200, &body)).unwrap();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::REGISTRY;
 
     fn conn() -> (tempfile::TempDir, Connection) {
         let dir = tempfile::tempdir().unwrap();
@@ -396,5 +519,71 @@ mod tests {
     fn an_org_with_every_policy_off_enforces_nothing() {
         let merged = merge(&[layer("A", OrgPolicy::default())]);
         assert_eq!(merged, EffectivePolicy::default());
+    }
+
+    #[test]
+    fn loopback_matches_the_shared_vectors() {
+        let v: serde_json::Value =
+            serde_json::from_str(include_str!("../../src/lib/loopbackVectors.json")).unwrap();
+        for url in v["loopback"].as_array().unwrap() {
+            assert!(is_loopback_url(url.as_str().unwrap()), "{url}");
+        }
+        for url in v["elsewhere"].as_array().unwrap() {
+            assert!(!is_loopback_url(url.as_str().unwrap()), "{url}");
+        }
+    }
+
+    #[test]
+    fn local_only_keeps_providers_on_this_mac() {
+        let local = Some("http://localhost:11434/v1");
+        let lan = Some("http://192.168.1.20:11434/v1");
+        assert!(allows_endpoint(ProviderId::Local, None), "on-device Whisper");
+        assert!(allows_endpoint(ProviderId::Local, local));
+        assert!(!allows_endpoint(ProviderId::Local, lan));
+        assert!(allows_endpoint(ProviderId::Custom, local));
+        assert!(!allows_endpoint(ProviderId::Custom, lan));
+        assert!(!allows_endpoint(ProviderId::Custom, None));
+        for spec in REGISTRY {
+            if !matches!(spec.id, ProviderId::Local | ProviderId::Custom) {
+                assert!(!allows_endpoint(spec.id, None), "{}", spec.id_str);
+                assert!(!allows_endpoint(spec.id, local), "{}", spec.id_str);
+            }
+        }
+    }
+
+    #[test]
+    fn without_local_only_everything_is_allowed() {
+        let policy = merge(&[layer("A", policy(false, 30, true, true))]);
+        for spec in REGISTRY {
+            assert!(policy.allows(spec.id, Some("https://api.example.com")), "{}", spec.id_str);
+        }
+    }
+
+    #[test]
+    fn refusals_name_the_organisation_that_set_local_only() {
+        let (_d, conn) = conn();
+        cache_one_org(&conn);
+        let err = check_endpoint(&conn, ProviderId::OpenAi, None).unwrap_err().to_string();
+        assert_eq!(err, "Blocked by Northwind: processing stays on this Mac.");
+        assert!(check_endpoint(&conn, ProviderId::Local, None).is_ok());
+        assert_eq!(check_leaves_mac(&conn).unwrap_err().to_string(), err);
+    }
+
+    #[test]
+    fn an_unreadable_cache_refuses_every_endpoint() {
+        let (_d, conn) = conn();
+        crate::db::set_setting(&conn, SETTING_ORG_CONFIG, "{not json").unwrap();
+        for spec in REGISTRY {
+            let err = check_endpoint(&conn, spec.id, Some("http://localhost:11434/v1")).unwrap_err();
+            assert_eq!(err.to_string(), "Blocked by your organisation: processing stays on this Mac.");
+        }
+        assert!(check_leaves_mac(&conn).is_err());
+    }
+
+    #[test]
+    fn no_policy_refuses_nothing() {
+        let (_d, conn) = conn();
+        assert!(check_endpoint(&conn, ProviderId::OpenAi, None).is_ok());
+        assert!(check_leaves_mac(&conn).is_ok());
     }
 }
