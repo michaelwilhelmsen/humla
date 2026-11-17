@@ -420,14 +420,51 @@ mod vocabulary_tests {
     }
 }
 
+/// Unicode-lowercased copy of `original`, plus a map from each char of the
+/// folded copy back to its byte offset in `original`. `char::to_lowercase` can
+/// expand one char into several (e.g. 'İ' → "i̇"), so byte offsets don't
+/// survive folding; this map does.
+struct Folded {
+    text: String,
+    /// Byte offset in `original` for each char of `text`.
+    orig_offsets: Vec<usize>,
+    original_len: usize,
+}
+
+impl Folded {
+    fn new(original: &str) -> Self {
+        let mut text = String::new();
+        let mut orig_offsets = Vec::new();
+        for (orig_idx, c) in original.char_indices() {
+            for lc in c.to_lowercase() {
+                orig_offsets.push(orig_idx);
+                text.push(lc);
+            }
+        }
+        Self { text, orig_offsets, original_len: original.len() }
+    }
+
+    /// Map a byte offset in the folded text back to a byte offset in the
+    /// original. An offset past the last folded char (e.g. the end) maps to
+    /// the end of the original.
+    fn byte_offset(&self, folded_pos: usize) -> usize {
+        let char_idx = self.text[..folded_pos].chars().count();
+        self.orig_offsets
+            .get(char_idx)
+            .copied()
+            .unwrap_or(self.original_len)
+    }
+}
+
 // Whisper's training data contained millions of subtitle files, so it
-// regularly appends "Subtitles by …" / "Undertekster av …" / "Thanks for
-// watching" at the end of real speech. If we see one of these markers
-// anywhere in the text, strip it back to the preceding sentence boundary.
+// regularly appends a credit/sign-off line ("Subtitles by …",
+// "Undertekster av …", "Субтитры сделал DimaTorzok", "Thanks for watching")
+// at the end of real speech. If we see one of these markers anywhere in the
+// text, strip it back to the preceding sentence boundary.
 fn strip_attribution_tail(text: &str) -> String {
-    // Triggers are ASCII so to_ascii_lowercase keeps byte offsets aligned
-    // with the original string for slicing.
-    let lower = text.to_ascii_lowercase();
+    // Triggers are matched case-insensitively in a Unicode-folded copy:
+    // `to_ascii_lowercase` cannot fold Cyrillic. Hits are mapped back to the
+    // original through `Folded`.
     const TRIGGERS: &[&str] = &[
         // Norwegian/Scandinavian subtitle credits. Whisper memorised whole
         // sign-off phrases from broadcast subtitles, so each verb form needs
@@ -459,17 +496,46 @@ fn strip_attribution_tail(text: &str) -> String {
         "like and subscribe",
         "see you next time",
         "see you in the next",
+        // Russian subtitle credits — the same artefact as the English ones,
+        // phrased as the source material Whisper memorised. "DimaTorzok" is
+        // the name of a Russian subtitle author whose credit the model
+        // reproduces verbatim (openai/whisper#1873, #928); it shows up both in
+        // Latin and in Cyrillic transliteration.
+        "субтитры делал",
+        "субтитры сделал",
+        "субтитры создавал",
+        "субтитры создал",
+        "субтитры подогнал",
+        "субтитры от",
+        "субтитры перевел",
+        "субтитры перевела",
+        "титры делал",
+        "титры сделал",
+        "титры создавал",
+        "титры от",
+        "редактор субтитров",
+        "корректор субтитров",
+        "переводчик субтитров",
+        "продолжение следует",
+        "подпишись на канал",
+        "подпишитесь на канал",
+        "dimatorzok",
+        "дима торзок",
     ];
+    let folded = Folded::new(text);
     let mut cut: Option<usize> = None;
     for trigger in TRIGGERS {
-        if let Some(pos) = lower.rfind(trigger) {
+        if let Some(pos) = folded.text.find(trigger) {
             // Back up to the nearest sentence boundary before the trigger so
             // we drop the whole offending phrase, not just the trigger word.
-            let start = text[..pos]
+            // First match wins: a credit can repeat inside one chunk, and
+            // cutting at the last copy would leave the earlier one behind.
+            let boundary = folded.text[..pos]
                 .rfind(['.', '!', '?', '\n'])
                 .map(|p| p + 1)
                 .unwrap_or(pos);
-            cut = Some(cut.map_or(start, |c| c.min(start)));
+            let cut_here = folded.byte_offset(boundary);
+            cut = Some(cut.map_or(cut_here, |c| c.min(cut_here)));
         }
     }
     match cut {
@@ -559,20 +625,20 @@ fn is_likely_hallucination(text: &str, _language: &str) -> bool {
 }
 
 /// Detect a chunk whose output is dominated by N-gram repetition — Whisper's
-/// well-known low-SNR failure mode where one phrase decodes ≥3 consecutive
-/// times. The contaminated chunk should be dropped; if it lands in the
-/// transcript, the trail-prompt mechanism then feeds the loop into the next
+/// well-known low-SNR failure mode where one phrase decodes several
+/// consecutive times. The contaminated chunk should be dropped; if it lands in
+/// the transcript, the trail-prompt mechanism then feeds the loop into the next
 /// chunk and the recording's tail becomes unrecoverable.
 ///
 /// Heuristic: scan phrase lengths 1..=7. For each, look for the longest
 /// run of consecutive identical (case-insensitive, punctuation-stripped)
 /// occurrences. Flag the chunk when:
 ///   - some phrase repeats ≥4 times in a row, OR
-///   - some phrase repeats ≥3 times AND covers ≥60% of the chunk's words.
+///   - some phrase repeats ≥2 times AND covers ≥75% of the chunk's words.
 ///
-/// The double rule keeps "yes yes yes" or "ja ja ja" mid-conversation from
-/// being dropped — a 3-rep tiny chunk is plausibly real speech, but a 3-rep
-/// run dominating a longer chunk is collapse.
+/// The double rule keeps "yes yes" or "ja ja" mid-conversation from being
+/// dropped — a 2-rep run that leaves a quarter of the chunk alone is
+/// plausibly real speech, while a 2-rep run dominating the chunk is collapse.
 /// Minimum run of consecutive words pinned to a single zero-length instant for
 /// `is_timing_collapse` to fire.
 ///
@@ -683,7 +749,7 @@ fn is_repetition_collapse(text: &str) -> bool {
         return false;
     }
     for phrase_len in 1..=7 {
-        if n < phrase_len * 3 {
+        if n < phrase_len * 2 {
             continue;
         }
         let mut start = 0;
@@ -699,7 +765,11 @@ fn is_repetition_collapse(text: &str) -> bool {
             if reps >= 4 {
                 return true;
             }
-            if reps >= 3 && (phrase_len * reps) * 5 >= n * 3 {
+            // Two reps are enough when they dominate the chunk (≥75% of its
+            // words): a 5-word subtitle credit repeated twice in a 10-word
+            // chunk is the Whisper credit-collapse shape, while a real short
+            // repetition ("да ладно да ладно так вот") stays under that share.
+            if reps >= 2 && (phrase_len * reps) * 4 >= n * 3 {
                 return true;
             }
             start = pos.max(start + 1);
@@ -1116,6 +1186,82 @@ mod repetition_tests {
         // be matched as identical reps.
         let s = "Er det en bok? er det en bok! Er Det En Bok? er det en bok.";
         assert!(is_repetition_collapse(s));
+    }
+
+    #[test]
+    fn collapse_detects_two_full_repeats_of_long_phrase() {
+        // Whisper subtitle-credit collapse: a 5-word credit repeated twice in
+        // a 10-word chunk is 100% coverage, so two reps are enough.
+        let s = "Редактор субтитров А.Семкин Корректор А.Егорова Редактор субтитров А.Семкин Корректор А.Егорова";
+        assert!(is_repetition_collapse(s));
+    }
+
+    #[test]
+    fn collapse_passes_two_short_reps_below_dominance() {
+        // 6-word chunk, 2 reps of a 2-word phrase = 4 words = 67% coverage —
+        // under the 75% bar, so a real short repetition survives.
+        let s = "да ладно да ладно так вот";
+        assert!(!is_repetition_collapse(s));
+    }
+}
+
+#[cfg(test)]
+mod attribution_tests {
+    use super::*;
+
+    #[test]
+    fn drops_russian_subtitle_credits() {
+        // Whisper appends a fixed subtitle credit on a pause, sometimes twice
+        // in one chunk. Fixtures are generic stand-ins, not transcript text.
+        assert_eq!(strip_attribution_tail("Субтитры делал DimaTorzok"), "");
+        assert_eq!(strip_attribution_tail("Субтитры создавал DimaTorzok"), "");
+        assert_eq!(strip_attribution_tail("Субтитры создал DimaTorzok"), "");
+        assert_eq!(strip_attribution_tail("Субтитры подогнал DimaTorzok"), "");
+        assert_eq!(strip_attribution_tail("Продолжение следует..."), "");
+        assert_eq!(strip_attribution_tail("ПОДПИШИСЬ НА КАНАЛ!"), "");
+        assert_eq!(
+            strip_attribution_tail(
+                "Документы подписаны, отчёт отправлен. Редактор субтитров А.Семкин Корректор А.Егорова"
+            ),
+            "Документы подписаны, отчёт отправлен."
+        );
+        assert_eq!(
+            strip_attribution_tail(
+                "Редактор субтитров А.Семкин Корректор А.Егорова Редактор субтитров А.Семкин Корректор А.Егорова"
+            ),
+            ""
+        );
+    }
+
+    #[test]
+    fn drops_credit_glued_to_real_speech() {
+        assert_eq!(
+            strip_attribution_tail("Проект запущен, команда довольна. Субтитры сделал DimaTorzok"),
+            "Проект запущен, команда довольна."
+        );
+    }
+
+    #[test]
+    fn keeps_real_speech_that_mentions_subtitles() {
+        // "субтитры к видео" is a real topic, not a credit line.
+        assert_eq!(
+            strip_attribution_tail("Вчера обсуждали субтитры к видео, всё ясно."),
+            "Вчера обсуждали субтитры к видео, всё ясно."
+        );
+    }
+
+    #[test]
+    fn folded_offsets_map_back_to_original() {
+        // 'İ' folds to two chars, so byte offsets differ between the folded
+        // copy and the original; the map must still land on a char boundary.
+        let original = "İx";
+        let folded = Folded::new(original);
+        assert_eq!(folded.byte_offset(0), 0);
+        assert_eq!(
+            folded.byte_offset(folded.text.find('x').unwrap()),
+            original.find('x').unwrap()
+        );
+        assert_eq!(folded.byte_offset(folded.text.len()), original.len());
     }
 }
 
