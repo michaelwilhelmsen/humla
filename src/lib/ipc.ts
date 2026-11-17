@@ -3,6 +3,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { Provider, SummaryProvider } from "./providers";
 import type { SpeakerLabelStat } from "./speakerSuggest";
 import { targetFolderId, targetNoteId, type ChatTarget } from "./chatTarget";
+import type { OrgStatus } from "./orgPolicy";
 
 export type CopilotStatus = {
   login: string | null;
@@ -853,6 +854,8 @@ export const ipc = {
   permissionsStatus: () => invoke<PermissionsStatus>("permissions_status"),
   permissionsRequest: (kind: PermissionKind) => invoke<PermissionsStatus>("permissions_request", { kind }),
   permissionsOpenSettings: (kind: PermissionKind) => invoke<void>("permissions_open_settings", { kind }),
+
+  orgStatus: () => invoke<OrgStatus>("org_status"),
 };
 
 export type PermissionKind = "microphone" | "screen" | "notifications";
