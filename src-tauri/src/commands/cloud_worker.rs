@@ -146,19 +146,30 @@ impl Manager {
         self.running.lock().abort();
     }
 
-    /// Fetch the organisation config every poll interval while the worker runs.
-    /// Without a session it skips the round, leaving the cache in force.
+    /// Refresh the organisation config while the worker runs, paced by
+    /// `org::next_delay`: back off while the server can't be reached, stop on a
+    /// server without the route until a refresh hears it answer. Without a
+    /// session it skips the round, leaving the cache in force.
     fn org_refresh_loop(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        use super::org;
         let db = self.db.clone();
         let cache = self.keychain_cache.clone();
         let app = self.app.clone();
         async move {
-            let mut tick = tokio::time::interval(POLL_INTERVAL);
+            let mut delay = org::first_delay(org::since_last_attempt());
             loop {
-                tick.tick().await;
-                if let Ok((base, session)) = super::cloud_auth::ensure_session_from(&db, &cache).await {
-                    super::org::refresh_org_config(&db, &app, &base, &session.token).await;
-                }
+                tokio::time::sleep(delay).await;
+                let attempt = match super::cloud_auth::ensure_session_from(&db, &cache).await {
+                    Ok((base, session)) => Some(org::refresh_org_config(&db, &app, &base, &session.token).await),
+                    Err(_) => None,
+                };
+                delay = match org::next_delay(delay, attempt) {
+                    Some(next) => next,
+                    None => {
+                        org::route_answered().await;
+                        org::REFRESH_INTERVAL
+                    }
+                };
             }
         }
     }
