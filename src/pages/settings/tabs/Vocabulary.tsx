@@ -1,6 +1,8 @@
 import { useState } from "react";
-import { X } from "lucide-react";
+import { Lock, X } from "lucide-react";
 import { Section } from "../components/Section";
+import { orgTerms, useOrgs } from "../../../lib/orgContent";
+import { ManagedBadge } from "../ManagedRow";
 import { inputClass } from "../types";
 import type { SettingsHook } from "../useSettings";
 
@@ -28,6 +30,8 @@ export function serializeVocabulary(terms: string[]): string {
 
 export function VocabularySection({ s, update }: Pick<SettingsHook, "s" | "update">) {
   const terms = parseVocabulary(s.custom_vocabulary);
+  const orgs = useOrgs();
+  const locked = orgTerms(orgs);
   const [draft, setDraft] = useState("");
   const full = terms.length >= VOCABULARY_LIMIT;
 
@@ -48,55 +52,84 @@ export function VocabularySection({ s, update }: Pick<SettingsHook, "s" | "updat
   }
 
   return (
-    <Section title="Your terms">
-      <div className="flex flex-col gap-3 py-3.5">
-        {terms.length > 0 && (
-          <ul className="flex flex-wrap gap-1.5" aria-label="Your terms">
-            {terms.map((term) => (
-              <li
-                key={term}
-                className="inline-flex items-center gap-1 pl-2 pr-1 py-1 rounded-md text-xs bg-[var(--color-pill-hover)] text-[var(--color-text)]"
-              >
-                {term}
-                <button
-                  type="button"
-                  aria-label={`Remove ${term}`}
-                  onClick={() => remove(term)}
-                  className="grid place-items-center w-4 h-4 rounded text-[var(--color-text-muted)] hover:text-[var(--color-text)]"
+    <>
+      {locked.length > 0 && (
+        <section className="mb-8">
+          <div className="flex items-center justify-between gap-3 mb-2.5 min-h-7">
+            <h2 className="text-sm font-medium">From your organisation</h2>
+            <div className="flex flex-wrap justify-end gap-1">
+              {orgs
+                .filter((o) => o.vocabulary.some((t) => t.trim()))
+                .map((o) => (
+                  <ManagedBadge key={o.id} source={o.name} reason={o.reason} />
+                ))}
+            </div>
+          </div>
+          <div className="rounded-[var(--radius-card)] border border-[var(--color-line-visible)] bg-[var(--color-surface)] px-4 py-3.5">
+            <ul className="flex flex-wrap gap-1.5" aria-label="Organisation terms">
+              {locked.map((term) => (
+                <li
+                  key={term}
+                  className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-xs bg-[var(--color-pill-hover)] text-[var(--color-text-muted)]"
                 >
-                  <X size={11} strokeWidth={2} aria-hidden />
-                </button>
-              </li>
-            ))}
-          </ul>
-        )}
-        <div className="flex gap-2">
-          <input
-            type="text"
-            aria-label="Add a term"
-            placeholder="Add a term"
-            value={draft}
-            disabled={full}
-            onChange={(e) => setDraft(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") {
-                e.preventDefault();
-                add();
-              }
-            }}
-            className={inputClass}
-          />
-          <button
-            type="button"
-            className="nd-btn"
-            disabled={full || candidates.length === 0}
-            onClick={add}
-          >
-            Add
-          </button>
+                  <Lock size={10} strokeWidth={2} aria-hidden />
+                  {term}
+                </li>
+              ))}
+            </ul>
+          </div>
+        </section>
+      )}
+      <Section title="Your terms">
+        <div className="flex flex-col gap-3 py-3.5">
+          {terms.length > 0 && (
+            <ul className="flex flex-wrap gap-1.5" aria-label="Your terms">
+              {terms.map((term) => (
+                <li
+                  key={term}
+                  className="inline-flex items-center gap-1 pl-2 pr-1 py-1 rounded-md text-xs bg-[var(--color-pill-hover)] text-[var(--color-text)]"
+                >
+                  {term}
+                  <button
+                    type="button"
+                    aria-label={`Remove ${term}`}
+                    onClick={() => remove(term)}
+                    className="grid place-items-center w-4 h-4 rounded text-[var(--color-text-muted)] hover:text-[var(--color-text)]"
+                  >
+                    <X size={11} strokeWidth={2} aria-hidden />
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+          <div className="flex gap-2">
+            <input
+              type="text"
+              aria-label="Add a term"
+              placeholder="Add a term"
+              value={draft}
+              disabled={full}
+              onChange={(e) => setDraft(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  add();
+                }
+              }}
+              className={inputClass}
+            />
+            <button
+              type="button"
+              className="nd-btn"
+              disabled={full || candidates.length === 0}
+              onClick={add}
+            >
+              Add
+            </button>
+          </div>
+          <p className="text-xs text-[var(--color-text-muted)]">Limit: {VOCABULARY_LIMIT}</p>
         </div>
-        <p className="text-xs text-[var(--color-text-muted)]">Limit: {VOCABULARY_LIMIT}</p>
-      </div>
-    </Section>
+      </Section>
+    </>
   );
 }

@@ -144,4 +144,88 @@ describe("TemplatesSection", () => {
     expect(within(yours).getByRole("button", { name: "Edit Standup" })).toBeInTheDocument();
     expect(within(yours).getByRole("button", { name: "Delete Standup" })).toBeInTheDocument();
   });
+
+  describe("from an organisation", () => {
+    const orgStatus = {
+      policy: {
+        org_name: null,
+        reason: null,
+        local_only: false,
+        retention_days: 0,
+        telemetry_off: false,
+        audio_forbidden: false,
+        rules: [],
+      },
+      orgs: [{ id: "o1", name: "Northwind", reason: "Approved for every department.", vocabulary: [], workspaces: ["ws1"] }],
+    };
+    const orgTemplate = (id: string, name: string, departments: string[]): SummaryPrompt => ({
+      ...prompt(id, name),
+      org_id: "o1",
+      org_workspaces: departments,
+    });
+
+    it("lists them first, read-only, with the marker once on the heading", async () => {
+      inWorkspace("Intake");
+      mockTauri({
+        org_status: () => orgStatus,
+        summary_prompts_list: () => [
+          prompt("p1", "Standup"),
+          orgTemplate("t1", "Case meeting", []),
+          orgTemplate("t2", "Intake review", ["ws1"]),
+          orgTemplate("t3", "Elsewhere", ["ws9"]),
+        ],
+      });
+      render(<TemplatesSection language="en" />);
+      const heading = await screen.findByRole("heading", { name: "From your organisation" });
+      const group = heading.closest("section")!;
+      const sections = screen.getAllByRole("heading", { level: 2 }).map((h) => h.textContent);
+      expect(sections[0]).toBe("From your organisation");
+      expect(await within(group).findAllByRole("button", { name: /Managed by Northwind/ })).toHaveLength(1);
+      expect(within(group).getByText("Case meeting")).toBeInTheDocument();
+      expect(within(group).getByText("Intake review")).toBeInTheDocument();
+      expect(within(group).queryByText("Elsewhere")).toBeNull();
+      expect(within(group).getByText("Intake")).toBeInTheDocument();
+      expect(within(group).queryByRole("button", { name: /^Edit / })).toBeNull();
+      expect(within(group).queryByRole("button", { name: /^Delete / })).toBeNull();
+      expect(within(group).getByRole("button", { name: "View Case meeting" })).toBeInTheDocument();
+      expect(screen.queryByText("Standup")?.closest("section")).not.toBe(group);
+    });
+
+    it("duplicates one into the editor as the user's own copy", async () => {
+      mockTauri({
+        org_status: () => orgStatus,
+        summary_prompts_list: () => [orgTemplate("t1", "Case meeting", [])],
+      });
+      render(<TemplatesSection language="en" />);
+      await userEvent.click(await screen.findByRole("button", { name: "Duplicate Case meeting" }));
+      const editor = await screen.findByRole("dialog", { name: "New template" });
+      expect(within(editor).getByLabelText("Name")).toHaveValue("Case meeting (copy)");
+      expect(within(editor).getByLabelText("Instructions")).toHaveValue("Case meeting instructions");
+    });
+
+    it("offers none in a team workspace outside the organisation, so none can be duplicated there", async () => {
+      inWorkspace("Book club");
+      mockTauri({
+        org_status: () => ({ ...orgStatus, orgs: [{ ...orgStatus.orgs[0], workspaces: ["ws9"] }] }),
+        summary_prompts_list: () => [prompt("p1", "Standup"), orgTemplate("t1", "Case meeting", [])],
+      });
+      render(<TemplatesSection language="en" />);
+      await screen.findByText("Standup");
+      await new Promise((r) => setTimeout(r, 0));
+      expect(screen.queryByRole("heading", { name: "From your organisation" })).toBeNull();
+      expect(screen.queryByText("Case meeting")).toBeNull();
+      expect(screen.queryByRole("button", { name: "Duplicate Case meeting" })).toBeNull();
+    });
+
+    it("shows no organisation group without one", async () => {
+      mockTauri({ summary_prompts_list: () => [prompt("p1", "Standup")] });
+      render(<TemplatesSection language="en" />);
+      await screen.findByText("Standup");
+      expect(screen.queryByRole("heading", { name: "From your organisation" })).toBeNull();
+      expect(screen.getAllByRole("heading", { level: 2 }).map((h) => h.textContent)).toEqual([
+        "Built-in",
+        "Your templates",
+      ]);
+    });
+  });
 });

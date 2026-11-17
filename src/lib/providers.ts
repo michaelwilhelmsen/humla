@@ -3,6 +3,8 @@
 // when the two drift. Which key cards to show, which ids may be sent over
 // IPC and which providers can summarise all derive from here.
 
+import { isLoopbackUrl } from "./loopback";
+
 export const PROVIDERS = [
   { id: "openai", label: "OpenAI", keychain: true, summarize: true, chat: true, transcribe: true },
   { id: "anthropic", label: "Anthropic", keychain: true, summarize: true, chat: true, transcribe: false },
@@ -58,4 +60,31 @@ export function isTranscribeKeyProvider(p: Provider): p is TranscribeKeyProvider
 
 export function isKeyProvider(p: Provider): p is KeyProvider {
   return (KEY_PROVIDERS as readonly Provider[]).includes(p);
+}
+
+/** What an organisation's `local_only` lets a provider reach. Mirrors
+ *  `org_policy::local_only_rule`; providers.test.ts reads that file. */
+export type LocalOnlyRule = "on_device_or_loopback" | "loopback" | "refused";
+
+export const LOCAL_ONLY_RULE: Record<Provider, LocalOnlyRule> = {
+  openai: "refused",
+  anthropic: "refused",
+  copilot: "refused",
+  deepgram: "refused",
+  groq: "refused",
+  local: "on_device_or_loopback",
+  custom: "loopback",
+};
+
+/** Mirrors `org_policy::allows_endpoint`. `baseUrl` null means the provider is
+ *  reached without one: on-device Whisper for `local`. */
+export function allowedUnderLocalOnly(p: Provider, baseUrl: string | null): boolean {
+  switch (LOCAL_ONLY_RULE[p]) {
+    case "on_device_or_loopback":
+      return baseUrl === null || isLoopbackUrl(baseUrl);
+    case "loopback":
+      return baseUrl !== null && isLoopbackUrl(baseUrl);
+    case "refused":
+      return false;
+  }
 }

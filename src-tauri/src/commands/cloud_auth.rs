@@ -670,6 +670,7 @@ pub enum SignInStep {
 
 #[tauri::command]
 pub async fn cloud_login(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     email: String,
     password: String,
@@ -681,7 +682,7 @@ pub async fn cloud_login(
             adopt(&state, session, email, Some(&password))?;
             *CHALLENGE.lock() = None;
             state.sync.config_changed(); // signed in → start the sync worker
-            let status = super::cloud::cloud_status(state).await?;
+            let status = super::cloud::cloud_status(app, state).await?;
             Ok(SignInStep::SignedIn { status: Box::new(status) })
         }
         Ok(PasswordLogin::TwoFactor { mfa_id }) => {
@@ -719,6 +720,7 @@ fn challenge_expired() -> CloudError {
 /// authenticator app, or one of the recovery codes.
 #[tauri::command]
 pub async fn cloud_verify_two_factor(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     code: Option<String>,
     recovery_code: Option<String>,
@@ -742,7 +744,7 @@ pub async fn cloud_verify_two_factor(
     }
     adopt_response(&state, &body, &challenge.email, None)?;
     *CHALLENGE.lock() = None;
-    Ok(super::cloud::cloud_status(state).await?)
+    Ok(super::cloud::cloud_status(app, state).await?)
 }
 
 // ---- managing two-factor authentication -------------------------------------

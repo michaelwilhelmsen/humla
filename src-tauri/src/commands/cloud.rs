@@ -611,7 +611,10 @@ async fn fetch_billing_config(base: &str) -> BillingConfig {
 // ---- commands --------------------------------------------------------------
 
 #[tauri::command]
-pub async fn cloud_status(state: State<'_, AppState>) -> Result<CloudStatus, String> {
+pub async fn cloud_status(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<CloudStatus, String> {
     let base = read_base_url(&state);
     let configured = base.is_some();
     let base_url = base.clone().unwrap_or_default();
@@ -643,10 +646,11 @@ pub async fn cloud_status(state: State<'_, AppState>) -> Result<CloudStatus, Str
         });
     };
 
-    let (workspaces, billing, two_factor) = tokio::join!(
+    let (workspaces, billing, two_factor, _) = tokio::join!(
         list_workspaces_inner(&base_url, &session),
         fetch_billing_config(&base_url),
         super::cloud_auth::fetch_two_factor_status(&base_url, &session.token),
+        super::org::refresh_org_config(&state.db, &app, &base_url, &session.token),
     );
     let workspaces = match workspaces {
         Ok(ws) => ws,
@@ -757,6 +761,7 @@ pub fn cloud_configure(state: State<'_, AppState>, base_url: String) -> Result<(
 /// email in the roster.
 #[tauri::command]
 pub async fn cloud_signup(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     email: String,
     password: String,
@@ -803,7 +808,7 @@ pub async fn cloud_signup(
     // Account created → sign in and keep the session, as cloud_login does.
     super::cloud_auth::sign_in_new_account(&state, &base, email, &password).await?;
     state.sync.config_changed();
-    cloud_status(state).await
+    cloud_status(app, state).await
 }
 
 /// Resend the email-verification message to the signed-in user's address. Uses
@@ -1200,6 +1205,7 @@ pub async fn cloud_delete_workspace(
 /// If you leave the active workspace, fall back to Personal and stop the worker.
 #[tauri::command]
 pub async fn cloud_leave_workspace(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     workspace_id: String,
 ) -> Result<(), String> {
@@ -1213,6 +1219,7 @@ pub async fn cloud_leave_workspace(
         .map_err(|e| e.to_string())?;
     pb_json(resp).await?; // surfaces the hook's message (e.g. owner-can't-leave)
     clear_roster_cache(&state, &workspace_id); // the cache dies with the membership (#116)
+    super::org::refresh_org_config(&state.db, &app, &base, &session.token).await;
     if read_workspace_id(&state).as_deref() == Some(workspace_id.as_str()) {
         {
             let conn = state.db.lock();

@@ -13,6 +13,8 @@ import { Row } from "./Section";
 import { Select } from "../../../components/ui/Select";
 import { Toggle } from "./Toggle";
 import { CustomModelField } from "../../../components/provider/CustomEndpoint";
+import type { PolicyRule } from "../../../lib/orgPolicy";
+import { ManagedRow } from "../ManagedRow";
 
 type LocalModelSummary = {
   id: string;
@@ -61,12 +63,16 @@ export function ProviderConfigForm({
   localModels,
   filterLocalToLanguage,
   hideLocal = false,
+  managed = null,
 }: {
   value: ProviderConfig;
   onChange: (next: ProviderConfig) => void;
   localModels: LocalModelSummary[];
   filterLocalToLanguage?: string;
   hideLocal?: boolean;
+  /** Who fixes the provider (`local_only`). `value` is then already the
+   *  enforced config; the provider shows disabled. */
+  managed?: PolicyRule | null;
 }) {
   const provider = value.provider;
   const localAvailable = !hideLocal && localModels.some((m) => m.downloaded);
@@ -120,45 +126,61 @@ export function ProviderConfigForm({
 
   return (
     <>
-      <Row
-        label="Provider"
-        description="Where audio is transcribed — on this Mac or a cloud API."
-        control={
-          <Select
-            value={provider}
-            onChange={(v) => {
-              const p = v as Provider;
-              if (p === "openai") {
-                onChange({ provider: "openai", model: "whisper-1" });
-              } else if (p === "local") {
-                const first = localModels.find(
-                  (m) =>
-                    m.downloaded &&
-                    (filterLocalToLanguage
-                      ? m.kind === "multilingual" ||
-                        m.specificLanguage === filterLocalToLanguage
-                      : m.kind === "multilingual"),
-                );
-                onChange({
-                  provider: "local",
-                  model_id: first?.id ?? "large-v3-turbo-q5",
-                  preset: "quality",
-                  use_gpu: true,
-                });
-              } else if (p === "deepgram") {
-                onChange({ provider: "deepgram", model: "nova-3" });
-              } else if (p === "groq") {
-                onChange({ provider: "groq", model: "whisper-large-v3-turbo" });
-              } else if (p === "custom") {
-                onChange({ provider: "custom", model: "" });
+      {managed ? (
+        <ManagedRow
+          label="Provider"
+          source={managed.source}
+          reason={managed.reason}
+          control={
+            <Select
+              value={provider}
+              onChange={() => {}}
+              options={[...PROVIDERS_BASE, LOCAL_PROVIDER]}
+              disabled
+            />
+          }
+        />
+      ) : (
+        <Row
+          label="Provider"
+          description="Where audio is transcribed — on this Mac or a cloud API."
+          control={
+            <Select
+              value={provider}
+              onChange={(v) => {
+                const p = v as Provider;
+                if (p === "openai") {
+                  onChange({ provider: "openai", model: "whisper-1" });
+                } else if (p === "local") {
+                  const first = localModels.find(
+                    (m) =>
+                      m.downloaded &&
+                      (filterLocalToLanguage
+                        ? m.kind === "multilingual" ||
+                          m.specificLanguage === filterLocalToLanguage
+                        : m.kind === "multilingual"),
+                  );
+                  onChange({
+                    provider: "local",
+                    model_id: first?.id ?? "large-v3-turbo-q5",
+                    preset: "quality",
+                    use_gpu: true,
+                  });
+                } else if (p === "deepgram") {
+                  onChange({ provider: "deepgram", model: "nova-3" });
+                } else if (p === "groq") {
+                  onChange({ provider: "groq", model: "whisper-large-v3-turbo" });
+                } else if (p === "custom") {
+                  onChange({ provider: "custom", model: "" });
+                }
+              }}
+              options={
+                localAvailable ? [...PROVIDERS_BASE, LOCAL_PROVIDER] : PROVIDERS_BASE
               }
-            }}
-            options={
-              localAvailable ? [...PROVIDERS_BASE, LOCAL_PROVIDER] : PROVIDERS_BASE
-            }
-          />
-        }
-      />
+            />
+          }
+        />
+      )}
 
       {value.provider === "custom" ? (
         <CustomModelField

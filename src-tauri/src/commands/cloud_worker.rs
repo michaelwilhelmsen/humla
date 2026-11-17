@@ -55,6 +55,8 @@ struct Running {
     handle: Option<Arc<cloud_sync::CloudSync>>,
     /// The spawned worker future, kept so a restart can abort it.
     task: Option<tauri::async_runtime::JoinHandle<()>>,
+    /// Refreshes the organisation config on the worker's interval.
+    org_task: Option<tauri::async_runtime::JoinHandle<()>>,
 }
 
 /// Build the observer and attempt an initial start (a no-op until the user has
@@ -87,10 +89,7 @@ impl Manager {
         let mut running = self.running.lock();
         // Abort any prior worker first so we never run two against the same DB
         // (which would race the shared outbox).
-        if let Some(task) = running.task.take() {
-            task.abort();
-        }
-        running.handle = None;
+        running.abort();
 
         let app = self.app.clone();
         let app_status = self.app.clone();
@@ -133,6 +132,7 @@ impl Manager {
                 let task = tauri::async_runtime::spawn(fut);
                 running.handle = Some(handle);
                 running.task = Some(task);
+                running.org_task = Some(tauri::async_runtime::spawn(self.org_refresh_loop()));
                 eprintln!("cloud-sync: worker started");
             }
             Err(e) => eprintln!("cloud-sync: start failed: {e:#}"),
@@ -143,11 +143,35 @@ impl Manager {
     /// `sync_outbox` means any not-yet-pushed ops survive and replay on the next
     /// start.
     fn stop(&self) {
-        let mut running = self.running.lock();
-        if let Some(task) = running.task.take() {
-            task.abort();
+        self.running.lock().abort();
+    }
+
+    /// Refresh the organisation config while the worker runs, paced by
+    /// `org::next_delay`: back off while the server can't be reached, stop on a
+    /// server without the route until a refresh hears it answer. Without a
+    /// session it skips the round, leaving the cache in force.
+    fn org_refresh_loop(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        use super::org;
+        let db = self.db.clone();
+        let cache = self.keychain_cache.clone();
+        let app = self.app.clone();
+        async move {
+            let mut delay = org::first_delay(org::since_last_attempt());
+            loop {
+                tokio::time::sleep(delay).await;
+                let attempt = match super::cloud_auth::ensure_session_from(&db, &cache).await {
+                    Ok((base, session)) => Some(org::refresh_org_config(&db, &app, &base, &session.token).await),
+                    Err(_) => None,
+                };
+                delay = match org::next_delay(delay, attempt) {
+                    Some(next) => next,
+                    None => {
+                        org::route_answered().await;
+                        org::REFRESH_INTERVAL
+                    }
+                };
+            }
         }
-        running.handle = None;
     }
 
     /// Snapshot the live handle for a forward, or `None` if the worker is down.
@@ -196,6 +220,15 @@ impl Manager {
 struct AppSession {
     db: cloud_sync::Db,
     keychain_cache: crate::keychain::Cache,
+}
+
+impl Running {
+    fn abort(&mut self) {
+        for task in [self.task.take(), self.org_task.take()].into_iter().flatten() {
+            task.abort();
+        }
+        self.handle = None;
+    }
 }
 
 impl cloud_sync::Session for AppSession {

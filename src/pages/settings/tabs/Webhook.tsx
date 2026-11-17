@@ -6,6 +6,8 @@ import { Btn } from "../components/Btn";
 import { Row } from "../components/Section";
 import { Toggle } from "../components/Toggle";
 import { inputClass, type EditableKey } from "../types";
+import type { PolicyRule } from "../../../lib/orgPolicy";
+import { ManagedBadge } from "../ManagedRow";
 
 // Send to webhook (#213): rows in the Integrations section, below MCP, because
 // that is what it is: a way for the user's own tools to receive their notes.
@@ -42,9 +44,12 @@ function endpointInput(url: string, headers: HeaderRow[]): WebhookEndpointInput 
 export function WebhookRows({
   s,
   update,
+  managed = null,
 }: {
   s: Record<EditableKey, string>;
   update: (key: EditableKey, value: string) => void;
+  /** Who keeps notes on this Mac (`local_only`): only a loopback URL is accepted. */
+  managed?: PolicyRule | null;
 }) {
   const enabled = s.webhook_enabled === "true";
   return (
@@ -60,12 +65,12 @@ export function WebhookRows({
           />
         }
       />
-      {enabled && <EndpointForm />}
+      {enabled && <EndpointForm managed={managed} />}
     </>
   );
 }
 
-function EndpointForm() {
+function EndpointForm({ managed }: { managed: PolicyRule | null }) {
   const [loaded, setLoaded] = useState(false);
   const [url, setUrl] = useState("");
   const [headers, setHeaders] = useState<HeaderRow[]>([]);
@@ -133,19 +138,23 @@ function EndpointForm() {
 
   return (
     <>
-      <Row label="Webhook URL">
+      <div className="py-3.5">
+        <div className="flex flex-wrap items-center gap-x-2 gap-y-1 mb-1.5">
+          <span className="text-sm">Webhook URL</span>
+          {managed && <ManagedBadge source={managed.source} reason={managed.reason} />}
+        </div>
         <input
           aria-label="Webhook URL"
           type="url"
           autoComplete="off"
           spellCheck={false}
           className={inputClass}
-          placeholder="https://example.com/webhook"
+          placeholder={managed ? "http://localhost:8787/webhook" : "https://example.com/webhook"}
           value={url}
           disabled={saving}
           onChange={(e) => edit(() => setUrl(e.target.value))}
         />
-      </Row>
+      </div>
       <Row label="Headers">
         <p className="text-xs text-[var(--color-text-muted)] mb-2">
           Saved values aren’t shown again. Leave one empty to keep it.

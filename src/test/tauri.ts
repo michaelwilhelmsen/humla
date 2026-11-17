@@ -70,6 +70,18 @@ export function mockTauri(
           workspaces: [],
           billing_enabled: false,
         };
+      case "org_status":
+        return {
+          policy: {
+            org_name: null,
+            reason: null,
+            local_only: false,
+            retention_days: 0,
+            telemetry_off: false,
+            audio_forbidden: false,
+            rules: [],
+          },
+        };
       case "provider_key_get":
         return null;
       case "webhook_get_endpoint":

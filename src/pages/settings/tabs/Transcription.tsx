@@ -12,6 +12,7 @@ import { CustomEndpointCard } from "../../../components/provider/CustomEndpoint"
 import { NEMOTRON_MAX_SPEAKERS } from "../../../lib/diarizeEngine";
 import { KEY_ONLY_PROVIDERS } from "../../../lib/providers";
 import { LANGUAGES, languageOptionLabel } from "../../../lib/languages";
+import { enforceLocalOnly, useLocalOnly } from "../../../lib/orgPolicy";
 import type { SettingsHook } from "../useSettings";
 
 // The selected cloud provider's key card renders right under the picker;
@@ -122,7 +123,10 @@ export function TranscriptionTab({
   | "downloadDiarize"
   | "deleteDiarize"
 >) {
-  const def = transcribeConfig.default;
+  const { managed, known } = useLocalOnly();
+  const def = managed
+    ? enforceLocalOnly(transcribeConfig.default, s.custom_base_url)
+    : transcribeConfig.default;
 
   return (
     <>
@@ -131,6 +135,7 @@ export function TranscriptionTab({
           value={def}
           onChange={setDefaultConfig}
           localModels={local.models}
+          managed={managed}
         />
         {def.provider === "local" && !local.models.some((m) => m.downloaded) && (
           <p className="text-xs text-[var(--color-danger)] py-3">
@@ -143,7 +148,7 @@ export function TranscriptionTab({
             onBaseUrlChange={(v) => update("custom_base_url", v)}
           />
         )}
-        {def.provider !== "local" && def.provider !== "custom" && (
+        {known && def.provider !== "local" && def.provider !== "custom" && (
           <ProviderKeyCard provider={def.provider as KeyProvider} />
         )}
         <Row
@@ -168,6 +173,8 @@ export function TranscriptionTab({
               setLanguageOverride={setLanguageOverride}
               removeLanguageOverride={removeLanguageOverride}
               local={local}
+              managed={managed}
+              customBaseUrl={s.custom_base_url}
             />
           </div>
           <div>
@@ -197,15 +204,17 @@ export function TranscriptionTab({
               }}
             />
           </div>
-          <div>
-            <div className="text-sm">Other API keys</div>
-            <p className="text-xs text-[var(--color-text-muted)] mt-0.5">
-              For per-language overrides.
-            </p>
-            {KEY_ONLY_PROVIDERS.filter((p) => p !== def.provider).map((p) => (
-              <ProviderKeyCard key={p} provider={p} />
-            ))}
-          </div>
+          {known && !managed && (
+            <div>
+              <div className="text-sm">Other API keys</div>
+              <p className="text-xs text-[var(--color-text-muted)] mt-0.5">
+                For per-language overrides.
+              </p>
+              {KEY_ONLY_PROVIDERS.filter((p) => p !== def.provider).map((p) => (
+                <ProviderKeyCard key={p} provider={p} />
+              ))}
+            </div>
+          )}
           {def.provider !== "custom" && (
             <div>
               <div className="text-sm">Custom endpoint</div>

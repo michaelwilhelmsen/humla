@@ -152,6 +152,15 @@ fn validate(endpoint: &Endpoint) -> Result<(Url, HeaderMap), String> {
     Ok((url, headers))
 }
 
+/// Under `local_only` a note may go only to a receiver on this Mac.
+fn check_policy(conn: &rusqlite::Connection, url: &Url) -> Result<(), String> {
+    let policy = crate::org_policy::effective_or_strictest(conn);
+    if policy.local_only && !crate::org_policy::is_loopback_url(url.as_str()) {
+        return Err(policy.blocked().to_string());
+    }
+    Ok(())
+}
+
 /// The receiver as the confirmation names it: its host, and its port when that
 /// isn't the scheme's default. Never the path or query, which often carry a
 /// token.
@@ -186,7 +195,8 @@ pub fn webhook_set_endpoint(state: State<AppState>, endpoint: EndpointInput) -> 
     if endpoint.url.is_empty() && endpoint.headers.is_empty() {
         return keychain::write(&state.keychain_cache, ACCOUNT, None);
     }
-    validate(&endpoint)?;
+    let (url, _) = validate(&endpoint)?;
+    check_policy(&state.db.lock(), &url)?;
     let json = serde_json::to_string(&endpoint).map_err(err)?;
     keychain::write(&state.keychain_cache, ACCOUNT, Some(&json))
 }
@@ -223,6 +233,8 @@ pub async fn webhook_send_note(
         (note, facts)
     };
     let endpoint = saved_endpoint(&state)?;
+    let (url, _) = validate(&endpoint)?;
+    check_policy(&state.db.lock(), &url)?;
     let app_dir = app.path().app_data_dir().map_err(err)?;
     let takes: Vec<_> = sessions::resolve_sessions(&sessions::recordings_dir(&app_dir, &note_id))
         .into_iter()
@@ -520,6 +532,25 @@ mod tests {
             "hooks.example.com"
         );
         assert_eq!(named("http://localhost:8787/ingest"), "localhost:8787");
+    }
+
+    #[test]
+    fn local_only_sends_only_to_a_receiver_on_this_mac() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = db::open(&dir.path().join("t.sqlite")).unwrap();
+        let url = |u: &str| Url::parse(u).unwrap();
+        assert!(check_policy(&conn, &url("https://hooks.example.com/x")).is_ok());
+        crate::org_policy::cache_local_only(&conn, "Northwind");
+        assert_eq!(
+            check_policy(&conn, &url("https://hooks.example.com/x")).unwrap_err(),
+            "Blocked by Northwind: processing stays on this Mac."
+        );
+        assert!(check_policy(&conn, &url("http://192.168.1.20:8787/ingest")).is_err());
+        assert!(check_policy(&conn, &url("http://localhost:8787/ingest")).is_ok());
+        assert!(check_policy(&conn, &url("http://127.0.0.1:8787/ingest")).is_ok());
+        db::set_setting(&conn, "org_config", "{not json").unwrap();
+        assert!(check_policy(&conn, &url("http://localhost:8787/ingest")).is_ok());
+        assert!(check_policy(&conn, &url("https://hooks.example.com/x")).is_err());
     }
 
     fn facts() -> NoteFacts {

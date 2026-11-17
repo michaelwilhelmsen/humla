@@ -5,7 +5,7 @@
 //! reloads a Note's conversation after restart. The heavy lifting (prompt
 //! assembly, budget, streaming orchestration) lives Tauri-free in `crate::chat`.
 
-use super::{DEFAULT_LOCAL_LLM_BASE_URL, DEFAULT_SUMMARY_MODEL};
+use super::DEFAULT_SUMMARY_MODEL;
 use crate::chat::{self, ChatCtx, ChatEvent, Citation, ToolScope};
 use crate::db::{self, ChatTarget, CHAT_TENANT_PERSONAL};
 use crate::embed::{self, EmbeddingAdapter, OLLAMA_EMBED_MODEL, OPENAI_EMBED_MODEL};
@@ -33,7 +33,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 /// Anthropic key against an OpenAI route it can't authenticate. A custom
 /// endpoint is treated the same way, since many gateways serve no embeddings.
 fn resolve_embed(resolved: &ResolvedChat) -> Option<embed::EmbedConfig> {
-    match resolved.provider {
+    let cfg = match resolved.provider {
         ProviderId::Local => Some(embed::EmbedConfig {
             model: resolved.embed.model.clone().unwrap_or_else(|| OLLAMA_EMBED_MODEL.to_string()),
             base_url: resolved.embed.base_url.clone().unwrap_or_else(|| resolved.base_url.clone()),
@@ -45,28 +45,36 @@ fn resolve_embed(resolved: &ResolvedChat) -> Option<embed::EmbedConfig> {
             base_url: resolved.base_url.clone(),
             api_key: resolved.api_key.clone(),
         }),
-    }
+    };
+    cfg.filter(|c| resolved.policy.allows(resolved.provider, Some(&c.base_url)))
 }
 
 /// The Keychain key for whichever provider chat is set to. Reading every slot
 /// would prompt for providers this turn never calls, so the setting is read
 /// first and only the matching slot is opened.
 fn chat_api_key(state: &State<AppState>) -> Option<String> {
-    let stored = {
+    let id = {
         let conn = state.db.lock();
-        db::get_setting(&conn, "chat_provider")
-            .ok()
-            .flatten()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "openai".into())
+        chat_provider_id(&conn).ok()?.0
     };
-    match ProviderId::parse(&stored) {
-        Some(id) if id.keychain_account().is_some() => {
-            super::read_provider_api_key(state, id.as_str()).ok().flatten()
-        }
-        _ => None,
-    }
+    id.keychain_account()?;
+    super::read_provider_api_key(state, id.as_str()).ok().flatten()
+}
+
+/// The chat provider in force and the policy that allowed it. Refuses an unknown
+/// id and one the organisation policy doesn't allow.
+fn chat_provider_id(
+    conn: &rusqlite::Connection,
+) -> anyhow::Result<(ProviderId, crate::org_policy::EffectivePolicy)> {
+    let provider = db::get_setting(conn, "chat_provider")?
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "openai".into());
+    let id = ProviderId::parse(&provider)
+        .filter(|p| p.capabilities().chat)
+        .ok_or_else(|| anyhow::anyhow!("unknown chat provider “{provider}” — pick one in Settings → Chat."))?;
+    let policy = super::check_llm_endpoint(conn, id)?;
+    Ok((id, policy))
 }
 
 /// Embed a Note's not-yet-embedded chunks under the adapter's model and cache
@@ -468,6 +476,7 @@ struct ResolvedChat {
     model: String,
     think: bool,
     embed: EmbedOverride,
+    policy: crate::org_policy::EffectivePolicy,
 }
 
 /// What the user has said about the local embedder, if anything. `None` on
@@ -489,16 +498,12 @@ fn resolve_chat(
             .filter(|s| !s.is_empty()))
     };
 
-    let provider = setting("chat_provider")?.unwrap_or_else(|| "openai".into());
+    let (id, policy) = chat_provider_id(conn)?;
     let model_setting = setting("chat_model")?;
-    let id = ProviderId::parse(&provider)
-        .filter(|p| p.capabilities().chat)
-        .ok_or_else(|| anyhow::anyhow!("unknown chat provider “{provider}” — pick one in Settings → Chat."))?;
 
     match id {
         ProviderId::Local => {
-            let base_url =
-                setting("local_llm_base_url")?.unwrap_or_else(|| DEFAULT_LOCAL_LLM_BASE_URL.to_string());
+            let base_url = super::local_llm_base_url(conn)?;
             let think = db::get_setting(conn, "local_llm_think")?
                 .map(|s| s.trim().eq_ignore_ascii_case("true"))
                 .unwrap_or(false);
@@ -518,7 +523,7 @@ fn resolve_chat(
                 base_url: setting("embed_base_url")?,
                 model: setting("embed_model")?,
             };
-            Ok(ResolvedChat { provider: id, base_url, api_key: None, model, think, embed })
+            Ok(ResolvedChat { provider: id, base_url, api_key: None, model, think, embed, policy })
         }
         ProviderId::OpenAi => {
             let api_key = api_key.filter(|s| !s.is_empty()).ok_or_else(|| {
@@ -538,6 +543,7 @@ fn resolve_chat(
                 model,
                 think: false,
                 embed: EmbedOverride::default(),
+                policy,
             })
         }
         ProviderId::Anthropic => {
@@ -554,6 +560,7 @@ fn resolve_chat(
                 model,
                 think: false,
                 embed: EmbedOverride::default(),
+                policy,
             })
         }
         ProviderId::Copilot => {
@@ -566,6 +573,7 @@ fn resolve_chat(
                 model,
                 think: false,
                 embed: EmbedOverride::default(),
+                policy,
             })
         }
         ProviderId::Custom => Ok(ResolvedChat {
@@ -575,6 +583,7 @@ fn resolve_chat(
             model: crate::custom_endpoint::model(conn, crate::custom_endpoint::CHAT_MODEL_SETTING)?,
             think: false,
             embed: EmbedOverride::default(),
+            policy,
         }),
         ProviderId::Deepgram | ProviderId::Groq => unreachable!("filtered on the chat capability"),
     }
@@ -2062,6 +2071,8 @@ async fn chat_send_cloud(
     draft: DraftSettings,
 ) -> Result<ChatSendResult, String> {
     let state: State<AppState> = app.state();
+    // Workspace chat runs on the server's cloud AI.
+    crate::org_policy::check_leaves_mac(&state.db.lock()).map_err(|e| e.to_string())?;
     let (
         workspace,
         folder_id,
@@ -2828,6 +2839,7 @@ async fn new_conversation_cloud(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::DEFAULT_LOCAL_LLM_BASE_URL;
     // Production code derives the scope from a `ChatTarget`; the tests still name
     // it directly to assert the stored value is what we think it is.
     use crate::db::CHAT_SCOPE_NOTE;
@@ -3174,6 +3186,41 @@ mod tests {
         db::set_setting(&conn, "chat_provider", "mistral").unwrap();
         let err = resolve_chat(&conn, Some("sk-test".into())).err().unwrap().to_string();
         assert!(err.contains("mistral"), "{err}");
+    }
+
+    #[test]
+    fn local_only_refuses_cloud_chat() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = db::open(&dir.path().join("t.sqlite")).unwrap();
+        crate::org_policy::cache_local_only(&conn, "Northwind");
+        for id in ["openai", "anthropic", "copilot"] {
+            db::set_setting(&conn, "chat_provider", id).unwrap();
+            let err = resolve_chat(&conn, Some("k".into())).err().unwrap().to_string();
+            assert_eq!(err, "Blocked by Northwind: processing stays on this Mac.", "{id}");
+            assert!(chat_provider_id(&conn).is_err(), "no Keychain slot opens for {id}");
+        }
+        db::set_setting(&conn, "chat_provider", "custom").unwrap();
+        db::set_setting(&conn, "custom_chat_model", "m").unwrap();
+        db::set_setting(&conn, "custom_base_url", "https://openrouter.ai/api/v1").unwrap();
+        assert!(resolve_chat(&conn, None).is_err());
+        db::set_setting(&conn, "custom_base_url", "http://localhost:1234/v1").unwrap();
+        assert!(resolve_chat(&conn, None).is_ok());
+    }
+
+    #[test]
+    fn local_only_keeps_chat_and_its_embedder_on_this_mac() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = db::open(&dir.path().join("t.sqlite")).unwrap();
+        crate::org_policy::cache_local_only(&conn, "Northwind");
+        db::set_setting(&conn, "chat_provider", "ollama").unwrap();
+        db::set_setting(&conn, "chat_model", "gemma4:12b-mlx").unwrap();
+        assert!(resolve_embed(&resolve_chat(&conn, None).unwrap()).is_some());
+        // A LAN embedder leaves chat keyword-only rather than sending notes off the Mac.
+        db::set_setting(&conn, "embed_base_url", "http://192.168.1.20:11434/v1").unwrap();
+        let resolved = resolve_chat(&conn, None).unwrap();
+        assert!(resolve_embed(&resolved).is_none());
+        db::set_setting(&conn, "local_llm_base_url", "http://192.168.1.20:11434/v1").unwrap();
+        assert!(resolve_chat(&conn, None).is_err());
     }
 
     #[test]

@@ -3,6 +3,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { Provider, SummaryProvider } from "./providers";
 import type { SpeakerLabelStat } from "./speakerSuggest";
 import { targetFolderId, targetNoteId, type ChatTarget } from "./chatTarget";
+import type { OrgStatus } from "./orgPolicy";
 
 export type CopilotStatus = {
   login: string | null;
@@ -276,6 +277,10 @@ export type SummaryPrompt = {
   updated_at: number;
   /** The workspace it is shared in; empty for a personal template. */
   workspace_id?: string;
+  /** Set on an organisation's template, which is read-only. */
+  org_id?: string;
+  /** The departments an organisation template is offered in; empty is all. */
+  org_workspaces?: string[];
 };
 
 export type LocalWhisperModelStatus = {
@@ -853,6 +858,8 @@ export const ipc = {
   permissionsStatus: () => invoke<PermissionsStatus>("permissions_status"),
   permissionsRequest: (kind: PermissionKind) => invoke<PermissionsStatus>("permissions_request", { kind }),
   permissionsOpenSettings: (kind: PermissionKind) => invoke<void>("permissions_open_settings", { kind }),
+
+  orgStatus: () => invoke<OrgStatus>("org_status"),
 };
 
 export type PermissionKind = "microphone" | "screen" | "notifications";

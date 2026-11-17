@@ -324,6 +324,17 @@ pub fn open(path: &Path) -> Result<Connection> {
         "ALTER TABLE summary_prompts ADD COLUMN workspace_id TEXT NOT NULL DEFAULT ''",
         [],
     );
+    // An organisation's template, cached from its config (`org_policy`). Such
+    // rows never sync, and `org_workspaces` (a JSON array) lists the
+    // departments it is offered to; empty means all of them.
+    let _ = conn.execute(
+        "ALTER TABLE summary_prompts ADD COLUMN org_id TEXT NOT NULL DEFAULT ''",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE summary_prompts ADD COLUMN org_workspaces TEXT NOT NULL DEFAULT '[]'",
+        [],
+    );
     // Soft-delete (Trash). NULL = live, set (ms) = trashed. Deleting sets this
     // instead of dropping the row so it's recoverable; remote tombstones land
     // here too. Note lists filter `deleted_at IS NULL`.
@@ -1098,19 +1109,29 @@ pub struct SummaryPrompt {
     pub updated_at: i64,
     #[serde(default)]
     pub workspace_id: String,
+    /// Set on an organisation's template, which is read-only here.
+    #[serde(default)]
+    pub org_id: String,
+    #[serde(default)]
+    pub org_workspaces: Vec<String>,
 }
+
+const SUMMARY_PROMPT_COLUMNS: &str =
+    "id, name, content, created_at, updated_at, workspace_id, org_id, org_workspaces";
 
 // Prompts are scoped to the active workspace PLUS your personal ('') ones:
 // personal prompts are always available as your reusable toolkit, while a
 // workspace's shared prompts only appear in that workspace (so a teammate's
 // custom prompt doesn't leak into everyone else's list). Each carries a
 // workspace_id so the sync worker pushes it to its owning workspace.
+// Organisation templates come along unscoped; the pickers offer each one only
+// in the departments it lists.
 pub fn list_summary_prompts(conn: &Connection, workspace: &str) -> Result<Vec<SummaryPrompt>> {
-    let mut stmt = conn.prepare_cached(
-        "SELECT id, name, content, created_at, updated_at, workspace_id FROM summary_prompts
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {SUMMARY_PROMPT_COLUMNS} FROM summary_prompts
          WHERE workspace_id = ?1 OR workspace_id = ''
-         ORDER BY name COLLATE NOCASE",
-    )?;
+         ORDER BY name COLLATE NOCASE"
+    ))?;
     let rows = stmt
         .query_map(params![workspace], map_summary_prompt)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1118,9 +1139,9 @@ pub fn list_summary_prompts(conn: &Connection, workspace: &str) -> Result<Vec<Su
 }
 
 pub fn get_summary_prompt(conn: &Connection, id: &str) -> Result<SummaryPrompt> {
-    let mut stmt = conn.prepare_cached(
-        "SELECT id, name, content, created_at, updated_at, workspace_id FROM summary_prompts WHERE id = ?1",
-    )?;
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {SUMMARY_PROMPT_COLUMNS} FROM summary_prompts WHERE id = ?1"
+    ))?;
     let p = stmt.query_row(params![id], map_summary_prompt)?;
     Ok(p)
 }
@@ -1147,6 +1168,7 @@ pub fn update_summary_prompt(
     name: &str,
     content: &str,
 ) -> Result<SummaryPrompt> {
+    refuse_org_prompt(conn, id)?;
     let now = now_ms();
     conn.execute(
         "UPDATE summary_prompts SET name = ?1, content = ?2, updated_at = ?3 WHERE id = ?4",
@@ -1156,7 +1178,18 @@ pub fn update_summary_prompt(
 }
 
 pub fn delete_summary_prompt(conn: &Connection, id: &str) -> Result<()> {
+    refuse_org_prompt(conn, id)?;
     conn.execute("DELETE FROM summary_prompts WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
+fn refuse_org_prompt(conn: &Connection, id: &str) -> Result<()> {
+    let org: Option<String> = conn
+        .query_row("SELECT org_id FROM summary_prompts WHERE id = ?1", params![id], |r| r.get(0))
+        .optional()?;
+    if org.is_some_and(|o| !o.is_empty()) {
+        anyhow::bail!("Only an administrator can change an organisation's template.");
+    }
     Ok(())
 }
 
@@ -1168,6 +1201,8 @@ fn map_summary_prompt(row: &rusqlite::Row) -> rusqlite::Result<SummaryPrompt> {
         created_at: row.get(3)?,
         updated_at: row.get(4)?,
         workspace_id: row.get(5)?,
+        org_id: row.get(6)?,
+        org_workspaces: serde_json::from_str(&row.get::<_, String>(7)?).unwrap_or_default(),
     })
 }
 

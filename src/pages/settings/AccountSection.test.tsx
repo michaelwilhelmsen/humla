@@ -391,4 +391,54 @@ describe("Account section", () => {
       within(dialog).queryByRole("button", { name: /delete workspace/i }),
     ).not.toBeInTheDocument();
   });
+
+  describe("Policies", () => {
+    const enforced = {
+      policy: {
+        org_name: "Northwind",
+        reason: "Nothing leaves this Mac.",
+        local_only: true,
+        retention_days: 30,
+        telemetry_off: false,
+        audio_forbidden: false,
+        rules: [
+          { kind: "local_only", source: "Northwind", reason: "Nothing leaves this Mac." },
+          { kind: "retention_days", source: "Northwind", reason: "Nothing leaves this Mac." },
+        ],
+      },
+    };
+
+    it("lists the policies in force, managed by their organisation", async () => {
+      renderApp("/settings?tab=account", {
+        cloud_status: () => signedIn("member", false),
+        cloud_workspace_members: () => MEMBERS,
+        org_status: () => enforced,
+      });
+      const dialog = await screen.findByRole("dialog", { name: /settings/i });
+      expect(await within(dialog).findByRole("heading", { name: "Policies" })).toBeInTheDocument();
+      expect(within(dialog).getByText("On this Mac only")).toBeInTheDocument();
+      expect(within(dialog).getByText("Deleted after 30 days")).toBeInTheDocument();
+
+      const badges = within(dialog).getAllByRole("button", { name: /managed by northwind/i });
+      expect(badges).toHaveLength(2);
+      await userEvent.click(badges[0]);
+      expect(await screen.findByText("Nothing leaves this Mac.")).toBeInTheDocument();
+      expect(screen.getByText(/only an administrator can change it/i)).toBeInTheDocument();
+    });
+
+    it("keeps them listed after sign-out", async () => {
+      renderApp("/settings?tab=account", {
+        cloud_status: () => signedOutConfigured(),
+        org_status: () => enforced,
+      });
+      const dialog = await screen.findByRole("dialog", { name: /settings/i });
+      expect(await within(dialog).findByText("On this Mac only")).toBeInTheDocument();
+    });
+
+    it("is absent when no policy is on", async () => {
+      const dialog = await openAccount(signedIn("member", false));
+      expect(await within(dialog).findByText("Acme")).toBeInTheDocument();
+      expect(within(dialog).queryByRole("heading", { name: "Policies" })).not.toBeInTheDocument();
+    });
+  });
 });

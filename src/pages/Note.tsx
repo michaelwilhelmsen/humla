@@ -81,6 +81,7 @@ import { SendToWebhookModal } from "./SendToWebhookModal";
 import { SaveAudioModal } from "./SaveAudioModal";
 import { useWebhookSends } from "../lib/webhook";
 import { SUMMARY_PRESETS, presetLabel } from "../lib/presets";
+import { templateOptions, useOrgContentVersion, useOrgs } from "../lib/orgContent";
 import { LANGUAGES, languageOptionLabel } from "../lib/languages";
 import { useDeveloperMode } from "../lib/useDeveloperMode";
 import { useSpeakerSuggestions } from "../lib/useSpeakerSuggestions";
@@ -1507,6 +1508,7 @@ export function Note() {
                 <div className="flex flex-wrap items-center gap-2 mb-4">
                   <PresetPicker
                     value={draft.summary_preset || "meeting"}
+                    workspaceId={draft.workspace_id ?? ""}
                     onChange={(v) => patch("summary_preset", v)}
                   />
                   <SummaryProviderChip
@@ -2590,16 +2592,21 @@ function WorkspacePicker({
 
 function PresetPicker({
   value,
+  workspaceId,
   onChange,
 }: {
   value: string;
+  workspaceId: string;
   onChange: (v: string) => void;
 }) {
   const [userPrompts, setUserPrompts] = useState<SummaryPrompt[]>([]);
+  const orgVersion = useOrgContentVersion();
+  const orgs = useOrgs();
 
   useEffect(() => {
     ipc.summaryPromptsList().then(setUserPrompts).catch(() => setUserPrompts([]));
-  }, []);
+  }, [orgVersion]);
+  const options = templateOptions(userPrompts, workspaceId, orgs);
 
   // If the note's saved value points at a deleted user prompt, surface a
   // "(missing)" entry so the user notices and can re-pick. Without this
@@ -2628,13 +2635,10 @@ function PresetPicker({
       onChange={onChange}
       title="Summary preset"
       options={[
-        ...SUMMARY_PRESETS.map((p) => ({ value: p.value, label: presetLabel(p) })),
-        ...userPrompts.map((p, i) => ({
-          value: `custom:${p.id}`,
-          label: p.name,
-          // Divider between the built-ins and your own prompts.
-          separatorBefore: i === 0,
-        })),
+        ...options,
+        // An organisation template this note already uses stays selectable
+        // after it stops being offered in the note's workspace.
+        ...(customPrompt && !options.some((o) => o.value === value) ? [{ value, label: customPrompt.name }] : []),
         ...(valueIsMissingUserPrompt ? [{ value, label: "(deleted prompt)" }] : []),
         ...(value === "custom" ? [{ value: "custom", label: "Custom (legacy)" }] : []),
       ]}

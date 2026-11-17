@@ -1952,6 +1952,57 @@ const CASES: Record<string, Scenario> = {
     render: () => null, // unused — `route` renders the app
     ipc: settingsContentIpc("viewer"),
   },
+  // `settings-org` is a member of two departments of an organisation that
+  // supplies templates (one for every department, one for two) and terms.
+  // Try `&section=vocabulary` and `&section=summaries`.
+  "settings-org": {
+    route: `/settings?tab=${new URLSearchParams(location.search).get("section") ?? "templates"}`,
+    render: () => null, // unused — `route` renders the app
+    ipc: settingsOrgIpc(),
+  },
+
+  // --- Settings → Account, signed in to a workspace. `account-policies` adds an
+  // organisation enforcing every policy; `-signed-out` is the same after
+  // sign-out, when the cached policies stay in force.
+  account: {
+    route: "/settings?tab=account",
+    render: () => null, // unused — `route` renders the app
+    ipc: accountIpc({ signedIn: true, policies: false }),
+  },
+  "account-policies": {
+    route: "/settings?tab=account",
+    render: () => null, // unused — `route` renders the app
+    ipc: accountIpc({ signedIn: true, policies: true }),
+  },
+  "account-policies-signed-out": {
+    route: "/settings?tab=account",
+    render: () => null, // unused — `route` renders the app
+    ipc: accountIpc({ signedIn: false, policies: true }),
+  },
+
+  // --- local_only: an organisation keeps processing on this Mac. The stored
+  // settings point at cloud providers, as they would on a Mac the policy has
+  // just reached; each section shows the enforced value as a managed row.
+  "summaries-local-only": {
+    route: "/settings?tab=summaries",
+    render: () => null, // unused — `route` renders the app
+    ipc: localOnlyIpc(),
+  },
+  "chat-local-only": {
+    route: "/settings?tab=chat",
+    render: () => null, // unused — `route` renders the app
+    ipc: localOnlyIpc(),
+  },
+  "transcription-local-only": {
+    route: "/settings?tab=transcription",
+    render: () => null, // unused — `route` renders the app
+    ipc: localOnlyIpc(),
+  },
+  "general-local-only": {
+    route: "/settings?tab=general",
+    render: () => null, // unused — `route` renders the app
+    ipc: localOnlyIpc(),
+  },
 
   // --- Two-factor authentication. Settings → Account, signed in to a
   // workspace you administer. `-off` also has a workspace waiting for it, so the
@@ -2034,6 +2085,158 @@ function settingsContentIpc(
           }),
         }
       : {}),
+  };
+}
+
+function settingsOrgIpc(): Record<string, Handler> {
+  const base = settingsContentIpc("member");
+  const intake: CloudWorkspace = { id: "w1", name: "Intake", role: "member", plan_status: "active" };
+  const homeCare: CloudWorkspace = { id: "w2", name: "Home care", role: "member", plan_status: "active" };
+  const org = (id: string, name: string, content: string, departments: string[]) => ({
+    id,
+    name,
+    content,
+    created_at: 0,
+    updated_at: 0,
+    workspace_id: "",
+    org_id: "o1",
+    org_workspaces: departments,
+  });
+  const own = (base.summary_prompts_list({}) as unknown[]) ?? [];
+  return {
+    ...base,
+    summary_prompts_list: () => [
+      org("org-case", "Case meeting", "Record the decision, who owns each action, and the deadline.", []),
+      org("org-intake", "Intake review", "List the needs raised, the services offered, and the next contact.", ["w1", "w2"]),
+      ...own,
+    ],
+    cloud_status: () => ({
+      ...DISCONNECTED,
+      configured: true,
+      logged_in: true,
+      base_url: "https://sync.humla.team",
+      user: { id: "u1", email: "m@example.no", name: "Michael", verified: true },
+      current_workspace: intake,
+      workspaces: [intake, homeCare],
+    }),
+    org_status: () => ({
+      policy: {
+        org_name: null,
+        reason: null,
+        local_only: false,
+        retention_days: 0,
+        telemetry_off: false,
+        audio_forbidden: false,
+        rules: [],
+      },
+      orgs: [
+        {
+          id: "o1",
+          name: "Northwind",
+          reason: "Approved for every department.",
+          vocabulary: ["Northwind", "IPLOS", "Individual plan", "Coordinating unit"],
+          workspaces: ["w1", "w2"],
+        },
+      ],
+    }),
+  };
+}
+
+function accountIpc({ signedIn, policies }: { signedIn: boolean; policies: boolean }) {
+  const team: CloudWorkspace = { id: "w1", name: "Northwind Health", role: "member", plan_status: "active" };
+  const reason = "Nothing leaves this Mac.";
+  const kinds = ["local_only", "retention_days", "telemetry_off", "audio_forbidden"] as const;
+  return {
+    cloud_status: () =>
+      signedIn
+        ? {
+            ...DISCONNECTED,
+            configured: true,
+            logged_in: true,
+            base_url: "https://sync.humla.team",
+            user: { id: "u1", email: "m@example.no", name: "Michael", verified: true },
+            current_workspace: team,
+            workspaces: [team],
+          }
+        : {
+            ...DISCONNECTED,
+            configured: true,
+            base_url: "https://sync.humla.team",
+          },
+    cloud_workspace_members: () => [
+      { id: "u1", email: "m@example.no", name: "Michael", role: "member" },
+      { id: "u2", email: "kari@example.no", name: "Kari", role: "owner" },
+    ],
+    org_status: () => ({
+      policy: policies
+        ? {
+            org_name: "Northwind",
+            reason,
+            local_only: true,
+            retention_days: 90,
+            telemetry_off: true,
+            audio_forbidden: true,
+            rules: kinds.map((kind) => ({ kind, source: "Northwind", reason })),
+          }
+        : {
+            org_name: null,
+            reason: null,
+            local_only: false,
+            retention_days: 0,
+            telemetry_off: false,
+            audio_forbidden: false,
+            rules: [],
+          },
+    }),
+  };
+}
+
+function localOnlyIpc(): Record<string, Handler> {
+  const reason = "Nothing leaves this Mac.";
+  const stored: Record<string, string> = {
+    summary_provider: "anthropic",
+    chat_provider: "openai",
+    local_llm_model: "gemma4:12b-mlx",
+    mcp_enabled: "true",
+    webhook_enabled: "true",
+  };
+  return {
+    org_status: () => ({
+      policy: {
+        org_name: "Northwind",
+        reason,
+        local_only: true,
+        retention_days: 0,
+        telemetry_off: false,
+        audio_forbidden: false,
+        rules: [{ kind: "local_only", source: "Northwind", reason }],
+      },
+    }),
+    settings_get: (args) => stored[(args as { key: string }).key] ?? null,
+    get_transcribe_config: () => ({
+      default: { provider: "deepgram", model: "nova-3" },
+      per_language: {
+        no: { provider: "groq", model: "whisper-large-v3-turbo" },
+        sv: { provider: "local", model_id: "large-v3-turbo-q5", preset: "balanced", use_gpu: true },
+      },
+    }),
+    local_whisper_models: () => [
+      {
+        id: "large-v3-turbo-q5",
+        label: "Large v3 Turbo (quantized)",
+        description: "The recommended default for almost all use.",
+        filename: "ggml-large-v3-turbo-q5_0.bin",
+        sizeBytesHint: 574_000_000,
+        kind: "multilingual",
+        specificLanguage: null,
+        downloaded: true,
+        sizeBytes: 574_000_000,
+        path: "/x",
+      },
+    ],
+    mcp_server_path: () => "/Applications/Humla.app/Contents/MacOS/humla-mcp",
+    webhook_get_endpoint: () => ({ url: "http://localhost:8787/ingest", headers: [] }),
+    local_llm_list_models: () => ["gemma4:12b-mlx"],
   };
 }
 
