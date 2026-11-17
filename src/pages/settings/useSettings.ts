@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import {
   ipc,
   onDiarizeDownloadProgress,
@@ -50,29 +51,48 @@ export function useSettings() {
     per_language: {},
   });
 
+  // The stored settings and transcription config. `live` is asked before each
+  // write so an unmounted or superseded load changes nothing.
+  const loadStored = useCallback(async (live: () => boolean) => {
+    const cfg = await ipc.getTranscribeConfig().catch(() => null);
+    if (!live()) return;
+    if (cfg) setTranscribeConfig(cfg);
+    const entries = await Promise.all(
+      (Object.keys(DEFAULTS) as EditableKey[]).map(
+        async (key) => [key, (await ipc.getSetting(key)) ?? DEFAULTS[key]] as const,
+      ),
+    );
+    if (!live()) return;
+    setS(Object.fromEntries(entries) as Record<EditableKey, string>);
+  }, []);
+
   useEffect(() => {
     let cancelled = false;
     (async () => {
-      const [models, cfg] = await Promise.all([
-        ipc.localWhisperModels(),
-        ipc.getTranscribeConfig().catch(() => null),
-        loadDiarizeStatuses(),
-      ]);
+      const [models] = await Promise.all([ipc.localWhisperModels(), loadDiarizeStatuses()]);
       if (cancelled) return;
       setLocal((p) => ({ ...p, models }));
-      if (cfg) setTranscribeConfig(cfg);
-      const entries = await Promise.all(
-        (Object.keys(DEFAULTS) as EditableKey[]).map(
-          async (key) => [key, (await ipc.getSetting(key)) ?? DEFAULTS[key]] as const,
-        ),
-      );
-      if (cancelled) return;
-      setS(Object.fromEntries(entries) as Record<EditableKey, string>);
+      await loadStored(() => !cancelled);
     })();
     return () => {
       cancelled = true;
     };
-  }, [loadDiarizeStatuses]);
+  }, [loadDiarizeStatuses, loadStored]);
+
+  // An arriving policy can rewrite settings in the backend (`apply_local_only`);
+  // reload them, or the next edit here writes the stale value back.
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    void listen("org_policy_changed", () => void loadStored(() => !cancelled)).then((u) => {
+      if (cancelled) u();
+      else unlisten = u;
+    });
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [loadStored]);
 
   // A write from another view, such as Home's offer switching the engine once
   // its model is ready, while this dialog is open over it.
