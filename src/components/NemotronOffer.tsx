@@ -47,9 +47,8 @@ export function NemotronOffer() {
         Make it clearer who said what
       </h2>
       <p>
-        Upgrade to <strong>Nemotron 3</strong>, our new, more accurate speaker-labeling
-        model. It’s better at telling voices apart, especially when several people share
-        a microphone.
+        <strong>Nemotron 3</strong> is better at telling voices apart, especially when several people
+        share a microphone.
       </p>
       {offer.stage === "downloading" ? (
         <DownloadProgress fraction={offer.fraction} phase={offer.phase} />

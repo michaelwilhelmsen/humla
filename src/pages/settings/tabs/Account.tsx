@@ -160,8 +160,7 @@ export function AccountTab({ s, update }: Pick<SettingsHook, "s" | "update">) {
               <div className="rounded-md border border-[var(--color-warning)] bg-[var(--color-pill-hover)] px-3 py-2 text-xs flex flex-col gap-2">
                 <div>
                   <span style={{ color: "var(--color-warning)" }}>⚠</span>{" "}
-                  Your email isn't verified yet. Check your inbox for the verification link — pending
-                  team invites only take effect once you verify.
+                  Email not verified. Team invites wait until it is.
                 </div>
                 <div className="flex items-center gap-2 flex-wrap">
                   <Btn onClick={resendVerification} disabled={busy}>
@@ -175,7 +174,7 @@ export function AccountTab({ s, update }: Pick<SettingsHook, "s" | "update">) {
           <Row label="Server" control={<ValuePill>{status.base_url}</ValuePill>} />
           <Row
             label="Upload recording audio"
-            description="Send each recording's audio to its workspace note so teammates can play it back. Transcripts and summaries always sync; turning this off keeps the audio itself on your Mac. Personal notes never leave the device either way."
+            description="Transcripts and summaries always sync. Off keeps audio on this Mac. Personal notes never leave it."
             control={
               <Toggle
                 label="Upload recording audio"
@@ -186,7 +185,7 @@ export function AccountTab({ s, update }: Pick<SettingsHook, "s" | "update">) {
           />
           <Row
             label="Disconnect server"
-            description="Forget this server and sign out. Cloud sync is opt-in — your notes always live locally first."
+            description="Signs you out. Your notes stay on this Mac."
             control={
               <Btn onClick={disconnect} disabled={busy} aria-label="Disconnect server">
                 <span className="inline-flex items-center gap-1.5">

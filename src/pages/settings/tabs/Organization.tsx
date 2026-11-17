@@ -169,8 +169,7 @@ function BillingPanel({
             </>
           )}
           <p className="text-xs text-[var(--color-text-muted)] leading-relaxed">
-            Seats track workspace members — adding or removing a member updates the next
-            invoice automatically, prorated.
+            Each member is a seat. Changes are prorated.
           </p>
         </>
       )}
@@ -215,7 +214,7 @@ function BillingPanel({
       )}
       {err && <p className="text-xs text-[var(--color-danger)] break-all">{err}</p>}
       <p className="text-[11px] text-[var(--color-text-muted)]">
-        Billing opens Stripe in your browser. Your plan updates here automatically when you return.
+        Opens Stripe in your browser.
       </p>
     </div>
   );
@@ -301,7 +300,7 @@ export function OrganizationTab() {
         <p className="text-sm text-[var(--color-text-muted)] py-3.5">
           {locked
             ? `${locked.name} requires two-factor authentication before you can open it. Turn it on under Two-factor authentication, above.`
-            : "You're in Personal (local-only) mode. Create a workspace to start collaborating, or pick one from the switcher at the top of the sidebar."}
+            : "You're in Personal (local-only). Create a workspace, or pick one in the sidebar."}
         </p>
         {status.workspaces.length > 0 && (
           <Row label="Your workspaces">
@@ -601,9 +600,7 @@ export function OrganizationTab() {
             </div>
             {notice && <p className="text-xs text-[var(--color-success)] mt-2">{notice}</p>}
             <p className="text-xs text-[var(--color-text-muted)] mt-2">
-              They get an email either way: existing accounts are added right away; new
-              people get an invitation and join automatically when they sign up on this
-              server with the invited address.
+              Everyone gets an email. New people join when they sign up with this address.
             </p>
           </Row>
         )}
@@ -648,8 +645,7 @@ export function OrganizationTab() {
                 )}
               </div>
               <p className="text-xs text-[var(--color-text-muted)]">
-                Makes the selected member the owner. You'll stay on as an admin — only the owner can
-                delete the workspace or transfer it again.
+                You stay on as an admin.
               </p>
             </div>
           </Row>
@@ -728,8 +724,7 @@ export function OrganizationTab() {
                 </div>
               )}
               <p className="text-xs text-[var(--color-text-muted)]">
-                You'll lose access to this workspace's shared notes. An admin can re-add you. Your
-                local copies stay on this device.
+                You lose access to its shared notes. Your local copies stay.
               </p>
             </div>
           </Row>

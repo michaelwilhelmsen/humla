@@ -114,7 +114,7 @@ describe("ChatTab on Anthropic", () => {
     );
     expect(await screen.findByLabelText("Anthropic API key")).toBeInTheDocument();
     expect(screen.getByRole("combobox", { name: "claude-sonnet-5" })).toBeInTheDocument();
-    expect(screen.getByText(/searches your notes by keyword/)).toBeInTheDocument();
+    expect(screen.getByText(/Keyword search only/)).toBeInTheDocument();
   });
 
   it("doesn't list OpenAI models while Anthropic is selected", async () => {
@@ -236,10 +236,10 @@ describe("ChatTab readiness", () => {
     render(<ChatTab s={settings({ chat_provider: "ollama", chat_model: "qwen3.5:4b" })} update={async () => {}} />);
     await waitFor(() => expect(screen.getByText(/Semantic search ready/)).toBeInTheDocument());
     await waitFor(() =>
-      expect(screen.getByText(/4 notes have no embedding under embeddinggemma yet/)).toBeInTheDocument(),
+      expect(screen.getByText(/4 notes aren’t embedded with embeddinggemma yet/)).toBeInTheDocument(),
     );
     await userEvent.click(screen.getByRole("button", { name: "Embed now" }));
-    await waitFor(() => expect(screen.queryByText(/no embedding under/)).toBeNull());
+    await waitFor(() => expect(screen.queryByText(/embedded with/)).toBeNull());
   });
 
   it("an embedded corpus adds no line at all", async () => {
@@ -250,7 +250,7 @@ describe("ChatTab readiness", () => {
     });
     render(<ChatTab s={settings({ chat_provider: "ollama", chat_model: "qwen3.5:4b" })} update={async () => {}} />);
     await waitFor(() => expect(screen.getByText(/Semantic search ready/)).toBeInTheDocument());
-    expect(screen.queryByText(/no embedding under/)).toBeNull();
+    expect(screen.queryByText(/embedded with/)).toBeNull();
     expect(screen.queryByRole("button", { name: "Embed now" })).toBeNull();
   });
 
@@ -401,12 +401,12 @@ describe("ChatTab rebuild-index row", () => {
 
     // The count is the point: a bare button gives no way to judge whether the slow,
     // key-spending action is worth taking.
-    expect(await screen.findByText(/7 recordings were indexed before the latest improvements/)).toBeTruthy();
+    expect(await screen.findByText(/7 recordings use an older index/)).toBeTruthy();
     expect(screen.getByRole("button", { name: /Rebuild now/i })).toBeTruthy();
     // The cost is disclosed rather than buried.
-    expect(screen.getByText(/uses your configured key/)).toBeTruthy();
+    expect(screen.getByText(/Uses your key, a few cents at most/)).toBeTruthy();
     // And it says what it does NOT touch, since "rebuild" sounds destructive.
-    expect(screen.getByText(/your notes aren't changed/)).toBeTruthy();
+    expect(screen.getByText(/Notes aren't changed/)).toBeTruthy();
   });
 
   it("reports how many notes it rebuilt", async () => {
@@ -441,7 +441,7 @@ describe("ChatTab rebuild-index row", () => {
     mockTauri({ chat_stale_note_count: () => 0 });
     render(<ChatTab s={settings()} update={async () => {}} />);
     expect(await screen.findByText(/Up to date/)).toBeTruthy();
-    expect(screen.queryByText(/indexed before the latest improvements/)).toBeNull();
+    expect(screen.queryByText(/an older index/)).toBeNull();
   });
 });
 
@@ -498,7 +498,7 @@ describe("ChatTab on a custom endpoint", () => {
         update={update}
       />,
     );
-    expect(screen.getByText(/searches your notes by keyword/)).toBeInTheDocument();
+    expect(screen.getByText(/Keyword search only/)).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "Type a model…" }));
     await userEvent.type(screen.getByRole("combobox", { name: "Custom endpoint model" }), "deepseek-chat{Enter}");
     expect(update).toHaveBeenCalledWith("custom_chat_model", "deepseek-chat");

@@ -132,7 +132,7 @@ describe("/chat page", () => {
     });
     renderChat();
 
-    expect(await screen.findByText(/in the composer for these any time/)).toBeInTheDocument();
+    expect(await screen.findByText(/for these any time/)).toBeInTheDocument();
   });
 
   it("fills the composer from a card rather than spending a turn", async () => {

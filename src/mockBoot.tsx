@@ -286,7 +286,7 @@ function panelEmptyCase(pending: boolean, width = 320): Scenario {
         text={
           pending
             ? "This recording hasn't been transcribed yet."
-            : "No transcript yet. Start a recording from the toolbar to capture and transcribe audio."
+            : "No transcript yet."
         }
         action={
           pending ? (

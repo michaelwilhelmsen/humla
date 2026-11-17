@@ -123,9 +123,7 @@ export function RenameYouRow() {
   return (
     <Row label='Speaker labelled "You"'>
       <p className="text-xs text-[color:var(--color-text-muted)]">
-        {count} recording{plural(count)} label{count === 1 ? "s" : ""} your side of the call as
-        "You". Renaming brings them together with the rest of your notes, so a search for your
-        name finds all of them.
+        {count} recording{plural(count)} label{count === 1 ? "s" : ""} your side of the call "You".
       </p>
       <div className="flex items-center gap-2 mt-2">
         <input
@@ -163,8 +161,7 @@ export function RenameYouRow() {
         </p>
       )}
       <p className="text-xs text-[color:var(--color-text-muted)] mt-1">
-        Rewrites each transcript and its playback labels. Summaries are left alone, and every
-        note keeps a restorable version from before the rename.
+        Summaries are left alone. Each note keeps a restorable version.
       </p>
     </Row>
   );

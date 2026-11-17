@@ -1198,7 +1198,7 @@ export function ChatPanel({
           </div>
         )}
         <p className="text-xs text-[var(--color-text-disabled)]">
-          Configured in Settings → Chat, separately from your transcription and summary providers.
+          Set up in Settings → Chat.
         </p>
       </div>
     );
@@ -1247,7 +1247,7 @@ export function ChatPanel({
                 ? "Still syncing your notes — this will be ready in a moment."
                 : nothingToSearch
                   ? "No notes yet. Record or import a meeting, then ask about it here."
-                  : "Ask anything about your notes — it searches, reads, and cites them to answer."}
+                  : "Ask anything about your notes."}
             </p>
             {/* The same prompts the "/" menu offers (#80), shown up front on a new
                 chat — a blank page tells a first-time user nothing about what this
@@ -1265,7 +1265,7 @@ export function ChatPanel({
                     exists. The new-chat screen is where it's worth saying: the
                     cards are right there to give "these" a referent. */}
                 <p className="text-xs text-[var(--color-text-disabled)]">
-                  Type <span className="font-medium">/</span> in the composer for these any time.
+                  Type <span className="font-medium">/</span> for these any time.
                 </p>
               </>
             )}

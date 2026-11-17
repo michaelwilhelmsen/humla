@@ -280,11 +280,6 @@ function AuthStage() {
       <Body>
         <Head
           title={isSignup ? "Create your account" : "Sign in"}
-          blurb={
-            isSignup
-              ? "A workspace belongs to an account, so this comes first. One step, then you name the workspace."
-              : "Sign in to the account your workspaces belong to."
-          }
         />
         <div className="flex flex-col gap-2.5">
           {isSignup && (
@@ -398,7 +393,6 @@ function NameStage({
       <Body>
         <Head
           title="Name your workspace"
-          blurb="Usually your company or team name. You can rename it later."
         />
         <input
           autoFocus

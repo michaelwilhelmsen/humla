@@ -56,7 +56,6 @@ export function TwoFactorSection() {
         <>
           <Row
             label="Authenticator app"
-            description="Signing in asks for a code from your authenticator app as well as your password."
             control={<ValuePill color="var(--color-success)">On</ValuePill>}
           />
           <Row
@@ -64,13 +63,13 @@ export function TwoFactorSection() {
             description={
               left === 0
                 ? "No recovery codes left. Make new ones in case you lose your phone."
-                : `${left} recovery ${left === 1 ? "code" : "codes"} left. Each signs you in once if you lose your phone.`
+                : `${left} left. Each works once.`
             }
             control={<Btn onClick={() => setFlow("codes")}>New codes…</Btn>}
           />
           <Row
             label="Replace authenticator"
-            description="Moving to a new phone, or lost the old one? Link a new app; the old one stops working."
+            description="The old app stops working."
             control={<Btn onClick={() => setFlow("replace")}>Replace…</Btn>}
           />
           <Row
@@ -99,7 +98,6 @@ export function TwoFactorSection() {
           )}
           <Row
             label="Authenticator app"
-            description="Ask for a code from an authenticator app each time you sign in, as well as your password."
             control={<Btn onClick={() => setFlow("enable")}>Turn on…</Btn>}
           />
         </>

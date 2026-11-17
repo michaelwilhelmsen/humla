@@ -22,9 +22,7 @@ export function GeneralTab() {
         <Row
           label="Design"
           description={
-            design
-              ? `${design.description} Each design has its own light and dark mode.`
-              : "Typeface, type scale and colours. Each design has its own light and dark mode."
+            design ? design.description : "Typeface, type scale and colours."
           }
           control={
             <Segmented
@@ -37,7 +35,6 @@ export function GeneralTab() {
         />
         <Row
           label="Theme"
-          description="System follows macOS appearance."
           control={
             <Segmented
               label="Theme"

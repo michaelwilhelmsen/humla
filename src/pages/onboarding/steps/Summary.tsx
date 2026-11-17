@@ -260,7 +260,7 @@ export function SummaryStep({ ctx }: { ctx: StepContext }) {
       <StepShell
         icon={<Sparkles size={26} strokeWidth={1.6} />}
         title="Set up AI summaries"
-        subtitle="Humla fuses your notes with the transcript into a summary."
+        subtitle="Also used for chat."
       />
     );
   }
@@ -271,8 +271,8 @@ export function SummaryStep({ ctx }: { ctx: StepContext }) {
       title="Set up AI summaries"
       subtitle={
         neutral
-          ? "Humla fuses your notes with the transcript into a summary — and powers AI Chat over your notes. Local: private, needs Ollama + ~6 GB RAM · OpenAI: better summaries, needs API key."
-          : "Humla fuses your notes with the transcript into a summary, and powers AI Chat over your notes. This is optional — you can skip it and set it up later."
+          ? "Also used for chat."
+          : "Also used for chat. Optional."
       }
     >
       <div className="w-full max-w-md flex flex-col gap-3 text-left">
@@ -509,8 +509,7 @@ export function SummaryStep({ ctx }: { ctx: StepContext }) {
                   ) : (
                     <>
                       <p className="text-xs text-[var(--color-text-muted)]">
-                        Optional: for AI chat that finds answers by meaning, pull the small
-                        embedding model too.
+                        Optional, for chat search by meaning:
                       </p>
                       <CommandSnippet
                         command={`ollama pull ${EMBEDDING_OLLAMA_MODEL}`}
@@ -541,7 +540,7 @@ export function SummaryStep({ ctx }: { ctx: StepContext }) {
           onClick={ctx.goNext}
           className="text-xs text-[var(--color-text-muted)] hover:text-[var(--color-text)] transition-colors"
         >
-          Skip for now — you can set this up later
+          Skip for now
         </button>
       </div>
     </StepShell>

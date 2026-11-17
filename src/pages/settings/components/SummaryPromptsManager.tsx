@@ -87,8 +87,7 @@ export function SummaryPromptsManager({ language }: { language: string }) {
           Built-in
         </p>
         <p className="text-xs text-[var(--color-text-muted)]">
-          Maintained presets — adapt automatically to the recording's
-          language. Read-only.
+          Read-only.
         </p>
         <div className="flex flex-wrap gap-2">
           {SUMMARY_PRESETS.map((p) => (
@@ -112,8 +111,7 @@ export function SummaryPromptsManager({ language }: { language: string }) {
         </div>
         {prompts.length === 0 ? (
           <p className="text-xs text-[var(--color-text-muted)]">
-            No custom prompts yet. Create one to use specialised
-            instructions for a recurring meeting type.
+            No custom prompts yet.
           </p>
         ) : (
           <div className="flex flex-col gap-2">
@@ -165,9 +163,7 @@ export function SummaryPromptsManager({ language }: { language: string }) {
       </div>
 
       <p className="text-xs text-[var(--color-text-muted)]">
-        Tip: custom prompts run literally — write them in the language you
-        want the summary in, or include a line like "Reply in Norwegian".
-        Built-in presets handle the language switch for you automatically.
+        Custom prompts get no language instruction. Write them in the summary’s language.
       </p>
 
       {error && (

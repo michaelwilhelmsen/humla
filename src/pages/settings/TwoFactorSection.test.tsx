@@ -72,7 +72,7 @@ describe("Settings → two-factor authentication", () => {
     expect(setups).toEqual([{ password: "hunter22", code: null, recoveryCode: null }]);
     expect(enables).toEqual([{ code: "123456" }]);
     expect(screen.queryByRole("dialog", { name: /turn on two-factor/i })).not.toBeInTheDocument();
-    expect(await within(dialog).findByText(/10 recovery codes left/i)).toBeInTheDocument();
+    expect(await within(dialog).findByText(/10 left/i)).toBeInTheDocument();
   });
 
   it("is not offered by a server without it", async () => {

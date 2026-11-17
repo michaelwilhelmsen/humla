@@ -51,6 +51,6 @@ describe("the MCP integration switch", () => {
   it("says plainly that it is read-only and that audio stays out of reach", () => {
     render(<IntegrationsSection s={settings()} update={() => {}} />);
     expect(screen.getByText(/Read-only/)).toBeInTheDocument();
-    expect(screen.getByText(/audio is never reachable/)).toBeInTheDocument();
+    expect(screen.getByText(/Audio is never reachable/)).toBeInTheDocument();
   });
 });

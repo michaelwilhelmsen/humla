@@ -17,8 +17,8 @@ describe("ImportDialog", () => {
     expect(
       await screen.findByText(
         (text) =>
-          text.startsWith("Pick the language spoken in this file.") &&
-          text.trim().endsWith("afterward."),
+          text.startsWith("Transcription runs once.") &&
+          text.trim().endsWith("another language."),
       ),
     ).toBeInTheDocument();
 

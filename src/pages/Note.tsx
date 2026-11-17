@@ -1572,7 +1572,7 @@ export function Note() {
                     text={
                       recActive
                         ? "The summary is generated after you stop the recording."
-                        : "No summary yet. Use Summarize in the toolbar to generate one from your notes and transcript."
+                        : "No summary yet."
                     }
                   />
                 )}
@@ -1798,7 +1798,7 @@ export function Note() {
                       // the meeting is already on disk.
                       pendingTranscription
                         ? "This recording hasn't been transcribed yet."
-                        : "No transcript yet. Start a recording from the toolbar to capture and transcribe audio."
+                        : "No transcript yet."
                     }
                     action={
                       // The same action the toolbar carries, on the surface
