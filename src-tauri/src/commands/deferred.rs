@@ -125,12 +125,29 @@ pub(super) struct PendingTake {
 
 /// A capture's streams moved out of its temp dir into one of their own in the
 /// system temp dir, for a replay that outlives the post-stop chain. The
-/// directory is deleted when this is dropped, however the replay ends.
+/// directory is deleted when this is dropped, however the replay ends. It holds
+/// an exclusive lock on [`LOCK_FILE`] while it lives, so another Humla process's
+/// launch sweep leaves it alone.
 #[derive(Debug)]
 pub(super) struct UnretainedStreams {
     dir: std::path::PathBuf,
     pub mic: Option<std::path::PathBuf>,
     pub sys: Option<std::path::PathBuf>,
+    _lock: std::fs::File,
+}
+
+const LOCK_FILE: &str = ".lock";
+
+/// Open `dir`'s lock file and take its exclusive lock without waiting.
+fn lock_dir(dir: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(dir.join(LOCK_FILE))?;
+    file.try_lock().map_err(std::io::Error::from)?;
+    Ok(file)
 }
 
 impl UnretainedStreams {
@@ -154,7 +171,8 @@ impl UnretainedStreams {
         }
         let dir = parent.join(format!("{UNRETAINED_PREFIX}{}", uuid::Uuid::new_v4()));
         tokio::fs::create_dir_all(&dir).await?;
-        let mut out = UnretainedStreams { dir, mic: None, sys: None };
+        let lock = lock_dir(&dir)?;
+        let mut out = UnretainedStreams { dir, mic: None, sys: None, _lock: lock };
         if let Some(src) = mic {
             out.mic = Some(move_file(src, &out.dir.join("mic.wav")).await?);
         }
@@ -294,8 +312,9 @@ pub(super) fn replay_owed(note_id: &str) -> bool {
 /// The prefix of the directories [`UnretainedStreams`] makes.
 const UNRETAINED_PREFIX: &str = "humla-unretained-";
 
-/// Delete unretained streams a quit or crash left behind. Run once at launch,
-/// before any replay can have started.
+/// Delete unretained streams a quit or crash left behind. Run once at launch.
+/// A directory whose lock is held belongs to a replay running in another Humla
+/// process (a dev build beside a release one) and is skipped.
 pub fn sweep_unretained_streams() -> usize {
     sweep_unretained_streams_in(&std::env::temp_dir())
 }
@@ -306,7 +325,10 @@ fn sweep_unretained_streams_in(parent: &std::path::Path) -> usize {
         .flatten()
         .filter(|e| e.file_name().to_string_lossy().starts_with(UNRETAINED_PREFIX))
         .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
-        .filter(|e| std::fs::remove_dir_all(e.path()).is_ok())
+        .filter(|e| {
+            let Ok(_held) = lock_dir(&e.path()) else { return false };
+            std::fs::remove_dir_all(e.path()).is_ok()
+        })
         .count()
 }
 
@@ -927,17 +949,6 @@ mod tests {
         assert_eq!(sweep_unretained_streams_in(parent.path()), 0);
     }
 
-    #[tokio::test]
-    async fn the_launch_sweep_finds_what_a_replay_leaves_behind() {
-        let capture = tempfile::tempdir().unwrap();
-        let parent = tempfile::tempdir().unwrap();
-        let mic = wav(capture.path(), "mic-full.wav").await;
-        let streams = UnretainedStreams::take_into(parent.path(), Some(&mic), None).await.unwrap().unwrap();
-        std::mem::forget(streams);
-        assert_eq!(sweep_unretained_streams_in(parent.path()), 1);
-        assert_eq!(std::fs::read_dir(parent.path()).unwrap().count(), 0);
-    }
-
     #[test]
     fn an_owed_replay_holds_the_note_until_every_mark_is_dropped() {
         let note = format!("owed-{}", uuid::Uuid::new_v4());
@@ -973,5 +984,22 @@ mod tests {
         let fail = source.find("if let Err(e) = diarized {").unwrap();
         let branch = &source[fail..fail + source[fail..].find("break;").unwrap()];
         assert!(branch.contains("if is_pending") && branch.contains("forget_pending_take(app, note_id, &entry.id)"));
+    }
+    #[tokio::test]
+    async fn the_launch_sweep_skips_a_replay_another_process_is_running() {
+        let capture = tempfile::tempdir().unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let mic = wav(capture.path(), "mic-full.wav").await;
+        let live = UnretainedStreams::take_into(parent.path(), Some(&mic), None).await.unwrap().unwrap();
+        let orphan = parent.path().join(format!("{UNRETAINED_PREFIX}crashed"));
+        std::fs::create_dir_all(&orphan).unwrap();
+        std::fs::write(orphan.join("mic.wav"), b"RIFF").unwrap();
+        std::fs::write(orphan.join(LOCK_FILE), b"").unwrap();
+
+        assert_eq!(sweep_unretained_streams_in(parent.path()), 1);
+        assert!(!orphan.exists(), "a lock nobody holds is swept");
+        assert!(live.mic.as_ref().unwrap().exists(), "a held lock survives");
+        drop(live);
+        assert_eq!(std::fs::read_dir(parent.path()).unwrap().count(), 0);
     }
 }
