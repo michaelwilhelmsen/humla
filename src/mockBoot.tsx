@@ -459,14 +459,34 @@ function noteShareCase(owner: string, isPrivate: boolean, sharedWith: string[]):
 }
 
 // A note in a workspace under its organisation's 90-day retention: the meta row
-// says when it goes.
-function noteRetentionCase(): Scenario {
+// says when it goes, and the date picker offers only earlier dates within it.
+// `-move` has the note in a second workspace and the backend refusing the move.
+function noteRetentionCase(move = false): Scenario {
   const base = noteShareCase("u1", false, []);
   const reason = "Case notes are kept for 90 days.";
+  const note = makeNote({
+    id: "n1",
+    title: "Styremøte 10. november 2026",
+    body: "<p>Møtedeltagere: Stian, Michael, Petter</p>",
+    workspace_id: move ? "ws2" : "ws1",
+    owner: "u1",
+    created_at: (move ? Date.now() - 120 * 86_400_000 : Date.now() - 10 * 86_400_000),
+  });
+  const workspaces = [
+    { id: "ws1", name: "Barnevern", role: "owner", plan_status: "active" },
+    { id: "ws2", name: "Screenpartner", role: "owner", plan_status: "active" },
+  ];
+  const cloud = base.ipc.cloud_status as () => Record<string, unknown>;
   return {
     ...base,
     ipc: {
       ...base.ipc,
+      notes_list: () => [note],
+      notes_get: () => note,
+      cloud_status: () => ({ ...cloud(), current_workspace: workspaces[move ? 1 : 0], workspaces }),
+      notes_set_workspace: () => {
+        throw "Notes older than 90 days can't be moved to Barnevern.";
+      },
       org_status: () => ({
         policy: {
           org_name: "Northwind",
@@ -1594,6 +1614,7 @@ const CASES: Record<string, Scenario> = {
   "note-share-only-me": noteShareCase("u1", true, []),
   "note-share-readonly": noteShareCase("u-stian", true, ["u1", "u-petter"]),
   "note-retention": noteRetentionCase(),
+  "note-retention-move": noteRetentionCase(true),
   "note-player": notePlayerCase(),
   "note-pending": noteTranscribeCase(false),
   "note-pending-text": noteTranscribeCase(true),
