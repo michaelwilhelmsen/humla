@@ -181,7 +181,7 @@ Recording in short: `recording_start` spawns `audio-capture` (via `setsid`); eac
 
 Two Swift binaries bundled via `bundle.macOS.externalBin`, Developer ID + hardened runtime.
 
-- **`audio-capture/`** — AVFoundation mic + ScreenCaptureKit system audio, per-source chunk and full WAVs, parent-death watchdog, `--keep-awake` (#180). A writer ignores every `write()` after `close()`. → [audio-capture](docs/architecture/audio-capture-and-notifications.md)
+- **`audio-capture/`** — AVFoundation mic + system audio from a Core Audio process tap (ScreenCaptureKit as the fallback, #220), per-source chunk and full WAVs, parent-death watchdog, `--keep-awake` (#180). A writer ignores every `write()` after `close()`. → [audio-capture](docs/architecture/audio-capture-and-notifications.md)
 - **`speaker-diarize/`** — FluidAudio (CoreML/ANE), one-shot per pass; subcommands `status`, `download`, `delete`. No entitlements file. → [diarization and echo](docs/features/diarization-and-echo.md)
 
 ## macOS specifics
