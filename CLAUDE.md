@@ -79,7 +79,7 @@ Feature detail lives in `docs/features/` and `docs/architecture/`; read the link
 - Ollama goes through native `/api/chat` (detected by `:11434`), mirrored in TS by `isOllamaUrl`. Qwen-specific sampling applies only to Qwen models.
 - Anthropic: never send `thinking`, `temperature`, `top_p` or `top_k`.
 - Custom endpoint: base URL used exactly as typed; send only `model`, `messages`, `stream` (and `tools`). Nothing is guessed about the server.
-- Copilot: always through the CLI (never the Copilot API directly), started with `--no-auto-update`, `--disable-builtin-mcps`, `--disable-client-telemetry`; one SDK session per chat turn; log usage lines, never content. Copilot uses `copilot_model` / `copilot_chat_model`, not `chat_model`.
+- Copilot: always through the CLI (never the Copilot API directly), started with `--no-auto-update`, `--disable-builtin-mcps`, `--disable-client-telemetry` and the SDK's `disable_client_telemetry`; one SDK session per chat turn; log usage lines, never content. Copilot uses `copilot_model` / `copilot_chat_model`, not `chat_model`.
 
 ### Cloud session
 

@@ -87,7 +87,7 @@ krilla = { version = "0.8", default-features = false, features = ["simple-text"]
 rustybuzz = "0.20"
 # GitHub Copilot: drives the user's Copilot CLI over JSON-RPC. Without
 # `bundled-cli`, so copilot::cli finds or downloads the CLI at run time.
-github-copilot-sdk = { version = "=1.0.27", default-features = false, features = ["runtime"] }
+github-copilot-sdk = { version = "=1.0.34", default-features = false, features = ["runtime"] }
 # The Copilot CLI download: an npm tarball, checked against a pinned sha512.
 tar = "0.4"
 flate2 = "1"
