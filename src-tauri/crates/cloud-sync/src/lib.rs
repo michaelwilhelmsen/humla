@@ -357,7 +357,12 @@ impl Worker {
             Op::Note { id, delete } => self.enqueue_simple("note", "notes", &id, delete),
             Op::Folder { id, delete } => self.enqueue_simple("folder", "folders", &id, delete),
             Op::Client { id, delete } => self.enqueue_simple("client", "clients", &id, delete),
-            Op::Prompt { id, delete } => self.enqueue_simple("prompt", "summary_prompts", &id, delete),
+            Op::Prompt { id, delete } => {
+                if self.is_org_prompt(&id)? {
+                    return Ok(());
+                }
+                self.enqueue_simple("prompt", "summary_prompts", &id, delete)
+            }
             Op::NoteMove { id, from, to } => {
                 // A move = tombstone in the old workspace + (re)create in the new
                 // one. The two rows differ only by `workspace`, so they don't
@@ -417,6 +422,15 @@ impl Worker {
     /// even if the active workspace changes before it drains; delete uses the
     /// active workspace (the row is gone, and reads are workspace-scoped). Empty
     /// workspace = Personal → dropped without a network call when it drains.
+    /// An organisation's template, cached from the org config. Never synced.
+    fn is_org_prompt(&self, id: &str) -> Result<bool> {
+        let conn = self.db.lock();
+        let org: Option<String> = conn
+            .query_row("SELECT org_id FROM summary_prompts WHERE id = ?1", rusqlite::params![id], |r| r.get(0))
+            .optional()?;
+        Ok(org.is_some_and(|o| !o.is_empty()))
+    }
+
     fn enqueue_simple(&self, entity: &str, table: &str, id: &str, delete: bool) -> Result<()> {
         let workspace = if delete {
             self.config.workspace_id.clone()
@@ -1413,7 +1427,7 @@ impl Worker {
         let conn = self.lock_db_fairly();
         if p.deleted {
             conn.execute(
-                "DELETE FROM summary_prompts WHERE id = ?1 AND workspace_id = ?2",
+                "DELETE FROM summary_prompts WHERE id = ?1 AND workspace_id = ?2 AND org_id = ''",
                 rusqlite::params![p.client_id, self.config.workspace_id],
             )?;
             return Ok(());
@@ -1422,7 +1436,7 @@ impl Worker {
             "INSERT INTO summary_prompts (id, name, content, created_at, updated_at, workspace_id)
              VALUES (?1, ?2, ?3, ?4, ?4, ?5)
              ON CONFLICT(id) DO UPDATE SET name=excluded.name, content=excluded.content, updated_at=excluded.updated_at
-             WHERE excluded.updated_at >= summary_prompts.updated_at",
+             WHERE excluded.updated_at >= summary_prompts.updated_at AND summary_prompts.org_id = ''",
             rusqlite::params![p.client_id, p.name, p.content, p.client_updated_at, self.config.workspace_id],
         )?;
         Ok(())
@@ -1532,7 +1546,7 @@ impl Worker {
     fn snapshot_prompt(&self, uuid: &str) -> Result<Option<PromptRow>> {
         let conn = self.db.lock();
         conn.query_row(
-            "SELECT name, content, updated_at FROM summary_prompts WHERE id = ?1",
+            "SELECT name, content, updated_at FROM summary_prompts WHERE id = ?1 AND org_id = ''",
             rusqlite::params![uuid],
             |r| Ok(PromptRow { name: r.get(0)?, content: r.get(1)?, updated_at: r.get(2)? }),
         )
@@ -2057,7 +2071,7 @@ mod it {
             );
             CREATE TABLE summary_prompts (
                 id TEXT PRIMARY KEY, name TEXT NOT NULL, content TEXT NOT NULL,
-                workspace_id TEXT NOT NULL DEFAULT '',
+                workspace_id TEXT NOT NULL DEFAULT '', org_id TEXT NOT NULL DEFAULT '',
                 created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
             );",
         )
@@ -2448,6 +2462,86 @@ mod it {
             conn.query_row("SELECT COUNT(*) FROM clients", [], |r| r.get(0)).unwrap()
         };
         assert_eq!(count, 0, "unsafe client_id is rejected");
+    }
+
+    fn insert_org_prompt(db: &Db, id: &str) {
+        db.lock()
+            .execute(
+                "INSERT INTO summary_prompts (id, name, content, workspace_id, org_id, created_at, updated_at)
+                 VALUES (?1, 'Case meeting', 'Org text', '', 'org1', 1, 1)",
+                rusqlite::params![id],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn an_organisation_template_is_never_enqueued() {
+        let db = test_db();
+        let w = worker(db.clone(), offline_config("wsP"));
+        insert_org_prompt(&db, "t1");
+        w.enqueue(Op::Prompt { id: "t1".into(), delete: false }).unwrap();
+        w.enqueue(Op::Prompt { id: "t1".into(), delete: true }).unwrap();
+        let count: i64 =
+            db.lock().query_row("SELECT COUNT(*) FROM sync_outbox", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn an_organisation_template_has_nothing_to_push() {
+        let db = test_db();
+        let w = worker(db.clone(), offline_config("wsP"));
+        insert_org_prompt(&db, "t1");
+        assert!(w.snapshot_prompt("t1").unwrap().is_none());
+    }
+
+    #[test]
+    fn a_pull_never_overwrites_or_deletes_an_organisation_template() {
+        let db = test_db();
+        let w = worker(db.clone(), offline_config("wsP"));
+        insert_org_prompt(&db, "t1");
+        let pulled = |deleted| RemotePrompt {
+            client_id: "t1".into(),
+            deleted,
+            name: "Hijack".into(),
+            content: "Other text".into(),
+            client_updated_at: 99,
+        };
+        w.apply_remote_prompt(&pulled(false)).unwrap();
+        w.apply_remote_prompt(&pulled(true)).unwrap();
+        let row: (String, String, String) = db
+            .lock()
+            .query_row("SELECT content, org_id, workspace_id FROM summary_prompts WHERE id = 't1'", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(row, ("Org text".into(), "org1".into(), String::new()));
+    }
+
+    #[test]
+    fn a_workspace_template_still_syncs() {
+        let db = test_db();
+        let w = worker(db.clone(), offline_config("wsP"));
+        db.lock()
+            .execute(
+                "INSERT INTO summary_prompts (id, name, content, workspace_id, created_at, updated_at)
+                 VALUES ('p1', 'Standup', 'Mine', 'wsP', 1, 1)",
+                [],
+            )
+            .unwrap();
+        w.enqueue(Op::Prompt { id: "p1".into(), delete: false }).unwrap();
+        let count: i64 =
+            db.lock().query_row("SELECT COUNT(*) FROM sync_outbox", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 1);
+        assert!(w.snapshot_prompt("p1").unwrap().is_some());
+        w.apply_remote_prompt(&RemotePrompt {
+            client_id: "p1".into(),
+            deleted: false,
+            name: "Standup".into(),
+            content: "Pulled".into(),
+            client_updated_at: 5,
+        })
+        .unwrap();
+        assert_eq!(scalar(&db, "SELECT content FROM summary_prompts WHERE id = ?1", "p1").as_deref(), Some("Pulled"));
     }
 
     /// A pulled note carries its Client reference into `notes.client_id`, and an
