@@ -5,7 +5,7 @@
 use super::playback::write_playback_assets;
 use super::timeline::{
     commit_rebuilt_transcript, group_values_to_transcript, read_timeline_values,
-    rebuild_note_transcript,
+    rebuild_note_transcript, serialize_timeline,
 };
 use super::transcribe::drop_incidental_stream_hallucinations;
 use super::transcript::{
@@ -15,8 +15,8 @@ use super::transcript::{
 use super::unify::unify_note_speakers;
 use super::capture::{ms_since, record_timing, PostStopSnapshot, StopClock};
 use super::{
-    chat, emit_error, err, notes, selected_diarize_engine, serialize_timeline,
-    session_changed_for_sync, ChainProgress, StreamSteps, DEFAULT_COMMUNITY1_THRESHOLD,
+    chat, emit_error, err, notes, selected_diarize_engine, session_changed_for_sync,
+    ChainProgress, StreamSteps, DEFAULT_COMMUNITY1_THRESHOLD,
 };
 use crate::recording::{ChunkRecord, ChunkSource, Step, TranscriptPayload};
 use crate::{db, diarize, sessions, wav, AppState};
