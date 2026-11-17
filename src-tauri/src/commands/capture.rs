@@ -1306,6 +1306,10 @@ pub(super) async fn ensure_provider_ready(
         if note_lang.trim().is_empty() { global } else { note_lang }
     };
     let provider_cfg = transcribe_cfg.resolve(&language).clone();
+    {
+        let conn = state.db.lock();
+        super::transcription_config::check(&conn, &provider_cfg).map_err(err)?;
+    }
     // Each cloud provider has its own Keychain slot. Look up the right one so
     // the check doesn't pass when (e.g.) the user picked Deepgram but only saved
     // an OpenAI key.

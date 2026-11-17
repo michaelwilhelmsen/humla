@@ -7,6 +7,8 @@
 //! `pub(crate)`.
 
 use super::err;
+use crate::org_policy::{self, EffectivePolicy};
+use crate::stt::{ProviderConfig, TranscribeConfig};
 use crate::db;
 use crate::AppState;
 use tauri::State;
@@ -33,6 +35,10 @@ pub fn set_transcribe_config(
 ) -> Result<(), String> {
     let json = serde_json::to_string(&config).map_err(err)?;
     let conn = state.db.lock();
+    let policy = org_policy::effective_or_refuse(&conn).map_err(err)?;
+    if !validate(&config, &policy, custom_base_url(&conn).as_deref()).is_empty() {
+        return Err(policy.blocked().to_string());
+    }
     db::set_setting(&conn, "transcribe_config", &json).map_err(err)
 }
 
@@ -54,4 +60,129 @@ pub(crate) fn read_transcribe_config(
         // this when the user opens the Transcription tab.
     }
     Ok(crate::stt::TranscribeConfig::default_fallback())
+}
+
+/// The custom endpoint's URL, shared by every surface that uses it.
+pub(crate) fn custom_base_url(conn: &rusqlite::Connection) -> Option<String> {
+    crate::custom_endpoint::base_url(conn).ok()
+}
+
+/// Where a transcription config sends audio: `None` for on-device Whisper.
+pub(crate) fn endpoint_url<'a>(cfg: &'a ProviderConfig, custom_base_url: Option<&'a str>) -> Option<&'a str> {
+    match cfg {
+        ProviderConfig::Custom(_) => custom_base_url,
+        ProviderConfig::Local(_)
+        | ProviderConfig::OpenAi(_)
+        | ProviderConfig::Deepgram(_)
+        | ProviderConfig::Groq(_) => cfg.base_url(),
+    }
+}
+
+/// Refuse a transcription config the policy doesn't allow, before any Keychain
+/// read.
+pub(crate) fn check(conn: &rusqlite::Connection, cfg: &ProviderConfig) -> anyhow::Result<()> {
+    let custom = custom_base_url(conn);
+    org_policy::check_endpoint(conn, cfg.provider(), endpoint_url(cfg, custom.as_deref())).map(|_| ())
+}
+
+/// The slots the policy refuses: `"default"` and the language code of each
+/// refused per-language override.
+pub(crate) fn validate(
+    cfg: &TranscribeConfig,
+    policy: &EffectivePolicy,
+    custom_base_url: Option<&str>,
+) -> Vec<String> {
+    let refused = |c: &ProviderConfig| !policy.allows(c.provider(), endpoint_url(c, custom_base_url));
+    let mut out = Vec::new();
+    if refused(&cfg.default) {
+        out.push("default".to_string());
+    }
+    out.extend(cfg.per_language.iter().filter(|(_, c)| refused(c)).map(|(l, _)| l.clone()));
+    out
+}
+
+/// `cfg` with every refused slot set to on-device Whisper, the one transcriber
+/// `local_only` always allows. Mirrored by `enforceLocalOnly` in
+/// `src/lib/orgPolicy.ts`.
+pub(crate) fn enforce(
+    cfg: &TranscribeConfig,
+    policy: &EffectivePolicy,
+    custom_base_url: Option<&str>,
+) -> TranscribeConfig {
+    let mut out = cfg.clone();
+    let refused = validate(cfg, policy, custom_base_url);
+    let local = || crate::stt::from_legacy_settings(Some("local"), None, None, None, None);
+    for slot in refused {
+        if slot == "default" {
+            out.default = local();
+        } else if let Some(c) = out.per_language.get_mut(&slot) {
+            *c = local();
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::stt::{CustomConfig, DeepgramConfig, OpenAiConfig};
+
+    fn local_only() -> EffectivePolicy {
+        let (_d, conn) = conn();
+        org_policy::cache_local_only(&conn, "Northwind");
+        org_policy::effective(&conn).unwrap()
+    }
+
+    fn conn() -> (tempfile::TempDir, rusqlite::Connection) {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = db::open(&dir.path().join("t.sqlite")).unwrap();
+        (dir, conn)
+    }
+
+    fn config() -> TranscribeConfig {
+        let mut cfg = TranscribeConfig::default_fallback();
+        cfg.default = ProviderConfig::OpenAi(OpenAiConfig { model: "whisper-1".into(), base_url: None });
+        cfg.per_language.insert(
+            "no".into(),
+            ProviderConfig::Deepgram(DeepgramConfig { model: "nova-3".into(), base_url: None }),
+        );
+        cfg.per_language.insert(
+            "sv".into(),
+            crate::stt::from_legacy_settings(Some("local"), None, Some("medium-q5"), None, None),
+        );
+        cfg.per_language.insert("da".into(), ProviderConfig::Custom(CustomConfig { model: "m".into() }));
+        cfg
+    }
+
+    #[test]
+    fn validate_names_every_refused_slot() {
+        let policy = local_only();
+        assert_eq!(validate(&config(), &policy, Some("http://localhost:9000/v1")), ["default", "no"]);
+        assert_eq!(validate(&config(), &policy, Some("https://api.example.com")), ["default", "da", "no"]);
+        assert!(validate(&config(), &EffectivePolicy::default(), None).is_empty());
+    }
+
+    #[test]
+    fn enforce_moves_refused_slots_to_on_device_whisper_and_keeps_the_rest() {
+        let policy = local_only();
+        let out = enforce(&config(), &policy, Some("http://localhost:9000/v1"));
+        assert_eq!(out.default.provider(), crate::providers::ProviderId::Local);
+        assert_eq!(out.per_language["no"].provider(), crate::providers::ProviderId::Local);
+        assert_eq!(out.per_language["sv"], config().per_language["sv"]);
+        assert_eq!(out.per_language["da"], config().per_language["da"]);
+        assert!(validate(&out, &policy, Some("http://localhost:9000/v1")).is_empty());
+    }
+
+    #[test]
+    fn check_refuses_a_cloud_transcriber_under_local_only() {
+        let (_d, conn) = conn();
+        org_policy::cache_local_only(&conn, "Northwind");
+        let cfg = config();
+        let err = check(&conn, &cfg.default).unwrap_err().to_string();
+        assert_eq!(err, "Blocked by Northwind: processing stays on this Mac.");
+        assert!(check(&conn, &cfg.per_language["sv"]).is_ok());
+        assert!(check(&conn, &cfg.per_language["da"]).is_err(), "custom with no URL");
+        db::set_setting(&conn, "custom_base_url", "http://[::1]:9000/v1").unwrap();
+        assert!(check(&conn, &cfg.per_language["da"]).is_ok());
+    }
 }

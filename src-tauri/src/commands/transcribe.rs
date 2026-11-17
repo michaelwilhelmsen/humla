@@ -52,6 +52,11 @@ pub(super) async fn transcribe_chunk(
         let state: State<AppState> = app.state();
         read_transcribe_config(&state)?.resolve(&language).clone()
     };
+    {
+        let state: State<AppState> = app.state();
+        let conn = state.db.lock();
+        super::transcription_config::check(&conn, &provider_cfg)?;
+    }
     // Each provider's key has its own Keychain slot; a custom endpoint may
     // take no key at all.
     let api_key = match provider_cfg.provider() {

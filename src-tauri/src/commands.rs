@@ -131,6 +131,34 @@ pub(crate) const TITLE_FALLBACK_MODEL: &str = "gpt-4o-mini";
 // Ollama's default port + OpenAI-compat path. Any user running LM Studio,
 // llama-server, or vLLM will override this in Settings.
 const DEFAULT_LOCAL_LLM_BASE_URL: &str = "http://localhost:11434/v1";
+
+/// The local LLM server summaries and chat call, as `local_llm_base_url` says.
+fn local_llm_base_url(conn: &rusqlite::Connection) -> anyhow::Result<String> {
+    Ok(db::get_setting(conn, "local_llm_base_url")?
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEFAULT_LOCAL_LLM_BASE_URL.to_string()))
+}
+
+/// Refuse a summary or chat provider the organisation policy doesn't allow,
+/// before any Keychain slot opens. A custom endpoint with no URL is checked as
+/// having none, which `local_only` refuses.
+fn check_llm_endpoint(
+    conn: &rusqlite::Connection,
+    id: crate::providers::ProviderId,
+) -> anyhow::Result<crate::org_policy::EffectivePolicy> {
+    use crate::providers::ProviderId;
+    let url = match id {
+        ProviderId::Local => Some(local_llm_base_url(conn)?),
+        ProviderId::Custom => crate::custom_endpoint::base_url(conn).ok(),
+        ProviderId::OpenAi
+        | ProviderId::Anthropic
+        | ProviderId::Copilot
+        | ProviderId::Deepgram
+        | ProviderId::Groq => None,
+    };
+    crate::org_policy::check_endpoint(conn, id, url.as_deref())
+}
 fn err<E: std::fmt::Display>(e: E) -> String { e.to_string() }
 
 /// A channel one chain's progress goes on.

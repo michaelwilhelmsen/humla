@@ -15,7 +15,7 @@ use std::path::PathBuf;
 pub use adapter::{BatchSttAdapter, TranscribeCtx, TranscribeResult, Word};
 pub use config::{from_legacy_settings, ProviderConfig, TranscribeConfig};
 #[cfg(test)]
-pub use config::{LocalWhisperConfig, OpenAiConfig};
+pub use config::{CustomConfig, DeepgramConfig, LocalWhisperConfig, OpenAiConfig};
 pub use custom::CustomAdapter;
 pub use keychain::keychain_account_for;
 pub use deepgram::DeepgramAdapter;

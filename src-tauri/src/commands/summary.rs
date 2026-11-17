@@ -7,7 +7,7 @@
 //! the parent re-export.
 
 use super::read_provider_api_key;
-use super::{DEFAULT_LANGUAGE, DEFAULT_LOCAL_LLM_BASE_URL, DEFAULT_SUMMARY_MODEL};
+use super::{DEFAULT_LANGUAGE, DEFAULT_SUMMARY_MODEL};
 use crate::db::{self, Note, NotePatch};
 use crate::languages;
 use crate::anthropic;
@@ -144,9 +144,11 @@ pub(super) fn summary_provider_id(
         note.id, note_override, provider
     );
 
-    ProviderId::parse(&provider)
+    let id = ProviderId::parse(&provider)
         .filter(|p| p.capabilities().summarize)
-        .ok_or_else(|| anyhow::anyhow!("unknown summary provider “{provider}” — pick one in Settings"))
+        .ok_or_else(|| anyhow::anyhow!("unknown summary provider “{provider}” — pick one in Settings"))?;
+    super::check_llm_endpoint(conn, id)?;
+    Ok(id)
 }
 
 pub(super) fn resolve_provider(
@@ -157,10 +159,7 @@ pub(super) fn resolve_provider(
     let id = summary_provider_id(conn, note)?;
     match id {
         ProviderId::Local => {
-            let base_url = db::get_setting(conn, "local_llm_base_url")?
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| DEFAULT_LOCAL_LLM_BASE_URL.to_string());
+            let base_url = super::local_llm_base_url(conn)?;
             let model = db::get_setting(conn, "local_llm_model")?
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
@@ -706,6 +705,49 @@ mod tests {
         let note = db::create_note(&conn, "no", "meeting", "").unwrap();
         let p = resolve_provider(&conn, &note, Some("sk-test".into())).unwrap();
         assert_eq!(p.base_url, openai::BASE);
+    }
+
+    #[test]
+    fn local_only_refuses_cloud_summaries_before_any_key_is_read() {
+        let (_dir, conn) = temp_conn();
+        crate::org_policy::cache_local_only(&conn, "Northwind");
+        let note = db::create_note(&conn, "no", "meeting", "").unwrap();
+        for id in ["openai", "anthropic", "copilot"] {
+            db::set_setting(&conn, "summary_provider", id).unwrap();
+            let err = summary_provider_id(&conn, &note).unwrap_err().to_string();
+            assert_eq!(err, "Blocked by Northwind: processing stays on this Mac.", "{id}");
+        }
+    }
+
+    #[test]
+    fn local_only_lets_summaries_run_on_a_loopback_server_only() {
+        let (_dir, conn) = temp_conn();
+        crate::org_policy::cache_local_only(&conn, "Northwind");
+        db::set_setting(&conn, "local_llm_model", "gemma4:12b-mlx").unwrap();
+        db::set_setting(&conn, "custom_model", "m").unwrap();
+        let note = db::create_note(&conn, "no", "meeting", "").unwrap();
+
+        db::set_setting(&conn, "summary_provider", "local").unwrap();
+        assert!(resolve_provider(&conn, &note, None).is_ok(), "the default localhost URL");
+        db::set_setting(&conn, "local_llm_base_url", "http://192.168.1.20:11434/v1").unwrap();
+        assert!(resolve_provider(&conn, &note, None).is_err());
+
+        db::set_setting(&conn, "summary_provider", "custom").unwrap();
+        assert!(resolve_provider(&conn, &note, None).is_err(), "no URL");
+        db::set_setting(&conn, "custom_base_url", "https://openrouter.ai/api/v1").unwrap();
+        assert!(resolve_provider(&conn, &note, None).is_err());
+        db::set_setting(&conn, "custom_base_url", "http://127.0.0.1:1234/v1").unwrap();
+        assert!(resolve_provider(&conn, &note, None).is_ok());
+    }
+
+    #[test]
+    fn a_note_override_is_held_to_the_same_policy() {
+        let (_dir, conn) = temp_conn();
+        crate::org_policy::cache_local_only(&conn, "Northwind");
+        db::set_setting(&conn, "summary_provider", "local").unwrap();
+        let mut note = db::create_note(&conn, "no", "meeting", "").unwrap();
+        note.summary_provider = "anthropic".into();
+        assert!(summary_provider_id(&conn, &note).is_err());
     }
 
     #[test]
