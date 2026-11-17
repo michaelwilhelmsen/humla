@@ -15,6 +15,9 @@ import { CustomEndpointCard, CustomModelField } from "../../../components/provid
 import { useCopilotStatus } from "../../../components/provider/useCopilot";
 import { SUMMARY_PROVIDERS } from "../types";
 import { ipc, type SummaryPrompt } from "../../../lib/ipc";
+import { useLocalOnly } from "../../../lib/orgPolicy";
+import { allowedUnderLocalOnly } from "../../../lib/providers";
+import { ManagedRow } from "../ManagedRow";
 import type { SettingsHook } from "../useSettings";
 
 export function SummaryTab({
@@ -35,12 +38,14 @@ export function SummaryTab({
       cancelled = true;
     };
   }, []);
-  const isLocal = s.summary_provider === "local";
-  const isAnthropic = s.summary_provider === "anthropic";
+  const { managed, known } = useLocalOnly();
+  const provider = managed ? enforcedLlmProvider(s.summary_provider, s.custom_base_url, "local") : s.summary_provider;
+  const isLocal = provider === "local";
+  const isAnthropic = known && provider === "anthropic";
   // Called unconditionally (rules of hooks) and inert until that provider is
   // the chosen one — neither the Keychain slot nor the model listing is
   // touched otherwise.
-  const isOpenAi = s.summary_provider === "openai";
+  const isOpenAi = known && provider === "openai";
   const openaiKey = useProviderKey("openai", { enabled: isOpenAi });
   const openaiModels = useCloudModels("openai", openaiKey.hasKey, s.summary_model, {
     enabled: isOpenAi,
@@ -49,23 +54,32 @@ export function SummaryTab({
   const anthropicModels = useCloudModels("anthropic", anthropicKey.hasKey, s.anthropic_model, {
     enabled: isAnthropic,
   });
-  const isCopilot = s.summary_provider === "copilot";
+  const isCopilot = known && provider === "copilot";
   const copilot = useCopilotStatus({ enabled: isCopilot });
 
   return (
     <>
       <Section title="Summaries">
-        <Row
-          label="Provider"
-          description="Local keeps the transcript on your Mac. The others send it to the provider."
-          control={
-            <Select
-              value={s.summary_provider}
-              onChange={(v) => update("summary_provider", v)}
-              options={SUMMARY_PROVIDERS}
-            />
-          }
-        />
+        {managed ? (
+          <ManagedRow
+            label="Provider"
+            source={managed.source}
+            reason={managed.reason}
+            control={<Select value={provider} onChange={() => {}} options={SUMMARY_PROVIDERS} disabled />}
+          />
+        ) : (
+          <Row
+            label="Provider"
+            description="Local keeps the transcript on your Mac. The others send it to the provider."
+            control={
+              <Select
+                value={s.summary_provider}
+                onChange={(v) => update("summary_provider", v)}
+                options={SUMMARY_PROVIDERS}
+              />
+            }
+          />
+        )}
 
         {isOpenAi && (
           <>
@@ -108,7 +122,7 @@ export function SummaryTab({
           />
         )}
 
-        {s.summary_provider === "custom" && (
+        {provider === "custom" && (
           <>
             <CustomEndpointCard
               baseUrl={s.custom_base_url}
@@ -195,4 +209,15 @@ export function SummaryTab({
       </Section>
     </>
   );
+}
+
+/**
+ * The summary or chat provider `local_only` leaves in force: the stored one when
+ * it may run on this Mac, else the local server. The backend moves the setting
+ * the same way when the policy arrives (`apply_local_only`).
+ */
+export function enforcedLlmProvider(stored: string, customBaseUrl: string, local: string): string {
+  if (stored === "local" || stored === "ollama") return stored;
+  if (stored === "custom" && allowedUnderLocalOnly("custom", customBaseUrl.trim() || null)) return stored;
+  return local;
 }

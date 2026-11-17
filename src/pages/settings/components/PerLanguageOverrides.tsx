@@ -4,6 +4,8 @@ import type { ProviderConfig, TranscribeConfig } from "../../../lib/ipc";
 import { ProviderConfigForm } from "./ProviderConfigForm";
 import { Select } from "../../../components/ui/Select";
 import type { LocalState } from "../types";
+import { ON_DEVICE_WHISPER, enforceLocalOnly, type PolicyRule } from "../../../lib/orgPolicy";
+import { ManagedBadge } from "../ManagedRow";
 
 // Section that lists existing per-language overrides and offers a + Add
 // form to create new ones. Each entry is rendered as a card with a
@@ -15,11 +17,16 @@ export function PerLanguageOverrides({
   setLanguageOverride,
   removeLanguageOverride,
   local,
+  managed = null,
+  customBaseUrl = "",
 }: {
   config: TranscribeConfig;
   setLanguageOverride: (language: string, cfg: ProviderConfig) => Promise<void>;
   removeLanguageOverride: (language: string) => Promise<void>;
   local: LocalState;
+  /** Who fixes the provider (`local_only`): each override shows its enforced value. */
+  managed?: PolicyRule | null;
+  customBaseUrl?: string;
 }) {
   const [showAddForm, setShowAddForm] = useState(false);
   const entries = Object.entries(config.per_language).sort(([a], [b]) =>
@@ -34,7 +41,8 @@ export function PerLanguageOverrides({
             <OverrideRow
               key={language}
               language={language}
-              cfg={cfg}
+              cfg={managed ? enforceLocalOnly(cfg, customBaseUrl) : cfg}
+              managed={managed}
               onDelete={() => removeLanguageOverride(language)}
             />
           ))}
@@ -58,6 +66,7 @@ export function PerLanguageOverrides({
         <AddOverrideForm
           existingLanguages={Object.keys(config.per_language)}
           local={local}
+          managed={managed}
           onCancel={() => setShowAddForm(false)}
           onAdd={async (language, cfg) => {
             await setLanguageOverride(language, cfg);
@@ -72,18 +81,21 @@ export function PerLanguageOverrides({
 function OverrideRow({
   language,
   cfg,
+  managed,
   onDelete,
 }: {
   language: string;
   cfg: ProviderConfig;
+  managed: PolicyRule | null;
   onDelete: () => void;
 }) {
   const lang = LANGUAGES.find((l) => l.value === language);
   return (
     <div className="flex items-start gap-3 px-3 py-2 rounded-md border border-[var(--color-line)]">
       <div className="flex-1 flex flex-col gap-0.5">
-        <div className="text-sm font-medium">
+        <div className="flex flex-wrap items-center gap-x-2 text-sm font-medium">
           {lang ? languageOptionLabel(lang) : language}
+          {managed && <ManagedBadge source={managed.source} reason={managed.reason} />}
         </div>
         <div className="text-xs text-[var(--color-text-muted)]">
           {summariseProvider(cfg)}
@@ -119,11 +131,13 @@ function summariseProvider(cfg: ProviderConfig): string {
 function AddOverrideForm({
   existingLanguages,
   local,
+  managed,
   onCancel,
   onAdd,
 }: {
   existingLanguages: string[];
   local: LocalState;
+  managed: PolicyRule | null;
   onCancel: () => void;
   onAdd: (language: string, cfg: ProviderConfig) => Promise<void>;
 }) {
@@ -135,10 +149,9 @@ function AddOverrideForm({
   );
   const initialLanguage = available[0]?.value ?? "no";
   const [language, setLanguage] = useState(initialLanguage);
-  const [cfg, setCfg] = useState<ProviderConfig>({
-    provider: "openai",
-    model: "whisper-1",
-  });
+  const [cfg, setCfg] = useState<ProviderConfig>(
+    managed ? ON_DEVICE_WHISPER : { provider: "openai", model: "whisper-1" },
+  );
 
   return (
     <div className="flex flex-col gap-3 px-3 py-3 rounded-md border border-[var(--color-line)] bg-[var(--color-canvas)]">
@@ -158,6 +171,7 @@ function AddOverrideForm({
         onChange={setCfg}
         localModels={local.models}
         filterLocalToLanguage={language}
+        managed={managed}
       />
       <div className="flex items-center gap-2">
         <button

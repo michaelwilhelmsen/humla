@@ -25,6 +25,9 @@ import {
   isOllamaUrl,
 } from "../../../lib/localModels";
 import { ipc } from "../../../lib/ipc";
+import { useLocalOnly } from "../../../lib/orgPolicy";
+import { ManagedRow } from "../ManagedRow";
+import { enforcedLlmProvider } from "./Summary";
 import type { SettingsHook } from "../useSettings";
 
 // AI Chat provider setting (issue #44). A dedicated provider choice, separate
@@ -43,13 +46,15 @@ export function modelSuitsProvider(model: string, provider: string): boolean {
 }
 
 export function ChatTab({ s, update }: Pick<SettingsHook, "s" | "update">) {
-  const isOllama = s.chat_provider === "ollama";
-  const isAnthropic = s.chat_provider === "anthropic";
-  const isCopilot = s.chat_provider === "copilot";
-  const isCustom = s.chat_provider === "custom";
+  const { managed, known } = useLocalOnly();
+  const provider = managed ? enforcedLlmProvider(s.chat_provider, s.custom_base_url, "ollama") : s.chat_provider;
+  const isOllama = provider === "ollama" || (managed !== null && provider === "local");
+  const isAnthropic = known && provider === "anthropic";
+  const isCopilot = known && provider === "copilot";
+  const isCustom = provider === "custom";
   // Every hook runs unconditionally (rules of hooks); the probe parks itself
   // when chat isn't on Ollama, and the listing when no Anthropic key is stored.
-  const isOpenAi = !isOllama && !isAnthropic && !isCopilot && !isCustom;
+  const isOpenAi = known && !isOllama && provider !== "anthropic" && provider !== "copilot" && !isCustom;
   const key = useProviderKey("openai", { enabled: isOpenAi });
   const anthropicKey = useProviderKey("anthropic", { enabled: isAnthropic });
   const copilot = useCopilotStatus({ enabled: isCopilot });
@@ -106,24 +111,35 @@ export function ChatTab({ s, update }: Pick<SettingsHook, "s" | "update">) {
       <p className="text-xs text-[var(--color-text-muted)] leading-relaxed py-3.5">
         Workspace chat is set under Account → Workspace chat.
       </p>
-      <Row
-        label="Provider"
-        description="Local keeps your notes on your Mac. The others send them to the provider."
-        control={
-          <Select
-            value={s.chat_provider}
-            onChange={(v) => {
-              void update("chat_provider", v);
-              // One `chat_model` serves every provider, so a switch can leave
-              // a Claude id on OpenAI or the reverse. Clear it rather than
-              // carry it: "" is the state the tab already draws as
-              // "Choose a model…".
-              if (!modelSuitsProvider(s.chat_model, v)) void update("chat_model", "");
-            }}
-            options={CHAT_PROVIDERS}
-          />
-        }
-      />
+      {managed ? (
+        <ManagedRow
+          label="Provider"
+          source={managed.source}
+          reason={managed.reason}
+          control={
+            <Select value={isOllama ? "ollama" : provider} onChange={() => {}} options={CHAT_PROVIDERS} disabled />
+          }
+        />
+      ) : (
+        <Row
+          label="Provider"
+          description="Local keeps your notes on your Mac. The others send them to the provider."
+          control={
+            <Select
+              value={s.chat_provider}
+              onChange={(v) => {
+                void update("chat_provider", v);
+                // One `chat_model` serves every provider, so a switch can leave
+                // a Claude id on OpenAI or the reverse. Clear it rather than
+                // carry it: "" is the state the tab already draws as
+                // "Choose a model…".
+                if (!modelSuitsProvider(s.chat_model, v)) void update("chat_model", "");
+              }}
+              options={CHAT_PROVIDERS}
+            />
+          }
+        />
+      )}
 
       {isAnthropic && (
         <>

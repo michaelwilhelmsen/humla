@@ -5,6 +5,8 @@ import { CommandSnippet } from "../../../components/CommandSnippet";
 import { Row, Section } from "../components/Section";
 import { Toggle } from "../components/Toggle";
 import type { EditableKey } from "../types";
+import { localOnlySource, useOrgPolicy } from "../../../lib/orgPolicy";
+import { ManagedRow } from "../ManagedRow";
 import { WebhookRows } from "./Webhook";
 
 // The ways the user's own tools reach their notes: the MCP server (#172), which
@@ -30,7 +32,8 @@ export function IntegrationsSection({
   s: Record<EditableKey, string>;
   update: (key: EditableKey, value: string) => void;
 }) {
-  const enabled = s.mcp_enabled === "true";
+  const managed = localOnlySource(useOrgPolicy());
+  const enabled = !managed && s.mcp_enabled === "true";
   const [path, setPath] = useState<string | null>(null);
 
   useEffect(() => {
@@ -56,28 +59,37 @@ export function IntegrationsSection({
 
   return (
     <Section title="Integrations">
-      <Row
-        label="Model Context Protocol server"
-        description={
-          <>
-            Read-only access for Claude Code, Codex and other MCP clients. Audio is never reachable.{" "}
-            <button
-              type="button"
-              onClick={() => void openExternal(MCP_GUIDE_URL)}
-              className="underline hover:text-[var(--color-text)]"
-            >
-              Setup guide
-            </button>
-          </>
-        }
-        control={
-          <Toggle
-            checked={enabled}
-            onChange={(next) => update("mcp_enabled", next ? "true" : "false")}
-            label="Enable the MCP server"
-          />
-        }
-      />
+      {managed ? (
+        <ManagedRow
+          label="Model Context Protocol server"
+          source={managed.source}
+          reason={managed.reason}
+          control={<Toggle checked={false} onChange={() => {}} label="Enable the MCP server" disabled />}
+        />
+      ) : (
+        <Row
+          label="Model Context Protocol server"
+          description={
+            <>
+              Read-only access for Claude Code, Codex and other MCP clients. Audio is never reachable.{" "}
+              <button
+                type="button"
+                onClick={() => void openExternal(MCP_GUIDE_URL)}
+                className="underline hover:text-[var(--color-text)]"
+              >
+                Setup guide
+              </button>
+            </>
+          }
+          control={
+            <Toggle
+              checked={enabled}
+              onChange={(next) => update("mcp_enabled", next ? "true" : "false")}
+              label="Enable the MCP server"
+            />
+          }
+        />
+      )}
       {enabled && path && (
         <>
           <Row label="Claude Code">
@@ -103,7 +115,7 @@ export function IntegrationsSection({
           </Row>
         </>
       )}
-      <WebhookRows s={s} update={update} />
+      <WebhookRows s={s} update={update} managed={managed} />
     </Section>
   );
 }
