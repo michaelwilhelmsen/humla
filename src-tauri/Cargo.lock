@@ -2035,6 +2035,8 @@ dependencies = [
  "block2",
  "chrono",
  "cloud-sync",
+ "core-foundation 0.10.1",
+ "core-foundation-sys",
  "dirs 7.0.0",
  "echo-probe",
  "flate2",

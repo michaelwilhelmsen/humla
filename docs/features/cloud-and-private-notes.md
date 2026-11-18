@@ -34,3 +34,26 @@ Tightening the server rule stops future reads only; a record leaving your view p
 ### The chat index
 
 humla-cloud's indexer reads with a service token across every workspace, which no collection rule constrains. So `private` and `owner` ride on every chunk and `IndexStore.viewerSql` is composed by every retrieval path (search, match count, both speaker listings). The viewer is optional in the type and **fail-closed**: omitted, it matches only public chunks.
+
+## Managed configuration (organisation layer, C6)
+
+An MDM configuration profile for the domain `no.humla.app` pins policies on a Mac with no sign-in, and no sign-out releases them (spec: `humla-cloud/docs/organisation-layer.md` §4 option C). `org_policy::managed()` reads it through CFPreferences and `effective()` merges it strictest-wins with the cached server config, as one more `Layer` whose source is **"This Mac's configuration"** (`MANAGED_SOURCE`, mirrored in `src/lib/orgPolicy.ts`).
+
+Flat keys in the payload, named after the server's fields:
+
+| Key | Type | Effect |
+|---|---|---|
+| `local_only` | boolean | Policy on/off |
+| `telemetry_off` | boolean | Policy on/off; stops first-run telemetry during onboarding |
+| `audio_forbidden` | boolean | Policy on/off |
+| `policy_reason` | string | Shown with the managed rules |
+| `server_url` | string | The cloud server; the user can't change or disconnect it |
+
+- **Only forced values count** (`CFPreferencesAppValueIsForced`): a user's own `defaults write no.humla.app …` is ignored.
+- **Fail closed**: a policy key forced to anything but a boolean (`<string>false</string>`, an integer) reads as **on**. A `server_url` that isn't an http(s) URL is ignored with a log line.
+- `retention_days` is **not read** from a profile. Retention covers organisation workspaces only, which a profile can't name, and `retention_in_force` reads only the server cache.
+- Read once on first use and again on every `cloud_status` (sign-in and window focus), which also moves settings to their enforced values (`apply_policy_to_settings`) and emits `org_policy_changed` when the layer changed. At launch, before the sync observer exists, `apply_managed_at_launch` does the same.
+- `server_url` is pinned by writing it into `cloud_base_url`, so every reader stays unchanged; when that changes the setting, the stored session token is dropped (`cloud_auth::forget_server`). `cloud_configure` refuses any other URL, and `cloud_status.server_managed` hides Change server and Disconnect.
+- Tests never read the Mac's profiles (`read_forced` is empty under `cfg(test)`); the parsing is `parse_managed` over a map of forced values. Linux builds read nothing.
+
+A sample profile: [`no.humla.app.mobileconfig`](no.humla.app.mobileconfig).

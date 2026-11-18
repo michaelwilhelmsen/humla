@@ -89,6 +89,8 @@ pub struct CloudStatus {
     /// Signed out without having signed out: the email of the account whose
     /// session ended, for the sign-in form to ask them back.
     pub signed_out_email: Option<String>,
+    /// A managed configuration profile sets the server; the user can't change it.
+    pub server_managed: bool,
 }
 
 /// The managed chat add-on the server advertises in its billing config (#75).
@@ -168,6 +170,32 @@ pub(crate) fn base_url(conn: &rusqlite::Connection) -> Option<String> {
         .ok()
         .flatten()
         .filter(|s| !s.trim().is_empty())
+}
+
+/// Write the server URL a managed configuration profile sets into the setting
+/// every reader uses. Returns whether it changed, in which case the session
+/// belongs to another server and must be dropped (`cloud_auth::forget_server`).
+pub(crate) fn pin_managed_server_url(conn: &rusqlite::Connection) -> anyhow::Result<bool> {
+    pin_server_url(conn, crate::org_policy::managed().server_url.as_deref())
+}
+
+fn pin_server_url(conn: &rusqlite::Connection, managed: Option<&str>) -> anyhow::Result<bool> {
+    let Some(url) = managed else { return Ok(false) };
+    if base_url(conn).as_deref() == Some(url) {
+        return Ok(false);
+    }
+    db::set_setting(conn, SETTING_BASE_URL, url)?;
+    Ok(true)
+}
+
+/// Refuse a server other than the one a managed configuration profile sets.
+fn check_configure(managed: Option<&str>, requested: &str) -> Result<(), String> {
+    match managed {
+        Some(url) if url != requested => {
+            Err(format!("The server is set by {}.", crate::org_policy::MANAGED_SOURCE))
+        }
+        _ => Ok(()),
+    }
 }
 
 fn read_workspace_id(state: &State<'_, AppState>) -> Option<String> {
@@ -615,6 +643,8 @@ pub async fn cloud_status(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<CloudStatus, String> {
+    super::org::refresh_managed_config(&app, &state);
+    let server_managed = crate::org_policy::managed().server_url.is_some();
     let base = read_base_url(&state);
     let configured = base.is_some();
     let base_url = base.clone().unwrap_or_default();
@@ -643,6 +673,7 @@ pub async fn cloud_status(
             signed_out_email: (configured && ended)
                 .then(|| super::cloud_auth::signed_out_email(&state.keychain_cache))
                 .flatten(),
+            server_managed,
         });
     };
 
@@ -692,6 +723,7 @@ pub async fn cloud_status(
         locked_workspaces,
         locked_current_workspace,
         signed_out_email: None,
+        server_managed,
     })
 }
 
@@ -746,6 +778,7 @@ pub async fn cloud_billing_portal(state: State<'_, AppState>, workspace_id: Stri
 #[tauri::command]
 pub fn cloud_configure(state: State<'_, AppState>, base_url: String) -> Result<(), String> {
     let trimmed = base_url.trim().trim_end_matches('/').to_string();
+    check_configure(crate::org_policy::managed().server_url.as_deref(), &trimmed)?;
     {
         let conn = state.db.lock();
         db::set_setting(&conn, SETTING_BASE_URL, &trimmed).map_err(err)?;
@@ -2160,6 +2193,27 @@ pub fn cloud_pending_note_ids(state: State<'_, AppState>) -> Result<Vec<String>,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_managed_server_url_is_written_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = db::open(&dir.path().join("notes.sqlite")).unwrap();
+        assert!(!pin_server_url(&conn, None).unwrap(), "no profile leaves the setting alone");
+        db::set_setting(&conn, SETTING_BASE_URL, "https://sync.humla.team").unwrap();
+        assert!(pin_server_url(&conn, Some("https://sync.example.org")).unwrap());
+        assert_eq!(base_url(&conn).as_deref(), Some("https://sync.example.org"));
+        assert!(!pin_server_url(&conn, Some("https://sync.example.org")).unwrap(), "already pinned");
+    }
+
+    #[test]
+    fn only_the_managed_server_may_be_configured() {
+        assert!(check_configure(None, "https://anything.example").is_ok());
+        assert!(check_configure(None, "").is_ok());
+        assert!(check_configure(Some("https://sync.example.org"), "https://sync.example.org").is_ok());
+        let refused = check_configure(Some("https://sync.example.org"), "").unwrap_err();
+        assert!(refused.contains("This Mac's configuration"), "{refused}");
+        assert!(check_configure(Some("https://sync.example.org"), "https://sync.humla.team").is_err());
+    }
 
     /// #191 — the mutex exists for contention between members, and a private note
     /// has no second person. Not taking the lock is also what keeps its row out of

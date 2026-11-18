@@ -165,6 +165,18 @@ pub(crate) fn apply_fetch(conn: &rusqlite::Connection, outcome: &FetchOutcome) -
         }),
         _ => false,
     };
+    let settings = apply_policy_to_settings(conn);
+    Changes {
+        policy: before != after,
+        settings,
+        content: templates || orgs_before != orgs_after,
+        retention: retention_before != org_policy::retention_in_force(conn),
+    }
+}
+
+/// [`apply_local_only`] then [`apply_device_policies`]. Returns whether either
+/// rewrote a setting.
+pub(crate) fn apply_policy_to_settings(conn: &rusqlite::Connection) -> bool {
     let local_only = apply_local_only(conn).unwrap_or_else(|e| {
         eprintln!("org policy: couldn't apply local_only to settings: {e:#}");
         false
@@ -173,12 +185,43 @@ pub(crate) fn apply_fetch(conn: &rusqlite::Connection, outcome: &FetchOutcome) -
         eprintln!("org policy: couldn't apply audio and telemetry policies to settings: {e:#}");
         false
     });
-    let settings = local_only || device;
-    Changes {
-        policy: before != after,
-        settings,
-        content: templates || orgs_before != orgs_after,
-        retention: retention_before != org_policy::retention_in_force(conn),
+    local_only || device
+}
+
+/// At launch, before the sync observer is built: pin a managed server URL
+/// (dropping a session that belongs to another server) and move settings to
+/// what the policy in force enforces, so a managed profile works before any
+/// sign-in.
+pub(crate) fn apply_managed_at_launch(conn: &rusqlite::Connection, cache: &crate::keychain::Cache) {
+    match super::cloud::pin_managed_server_url(conn) {
+        Ok(true) => super::cloud_auth::forget_server(cache),
+        Ok(false) => {}
+        Err(e) => eprintln!("org policy: couldn't pin the managed server URL: {e:#}"),
+    }
+    apply_policy_to_settings(conn);
+}
+
+/// Re-read the managed configuration profile and act on what changed: pin a
+/// new server URL, move settings to enforced values and tell the UI. Runs from
+/// `cloud_status`, so window focus picks up a profile installed meanwhile.
+pub(crate) fn refresh_managed_config(app: &tauri::AppHandle, state: &State<'_, AppState>) {
+    let change = org_policy::reload_managed();
+    if change.server_url {
+        let pinned = super::cloud::pin_managed_server_url(&state.db.lock()).unwrap_or_else(|e| {
+            eprintln!("org policy: couldn't pin the managed server URL: {e:#}");
+            false
+        });
+        if pinned {
+            super::cloud_auth::server_changed(state);
+            state.sync.config_changed();
+        }
+    }
+    if change.policy {
+        let settings = apply_policy_to_settings(&state.db.lock());
+        let _ = app.emit("org_policy_changed", ());
+        if settings {
+            let _ = app.emit("org_settings_rewritten", ());
+        }
     }
 }
 

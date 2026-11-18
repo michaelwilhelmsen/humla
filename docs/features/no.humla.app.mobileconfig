@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>PayloadContent</key>
+	<array>
+		<dict>
+			<key>PayloadType</key>
+			<string>no.humla.app</string>
+			<key>PayloadIdentifier</key>
+			<string>com.example.humla.settings</string>
+			<key>PayloadUUID</key>
+			<string>8228a77b-44fc-4909-90cc-11fe9a295173</string>
+			<key>PayloadVersion</key>
+			<integer>1</integer>
+			<key>PayloadDisplayName</key>
+			<string>Humla</string>
+			<key>local_only</key>
+			<true/>
+			<key>telemetry_off</key>
+			<true/>
+			<key>audio_forbidden</key>
+			<false/>
+			<key>policy_reason</key>
+			<string>Meeting notes stay on this Mac.</string>
+			<key>server_url</key>
+			<string>https://sync.example.com</string>
+		</dict>
+	</array>
+	<key>PayloadDisplayName</key>
+	<string>Humla configuration</string>
+	<key>PayloadIdentifier</key>
+	<string>com.example.humla</string>
+	<key>PayloadScope</key>
+	<string>System</string>
+	<key>PayloadType</key>
+	<string>Configuration</string>
+	<key>PayloadUUID</key>
+	<string>625ecf45-36ad-4b14-888c-ccfcf32585c7</string>
+	<key>PayloadVersion</key>
+	<integer>1</integer>
+</dict>
+</plist>

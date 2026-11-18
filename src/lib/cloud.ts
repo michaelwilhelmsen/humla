@@ -139,6 +139,8 @@ export type CloudStatus = {
   /** Signed out without signing out: the email of the account whose session
    *  ended, for the sign-in form to ask them back. */
   signed_out_email?: string | null;
+  /** A managed configuration profile sets the server; it can't be changed. */
+  server_managed?: boolean;
 };
 
 /** Managed chat add-on advertised in the server's billing config (issue #75). */
@@ -268,6 +270,7 @@ export const DISCONNECTED: CloudStatus = {
   locked_workspaces: [],
   locked_current_workspace: null,
   signed_out_email: null,
+  server_managed: false,
 };
 
 type CloudState = {

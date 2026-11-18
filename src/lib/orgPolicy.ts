@@ -22,6 +22,10 @@ export type EffectivePolicy = {
   rules: PolicyRule[];
 };
 
+/** Who a managed configuration profile's rules name. Mirrors
+ *  `org_policy::MANAGED_SOURCE`. */
+export const MANAGED_SOURCE = "This Mac's configuration";
+
 /** Mirrors `org_policy::OrgSummary`. */
 export type OrgSummary = {
   id: string;

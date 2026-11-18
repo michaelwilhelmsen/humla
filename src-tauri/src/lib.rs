@@ -204,6 +204,7 @@ where
             // exist. In the open-source build this is `NoopSync` and the
             // factory ignores the context.
             let keychain_cache = keychain::new_cache();
+            commands::apply_managed_at_launch(&db.lock(), &keychain_cache);
             let sync = make_sync(sync::SyncContext {
                 db: db.clone(),
                 app: app.handle().clone(),

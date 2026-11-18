@@ -583,9 +583,14 @@ pub(crate) fn sign_out(state: &State<'_, AppState>) {
 
 /// A new server invalidates the session, and its token must not be sent to it.
 pub(crate) fn server_changed(state: &State<'_, AppState>) {
-    if let Some(mut account) = read_account(&state.keychain_cache) {
+    forget_server(&state.keychain_cache);
+}
+
+/// [`server_changed`] for callers that run before `AppState` exists.
+pub(crate) fn forget_server(cache: &crate::keychain::Cache) {
+    if let Some(mut account) = read_account(cache) {
         if account.token.take().is_some() {
-            let _ = store_account(&state.keychain_cache, Some(&account));
+            let _ = store_account(cache, Some(&account));
         }
     }
     set_session(None);
