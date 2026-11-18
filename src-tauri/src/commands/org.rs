@@ -1173,6 +1173,18 @@ mod tests {
         }
     }
 
+    /// The command takes Tauri state, so this pins that a move into an
+    /// audio_forbidden department deletes the note's audio and pings sync.
+    #[test]
+    fn a_move_into_an_audio_forbidden_department_drops_the_notes_audio() {
+        let notes = include_str!("notes.rs");
+        let mv = &notes[notes.find("pub fn notes_set_workspace").unwrap()..];
+        let mv = &mv[..mv.find("\n}\n").unwrap()];
+        let order = ["check_move", "forbids_audio", "delete_stored_audio", "note_changed_for_sync", "note_moved"];
+        let at: Vec<usize> = order.iter().map(|k| mv.find(k).unwrap_or_else(|| panic!("{k}"))).collect();
+        assert!(at.windows(2).all(|w| w[0] < w[1]), "{at:?}");
+    }
+
     #[test]
     fn telemetry_off_alone_keeps_no_note_in_its_department() {
         let (_d, conn) = conn();
