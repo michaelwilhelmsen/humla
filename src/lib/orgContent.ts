@@ -2,11 +2,18 @@ import { useEffect, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { ipc, type SummaryPrompt } from "./ipc";
 import { useCloudStore } from "./cloud";
-import type { OrgSummary } from "./orgPolicy";
+import type { AdminOrg, OrgSummary } from "./orgPolicy";
 import { SUMMARY_PRESETS, presetLabel } from "./presets";
 
 export function isOrgTemplate(t: SummaryPrompt): boolean {
   return !!t.org_id;
+}
+
+/** The server's `client_id` of an organisation template, from its row id
+ *  (`org_policy::template_row_id`). */
+export function orgTemplateClientId(t: SummaryPrompt): string | null {
+  const prefix = `org_${t.org_id}_`;
+  return t.org_id && t.id.startsWith(prefix) ? t.id.slice(prefix.length) : null;
 }
 
 /** Whether an organisation template is offered in `workspaceId`. In Personal
@@ -111,4 +118,48 @@ export function useOrgs(): OrgSummary[] {
     };
   }, [cloudStatus, version]);
   return orgs;
+}
+
+/** The organisations the signed-in user administers, asked of the server.
+ *  Signed out, offline or on any failure there are none, so nothing offers to
+ *  edit what can't be saved. */
+export function useAdminOrgs(): AdminOrg[] {
+  const [orgs, setOrgs] = useState<AdminOrg[]>([]);
+  const loggedIn = useCloudStore((s) => s.status.logged_in);
+  const userId = useCloudStore((s) => s.status.user?.id ?? "");
+  useEffect(() => {
+    if (!loggedIn) {
+      setOrgs([]);
+      return;
+    }
+    let cancelled = false;
+    ipc
+      .orgAdminOrgs()
+      .then((next) => !cancelled && setOrgs(next ?? []))
+      .catch(() => !cancelled && setOrgs([]));
+    return () => {
+      cancelled = true;
+    };
+  }, [loggedIn, userId]);
+  return orgs;
+}
+
+/** Of `orgs`, the ones the user can edit here: administered, and not waiting
+ *  on the two-factor authentication the organisation requires (`locked`). */
+export function editableOrgs(
+  orgs: OrgSummary[],
+  admin: AdminOrg[],
+  twoFactorOn: boolean,
+): { editable: OrgSummary[]; locked: OrgSummary[] } {
+  const adminOf = (o: OrgSummary) => admin.find((a) => a.id === o.id);
+  return {
+    editable: orgs.filter((o) => {
+      const a = adminOf(o);
+      return a && (!a.require_2fa || twoFactorOn);
+    }),
+    locked: orgs.filter((o) => {
+      const a = adminOf(o);
+      return a && a.require_2fa && !twoFactorOn;
+    }),
+  };
 }

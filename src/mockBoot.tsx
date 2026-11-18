@@ -2008,6 +2008,13 @@ const CASES: Record<string, Scenario> = {
     render: () => null, // unused — `route` renders the app
     ipc: settingsOrgIpc(),
   },
+  // `settings-org-admin` is the same user as one of the organisation's admins,
+  // who edits its templates and terms. Saves are logged, not applied.
+  "settings-org-admin": {
+    route: `/settings?tab=${new URLSearchParams(location.search).get("section") ?? "templates"}`,
+    render: () => null, // unused — `route` renders the app
+    ipc: settingsOrgIpc({ admin: true }),
+  },
 
   // --- Settings → Account, signed in to a workspace. `account-policies` adds an
   // organisation enforcing every policy; `-signed-out` is the same after
@@ -2154,7 +2161,7 @@ function settingsContentIpc(
   };
 }
 
-function settingsOrgIpc(): Record<string, Handler> {
+function settingsOrgIpc({ admin = false }: { admin?: boolean } = {}): Record<string, Handler> {
   const base = settingsContentIpc("member");
   const intake: CloudWorkspace = { id: "w1", name: "Intake", role: "member", plan_status: "active" };
   const homeCare: CloudWorkspace = { id: "w2", name: "Home care", role: "member", plan_status: "active" };
@@ -2172,8 +2179,8 @@ function settingsOrgIpc(): Record<string, Handler> {
   return {
     ...base,
     summary_prompts_list: () => [
-      org("org-case", "Case meeting", "Record the decision, who owns each action, and the deadline.", []),
-      org("org-intake", "Intake review", "List the needs raised, the services offered, and the next contact.", ["w1", "w2"]),
+      org("org_o1_case", "Case meeting", "Record the decision, who owns each action, and the deadline.", []),
+      org("org_o1_intake", "Intake review", "List the needs raised, the services offered, and the next contact.", ["w1", "w2"]),
       ...own,
     ],
     cloud_status: () => ({
@@ -2185,6 +2192,20 @@ function settingsOrgIpc(): Record<string, Handler> {
       current_workspace: intake,
       workspaces: [intake, homeCare],
     }),
+    ...(admin
+      ? {
+          org_admin_orgs: () => [{ id: "o1", name: "Northwind", require_2fa: false }],
+          org_template_open: (args) => ({
+            name: (args as { clientId: string }).clientId === "intake" ? "Intake review" : "Case meeting",
+            content: "Record the decision, who owns each action, and the deadline.",
+            workspaces: (args as { clientId: string }).clientId === "intake" ? ["w1", "w2"] : [],
+            hidden: (args as { clientId: string }).clientId === "intake" ? 1 : 0,
+          }),
+          org_template_save: (args) => console.log("[mock] org_template_save", args),
+          org_template_delete: (args) => console.log("[mock] org_template_delete", args),
+          org_vocabulary_edit: (args) => console.log("[mock] org_vocabulary_edit", args),
+        }
+      : {}),
     org_status: () => ({
       policy: {
         org_name: null,

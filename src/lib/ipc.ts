@@ -3,7 +3,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { Provider, SummaryProvider } from "./providers";
 import type { SpeakerLabelStat } from "./speakerSuggest";
 import { targetFolderId, targetNoteId, type ChatTarget } from "./chatTarget";
-import type { AudioSweep, OrgStatus } from "./orgPolicy";
+import type { AdminOrg, AudioSweep, OrgStatus, OrgTemplateDraft } from "./orgPolicy";
 
 export type CopilotStatus = {
   login: string | null;
@@ -864,6 +864,22 @@ export const ipc = {
   orgAudioNotice: () => invoke<AudioSweep | null>("org_audio_notice"),
   /** Deletes every note's stored audio for `orgId`'s policy; returns the file count. */
   orgAudioSweep: (orgId: string) => invoke<number>("org_audio_sweep", { orgId }),
+  /** The organisations the signed-in user administers. */
+  orgAdminOrgs: () => invoke<AdminOrg[]>("org_admin_orgs"),
+  orgTemplateOpen: (orgId: string, clientId: string) =>
+    invoke<OrgTemplateDraft>("org_template_open", { orgId, clientId }),
+  /** Creates when `clientId` is null; `workspaces` null is every department. */
+  orgTemplateSave: (
+    orgId: string,
+    clientId: string | null,
+    name: string,
+    content: string,
+    workspaces: string[] | null,
+  ) => invoke<void>("org_template_save", { orgId, clientId, name, content, workspaces }),
+  orgTemplateDelete: (orgId: string, clientId: string) =>
+    invoke<void>("org_template_delete", { orgId, clientId }),
+  orgVocabularyEdit: (orgId: string, add: string[], remove: string[]) =>
+    invoke<void>("org_vocabulary_edit", { orgId, add, remove }),
 };
 
 export type PermissionKind = "microphone" | "screen" | "notifications";

@@ -228,4 +228,232 @@ describe("TemplatesSection", () => {
       ]);
     });
   });
+  describe("as an organisation admin", () => {
+    const intake = { id: "ws1", name: "Intake", role: "member" } as CloudWorkspace;
+    const homeCare = { id: "ws2", name: "Home care", role: "member" } as CloudWorkspace;
+    const policy = {
+      org_name: null,
+      reason: null,
+      local_only: false,
+      retention_days: 0,
+      telemetry_off: false,
+      audio_forbidden: false,
+      rules: [],
+    };
+    const orgStatus = {
+      policy,
+      orgs: [{ id: "o1", name: "Northwind", reason: "", vocabulary: [], workspaces: ["ws1", "ws2"] }],
+    };
+    const orgTemplate = (clientId: string, name: string, departments: string[]): SummaryPrompt => ({
+      ...prompt(`org_o1_${clientId}`, name),
+      org_id: "o1",
+      org_workspaces: departments,
+    });
+    const rows = () => [orgTemplate("case", "Case meeting", []), orgTemplate("home", "Home visit", ["ws2"])];
+
+    function signedIn(twoFactor = false) {
+      useCloudStore.setState({
+        status: {
+          ...DISCONNECTED,
+          configured: true,
+          logged_in: true,
+          user: { id: "u1", email: "a@example.no", name: "A", verified: true },
+          current_workspace: intake,
+          workspaces: [intake, homeCare],
+          two_factor: { available: true, enabled: twoFactor, recovery_codes_left: 0, required_by: [] },
+        },
+        ready: true,
+      });
+    }
+
+    async function orgGroup() {
+      return (await screen.findByRole("heading", { name: "From your organisation" })).closest("section")!;
+    }
+
+    it("leaves a member's view read-only", async () => {
+      signedIn();
+      mockTauri({ org_status: () => orgStatus, summary_prompts_list: rows, org_admin_orgs: () => [] });
+      render(<TemplatesSection language="en" />);
+      const group = await orgGroup();
+      expect(await within(group).findByText("Case meeting")).toBeInTheDocument();
+      expect(within(group).queryByText("Home visit")).toBeNull();
+      expect(within(group).queryByRole("button", { name: /^Edit / })).toBeNull();
+      expect(within(group).queryByRole("button", { name: /new template/i })).toBeNull();
+    });
+
+    it("never asks the server signed out", async () => {
+      const asked = vi.fn(() => [{ id: "o1", name: "Northwind", require_2fa: false }]);
+      mockTauri({ org_status: () => orgStatus, summary_prompts_list: rows, org_admin_orgs: asked });
+      render(<TemplatesSection language="en" />);
+      const group = await orgGroup();
+      await within(group).findByText("Case meeting");
+      expect(asked).not.toHaveBeenCalled();
+      expect(within(group).queryByRole("button", { name: /^Edit / })).toBeNull();
+    });
+
+    it("lists every one of the organisation's templates to an admin, editable", async () => {
+      signedIn();
+      mockTauri({
+        org_status: () => orgStatus,
+        summary_prompts_list: rows,
+        org_admin_orgs: () => [{ id: "o1", name: "Northwind", require_2fa: false }],
+      });
+      render(<TemplatesSection language="en" />);
+      const group = await orgGroup();
+      expect(await within(group).findByRole("button", { name: "Edit Home visit" })).toBeInTheDocument();
+      expect(within(group).getByRole("button", { name: "Edit Case meeting" })).toBeInTheDocument();
+      expect(within(group).getByRole("button", { name: "Delete Case meeting" })).toBeInTheDocument();
+      expect(within(group).getByText("Home care")).toBeInTheDocument();
+    });
+
+    it("creates one for chosen departments", async () => {
+      signedIn();
+      const saved = vi.fn(() => null);
+      mockTauri({
+        org_status: () => orgStatus,
+        summary_prompts_list: rows,
+        org_admin_orgs: () => [{ id: "o1", name: "Northwind", require_2fa: false }],
+        org_template_save: saved,
+      });
+      render(<TemplatesSection language="en" />);
+      const group = await orgGroup();
+      await userEvent.click(await within(group).findByRole("button", { name: /new template/i }));
+      const editor = await screen.findByRole("dialog", { name: "New organisation template" });
+      await userEvent.type(within(editor).getByLabelText("Name"), "Intake review");
+      await userEvent.type(within(editor).getByLabelText("Instructions"), "Needs first.");
+      await userEvent.click(within(editor).getByRole("radio", { name: "Some departments" }));
+      expect(within(editor).getByRole("button", { name: "Save template" })).toBeDisabled();
+      await userEvent.click(within(editor).getByRole("checkbox", { name: "Intake" }));
+      await userEvent.click(within(editor).getByRole("button", { name: "Save template" }));
+      expect(saved).toHaveBeenCalledWith({
+        orgId: "o1",
+        clientId: null,
+        name: "Intake review",
+        content: "Needs first.",
+        workspaces: ["ws1"],
+      });
+      expect(screen.queryByRole("dialog", { name: "New organisation template" })).toBeNull();
+    });
+
+    it("edits one from the server's copy and keeps departments it can't show", async () => {
+      signedIn();
+      const opened = vi.fn(() => ({ name: "Home visit", content: "Server text", workspaces: ["ws2"], hidden: 2 }));
+      const saved = vi.fn(() => null);
+      mockTauri({
+        org_status: () => orgStatus,
+        summary_prompts_list: rows,
+        org_admin_orgs: () => [{ id: "o1", name: "Northwind", require_2fa: false }],
+        org_template_open: opened,
+        org_template_save: saved,
+      });
+      render(<TemplatesSection language="en" />);
+      await userEvent.click(await screen.findByRole("button", { name: "Edit Home visit" }));
+      expect(opened).toHaveBeenCalledWith({ orgId: "o1", clientId: "home" });
+      const editor = await screen.findByRole("dialog", { name: "Edit organisation template" });
+      expect(within(editor).getByLabelText("Instructions")).toHaveValue("Server text");
+      expect(within(editor).getByRole("radio", { name: "Some departments" })).toHaveAttribute("aria-checked", "true");
+      expect(within(editor).getByRole("checkbox", { name: "Home care" })).toBeChecked();
+      expect(within(editor).getByRole("checkbox", { name: "Intake" })).not.toBeChecked();
+      expect(within(editor).getByText("Also offered in 2 departments you're not in.")).toBeInTheDocument();
+      // Unticking every department shown still leaves the hidden ones.
+      await userEvent.click(within(editor).getByRole("checkbox", { name: "Home care" }));
+      expect(within(editor).getByRole("button", { name: "Save template" })).toBeEnabled();
+      await userEvent.click(within(editor).getByRole("checkbox", { name: "Intake" }));
+      await userEvent.click(within(editor).getByRole("button", { name: "Save template" }));
+      expect(saved).toHaveBeenCalledWith({
+        orgId: "o1",
+        clientId: "home",
+        name: "Home visit",
+        content: "Server text",
+        workspaces: ["ws1"],
+      });
+    });
+
+    it("offers it in every department again", async () => {
+      signedIn();
+      const saved = vi.fn(() => null);
+      mockTauri({
+        org_status: () => orgStatus,
+        summary_prompts_list: rows,
+        org_admin_orgs: () => [{ id: "o1", name: "Northwind", require_2fa: false }],
+        org_template_open: () => ({ name: "Home visit", content: "x", workspaces: ["ws2"], hidden: 0 }),
+        org_template_save: saved,
+      });
+      render(<TemplatesSection language="en" />);
+      await userEvent.click(await screen.findByRole("button", { name: "Edit Home visit" }));
+      const editor = await screen.findByRole("dialog", { name: "Edit organisation template" });
+      await userEvent.click(within(editor).getByRole("radio", { name: "Every department" }));
+      expect(within(editor).queryByRole("checkbox")).toBeNull();
+      await userEvent.click(within(editor).getByRole("button", { name: "Save template" }));
+      expect(saved).toHaveBeenCalledWith(expect.objectContaining({ clientId: "home", workspaces: null }));
+    });
+
+    it("deletes one for everyone after an inline confirm", async () => {
+      signedIn();
+      const deleted = vi.fn(() => null);
+      mockTauri({
+        org_status: () => orgStatus,
+        summary_prompts_list: rows,
+        org_admin_orgs: () => [{ id: "o1", name: "Northwind", require_2fa: false }],
+        org_template_delete: deleted,
+      });
+      render(<TemplatesSection language="en" />);
+      await userEvent.click(await screen.findByRole("button", { name: "Delete Case meeting" }));
+      expect(deleted).not.toHaveBeenCalled();
+      expect(screen.getByText("Delete “Case meeting” for everyone?")).toBeInTheDocument();
+      await userEvent.click(screen.getByRole("button", { name: "Delete" }));
+      expect(deleted).toHaveBeenCalledWith({ orgId: "o1", clientId: "case" });
+    });
+
+    it("shows a refused save in the editor and keeps it open", async () => {
+      signedIn();
+      mockTauri({
+        org_status: () => orgStatus,
+        summary_prompts_list: rows,
+        org_admin_orgs: () => [{ id: "o1", name: "Northwind", require_2fa: false }],
+        org_template_open: () => ({ name: "Case meeting", content: "x", workspaces: [], hidden: 0 }),
+        org_template_save: () => {
+          throw "Only Northwind's admins can change this.";
+        },
+      });
+      render(<TemplatesSection language="en" />);
+      await userEvent.click(await screen.findByRole("button", { name: "Edit Case meeting" }));
+      const editor = await screen.findByRole("dialog", { name: "Edit organisation template" });
+      await userEvent.click(within(editor).getByRole("button", { name: "Save template" }));
+      expect(await within(editor).findByRole("alert")).toHaveTextContent("Only Northwind's admins can change this.");
+    });
+
+    it("shows a refused delete under the group", async () => {
+      signedIn();
+      mockTauri({
+        org_status: () => orgStatus,
+        summary_prompts_list: rows,
+        org_admin_orgs: () => [{ id: "o1", name: "Northwind", require_2fa: false }],
+        org_template_delete: () => {
+          throw "Couldn't reach the server. Try again when you're online.";
+        },
+      });
+      render(<TemplatesSection language="en" />);
+      await userEvent.click(await screen.findByRole("button", { name: "Delete Case meeting" }));
+      await userEvent.click(screen.getByRole("button", { name: "Delete" }));
+      const group = await orgGroup();
+      expect(await within(group).findByRole("alert")).toHaveTextContent("Couldn't reach the server.");
+    });
+
+    it("asks for two-factor authentication before an admin can edit where it's required", async () => {
+      signedIn(false);
+      mockTauri({
+        org_status: () => orgStatus,
+        summary_prompts_list: rows,
+        org_admin_orgs: () => [{ id: "o1", name: "Northwind", require_2fa: true }],
+      });
+      render(<TemplatesSection language="en" />);
+      const group = await orgGroup();
+      expect(
+        await within(group).findByText(/Northwind requires two-factor authentication to edit its templates/),
+      ).toBeInTheDocument();
+      expect(within(group).queryByRole("button", { name: /^Edit / })).toBeNull();
+      expect(within(group).queryByRole("button", { name: /new template/i })).toBeNull();
+    });
+  });
 });

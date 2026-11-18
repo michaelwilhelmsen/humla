@@ -36,6 +36,13 @@ export type OrgSummary = {
   workspaces: string[];
 };
 
+/** Mirrors `commands::org_admin::AdminOrg`. */
+export type AdminOrg = { id: string; name: string; require_2fa: boolean };
+
+/** Mirrors `commands::org_admin::OrgTemplateDraft`: `workspaces` are the
+ *  user's own departments, `hidden` counts the others it is offered to. */
+export type OrgTemplateDraft = { name: string; content: string; workspaces: string[]; hidden: number };
+
 /** Days of retention per workspace, from `org_policy::retention_scope`. */
 export type RetentionScope = Record<string, number>;
 

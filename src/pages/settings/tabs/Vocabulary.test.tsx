@@ -4,6 +4,7 @@ import { mockTauri } from "../../../test/tauri";
 import userEvent from "@testing-library/user-event";
 import { VocabularySection, VOCABULARY_LIMIT, parseVocabulary } from "./Vocabulary";
 import { DEFAULTS, type EditableKey } from "../types";
+import { DISCONNECTED, useCloudStore } from "../../../lib/cloud";
 
 function renderWith(stored: string) {
   const update = vi.fn(async () => {});
@@ -84,5 +85,84 @@ describe("VocabularySection with an organisation", () => {
     await new Promise((r) => setTimeout(r, 0));
     expect(screen.queryByRole("list", { name: "Organisation terms" })).toBeNull();
     expect(screen.getAllByRole("heading", { level: 2 }).map((h) => h.textContent)).toEqual(["Your terms"]);
+  });
+});
+
+describe("VocabularySection for an organisation admin", () => {
+  const status = {
+    policy: { org_name: null, reason: null, local_only: false, retention_days: 0, telemetry_off: false, audio_forbidden: false, rules: [] },
+    orgs: [{ id: "o1", name: "Northwind", reason: "", vocabulary: ["Northwind", "Fjord"], workspaces: ["w1"] }],
+  };
+
+  function signedIn(twoFactor = false) {
+    useCloudStore.setState({
+      status: {
+        ...DISCONNECTED,
+        configured: true,
+        logged_in: true,
+        user: { id: "u1", email: "a@example.no", name: "A", verified: true },
+        two_factor: { available: true, enabled: twoFactor, recovery_codes_left: 0, required_by: [] },
+      },
+      ready: true,
+    });
+  }
+
+  it("edits the organisation's terms on the server", async () => {
+    signedIn();
+    const edited = vi.fn(() => null);
+    mockTauri({
+      org_status: () => status,
+      org_admin_orgs: () => [{ id: "o1", name: "Northwind", require_2fa: false }],
+      org_vocabulary_edit: edited,
+    });
+    const update = renderWith("Tauri");
+    const list = await screen.findByRole("list", { name: "Northwind terms" });
+    expect(within(list).getAllByRole("listitem").map((li) => li.textContent)).toEqual(["Northwind", "Fjord"]);
+    expect(screen.queryByRole("list", { name: "Organisation terms" })).toBeNull();
+
+    await userEvent.click(screen.getByRole("button", { name: "Remove Fjord from Northwind" }));
+    expect(edited).toHaveBeenCalledWith({ orgId: "o1", add: [], remove: ["Fjord"] });
+
+    await userEvent.type(screen.getByLabelText("Add a term for Northwind"), "IPLOS, AI{Enter}");
+    expect(edited).toHaveBeenCalledWith({ orgId: "o1", add: ["IPLOS"], remove: [] });
+    expect(screen.getByLabelText("Add a term for Northwind")).toHaveValue("");
+    expect(update).not.toHaveBeenCalled();
+  });
+
+  it("shows a refused edit and keeps what was typed", async () => {
+    signedIn();
+    mockTauri({
+      org_status: () => status,
+      org_admin_orgs: () => [{ id: "o1", name: "Northwind", require_2fa: false }],
+      org_vocabulary_edit: () => {
+        throw "Only Northwind's admins can change this.";
+      },
+    });
+    renderWith("");
+    await userEvent.type(await screen.findByLabelText("Add a term for Northwind"), "IPLOS{Enter}");
+    expect(await screen.findByRole("alert")).toHaveTextContent("Only Northwind's admins can change this.");
+    expect(screen.getByLabelText("Add a term for Northwind")).toHaveValue("IPLOS");
+  });
+
+  it("keeps a member's terms locked", async () => {
+    signedIn();
+    mockTauri({ org_status: () => status, org_admin_orgs: () => [] });
+    renderWith("");
+    expect(await screen.findByRole("list", { name: "Organisation terms" })).toBeInTheDocument();
+    expect(screen.queryByLabelText("Add a term for Northwind")).toBeNull();
+  });
+
+  it("asks for two-factor authentication where the organisation requires it", async () => {
+    signedIn(false);
+    mockTauri({
+      org_status: () => status,
+      org_admin_orgs: () => [{ id: "o1", name: "Northwind", require_2fa: true }],
+    });
+    renderWith("");
+    expect(
+      await screen.findByText(/Northwind requires two-factor authentication to edit its terms/),
+    ).toBeInTheDocument();
+    expect(screen.queryByLabelText("Add a term for Northwind")).toBeNull();
+    expect(screen.getByRole("list", { name: "Organisation terms" })).toBeInTheDocument();
   });
 });
