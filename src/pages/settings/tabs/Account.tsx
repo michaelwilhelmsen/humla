@@ -92,7 +92,7 @@ export function AccountTab({ s, update }: Pick<SettingsHook, "s" | "update">) {
   const [error, setError] = useState<string | null>(null);
   const [verifyMsg, setVerifyMsg] = useState<string | null>(null);
   const [resetMsg, setResetMsg] = useState<string | null>(null);
-  const auth = useCloudSignIn();
+  const auth = useCloudSignIn(email);
 
   // A session that ended by itself names its account, so the form can ask the
   // user back without them retyping it. Status arrives after the first render.
@@ -307,7 +307,8 @@ export function AccountTab({ s, update }: Pick<SettingsHook, "s" | "update">) {
         )}
         <Row label="Email">
           <input className={inputCls} type="email" autoComplete="username" value={email}
-            onChange={(e) => setEmail(e.target.value)} placeholder="you@example.com" />
+            onChange={(e) => setEmail(e.target.value)} onBlur={auth.emailBlurred}
+            placeholder="you@example.com" />
         </Row>
         <Row label="Password">
           <input className={inputCls} type="password"

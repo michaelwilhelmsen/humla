@@ -1036,6 +1036,7 @@ function workspaceCase(stage: "connect" | "auth" | "name" | "trial" | "invite"):
     render: () => <WorkspaceHarness status={status} pinned={stage === "trial" || stage === "invite"} />,
     ipc: {
       cloud_status: () => status,
+      cloud_sign_in_methods: signInMethodsByDomain(false),
       cloud_create_workspace: () => ws("none"),
       cloud_invite_member: () => "invited",
       cloud_billing_checkout: () => "https://checkout.stripe.test/x",
@@ -2128,9 +2129,16 @@ const CASES: Record<string, Scenario> = {
     },
   },
 
-  // --- Sign in with Microsoft. Settings → Account, signed out, on a server
-  // that offers it. `-wait` keeps the browser out until Cancel; `-refused` is a
-  // tenant no organisation has; `-two-factor` goes on to the code step.
+  // --- Sign in with Microsoft. Settings → Account, signed out. The button
+  // shows once the email is at rana.kommune.no (not for gmail.com); on
+  // `-everyone` it shows for any email. `-wait` keeps the browser out until
+  // Cancel; `-refused` is a tenant no organisation has; `-two-factor` goes on
+  // to the code step.
+  "microsoft-sign-in-everyone": {
+    route: "/settings?tab=account",
+    render: () => null, // unused — `route` renders the app
+    ipc: microsoftIpc(() => new Promise(() => {}), true),
+  },
   "microsoft-sign-in-wait": {
     route: "/settings?tab=account",
     render: () => null, // unused — `route` renders the app
@@ -2165,11 +2173,24 @@ const CASES: Record<string, Scenario> = {
   },
 };
 
-function microsoftIpc(login: () => Promise<unknown>): Record<string, (args: unknown) => unknown> {
+/** humla-cloud's `sign-in-methods`: Microsoft for rana.kommune.no addresses,
+ *  or for everyone. */
+function signInMethodsByDomain(everyone: boolean): Handler {
+  return async (args) => {
+    const email = (args as { email?: string } | undefined)?.email ?? "";
+    await new Promise((r) => setTimeout(r, 150));
+    return { microsoft: everyone || email.toLowerCase().endsWith("@rana.kommune.no") };
+  };
+}
+
+function microsoftIpc(
+  login: () => Promise<unknown>,
+  everyone = false,
+): Record<string, (args: unknown) => unknown> {
   let cancel: ((e: unknown) => void) | null = null;
   return {
     cloud_status: () => ({ ...DISCONNECTED, configured: true, base_url: "https://sync.humla.team" }),
-    cloud_sign_in_methods: () => ({ microsoft: true }),
+    cloud_sign_in_methods: signInMethodsByDomain(everyone),
     cloud_login_microsoft: () =>
       new Promise((resolve, reject) => {
         cancel = reject;

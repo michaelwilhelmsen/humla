@@ -50,22 +50,52 @@ pub(crate) fn redirect_url(base: &str) -> String {
     format!("{}/api/oauth2-redirect", base.trim_end_matches('/'))
 }
 
-/// The provider's `authURL` with `state` set to the realtime client id and
-/// `redirect_uri` to the server's redirect page. Only an http(s) URL is opened.
-pub(crate) fn browser_url(auth_url: &str, client_id: &str, redirect: &str) -> Option<String> {
+/// The provider's `authURL` with `state` set to the realtime client id,
+/// `redirect_uri` to the server's redirect page and `login_hint` to the email
+/// typed in the form, if any. Only an http(s) URL is opened.
+pub(crate) fn browser_url(
+    auth_url: &str,
+    client_id: &str,
+    redirect: &str,
+    login_hint: &str,
+) -> Option<String> {
     let mut url = reqwest::Url::parse(auth_url).ok()?;
     if !matches!(url.scheme(), "https" | "http") {
         return None;
     }
     let mut pairs: Vec<(String, String)> = url
         .query_pairs()
-        .filter(|(k, _)| k != "state" && k != "redirect_uri")
+        .filter(|(k, _)| k != "state" && k != "redirect_uri" && k != "login_hint")
         .map(|(k, v)| (k.into_owned(), v.into_owned()))
         .collect();
     pairs.push(("state".into(), client_id.into()));
     pairs.push(("redirect_uri".into(), redirect.into()));
+    let login_hint = login_hint.trim();
+    if !login_hint.is_empty() {
+        pairs.push(("login_hint".into(), login_hint.into()));
+    }
     url.query_pairs_mut().clear().extend_pairs(pairs);
     Some(url.into())
+}
+
+/// humla-cloud's answer to whether `email` signs in with Microsoft. A blank
+/// email asks whether the server offers it to everyone.
+pub(crate) fn sign_in_methods_url(base: &str, email: &str) -> Option<String> {
+    let mut url =
+        reqwest::Url::parse(&format!("{}/api/humla/sign-in-methods", base.trim_end_matches('/')))
+            .ok()?;
+    let email = email.trim();
+    if !email.is_empty() {
+        url.query_pairs_mut().append_pair("email", email);
+    }
+    Some(url.into())
+}
+
+/// Anything but a 2xx answer saying `microsoft: true` is no Microsoft; an older
+/// server answers 404.
+pub(crate) fn parse_sign_in_methods(status: u16, body: &Value) -> SignInMethods {
+    let offered = body.get("microsoft").and_then(Value::as_bool).unwrap_or(false);
+    SignInMethods { microsoft: (200..300).contains(&status) && offered }
 }
 
 /// One server-sent event.
@@ -272,6 +302,7 @@ impl Realtime {
 /// The flow up to the server's answer. `open_browser` gets the provider URL.
 async fn microsoft_login(
     base: &str,
+    login_hint: &str,
     open_browser: impl FnOnce(String) -> Result<(), String>,
 ) -> Result<PasswordLogin, CloudError> {
     let provider = fetch_provider(base).await?;
@@ -292,9 +323,11 @@ async fn microsoft_login(
     }
 
     let redirect = redirect_url(base);
-    let url = browser_url(&provider.auth_url, &client_id, &redirect).ok_or_else(did_not_finish)?;
-    open_browser(url).map_err(|e| {
-        eprintln!("cloud: microsoft sign-in: couldn't open the browser: {e}");
+    let url = browser_url(&provider.auth_url, &client_id, &redirect, login_hint)
+        .ok_or_else(did_not_finish)?;
+    // The error may carry the URL, and with it the login hint.
+    open_browser(url).map_err(|_| {
+        eprintln!("cloud: microsoft sign-in: couldn't open the browser");
         failure("failed", "Couldn't open your browser.")
     })?;
 
@@ -329,27 +362,44 @@ fn open_in_browser(app: &tauri::AppHandle, url: String) -> Result<(), String> {
     tauri_plugin_shell::ShellExt::shell(app).open(url, None).map_err(|e| e.to_string())
 }
 
-#[derive(Default, Serialize)]
+#[derive(Debug, Default, PartialEq, Serialize)]
 pub struct SignInMethods {
     pub microsoft: bool,
 }
 
-/// The sign-in methods the configured server offers beside the password.
+/// The sign-in methods the configured server offers `email` beside the
+/// password; with no email, the ones it offers everyone.
 #[tauri::command]
-pub async fn cloud_sign_in_methods(state: State<'_, AppState>) -> Result<SignInMethods, String> {
-    let Some(base) = super::cloud::read_base_url(&state) else {
+pub async fn cloud_sign_in_methods(
+    state: State<'_, AppState>,
+    email: Option<String>,
+) -> Result<SignInMethods, String> {
+    let Some(url) = super::cloud::read_base_url(&state)
+        .and_then(|base| sign_in_methods_url(&base, email.as_deref().unwrap_or("")))
+    else {
         return Ok(SignInMethods::default());
     };
-    Ok(SignInMethods { microsoft: fetch_provider(&base).await.is_ok() })
+    match http().get(url).send().await {
+        Ok(resp) => {
+            let (status, body) = status_and_body(resp).await;
+            Ok(parse_sign_in_methods(status, &body))
+        }
+        Err(e) => {
+            log("sign-in-methods", e);
+            Ok(SignInMethods::default())
+        }
+    }
 }
 
 /// Sign in with Microsoft in the system browser. Resolves once the browser
 /// comes back, the user cancels ([`cloud_cancel_microsoft`]) or five minutes
 /// pass; an account with two-factor authentication goes on to the code step.
+/// `email`, the address typed in the form, prefills Microsoft's sign-in page.
 #[tauri::command]
 pub async fn cloud_login_microsoft(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
+    email: Option<String>,
 ) -> Result<SignInStep, CloudError> {
     let base = super::cloud::read_base_url(&state)
         .ok_or_else(|| CloudError::from(NOT_CONFIGURED.to_string()))?;
@@ -358,7 +408,7 @@ pub async fn cloud_login_microsoft(
     *ATTEMPT.lock() = Some((id, tx));
 
     let outcome = tokio::select! {
-        r = microsoft_login(&base, |url| open_in_browser(&app, url)) => r,
+        r = microsoft_login(&base, email.as_deref().unwrap_or(""), |url| open_in_browser(&app, url)) => r,
         _ = stopped => Err(cancelled()),
         _ = tokio::time::sleep(WAIT) => Err(timed_out()),
     };
@@ -405,7 +455,7 @@ mod tests {
         };
         let opened = std::sync::Arc::new(Mutex::new(None::<String>));
         let seen = opened.clone();
-        let outcome = microsoft_login(&base, move |url| {
+        let outcome = microsoft_login(&base, "", move |url| {
             let parsed = reqwest::Url::parse(&url).map_err(|e| e.to_string())?;
             let q = |k: &str| parsed.query_pairs().find(|(n, _)| n == k).map(|(_, v)| v.into_owned());
             let (state, redirect) = (q("state").unwrap(), q("redirect_uri").unwrap());
@@ -459,6 +509,7 @@ mod tests {
             "https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize?client_id=abc&code_challenge=c%2Bd&response_type=code&scope=User.Read&state=server-state&redirect_uri=",
             "client-1",
             &redirect,
+            "",
         )
         .unwrap();
         let parsed = reqwest::Url::parse(&url).unwrap();
@@ -471,15 +522,69 @@ mod tests {
         assert_eq!(get("code_challenge"), ["c+d"]);
         assert_eq!(get("scope"), ["User.Read"]);
         assert_eq!(parsed.path(), "/organizations/oauth2/v2.0/authorize");
+        assert!(get("login_hint").is_empty());
 
-        let added = browser_url("https://login.example/authorize?client_id=abc", "c", &redirect).unwrap();
+        let added = browser_url("https://login.example/authorize?client_id=abc", "c", &redirect, "  ").unwrap();
         assert!(added.contains("state=c") && added.contains("redirect_uri="));
+        assert!(!added.contains("login_hint"));
+    }
+
+    #[test]
+    fn the_typed_email_goes_to_microsoft_as_the_login_hint() {
+        let url = browser_url(
+            "https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize?client_id=abc&login_hint=old",
+            "c",
+            "https://sync.example.no/api/oauth2-redirect",
+            " kari+humla@rana.kommune.no ",
+        )
+        .unwrap();
+        assert!(url.contains("login_hint=kari%2Bhumla%40rana.kommune.no"), "{url}");
+        let parsed = reqwest::Url::parse(&url).unwrap();
+        let hints: Vec<String> =
+            parsed.query_pairs().filter(|(k, _)| k == "login_hint").map(|(_, v)| v.into_owned()).collect();
+        assert_eq!(hints, ["kari+humla@rana.kommune.no"]);
+    }
+
+    #[test]
+    fn the_lookup_carries_the_email_encoded_and_none_when_blank() {
+        assert_eq!(
+            sign_in_methods_url("https://sync.example.no/", "").as_deref(),
+            Some("https://sync.example.no/api/humla/sign-in-methods")
+        );
+        assert_eq!(
+            sign_in_methods_url("https://sync.example.no", "   ").as_deref(),
+            Some("https://sync.example.no/api/humla/sign-in-methods")
+        );
+        let url = sign_in_methods_url("https://sync.example.no", " kari+x@rana.kommune.no&y=1 ").unwrap();
+        assert_eq!(
+            url,
+            "https://sync.example.no/api/humla/sign-in-methods?email=kari%2Bx%40rana.kommune.no%26y%3D1"
+        );
+        let parsed = reqwest::Url::parse(&url).unwrap();
+        let q: Vec<(String, String)> =
+            parsed.query_pairs().map(|(k, v)| (k.into_owned(), v.into_owned())).collect();
+        assert_eq!(q, [("email".to_string(), "kari+x@rana.kommune.no&y=1".to_string())]);
+        assert_eq!(sign_in_methods_url("not a url", "a@b.no"), None);
+    }
+
+    #[test]
+    fn microsoft_is_offered_only_when_the_server_says_so() {
+        let yes = SignInMethods { microsoft: true };
+        let no = SignInMethods { microsoft: false };
+        assert_eq!(parse_sign_in_methods(200, &json!({ "microsoft": true })), yes);
+        assert_eq!(parse_sign_in_methods(200, &json!({ "microsoft": false })), no);
+        assert_eq!(parse_sign_in_methods(200, &json!({ "microsoft": "true" })), no);
+        assert_eq!(parse_sign_in_methods(200, &json!({})), no);
+        assert_eq!(parse_sign_in_methods(200, &Value::Null), no);
+        assert_eq!(parse_sign_in_methods(404, &json!({ "microsoft": true })), no);
+        assert_eq!(parse_sign_in_methods(404, &json!({ "message": "The requested resource wasn't found." })), no);
+        assert_eq!(parse_sign_in_methods(500, &json!({ "microsoft": true })), no);
     }
 
     #[test]
     fn only_a_web_url_is_opened() {
-        assert_eq!(browser_url("file:///etc/passwd?state=x", "c", "r"), None);
-        assert_eq!(browser_url("not a url", "c", "r"), None);
+        assert_eq!(browser_url("file:///etc/passwd?state=x", "c", "r", ""), None);
+        assert_eq!(browser_url("not a url", "c", "r", ""), None);
     }
 
     #[test]

@@ -356,11 +356,10 @@ function ConnectStage() {
 
 function AuthStage({ mode: initialMode }: { mode: "signup" | "signin" }) {
   const status = useCloudStore((s) => s.status);
-  const auth = useCloudSignIn();
-
   const [mode, setMode] = useState(initialMode);
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
+  const auth = useCloudSignIn(email);
   const [password, setPassword] = useState("");
   const { busy, error } = auth;
 
@@ -413,6 +412,7 @@ function AuthStage({ mode: initialMode }: { mode: "signup" | "signin" }) {
         autoComplete="username"
         value={email}
         onChange={(e) => setEmail(e.target.value)}
+        onBlur={auth.emailBlurred}
         placeholder="you@example.com"
         className={inputCls}
       />
