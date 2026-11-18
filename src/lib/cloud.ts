@@ -7,6 +7,7 @@
 
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import type { SyncStatus } from "./ipc";
 
 /**
@@ -30,6 +31,31 @@ export type CloudWorkspace = {
   /** Every member must have two-factor authentication to open it. */
   require_2fa?: boolean;
 };
+
+/** An invite to an organisation's department, waiting for the user's answer.
+ *  Mirrors `commands::invites::OrgInvite`. */
+export type OrgInvite = {
+  id: string;
+  workspace_id: string;
+  workspace_name: string;
+  organisation_name: string;
+  role: string;
+  invited_by_name: string;
+  created: string;
+};
+
+/** An open invite to a department, as its owner and admins see it. Mirrors
+ *  `commands::invites::PendingInvite`. */
+export type PendingInvite = { id: string; email: string; role: string; invited_by_name: string; created: string };
+
+/** The server no longer has the invite: answered elsewhere, withdrawn, or its
+ *  department left the organisation. */
+export function inviteGone(reason: string): boolean {
+  return reason === "not_found" || reason === "invite_expired";
+}
+
+/** What the inviter reads when the invite route answers `pending`. */
+export const INVITE_PENDING = "Invite sent. They join when they accept.";
 
 /** A workspace named and nothing more: all a member is told about one that
  *  requires two-factor authentication they don't have yet. */
@@ -141,6 +167,8 @@ export type CloudStatus = {
   signed_out_email?: string | null;
   /** A managed configuration profile sets the server; it can't be changed. */
   server_managed?: boolean;
+  /** Invites to organisation departments waiting for the user's answer. */
+  invites?: OrgInvite[];
 };
 
 /** Managed chat add-on advertised in the server's billing config (issue #75). */
@@ -224,11 +252,20 @@ export const cloudApi = {
   workspaceMembers: (workspaceId: string) =>
     invoke<CloudMember[]>("cloud_workspace_members", { workspaceId }),
   pendingNoteIds: () => invoke<string[]>("cloud_pending_note_ids"),
+  /** Returns "added", or "pending" in an organisation department. */
   addMember: (workspaceId: string, email: string) =>
-    invoke<void>("cloud_add_member", { workspaceId, email }),
-  /** Invite by email. Returns "added" (had an account) or "invited" (pending). */
+    invoke<string>("cloud_add_member", { workspaceId, email }),
+  /** Invite by email. Returns "added" (had an account), "invited" (no account
+   *  yet) or "pending" (an organisation department: they join once they accept). */
   inviteMember: (workspaceId: string, email: string, role: CloudRole = "member") =>
     invoke<string>("cloud_invite_member", { workspaceId, email, role }),
+  /** Join an invite's department and switch to it; returns its id. */
+  acceptInvite: (inviteId: string) => invoke<string>("cloud_accept_invite", { inviteId }),
+  declineInvite: (inviteId: string) => invoke<void>("cloud_decline_invite", { inviteId }),
+  /** A department's open invites; owners and admins only. */
+  pendingInvites: (workspaceId: string) =>
+    invoke<PendingInvite[]>("cloud_pending_invites", { workspaceId }),
+  withdrawInvite: (inviteId: string) => invoke<void>("cloud_withdraw_invite", { inviteId }),
   removeMember: (workspaceId: string, userId: string) =>
     invoke<void>("cloud_remove_member", { workspaceId, userId }),
   setMemberRole: (workspaceId: string, userId: string, role: CloudRole) =>
@@ -271,6 +308,7 @@ export const DISCONNECTED: CloudStatus = {
   locked_current_workspace: null,
   signed_out_email: null,
   server_managed: false,
+  invites: [],
 };
 
 type CloudState = {
@@ -286,6 +324,7 @@ type CloudState = {
   refresh: () => Promise<void>;
   setStatus: (s: CloudStatus) => void;
   setSyncStatus: (s: SyncStatus | null) => void;
+  setInvites: (invites: OrgInvite[]) => void;
   refreshPending: () => Promise<void>;
 };
 
@@ -297,6 +336,7 @@ export const useCloudStore = create<CloudState>((set) => ({
   pendingNoteIds: new Set(),
   setStatus: (status) => set({ status, ready: true }),
   setSyncStatus: (syncStatus) => set({ syncStatus }),
+  setInvites: (invites) => set((s) => ({ status: { ...s.status, invites } })),
   refreshPending: async () => {
     try {
       set({ pendingNoteIds: new Set(await cloudApi.pendingNoteIds()) });
@@ -395,4 +435,9 @@ export function roleColorVar(role: CloudRole): string {
     default:
       return "var(--color-text-muted)";
   }
+}
+
+/** Keep the store's invites in step with the backend's refreshes. */
+export function onOrgInvitesChanged(): Promise<() => void> {
+  return listen<OrgInvite[]>("org_invites_changed", (e) => useCloudStore.getState().setInvites(e.payload));
 }

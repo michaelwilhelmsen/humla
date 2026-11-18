@@ -11,6 +11,7 @@ import {
 } from "lucide-react";
 import {
   HUMLA_CLOUD_URL,
+  INVITE_PENDING,
   cloudApi,
   formatSeatPrice,
   useCloudStore,
@@ -537,7 +538,7 @@ function TrialStage({
 
 // ── stage: invite ────────────────────────────────────────────────────────────
 
-type Invited = { email: string; status: "added" | "invited" };
+type Invited = { email: string; status: "added" | "invited" | "pending" };
 
 function InviteStage({
   ws,
@@ -563,7 +564,7 @@ function InviteStage({
       const result = await cloudApi.inviteMember(ws.id, addr);
       setSent((prev) => [
         ...prev,
-        { email: addr, status: result === "invited" ? "invited" : "added" },
+        { email: addr, status: result === "invited" || result === "pending" ? result : "added" },
       ]);
       setEmail("");
     } catch (e) {
@@ -629,7 +630,11 @@ function InviteStage({
                 <span className="text-[var(--color-text-muted)] shrink-0">
                   {/* "invited" has no account yet, so nothing happens until they
                       sign up AND verify — saying "added" there would be a lie. */}
-                  {s.status === "invited" ? "invited by email" : "added"}
+                  {s.status === "invited"
+                    ? "invited by email"
+                    : s.status === "pending"
+                      ? INVITE_PENDING
+                      : "added"}
                 </span>
               </li>
             ))}

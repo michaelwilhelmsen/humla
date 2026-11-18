@@ -4,6 +4,7 @@ import { cloudApi, useCloudStore, HUMLA_CLOUD_URL } from "../../../lib/cloud";
 import { useCloudSignIn } from "../../../lib/useCloudSignIn";
 import { TwoFactorCodeForm } from "../../../components/TwoFactorCodeForm";
 import { TwoFactorSection } from "./TwoFactor";
+import { OrgInviteCard } from "../../../components/OrgInviteCard";
 import { Row, Section } from "../components/Section";
 import { Btn } from "../components/Btn";
 import { ValuePill } from "../components/ValuePill";
@@ -29,6 +30,19 @@ export function PoliciesSection() {
           reason={r.reason}
           control={<ValuePill>{r.value}</ValuePill>}
         />
+      ))}
+    </Section>
+  );
+}
+
+export function InvitesSection() {
+  const status = useCloudStore((s) => s.status);
+  const invites = status.logged_in ? (status.invites ?? []) : [];
+  if (invites.length === 0) return null;
+  return (
+    <Section title="Invitations">
+      {invites.map((invite) => (
+        <OrgInviteCard key={invite.id} invite={invite} />
       ))}
     </Section>
   );

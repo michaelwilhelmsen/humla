@@ -137,30 +137,47 @@ export const NO_POLICY: EffectivePolicy = {
 
 export type PolicyRow = { key: string; label: string; value: string; source: string; reason: string };
 
-const ORDER: PolicyKind[] = ["local_only", "retention_days", "audio_forbidden", "telemetry_off"];
+export const POLICY_ORDER: PolicyKind[] = ["local_only", "retention_days", "audio_forbidden", "telemetry_off"];
+
+/** The setting each policy fixes, as the Policies list names it. */
+export const POLICY_LABEL: Record<PolicyKind, string> = {
+  local_only: "AI processing",
+  retention_days: "Note retention",
+  audio_forbidden: "Keep recorded audio",
+  telemetry_off: "Send anonymous usage counters",
+};
+
+export const AUDIT_READS_LABEL = "Opening notes";
+export const AUDIT_READS_VALUE = "Recorded";
 
 /** One row per policy in force: the setting it fixes and its enforced value.
  *  Then one per organisation that records opening its notes. */
 export function policyRows(policy: EffectivePolicy, orgs: OrgSummary[] = []): PolicyRow[] {
   const describe = (kind: PolicyKind): { label: string; value: string } => {
+    const label = POLICY_LABEL[kind];
     switch (kind) {
       case "local_only":
-        return { label: "AI processing", value: "On this Mac only" };
+        return { label, value: "On this Mac only" };
       case "retention_days":
-        return { label: "Note retention", value: deletedAfter(policy.retention_days) };
+        return { label, value: deletedAfter(policy.retention_days) };
       case "audio_forbidden":
-        return { label: "Keep recorded audio", value: "Off" };
       case "telemetry_off":
-        return { label: "Send anonymous usage counters", value: "Off" };
+        return { label, value: "Off" };
     }
   };
-  const enforced = ORDER.flatMap((kind) => {
+  const enforced = POLICY_ORDER.flatMap((kind) => {
     const rule = policy.rules.find((r) => r.kind === kind);
     return rule ? [{ key: kind, ...describe(kind), source: rule.source, reason: rule.reason }] : [];
   });
   const audited = orgs
     .filter((o) => o.audit_reads)
-    .map((o) => ({ key: `audit_reads:${o.id}`, label: "Opening notes", value: "Recorded", source: o.name, reason: o.reason }));
+    .map((o) => ({
+      key: `audit_reads:${o.id}`,
+      label: AUDIT_READS_LABEL,
+      value: AUDIT_READS_VALUE,
+      source: o.name,
+      reason: o.reason,
+    }));
   return [...enforced, ...audited];
 }
 
@@ -185,6 +202,11 @@ export function usePolicyRows(): PolicyRow[] {
 export function useNoteOrgPolicy(workspaceId: string | null | undefined): { retentionDays: number; audit: AuditScope } {
   const { retention, audit } = useOrgPolicyStatus();
   return { retentionDays: retentionDaysFor(retention, workspaceId), audit };
+}
+
+/** The organisation departments the user is in. */
+export function useOrgWorkspaces(): string[] {
+  return useOrgPolicyStatus().orgs.flatMap((o) => o.workspaces);
 }
 
 /** Who sets `local_only` (null when off), and whether the policy has loaded.
