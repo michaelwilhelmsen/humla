@@ -3,7 +3,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { Provider, SummaryProvider } from "./providers";
 import type { SpeakerLabelStat } from "./speakerSuggest";
 import { targetFolderId, targetNoteId, type ChatTarget } from "./chatTarget";
-import type { AdminOrg, AudioSweep, OrgStatus, OrgTemplateDraft } from "./orgPolicy";
+import type { AdminContent, AdminOrg, AudioSweep, OrgStatus, OrgTemplateDraft } from "./orgPolicy";
 
 export type CopilotStatus = {
   login: string | null;
@@ -866,6 +866,9 @@ export const ipc = {
   orgAudioSweep: (orgId: string) => invoke<number>("org_audio_sweep", { orgId }),
   /** The organisations the signed-in user administers. */
   orgAdminOrgs: () => invoke<AdminOrg[]>("org_admin_orgs"),
+  /** Templates and terms of an administered organisation the user is in no
+   *  department of, read for editing only. */
+  orgAdminContent: (orgId: string) => invoke<AdminContent>("org_admin_content", { orgId }),
   orgTemplateOpen: (orgId: string, clientId: string) =>
     invoke<OrgTemplateDraft>("org_template_open", { orgId, clientId }),
   /** Creates when `clientId` is null; `workspaces` null is every department. */

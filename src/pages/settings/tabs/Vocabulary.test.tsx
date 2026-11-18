@@ -166,3 +166,29 @@ describe("VocabularySection for an organisation admin", () => {
     expect(screen.getByRole("list", { name: "Organisation terms" })).toBeInTheDocument();
   });
 });
+
+describe("VocabularySection for an admin outside the organisation's departments", () => {
+  it("edits its terms from the server and reloads them after an edit", async () => {
+    useCloudStore.setState({
+      status: { ...DISCONNECTED, configured: true, logged_in: true, user: { id: "u1", email: "a@example.no", name: "A", verified: true } },
+      ready: true,
+    });
+    const asked = vi.fn(() => ({ templates: [], vocabulary: ["Fjord"] }));
+    const edited = vi.fn(() => null);
+    mockTauri({
+      org_status: () => ({
+        policy: { org_name: null, reason: null, local_only: false, retention_days: 0, telemetry_off: false, audio_forbidden: false, rules: [] },
+        orgs: [],
+      }),
+      org_admin_orgs: () => [{ id: "o2", name: "Fjordby", require_2fa: false }],
+      org_admin_content: asked,
+      org_vocabulary_edit: edited,
+    });
+    renderWith("");
+    const list = await screen.findByRole("list", { name: "Fjordby terms" });
+    expect(within(list).getByText("Fjord")).toBeInTheDocument();
+    await userEvent.type(screen.getByLabelText("Add a term for Fjordby"), "IPLOS{Enter}");
+    expect(edited).toHaveBeenCalledWith({ orgId: "o2", add: ["IPLOS"], remove: [] });
+    await vi.waitFor(() => expect(asked).toHaveBeenCalledTimes(2));
+  });
+});

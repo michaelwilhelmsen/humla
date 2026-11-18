@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { ipc, type SummaryPrompt } from "./ipc";
 import { useCloudStore } from "./cloud";
-import type { AdminOrg, OrgSummary } from "./orgPolicy";
+import type { AdminContent, AdminOrg, OrgSummary } from "./orgPolicy";
 import { SUMMARY_PRESETS, presetLabel } from "./presets";
 
 export function isOrgTemplate(t: SummaryPrompt): boolean {
@@ -104,7 +104,12 @@ export function useOrgContentVersion(): number {
 /** The organisations whose templates and terms apply here. A failed read
  *  shows none. */
 export function useOrgs(): OrgSummary[] {
-  const [orgs, setOrgs] = useState<OrgSummary[]>([]);
+  return useOrgsState() ?? [];
+}
+
+/** [`useOrgs`], but `null` until the first read has answered. */
+export function useOrgsState(): OrgSummary[] | null {
+  const [orgs, setOrgs] = useState<OrgSummary[] | null>(null);
   const cloudStatus = useCloudStore((s) => s.status);
   const version = useOrgContentVersion();
   useEffect(() => {
@@ -161,5 +166,48 @@ export function editableOrgs(
       const a = adminOf(o);
       return a && a.require_2fa && !twoFactorOn;
     }),
+  };
+}
+
+/** An administered organisation the user is in no department of. */
+export type AdminOnlyOrg = { summary: OrgSummary; content: AdminContent | null; error: string | null };
+
+/** The organisations in `admin` that the cached config doesn't list, with their
+ *  templates and terms read from the server for editing. They are kept in this
+ *  hook's state only: nothing caches them, applies them or offers them in a
+ *  picker. Nothing is asked until the config has been read (`orgs` non-null),
+ *  and organisations waiting on two-factor authentication are left out. */
+export function useAdminOnlyOrgs(
+  orgs: OrgSummary[] | null,
+  admin: AdminOrg[],
+  twoFactorOn: boolean,
+): { list: AdminOnlyOrg[]; reload: () => void } {
+  const [content, setContent] = useState<Record<string, { content: AdminContent | null; error: string | null }>>({});
+  const [round, setRound] = useState(0);
+  const missing =
+    orgs === null
+      ? []
+      : admin.filter((a) => !orgs.some((o) => o.id === a.id) && (!a.require_2fa || twoFactorOn));
+  const key = missing.map((a) => a.id).join(",");
+  useEffect(() => {
+    if (!key) return;
+    let cancelled = false;
+    for (const id of key.split(",")) {
+      ipc
+        .orgAdminContent(id)
+        .then((c) => !cancelled && setContent((prev) => ({ ...prev, [id]: { content: c, error: null } })))
+        .catch((e) => !cancelled && setContent((prev) => ({ ...prev, [id]: { content: null, error: String(e) } })));
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, [key, round]);
+  return {
+    list: missing.map((a) => ({
+      summary: { id: a.id, name: a.name, reason: "", vocabulary: content[a.id]?.content?.vocabulary ?? [], workspaces: [] },
+      content: content[a.id]?.content ?? null,
+      error: content[a.id]?.error ?? null,
+    })),
+    reload: () => setRound((r) => r + 1),
   };
 }

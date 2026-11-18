@@ -8,10 +8,12 @@ import {
   orgTemplateClientId,
   pickerTemplates,
   useActiveWorkspaceId,
+  useAdminOnlyOrgs,
   useAdminOrgs,
   useOrgContentVersion,
-  useOrgs,
+  useOrgsState,
 } from "../../../lib/orgContent";
+import type { OrgSummary } from "../../../lib/orgPolicy";
 import { ManagedBadge } from "../ManagedRow";
 import { Segmented } from "../components/Segmented";
 import { Select } from "../../../components/ui/Select";
@@ -62,10 +64,12 @@ export function TemplatesSection({ language }: { language: string }) {
   const currentRole = useCloudStore((s) => s.status.current_workspace?.role);
   const workspaces = useCloudStore((s) => s.status.workspaces);
   const activeWorkspaceId = useActiveWorkspaceId();
-  const orgs = useOrgs();
+  const orgsState = useOrgsState();
+  const orgs = orgsState ?? [];
   const orgVersion = useOrgContentVersion();
   const adminOrgs = useAdminOrgs();
   const twoFactorOn = useCloudStore((s) => s.status.two_factor?.enabled ?? false);
+  const adminOnly = useAdminOnlyOrgs(orgsState, adminOrgs, twoFactorOn);
   const [orgEditing, setOrgEditing] = useState<OrgDraft | null>(null);
   const [orgEditorError, setOrgEditorError] = useState<string | null>(null);
   const [orgSaving, setOrgSaving] = useState(false);
@@ -157,6 +161,7 @@ export function TemplatesSection({ language }: { language: string }) {
       setOrgEditing(null);
       setOrgEditorError(null);
       setOrgError(null);
+      adminOnly.reload();
       await refresh();
     } catch (e) {
       setOrgEditorError(String(e));
@@ -172,6 +177,7 @@ export function TemplatesSection({ language }: { language: string }) {
       await ipc.orgTemplateDelete(t.org_id, clientId);
       setConfirmDeleteId(null);
       setOrgError(null);
+      adminOnly.reload();
       await refresh();
     } catch (e) {
       setConfirmDeleteId(null);
@@ -180,16 +186,52 @@ export function TemplatesSection({ language }: { language: string }) {
   }
 
   const { org: offered, own } = pickerTemplates(templates, activeWorkspaceId, orgs);
-  const { editable, locked: twoFactorLocked } = editableOrgs(orgs, adminOrgs, twoFactorOn);
+  // Organisations the user administers without being in any of their
+  // departments: shown here to edit, from the server, and nowhere else.
+  const outsideConfig: OrgSummary[] =
+    orgsState === null
+      ? []
+      : adminOrgs
+          .filter((a) => !orgs.some((o) => o.id === a.id))
+          .map((a) => adminOnly.list.find((x) => x.summary.id === a.id)?.summary ?? {
+            id: a.id,
+            name: a.name,
+            reason: "",
+            vocabulary: [],
+            workspaces: [],
+          });
+  const { editable, locked: twoFactorLocked } = editableOrgs([...orgs, ...outsideConfig], adminOrgs, twoFactorOn);
   const canAdmin = (t: SummaryPrompt) => editable.some((o) => o.id === t.org_id);
-  const fromOrg = templates.filter((t) => isOrgTemplate(t) && (canAdmin(t) || offered.includes(t)));
+  const adminOnlyRows: (SummaryPrompt & { departments: number })[] = adminOnly.list.flatMap((a) =>
+    (a.content?.templates ?? []).map((t) => ({
+      id: `org_${a.summary.id}_${t.client_id}`,
+      name: t.name,
+      content: t.content,
+      created_at: 0,
+      updated_at: 0,
+      workspace_id: "",
+      org_id: a.summary.id,
+      org_workspaces: [],
+      departments: t.departments,
+    })),
+  );
+  const fromOrg: SummaryPrompt[] = [
+    ...templates.filter((t) => isOrgTemplate(t) && (canAdmin(t) || offered.includes(t))),
+    ...adminOnlyRows,
+  ];
+  const adminOnlyErrors = adminOnly.list.flatMap((a) => (a.error ? [a.error] : []));
   const shared = own.filter((t) => t.workspace_id);
   const personal = own.filter((t) => !t.workspace_id);
   const orgsShown = orgs.filter(
     (o) => fromOrg.some((t) => t.org_id === o.id) || editable.includes(o) || twoFactorLocked.includes(o),
   );
+  const departmentLabels = (t: SummaryPrompt) => {
+    const n = adminOnlyRows.find((r) => r.id === t.id)?.departments;
+    if (n === undefined) return departmentNames(t);
+    return n === 0 ? [] : [`${n} ${n === 1 ? "department" : "departments"}`];
+  };
   const showOrgGroup = fromOrg.length > 0 || editable.length > 0 || twoFactorLocked.length > 0;
-  const editingOrg = orgs.find((o) => o.id === orgEditing?.orgId);
+  const editingOrg = editable.find((o) => o.id === orgEditing?.orgId);
   const orgDepartments = (editingOrg?.workspaces ?? []).map((id) => ({
     id,
     name: workspaces.find((w) => w.id === id)?.name ?? id,
@@ -287,7 +329,7 @@ export function TemplatesSection({ language }: { language: string }) {
                 key={t.id}
                 name={t.name}
                 locked={!canAdmin(t)}
-                departments={departmentNames(t)}
+                departments={departmentLabels(t)}
                 actions={
                   canAdmin(t) ? (
                     <>
@@ -348,6 +390,11 @@ export function TemplatesSection({ language }: { language: string }) {
           {twoFactorLocked.map((o) => (
             <p key={o.id} className="text-xs text-[var(--color-text-muted)] py-3.5">
               {o.name} requires two-factor authentication to edit its templates. Set it up in Settings → Account.
+            </p>
+          ))}
+          {adminOnlyErrors.map((e) => (
+            <p key={e} role="alert" className="text-xs py-3" style={{ color: "var(--color-danger)" }}>
+              {e}
             </p>
           ))}
           {orgError && (
@@ -470,11 +517,13 @@ export function TemplatesSection({ language }: { language: string }) {
                 />
               </div>
             )}
-            <DepartmentPicker
-              draft={orgEditing}
-              departments={orgDepartments}
-              onChange={(every, chosen) => setOrgEditing({ ...orgEditing, every, workspaces: chosen })}
-            />
+            {(orgDepartments.length > 0 || orgEditing.hidden > 0) && (
+              <DepartmentPicker
+                draft={orgEditing}
+                departments={orgDepartments}
+                onChange={(every, chosen) => setOrgEditing({ ...orgEditing, every, workspaces: chosen })}
+              />
+            )}
           </TemplateEditor>
         )}
       </Modal>

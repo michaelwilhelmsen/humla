@@ -36,6 +36,23 @@ pub struct OrgTemplateDraft {
     pub hidden: usize,
 }
 
+/// An organisation the admin is in no department of, read straight from the
+/// collections: only for editing, never cached or applied on this Mac.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct AdminContent {
+    pub templates: Vec<AdminTemplate>,
+    pub vocabulary: Vec<String>,
+}
+
+/// `departments` counts the departments a template is offered in; 0 is all.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct AdminTemplate {
+    pub client_id: String,
+    pub name: String,
+    pub content: String,
+    pub departments: usize,
+}
+
 /// The stored record behind a template.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct StoredTemplate {
@@ -141,6 +158,32 @@ pub(crate) fn parse_template_lookup(body: &Value) -> Result<Option<StoredTemplat
         content: str_field(t, "content"),
         workspaces: ids(t.get("workspaces").unwrap_or(&Value::Null)),
     }))
+}
+
+pub(crate) fn templates_filter(org_id: &str) -> Result<String, String> {
+    if !safe_id(org_id) {
+        return Err("Not an organisation.".into());
+    }
+    Ok(format!("organisation='{org_id}' && deleted!=true"))
+}
+
+/// An organisation's live templates as an admin lists them.
+pub(crate) fn parse_admin_templates(body: &Value) -> Result<Vec<AdminTemplate>, String> {
+    let items = body
+        .get("items")
+        .and_then(|i| i.as_array())
+        .ok_or("unreadable organisation templates")?;
+    Ok(items
+        .iter()
+        .filter(|t| !t.get("deleted").and_then(|d| d.as_bool()).unwrap_or(false))
+        .map(|t| AdminTemplate {
+            client_id: str_field(t, "client_id"),
+            name: str_field(t, "name"),
+            content: org_policy::plain_text(&str_field(t, "content")),
+            departments: ids(t.get("workspaces").unwrap_or(&Value::Null)).len(),
+        })
+        .filter(|t| safe_id(&t.client_id))
+        .collect())
 }
 
 /// What the editor shows of `stored`, given the departments the user is in.
@@ -341,6 +384,28 @@ pub async fn org_admin_orgs(state: State<'_, AppState>) -> Result<Vec<AdminOrg>,
     let answer = send(&state, ORGS_PATH, Req::Get(&query)).await?;
     ok(&answer, "Your organisation")?;
     parse_admin_orgs(&answer.body)
+}
+
+/// The templates and terms of an organisation the user administers, for an
+/// admin who is in none of its departments. Nothing here is written locally.
+#[tauri::command]
+pub async fn org_admin_content(state: State<'_, AppState>, org_id: String) -> Result<AdminContent, String> {
+    let filter = templates_filter(&org_id)?;
+    let (org, _) = cached_org(&state, &org_id);
+    let query = [
+        ("filter", filter.as_str()),
+        ("fields", "client_id,name,content,workspaces,deleted"),
+        ("sort", "name"),
+        ("perPage", "500"),
+    ];
+    let templates = send(&state, TEMPLATES_PATH, Req::Get(&query)).await?;
+    ok(&templates, &org)?;
+    let record = send(&state, &format!("{ORGS_PATH}/{org_id}"), Req::Get(&[("fields", "vocabulary")])).await?;
+    ok(&record, &org)?;
+    Ok(AdminContent {
+        templates: parse_admin_templates(&templates.body)?,
+        vocabulary: parse_vocabulary(&record.body)?,
+    })
 }
 
 /// Read a template from the server for its editor.
@@ -577,6 +642,37 @@ mod tests {
             "N didn't accept the change. Check the name and try again."
         );
         assert_eq!(refusal(500, &none, "N"), "Couldn't save to N (500). Try again.");
+    }
+
+    #[test]
+    fn an_admin_lists_live_templates_with_a_department_count() {
+        assert_eq!(templates_filter("o1").unwrap(), "organisation='o1' && deleted!=true");
+        assert!(templates_filter("o1' || '1").is_err());
+        let body = json!({ "items": [
+            { "client_id": "case", "name": "Case", "content": "<p>A</p><p>B</p>", "workspaces": [] },
+            { "client_id": "home", "name": "Home", "content": "x", "workspaces": ["w1", "w9"] },
+            { "client_id": "gone", "name": "Gone", "content": "", "deleted": true },
+            { "client_id": "bad id", "name": "Bad", "content": "" },
+        ]});
+        assert_eq!(
+            parse_admin_templates(&body).unwrap(),
+            vec![
+                AdminTemplate { client_id: "case".into(), name: "Case".into(), content: "A\nB".into(), departments: 0 },
+                AdminTemplate { client_id: "home".into(), name: "Home".into(), content: "x".into(), departments: 2 },
+            ]
+        );
+        assert!(parse_admin_templates(&json!({})).is_err());
+    }
+
+    // Organisation content reaches this Mac only through the config's cache
+    // (`org_policy::apply_templates`); nothing here may write the database.
+    #[test]
+    fn no_admin_command_writes_this_mac() {
+        let src = include_str!("org_admin.rs");
+        let code = &src[..src.find("#[cfg(test)]").unwrap()];
+        for forbidden in ["summary_prompts", "set_setting", "apply_templates", "execute(", "store("] {
+            assert!(!code.contains(forbidden), "org_admin.rs must not use {forbidden}");
+        }
     }
 
     #[test]

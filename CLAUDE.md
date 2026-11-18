@@ -85,7 +85,7 @@ Feature detail lives in `docs/features/` and `docs/architecture/`; read the link
 
 ### Organisation admins
 
-- An org admin edits templates and terms on the server only (`commands/org_admin.rs`), never through a local queue; every write ends with `refresh_org_config`. The `organisations` PATCH carries `vocabulary` and nothing else. A template save keeps the departments the admin can't see (`scope_workspaces`). Policies are never edited in the client.
+- An org admin edits templates and terms on the server only (`commands/org_admin.rs`), never through a local queue; every write ends with `refresh_org_config`. The `organisations` PATCH carries `vocabulary` and nothing else. A template save keeps the departments the admin can't see (`scope_workspaces`). Policies are never edited in the client. An organisation the admin is in no department of is read straight from `org_templates` / `organisations` (`org_admin_content`) into the editing views only: never cached, applied or offered in a picker.
 
 ### Cloud session
 

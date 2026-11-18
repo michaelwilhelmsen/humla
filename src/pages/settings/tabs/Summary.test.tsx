@@ -1,9 +1,10 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { SummaryTab } from "./Summary";
 import { mockTauri } from "../../../test/tauri";
 import { DEFAULTS, type EditableKey } from "../types";
+import { DISCONNECTED, useCloudStore } from "../../../lib/cloud";
 
 function settings(overrides: Partial<Record<EditableKey, string>> = {}) {
   return { ...DEFAULTS, ...overrides } as Record<EditableKey, string>;
@@ -141,5 +142,28 @@ describe("SummaryTab on a custom endpoint", () => {
     await userEvent.type(screen.getByLabelText("Custom endpoint base URL"), "h");
     expect(update).toHaveBeenCalledWith("custom_base_url", "h");
     expect(update).not.toHaveBeenCalledWith("local_llm_base_url", expect.anything());
+  });
+});
+
+describe("SummaryTab default template", () => {
+  it("never offers an organisation the user only administers", async () => {
+    useCloudStore.setState({
+      status: { ...DISCONNECTED, configured: true, logged_in: true, user: { id: "u1", email: "a@example.no", name: "A", verified: true } },
+      ready: true,
+    });
+    const asked = vi.fn(() => ({
+      templates: [{ client_id: "board", name: "Board minutes", content: "x", departments: 0 }],
+      vocabulary: [],
+    }));
+    mockTauri({
+      org_admin_orgs: () => [{ id: "o2", name: "Fjordby", require_2fa: false }],
+      org_admin_content: asked,
+    });
+    render(<SummaryTab s={settings({ default_summary_preset: "meeting" })} update={async () => {}} />);
+    await userEvent.click(await screen.findByRole("combobox", { name: /Meeting/ }));
+    const list = await screen.findByRole("listbox");
+    expect(within(list).getByRole("option", { name: "Lecture" })).toBeInTheDocument();
+    expect(within(list).queryByRole("option", { name: "Board minutes" })).toBeNull();
+    expect(asked).not.toHaveBeenCalled();
   });
 });

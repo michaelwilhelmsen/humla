@@ -2009,7 +2009,8 @@ const CASES: Record<string, Scenario> = {
     ipc: settingsOrgIpc(),
   },
   // `settings-org-admin` is the same user as one of the organisation's admins,
-  // who edits its templates and terms. Saves are logged, not applied.
+  // who edits its templates and terms, and also an admin of Fjordby, where
+  // they are in no department. Saves are logged, not applied.
   "settings-org-admin": {
     route: `/settings?tab=${new URLSearchParams(location.search).get("section") ?? "templates"}`,
     render: () => null, // unused — `route` renders the app
@@ -2194,7 +2195,17 @@ function settingsOrgIpc({ admin = false }: { admin?: boolean } = {}): Record<str
     }),
     ...(admin
       ? {
-          org_admin_orgs: () => [{ id: "o1", name: "Northwind", require_2fa: false }],
+          org_admin_orgs: () => [
+            { id: "o1", name: "Northwind", require_2fa: false },
+            { id: "o2", name: "Fjordby", require_2fa: false },
+          ],
+          org_admin_content: () => ({
+            templates: [
+              { client_id: "board", name: "Board minutes", content: "Motions, votes and who voted how.", departments: 0 },
+              { client_id: "audit", name: "Audit review", content: "Findings and the owner of each.", departments: 2 },
+            ],
+            vocabulary: ["Fjordby", "Formannskap"],
+          }),
           org_template_open: (args) => ({
             name: (args as { clientId: string }).clientId === "intake" ? "Intake review" : "Case meeting",
             content: "Record the decision, who owns each action, and the deadline.",

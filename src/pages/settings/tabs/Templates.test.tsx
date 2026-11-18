@@ -456,4 +456,119 @@ describe("TemplatesSection", () => {
       expect(within(group).queryByRole("button", { name: /new template/i })).toBeNull();
     });
   });
+  describe("as an admin of an organisation outside the user's departments", () => {
+    const policy = {
+      org_name: null,
+      reason: null,
+      local_only: false,
+      retention_days: 0,
+      telemetry_off: false,
+      audio_forbidden: false,
+      rules: [],
+    };
+    const content = {
+      templates: [
+        { client_id: "board", name: "Board minutes", content: "Motions and votes.", departments: 0 },
+        { client_id: "audit", name: "Audit review", content: "Findings.", departments: 2 },
+      ],
+      vocabulary: ["Fjord"],
+    };
+
+    function signedIn() {
+      useCloudStore.setState({
+        status: {
+          ...DISCONNECTED,
+          configured: true,
+          logged_in: true,
+          user: { id: "u1", email: "a@example.no", name: "A", verified: true },
+        },
+        ready: true,
+      });
+    }
+
+    function handlers(extra: Record<string, (args: unknown) => unknown> = {}) {
+      return {
+        org_status: () => ({ policy, orgs: [] }),
+        summary_prompts_list: () => [prompt("p1", "Standup")],
+        org_admin_orgs: () => [{ id: "o2", name: "Fjordby", require_2fa: false }],
+        org_admin_content: () => content,
+        ...extra,
+      };
+    }
+
+    it("lists its templates from the server, editable, and caches none of them", async () => {
+      signedIn();
+      const asked = vi.fn(() => content);
+      const created = vi.fn();
+      const updated = vi.fn();
+      mockTauri(handlers({ org_admin_content: asked, summary_prompts_create: created, summary_prompts_update: updated }));
+      render(<TemplatesSection language="en" />);
+      const group = (await screen.findByRole("heading", { name: "From your organisation" })).closest("section")!;
+      expect(await within(group).findByRole("button", { name: "Edit Board minutes" })).toBeInTheDocument();
+      expect(within(group).getByText("2 departments")).toBeInTheDocument();
+      expect(within(group).queryByRole("button", { name: /Managed by/ })).toBeNull();
+      expect(asked).toHaveBeenCalledWith({ orgId: "o2" });
+      expect(created).not.toHaveBeenCalled();
+      expect(updated).not.toHaveBeenCalled();
+    });
+
+    it("creates one for every department and reloads from the server", async () => {
+      signedIn();
+      const asked = vi.fn(() => content);
+      const saved = vi.fn(() => null);
+      mockTauri(handlers({ org_admin_content: asked, org_template_save: saved }));
+      render(<TemplatesSection language="en" />);
+      const group = (await screen.findByRole("heading", { name: "From your organisation" })).closest("section")!;
+      await userEvent.click(await within(group).findByRole("button", { name: /new template/i }));
+      const editor = await screen.findByRole("dialog", { name: "New organisation template" });
+      expect(within(editor).queryByRole("radio")).toBeNull();
+      await userEvent.type(within(editor).getByLabelText("Name"), "Agenda");
+      await userEvent.click(within(editor).getByRole("button", { name: "Save template" }));
+      expect(saved).toHaveBeenCalledWith({ orgId: "o2", clientId: null, name: "Agenda", content: "", workspaces: null });
+      await vi.waitFor(() => expect(asked).toHaveBeenCalledTimes(2));
+    });
+
+    it("keeps the departments a template already names", async () => {
+      signedIn();
+      const saved = vi.fn(() => null);
+      mockTauri(
+        handlers({
+          org_template_open: () => ({ name: "Audit review", content: "Findings.", workspaces: [], hidden: 2 }),
+          org_template_save: saved,
+        }),
+      );
+      render(<TemplatesSection language="en" />);
+      await userEvent.click(await screen.findByRole("button", { name: "Edit Audit review" }));
+      const editor = await screen.findByRole("dialog", { name: "Edit organisation template" });
+      expect(within(editor).getByRole("radio", { name: "Some departments" })).toHaveAttribute("aria-checked", "true");
+      expect(within(editor).queryByRole("checkbox")).toBeNull();
+      expect(within(editor).getByText("Also offered in 2 departments you're not in.")).toBeInTheDocument();
+      await userEvent.click(within(editor).getByRole("button", { name: "Save template" }));
+      expect(saved).toHaveBeenCalledWith(expect.objectContaining({ orgId: "o2", clientId: "audit", workspaces: [] }));
+    });
+
+    it("asks nothing and shows nothing for a user in no organisation who administers none", async () => {
+      signedIn();
+      const asked = vi.fn();
+      mockTauri({ summary_prompts_list: () => [prompt("p1", "Standup")], org_admin_orgs: () => [], org_admin_content: asked });
+      render(<TemplatesSection language="en" />);
+      await screen.findByText("Standup");
+      await new Promise((r) => setTimeout(r, 0));
+      expect(asked).not.toHaveBeenCalled();
+      expect(screen.queryByRole("alert")).toBeNull();
+      expect(screen.getAllByRole("heading", { level: 2 }).map((h) => h.textContent)).toEqual([
+        "Built-in",
+        "Your templates",
+      ]);
+    });
+
+    it("skips the listing entirely when not signed in", async () => {
+      const listed = vi.fn(() => []);
+      mockTauri({ org_admin_orgs: listed });
+      render(<TemplatesSection language="en" />);
+      await screen.findByRole("heading", { name: "Built-in" });
+      await new Promise((r) => setTimeout(r, 0));
+      expect(listed).not.toHaveBeenCalled();
+    });
+  });
 });

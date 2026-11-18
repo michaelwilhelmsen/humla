@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { Lock, X } from "lucide-react";
 import { Section } from "../components/Section";
-import { editableOrgs, orgTerms, useAdminOrgs, useOrgs } from "../../../lib/orgContent";
+import { editableOrgs, orgTerms, useAdminOnlyOrgs, useAdminOrgs, useOrgsState } from "../../../lib/orgContent";
 import { useCloudStore } from "../../../lib/cloud";
 import { ipc } from "../../../lib/ipc";
 import type { OrgSummary } from "../../../lib/orgPolicy";
@@ -40,10 +40,29 @@ function splitDraft(draft: string): string[] {
 
 export function VocabularySection({ s, update }: Pick<SettingsHook, "s" | "update">) {
   const terms = parseVocabulary(s.custom_vocabulary);
-  const orgs = useOrgs();
+  const orgsState = useOrgsState();
+  const orgs = orgsState ?? [];
   const adminOrgs = useAdminOrgs();
   const twoFactorOn = useCloudStore((st) => st.status.two_factor?.enabled ?? false);
-  const { editable, locked: twoFactorLocked } = editableOrgs(orgs, adminOrgs, twoFactorOn);
+  const adminOnly = useAdminOnlyOrgs(orgsState, adminOrgs, twoFactorOn);
+  // Organisations the user administers without being in any of their
+  // departments: their terms are edited here and applied nowhere.
+  const outsideConfig: OrgSummary[] =
+    orgsState === null
+      ? []
+      : adminOrgs
+          .filter((a) => !orgs.some((o) => o.id === a.id))
+          .map(
+            (a) =>
+              adminOnly.list.find((x) => x.summary.id === a.id)?.summary ?? {
+                id: a.id,
+                name: a.name,
+                reason: "",
+                vocabulary: [],
+                workspaces: [],
+              },
+          );
+  const { editable, locked: twoFactorLocked } = editableOrgs([...orgs, ...outsideConfig], adminOrgs, twoFactorOn);
   const locked = orgTerms(orgs.filter((o) => !editable.includes(o)));
   const [draft, setDraft] = useState("");
   const full = terms.length >= VOCABULARY_LIMIT;
@@ -77,7 +96,13 @@ export function VocabularySection({ s, update }: Pick<SettingsHook, "s" | "updat
           </div>
           <div className="flex flex-col gap-3">
             {editable.map((o) => (
-              <OrgTermsEditor key={o.id} org={o} named={orgs.length > 1} />
+              <OrgTermsEditor
+                key={o.id}
+                org={o}
+                named={orgs.length + outsideConfig.length > 1}
+                error={adminOnly.list.find((a) => a.summary.id === o.id)?.error ?? null}
+                onEdited={adminOnly.reload}
+              />
             ))}
             {locked.length > 0 && (
               <div className="rounded-[var(--radius-card)] border border-[var(--color-line-visible)] bg-[var(--color-surface)] px-4 py-3.5">
@@ -157,11 +182,24 @@ export function VocabularySection({ s, update }: Pick<SettingsHook, "s" | "updat
 }
 
 /** An administered organisation's terms, edited on the server. The list shown
- *  is the cached config's, which the backend refreshes after each edit. */
-function OrgTermsEditor({ org, named }: { org: OrgSummary; named: boolean }) {
+ *  is the cached config's, which the backend refreshes after each edit, or for
+ *  an organisation outside the user's departments the server's, reloaded
+ *  through `onEdited`. */
+function OrgTermsEditor({
+  org,
+  named,
+  error: loadError,
+  onEdited,
+}: {
+  org: OrgSummary;
+  named: boolean;
+  error: string | null;
+  onEdited: () => void;
+}) {
   const [draft, setDraft] = useState("");
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [editError, setError] = useState<string | null>(null);
+  const error = editError ?? loadError;
   const terms = parseVocabulary(org.vocabulary.join("\n"));
   const candidates = splitDraft(draft);
   const full = terms.length >= VOCABULARY_LIMIT;
@@ -171,6 +209,7 @@ function OrgTermsEditor({ org, named }: { org: OrgSummary; named: boolean }) {
     try {
       await ipc.orgVocabularyEdit(org.id, add, remove);
       setError(null);
+      onEdited();
       if (add.length > 0) setDraft("");
     } catch (e) {
       setError(String(e));

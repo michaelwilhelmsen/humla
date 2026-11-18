@@ -43,6 +43,13 @@ export type AdminOrg = { id: string; name: string; require_2fa: boolean };
  *  user's own departments, `hidden` counts the others it is offered to. */
 export type OrgTemplateDraft = { name: string; content: string; workspaces: string[]; hidden: number };
 
+/** Mirrors `commands::org_admin::AdminContent`: an organisation the user
+ *  administers without being in any of its departments. Edited only, never
+ *  applied on this Mac. `departments` counts where a template is offered; 0 is
+ *  every department. */
+export type AdminTemplate = { client_id: string; name: string; content: string; departments: number };
+export type AdminContent = { templates: AdminTemplate[]; vocabulary: string[] };
+
 /** Days of retention per workspace, from `org_policy::retention_scope`. */
 export type RetentionScope = Record<string, number>;
 

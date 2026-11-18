@@ -424,6 +424,7 @@ where
             commands::org_audio_notice,
             commands::org_audio_sweep,
             commands::org_admin_orgs,
+            commands::org_admin_content,
             commands::org_template_open,
             commands::org_template_save,
             commands::org_template_delete,
