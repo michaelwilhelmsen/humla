@@ -784,6 +784,8 @@ fn fetch_with_header(
     tail: &str,
 ) -> Result<(db::Note, String), Outcome> {
     let note = fetch_note(conn, workspace, note_id)?;
+    // An MCP client reading a note is an open, under the organisation's `audit_reads`.
+    crate::org_audit::record(conn, crate::org_audit::Action::Open, &note.workspace_id, &note.id);
     let langs = db::note_languages(conn, &[note_id]).unwrap_or_default();
     // The same descriptor a listing row is built from, for the one note. Without it a
     // client that jumps straight to an id — from a search hit, or one the user pasted —
