@@ -225,6 +225,10 @@ impl Manager {
                 Arc::new(move |note_id: &str| super::org::note_busy(&app, note_id))
             },
             purge_note: Arc::new(|conn: &rusqlite::Connection, id: &str| crate::db::purge_note_rows(conn, id)),
+            governed: {
+                let (db, workspace) = (self.db.clone(), workspace_id.clone());
+                Arc::new(move || crate::org_policy::governs_workspace(&db.lock(), &workspace))
+            },
             workspace_id,
             poll_interval: POLL_INTERVAL,
             recordings_dir,

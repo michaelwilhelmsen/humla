@@ -136,6 +136,30 @@ pub struct Config {
     /// Deletes a note and everything keyed to it, inside the transaction the
     /// worker opens. The app passes `db::purge_note_rows`.
     pub purge_note: PurgeNote,
+    /// Whether an organisation's policy governs this workspace's notes, so a
+    /// conflict copy stays in it rather than going to Personal. Read once at
+    /// the start of each pull.
+    pub governed: Governed,
+}
+
+pub type Governed = Arc<dyn Fn() -> bool + Send + Sync>;
+
+/// No organisation: a conflict copy goes to Personal.
+pub fn not_governed() -> Governed {
+    Arc::new(|| false)
+}
+
+/// What one pull applies notes under, read before it takes the database.
+#[derive(Clone, Copy, Debug, Default)]
+struct PullScope {
+    cutoff: Option<i64>,
+    governed: bool,
+}
+
+impl From<Option<i64>> for PullScope {
+    fn from(cutoff: Option<i64>) -> Self {
+        PullScope { cutoff, governed: false }
+    }
 }
 
 pub type RetentionCutoff = Arc<dyn Fn() -> Option<i64> + Send + Sync>;
@@ -1143,10 +1167,10 @@ impl Worker {
     /// Pull every entity changed since its cursor and apply locally.
     async fn pull(&self) -> Result<()> {
         let auth = self.ensure_auth().await?;
-        let cutoff = (self.config.retention_cutoff)();
+        let scope = PullScope { cutoff: (self.config.retention_cutoff)(), governed: (self.config.governed)() };
         let mut changed = false;
         changed |= self
-            .pull_collection("notes", "notes_cursor", &auth.token, |v| self.apply_remote_note_json(v, cutoff))
+            .pull_collection("notes", "notes_cursor", &auth.token, |v| self.apply_remote_note_json(v, scope))
             .await?;
         changed |= self
             .pull_collection("folders", "folders_cursor", &auth.token, |v| self.apply_remote_folder_json(v))
@@ -1274,9 +1298,9 @@ impl Worker {
         FairGuard(Some(self.db.lock()))
     }
 
-    fn apply_remote_note_json(&self, v: &serde_json::Value, cutoff: Option<i64>) -> Result<()> {
+    fn apply_remote_note_json(&self, v: &serde_json::Value, scope: impl Into<PullScope>) -> Result<()> {
         let n: RemoteNote = serde_json::from_value(v.clone())?;
-        self.apply_remote_note(&n, cutoff)
+        self.apply_remote_note(&n, scope)
     }
 
     fn apply_remote_folder_json(&self, v: &serde_json::Value) -> Result<()> {
@@ -1298,7 +1322,8 @@ impl Worker {
     /// commands (no observer re-ping) and writes the server's timestamp as
     /// `updated_at` (NOT now()), with a last-write-wins guard so a stale pull
     /// can't clobber a newer local edit.
-    fn apply_remote_note(&self, n: &RemoteNote, cutoff: Option<i64>) -> Result<()> {
+    fn apply_remote_note(&self, n: &RemoteNote, scope: impl Into<PullScope>) -> Result<()> {
+        let scope: PullScope = scope.into();
         // Reject a non-UUID client_id from the server: it would become a local
         // primary key and later be interpolated into PocketBase filters. Our
         // client only ever creates UUID ids, so anything else is malformed or
@@ -1308,7 +1333,7 @@ impl Worker {
             eprintln!("cloud-sync: skipping pulled note with unsafe client_id");
             return Ok(());
         }
-        if let Some(cutoff) = cutoff {
+        if let Some(cutoff) = scope.cutoff {
             if self.purge_if_expired(n, cutoff)? {
                 return Ok(());
             }
@@ -1358,8 +1383,11 @@ impl Worker {
                         .is_some();
                     if has_pending {
                         let copy_id = format!("{}-conflict-{}", n.client_id, now_ms());
-                        // Copy every field from the current local row; mark it
-                        // Personal (workspace '') so the copy never syncs back.
+                        // Copy every field from the current local row. It goes
+                        // to Personal (workspace '') so it never syncs back,
+                        // unless an organisation governs this workspace: then
+                        // it stays under that organisation's rules, unpushed.
+                        let home = if scope.governed { ws } else { "" };
                         conn.execute(
                             "INSERT INTO notes
                                 (id, title, body, transcript, summary, audio_path, summary_preset,
@@ -1367,9 +1395,9 @@ impl Worker {
                                  workspace_id, created_at, updated_at)
                              SELECT ?1, title || ' (conflict copy)', body, transcript, summary,
                                  audio_path, summary_preset, folder_id, client_id, language, summary_provider,
-                                 expected_speakers, '', '', created_at, ?2
+                                 expected_speakers, '', ?4, created_at, ?2
                              FROM notes WHERE id = ?3",
-                            rusqlite::params![copy_id, now_ms(), n.client_id],
+                            rusqlite::params![copy_id, now_ms(), n.client_id, home],
                         )?;
                         // Drop the queued push for the original (this workspace) —
                         // we're taking the server's version, so it would just echo.
@@ -2125,6 +2153,7 @@ mod it {
             retention_cutoff: no_retention(),
             note_busy: Arc::new(|_: &str| false),
             purge_note: Arc::new(test_purge_note_rows),
+            governed: not_governed(),
         })
     }
 
@@ -2207,6 +2236,7 @@ mod it {
             retention_cutoff: no_retention(),
             note_busy: Arc::new(|_: &str| false),
             purge_note: Arc::new(test_purge_note_rows),
+            governed: not_governed(),
         }
     }
 
@@ -3033,6 +3063,44 @@ mod it {
             .unwrap();
         assert_eq!(pending, 0, "stale pending push dropped");
         assert!(fired.load(Ordering::SeqCst), "conflict callback fired");
+    }
+
+    /// In a workspace an organisation governs, the conflict copy stays in it.
+    #[test]
+    fn a_governed_workspaces_conflict_copy_stays_in_it() {
+        let db = test_db();
+        let w = Worker {
+            db: db.clone(),
+            config: offline_config("wsA"),
+            http: crate::http::client(),
+            notify: Arc::new(|| {}),
+            status: Arc::new(|_| {}),
+            conflict: Arc::new(|_: &str| {}),
+            purged: Arc::new(|_: &str| {}),
+            auth: Mutex::new(None),
+        };
+        db.lock()
+            .execute(
+                "INSERT INTO notes (id, title, body, workspace_id, created_at, updated_at) VALUES ('n1','mine','local body','wsA',1,100)",
+                [],
+            )
+            .unwrap();
+        w.enqueue(Op::Note { id: "n1".into(), delete: false }).unwrap();
+        let remote = RemoteNote { client_id: "n1".into(), title: "theirs".into(), client_updated_at: 200, ..Default::default() };
+        w.apply_remote_note(&remote, PullScope { cutoff: None, governed: true }).unwrap();
+        let conn = db.lock();
+        let homes: Vec<String> = conn
+            .prepare("SELECT workspace_id FROM notes WHERE title LIKE '%(conflict copy)'")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(homes, ["wsA"], "never Personal");
+        let pending: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sync_outbox WHERE op='upsert'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(pending, 0, "the copy isn't pushed");
     }
 
     #[tokio::test]
