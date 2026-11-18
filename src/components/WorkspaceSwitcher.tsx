@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { Check, ChevronsUpDown, Cloud, CloudOff, Lock, Plus, RefreshCw, User, Users } from "lucide-react";
+import { Check, ChevronsUpDown, Cloud, CloudOff, Lock, Mail, Plus, RefreshCw, User, Users } from "lucide-react";
 import {
   cloudApi,
   roleLabel,
@@ -13,6 +13,8 @@ import { useDeepLinkStore } from "../lib/deepLink";
 import type { SyncStatus } from "../lib/ipc";
 import { Menu, MenuContent, MenuItem, MenuLabel, MenuSeparator, MenuTrigger } from "./ui/Menu";
 import { NewWorkspaceModal } from "./NewWorkspaceModal";
+import { OrgInviteCard } from "./OrgInviteCard";
+import { Modal } from "../pages/settings/components/Modal";
 
 // Small sync-state indicator shown next to the active workspace. Surfaces what
 // was previously invisible: whether sync is running, done, or failing.
@@ -115,6 +117,7 @@ export function WorkspaceSwitcher() {
   // Both entrances open the same sheet; only the attribution differs, and that
   // difference is the entire point of an ambient hint — whether it converts.
   const [creatingSource, setCreatingSource] = useState<CheckoutSource>("new_workspace");
+  const [reviewing, setReviewing] = useState<string | null>(null);
 
   function startCreating(source: CheckoutSource) {
     setCreatingSource(source);
@@ -136,6 +139,9 @@ export function WorkspaceSwitcher() {
   // The session ended without the user signing out: nothing syncs until they
   // sign in again, so the switcher says so.
   const sessionEnded = !status.logged_in && !!status.signed_out_email;
+  const invites = status.logged_in ? (status.invites ?? []) : [];
+  const reviewed = invites.find((i) => i.id === reviewing) ?? null;
+  const invitesTitle = invites.length === 1 ? "1 invitation" : `${invites.length} invitations`;
 
   async function select(id: string) {
     try {
@@ -168,6 +174,11 @@ export function WorkspaceSwitcher() {
             )}
           </span>
           <span className="flex-1 min-w-0 text-left truncate">{label}</span>
+          {invites.length > 0 && (
+            <span title={invitesTitle} aria-label={invitesTitle} className="shrink-0 grid place-items-center">
+              <Mail size={13} strokeWidth={1.5} className="text-[var(--color-accent-text)]" />
+            </span>
+          )}
           {current && syncStatus && <SyncIndicator status={syncStatus} />}
           {current ? (
             <RolePill role={current.role} />
@@ -226,6 +237,23 @@ export function WorkspaceSwitcher() {
             </>
           )}
 
+          {invites.length > 0 && (
+            <>
+              <MenuLabel className="pt-2 pb-1">Invitations</MenuLabel>
+              {invites.map((invite) => (
+                <MenuItem key={invite.id} className="px-2" onSelect={() => setReviewing(invite.id)}>
+                  <Mail size={14} strokeWidth={1.5} className="shrink-0 text-[var(--color-accent-text)]" />
+                  <span className="flex-1 min-w-0">
+                    <span className="block truncate">{invite.workspace_name}</span>
+                    <span className="block truncate text-xs text-[var(--color-text-muted)]">
+                      {invite.organisation_name}
+                    </span>
+                  </span>
+                </MenuItem>
+              ))}
+            </>
+          )}
+
           <MenuSeparator />
 
           {/* Offered whether or not you're signed in: signing in is the sheet's
@@ -239,6 +267,18 @@ export function WorkspaceSwitcher() {
           </MenuItem>
         </MenuContent>
       </Menu>
+      <Modal open={!!reviewed} onClose={() => setReviewing(null)} title="Invitation" size="sm">
+        {reviewed && (
+          <OrgInviteCard
+            invite={reviewed}
+            onAccepted={() => setReviewing(null)}
+            onOpenAccount={() => {
+              setReviewing(null);
+              navigate("/settings?tab=account");
+            }}
+          />
+        )}
+      </Modal>
       <NewWorkspaceModal
         open={creatingOpen}
         onClose={() => setCreatingOpen(false)}

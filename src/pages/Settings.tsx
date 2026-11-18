@@ -11,7 +11,7 @@ import { TemplatesSection } from "./settings/tabs/Templates";
 import { VocabularySection } from "./settings/tabs/Vocabulary";
 import { ChatTab } from "./settings/tabs/Chat";
 import { AboutTab } from "./settings/tabs/About";
-import { AccountTab, PoliciesSection } from "./settings/tabs/Account";
+import { AccountTab, InvitesSection, PoliciesSection } from "./settings/tabs/Account";
 import { OrganizationTab } from "./settings/tabs/Organization";
 import { useSettings } from "./settings/useSettings";
 
@@ -53,6 +53,7 @@ export function Settings() {
     account: (
       <>
         <AccountTab s={settings.s} update={settings.update} />
+        <InvitesSection />
         <PoliciesSection />
         <OrganizationTab />
       </>

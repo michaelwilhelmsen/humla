@@ -91,6 +91,8 @@ pub struct CloudStatus {
     pub signed_out_email: Option<String>,
     /// A managed configuration profile sets the server; the user can't change it.
     pub server_managed: bool,
+    /// Invites to organisation departments waiting for the user's answer.
+    pub invites: Vec<super::invites::OrgInvite>,
 }
 
 /// The managed chat add-on the server advertises in its billing config (#75).
@@ -224,17 +226,27 @@ async fn pb_json(resp: reqwest::Response) -> Result<serde_json::Value, String> {
         .await
         .map_err(|e| format!("pocketbase: invalid response ({e})"))?;
     if !status.is_success() {
-        if val.get("reason").and_then(|r| r.as_str()) == Some("two_factor_required") {
-            return Err(super::cloud_auth::TWO_FACTOR_REQUIRED.to_string());
-        }
-        let msg = val
-            .get("message")
-            .and_then(|m| m.as_str())
-            .or_else(|| val.get("error").and_then(|m| m.as_str()))
-            .unwrap_or("request failed");
-        return Err(format!("pocketbase {status}: {msg}"));
+        return Err(pb_failure(status, &val));
     }
     Ok(val)
+}
+
+/// A PATCH that would add someone to an organisation department: they have to
+/// be invited and accept.
+pub(crate) const INVITE_REQUIRED: &str = "They join this department by accepting an invite.";
+
+fn pb_failure(status: reqwest::StatusCode, val: &serde_json::Value) -> String {
+    match val.get("reason").and_then(|r| r.as_str()) {
+        Some("two_factor_required") => return super::cloud_auth::TWO_FACTOR_REQUIRED.to_string(),
+        Some("invite_required") => return INVITE_REQUIRED.to_string(),
+        _ => {}
+    }
+    let msg = val
+        .get("message")
+        .and_then(|m| m.as_str())
+        .or_else(|| val.get("error").and_then(|m| m.as_str()))
+        .unwrap_or("request failed");
+    format!("pocketbase {status}: {msg}")
 }
 
 async fn authed_get(
@@ -670,14 +682,16 @@ pub async fn cloud_status(
                 .then(|| super::cloud_auth::signed_out_email(&state.keychain_cache))
                 .flatten(),
             server_managed,
+            invites: vec![],
         });
     };
 
-    let (workspaces, billing, two_factor, _) = tokio::join!(
+    let (workspaces, billing, two_factor, _, invites) = tokio::join!(
         list_workspaces_inner(&base_url, &session),
         fetch_billing_config(&base_url),
         super::cloud_auth::fetch_two_factor_status(&base_url, &session.token),
         super::org::refresh_org_config(&state.db, &app, &base_url, &session.token),
+        super::invites::refresh(&app, &base_url, &session),
     );
     // After sign-in too, when no workspace is selected and the worker isn't running.
     let (db, cache) = (state.db.clone(), state.keychain_cache.clone());
@@ -723,6 +737,7 @@ pub async fn cloud_status(
         locked_current_workspace,
         signed_out_email: None,
         server_managed,
+        invites,
     })
 }
 
@@ -901,6 +916,7 @@ pub async fn cloud_request_password_reset(
 #[tauri::command]
 pub fn cloud_logout(state: State<'_, AppState>) -> Result<(), String> {
     super::cloud_auth::sign_out(&state);
+    super::invites::clear();
     clear_all_roster_caches(&state); // no cached names survive sign-out (#116 / ADR-0002)
     state.sync.config_changed(); // creds gone → stop the sync worker
     Ok(())
@@ -1052,14 +1068,51 @@ async fn fetch_relations(
     Ok((ids(&val, "members"), ids(&val, "admins"), ids(&val, "viewers")))
 }
 
+/// Whether the cached organisation config lists `workspace_id` as one of its
+/// departments.
+fn in_organisation(config: Option<&crate::org_policy::OrgConfig>, workspace_id: &str) -> bool {
+    config.is_some_and(|c| c.orgs.iter().any(|o| o.workspaces.iter().any(|w| w == workspace_id)))
+}
+
+/// How adding a member by id goes: an organisation department takes an invite.
+#[derive(Debug, PartialEq)]
+enum AddRoute {
+    Invite,
+    Patch,
+}
+
+fn add_route(org_workspace: bool) -> AddRoute {
+    if org_workspace {
+        AddRoute::Invite
+    } else {
+        AddRoute::Patch
+    }
+}
+
+/// After a PATCH failed with `error`: whether to send an invite instead.
+fn falls_back_to_invite(error: &str) -> bool {
+    error == INVITE_REQUIRED
+}
+
+/// Add an existing account by email. Returns the status the invite route
+/// answers with when an organisation department needs their consent
+/// (`"pending"`), else `"added"`.
 #[tauri::command]
 pub async fn cloud_add_member(
     state: State<'_, AppState>,
     workspace_id: String,
     email: String,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let (base, session) = ensure_session(&state).await?;
     let email = email.trim();
+
+    let org_workspace = {
+        let conn = state.db.lock();
+        in_organisation(crate::org_policy::cached(&conn).ok().flatten().as_ref(), &workspace_id)
+    };
+    if add_route(org_workspace) == AddRoute::Invite {
+        return post_invite(&base, &session.token, &workspace_id, email, "member").await;
+    }
 
     // Resolve email → user id via the server-side superuser hook, so the client
     // needs no read access to the users collection (the list/view rules are
@@ -1091,15 +1144,36 @@ pub async fn cloud_add_member(
     if !members.contains(&user_id) {
         members.push(user_id);
         let path = format!("/api/collections/workspaces/records/{workspace_id}");
-        authed_patch(&base, &session.token, &path, serde_json::json!({ "members": members })).await?;
+        match authed_patch(&base, &session.token, &path, serde_json::json!({ "members": members })).await {
+            Ok(_) => {}
+            Err(e) if falls_back_to_invite(&e) => {
+                return post_invite(&base, &session.token, &workspace_id, email, "member").await;
+            }
+            Err(e) => return Err(e),
+        }
     }
-    Ok(())
+    Ok("added".into())
 }
 
-/// Invite someone to a workspace by email. If they already have an account they
-/// are added immediately (returns "added"); otherwise a pending invite is
-/// recorded and they auto-join on sign-up (returns "invited"). Owner/admin only
-/// (enforced by the hook). Supersedes `cloud_add_member` for the UI.
+pub(crate) fn invite_request(workspace_id: &str, email: &str, role: &str) -> serde_json::Value {
+    serde_json::json!({ "workspace_id": workspace_id, "email": email.trim(), "role": role })
+}
+
+/// The invite route's `status`: `"added"`, `"invited"` (no account yet) or
+/// `"pending"` (an organisation department, joined once they accept).
+pub(crate) fn invite_status(val: &serde_json::Value) -> String {
+    val.get("status").and_then(|v| v.as_str()).unwrap_or("invited").to_string()
+}
+
+async fn post_invite(base: &str, token: &str, workspace_id: &str, email: &str, role: &str) -> Result<String, String> {
+    let val = authed_post(base, token, "/api/humla/invite", invite_request(workspace_id, email, role)).await?;
+    Ok(invite_status(&val))
+}
+
+/// Invite someone to a workspace by email. An existing account is added at
+/// once (`"added"`), or, in an organisation department, gets an invite to
+/// accept in the app (`"pending"`); anyone else gets an email and joins on
+/// sign-up (`"invited"`). Owner/admin only (enforced by the hook).
 #[tauri::command]
 pub async fn cloud_invite_member(
     state: State<'_, AppState>,
@@ -1108,19 +1182,7 @@ pub async fn cloud_invite_member(
     role: String,
 ) -> Result<String, String> {
     let (base, session) = ensure_session(&state).await?;
-    let resp = http()
-        .post(format!("{base}/api/humla/invite"))
-        .bearer_auth(&session.token)
-        .json(&serde_json::json!({
-            "workspace_id": workspace_id,
-            "email": email.trim(),
-            "role": role,
-        }))
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-    let val = pb_json(resp).await?;
-    Ok(val.get("status").and_then(|v| v.as_str()).unwrap_or("invited").to_string())
+    post_invite(&base, &session.token, &workspace_id, &email, &role).await
 }
 
 #[tauri::command]
@@ -2389,5 +2451,61 @@ mod tests {
             !ids.iter().any(|id| id.contains("..")),
             "no traversal id may survive into the reconcile input"
         );
+    }
+
+    fn org_config(workspaces: &[&str]) -> crate::org_policy::OrgConfig {
+        serde_json::from_value(serde_json::json!({
+            "orgs": [{
+                "id": "o1",
+                "name": "Bergen kommune",
+                "policy": { "local_only": true, "retention_days": 0, "telemetry_off": false, "audio_forbidden": false },
+                "workspaces": workspaces,
+            }]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn only_an_organisation_department_takes_the_invite_route() {
+        let config = org_config(&["ws-org"]);
+        assert!(in_organisation(Some(&config), "ws-org"));
+        assert!(!in_organisation(Some(&config), "ws-team"));
+        assert!(!in_organisation(None, "ws-org"));
+        assert_eq!(add_route(in_organisation(Some(&config), "ws-org")), AddRoute::Invite);
+        assert_eq!(add_route(in_organisation(Some(&config), "ws-team")), AddRoute::Patch);
+    }
+
+    #[test]
+    fn a_patch_refused_with_invite_required_falls_back_to_the_invite_route() {
+        let refused = pb_failure(
+            reqwest::StatusCode::FORBIDDEN,
+            &serde_json::json!({ "message": "Invite them instead.", "reason": "invite_required" }),
+        );
+        assert!(falls_back_to_invite(&refused));
+        let other = pb_failure(reqwest::StatusCode::FORBIDDEN, &serde_json::json!({ "message": "Only admins." }));
+        assert!(!falls_back_to_invite(&other));
+        assert_eq!(other, "pocketbase 403 Forbidden: Only admins.");
+    }
+
+    #[test]
+    fn a_workspace_refused_for_two_factor_keeps_its_wording() {
+        let refused = pb_failure(reqwest::StatusCode::FORBIDDEN, &serde_json::json!({ "reason": "two_factor_required" }));
+        assert_eq!(refused, super::super::cloud_auth::TWO_FACTOR_REQUIRED);
+    }
+
+    #[test]
+    fn the_invite_request_carries_workspace_email_and_role() {
+        assert_eq!(
+            invite_request("ws1", " kari@example.no ", "member"),
+            serde_json::json!({ "workspace_id": "ws1", "email": "kari@example.no", "role": "member" })
+        );
+    }
+
+    #[test]
+    fn the_invite_status_tells_pending_from_added() {
+        assert_eq!(invite_status(&serde_json::json!({ "status": "pending" })), "pending");
+        assert_eq!(invite_status(&serde_json::json!({ "status": "added" })), "added");
+        assert_eq!(invite_status(&serde_json::json!({ "status": "invited" })), "invited");
+        assert_eq!(invite_status(&serde_json::json!({})), "invited");
     }
 }

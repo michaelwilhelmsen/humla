@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { ipc, onRecordingDiagnostic, onRecordingError, onRecordingStatus, onSummary, onSummaryStatus, onTitleStatus, onTranscribeStatus, onDiarizeStatus, onTranscript, onTranscriptReplaced, onNotesChanged, onSyncStatus, onSyncConflict, onLocalWhisperProgress, onLocalWhisperDownloadError, type Client, type Folder, type Note, type RecordingDiagnostic, type RecordingStatus, type Step } from "./ipc";
-import { useCloudStore } from "./cloud";
+import { onOrgInvitesChanged, useCloudStore } from "./cloud";
 
 type NotesState = {
   notes: Note[];
@@ -464,6 +464,7 @@ export function bindBackendListeners() {
     // Both are the account's state changing under the UI: the status says how.
     if (s === "signed_out" || s === "two_factor_required") void useCloudStore.getState().refresh();
   });
+  void onOrgInvitesChanged().catch(() => {});
   // A sync conflict preserved local edits as a copy → tell the user where it went.
   onSyncConflict((title) =>
     useRecordingStore.getState().pushError({

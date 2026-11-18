@@ -569,6 +569,7 @@ fn adopt(
         token: Some(session.token.clone()),
     };
     store_account(&state.keychain_cache, Some(&account))?;
+    super::invites::clear();
     adopt_audit_account(&state.db, &session.user_id);
     set_session(Some(session));
     Ok(())
@@ -593,6 +594,7 @@ pub(crate) fn forget_account(cache: &crate::keychain::Cache) {
 }
 
 fn forget_account_with(store: impl FnOnce(Option<&StoredAccount>) -> Result<(), String>) {
+    super::invites::clear();
     if let Err(e) = store(None) {
         eprintln!("cloud: couldn't remove the stored account: {e}");
     }
@@ -769,7 +771,7 @@ pub async fn cloud_verify_two_factor(
 // ---- managing two-factor authentication -------------------------------------
 
 #[derive(Clone, Copy)]
-enum Verb {
+pub(crate) enum Verb {
     Get,
     Post,
     Patch,
@@ -778,7 +780,7 @@ enum Verb {
 /// A request to a two-factor route or a workspace record, as the signed-in user:
 /// the session is renewed and the request sent once more if the server refuses
 /// its token. Failures read through [`route_error`].
-async fn authed_call(
+pub(crate) async fn authed_call(
     state: &State<'_, AppState>,
     verb: Verb,
     path: &str,

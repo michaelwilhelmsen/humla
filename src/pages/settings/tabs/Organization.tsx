@@ -1,17 +1,20 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { LogOut, ShieldCheck, Trash2, UserPlus } from "lucide-react";
 import { open as openExternal } from "@tauri-apps/plugin-shell";
 import {
   cloudApi,
   cloudError,
   formatSeatPrice,
+  INVITE_PENDING,
   roleColorVar,
   roleLabel,
   useCloudStore,
   type CloudMember,
   type CloudRole,
   type CloudWorkspace,
+  type PendingInvite,
 } from "../../../lib/cloud";
+import { useOrgWorkspaces } from "../../../lib/orgPolicy";
 import { useNotesStore } from "../../../lib/store";
 import { Row, Section } from "../components/Section";
 import { Btn } from "../components/Btn";
@@ -245,6 +248,11 @@ export function OrganizationTab() {
   // Who has two-factor authentication, by member id: what an owner or admin
   // needs to see before requiring it.
   const [hasTwoFactor, setHasTwoFactor] = useState<TwoFactorRoster>(null);
+  const orgWorkspaces = useOrgWorkspaces();
+  const showPending = canManage && !!ws && orgWorkspaces.includes(ws.id);
+  const [pending, setPending] = useState<PendingInvite[]>([]);
+  // Only the latest load lands, so the list is always the department shown.
+  const pendingLoad = useRef(0);
 
   // Reseed the rename field and reset the danger confirms whenever the active
   // workspace (or its name, after a rename) changes.
@@ -272,6 +280,19 @@ export function OrganizationTab() {
     if (ws?.id) loadMembers(ws.id);
     else setMembers([]);
   }, [ws?.id, loadMembers]);
+
+  // Best-effort: an older server, or one that won't show them, lists none.
+  const loadPending = useCallback(async (id: string) => {
+    const load = ++pendingLoad.current;
+    const list = await cloudApi.pendingInvites(id).catch(() => []);
+    if (load === pendingLoad.current) setPending(list);
+  }, []);
+
+  useEffect(() => {
+    pendingLoad.current++;
+    setPending([]);
+    if (ws?.id && showPending) void loadPending(ws.id);
+  }, [ws?.id, showPending, loadPending]);
 
   useEffect(() => {
     setHasTwoFactor(null);
@@ -344,13 +365,30 @@ export function OrganizationTab() {
       const status = await cloudApi.inviteMember(ws.id, email);
       setAddEmail("");
       setNotice(
-        status === "invited"
-          ? `Invitation emailed to ${email} — they'll join automatically when they sign up and verify their email.`
-          : `Added ${email} to the workspace — they've been notified by email.`,
+        status === "pending"
+          ? INVITE_PENDING
+          : status === "invited"
+            ? `Invitation emailed to ${email} — they'll join automatically when they sign up and verify their email.`
+            : `Added ${email} to the workspace — they've been notified by email.`,
       );
       await loadMembers(ws.id);
+      if (showPending) await loadPending(ws.id);
     } catch (e) {
       setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function withdraw(inviteId: string) {
+    if (!ws) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await cloudApi.withdrawInvite(inviteId);
+      await loadPending(ws.id);
+    } catch (e) {
+      setError(cloudError(e).message);
     } finally {
       setBusy(false);
     }
@@ -580,6 +618,31 @@ export function OrganizationTab() {
             </div>
           ))}
         </div>
+
+        {pending.length > 0 && (
+          <Row label="Invited">
+            <div className="flex flex-col gap-1">
+              {pending.map((p) => (
+                <div
+                  key={p.id}
+                  className="flex items-center gap-3 px-3 py-2 rounded-md border border-[var(--color-line)]"
+                >
+                  <div className="flex-1 min-w-0">
+                    <div className="text-sm truncate">{p.email}</div>
+                    {p.invited_by_name && (
+                      <div className="text-xs text-[var(--color-text-muted)] truncate">
+                        Invited by {p.invited_by_name}
+                      </div>
+                    )}
+                  </div>
+                  <Btn onClick={() => withdraw(p.id)} disabled={busy}>
+                    Withdraw
+                  </Btn>
+                </div>
+              ))}
+            </div>
+          </Row>
+        )}
 
         {canManage && (
           <Row label="Add member by email">

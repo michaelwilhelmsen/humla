@@ -2030,6 +2030,13 @@ const CASES: Record<string, Scenario> = {
     render: () => null, // unused — `route` renders the app
     ipc: accountIpc({ signedIn: true, policies: true }),
   },
+  // `account-invites`: an invite to an organisation's department, in Settings
+  // and the workspace switcher. Accepting answers that 2FA is required.
+  "account-invites": {
+    route: "/settings?tab=account",
+    render: () => null, // unused — `route` renders the app
+    ipc: accountIpc({ signedIn: true, policies: false, invites: true }),
+  },
   "account-policies-signed-out": {
     route: "/settings?tab=account",
     render: () => null, // unused — `route` renders the app
@@ -2250,7 +2257,7 @@ function settingsOrgIpc({ admin = false }: { admin?: boolean } = {}): Record<str
   };
 }
 
-function accountIpc({ signedIn, policies }: { signedIn: boolean; policies: boolean }) {
+function accountIpc({ signedIn, policies, invites = false }: { signedIn: boolean; policies: boolean; invites?: boolean }) {
   const team: CloudWorkspace = { id: "w1", name: "Northwind Health", role: "member", plan_status: "active" };
   const reason = "Nothing leaves this Mac.";
   const kinds = ["local_only", "retention_days", "telemetry_off", "audio_forbidden"] as const;
@@ -2265,6 +2272,21 @@ function accountIpc({ signedIn, policies }: { signedIn: boolean; policies: boole
             user: { id: "u1", email: "m@example.no", name: "Michael", verified: true },
             current_workspace: team,
             workspaces: [team],
+            invites: invites
+              ? [
+                  {
+                    id: "i1",
+                    workspace_id: "w2",
+                    workspace_name: "Child welfare",
+                    organisation_name: "Bergen kommune",
+                    role: "member",
+                    invited_by_name: "Kari Nordmann",
+                    created: "2026-11-18 10:00:00.000Z",
+                    policy: { local_only: true, retention_days: 90, telemetry_off: false, audio_forbidden: true },
+                    policy_reason: "Case notes stay on municipal devices.",
+                  },
+                ]
+              : [],
           }
         : {
             ...DISCONNECTED,
@@ -2275,6 +2297,14 @@ function accountIpc({ signedIn, policies }: { signedIn: boolean; policies: boole
       { id: "u1", email: "m@example.no", name: "Michael", role: "member" },
       { id: "u2", email: "kari@example.no", name: "Kari", role: "owner" },
     ],
+    cloud_accept_invite: (args: unknown) => {
+      console.log("[mock] accept", args);
+      throw {
+        reason: "two_factor_required",
+        message: "This department requires two-factor authentication. Set it up in Settings → Account, then accept again.",
+      };
+    },
+    cloud_decline_invite: (args: unknown) => console.log("[mock] decline", args),
     org_status: () => ({
       policy: policies
         ? {
