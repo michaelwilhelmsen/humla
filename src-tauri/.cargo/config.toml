@@ -8,7 +8,7 @@ runner = "../scripts/dev-sign.sh"
 [target.x86_64-apple-darwin]
 runner = "../scripts/dev-sign.sh"
 
-# github-copilot-sdk's build script downloads the Copilot runtime unless told
+# copilot-sdk's build script downloads the Copilot runtime unless told
 # not to.
 [env]
 COPILOT_SKIP_CLI_DOWNLOAD = "1"

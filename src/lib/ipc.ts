@@ -11,6 +11,8 @@ export type CopilotStatus = {
   cliVersion: string | null;
   /** Why the CLI last failed to start, if it did. */
   cliError: string | null;
+  /** Whether the CLI found is Humla's own download of `downloadVersion`. */
+  cliIsDownload: boolean;
   downloadVersion: string;
 };
 export type CopilotDeviceCode = { userCode: string; verificationUri: string; expiresIn: number };

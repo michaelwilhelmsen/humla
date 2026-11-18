@@ -1,6 +1,6 @@
 //! GitHub Copilot as a summary and chat provider (#227), reached through the
 //! user's Copilot subscription: Humla signs in with its own OAuth app and
-//! drives the Copilot CLI through `github-copilot-sdk`.
+//! drives the Copilot CLI through `copilot-sdk`.
 
 pub mod auth;
 pub mod cli;
@@ -8,7 +8,7 @@ pub mod session;
 
 use std::path::{Path, PathBuf};
 
-use github_copilot_sdk::Client;
+use copilot_sdk::Client;
 
 use crate::keychain;
 
@@ -30,6 +30,12 @@ pub fn read_credentials(cache: &keychain::Cache) -> Result<Option<auth::Credenti
 pub fn write_credentials(cache: &keychain::Cache, creds: Option<&auth::Credentials>) -> Result<(), String> {
     let json = creds.map(|c| serde_json::to_string(c).expect("credentials serialize"));
     keychain::write(cache, CREDENTIALS_ACCOUNT, json.as_deref())
+}
+
+/// Whether a failed start is answered by downloading the pinned CLI: only when
+/// the CLI spoke another protocol and isn't that download already.
+pub fn should_replace_cli(e: &anyhow::Error, cli: Option<&Path>, pinned: &Path) -> bool {
+    e.downcast_ref::<session::WrongProtocol>().is_some() && cli != Some(pinned)
 }
 
 impl Runtime {
@@ -68,5 +74,21 @@ impl Runtime {
         let token = self.token(cache).await?;
         let cli = self.cli(app_data).await.ok_or_else(|| anyhow::anyhow!(NO_CLI))?;
         self.client(&cli, &token).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_cli_on_another_protocol_that_isnt_the_download_is_replaced() {
+        let pinned = Path::new("/data/copilot/1.0.114/copilot");
+        let own = Path::new("/opt/homebrew/bin/copilot");
+        let wrong = || anyhow::Error::new(session::WrongProtocol("version mismatch".into()));
+        assert!(should_replace_cli(&wrong(), Some(own), pinned));
+        assert!(!should_replace_cli(&wrong(), Some(pinned), pinned), "the download itself is never replaced");
+        assert!(!should_replace_cli(&anyhow::anyhow!(SIGNED_OUT), Some(own), pinned));
+        assert!(!should_replace_cli(&anyhow::anyhow!("startup timeout"), Some(own), pinned));
     }
 }

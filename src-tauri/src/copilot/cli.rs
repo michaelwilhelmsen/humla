@@ -14,8 +14,12 @@ use anyhow::{anyhow, bail, Context};
 use base64::Engine as _;
 use sha2::{Digest, Sha512};
 
-/// The CLI `github-copilot-sdk` 1.0.34 was published against.
-pub const VERSION: &str = "1.0.112";
+/// The CLI `copilot-sdk` 2.0.1 was published against.
+pub const VERSION: &str = "1.0.114";
+
+/// The oldest CLI that speaks the SDK's protocol (4); an older download is
+/// refused at start, so it is never tried.
+const OLDEST_COMPATIBLE: &str = "1.0.114";
 
 /// GitHub's Apple team, which signs the CLI binary.
 const GITHUB_TEAM_ID: &str = "VEKTX9H2N7";
@@ -25,11 +29,11 @@ fn pinned(arch: &str) -> Option<(&'static str, &'static str)> {
     match arch {
         "aarch64" => Some((
             "copilot-darwin-arm64",
-            "sha512-KhEgTlMtHkDWaBWwHGS+17wlsJLOt+rEC4Y5JLQ5QE+nVIgyA8QpEmrf4RuJWs1i9JLLYldtpk8dTyD+LIbM2Q==",
+            "sha512-Mw47DTwMNDG0bb4t1rVu7S+ekdThIGGitpG28/wGpACZ0lFhYnpNEoSJ7hHBM3oix4b/w6+ZcmxE9J9MngsR9Q==",
         )),
         "x86_64" => Some((
             "copilot-darwin-x64",
-            "sha512-e+GtWjgen/DyUIFPzT+EHQBG+ck2NW5ouSDYOM4vY6flLbGrchcOfqz6O9E5z3JXvns2EQtZ9W5byFiFbq4XcA==",
+            "sha512-yEvWQ5XY10b8KbateMDggbHwj/Ocd5VjkmJX4xDB1YwlMFVin9812X8YsWTaG09RmOKTMU9dwAjWHHSUDUEK6Q==",
         )),
         _ => None,
     }
@@ -48,8 +52,8 @@ pub fn managed_path(app_data: &Path) -> PathBuf {
     app_data.join("copilot").join(VERSION).join("copilot")
 }
 
-/// Humla's downloads: the pinned version first, then older ones, newest first.
-/// An older download still runs while the SDK's protocol version hasn't moved.
+/// Humla's downloads: the pinned version first, then older ones still on the
+/// SDK's protocol, newest first.
 pub fn managed_paths(app_data: &Path) -> Vec<PathBuf> {
     let mut older: Vec<(Vec<u64>, PathBuf)> = std::fs::read_dir(app_data.join("copilot"))
         .into_iter()
@@ -58,7 +62,8 @@ pub fn managed_paths(app_data: &Path) -> Vec<PathBuf> {
         .filter_map(|entry| {
             let name = entry.file_name().into_string().ok()?;
             let key = version_key(&name)?;
-            (name != VERSION).then(|| (key, entry.path().join("copilot")))
+            let compatible = key >= version_key(OLDEST_COMPATIBLE)?;
+            (name != VERSION && compatible).then(|| (key, entry.path().join("copilot")))
         })
         .collect();
     older.sort_by(|a, b| b.0.cmp(&a.0));
@@ -253,10 +258,11 @@ pub async fn locate(app_data: &Path) -> Option<PathBuf> {
     find(&candidates(None, &managed, &home, Some(&shell)), arch())
 }
 
-/// `copilot --version`'s version number.
+/// The version Humla runs. Without `--no-auto-update` the CLI reports the
+/// newer copy it would update itself to.
 pub async fn version(binary: &Path) -> Option<String> {
     let run = tokio::process::Command::new(binary)
-        .arg("--version")
+        .args(["--no-auto-update", "--version"])
         .stdin(std::process::Stdio::null())
         .kill_on_drop(true)
         .output();
@@ -335,9 +341,9 @@ mod tests {
     }
 
     #[test]
-    fn older_downloads_follow_the_pinned_one_newest_first() {
+    fn older_downloads_on_the_protocol_follow_the_pinned_one_newest_first() {
         let dir = tempfile::tempdir().unwrap();
-        for name in ["1.0.99", "1.0.104", "notes", VERSION] {
+        for name in ["1.0.112", "1.0.115", "1.0.120", "notes", VERSION] {
             std::fs::create_dir_all(dir.path().join("copilot").join(name)).unwrap();
         }
         let root = dir.path().join("copilot");
@@ -345,8 +351,8 @@ mod tests {
             managed_paths(dir.path()),
             [
                 root.join(VERSION).join("copilot"),
-                root.join("1.0.104/copilot"),
-                root.join("1.0.99/copilot"),
+                root.join("1.0.120/copilot"),
+                root.join("1.0.115/copilot"),
             ]
         );
     }

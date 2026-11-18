@@ -1987,12 +1987,7 @@ pub async fn chat_send(
     }
 
     let adapter: Box<dyn chat::ChatAdapter> = if resolved.provider == ProviderId::Copilot {
-        let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
-        let client = state
-            .copilot
-            .ready_client(&state.keychain_cache, &app_data)
-            .await
-            .map_err(|e| e.to_string())?;
+        let client = super::copilot_client(&app).await.map_err(|e| e.to_string())?;
         Box::new(chat::CopilotChatAdapter::new(client))
     } else {
         chat::build_chat_adapter(resolved.provider).map_err(|e| e.to_string())?

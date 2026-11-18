@@ -33,7 +33,7 @@ pub(super) struct ResolvedProvider {
     pub(super) think: bool,
     /// The running Copilot CLI, which the caller attaches after resolving —
     /// starting it is async and resolving is not.
-    pub(super) copilot: Option<github_copilot_sdk::Client>,
+    pub(super) copilot: Option<copilot_sdk::Client>,
 }
 
 /// Which client a resolved provider is called through. One answer, so a caller
@@ -109,9 +109,7 @@ pub(super) async fn attach_copilot(app: &AppHandle, p: &mut ResolvedProvider) ->
     if p.provider != ProviderId::Copilot {
         return Ok(());
     }
-    let state: State<AppState> = app.state();
-    let app_data = app.path().app_data_dir()?;
-    p.copilot = Some(state.copilot.ready_client(&state.keychain_cache, &app_data).await?);
+    p.copilot = Some(super::copilot_client(app).await?);
     Ok(())
 }
 
