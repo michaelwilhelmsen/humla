@@ -11,25 +11,42 @@ import { ValuePill } from "../components/ValuePill";
 import { Toggle } from "../components/Toggle";
 import type { SettingsHook } from "../useSettings";
 import { ManagedRow } from "../ManagedRow";
-import { MANAGED_SOURCE, usePolicyRows } from "../../../lib/orgPolicy";
+import { MANAGED_SOURCE, usePolicyGroups } from "../../../lib/orgPolicy";
 
 const inputCls =
   "w-full text-sm px-3 py-2 rounded-md border border-[var(--color-line-visible)] bg-[var(--color-surface)] focus:border-[var(--color-text-muted)] transition-colors";
 
 // Policies stay in force after sign-out, so the list shows in every state.
+// Each organisation's rules apply to its own departments; a managed profile's
+// to every workspace.
 export function PoliciesSection() {
-  const rows = usePolicyRows();
-  if (rows.length === 0) return null;
+  const groups = usePolicyGroups();
+  const status = useCloudStore((s) => s.status);
+  if (groups.length === 0) return null;
+  const known = [...status.workspaces, ...(status.locked_workspaces ?? [])];
+  const departments = (ids: string[]) =>
+    ids.length === 0
+      ? "Every workspace"
+      : ids.map((id) => known.find((w) => w.id === id)?.name).filter(Boolean).join(", ");
   return (
     <Section title="Policies">
-      {rows.map((r) => (
-        <ManagedRow
-          key={r.key}
-          label={r.label}
-          source={r.source}
-          reason={r.reason}
-          control={<ValuePill>{r.value}</ValuePill>}
-        />
+      {groups.map((g) => (
+        <div key={g.key}>
+          <p className="pt-3.5 text-xs text-[var(--color-text-muted)]">
+            {[g.source, departments(g.workspaces)].filter(Boolean).join(" · ")}
+          </p>
+          <div className="flex flex-col divide-y divide-[var(--color-line)]">
+            {g.rows.map((r) => (
+              <ManagedRow
+                key={r.key}
+                label={r.label}
+                source={r.source}
+                reason={r.reason}
+                control={<ValuePill>{r.value}</ValuePill>}
+              />
+            ))}
+          </div>
+        </div>
       ))}
     </Section>
   );

@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { ipc, type ProviderConfig } from "./ipc";
 import { useCloudStore } from "./cloud";
+import { useActiveWorkspaceId } from "./orgContent";
 import { allowedUnderLocalOnly } from "./providers";
 import type { AuditScope } from "./audit";
 
@@ -56,10 +57,28 @@ export type AdminContent = { templates: AdminTemplate[]; vocabulary: string[] };
 /** Days of retention per workspace, from `org_policy::retention_scope`. */
 export type RetentionScope = Record<string, number>;
 
-export type OrgStatus = { policy: EffectivePolicy; orgs?: OrgSummary[]; retention?: RetentionScope; audit?: AuditScope };
+/** Mirrors `org_policy::OrgPolicies`: one organisation's own policies and the
+ *  departments they govern. */
+export type OrgPolicies = { org_id: string; workspaces: string[]; policy: EffectivePolicy };
 
-/** Mirrors `org_policy::AudioSweep`. */
-export type AudioSweep = { org_id: string; org_name: string };
+/** Mirrors `commands::org::OrgStatus`. `policy` is for notes in the workspace
+ *  asked about; `device` is what applies app-wide; `managed` is the managed
+ *  configuration profile alone. */
+export type OrgStatus = {
+  policy: EffectivePolicy;
+  device?: EffectivePolicy;
+  managed?: EffectivePolicy;
+  orgs?: OrgSummary[];
+  org_policies?: OrgPolicies[];
+  /** The organisation whose policies govern notes in each department. */
+  governed?: Record<string, string>;
+  retention?: RetentionScope;
+  audit?: AuditScope;
+};
+
+/** Mirrors `org_policy::AudioSweep`: `all` sweeps every note, otherwise the
+ *  organisation's departments. */
+export type AudioSweep = { org_id: string; org_name: string; all?: boolean };
 
 /** Who set `kind`, or null when no rule enforces it. */
 export function policySource(policy: EffectivePolicy, kind: PolicyKind): PolicyRule | null {
@@ -151,7 +170,7 @@ export const AUDIT_READS_LABEL = "Opening notes";
 export const AUDIT_READS_VALUE = "Recorded";
 
 /** One row per policy in force: the setting it fixes and its enforced value.
- *  Then one per organisation that records opening its notes. */
+ *  Then one per organisation in `orgs` that records opening its notes. */
 export function policyRows(policy: EffectivePolicy, orgs: OrgSummary[] = []): PolicyRow[] {
   const describe = (kind: PolicyKind): { label: string; value: string } => {
     const label = POLICY_LABEL[kind];
@@ -181,52 +200,114 @@ export function policyRows(policy: EffectivePolicy, orgs: OrgSummary[] = []): Po
   return [...enforced, ...audited];
 }
 
+/** The policies one source enforces, and the departments they apply to (none
+ *  for a managed profile, which governs every workspace). */
+export type PolicyGroup = { key: string; source: string; workspaces: string[]; rows: PolicyRow[] };
+
+/** Each organisation's rules with its departments, then the managed profile's. */
+export function policyGroups(status: Pick<PolicyStatus, "orgPolicies" | "orgs" | "managed">): PolicyGroup[] {
+  const groups: PolicyGroup[] = status.orgPolicies.flatMap((op) => {
+    const org = status.orgs.find((o) => o.id === op.org_id);
+    const rows = policyRows(op.policy, org ? [org] : []);
+    const source = org?.name ?? op.policy.org_name ?? "";
+    return rows.length > 0 ? [{ key: op.org_id, source, workspaces: op.workspaces, rows }] : [];
+  });
+  const managed = policyRows(status.managed);
+  if (managed.length > 0) groups.push({ key: "managed", source: MANAGED_SOURCE, workspaces: [], rows: managed });
+  return groups;
+}
+
 /**
- * The policies in force, for display. Reloads when cloud status changes (which
- * refetches the organisation config) and when the backend reports a change.
- * A failed read shows nothing; nothing enforces from this value.
+ * The policies for notes in the active workspace, for display. Reloads when
+ * cloud status changes (which refetches the organisation config), when the
+ * workspace switches, and when the backend reports a change. A failed read
+ * shows nothing; nothing enforces from this value.
  */
 export function useOrgPolicy(): EffectivePolicy {
-  return useOrgPolicyStatus().policy;
+  return useOrgPolicyStatus(useActiveWorkspaceId()).policy;
 }
 
-/** [`policyRows`] for the policies and organisations in force. */
-export function usePolicyRows(): PolicyRow[] {
-  const { policy, orgs } = useOrgPolicyStatus();
-  return policyRows(policy, orgs);
+/** What applies app-wide: the managed profile and every organisation's
+ *  `telemetry_off`. */
+export function useDevicePolicy(): EffectivePolicy {
+  return useOrgPolicyStatus("").device;
 }
 
-/** What the organisations ask of a note in `workspaceId`: days before it is
- *  deleted (0 when none), and the audit scope its opens and copies are
- *  reported against. */
-export function useNoteOrgPolicy(workspaceId: string | null | undefined): { retentionDays: number; audit: AuditScope } {
-  const { retention, audit } = useOrgPolicyStatus();
-  return { retentionDays: retentionDaysFor(retention, workspaceId), audit };
+/** The managed configuration profile alone, which governs the user's own
+ *  settings everywhere (the MCP switch, the webhook receiver). */
+export function useManagedPolicy(): EffectivePolicy {
+  return useOrgPolicyStatus("").managed;
+}
+
+/** [`policyGroups`] for the organisations and profile in force. */
+export function usePolicyGroups(): PolicyGroup[] {
+  return policyGroups(useOrgPolicyStatus(""));
+}
+
+/** What the organisations ask of a note in `workspaceId`: its policies, the
+ *  organisation that governs it (null when none), days before it is deleted (0
+ *  when none), and the audit scope its opens and copies are reported against. */
+export function useNoteOrgPolicy(workspaceId: string | null | undefined): {
+  policy: EffectivePolicy;
+  managedBy: string | null;
+  retentionDays: number;
+  audit: AuditScope;
+} {
+  const ws = workspaceId?.trim() ?? "";
+  const { policy, governed, retention, audit } = useOrgPolicyStatus(ws);
+  return {
+    policy,
+    managedBy: (ws && Object.prototype.hasOwnProperty.call(governed, ws) ? governed[ws] : null) ?? null,
+    retentionDays: retentionDaysFor(retention, ws),
+    audit,
+  };
 }
 
 /** The organisation departments the user is in. */
 export function useOrgWorkspaces(): string[] {
-  return useOrgPolicyStatus().orgs.flatMap((o) => o.workspaces);
+  return useOrgPolicyStatus("").orgs.flatMap((o) => o.workspaces);
 }
 
-/** Who sets `local_only` (null when off), and whether the policy has loaded.
- *  Until it has, a settings tab touches no cloud provider's key or models. */
+/** Who sets `local_only` for notes in the active workspace (null when off),
+ *  and whether the policy has loaded. Until it has, a settings tab touches no
+ *  cloud provider's key or models. */
 export function useLocalOnly(): { managed: PolicyRule | null; known: boolean } {
-  const { policy, known } = useOrgPolicyStatus();
+  const { policy, known } = useOrgPolicyStatus(useActiveWorkspaceId());
   return { managed: localOnlySource(policy), known };
+}
+
+/** The name Settings shows for the workspace a governed section applies to. */
+export function useActiveWorkspaceName(): string {
+  return useCloudStore(
+    (s) => s.status.current_workspace?.name ?? s.status.locked_current_workspace?.name ?? "Personal",
+  );
 }
 
 type PolicyStatus = {
   policy: EffectivePolicy;
+  device: EffectivePolicy;
+  managed: EffectivePolicy;
+  orgPolicies: OrgPolicies[];
+  governed: Record<string, string>;
   retention: RetentionScope;
   audit: AuditScope;
   orgs: OrgSummary[];
   known: boolean;
 };
 
-const UNKNOWN: PolicyStatus = { policy: NO_POLICY, retention: {}, audit: {}, orgs: [], known: false };
+const UNKNOWN: PolicyStatus = {
+  policy: NO_POLICY,
+  device: NO_POLICY,
+  managed: NO_POLICY,
+  orgPolicies: [],
+  governed: {},
+  retention: {},
+  audit: {},
+  orgs: [],
+  known: false,
+};
 
-function useOrgPolicyStatus(): PolicyStatus {
+function useOrgPolicyStatus(workspaceId: string): PolicyStatus {
   const [state, setState] = useState<PolicyStatus>(UNKNOWN);
   const cloudStatus = useCloudStore((s) => s.status);
 
@@ -234,12 +315,16 @@ function useOrgPolicyStatus(): PolicyStatus {
     let cancelled = false;
     const load = () =>
       ipc
-        .orgStatus()
+        .orgStatus(workspaceId)
         .then(
           (s) =>
             !cancelled &&
             setState({
               policy: s?.policy ?? NO_POLICY,
+              device: s?.device ?? NO_POLICY,
+              managed: s?.managed ?? NO_POLICY,
+              orgPolicies: s?.org_policies ?? [],
+              governed: s?.governed ?? {},
               retention: s?.retention ?? {},
               audit: s?.audit ?? {},
               orgs: s?.orgs ?? [],
@@ -257,7 +342,7 @@ function useOrgPolicyStatus(): PolicyStatus {
       cancelled = true;
       unlisten?.();
     };
-  }, [cloudStatus]);
+  }, [cloudStatus, workspaceId]);
 
   return state;
 }

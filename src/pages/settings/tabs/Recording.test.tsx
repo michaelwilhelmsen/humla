@@ -55,7 +55,7 @@ describe("Send anonymous usage counters", () => {
 
   it("is managed and off under telemetry_off", async () => {
     mockTauri({
-      org_status: () => ({ policy: enforcing }),
+      org_status: () => ({ policy: NO_POLICY, device: enforcing }),
       settings_get: (args) => ((args as { key: string }).key === "telemetry_enabled" ? "true" : null),
     });
     render(<MemoryRouter><AboutTab /></MemoryRouter>);

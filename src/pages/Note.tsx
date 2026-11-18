@@ -377,7 +377,7 @@ export function Note() {
   // through the settings bus, not a plain fetch: Settings is a dialog over a
   // *pinned* router location, so this view never sees the trip to /settings and
   // back and can't use navigation as its cue to re-read.
-  const keepAudio = useLiveSetting("keep_audio") === "true";
+  const keepAudioSetting = useLiveSetting("keep_audio") === "true";
   // Live reasoning + content streamed from the local LLM. Cleared each time a
   // new summarize starts and again when the summary lands. Scoped by note id
   // so a delta from a different note's run doesn't leak into this view.
@@ -478,7 +478,9 @@ export function Note() {
   // Set once the note is deleted for good under this view: nothing may save
   // to it or put it back in the store.
   const purged = useRef(false);
-  const { retentionDays, audit } = useNoteOrgPolicy(draft?.workspace_id);
+  const { policy: notePolicy, managedBy, retentionDays, audit } = useNoteOrgPolicy(draft?.workspace_id);
+  // The audio gate as the backend applies it to this note.
+  const keepAudio = keepAudioSetting && !notePolicy.audio_forbidden;
   const draftId = draft?.id;
   const opensRecorded = recordsOpens(audit, draft?.workspace_id);
   useEffect(() => {
@@ -1350,6 +1352,7 @@ export function Note() {
               }
             }}
           />
+          {managedBy && <span className="nd-meta">Managed by {managedBy}</span>}
           {retentionDays > 0 && <span className="nd-meta">{deletedAfter(retentionDays)}</span>}
           <FolderPicker
             value={draft.folder_id}

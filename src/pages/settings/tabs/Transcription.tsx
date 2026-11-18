@@ -12,7 +12,7 @@ import { CustomEndpointCard } from "../../../components/provider/CustomEndpoint"
 import { NEMOTRON_MAX_SPEAKERS } from "../../../lib/diarizeEngine";
 import { KEY_ONLY_PROVIDERS } from "../../../lib/providers";
 import { LANGUAGES, languageOptionLabel } from "../../../lib/languages";
-import { enforceLocalOnly, useLocalOnly } from "../../../lib/orgPolicy";
+import { enforceLocalOnly, useActiveWorkspaceName, useLocalOnly } from "../../../lib/orgPolicy";
 import type { SettingsHook } from "../useSettings";
 
 // The selected cloud provider's key card renders right under the picker;
@@ -124,13 +124,14 @@ export function TranscriptionTab({
   | "deleteDiarize"
 >) {
   const { managed, known } = useLocalOnly();
+  const workspaceName = useActiveWorkspaceName();
   const def = managed
     ? enforceLocalOnly(transcribeConfig.default, s.custom_base_url)
     : transcribeConfig.default;
 
   return (
     <>
-      <Section title="Transcription">
+      <Section title="Transcription" scope={workspaceName}>
         <ProviderConfigForm
           value={def}
           onChange={setDefaultConfig}

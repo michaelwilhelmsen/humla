@@ -7,7 +7,7 @@ import { TranscriptionTab } from "./tabs/Transcription";
 import { IntegrationsSection } from "./tabs/Integrations";
 import { mockTauri } from "../../test/tauri";
 import type { ProviderConfig } from "../../lib/ipc";
-import { NO_POLICY, type EffectivePolicy } from "../../lib/orgPolicy";
+import { MANAGED_SOURCE, NO_POLICY, type EffectivePolicy } from "../../lib/orgPolicy";
 import { DEFAULTS, EMPTY_DIARIZE_STATE, EMPTY_LOCAL_STATE, type EditableKey } from "./types";
 
 const LOCAL_ONLY: EffectivePolicy = {
@@ -97,6 +97,32 @@ describe("under local_only", () => {
     expect(await managedBadge()).toHaveLength(2);
   });
 
+  it("an organisation's local_only leaves the MCP server and webhook to the user", async () => {
+    render(<IntegrationsSection s={settings({ mcp_enabled: "true", webhook_enabled: "true" })} update={vi.fn()} />);
+    await screen.findByLabelText("Webhook URL");
+    expect(screen.getByRole("switch", { name: /MCP server/i })).not.toBeDisabled();
+    expect(screen.queryByRole("button", { name: /Managed by/ })).toBeNull();
+  });
+});
+
+describe("under a managed profile's local_only", () => {
+  const MANAGED: EffectivePolicy = {
+    ...NO_POLICY,
+    org_name: MANAGED_SOURCE,
+    local_only: true,
+    rules: [{ kind: "local_only", source: MANAGED_SOURCE, reason: "" }],
+  };
+
+  beforeEach(() => {
+    mockTauri({
+      org_status: () => ({ policy: MANAGED, managed: MANAGED, device: MANAGED }),
+      mcp_server_path: () => "/Applications/Humla.app/Contents/MacOS/humla-mcp",
+      webhook_get_endpoint: () => ({ url: "", headers: [] }),
+    });
+  });
+
+  const managedBadge = () => screen.findAllByRole("button", { name: /Managed by This Mac's configuration/ });
+
   it("the MCP server is off and can't be turned on", async () => {
     const update = vi.fn();
     render(<IntegrationsSection s={settings({ mcp_enabled: "true" })} update={update} />);
@@ -110,7 +136,7 @@ describe("under local_only", () => {
   it("the webhook URL is marked as managed", async () => {
     render(<IntegrationsSection s={settings({ webhook_enabled: "true" })} update={vi.fn()} />);
     await screen.findByLabelText("Webhook URL");
-    await waitFor(() => expect(screen.getAllByRole("button", { name: /Managed by Northwind/ })).toHaveLength(2));
+    await waitFor(() => expect(screen.getAllByRole("button", { name: /Managed by This Mac's configuration/ })).toHaveLength(2));
     expect(screen.getByLabelText("Webhook URL")).toHaveAttribute("placeholder", "http://localhost:8787/webhook");
   });
 });

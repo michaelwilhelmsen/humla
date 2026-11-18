@@ -36,10 +36,18 @@ describe("OrgAudioNotice", () => {
       },
     });
     render(<OrgAudioNotice />);
-    expect(await screen.findByText("Northwind doesn't allow stored audio. Audio on this Mac will be deleted.")).toBeTruthy();
+    expect(await screen.findByText("Northwind doesn't allow stored audio. Audio of its notes on this Mac will be deleted.")).toBeTruthy();
     expect(sweeps).toEqual([]);
     await userEvent.click(screen.getByRole("button", { name: "Delete audio" }));
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
     expect(sweeps).toEqual(["o1"]);
+  });
+
+  it("says a managed profile's sweep reaches every note", async () => {
+    mockTauri({ org_audio_notice: () => ({ org_id: "mac-configuration", org_name: "This Mac's configuration", all: true }) });
+    render(<OrgAudioNotice />);
+    expect(
+      await screen.findByText("This Mac's configuration doesn't allow stored audio. Audio on this Mac will be deleted."),
+    ).toBeTruthy();
   });
 });

@@ -2305,8 +2305,8 @@ function accountIpc({ signedIn, policies, invites = false }: { signedIn: boolean
       };
     },
     cloud_decline_invite: (args: unknown) => console.log("[mock] decline", args),
-    org_status: () => ({
-      policy: policies
+    org_status: () => {
+      const policy = policies
         ? {
             org_name: "Northwind",
             reason,
@@ -2324,9 +2324,15 @@ function accountIpc({ signedIn, policies, invites = false }: { signedIn: boolean
             telemetry_off: false,
             audio_forbidden: false,
             rules: [],
-          },
-      retention: policies ? { w1: 90 } : {},
-    }),
+          };
+      return {
+        policy,
+        orgs: policies ? [{ id: "o1", name: "Northwind", reason, vocabulary: [], workspaces: ["w1"] }] : [],
+        org_policies: policies ? [{ org_id: "o1", workspaces: ["w1"], policy }] : [],
+        governed: policies ? { w1: "Northwind" } : {},
+        retention: policies ? { w1: 90 } : {},
+      };
+    },
   };
 }
 
@@ -2346,6 +2352,15 @@ function devicePolicyIpc({ notice }: { notice: boolean }): Record<string, Handle
           { kind: "telemetry_off", source: "Northwind", reason },
           { kind: "audio_forbidden", source: "Northwind", reason },
         ],
+      },
+      device: {
+        org_name: "Northwind",
+        reason,
+        local_only: false,
+        retention_days: 0,
+        telemetry_off: true,
+        audio_forbidden: false,
+        rules: [{ kind: "telemetry_off", source: "Northwind", reason }],
       },
     }),
     org_audio_notice: () => due,

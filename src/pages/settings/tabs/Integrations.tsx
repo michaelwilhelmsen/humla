@@ -5,7 +5,7 @@ import { CommandSnippet } from "../../../components/CommandSnippet";
 import { Row, Section } from "../components/Section";
 import { Toggle } from "../components/Toggle";
 import type { EditableKey } from "../types";
-import { localOnlySource, useOrgPolicy } from "../../../lib/orgPolicy";
+import { localOnlySource, useManagedPolicy } from "../../../lib/orgPolicy";
 import { ManagedRow } from "../ManagedRow";
 import { WebhookRows } from "./Webhook";
 
@@ -32,7 +32,7 @@ export function IntegrationsSection({
   s: Record<EditableKey, string>;
   update: (key: EditableKey, value: string) => void;
 }) {
-  const managed = localOnlySource(useOrgPolicy());
+  const managed = localOnlySource(useManagedPolicy());
   const enabled = !managed && s.mcp_enabled === "true";
   const [path, setPath] = useState<string | null>(null);
 
