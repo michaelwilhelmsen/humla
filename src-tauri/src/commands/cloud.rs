@@ -775,11 +775,18 @@ pub async fn cloud_billing_portal(state: State<'_, AppState>, workspace_id: Stri
 pub fn cloud_configure(state: State<'_, AppState>, base_url: String) -> Result<(), String> {
     let trimmed = base_url.trim().trim_end_matches('/').to_string();
     check_configure(crate::org_policy::managed().server_url.as_deref(), &trimmed)?;
-    {
+    let moved = {
         let conn = state.db.lock();
+        let moved = self::base_url(&conn).is_some_and(|old| old != trimmed);
         db::set_setting(&conn, SETTING_BASE_URL, &trimmed).map_err(err)?;
+        moved
+    };
+    // Credentials for one server are never sent to another.
+    if moved {
+        super::cloud_auth::forget_account(&state.keychain_cache);
+    } else {
+        super::cloud_auth::server_changed(&state);
     }
-    super::cloud_auth::server_changed(&state);
     state.sync.config_changed();
     Ok(())
 }
