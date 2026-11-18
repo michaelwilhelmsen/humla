@@ -2128,6 +2128,34 @@ const CASES: Record<string, Scenario> = {
     },
   },
 
+  // --- Sign in with Microsoft. Settings → Account, signed out, on a server
+  // that offers it. `-wait` keeps the browser out until Cancel; `-refused` is a
+  // tenant no organisation has; `-two-factor` goes on to the code step.
+  "microsoft-sign-in-wait": {
+    route: "/settings?tab=account",
+    render: () => null, // unused — `route` renders the app
+    ipc: microsoftIpc(() => new Promise(() => {})),
+  },
+  "microsoft-sign-in-refused": {
+    route: "/settings?tab=account",
+    render: () => null, // unused — `route` renders the app
+    ipc: microsoftIpc(async () => {
+      await new Promise((r) => setTimeout(r, 600));
+      throw {
+        reason: "entra_tenant_not_enabled",
+        message: "Your organisation doesn't sign in to Humla with Microsoft.",
+      };
+    }),
+  },
+  "microsoft-sign-in-two-factor": {
+    route: "/settings?tab=account",
+    render: () => null, // unused — `route` renders the app
+    ipc: microsoftIpc(async () => {
+      await new Promise((r) => setTimeout(r, 600));
+      return { step: "two_factor" };
+    }),
+  },
+
   // --- Themes: the token-driven chrome on one page, so a theme can be judged
   // as a design rather than as a diff. Combine with ?palette= and ?theme=.
   themes: {
@@ -2136,6 +2164,26 @@ const CASES: Record<string, Scenario> = {
     ipc: {},
   },
 };
+
+function microsoftIpc(login: () => Promise<unknown>): Record<string, (args: unknown) => unknown> {
+  let cancel: ((e: unknown) => void) | null = null;
+  return {
+    cloud_status: () => ({ ...DISCONNECTED, configured: true, base_url: "https://sync.humla.team" }),
+    cloud_sign_in_methods: () => ({ microsoft: true }),
+    cloud_login_microsoft: () =>
+      new Promise((resolve, reject) => {
+        cancel = reject;
+        login().then(resolve, reject);
+      }),
+    cloud_cancel_microsoft: () => {
+      cancel?.({ reason: "cancelled", message: "Sign-in with Microsoft was cancelled." });
+      cancel = null;
+    },
+    cloud_verify_two_factor: () => {
+      throw { reason: "invalid_code", message: "That code isn't right." };
+    },
+  };
+}
 
 function settingsContentIpc(
   workspace: CloudWorkspace["role"] | null,

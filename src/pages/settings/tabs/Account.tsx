@@ -3,6 +3,7 @@ import { Cloud, CloudOff, LogOut } from "lucide-react";
 import { cloudApi, useCloudStore, HUMLA_CLOUD_URL } from "../../../lib/cloud";
 import { useCloudSignIn } from "../../../lib/useCloudSignIn";
 import { TwoFactorCodeForm } from "../../../components/TwoFactorCodeForm";
+import { MicrosoftSignIn } from "../../../components/MicrosoftSignIn";
 import { TwoFactorSection } from "./TwoFactor";
 import { OrgInviteCard } from "../../../components/OrgInviteCard";
 import { Row, Section } from "../components/Section";
@@ -321,12 +322,15 @@ export function AccountTab({ s, update }: Pick<SettingsHook, "s" | "update">) {
           )}
           <div className="flex gap-2">
             <Btn onClick={submit} disabled={formBusy || !canSubmit}>
-              {auth.busy ? (isSignup ? "Creating…" : "Signing in…") : isSignup ? "Create account" : "Sign in"}
+              {auth.busy && !auth.waitingForMicrosoft
+                ? (isSignup ? "Creating…" : "Signing in…")
+                : isSignup ? "Create account" : "Sign in"}
             </Btn>
             {!status.server_managed && (
               <Btn onClick={disconnect} disabled={formBusy}>Change server</Btn>
             )}
           </div>
+          <MicrosoftSignIn auth={auth} />
           <div className="flex items-center gap-4">
             <button type="button" onClick={toggleMode}
               className="text-xs text-[var(--color-interactive)] hover:underline">

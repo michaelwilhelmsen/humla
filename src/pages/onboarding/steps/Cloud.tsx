@@ -73,6 +73,7 @@ import { checkoutKind, offersTrial, planIsLive, useCheckout } from "../../../lib
 import type { StepContext } from "../types";
 import { useCloudSignIn } from "../../../lib/useCloudSignIn";
 import { TwoFactorCodeForm } from "../../../components/TwoFactorCodeForm";
+import { MicrosoftSignIn } from "../../../components/MicrosoftSignIn";
 import { StepShell } from "../StepShell";
 
 type Option = "solo" | "team" | "existing";
@@ -432,7 +433,7 @@ function AuthStage({ mode: initialMode }: { mode: "signup" | "signin" }) {
           disabled={busy || !canSubmit}
           className="nd-btn nd-btn-primary"
         >
-          {busy
+          {busy && !auth.waitingForMicrosoft
             ? isSignup
               ? "Creating…"
               : "Signing in…"
@@ -448,6 +449,7 @@ function AuthStage({ mode: initialMode }: { mode: "signup" | "signin" }) {
           {isSignup ? "Already have an account? Sign in" : "New here? Create an account"}
         </button>
       </div>
+      <MicrosoftSignIn auth={auth} />
     </div>
   );
 }

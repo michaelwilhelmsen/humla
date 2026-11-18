@@ -22,6 +22,7 @@ import type { CheckoutSource } from "../lib/cloud";
 import { useNotesStore } from "../lib/store";
 import { useCloudSignIn } from "../lib/useCloudSignIn";
 import { TwoFactorCodeForm } from "./TwoFactorCodeForm";
+import { MicrosoftSignIn } from "./MicrosoftSignIn";
 import { Modal } from "../pages/settings/components/Modal";
 
 // Creating a workspace, end to end, in one sheet.
@@ -314,6 +315,7 @@ function AuthStage() {
             placeholder={isSignup ? "At least 8 characters" : "••••••••"}
           />
         </div>
+        <MicrosoftSignIn auth={auth} />
         <Err>{error}</Err>
         {/* Branch, don't assert: a self-hosted server bills nothing, so quoting a
             per-seat price here would be the app inventing a charge. */}
@@ -330,7 +332,7 @@ function AuthStage() {
           disabled={busy || !canSubmit}
           className="nd-btn nd-btn-primary"
         >
-          {busy
+          {busy && !auth.waitingForMicrosoft
             ? isSignup
               ? "Creating…"
               : "Signing in…"
