@@ -410,6 +410,15 @@ fn anchor_note(
     }
 }
 
+/// Refuse a workspace turn anchored on a note whose own workspace keeps its
+/// content on this Mac.
+fn refuse_governed_anchor(conn: &rusqlite::Connection, note: Option<&db::Note>) -> Result<(), String> {
+    match note {
+        Some(n) => crate::org_policy::check_leaves_mac(conn, Some(&n.workspace_id)).map_err(|e| e.to_string()),
+        None => Ok(()),
+    }
+}
+
 /// The reference block for a turn, plus the anchor's plain-text body when there is
 /// one (the caller reindexes it). A library-wide turn gets NO grounding at all —
 /// `assemble_prompt` skips an empty block, and nothing was truncated because
@@ -2122,9 +2131,11 @@ async fn chat_send_cloud(
         let Some(workspace) = ctx.workspace() else {
             return Err("No workspace selected — switch to a workspace to use Team chat.".into());
         };
-        // Workspace chat runs on the server's cloud AI.
+        // Workspace chat runs on the server's cloud AI, and the anchor note's
+        // title goes with the turn, whichever workspace that note is in.
         crate::org_policy::check_leaves_mac(&conn, Some(workspace)).map_err(|e| e.to_string())?;
         let note = anchor_note(&conn, &target)?;
+        refuse_governed_anchor(&conn, note.as_ref())?;
         // Resolve the target workspace-handle session (issue #61): an explicit
         // id, else the active/most-recent handle, lazily creating one (remote_id
         // filled from the server's response below) on the first turn.
@@ -3245,6 +3256,22 @@ mod tests {
         assert!(resolve_chat(&conn, None).is_ok());
         force_for_test(&[]);
         reload_managed();
+    }
+
+    #[test]
+    fn a_workspace_turn_refuses_an_anchor_from_a_governed_department() {
+        use crate::org_policy::{cache_local_only, note_in, TEST_ORG_WORKSPACE};
+        let dir = tempfile::tempdir().unwrap();
+        let conn = db::open(&dir.path().join("t.sqlite")).unwrap();
+        cache_local_only(&conn, "Northwind");
+        let governed = db::get_note(&conn, &note_in(&conn, TEST_ORG_WORKSPACE)).unwrap();
+        assert_eq!(
+            refuse_governed_anchor(&conn, Some(&governed)).unwrap_err(),
+            "Blocked by Northwind: processing stays on this Mac."
+        );
+        let other = db::get_note(&conn, &note_in(&conn, "w-other")).unwrap();
+        assert!(refuse_governed_anchor(&conn, Some(&other)).is_ok());
+        assert!(refuse_governed_anchor(&conn, None).is_ok());
     }
 
     /// Local chat reads Personal notes only, so an organisation's `local_only`
