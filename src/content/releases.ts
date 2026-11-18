@@ -11,6 +11,23 @@ export type Release = {
 
 export const releases: Release[] = [
   {
+    version: "0.79.0",
+    date: "2026-11-18",
+    title: "Organisation rules stay in their own workspaces",
+    summary: "An organisation's rules now apply to its own departments only, so your other workspaces and Personal notes follow your own settings.",
+    paragraphs: [
+      "Until now, joining an organisation's department meant its rules covered every note on your Mac. If the organisation kept all processing on the Mac, your Personal notes and your other workspaces were locked to local processing too. Now an organisation's rules apply only to notes in its own departments. Everywhere else, your own choices apply.",
+      "Settings show which workspace you're looking at. In a department with rules, the settings it controls say \"Managed by\" and the organisation's name, and notes there carry the same label. Switch to another workspace and the same settings are yours to change. If a department keeps transcription on the Mac, Humla says so once when you record. A note can't be moved out of a department with rules on.",
+      "Nothing changes if you're not in an organisation. Organisations that manage their Macs through a configuration profile still lock the whole Mac, as before.",
+    ],
+    highlights: [
+      "Organisation rules apply only to that organisation's departments.",
+      "Settings show which workspace they apply to, with \"Managed by\" where a rule decides.",
+      "Notes in a department with rules show who manages them.",
+    ],
+    issues: [],
+  },
+  {
     version: "0.78.0",
     date: "2026-11-18",
     title: "Department invites and an audit log",
