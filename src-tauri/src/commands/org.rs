@@ -88,20 +88,20 @@ pub fn org_audio_notice(state: State<'_, AppState>) -> Option<AudioSweep> {
 /// Refused unless that sweep is due right now.
 #[tauri::command]
 pub fn org_audio_sweep(app: tauri::AppHandle, state: State<'_, AppState>, org_id: String) -> Result<usize, String> {
-    let scope = authorise_audio_sweep(&state.db.lock(), &org_id)?;
+    let due = authorise_audio_sweep(&state.db.lock(), &org_id)?;
+    let scope = org_policy::sweep_scope(&due);
     let removed = super::assets::delete_stored_audio_in(&app, |note_id| {
         let workspace = db::get_note(&state.db.lock(), note_id).map(|n| n.workspace_id);
         workspace.is_ok_and(|ws| scope.covers(&ws))
     })?;
-    org_policy::record_audio_sweep(&state.db.lock(), &org_id).map_err(|e| format!("organisation policy: {e}"))?;
+    org_policy::record_audio_sweep(&state.db.lock(), &due).map_err(|e| format!("organisation policy: {e}"))?;
     Ok(removed)
 }
 
-fn authorise_audio_sweep(conn: &rusqlite::Connection, org_id: &str) -> Result<org_policy::SweepScope, String> {
-    let refused = || "No organisation asks for stored audio to be deleted.".to_string();
+fn authorise_audio_sweep(conn: &rusqlite::Connection, org_id: &str) -> Result<AudioSweep, String> {
     match org_policy::audio_sweep_due(conn) {
-        Some(due) if due.org_id == org_id => org_policy::sweep_scope(conn, &due).ok_or_else(refused),
-        _ => Err(refused()),
+        Some(due) if due.org_id == org_id => Ok(due),
+        _ => Err("No organisation asks for stored audio to be deleted.".into()),
     }
 }
 
@@ -900,7 +900,7 @@ mod tests {
         );
         assert_eq!(get(&conn, "keep_audio").as_deref(), Some("true"), "Personal still keeps audio");
         assert_eq!(apply_fetch(&conn, &org_policy::classify(200, &device_body(true, false))), Changes::default());
-        let scope = authorise_audio_sweep(&conn, "o1").unwrap();
+        let scope = org_policy::sweep_scope(&authorise_audio_sweep(&conn, "o1").unwrap());
         assert_eq!(scope, org_policy::SweepScope::Workspaces(vec!["w1".into()]));
         assert!(scope.covers("w1"));
         assert!(!scope.covers("") && !scope.covers("w2"), "Personal and other workspaces keep their audio");
@@ -918,7 +918,7 @@ mod tests {
         assert_eq!(get(&conn, "keep_audio").as_deref(), Some("false"));
         assert_eq!(get(&conn, "transcribe_manually").as_deref(), Some("true"), "the closed gate defers nothing");
         assert!(!apply_device_policies(&conn).unwrap());
-        let scope = authorise_audio_sweep(&conn, org_policy::MANAGED_SWEEP_ID).unwrap();
+        let scope = org_policy::sweep_scope(&authorise_audio_sweep(&conn, org_policy::MANAGED_SWEEP_ID).unwrap());
         assert!(scope.covers("") && scope.covers("w1"));
         org_policy::force_for_test(&[]);
         org_policy::reload_managed();
@@ -953,7 +953,8 @@ mod tests {
     fn a_swept_organisation_authorises_no_second_sweep() {
         let (_d, conn) = conn();
         apply_fetch(&conn, &org_policy::classify(200, &device_body(true, false)));
-        org_policy::record_audio_sweep(&conn, "o1").unwrap();
+        let due = org_policy::audio_sweep_due(&conn).unwrap();
+        org_policy::record_audio_sweep(&conn, &due).unwrap();
         assert!(authorise_audio_sweep(&conn, "o1").is_err());
     }
 

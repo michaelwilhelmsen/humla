@@ -471,6 +471,22 @@ describe("Account section", () => {
       expect(screen.getByText(/only an administrator can change it/i)).toBeInTheDocument();
     });
 
+    it("names an organisation's departments behind 2FA, never every workspace", async () => {
+      const lockedDept = { id: "wl", name: "Barnevern" };
+      renderApp("/settings?tab=account", {
+        cloud_status: () => ({ ...signedIn("member", false), locked_workspaces: [lockedDept] }),
+        cloud_workspace_members: () => MEMBERS,
+        org_status: () => ({
+          policy: NONE,
+          orgs: [org("o1", "Northwind", [])],
+          org_policies: [{ org_id: "o1", workspaces: ["wl"], policy: northwind }],
+        }),
+      });
+      const dialog = await screen.findByRole("dialog", { name: /settings/i });
+      expect(await within(dialog).findByText("Northwind · Barnevern")).toBeInTheDocument();
+      expect(within(dialog).queryByText(/Every workspace/)).toBeNull();
+    });
+
     it("keeps them listed after sign-out", async () => {
       renderApp("/settings?tab=account", {
         cloud_status: () => signedOutConfigured(),

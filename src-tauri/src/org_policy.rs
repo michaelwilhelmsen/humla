@@ -42,8 +42,23 @@ pub(crate) struct Org {
     pub vocabulary: Vec<String>,
     #[serde(default)]
     pub workspaces: Vec<String>,
+    /// The user's departments behind a 2FA requirement they haven't met: the
+    /// policy still governs their notes, though no content comes with them.
+    #[serde(default)]
+    pub locked_workspaces: Vec<String>,
     #[serde(default)]
     pub templates: Vec<OrgTemplate>,
+}
+
+impl Org {
+    /// Every department of the user's it names, open or behind 2FA.
+    pub(crate) fn departments(&self) -> impl Iterator<Item = &str> {
+        self.workspaces.iter().chain(&self.locked_workspaces).map(|w| w.trim()).filter(|w| !w.is_empty())
+    }
+
+    fn claims(&self, workspace_id: &str) -> bool {
+        self.departments().any(|w| w == workspace_id)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -427,11 +442,30 @@ fn department(workspace_id: Option<&str>) -> Option<&str> {
     workspace_id.map(str::trim).filter(|w| !w.is_empty())
 }
 
-/// The organisations whose departments include `workspace_id`. A workspace
-/// belongs to one organisation; should two list it, both apply.
+/// The organisations governing `workspace_id`: those naming it as a
+/// department, open or locked. A workspace belongs to one organisation; should
+/// two name it, both apply. A server from before `locked_workspaces` names no
+/// department of an organisation whose 2FA is unmet, so while one names none
+/// at all and has a policy on, it governs every workspace no organisation
+/// claims. Personal never.
 pub(crate) fn orgs_for<'a>(config: &'a OrgConfig, workspace_id: Option<&str>) -> Vec<&'a Org> {
     let Some(ws) = department(workspace_id) else { return Vec::new() };
-    config.orgs.iter().filter(|o| o.workspaces.iter().any(|w| w.trim() == ws)).collect()
+    let claimed: Vec<&Org> = config.orgs.iter().filter(|o| o.claims(ws)).collect();
+    if !claimed.is_empty() {
+        return claimed;
+    }
+    config.orgs.iter().filter(|o| o.departments().next().is_none() && governs_notes(&o.policy)).collect()
+}
+
+/// Whether an organisation's policy governs notes in `workspace_id`, for a
+/// sync conflict copy. A cache that can't be read says yes; nothing cached
+/// says no.
+pub(crate) fn governs_workspace(conn: &Connection, workspace_id: &str) -> bool {
+    match cached(conn) {
+        Ok(Some(config)) => orgs_for(&config, Some(workspace_id)).iter().any(|o| governs_notes(&o.policy)),
+        Ok(None) => false,
+        Err(_) => true,
+    }
 }
 
 /// Whether an organisation's policy reaches its notes, as opposed to the app
@@ -496,7 +530,7 @@ pub(crate) fn org_policies(config: Option<&OrgConfig>) -> Vec<OrgPolicies> {
                 .iter()
                 .map(|o| OrgPolicies {
                     org_id: o.id.clone(),
-                    workspaces: o.workspaces.clone(),
+                    workspaces: o.departments().map(String::from).collect(),
                     policy: merge(&[layer_of(o)]),
                 })
                 .collect()
@@ -516,7 +550,7 @@ pub struct OrgPolicies {
 pub(crate) fn governed_workspaces(config: Option<&OrgConfig>) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     for org in config.iter().flat_map(|c| &c.orgs).filter(|o| governs_notes(&o.policy)) {
-        for ws in org.workspaces.iter().map(|w| w.trim()).filter(|w| !w.is_empty()) {
+        for ws in org.departments() {
             out.entry(ws.to_string()).or_insert_with(|| org.name.clone());
         }
     }
@@ -816,10 +850,12 @@ fn strictest(policy: OrgPolicy) -> EffectivePolicy {
 }
 
 /// The policy for notes in a note's workspace. A note that can't be read is
-/// treated as a department whose cache can't be read.
+/// treated as a department whose cache can't be read, unless no organisation
+/// is cached.
 pub(crate) fn effective_for_note(conn: &Connection, note_id: &str) -> EffectivePolicy {
     match crate::db::get_note(conn, note_id) {
         Ok(note) => effective_for_or_strictest(conn, Some(&note.workspace_id)),
+        Err(_) if cached(conn).is_ok_and(|c| c.is_none_or(|c| c.orgs.is_empty())) => effective_managed(),
         Err(e) => {
             eprintln!("org policy: note {note_id} unreadable, enforcing the strictest policy: {e:#}");
             strictest(OrgPolicy { local_only: true, telemetry_off: true, audio_forbidden: true, ..OrgPolicy::default() })
@@ -863,45 +899,58 @@ pub(crate) fn check_leaves_mac(conn: &Connection, workspace_id: Option<&str>) ->
 pub(crate) const SETTING_AUDIO_SWEPT: &str = "org_audio_swept";
 
 /// An organisation whose `audio_forbidden` still owes the sweep of audio
-/// already on this Mac: of notes in its departments, or of every note when
-/// `all` (a managed profile).
+/// already on this Mac: of notes in `workspaces`, its departments not swept
+/// yet, or of every note when `all` (a managed profile).
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct AudioSweep {
     pub org_id: String,
     pub org_name: String,
     pub all: bool,
+    pub workspaces: Vec<String>,
 }
 
 /// The id a managed configuration profile's sweep is recorded under. Not a
 /// PocketBase id, which is alphanumeric, so it can't name an organisation.
 pub(crate) const MANAGED_SWEEP_ID: &str = "mac-configuration";
 
-/// The first organisation, then a managed profile, that forbids audio and
-/// hasn't swept yet. Only a cache that reads cleanly can name an organisation,
-/// and only one with an id, a name and a department; a profile owes it only
+/// How one department's sweep is recorded: `<org id>/<workspace id>`.
+fn swept_key(org_id: &str, workspace_id: &str) -> String {
+    format!("{org_id}/{}", workspace_id.trim())
+}
+
+/// The first organisation, then a managed profile, that forbids audio and has
+/// a department not swept yet. Only a cache that reads cleanly can name an
+/// organisation, and only one with an id and a name; a profile owes it only
 /// when it forces `audio_forbidden` to `true`. A policy that can't be read
 /// closes the audio gate through [`effective_for_or_strictest`] but never
 /// deletes anything.
 pub(crate) fn audio_sweep_due(conn: &Connection) -> Option<AudioSweep> {
-    let swept = swept_orgs(conn);
-    let orgs = match cached(conn) {
-        Ok(Some(config)) => config.orgs,
-        _ => Vec::new(),
+    let config = match cached(conn) {
+        Ok(Some(config)) => Some(config),
+        _ => None,
     };
-    orgs.into_iter()
-        .find(|o| {
-            o.policy.audio_forbidden
-                && !o.id.trim().is_empty()
-                && !o.name.trim().is_empty()
-                && o.workspaces.iter().any(|w| !w.trim().is_empty())
-                && !swept.contains(&o.id)
+    let swept = match &config {
+        Some(c) => migrate_swept(conn, c),
+        None => swept_entries(conn),
+    };
+    config
+        .into_iter()
+        .flat_map(|c| c.orgs)
+        .filter(|o| o.policy.audio_forbidden && !o.id.trim().is_empty() && !o.name.trim().is_empty())
+        .find_map(|o| {
+            let pending: Vec<String> = o
+                .departments()
+                .filter(|w| !swept.contains(&swept_key(&o.id, w)))
+                .map(String::from)
+                .collect();
+            (!pending.is_empty()).then(|| AudioSweep { org_id: o.id.clone(), org_name: o.name.clone(), all: false, workspaces: pending })
         })
-        .map(|o| AudioSweep { org_id: o.id, org_name: o.name, all: false })
         .or_else(|| {
             (managed().sweeps_audio && !swept.iter().any(|id| id == MANAGED_SWEEP_ID)).then(|| AudioSweep {
                 org_id: MANAGED_SWEEP_ID.into(),
                 org_name: MANAGED_SOURCE.into(),
                 all: true,
+                workspaces: Vec::new(),
             })
         })
 }
@@ -927,18 +976,16 @@ impl SweepScope {
     }
 }
 
-/// The scope of `sweep`, read from a cache that parses cleanly; `None` when
-/// that organisation can no longer be found there.
-pub(crate) fn sweep_scope(conn: &Connection, sweep: &AudioSweep) -> Option<SweepScope> {
+/// The notes `sweep` deletes the audio of.
+pub(crate) fn sweep_scope(sweep: &AudioSweep) -> SweepScope {
     if sweep.all {
-        return Some(SweepScope::Everything);
+        SweepScope::Everything
+    } else {
+        SweepScope::Workspaces(sweep.workspaces.clone())
     }
-    let config = cached(conn).ok().flatten()?;
-    let org = config.orgs.into_iter().find(|o| o.id == sweep.org_id)?;
-    Some(SweepScope::Workspaces(org.workspaces))
 }
 
-fn swept_orgs(conn: &Connection) -> Vec<String> {
+fn swept_entries(conn: &Connection) -> Vec<String> {
     crate::db::get_setting(conn, SETTING_AUDIO_SWEPT)
         .ok()
         .flatten()
@@ -946,11 +993,56 @@ fn swept_orgs(conn: &Connection) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Record that `org_id`'s sweep ran, so its notice doesn't come back.
-pub(crate) fn record_audio_sweep(conn: &Connection, org_id: &str) -> anyhow::Result<()> {
-    let mut swept = swept_orgs(conn);
-    if !swept.iter().any(|id| id == org_id) {
-        swept.push(org_id.to_string());
+/// The swept entries, with each bare organisation id an older version recorded
+/// replaced by that organisation's departments as `config` lists them now, so
+/// a department it gains later still owes its sweep. Written back once.
+fn migrate_swept(conn: &Connection, config: &OrgConfig) -> Vec<String> {
+    let entries = swept_entries(conn);
+    let legacy = |e: &String| e != MANAGED_SWEEP_ID && !e.contains('/');
+    if !entries.iter().any(legacy) {
+        return entries;
+    }
+    let mut out: Vec<String> = Vec::new();
+    for e in &entries {
+        let expanded: Vec<String> = if legacy(e) {
+            config
+                .orgs
+                .iter()
+                .filter(|o| &o.id == e)
+                .flat_map(|o| o.departments().map(|w| swept_key(&o.id, w)).collect::<Vec<_>>())
+                .collect()
+        } else {
+            vec![e.clone()]
+        };
+        for k in expanded {
+            if !out.contains(&k) {
+                out.push(k);
+            }
+        }
+    }
+    if let Ok(json) = serde_json::to_string(&out) {
+        if let Err(e) = crate::db::set_setting(conn, SETTING_AUDIO_SWEPT, &json) {
+            eprintln!("org policy: couldn't migrate the audio sweep record: {e:#}");
+        }
+    }
+    out
+}
+
+/// Record that `sweep` ran, so its notice doesn't come back.
+pub(crate) fn record_audio_sweep(conn: &Connection, sweep: &AudioSweep) -> anyhow::Result<()> {
+    let mut swept = swept_entries(conn);
+    let keys: Vec<String> = if sweep.all {
+        vec![MANAGED_SWEEP_ID.to_string()]
+    } else {
+        sweep.workspaces.iter().map(|w| swept_key(&sweep.org_id, w)).collect()
+    };
+    let before = swept.len();
+    for k in keys {
+        if !swept.contains(&k) {
+            swept.push(k);
+        }
+    }
+    if swept.len() != before {
         crate::db::set_setting(conn, SETTING_AUDIO_SWEPT, &serde_json::to_string(&swept)?)?;
     }
     Ok(())
@@ -980,11 +1072,11 @@ pub(crate) fn retention_rules(config: &OrgConfig) -> BTreeMap<String, RetentionR
     let mut rules: BTreeMap<String, RetentionRule> = BTreeMap::new();
     for org in config.orgs.iter().filter(|o| o.policy.retention_days > 0 && !o.id.trim().is_empty()) {
         let rule = RetentionRule { days: org.policy.retention_days, source: org.name.clone() };
-        for ws in org.workspaces.iter().filter(|w| !w.trim().is_empty()) {
+        for ws in org.departments() {
             match rules.get(ws) {
                 Some(have) if have.days <= rule.days => {}
                 _ => {
-                    rules.insert(ws.clone(), rule.clone());
+                    rules.insert(ws.to_string(), rule.clone());
                 }
             }
         }
@@ -1019,11 +1111,12 @@ pub(crate) fn retention_rule(conn: &Connection, workspace_id: &str) -> Option<Re
     retention_in_force(conn).remove(workspace_id)
 }
 
-/// Whether an organisation owning `workspace_id` forbids audio, read from a
-/// cache that parses cleanly: only that may delete audio.
+/// Whether an organisation naming `workspace_id` as a department forbids
+/// audio, read from a cache that parses cleanly: only that may delete audio.
 pub(crate) fn forbids_audio(conn: &Connection, workspace_id: &str) -> bool {
+    let ws = workspace_id.trim();
     match cached(conn) {
-        Ok(Some(config)) => orgs_for(&config, Some(workspace_id)).iter().any(|o| o.policy.audio_forbidden),
+        Ok(Some(config)) => config.orgs.iter().any(|o| o.policy.audio_forbidden && o.claims(ws)),
         _ => false,
     }
 }
@@ -1725,6 +1818,12 @@ mod tests {
         assert!(check_endpoint(&conn, Some("w1"), ProviderId::OpenAi, None).is_ok());
         assert!(check_leaves_mac(&conn, Some("w1")).is_ok());
     }
+    fn record_due(conn: &Connection, org_id: &str) {
+        let due = audio_sweep_due(conn).unwrap();
+        assert_eq!(due.org_id, org_id);
+        record_audio_sweep(conn, &due).unwrap();
+    }
+
     fn cache_audio(conn: &Connection, id: &str, name: &str, forbidden: bool) {
         let body = format!(
             r#"{{"orgs":[{{"id":"{id}","name":"{name}","policy":{{"local_only":false,"retention_days":0,"telemetry_off":false,"audio_forbidden":{forbidden}}},"workspaces":["w1"]}}]}}"#
@@ -1767,10 +1866,10 @@ mod tests {
         cache_audio(&conn, "o1", "Northwind", true);
         let due = audio_sweep_due(&conn).unwrap();
         assert_eq!((due.org_id.as_str(), due.org_name.as_str()), ("o1", "Northwind"));
-        record_audio_sweep(&conn, "o1").unwrap();
-        record_audio_sweep(&conn, "o1").unwrap();
+        record_due(&conn, "o1");
+        record_audio_sweep(&conn, &due).unwrap();
         assert_eq!(audio_sweep_due(&conn), None);
-        assert_eq!(crate::db::get_setting(&conn, SETTING_AUDIO_SWEPT).unwrap().as_deref(), Some(r#"["o1"]"#));
+        assert_eq!(crate::db::get_setting(&conn, SETTING_AUDIO_SWEPT).unwrap().as_deref(), Some(r#"["o1/w1"]"#));
         assert!(effective_for_or_strictest(&conn, Some("w1")).audio_forbidden, "the gate stays closed after the sweep");
     }
 
@@ -1778,7 +1877,7 @@ mod tests {
     fn a_second_organisation_owes_its_own_sweep() {
         let (_d, conn) = conn();
         cache_audio(&conn, "o1", "Northwind", true);
-        record_audio_sweep(&conn, "o1").unwrap();
+        record_due(&conn, "o1");
         cache_audio(&conn, "o2", "Fjordby", true);
         assert_eq!(audio_sweep_due(&conn).map(|d| d.org_id), Some("o2".into()));
     }
@@ -1799,9 +1898,12 @@ mod tests {
         force_for_test(&[("audio_forbidden", ManagedValue::Bool(true))]);
         reload_managed();
         let due = audio_sweep_due(&conn).unwrap();
-        assert_eq!(due, AudioSweep { org_id: MANAGED_SWEEP_ID.into(), org_name: MANAGED_SOURCE.into(), all: true });
-        assert_eq!(sweep_scope(&conn, &due), Some(SweepScope::Everything));
-        record_audio_sweep(&conn, MANAGED_SWEEP_ID).unwrap();
+        assert_eq!(
+            due,
+            AudioSweep { org_id: MANAGED_SWEEP_ID.into(), org_name: MANAGED_SOURCE.into(), all: true, workspaces: vec![] }
+        );
+        assert_eq!(sweep_scope(&due), SweepScope::Everything);
+        record_due(&conn, MANAGED_SWEEP_ID);
         assert_eq!(audio_sweep_due(&conn), None, "once only");
     }
 
@@ -1812,9 +1914,9 @@ mod tests {
         force_for_test(&[("audio_forbidden", ManagedValue::Bool(true))]);
         reload_managed();
         assert_eq!(audio_sweep_due(&conn).unwrap().org_id, "o1");
-        record_audio_sweep(&conn, "o1").unwrap();
+        record_due(&conn, "o1");
         assert_eq!(audio_sweep_due(&conn).unwrap().org_id, MANAGED_SWEEP_ID);
-        record_audio_sweep(&conn, MANAGED_SWEEP_ID).unwrap();
+        record_due(&conn, MANAGED_SWEEP_ID);
         assert_eq!(audio_sweep_due(&conn), None);
     }
 
@@ -1929,13 +2031,85 @@ mod tests {
         let (_d, conn) = conn();
         assert!(store(&conn, &classify(200, TWO_ORGS)).unwrap());
         let due = audio_sweep_due(&conn).unwrap();
-        assert_eq!(due, AudioSweep { org_id: "a".into(), org_name: "Humla".into(), all: false });
-        let scope = sweep_scope(&conn, &due).unwrap();
+        assert_eq!(due, AudioSweep { org_id: "a".into(), org_name: "Humla".into(), all: false, workspaces: vec!["wa".into()] });
+        let scope = sweep_scope(&due);
         assert!(scope.covers("wa"));
         assert!(!scope.covers("wb") && !scope.covers("") && !scope.covers(" "));
         let without_departments = TWO_ORGS.replace(r#""workspaces":["wa"]"#, r#""workspaces":[]"#);
         assert!(store(&conn, &classify(200, &without_departments)).unwrap());
         assert_eq!(audio_sweep_due(&conn), None, "nothing of its own to sweep");
+    }
+
+    #[test]
+    fn a_department_attached_or_unlocked_later_owes_its_own_sweep() {
+        let (_d, conn) = conn();
+        cache_audio(&conn, "o1", "Northwind", true);
+        record_due(&conn, "o1");
+        let body = r#"{"orgs":[{"id":"o1","name":"Northwind","policy":{"local_only":false,"retention_days":0,"telemetry_off":false,"audio_forbidden":true},"workspaces":["w1","w2"],"locked_workspaces":["w3"]}]}"#;
+        store(&conn, &classify(200, body)).unwrap();
+        let due = audio_sweep_due(&conn).unwrap();
+        assert_eq!(due.workspaces, ["w2", "w3"], "only the departments not swept yet");
+        assert!(!sweep_scope(&due).covers("w1"));
+        record_audio_sweep(&conn, &due).unwrap();
+        assert_eq!(audio_sweep_due(&conn), None);
+    }
+
+    #[test]
+    fn a_sweep_recorded_per_organisation_covers_the_departments_it_had() {
+        let (_d, conn) = conn();
+        crate::db::set_setting(&conn, SETTING_AUDIO_SWEPT, r#"["o1","mac-configuration","gone"]"#).unwrap();
+        cache_audio(&conn, "o1", "Northwind", true);
+        assert_eq!(audio_sweep_due(&conn), None);
+        assert_eq!(
+            crate::db::get_setting(&conn, SETTING_AUDIO_SWEPT).unwrap().as_deref(),
+            Some(r#"["o1/w1","mac-configuration"]"#)
+        );
+        let body = r#"{"orgs":[{"id":"o1","name":"Northwind","policy":{"local_only":false,"retention_days":0,"telemetry_off":false,"audio_forbidden":true},"workspaces":["w1","w2"]}]}"#;
+        store(&conn, &classify(200, body)).unwrap();
+        assert_eq!(audio_sweep_due(&conn).unwrap().workspaces, ["w2"], "attached after the upgrade");
+    }
+
+    #[test]
+    fn a_department_behind_unmet_2fa_keeps_its_organisations_policy() {
+        let (_d, conn) = conn();
+        let body = r#"{"orgs":[{"id":"a","name":"Humla","policy":{"local_only":true,"retention_days":30,"telemetry_off":false,"audio_forbidden":true},"workspaces":[],"locked_workspaces":["wl"]}]}"#;
+        store(&conn, &classify(200, body)).unwrap();
+        let p = effective_for(&conn, Some("wl")).unwrap();
+        assert!(p.local_only && p.audio_forbidden && p.retention_days == 30);
+        assert!(!effective_for(&conn, Some("w-other")).unwrap().local_only, "a claimed org governs only its own");
+        assert!(!effective_for(&conn, None).unwrap().local_only);
+        let config = cached(&conn).unwrap().unwrap();
+        assert_eq!(retention_rules(&config)["wl"].days, 30);
+        assert_eq!(governed_workspaces(Some(&config))["wl"], "Humla");
+        assert_eq!(org_policies(Some(&config))[0].workspaces, ["wl"]);
+        assert!(forbids_audio(&conn, "wl") && governs_workspace(&conn, "wl"));
+        assert_eq!(audio_sweep_due(&conn).unwrap().workspaces, ["wl"]);
+        assert!(vocabulary_for(&conn, Some("wl")).is_empty());
+    }
+
+    #[test]
+    fn an_older_server_naming_no_department_governs_every_unclaimed_workspace() {
+        let (_d, conn) = conn();
+        let body = r#"{"orgs":[
+            {"id":"a","name":"Humla","policy":{"local_only":true,"retention_days":0,"telemetry_off":false,"audio_forbidden":true},"workspaces":[]},
+            {"id":"b","name":"Screenpartner","policy":{"local_only":false,"retention_days":0,"telemetry_off":false,"audio_forbidden":false},"workspaces":["wb"]}]}"#;
+        store(&conn, &classify(200, body)).unwrap();
+        assert!(effective_for(&conn, Some("w-unknown")).unwrap().local_only);
+        assert!(!effective_for(&conn, Some("wb")).unwrap().local_only, "claimed by another organisation");
+        assert!(!effective_for(&conn, None).unwrap().local_only, "Personal is never affected");
+        assert!(governs_workspace(&conn, "w-unknown") && !governs_workspace(&conn, "wb"));
+        assert!(!forbids_audio(&conn, "w-unknown"), "a guess deletes nothing");
+        assert_eq!(audio_sweep_due(&conn), None);
+    }
+
+    #[test]
+    fn a_note_that_cant_be_read_is_strictest_only_with_an_organisation_cached() {
+        let (_d, conn) = conn();
+        assert_eq!(effective_for_note(&conn, "missing"), EffectivePolicy::default());
+        store(&conn, &classify(200, r#"{"orgs":[]}"#)).unwrap();
+        assert_eq!(effective_for_note(&conn, "missing"), EffectivePolicy::default());
+        cache_one_org(&conn);
+        assert!(effective_for_note(&conn, "missing").local_only);
     }
 
     #[test]

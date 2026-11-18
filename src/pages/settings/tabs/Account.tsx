@@ -24,16 +24,16 @@ export function PoliciesSection() {
   const status = useCloudStore((s) => s.status);
   if (groups.length === 0) return null;
   const known = [...status.workspaces, ...(status.locked_workspaces ?? [])];
-  const departments = (ids: string[]) =>
-    ids.length === 0
+  const departments = (g: { workspaces: string[]; everyWorkspace: boolean }) =>
+    g.everyWorkspace
       ? "Every workspace"
-      : ids.map((id) => known.find((w) => w.id === id)?.name).filter(Boolean).join(", ");
+      : g.workspaces.map((id) => known.find((w) => w.id === id)?.name).filter(Boolean).join(", ");
   return (
     <Section title="Policies">
       {groups.map((g) => (
         <div key={g.key}>
           <p className="pt-3.5 text-xs text-[var(--color-text-muted)]">
-            {[g.source, departments(g.workspaces)].filter(Boolean).join(" · ")}
+            {[g.source, departments(g)].filter(Boolean).join(" · ")}
           </p>
           <div className="flex flex-col divide-y divide-[var(--color-line)]">
             {g.rows.map((r) => (
