@@ -152,7 +152,7 @@ describe("SummaryTab default template", () => {
       ready: true,
     });
     const asked = vi.fn(() => ({
-      templates: [{ client_id: "board", name: "Board minutes", content: "x", departments: 0 }],
+      templates: [{ client_id: "board", name: "Board minutes", content: "x", workspaces: [] }],
       vocabulary: [],
     }));
     mockTauri({

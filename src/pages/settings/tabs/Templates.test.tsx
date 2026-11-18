@@ -250,6 +250,16 @@ describe("TemplatesSection", () => {
       org_workspaces: departments,
     });
     const rows = () => [orgTemplate("case", "Case meeting", []), orgTemplate("home", "Home visit", ["ws2"])];
+    // The server's copy also holds a template for a department the admin isn't
+    // in, which the config never sends.
+    const serverContent = {
+      templates: [
+        { client_id: "case", name: "Case meeting", content: "Case meeting instructions", workspaces: [] },
+        { client_id: "home", name: "Home visit", content: "Home visit instructions", workspaces: ["ws2"] },
+        { client_id: "far", name: "Far away", content: "x", workspaces: ["ws9"] },
+      ],
+      vocabulary: [],
+    };
 
     function signedIn(twoFactor = false) {
       useCloudStore.setState({
@@ -297,6 +307,7 @@ describe("TemplatesSection", () => {
         org_status: () => orgStatus,
         summary_prompts_list: rows,
         org_admin_orgs: () => [{ id: "o1", name: "Northwind", require_2fa: false }],
+        org_admin_content: () => serverContent,
       });
       render(<TemplatesSection language="en" />);
       const group = await orgGroup();
@@ -304,6 +315,48 @@ describe("TemplatesSection", () => {
       expect(within(group).getByRole("button", { name: "Edit Case meeting" })).toBeInTheDocument();
       expect(within(group).getByRole("button", { name: "Delete Case meeting" })).toBeInTheDocument();
       expect(within(group).getByText("Home care")).toBeInTheDocument();
+      expect(within(group).getByRole("button", { name: "Edit Far away" })).toBeInTheDocument();
+      expect(within(group).getByText("1 department")).toBeInTheDocument();
+      expect(within(group).getAllByText("Case meeting")).toHaveLength(1);
+    });
+
+    it("shows the cached rows read-only until the server's copy is read", async () => {
+      signedIn();
+      mockTauri({
+        org_status: () => orgStatus,
+        summary_prompts_list: rows,
+        org_admin_orgs: () => [{ id: "o1", name: "Northwind", require_2fa: false }],
+        org_admin_content: () => {
+          throw "Couldn't reach the server. Try again when you're online.";
+        },
+      });
+      render(<TemplatesSection language="en" />);
+      const group = await orgGroup();
+      expect(await within(group).findByRole("alert")).toHaveTextContent("Couldn't reach the server.");
+      expect(within(group).getByText("Case meeting")).toBeInTheDocument();
+      expect(within(group).queryByRole("button", { name: /^Edit / })).toBeNull();
+      expect(within(group).queryByText("Far away")).toBeNull();
+    });
+
+    it("keeps the editor open on a deleted template and reads the server again", async () => {
+      signedIn();
+      const asked = vi.fn(() => serverContent);
+      mockTauri({
+        org_status: () => orgStatus,
+        summary_prompts_list: rows,
+        org_admin_orgs: () => [{ id: "o1", name: "Northwind", require_2fa: false }],
+        org_admin_content: asked,
+        org_template_open: () => ({ name: "Case meeting", content: "x", workspaces: [], hidden: 0 }),
+        org_template_save: () => {
+          throw "This template was deleted.";
+        },
+      });
+      render(<TemplatesSection language="en" />);
+      await userEvent.click(await screen.findByRole("button", { name: "Edit Case meeting" }));
+      const editor = await screen.findByRole("dialog", { name: "Edit organisation template" });
+      await userEvent.click(within(editor).getByRole("button", { name: "Save template" }));
+      expect(await within(editor).findByRole("alert")).toHaveTextContent("This template was deleted.");
+      await vi.waitFor(() => expect(asked).toHaveBeenCalledTimes(2));
     });
 
     it("creates one for chosen departments", async () => {
@@ -313,6 +366,7 @@ describe("TemplatesSection", () => {
         org_status: () => orgStatus,
         summary_prompts_list: rows,
         org_admin_orgs: () => [{ id: "o1", name: "Northwind", require_2fa: false }],
+        org_admin_content: () => serverContent,
         org_template_save: saved,
       });
       render(<TemplatesSection language="en" />);
@@ -343,6 +397,7 @@ describe("TemplatesSection", () => {
         org_status: () => orgStatus,
         summary_prompts_list: rows,
         org_admin_orgs: () => [{ id: "o1", name: "Northwind", require_2fa: false }],
+        org_admin_content: () => serverContent,
         org_template_open: opened,
         org_template_save: saved,
       });
@@ -376,6 +431,7 @@ describe("TemplatesSection", () => {
         org_status: () => orgStatus,
         summary_prompts_list: rows,
         org_admin_orgs: () => [{ id: "o1", name: "Northwind", require_2fa: false }],
+        org_admin_content: () => serverContent,
         org_template_open: () => ({ name: "Home visit", content: "x", workspaces: ["ws2"], hidden: 0 }),
         org_template_save: saved,
       });
@@ -395,6 +451,7 @@ describe("TemplatesSection", () => {
         org_status: () => orgStatus,
         summary_prompts_list: rows,
         org_admin_orgs: () => [{ id: "o1", name: "Northwind", require_2fa: false }],
+        org_admin_content: () => serverContent,
         org_template_delete: deleted,
       });
       render(<TemplatesSection language="en" />);
@@ -411,6 +468,7 @@ describe("TemplatesSection", () => {
         org_status: () => orgStatus,
         summary_prompts_list: rows,
         org_admin_orgs: () => [{ id: "o1", name: "Northwind", require_2fa: false }],
+        org_admin_content: () => serverContent,
         org_template_open: () => ({ name: "Case meeting", content: "x", workspaces: [], hidden: 0 }),
         org_template_save: () => {
           throw "Only Northwind's admins can change this.";
@@ -429,6 +487,7 @@ describe("TemplatesSection", () => {
         org_status: () => orgStatus,
         summary_prompts_list: rows,
         org_admin_orgs: () => [{ id: "o1", name: "Northwind", require_2fa: false }],
+        org_admin_content: () => serverContent,
         org_template_delete: () => {
           throw "Couldn't reach the server. Try again when you're online.";
         },
@@ -468,8 +527,8 @@ describe("TemplatesSection", () => {
     };
     const content = {
       templates: [
-        { client_id: "board", name: "Board minutes", content: "Motions and votes.", departments: 0 },
-        { client_id: "audit", name: "Audit review", content: "Findings.", departments: 2 },
+        { client_id: "board", name: "Board minutes", content: "Motions and votes.", workspaces: [] },
+        { client_id: "audit", name: "Audit review", content: "Findings.", workspaces: ["x1", "x2"] },
       ],
       vocabulary: ["Fjord"],
     };

@@ -2199,13 +2199,23 @@ function settingsOrgIpc({ admin = false }: { admin?: boolean } = {}): Record<str
             { id: "o1", name: "Northwind", require_2fa: false },
             { id: "o2", name: "Fjordby", require_2fa: false },
           ],
-          org_admin_content: () => ({
-            templates: [
-              { client_id: "board", name: "Board minutes", content: "Motions, votes and who voted how.", departments: 0 },
-              { client_id: "audit", name: "Audit review", content: "Findings and the owner of each.", departments: 2 },
-            ],
-            vocabulary: ["Fjordby", "Formannskap"],
-          }),
+          org_admin_content: (args) =>
+            (args as { orgId: string }).orgId === "o1"
+              ? {
+                  templates: [
+                    { client_id: "case", name: "Case meeting", content: "Record the decision, who owns each action, and the deadline.", workspaces: [] },
+                    { client_id: "intake", name: "Intake review", content: "List the needs raised, the services offered, and the next contact.", workspaces: ["w1", "w2", "w7"] },
+                    { client_id: "night", name: "Night shift handover", content: "Who was seen, what changed, what's next.", workspaces: ["w7"] },
+                  ],
+                  vocabulary: ["Northwind", "IPLOS", "Individual plan", "Coordinating unit", "Smith, John"],
+                }
+              : {
+                  templates: [
+                    { client_id: "board", name: "Board minutes", content: "Motions, votes and who voted how.", workspaces: [] },
+                    { client_id: "audit", name: "Audit review", content: "Findings and the owner of each.", workspaces: ["x1", "x2"] },
+                  ],
+                  vocabulary: ["Fjordby", "Formannskap"],
+                },
           org_template_open: (args) => ({
             name: (args as { clientId: string }).clientId === "intake" ? "Intake review" : "Case meeting",
             content: "Record the decision, who owns each action, and the deadline.",

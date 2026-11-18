@@ -169,26 +169,25 @@ export function editableOrgs(
   };
 }
 
-/** An administered organisation the user is in no department of. */
-export type AdminOnlyOrg = { summary: OrgSummary; content: AdminContent | null; error: string | null };
+/** An organisation the user administers, with its templates and terms as the
+ *  server holds them (`content`, null until read or when the read failed). */
+export type AdminOrgContent = { summary: OrgSummary; content: AdminContent | null; error: string | null };
 
-/** The organisations in `admin` that the cached config doesn't list, with their
- *  templates and terms read from the server for editing. They are kept in this
- *  hook's state only: nothing caches them, applies them or offers them in a
- *  picker. Nothing is asked until the config has been read (`orgs` non-null),
- *  and organisations waiting on two-factor authentication are left out. */
-export function useAdminOnlyOrgs(
+/** Every organisation in `admin`, read from the server for editing: an admin
+ *  sees templates for departments they aren't in, which the config leaves out.
+ *  The result stays in this hook's state: nothing caches it, applies it or
+ *  offers it in a picker. Nothing is asked until the config has been read
+ *  (`orgs` non-null), and organisations waiting on two-factor authentication
+ *  are left out. */
+export function useAdminContent(
   orgs: OrgSummary[] | null,
   admin: AdminOrg[],
   twoFactorOn: boolean,
-): { list: AdminOnlyOrg[]; reload: () => void } {
+): { list: AdminOrgContent[]; reload: () => void } {
   const [content, setContent] = useState<Record<string, { content: AdminContent | null; error: string | null }>>({});
   const [round, setRound] = useState(0);
-  const missing =
-    orgs === null
-      ? []
-      : admin.filter((a) => !orgs.some((o) => o.id === a.id) && (!a.require_2fa || twoFactorOn));
-  const key = missing.map((a) => a.id).join(",");
+  const readable = orgs === null ? [] : admin.filter((a) => !a.require_2fa || twoFactorOn);
+  const key = readable.map((a) => a.id).join(",");
   useEffect(() => {
     if (!key) return;
     let cancelled = false;
@@ -203,11 +202,27 @@ export function useAdminOnlyOrgs(
     };
   }, [key, round]);
   return {
-    list: missing.map((a) => ({
-      summary: { id: a.id, name: a.name, reason: "", vocabulary: content[a.id]?.content?.vocabulary ?? [], workspaces: [] },
-      content: content[a.id]?.content ?? null,
-      error: content[a.id]?.error ?? null,
-    })),
+    list: readable.map((a) => {
+      const cached = orgs?.find((o) => o.id === a.id);
+      const read = content[a.id];
+      return {
+        summary: {
+          id: a.id,
+          name: cached?.name ?? a.name,
+          reason: cached?.reason ?? "",
+          vocabulary: read?.content?.vocabulary ?? cached?.vocabulary ?? [],
+          workspaces: cached?.workspaces ?? [],
+        },
+        content: read?.content ?? null,
+        error: read?.error ?? null,
+      };
+    }),
     reload: () => setRound((r) => r + 1),
   };
+}
+
+/** Organisation terms exactly as stored: blanks and exact repeats dropped,
+ *  never split on commas. */
+export function storedTerms(vocabulary: string[]): string[] {
+  return [...new Set(vocabulary.filter((t) => t.trim()))];
 }

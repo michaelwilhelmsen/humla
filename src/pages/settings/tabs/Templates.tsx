@@ -8,7 +8,7 @@ import {
   orgTemplateClientId,
   pickerTemplates,
   useActiveWorkspaceId,
-  useAdminOnlyOrgs,
+  useAdminContent,
   useAdminOrgs,
   useOrgContentVersion,
   useOrgsState,
@@ -69,7 +69,7 @@ export function TemplatesSection({ language }: { language: string }) {
   const orgVersion = useOrgContentVersion();
   const adminOrgs = useAdminOrgs();
   const twoFactorOn = useCloudStore((s) => s.status.two_factor?.enabled ?? false);
-  const adminOnly = useAdminOnlyOrgs(orgsState, adminOrgs, twoFactorOn);
+  const adminContent = useAdminContent(orgsState, adminOrgs, twoFactorOn);
   const [orgEditing, setOrgEditing] = useState<OrgDraft | null>(null);
   const [orgEditorError, setOrgEditorError] = useState<string | null>(null);
   const [orgSaving, setOrgSaving] = useState(false);
@@ -161,10 +161,11 @@ export function TemplatesSection({ language }: { language: string }) {
       setOrgEditing(null);
       setOrgEditorError(null);
       setOrgError(null);
-      adminOnly.reload();
+      adminContent.reload();
       await refresh();
     } catch (e) {
       setOrgEditorError(String(e));
+      adminContent.reload();
     } finally {
       setOrgSaving(false);
     }
@@ -177,7 +178,7 @@ export function TemplatesSection({ language }: { language: string }) {
       await ipc.orgTemplateDelete(t.org_id, clientId);
       setConfirmDeleteId(null);
       setOrgError(null);
-      adminOnly.reload();
+      adminContent.reload();
       await refresh();
     } catch (e) {
       setConfirmDeleteId(null);
@@ -186,23 +187,24 @@ export function TemplatesSection({ language }: { language: string }) {
   }
 
   const { org: offered, own } = pickerTemplates(templates, activeWorkspaceId, orgs);
-  // Organisations the user administers without being in any of their
-  // departments: shown here to edit, from the server, and nowhere else.
+  // An administered organisation is listed from the server once read, so its
+  // admins see templates for departments they aren't in; until then, and for
+  // everyone else, from the cache. Server rows are only shown here.
   const outsideConfig: OrgSummary[] =
     orgsState === null
       ? []
       : adminOrgs
           .filter((a) => !orgs.some((o) => o.id === a.id))
-          .map((a) => adminOnly.list.find((x) => x.summary.id === a.id)?.summary ?? {
-            id: a.id,
-            name: a.name,
-            reason: "",
-            vocabulary: [],
-            workspaces: [],
-          });
-  const { editable, locked: twoFactorLocked } = editableOrgs([...orgs, ...outsideConfig], adminOrgs, twoFactorOn);
-  const canAdmin = (t: SummaryPrompt) => editable.some((o) => o.id === t.org_id);
-  const adminOnlyRows: (SummaryPrompt & { departments: number })[] = adminOnly.list.flatMap((a) =>
+          .map((a) => ({ id: a.id, name: a.name, reason: "", vocabulary: [], workspaces: [] }));
+  const { editable: administered, locked: twoFactorLocked } = editableOrgs(
+    [...orgs, ...outsideConfig],
+    adminOrgs,
+    twoFactorOn,
+  );
+  const fromServer = (orgId?: string) => adminContent.list.find((a) => a.summary.id === orgId && a.content);
+  const editable = administered.filter((o) => fromServer(o.id)).map((o) => fromServer(o.id)!.summary);
+  const canAdmin = (t: SummaryPrompt) => !!fromServer(t.org_id);
+  const serverRows: SummaryPrompt[] = adminContent.list.flatMap((a) =>
     (a.content?.templates ?? []).map((t) => ({
       id: `org_${a.summary.id}_${t.client_id}`,
       name: t.name,
@@ -211,24 +213,28 @@ export function TemplatesSection({ language }: { language: string }) {
       updated_at: 0,
       workspace_id: "",
       org_id: a.summary.id,
-      org_workspaces: [],
-      departments: t.departments,
+      org_workspaces: t.workspaces,
     })),
   );
   const fromOrg: SummaryPrompt[] = [
-    ...templates.filter((t) => isOrgTemplate(t) && (canAdmin(t) || offered.includes(t))),
-    ...adminOnlyRows,
+    ...templates.filter((t) => isOrgTemplate(t) && !fromServer(t.org_id) && offered.includes(t)),
+    ...serverRows,
   ];
-  const adminOnlyErrors = adminOnly.list.flatMap((a) => (a.error ? [a.error] : []));
+  const adminErrors = adminContent.list.flatMap((a) => (a.error ? [a.error] : []));
   const shared = own.filter((t) => t.workspace_id);
   const personal = own.filter((t) => !t.workspace_id);
   const orgsShown = orgs.filter(
-    (o) => fromOrg.some((t) => t.org_id === o.id) || editable.includes(o) || twoFactorLocked.includes(o),
+    (o) =>
+      fromOrg.some((t) => t.org_id === o.id) ||
+      editable.some((e) => e.id === o.id) ||
+      twoFactorLocked.includes(o),
   );
   const departmentLabels = (t: SummaryPrompt) => {
-    const n = adminOnlyRows.find((r) => r.id === t.id)?.departments;
-    if (n === undefined) return departmentNames(t);
-    return n === 0 ? [] : [`${n} ${n === 1 ? "department" : "departments"}`];
+    const named = departmentNames(t);
+    const others = (t.org_workspaces ?? []).length - named.length;
+    if (others === 0) return named;
+    const word = others === 1 ? "department" : "departments";
+    return [...named, named.length > 0 ? `${others} other ${word}` : `${others} ${word}`];
   };
   const showOrgGroup = fromOrg.length > 0 || editable.length > 0 || twoFactorLocked.length > 0;
   const editingOrg = editable.find((o) => o.id === orgEditing?.orgId);
@@ -392,7 +398,7 @@ export function TemplatesSection({ language }: { language: string }) {
               {o.name} requires two-factor authentication to edit its templates. Set it up in Settings → Account.
             </p>
           ))}
-          {adminOnlyErrors.map((e) => (
+          {adminErrors.map((e) => (
             <p key={e} role="alert" className="text-xs py-3" style={{ color: "var(--color-danger)" }}>
               {e}
             </p>

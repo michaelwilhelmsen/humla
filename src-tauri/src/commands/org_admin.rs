@@ -44,13 +44,14 @@ pub struct AdminContent {
     pub vocabulary: Vec<String>,
 }
 
-/// `departments` counts the departments a template is offered in; 0 is all.
+/// `workspaces` are the departments a template is offered in, every one of
+/// them, which an admin may list; empty is all.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct AdminTemplate {
     pub client_id: String,
     pub name: String,
     pub content: String,
-    pub departments: usize,
+    pub workspaces: Vec<String>,
 }
 
 /// The stored record behind a template.
@@ -60,10 +61,20 @@ pub(crate) struct StoredTemplate {
     pub name: String,
     pub content: String,
     pub workspaces: Vec<String>,
+    pub client_updated_at: i64,
+    pub deleted: bool,
 }
 
 fn str_field(v: &Value, key: &str) -> String {
     v.get(key).and_then(|s| s.as_str()).unwrap_or_default().to_string()
+}
+
+fn number(v: &Value, key: &str) -> i64 {
+    v.get(key).and_then(|n| n.as_f64()).map(|n| n as i64).unwrap_or(0)
+}
+
+fn flag(v: &Value, key: &str) -> bool {
+    v.get(key).and_then(|b| b.as_bool()).unwrap_or(false)
 }
 
 fn ids(v: &Value) -> Vec<String> {
@@ -157,6 +168,8 @@ pub(crate) fn parse_template_lookup(body: &Value) -> Result<Option<StoredTemplat
         name: str_field(t, "name"),
         content: str_field(t, "content"),
         workspaces: ids(t.get("workspaces").unwrap_or(&Value::Null)),
+        client_updated_at: number(t, "client_updated_at"),
+        deleted: flag(t, "deleted"),
     }))
 }
 
@@ -180,7 +193,7 @@ pub(crate) fn parse_admin_templates(body: &Value) -> Result<Vec<AdminTemplate>, 
             client_id: str_field(t, "client_id"),
             name: str_field(t, "name"),
             content: org_policy::plain_text(&str_field(t, "content")),
-            departments: ids(t.get("workspaces").unwrap_or(&Value::Null)).len(),
+            workspaces: ids(t.get("workspaces").unwrap_or(&Value::Null)),
         })
         .filter(|t| safe_id(&t.client_id))
         .collect())
@@ -261,6 +274,45 @@ pub(crate) fn create_body(
         "client_updated_at": now_ms,
         "deleted": false,
     })
+}
+
+/// The stamp a write carries: never older than the stored one, so this Mac's
+/// clock running behind can't make the server keep the stored fields.
+pub(crate) fn next_stamp(now_ms: i64, stored: i64) -> i64 {
+    now_ms.max(stored.saturating_add(1))
+}
+
+/// The PATCH for saving `stored`. A tombstoned template is refused rather than
+/// brought back.
+pub(crate) fn update_plan(
+    stored: &StoredTemplate,
+    mine: &[String],
+    chosen: Option<&[String]>,
+    name: &str,
+    content: &str,
+    now_ms: i64,
+) -> Result<Value, String> {
+    if stored.deleted {
+        return Err(DELETED.into());
+    }
+    let scope = scope_workspaces(&stored.workspaces, mine, chosen)?;
+    Ok(update_body(name, content, &scope, next_stamp(now_ms, stored.client_updated_at)))
+}
+
+pub(crate) const DELETED: &str = "This template was deleted.";
+pub(crate) const OVERTAKEN: &str =
+    "Someone else changed this template at the same time, so your change wasn't saved. Open it again to see theirs.";
+
+/// Whether the record the server answered with holds what was sent. The
+/// last-write-wins hook answers a stale write with 200 and the stored fields.
+pub(crate) fn write_landed(sent: &Value, returned: &Value) -> bool {
+    let same_stamp = number(sent, "client_updated_at") == number(returned, "client_updated_at");
+    let same_deleted = flag(sent, "deleted") == flag(returned, "deleted");
+    let same_name = sent.get("name").is_none_or(|n| returned.get("name") == Some(n));
+    let same_content = sent.get("content").is_none_or(|_| {
+        org_policy::plain_text(&str_field(sent, "content")) == org_policy::plain_text(&str_field(returned, "content"))
+    });
+    same_stamp && same_deleted && same_name && same_content
 }
 
 pub(crate) fn update_body(name: &str, content: &str, workspaces: &[String], now_ms: i64) -> Value {
@@ -375,6 +427,13 @@ async fn refresh(app: &tauri::AppHandle, state: &State<'_, AppState>, answer: &A
     super::org::refresh_org_config(&state.db, app, &answer.base, &answer.token).await;
 }
 
+/// [`refresh`] without an answer in hand.
+async fn refresh_config(app: &tauri::AppHandle, state: &State<'_, AppState>) {
+    if let Ok((base, token)) = super::cloud_auth::cloud_session(state).await {
+        super::org::refresh_org_config(&state.db, app, &base, &token).await;
+    }
+}
+
 // ---- commands -----------------------------------------------------------------
 
 /// The organisations the signed-in user administers.
@@ -435,7 +494,7 @@ pub async fn org_template_save(
     let name = check_name(&name)?;
     let (org, mine) = cached_org(&state, &org_id);
     let now = crate::db::now_ms();
-    let answer = match client_id {
+    let (body, answer) = match client_id {
         None => {
             if !safe_id(&org_id) {
                 return Err("Not an organisation.".into());
@@ -443,17 +502,27 @@ pub async fn org_template_save(
             let scope = scope_workspaces(&[], &mine, workspaces.as_deref())?;
             let client_id = uuid::Uuid::new_v4().to_string();
             let body = create_body(&org_id, &client_id, &name, &content, &scope, now);
-            send(&state, TEMPLATES_PATH, Req::Post(&body)).await?
+            let answer = send(&state, TEMPLATES_PATH, Req::Post(&body)).await?;
+            (body, answer)
         }
         Some(client_id) => {
             let stored = lookup(&state, &org_id, &client_id, &org).await?;
-            let scope = scope_workspaces(&stored.workspaces, &mine, workspaces.as_deref())?;
-            let body = update_body(&name, &content, &scope, now);
-            send(&state, &format!("{TEMPLATES_PATH}/{}", stored.record_id), Req::Patch(&body)).await?
+            let body = match update_plan(&stored, &mine, workspaces.as_deref(), &name, &content, now) {
+                Ok(body) => body,
+                Err(e) => {
+                    refresh_config(&app, &state).await;
+                    return Err(e);
+                }
+            };
+            let answer = send(&state, &format!("{TEMPLATES_PATH}/{}", stored.record_id), Req::Patch(&body)).await?;
+            (body, answer)
         }
     };
     ok(&answer, &org)?;
     refresh(&app, &state, &answer).await;
+    if !write_landed(&body, &answer.body) {
+        return Err(OVERTAKEN.into());
+    }
     Ok(())
 }
 
@@ -467,10 +536,17 @@ pub async fn org_template_delete(
 ) -> Result<(), String> {
     let (org, _) = cached_org(&state, &org_id);
     let stored = lookup(&state, &org_id, &client_id, &org).await?;
-    let body = tombstone_body(crate::db::now_ms());
+    if stored.deleted {
+        refresh_config(&app, &state).await;
+        return Ok(());
+    }
+    let body = tombstone_body(next_stamp(crate::db::now_ms(), stored.client_updated_at));
     let answer = send(&state, &format!("{TEMPLATES_PATH}/{}", stored.record_id), Req::Patch(&body)).await?;
     ok(&answer, &org)?;
     refresh(&app, &state, &answer).await;
+    if !write_landed(&body, &answer.body) {
+        return Err(OVERTAKEN.into());
+    }
     Ok(())
 }
 
@@ -568,13 +644,18 @@ mod tests {
 
     #[test]
     fn a_lookup_reads_the_first_record_or_none() {
-        let body = json!({ "items": [{ "id": "r1", "name": "Case", "content": "<p>A &amp; B</p>", "workspaces": ["w1", "w9"] }] });
+        let body = json!({ "items": [{
+            "id": "r1", "name": "Case", "content": "<p>A &amp; B</p>", "workspaces": ["w1", "w9"],
+            "client_updated_at": 1700000000000.0, "deleted": false,
+        }] });
         let stored = parse_template_lookup(&body).unwrap().unwrap();
         assert_eq!(stored, StoredTemplate {
             record_id: "r1".into(),
             name: "Case".into(),
             content: "<p>A &amp; B</p>".into(),
             workspaces: s(&["w1", "w9"]),
+            client_updated_at: 1_700_000_000_000,
+            deleted: false,
         });
         assert_eq!(parse_template_lookup(&json!({ "items": [] })).unwrap(), None);
         assert!(parse_template_lookup(&json!({})).is_err());
@@ -657,8 +738,8 @@ mod tests {
         assert_eq!(
             parse_admin_templates(&body).unwrap(),
             vec![
-                AdminTemplate { client_id: "case".into(), name: "Case".into(), content: "A\nB".into(), departments: 0 },
-                AdminTemplate { client_id: "home".into(), name: "Home".into(), content: "x".into(), departments: 2 },
+                AdminTemplate { client_id: "case".into(), name: "Case".into(), content: "A\nB".into(), workspaces: vec![] },
+                AdminTemplate { client_id: "home".into(), name: "Home".into(), content: "x".into(), workspaces: s(&["w1", "w9"]) },
             ]
         );
         assert!(parse_admin_templates(&json!({})).is_err());
@@ -673,6 +754,45 @@ mod tests {
         for forbidden in ["summary_prompts", "set_setting", "apply_templates", "execute(", "store("] {
             assert!(!code.contains(forbidden), "org_admin.rs must not use {forbidden}");
         }
+    }
+
+    fn stored(stamp: i64, deleted: bool) -> StoredTemplate {
+        StoredTemplate {
+            record_id: "r1".into(),
+            name: "Case".into(),
+            content: "<p>x</p>".into(),
+            workspaces: s(&["w9"]),
+            client_updated_at: stamp,
+            deleted,
+        }
+    }
+
+    #[test]
+    fn a_deleted_template_is_refused_rather_than_brought_back() {
+        assert_eq!(update_plan(&stored(5, true), &[], Some(&[]), "Case", "x", 10), Err(DELETED.to_string()));
+    }
+
+    #[test]
+    fn a_clock_behind_the_stored_stamp_still_writes_newer() {
+        assert_eq!(next_stamp(10, 5), 10);
+        assert_eq!(next_stamp(10, 50), 51);
+        let body = update_plan(&stored(50, false), &[], Some(&[]), "Case", "x", 10).unwrap();
+        assert_eq!(body["client_updated_at"], json!(51));
+        assert_eq!(body["workspaces"], json!(["w9"]));
+    }
+
+    #[test]
+    fn a_stale_write_answered_with_the_stored_record_is_caught() {
+        let sent = update_body("New name", "New text", &[], 51);
+        let landed = json!({ "name": "New name", "content": "<p>New text</p>", "client_updated_at": 51.0, "deleted": false });
+        assert!(write_landed(&sent, &landed));
+        let kept = json!({ "name": "Case", "content": "<p>x</p>", "client_updated_at": 90, "deleted": false });
+        assert!(!write_landed(&sent, &kept));
+        let reworded = json!({ "name": "New name", "content": "<p>Other</p>", "client_updated_at": 51, "deleted": false });
+        assert!(!write_landed(&sent, &reworded));
+        let tombstone = tombstone_body(60);
+        assert!(write_landed(&tombstone, &json!({ "name": "Case", "client_updated_at": 60, "deleted": true })));
+        assert!(!write_landed(&tombstone, &json!({ "name": "Case", "client_updated_at": 90, "deleted": false })));
     }
 
     #[test]

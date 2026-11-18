@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { Lock, X } from "lucide-react";
 import { Section } from "../components/Section";
-import { editableOrgs, orgTerms, useAdminOnlyOrgs, useAdminOrgs, useOrgsState } from "../../../lib/orgContent";
+import { editableOrgs, orgTerms, storedTerms, useAdminContent, useAdminOrgs, useOrgsState } from "../../../lib/orgContent";
 import { useCloudStore } from "../../../lib/cloud";
 import { ipc } from "../../../lib/ipc";
 import type { OrgSummary } from "../../../lib/orgPolicy";
@@ -44,31 +44,28 @@ export function VocabularySection({ s, update }: Pick<SettingsHook, "s" | "updat
   const orgs = orgsState ?? [];
   const adminOrgs = useAdminOrgs();
   const twoFactorOn = useCloudStore((st) => st.status.two_factor?.enabled ?? false);
-  const adminOnly = useAdminOnlyOrgs(orgsState, adminOrgs, twoFactorOn);
-  // Organisations the user administers without being in any of their
-  // departments: their terms are edited here and applied nowhere.
+  const adminContent = useAdminContent(orgsState, adminOrgs, twoFactorOn);
+  // An administered organisation's terms are edited as the server holds them,
+  // once read; until then they show locked from the cache like anyone else's.
   const outsideConfig: OrgSummary[] =
     orgsState === null
       ? []
       : adminOrgs
           .filter((a) => !orgs.some((o) => o.id === a.id))
-          .map(
-            (a) =>
-              adminOnly.list.find((x) => x.summary.id === a.id)?.summary ?? {
-                id: a.id,
-                name: a.name,
-                reason: "",
-                vocabulary: [],
-                workspaces: [],
-              },
-          );
-  const { editable, locked: twoFactorLocked } = editableOrgs([...orgs, ...outsideConfig], adminOrgs, twoFactorOn);
-  const locked = orgTerms(orgs.filter((o) => !editable.includes(o)));
+          .map((a) => ({ id: a.id, name: a.name, reason: "", vocabulary: [], workspaces: [] }));
+  const { editable: administered, locked: twoFactorLocked } = editableOrgs(
+    [...orgs, ...outsideConfig],
+    adminOrgs,
+    twoFactorOn,
+  );
+  const read = (id: string) => adminContent.list.find((a) => a.summary.id === id && a.content);
+  const editable = administered.flatMap((o) => read(o.id)?.summary ?? []);
+  const locked = orgTerms(orgs.filter((o) => !editable.some((e) => e.id === o.id)));
   const [draft, setDraft] = useState("");
   const full = terms.length >= VOCABULARY_LIMIT;
   const candidates = splitDraft(draft);
   const badged = orgs.filter(
-    (o) => o.vocabulary.some((t) => t.trim()) || editable.includes(o) || twoFactorLocked.includes(o),
+    (o) => o.vocabulary.some((t) => t.trim()) || editable.some((e) => e.id === o.id) || twoFactorLocked.includes(o),
   );
 
   function add() {
@@ -100,8 +97,7 @@ export function VocabularySection({ s, update }: Pick<SettingsHook, "s" | "updat
                 key={o.id}
                 org={o}
                 named={orgs.length + outsideConfig.length > 1}
-                error={adminOnly.list.find((a) => a.summary.id === o.id)?.error ?? null}
-                onEdited={adminOnly.reload}
+                onEdited={adminContent.reload}
               />
             ))}
             {locked.length > 0 && (
@@ -181,27 +177,26 @@ export function VocabularySection({ s, update }: Pick<SettingsHook, "s" | "updat
   );
 }
 
-/** An administered organisation's terms, edited on the server. The list shown
- *  is the cached config's, which the backend refreshes after each edit, or for
- *  an organisation outside the user's departments the server's, reloaded
- *  through `onEdited`. */
+/** An administered organisation's terms as the server holds them, edited
+ *  there and read again through `onEdited`. */
 function OrgTermsEditor({
   org,
   named,
-  error: loadError,
   onEdited,
 }: {
   org: OrgSummary;
   named: boolean;
-  error: string | null;
   onEdited: () => void;
 }) {
   const [draft, setDraft] = useState("");
   const [busy, setBusy] = useState(false);
-  const [editError, setError] = useState<string | null>(null);
-  const error = editError ?? loadError;
-  const terms = parseVocabulary(org.vocabulary.join("\n"));
-  const candidates = splitDraft(draft);
+  const [error, setError] = useState<string | null>(null);
+  const terms = storedTerms(org.vocabulary);
+  // A stored term may hold a comma ("Smith, John"), so only lines split.
+  const candidates = draft
+    .split("\n")
+    .map((t) => t.trim())
+    .filter((t) => t.length >= MIN_TERM_LENGTH);
   const full = terms.length >= VOCABULARY_LIMIT;
 
   async function edit(add: string[], remove: string[]) {
@@ -213,6 +208,7 @@ function OrgTermsEditor({
       if (add.length > 0) setDraft("");
     } catch (e) {
       setError(String(e));
+      onEdited();
     } finally {
       setBusy(false);
     }

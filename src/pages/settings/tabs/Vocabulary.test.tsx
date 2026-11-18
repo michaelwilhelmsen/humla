@@ -113,6 +113,7 @@ describe("VocabularySection for an organisation admin", () => {
     mockTauri({
       org_status: () => status,
       org_admin_orgs: () => [{ id: "o1", name: "Northwind", require_2fa: false }],
+      org_admin_content: () => ({ templates: [], vocabulary: ["Northwind", "Fjord"] }),
       org_vocabulary_edit: edited,
     });
     const update = renderWith("Tauri");
@@ -123,7 +124,7 @@ describe("VocabularySection for an organisation admin", () => {
     await userEvent.click(screen.getByRole("button", { name: "Remove Fjord from Northwind" }));
     expect(edited).toHaveBeenCalledWith({ orgId: "o1", add: [], remove: ["Fjord"] });
 
-    await userEvent.type(screen.getByLabelText("Add a term for Northwind"), "IPLOS, AI{Enter}");
+    await userEvent.type(screen.getByLabelText("Add a term for Northwind"), "IPLOS{Enter}");
     expect(edited).toHaveBeenCalledWith({ orgId: "o1", add: ["IPLOS"], remove: [] });
     expect(screen.getByLabelText("Add a term for Northwind")).toHaveValue("");
     expect(update).not.toHaveBeenCalled();
@@ -134,6 +135,7 @@ describe("VocabularySection for an organisation admin", () => {
     mockTauri({
       org_status: () => status,
       org_admin_orgs: () => [{ id: "o1", name: "Northwind", require_2fa: false }],
+      org_admin_content: () => ({ templates: [], vocabulary: ["Northwind", "Fjord"] }),
       org_vocabulary_edit: () => {
         throw "Only Northwind's admins can change this.";
       },
@@ -142,6 +144,24 @@ describe("VocabularySection for an organisation admin", () => {
     await userEvent.type(await screen.findByLabelText("Add a term for Northwind"), "IPLOS{Enter}");
     expect(await screen.findByRole("alert")).toHaveTextContent("Only Northwind's admins can change this.");
     expect(screen.getByLabelText("Add a term for Northwind")).toHaveValue("IPLOS");
+  });
+
+  it("keeps a stored term with a comma whole", async () => {
+    signedIn();
+    const edited = vi.fn(() => null);
+    mockTauri({
+      org_status: () => status,
+      org_admin_orgs: () => [{ id: "o1", name: "Northwind", require_2fa: false }],
+      org_admin_content: () => ({ templates: [], vocabulary: ["Smith, John", "Fjord"] }),
+      org_vocabulary_edit: edited,
+    });
+    renderWith("");
+    const list = await screen.findByRole("list", { name: "Northwind terms" });
+    expect(within(list).getAllByRole("listitem").map((li) => li.textContent)).toEqual(["Smith, John", "Fjord"]);
+    await userEvent.click(screen.getByRole("button", { name: "Remove Smith, John from Northwind" }));
+    expect(edited).toHaveBeenCalledWith({ orgId: "o1", add: [], remove: ["Smith, John"] });
+    await userEvent.type(screen.getByLabelText("Add a term for Northwind"), "Hansen, Kari{Enter}");
+    expect(edited).toHaveBeenCalledWith({ orgId: "o1", add: ["Hansen, Kari"], remove: [] });
   });
 
   it("keeps a member's terms locked", async () => {
