@@ -62,7 +62,9 @@ fn chat_api_key(state: &State<AppState>) -> Option<String> {
 }
 
 /// The chat provider in force and the policy that allowed it. Refuses an unknown
-/// id and one the organisation policy doesn't allow.
+/// id and one the policy doesn't allow. Local chat reads Personal notes only, so
+/// it is held to the Personal policy; a note from a department is checked on its
+/// own where it enters a turn or the embedder.
 fn chat_provider_id(
     conn: &rusqlite::Connection,
 ) -> anyhow::Result<(ProviderId, crate::org_policy::EffectivePolicy)> {
@@ -73,7 +75,7 @@ fn chat_provider_id(
     let id = ProviderId::parse(&provider)
         .filter(|p| p.capabilities().chat)
         .ok_or_else(|| anyhow::anyhow!("unknown chat provider “{provider}” — pick one in Settings → Chat."))?;
-    let policy = super::check_llm_endpoint(conn, id)?;
+    let policy = super::check_llm_endpoint(conn, None, id)?;
     Ok((id, policy))
 }
 
@@ -84,10 +86,14 @@ fn chat_provider_id(
 pub(crate) async fn embed_note(
     db: &Arc<Mutex<Connection>>,
     adapter: &dyn EmbeddingAdapter,
+    to: EmbedTarget<'_>,
     note_id: &str,
 ) {
     let need = {
         let conn = db.lock();
+        if !may_embed(&conn, note_id, to) {
+            return;
+        }
         db::note_texts_needing_embedding(&conn, note_id, adapter.model_id()).unwrap_or_default()
     };
     if need.is_empty() {
@@ -110,6 +116,24 @@ pub(crate) async fn embed_note(
     }
 }
 
+/// Where an embedder sends note text.
+#[derive(Clone, Copy)]
+pub(crate) struct EmbedTarget<'a> {
+    provider: ProviderId,
+    base_url: &'a str,
+}
+
+impl<'a> EmbedTarget<'a> {
+    fn of(resolved: &ResolvedChat, cfg: &'a embed::EmbedConfig) -> Self {
+        Self { provider: resolved.provider, base_url: &cfg.base_url }
+    }
+}
+
+/// Whether the policy for a note's workspace lets its text go to the embedder.
+fn may_embed(conn: &Connection, note_id: &str, to: EmbedTarget<'_>) -> bool {
+    crate::org_policy::effective_for_note(conn, note_id).allows(to.provider, Some(to.base_url))
+}
+
 /// Resolve the embedding provider and embed a Note off the request path
 /// (content-settled checkpoint). Spawned fire-and-forget after a re-chunk so
 /// editing never blocks on embedding. No-op if no provider is configured.
@@ -123,7 +147,7 @@ pub async fn embed_note_bg(app: AppHandle, note_id: String) {
     let Ok(resolved) = resolved else { return };
     let Some(cfg) = resolve_embed(&resolved) else { return };
     let adapter = cfg.adapter();
-    embed_note(&state.db, &adapter, &note_id).await;
+    embed_note(&state.db, &adapter, EmbedTarget::of(&resolved, &cfg), &note_id).await;
 }
 
 /// Rebuild one Note's retrieval chunks from its current content. The single
@@ -172,16 +196,17 @@ pub async fn embed_backfill(app: AppHandle) {
     let Ok(resolved) = resolved else { return };
     let Some(cfg) = resolve_embed(&resolved) else { return };
     let adapter = cfg.adapter();
+    let to = EmbedTarget::of(&resolved, &cfg);
     let ids = {
         let conn = state.db.lock();
-        db::note_ids_needing_embedding(&conn, adapter.model_id()).unwrap_or_default()
+        notes_to_embed(&conn, adapter.model_id(), to).unwrap_or_default()
     };
     if ids.is_empty() {
         return;
     }
     eprintln!("[chat] embedding backfill: {} note(s) under {}", ids.len(), adapter.model_id());
     for id in ids {
-        embed_note(&state.db, &adapter, &id).await;
+        embed_note(&state.db, &adapter, to, &id).await;
     }
     eprintln!("[chat] embedding backfill complete");
 }
@@ -199,7 +224,13 @@ pub fn chat_unembedded_note_count(state: State<AppState>) -> Result<usize, Strin
     let conn = state.db.lock();
     let Ok(resolved) = resolve_chat(&conn, key) else { return Ok(0) };
     let Some(cfg) = resolve_embed(&resolved) else { return Ok(0) };
-    db::note_ids_needing_embedding(&conn, &cfg.model).map(|ids| ids.len()).map_err(super::err)
+    notes_to_embed(&conn, &cfg.model, EmbedTarget::of(&resolved, &cfg)).map(|ids| ids.len()).map_err(super::err)
+}
+
+/// The notes missing vectors under `model` that the policy lets go to `to`.
+fn notes_to_embed(conn: &Connection, model: &str, to: EmbedTarget<'_>) -> anyhow::Result<Vec<String>> {
+    let ids = db::note_ids_needing_embedding(conn, model)?;
+    Ok(ids.into_iter().filter(|id| may_embed(conn, id, to)).collect())
 }
 
 /// Embed what `chat_unembedded_note_count` counts, without waiting for the next
@@ -213,7 +244,7 @@ pub async fn chat_embed_missing(app: AppHandle) -> Result<usize, String> {
         let conn = state.db.lock();
         let Ok(resolved) = resolve_chat(&conn, key) else { return Ok(0) };
         let Some(cfg) = resolve_embed(&resolved) else { return Ok(0) };
-        db::note_ids_needing_embedding(&conn, &cfg.model).map_err(super::err)?.len()
+        notes_to_embed(&conn, &cfg.model, EmbedTarget::of(&resolved, &cfg)).map_err(super::err)?.len()
     };
     embed_backfill(app).await;
     Ok(before)
@@ -376,6 +407,15 @@ fn anchor_note(
     match target.note_id() {
         Some(id) => db::get_note(conn, id).map(Some).map_err(|e| e.to_string()),
         None => Ok(None),
+    }
+}
+
+/// Refuse a workspace turn anchored on a note whose own workspace keeps its
+/// content on this Mac.
+fn refuse_governed_anchor(conn: &rusqlite::Connection, note: Option<&db::Note>) -> Result<(), String> {
+    match note {
+        Some(n) => crate::org_policy::check_leaves_mac(conn, Some(&n.workspace_id)).map_err(|e| e.to_string()),
+        None => Ok(()),
     }
 }
 
@@ -1892,6 +1932,10 @@ pub async fn chat_send(
         // tenant is Personal and there's no workspace to scope tools to.
         let workspace = String::new();
         let resolved = resolve_chat(&conn, chat_key).map_err(|e| e.to_string())?;
+        if let Some(note) = note.as_ref() {
+            crate::org_policy::check_endpoint(&conn, Some(&note.workspace_id), resolved.provider, Some(&resolved.base_url))
+                .map_err(|e| e.to_string())?;
+        }
         // Resolve the target session (issue #61): an explicit id, else the
         // active/most-recent one, lazily creating the target's first session on
         // the first send. Breadth is a persisted live filter within it.
@@ -1936,9 +1980,10 @@ pub async fn chat_send(
     // for the note the user is chatting about on the very first question. Other
     // notes are embedded at their own checkpoints (issue #48) — so a library-wide
     // turn has nothing to pre-embed and skips straight to the loop.
-    let embedder = resolve_embed(&resolved).map(|cfg| cfg.adapter());
-    if let (Some(embedder), Some(anchor)) = (embedder.as_ref(), target.note_id()) {
-        embed_note(&state.db, embedder, anchor).await;
+    let embed_cfg = resolve_embed(&resolved);
+    let embedder = embed_cfg.as_ref().map(|cfg| cfg.adapter());
+    if let (Some(cfg), Some(embedder), Some(anchor)) = (embed_cfg.as_ref(), embedder.as_ref(), target.note_id()) {
+        embed_note(&state.db, embedder, EmbedTarget::of(&resolved, cfg), anchor).await;
     }
 
     let adapter: Box<dyn chat::ChatAdapter> = if resolved.provider == ProviderId::Copilot {
@@ -2071,8 +2116,6 @@ async fn chat_send_cloud(
     draft: DraftSettings,
 ) -> Result<ChatSendResult, String> {
     let state: State<AppState> = app.state();
-    // Workspace chat runs on the server's cloud AI.
-    crate::org_policy::check_leaves_mac(&state.db.lock()).map_err(|e| e.to_string())?;
     let (
         workspace,
         folder_id,
@@ -2088,7 +2131,11 @@ async fn chat_send_cloud(
         let Some(workspace) = ctx.workspace() else {
             return Err("No workspace selected — switch to a workspace to use Team chat.".into());
         };
+        // Workspace chat runs on the server's cloud AI, and the anchor note's
+        // title goes with the turn, whichever workspace that note is in.
+        crate::org_policy::check_leaves_mac(&conn, Some(workspace)).map_err(|e| e.to_string())?;
         let note = anchor_note(&conn, &target)?;
+        refuse_governed_anchor(&conn, note.as_ref())?;
         // Resolve the target workspace-handle session (issue #61): an explicit
         // id, else the active/most-recent handle, lazily creating one (remote_id
         // filled from the server's response below) on the first turn.
@@ -3189,14 +3236,16 @@ mod tests {
     }
 
     #[test]
-    fn local_only_refuses_cloud_chat() {
+    fn a_managed_local_only_refuses_cloud_chat() {
+        use crate::org_policy::{force_for_test, reload_managed, ManagedValue, MANAGED_SOURCE};
         let dir = tempfile::tempdir().unwrap();
         let conn = db::open(&dir.path().join("t.sqlite")).unwrap();
-        crate::org_policy::cache_local_only(&conn, "Northwind");
+        force_for_test(&[("local_only", ManagedValue::Bool(true))]);
+        reload_managed();
         for id in ["openai", "anthropic", "copilot"] {
             db::set_setting(&conn, "chat_provider", id).unwrap();
             let err = resolve_chat(&conn, Some("k".into())).err().unwrap().to_string();
-            assert_eq!(err, "Blocked by Northwind: processing stays on this Mac.", "{id}");
+            assert_eq!(err, format!("Blocked by {MANAGED_SOURCE}: processing stays on this Mac."), "{id}");
             assert!(chat_provider_id(&conn).is_err(), "no Keychain slot opens for {id}");
         }
         db::set_setting(&conn, "chat_provider", "custom").unwrap();
@@ -3205,13 +3254,53 @@ mod tests {
         assert!(resolve_chat(&conn, None).is_err());
         db::set_setting(&conn, "custom_base_url", "http://localhost:1234/v1").unwrap();
         assert!(resolve_chat(&conn, None).is_ok());
+        force_for_test(&[]);
+        reload_managed();
+    }
+
+    #[test]
+    fn a_workspace_turn_refuses_an_anchor_from_a_governed_department() {
+        use crate::org_policy::{cache_local_only, note_in, TEST_ORG_WORKSPACE};
+        let dir = tempfile::tempdir().unwrap();
+        let conn = db::open(&dir.path().join("t.sqlite")).unwrap();
+        cache_local_only(&conn, "Northwind");
+        let governed = db::get_note(&conn, &note_in(&conn, TEST_ORG_WORKSPACE)).unwrap();
+        assert_eq!(
+            refuse_governed_anchor(&conn, Some(&governed)).unwrap_err(),
+            "Blocked by Northwind: processing stays on this Mac."
+        );
+        let other = db::get_note(&conn, &note_in(&conn, "w-other")).unwrap();
+        assert!(refuse_governed_anchor(&conn, Some(&other)).is_ok());
+        assert!(refuse_governed_anchor(&conn, None).is_ok());
+    }
+
+    /// Local chat reads Personal notes only, so an organisation's `local_only`
+    /// leaves it alone; its notes never reach a cloud embedder.
+    #[test]
+    fn an_organisations_local_only_keeps_only_its_notes_from_a_cloud_embedder() {
+        use crate::org_policy::{cache_local_only, note_in, TEST_ORG_WORKSPACE};
+        let dir = tempfile::tempdir().unwrap();
+        let conn = db::open(&dir.path().join("t.sqlite")).unwrap();
+        cache_local_only(&conn, "Northwind");
+        db::set_setting(&conn, "chat_provider", "openai").unwrap();
+        let resolved = resolve_chat(&conn, Some("sk-test".into())).unwrap();
+        let cfg = resolve_embed(&resolved).unwrap();
+        let to = EmbedTarget::of(&resolved, &cfg);
+        let governed = note_in(&conn, TEST_ORG_WORKSPACE);
+        assert!(!may_embed(&conn, &governed, to));
+        assert!(may_embed(&conn, &note_in(&conn, ""), to));
+        assert!(may_embed(&conn, &note_in(&conn, "w-other"), to));
+        let local = EmbedTarget { provider: ProviderId::Local, base_url: "http://localhost:11434/v1" };
+        assert!(may_embed(&conn, &governed, local));
     }
 
     #[test]
     fn local_only_keeps_chat_and_its_embedder_on_this_mac() {
+        use crate::org_policy::{force_for_test, reload_managed, ManagedValue};
         let dir = tempfile::tempdir().unwrap();
         let conn = db::open(&dir.path().join("t.sqlite")).unwrap();
-        crate::org_policy::cache_local_only(&conn, "Northwind");
+        force_for_test(&[("local_only", ManagedValue::Bool(true))]);
+        reload_managed();
         db::set_setting(&conn, "chat_provider", "ollama").unwrap();
         db::set_setting(&conn, "chat_model", "gemma4:12b-mlx").unwrap();
         assert!(resolve_embed(&resolve_chat(&conn, None).unwrap()).is_some());
@@ -3221,6 +3310,8 @@ mod tests {
         assert!(resolve_embed(&resolved).is_none());
         db::set_setting(&conn, "local_llm_base_url", "http://192.168.1.20:11434/v1").unwrap();
         assert!(resolve_chat(&conn, None).is_err());
+        force_for_test(&[]);
+        reload_managed();
     }
 
     #[test]

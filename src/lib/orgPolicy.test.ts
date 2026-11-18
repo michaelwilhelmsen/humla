@@ -11,6 +11,7 @@ import {
   isLoopbackUrl,
   localOnlySource,
   policySource,
+  policyGroups,
   policyRows,
   redateBounds,
   retentionDaysFor,
@@ -64,6 +65,34 @@ describe("policyRows", () => {
   it("says one day in the singular", () => {
     const policy = { ...NO_POLICY, retention_days: 1, rules: [rule("retention_days")] };
     expect(policyRows(policy)[0].value).toBe("Deleted after 1 day");
+  });
+});
+
+describe("policyGroups", () => {
+  const org = (id: string, name: string, audit_reads = false) => ({
+    id,
+    name,
+    reason: "",
+    vocabulary: [],
+    workspaces: [`w-${id}`],
+    audit_reads,
+  });
+
+  it("lists each organisation's rules with its departments, then the managed profile's", () => {
+    const groups = policyGroups({
+      orgs: [org("a", "Humla"), org("b", "Screenpartner", true), org("c", "Quiet")],
+      orgPolicies: [
+        { org_id: "a", workspaces: ["w-a"], policy: { ...NO_POLICY, local_only: true, rules: [rule("local_only", "Humla")] } },
+        { org_id: "b", workspaces: ["w-b"], policy: NO_POLICY },
+        { org_id: "c", workspaces: ["w-c"], policy: NO_POLICY },
+      ],
+      managed: { ...NO_POLICY, telemetry_off: true, rules: [rule("telemetry_off", MANAGED_SOURCE)] },
+    });
+    expect(groups.map((g) => [g.source, g.workspaces, g.rows.map((r) => r.label)])).toEqual([
+      ["Humla", ["w-a"], ["AI processing"]],
+      ["Screenpartner", ["w-b"], ["Opening notes"]],
+      [MANAGED_SOURCE, [], ["Send anonymous usage counters"]],
+    ]);
   });
 });
 

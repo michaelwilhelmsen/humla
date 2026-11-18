@@ -413,22 +413,43 @@ describe("Account section", () => {
   });
 
   describe("Policies", () => {
+    const NONE = {
+      org_name: null,
+      reason: null,
+      local_only: false,
+      retention_days: 0,
+      telemetry_off: false,
+      audio_forbidden: false,
+      rules: [],
+    };
+    const northwind = {
+      ...NONE,
+      org_name: "Northwind",
+      reason: "Nothing leaves this Mac.",
+      local_only: true,
+      retention_days: 30,
+      rules: [
+        { kind: "local_only", source: "Northwind", reason: "Nothing leaves this Mac." },
+        { kind: "retention_days", source: "Northwind", reason: "Nothing leaves this Mac." },
+      ],
+    };
+    const contoso = {
+      ...NONE,
+      org_name: "Contoso",
+      telemetry_off: true,
+      rules: [{ kind: "telemetry_off", source: "Contoso", reason: "" }],
+    };
+    const org = (id: string, name: string, workspaces: string[]) => ({ id, name, reason: "", vocabulary: [], workspaces });
     const enforced = {
-      policy: {
-        org_name: "Northwind",
-        reason: "Nothing leaves this Mac.",
-        local_only: true,
-        retention_days: 30,
-        telemetry_off: false,
-        audio_forbidden: false,
-        rules: [
-          { kind: "local_only", source: "Northwind", reason: "Nothing leaves this Mac." },
-          { kind: "retention_days", source: "Northwind", reason: "Nothing leaves this Mac." },
-        ],
-      },
+      policy: NONE,
+      orgs: [org("o1", "Northwind", ["w1"]), org("o2", "Contoso", ["w9"])],
+      org_policies: [
+        { org_id: "o1", workspaces: ["w1"], policy: northwind },
+        { org_id: "o2", workspaces: ["w9"], policy: contoso },
+      ],
     };
 
-    it("lists the policies in force, managed by their organisation", async () => {
+    it("lists each organisation's rules with the departments they apply to", async () => {
       renderApp("/settings?tab=account", {
         cloud_status: () => signedIn("member", false),
         cloud_workspace_members: () => MEMBERS,
@@ -436,14 +457,34 @@ describe("Account section", () => {
       });
       const dialog = await screen.findByRole("dialog", { name: /settings/i });
       expect(await within(dialog).findByRole("heading", { name: "Policies" })).toBeInTheDocument();
+      expect(within(dialog).getByText("Northwind · Acme")).toBeInTheDocument();
+      expect(within(dialog).getByText("Contoso")).toBeInTheDocument();
       expect(within(dialog).getByText("On this Mac only")).toBeInTheDocument();
       expect(within(dialog).getByText("Deleted after 30 days")).toBeInTheDocument();
+      expect(within(dialog).getByText("Send anonymous usage counters")).toBeInTheDocument();
 
       const badges = within(dialog).getAllByRole("button", { name: /managed by northwind/i });
       expect(badges).toHaveLength(2);
+      expect(within(dialog).getAllByRole("button", { name: /managed by contoso/i })).toHaveLength(1);
       await userEvent.click(badges[0]);
       expect(await screen.findByText("Nothing leaves this Mac.")).toBeInTheDocument();
       expect(screen.getByText(/only an administrator can change it/i)).toBeInTheDocument();
+    });
+
+    it("names an organisation's departments behind 2FA, never every workspace", async () => {
+      const lockedDept = { id: "wl", name: "Barnevern" };
+      renderApp("/settings?tab=account", {
+        cloud_status: () => ({ ...signedIn("member", false), locked_workspaces: [lockedDept] }),
+        cloud_workspace_members: () => MEMBERS,
+        org_status: () => ({
+          policy: NONE,
+          orgs: [org("o1", "Northwind", [])],
+          org_policies: [{ org_id: "o1", workspaces: ["wl"], policy: northwind }],
+        }),
+      });
+      const dialog = await screen.findByRole("dialog", { name: /settings/i });
+      expect(await within(dialog).findByText("Northwind · Barnevern")).toBeInTheDocument();
+      expect(within(dialog).queryByText(/Every workspace/)).toBeNull();
     });
 
     it("keeps them listed after sign-out", async () => {
@@ -455,23 +496,20 @@ describe("Account section", () => {
       expect(await within(dialog).findByText("On this Mac only")).toBeInTheDocument();
     });
 
-    it("names this Mac's configuration as the source of a managed rule", async () => {
+    it("names this Mac's configuration as the source of a rule for every workspace", async () => {
+      const managed = {
+        ...NONE,
+        org_name: "This Mac's configuration",
+        telemetry_off: true,
+        rules: [{ kind: "telemetry_off", source: "This Mac's configuration", reason: "" }],
+      };
       renderApp("/settings?tab=account", {
         cloud_status: () => signedOutConfigured(),
-        org_status: () => ({
-          policy: {
-            org_name: "This Mac's configuration",
-            reason: null,
-            local_only: false,
-            retention_days: 0,
-            telemetry_off: true,
-            audio_forbidden: false,
-            rules: [{ kind: "telemetry_off", source: "This Mac's configuration", reason: "" }],
-          },
-        }),
+        org_status: () => ({ policy: managed, managed }),
       });
       const dialog = await screen.findByRole("dialog", { name: /settings/i });
       expect(await within(dialog).findByText("Send anonymous usage counters")).toBeInTheDocument();
+      expect(within(dialog).getByText("This Mac's configuration · Every workspace")).toBeInTheDocument();
       expect(within(dialog).getByRole("button", { name: /managed by this mac's configuration/i })).toBeInTheDocument();
     });
 

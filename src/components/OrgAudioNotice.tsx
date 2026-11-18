@@ -57,7 +57,8 @@ export function OrgAudioNotice() {
       {due && (
         <div className="flex flex-col gap-4">
           <p className="text-sm leading-relaxed">
-            {due.org_name} doesn't allow stored audio. Audio on this Mac will be deleted.
+            {due.org_name} doesn't allow stored audio.{" "}
+            {due.all ? "Audio on this Mac will be deleted." : "Audio of its notes on this Mac will be deleted."}
           </p>
           {error && <p className="text-xs text-[var(--color-danger)]">{error}</p>}
           <div className="flex justify-end">

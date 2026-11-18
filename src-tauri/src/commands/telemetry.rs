@@ -92,7 +92,7 @@ pub fn telemetry_event(app: tauri::AppHandle, event: String) {
         (
             db::get_setting(&conn, "telemetry_enabled").ok().flatten(),
             db::get_setting(&conn, &sent_key(&event)).ok().flatten(),
-            crate::org_policy::effective_or_strictest(&conn).telemetry_off,
+            crate::org_policy::effective_device_or_strictest(&conn).telemetry_off,
         )
     };
     if !should_send(enabled, already, &event, policy_off) {
@@ -180,11 +180,23 @@ mod tests {
     fn without_a_policy_the_gates_are_unchanged() {
         let conn_dir = tempfile::tempdir().unwrap();
         let conn = db::open(&conn_dir.path().join("t.sqlite")).unwrap();
-        assert!(!crate::org_policy::effective_or_strictest(&conn).telemetry_off, "nothing cached");
+        let off = |conn: &rusqlite::Connection| crate::org_policy::effective_device_or_strictest(conn).telemetry_off;
+        assert!(!off(&conn), "nothing cached");
         let empty = crate::org_policy::classify(200, r#"{"orgs":[]}"#);
         crate::org_policy::store(&conn, &empty).unwrap();
-        assert!(!crate::org_policy::effective_or_strictest(&conn).telemetry_off, "in no organisation");
+        assert!(!off(&conn), "in no organisation");
         db::set_setting(&conn, crate::org_policy::SETTING_ORG_CONFIG, "{not json").unwrap();
-        assert!(crate::org_policy::effective_or_strictest(&conn).telemetry_off, "unreadable");
+        assert!(off(&conn), "unreadable");
+    }
+
+    #[test]
+    fn an_organisations_telemetry_off_applies_app_wide_and_nothing_else_does() {
+        let conn_dir = tempfile::tempdir().unwrap();
+        let conn = db::open(&conn_dir.path().join("t.sqlite")).unwrap();
+        let body = r#"{"orgs":[{"id":"o1","name":"Northwind","policy":{"local_only":true,"retention_days":0,"telemetry_off":true,"audio_forbidden":true},"workspaces":["w1"]}]}"#;
+        crate::org_policy::store(&conn, &crate::org_policy::classify(200, body)).unwrap();
+        let device = crate::org_policy::effective_device_or_strictest(&conn);
+        assert!(device.telemetry_off);
+        assert!(!device.local_only && !device.audio_forbidden, "note policies stay in their departments");
     }
 }

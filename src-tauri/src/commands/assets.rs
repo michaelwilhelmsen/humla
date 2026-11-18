@@ -148,15 +148,20 @@ pub fn stored_audio_stats(app: AppHandle) -> Result<crate::sessions::StoredAudio
 /// would pull the audio straight back down from the server.
 #[tauri::command]
 pub fn delete_stored_audio(app: AppHandle) -> Result<usize, String> {
+    delete_stored_audio_in(&app, |_| true)
+}
+
+/// [`delete_stored_audio`] for the notes `covers` accepts.
+pub(super) fn delete_stored_audio_in(app: &AppHandle, covers: impl Fn(&str) -> bool) -> Result<usize, String> {
     let app_dir = app.path().app_data_dir().map_err(err)?;
     let root = crate::sessions::recordings_root(&app_dir);
     let totals = crate::sessions::stored_audio_totals(&root);
     let mut removed = 0;
-    for note_id in &totals.note_ids {
+    for note_id in totals.note_ids.iter().filter(|id| covers(id)) {
         let n = crate::sessions::delete_stored_audio(&root.join(note_id));
         if n > 0 {
             removed += n;
-            super::note_changed_for_sync(&app, note_id);
+            super::note_changed_for_sync(app, note_id);
         }
     }
     Ok(removed)

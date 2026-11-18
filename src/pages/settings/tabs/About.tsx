@@ -8,7 +8,7 @@ import { Btn } from "../components/Btn";
 import { Row, Section } from "../components/Section";
 import { Toggle } from "../components/Toggle";
 import { ManagedRow } from "../ManagedRow";
-import { policySource, useOrgPolicy } from "../../../lib/orgPolicy";
+import { policySource, useDevicePolicy } from "../../../lib/orgPolicy";
 
 const REPO_URL = "https://github.com/michaelwilhelmsen/humla";
 
@@ -24,7 +24,7 @@ const REPO_URL = "https://github.com/michaelwilhelmsen/humla";
  *  turns it on. */
 function UsageCountersRow() {
   const [on, setOn] = useState<boolean | null>(null);
-  const managed = policySource(useOrgPolicy(), "telemetry_off");
+  const managed = policySource(useDevicePolicy(), "telemetry_off");
 
   useEffect(() => {
     let cancelled = false;

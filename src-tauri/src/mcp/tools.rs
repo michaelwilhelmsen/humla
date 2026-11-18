@@ -629,6 +629,9 @@ pub fn execute(
     args: &Value,
     now_ms: i64,
 ) -> Outcome {
+    if let Some(refusal) = super::workspace_refusal(conn, workspace) {
+        return Outcome::error(refusal);
+    }
     match name {
         TOOL_SEARCH => run_search(conn, workspace, args, now_ms),
         TOOL_GET => run_get(conn, workspace, args),
@@ -771,6 +774,9 @@ fn fetch_note(conn: &Connection, workspace: &str, note_id: &str) -> Result<db::N
         .map_err(|_| Outcome::error(format!("No note found with id \"{note_id}\".")))?;
     if note.workspace_id != workspace || note.deleted_at.is_some() {
         return Err(Outcome::error(format!("No note found with id \"{note_id}\".")));
+    }
+    if let Some(refusal) = super::workspace_refusal(conn, &note.workspace_id) {
+        return Err(Outcome::error(refusal));
     }
     Ok(note)
 }

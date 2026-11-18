@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { save } from "@tauri-apps/plugin-dialog";
 import { ipc, type AudioFormat, type Note, type TakeAudio } from "../lib/ipc";
 import { useRecordingStore } from "../lib/store";
-import { useOrgPolicy } from "../lib/orgPolicy";
+import { useNoteOrgPolicy } from "../lib/orgPolicy";
 import { formatDurationWords, sessionTitle } from "../lib/sessions";
 import { slug } from "./ExportModal";
 import { Modal } from "./settings/components/Modal";
@@ -64,7 +64,7 @@ export function SaveAudioModal({
   keepAudio: boolean;
 }) {
   const pushError = useRecordingStore((s) => s.pushError);
-  const audioForbidden = useOrgPolicy().audio_forbidden;
+  const audioForbidden = useNoteOrgPolicy(note.workspace_id).policy.audio_forbidden;
   const [takes, setTakes] = useState<TakeAudio[] | null>(null);
   const [format, setFormat] = useState<AudioFormat>("m4a");
   const [busy, setBusy] = useState(false);

@@ -36,8 +36,8 @@ pub(super) async fn transcribe_chunk(
         let conn = state.db.lock();
         let global_language = db::get_setting(&conn, "language")?
             .unwrap_or_else(|| DEFAULT_LANGUAGE.to_string());
-        let note_language = db::get_note(&conn, &note_id)
-            .map(|n| n.language)
+        let (note_language, workspace) = db::get_note(&conn, &note_id)
+            .map(|n| (n.language, n.workspace_id))
             .unwrap_or_default();
         let language = if note_language.trim().is_empty() {
             global_language
@@ -46,17 +46,16 @@ pub(super) async fn transcribe_chunk(
         };
         let vocabulary = db::get_setting(&conn, "custom_vocabulary")?
             .unwrap_or_default();
-        (language, vocabulary, crate::org_policy::vocabulary(&conn))
+        (language, vocabulary, crate::org_policy::vocabulary_for(&conn, Some(&workspace)))
     };
     let provider_cfg = {
         let state: State<AppState> = app.state();
-        read_transcribe_config(&state)?.resolve(&language).clone()
-    };
-    {
-        let state: State<AppState> = app.state();
+        let cfg = read_transcribe_config(&state)?;
         let conn = state.db.lock();
-        super::transcription_config::check(&conn, &provider_cfg)?;
-    }
+        let (provider_cfg, _) = super::transcription_config::resolve_for_note(&conn, &cfg, &note_id, &language);
+        super::transcription_config::check(&conn, &note_id, &provider_cfg)?;
+        provider_cfg
+    };
     // Each provider's key has its own Keychain slot; a custom endpoint may
     // take no key at all.
     let api_key = match provider_cfg.provider() {

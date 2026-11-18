@@ -438,7 +438,7 @@ pub async fn recording_start(
     // this note to Deepgram keeps its live transcript while a Norwegian note on
     // local Whisper defers.
     let sink_mode = if matches!(provider_cfg, crate::stt::ProviderConfig::Local(_))
-        && deferred_transcription_enabled(&app)
+        && deferred_transcription_enabled(&app, &note_id)
     {
         SinkMode::Deferred
     } else {
@@ -1115,7 +1115,7 @@ async fn post_stop_chain_inner(
     // multi-take note recorded with keep_audio off simply can't be unified.)
     // One gate decision for the whole chain, so retention and the deferred
     // branch below can't disagree.
-    let keep_audio = keep_audio_enabled(&app);
+    let keep_audio = keep_audio_enabled(&app, &note_id);
     let t_keep = std::time::Instant::now();
     maybe_keep_audio(&app, &note_id, &post_stop, &progress, keep_audio).await;
     clock.record(|t| t.keep_audio_ms = ms_since(t_keep));
@@ -1337,13 +1337,20 @@ pub(super) async fn ensure_provider_ready(
     state: &State<'_, AppState>,
     note_id: &str,
 ) -> Result<crate::stt::ProviderConfig, String> {
-    check_provider_ready(app, state, note_id).await.map_err(|e| match e {
+    let (cfg, kept_by) = check_provider_ready(app, state, note_id).await.map_err(|e| match e {
         NotReady::Missing(msg) => {
             emit_error(app, Some(note_id), &msg);
             msg
         }
         NotReady::Failed(msg) => msg,
-    })
+    })?;
+    if let Some(source) = kept_by {
+        let _ = app.emit(
+            "transcription_kept_local",
+            serde_json::json!({ "noteId": note_id, "source": source }),
+        );
+    }
+    Ok(cfg)
 }
 
 /// Why the provider can't run: a missing key, model or URL the user can fix,
@@ -1367,12 +1374,13 @@ impl NotReady {
     }
 }
 
-/// [`ensure_provider_ready`] without the toast.
+/// [`ensure_provider_ready`] without the toast. Also names who keeps this note's
+/// transcription on this Mac, when that changed the provider.
 pub(super) async fn check_provider_ready(
     app: &AppHandle,
     state: &State<'_, AppState>,
     note_id: &str,
-) -> Result<crate::stt::ProviderConfig, NotReady> {
+) -> Result<(crate::stt::ProviderConfig, Option<String>), NotReady> {
     // Resolve the per-language override (if any) up front: both the prereq
     // check and the prewarm use the resolved provider — otherwise a user with a
     // Norwegian override (Local) and an English default (Deepgram) would prewarm
@@ -1388,11 +1396,12 @@ pub(super) async fn check_provider_ready(
             .unwrap_or_default();
         if note_lang.trim().is_empty() { global } else { note_lang }
     };
-    let provider_cfg = transcribe_cfg.resolve(&language).clone();
-    {
+    let (provider_cfg, kept_by) = {
         let conn = state.db.lock();
-        super::transcription_config::check(&conn, &provider_cfg).map_err(err)?;
-    }
+        let resolved = super::transcription_config::resolve_for_note(&conn, &transcribe_cfg, note_id, &language);
+        super::transcription_config::check(&conn, note_id, &resolved.0).map_err(err)?;
+        resolved
+    };
     // Each cloud provider has its own Keychain slot. Look up the right one so
     // the check doesn't pass when (e.g.) the user picked Deepgram but only saved
     // an OpenAI key.
@@ -1450,7 +1459,7 @@ pub(super) async fn check_provider_ready(
             });
         }
     }
-    Ok(provider_cfg)
+    Ok((provider_cfg, kept_by))
 }
 
 /// Handle one decoded sidecar event during a live capture, an import, or a

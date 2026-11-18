@@ -14,9 +14,18 @@ use crate::{db, AppState};
 
 #[derive(Serialize)]
 pub struct OrgStatus {
+    /// The policies for notes in the workspace asked about.
     pub policy: EffectivePolicy,
+    /// What applies app-wide (`org_policy::effective_device`).
+    pub device: EffectivePolicy,
+    /// The managed configuration profile alone.
+    pub managed: EffectivePolicy,
     /// The organisations whose templates and terms apply here.
     pub orgs: Vec<OrgSummary>,
+    /// Each organisation's own policies and departments.
+    pub org_policies: Vec<org_policy::OrgPolicies>,
+    /// The organisation whose policies govern notes in each department.
+    pub governed: BTreeMap<String, String>,
     /// Days of retention per workspace (`org_policy::retention_scope`).
     pub retention: BTreeMap<String, u32>,
     /// Each organisation workspace, with whether opening a note there is
@@ -24,14 +33,27 @@ pub struct OrgStatus {
     pub audit: BTreeMap<String, bool>,
 }
 
+/// The policies as Settings and a note show them: for notes in `workspace_id`
+/// (Personal when absent), and what applies app-wide.
 #[tauri::command]
-pub fn org_status(state: State<'_, AppState>) -> Result<OrgStatus, String> {
+pub fn org_status(state: State<'_, AppState>, workspace_id: Option<String>) -> Result<OrgStatus, String> {
     let conn = state.db.lock();
-    let policy = org_policy::effective(&conn).map_err(|e| format!("organisation policy: {e}"))?;
-    let config = org_policy::cached(&conn).map_err(|e| format!("organisation policy: {e}"))?;
+    let unreadable = |e: anyhow::Error| format!("organisation policy: {e}");
+    let policy = org_policy::effective_for(&conn, workspace_id.as_deref()).map_err(unreadable)?;
+    let device = org_policy::effective_device(&conn).map_err(unreadable)?;
+    let config = org_policy::cached(&conn).map_err(unreadable)?;
     let retention = config.as_ref().map(org_policy::retention_scope).unwrap_or_default();
     let audit = config.as_ref().map(crate::org_audit::scope).unwrap_or_default();
-    Ok(OrgStatus { policy, orgs: org_policy::summaries(config.as_ref()), retention, audit })
+    Ok(OrgStatus {
+        policy,
+        device,
+        managed: org_policy::effective_managed(),
+        orgs: org_policy::summaries(config.as_ref()),
+        org_policies: org_policy::org_policies(config.as_ref()),
+        governed: org_policy::governed_workspaces(config.as_ref()),
+        retention,
+        audit,
+    })
 }
 
 /// A note was opened in the app: queued for its organisation's audit log under
@@ -61,19 +83,24 @@ pub fn org_audio_notice(state: State<'_, AppState>) -> Option<AudioSweep> {
     org_policy::audio_sweep_due(&state.db.lock())
 }
 
-/// Delete every note's stored audio for `org_id`'s `audio_forbidden` and record
-/// that it ran. Refused unless that organisation's sweep is due right now.
+/// Delete the stored audio `org_id`'s `audio_forbidden` covers (notes in its
+/// departments, or every note for a managed profile) and record that it ran.
+/// Refused unless that sweep is due right now.
 #[tauri::command]
 pub fn org_audio_sweep(app: tauri::AppHandle, state: State<'_, AppState>, org_id: String) -> Result<usize, String> {
-    authorise_audio_sweep(&state.db.lock(), &org_id)?;
-    let removed = super::delete_stored_audio(app)?;
-    org_policy::record_audio_sweep(&state.db.lock(), &org_id).map_err(|e| format!("organisation policy: {e}"))?;
+    let due = authorise_audio_sweep(&state.db.lock(), &org_id)?;
+    let scope = org_policy::sweep_scope(&due);
+    let removed = super::assets::delete_stored_audio_in(&app, |note_id| {
+        let workspace = db::get_note(&state.db.lock(), note_id).map(|n| n.workspace_id);
+        workspace.is_ok_and(|ws| scope.covers(&ws))
+    })?;
+    org_policy::record_audio_sweep(&state.db.lock(), &due).map_err(|e| format!("organisation policy: {e}"))?;
     Ok(removed)
 }
 
-fn authorise_audio_sweep(conn: &rusqlite::Connection, org_id: &str) -> Result<(), String> {
+fn authorise_audio_sweep(conn: &rusqlite::Connection, org_id: &str) -> Result<AudioSweep, String> {
     match org_policy::audio_sweep_due(conn) {
-        Some(due) if due.org_id == org_id => Ok(()),
+        Some(due) if due.org_id == org_id => Ok(due),
         _ => Err("No organisation asks for stored audio to be deleted.".into()),
     }
 }
@@ -180,7 +207,7 @@ pub(crate) async fn refresh_org_config(
 /// Cache a fetch and move settings the policy refuses to their enforced values. Never clears the cache on
 /// anything but an authenticated answer (`org_policy::store`).
 pub(crate) fn apply_fetch(conn: &rusqlite::Connection, outcome: &FetchOutcome) -> Changes {
-    let before = org_policy::effective(conn).ok();
+    let before = policies_in_force(conn);
     let retention_before = org_policy::retention_in_force(conn);
     let orgs_before = org_policy::cached(conn).ok().map(|c| org_policy::summaries(c.as_ref()));
     let audit_before = crate::org_audit::scope_in_force(conn);
@@ -192,7 +219,7 @@ pub(crate) fn apply_fetch(conn: &rusqlite::Connection, outcome: &FetchOutcome) -
             release_audit_queue(conn);
         }
     }
-    let after = org_policy::effective(conn).ok();
+    let after = policies_in_force(conn);
     let orgs_after = org_policy::cached(conn).ok().map(|c| org_policy::summaries(c.as_ref()));
     let templates = match (outcome, stored) {
         (FetchOutcome::Fetched(config), Ok(_)) => org_policy::apply_templates(conn, config).unwrap_or_else(|e| {
@@ -208,6 +235,15 @@ pub(crate) fn apply_fetch(conn: &rusqlite::Connection, outcome: &FetchOutcome) -
         content: templates || orgs_before != orgs_after,
         retention: retention_before != org_policy::retention_in_force(conn),
     }
+}
+
+/// Every policy any note or the app is under, to tell whether a fetch changed
+/// one. `None` when the cache can't be read.
+fn policies_in_force(conn: &rusqlite::Connection) -> Option<(EffectivePolicy, Vec<org_policy::OrgPolicies>)> {
+    let device = org_policy::effective_device(conn).ok()?;
+    let config = org_policy::cached(conn).ok()?;
+    let orgs = org_policy::org_policies(config.as_ref()).into_iter().filter(|o| !o.policy.rules.is_empty());
+    Some((device, orgs.collect()))
 }
 
 /// An authenticated answer listing no organisation: the user left, or was
@@ -329,15 +365,17 @@ pub(crate) async fn route_answered() {
     ROUTE_ANSWERED.notified().await;
 }
 
-/// Under `local_only`, move each setting the policy refuses to its enforced
-/// value, so Settings shows what actually runs and keeps it when the policy is
-/// lifted: summaries and chat to the local server, refused transcription slots
-/// to on-device Whisper, the MCP switch off. A local server at a non-loopback
-/// URL is left for the user to point at this Mac; the call-time checks refuse it
+/// Under a managed profile's `local_only`, move each setting the policy
+/// refuses to its enforced value, so Settings shows what actually runs and
+/// keeps it when the policy is lifted: summaries and chat to the local server,
+/// refused transcription slots to on-device Whisper, the MCP switch off. An
+/// organisation's `local_only` rewrites nothing: the settings are also what
+/// Personal and other workspaces use. A local server at a non-loopback URL is
+/// left for the user to point at this Mac; the call-time checks refuse it
 /// meanwhile. Returns whether anything was written.
 pub(crate) fn apply_local_only(conn: &rusqlite::Connection) -> anyhow::Result<bool> {
     use crate::providers::ProviderId;
-    let policy = org_policy::effective(conn)?;
+    let policy = org_policy::effective_managed();
     if !policy.local_only {
         return Ok(false);
     }
@@ -347,7 +385,7 @@ pub(crate) fn apply_local_only(conn: &rusqlite::Connection) -> anyhow::Result<bo
         let id = ProviderId::parse(stored.as_deref().unwrap_or("openai"));
         let allowed = match id {
             Some(ProviderId::Local) => true,
-            Some(id) => super::check_llm_endpoint(conn, id).is_ok(),
+            Some(id) => super::check_llm_endpoint(conn, None, id).is_ok(),
             None => false,
         };
         if !allowed {
@@ -372,13 +410,16 @@ pub(crate) fn apply_local_only(conn: &rusqlite::Connection) -> anyhow::Result<bo
     Ok(wrote)
 }
 
-/// Under `audio_forbidden`, turn `keep_audio` off; under `telemetry_off`, turn
-/// `telemetry_enabled` off. Only an explicit "true" is rewritten: unset already
+/// Under a managed profile's `audio_forbidden`, turn `keep_audio` off; under
+/// `telemetry_off` from anywhere, turn `telemetry_enabled` off. An
+/// organisation's `audio_forbidden` leaves the setting alone, since it is also
+/// what Personal uses. Only an explicit "true" is rewritten: unset already
 /// means off for both. Returns whether anything was written.
 pub(crate) fn apply_device_policies(conn: &rusqlite::Connection) -> anyhow::Result<bool> {
-    let policy = org_policy::effective(conn)?;
+    let audio_forbidden = org_policy::effective_managed().audio_forbidden;
+    let telemetry_off = org_policy::effective_device(conn)?.telemetry_off;
     let mut wrote = false;
-    for (on, key) in [(policy.audio_forbidden, "keep_audio"), (policy.telemetry_off, "telemetry_enabled")] {
+    for (on, key) in [(audio_forbidden, "keep_audio"), (telemetry_off, "telemetry_enabled")] {
         if on && db::get_setting(conn, key)?.as_deref() == Some("true") {
             db::set_setting(conn, key, "false")?;
             wrote = true;
@@ -483,8 +524,12 @@ pub(crate) fn refuse_past_retention(conn: &rusqlite::Connection, note_id: &str, 
     Ok(())
 }
 
-/// Refuse to move a note into a workspace whose retention it is already past:
-/// the server would refuse it and the sweep would purge the only copy.
+/// Refuse to move a note out of a department whose organisation governs its
+/// notes (`org_policy::governs_notes`), so a note can't leave its rules by
+/// changing workspace; moving between that organisation's own departments is
+/// fine. A cache that can't be read refuses any move out of a workspace. Then
+/// refuse a move into a workspace whose retention the note is already past: the
+/// server would refuse it and the sweep would purge the only copy.
 pub(crate) fn check_move(
     conn: &rusqlite::Connection,
     note: &db::Note,
@@ -492,6 +537,20 @@ pub(crate) fn check_move(
     to_name: Option<&str>,
     now_ms: i64,
 ) -> Result<(), String> {
+    if !note.workspace_id.trim().is_empty() && note.workspace_id.trim() != to.trim() {
+        let leaving = |source: &str| Err(format!("Blocked by {source}: its notes can't move out of its departments."));
+        match org_policy::cached(conn) {
+            Err(_) => return leaving("your organisation"),
+            Ok(None) => {}
+            Ok(Some(config)) => {
+                let staying: Vec<&str> = org_policy::orgs_for(&config, Some(to)).iter().map(|o| o.id.as_str()).collect();
+                let from = org_policy::orgs_for(&config, Some(&note.workspace_id));
+                if let Some(org) = from.iter().find(|o| org_policy::governs_notes(&o.policy) && !staying.contains(&o.id.as_str())) {
+                    return leaving(&org.name);
+                }
+            }
+        }
+    }
     let Some(rule) = org_policy::retention_rule(conn, to) else { return Ok(()) };
     if org_policy::is_past(note.created_at, org_policy::retention_cutoff(now_ms, rule.days)) {
         let name = to_name.map(str::trim).filter(|n| !n.is_empty()).unwrap_or("this workspace");
@@ -663,14 +722,17 @@ mod tests {
     }
 
     #[test]
-    fn local_only_arriving_reports_both_changes() {
+    fn an_organisations_local_only_arriving_rewrites_no_setting() {
         let (_d, conn) = conn();
         db::set_setting(&conn, "summary_provider", "anthropic").unwrap();
-        let body = r#"{"orgs":[{"id":"o1","name":"Northwind","policy":{"local_only":true,"retention_days":0,"telemetry_off":false,"audio_forbidden":false}}]}"#;
+        db::set_setting(&conn, crate::mcp::SETTING_ENABLED, "true").unwrap();
+        let body = r#"{"orgs":[{"id":"o1","name":"Northwind","policy":{"local_only":true,"retention_days":0,"telemetry_off":false,"audio_forbidden":false},"workspaces":["w1"]}]}"#;
         assert_eq!(
             apply_fetch(&conn, &org_policy::classify(200, body)),
-            Changes { policy: true, settings: true, content: true, retention: false }
+            Changes { policy: true, settings: false, content: true, retention: false }
         );
+        assert_eq!(db::get_setting(&conn, "summary_provider").unwrap().as_deref(), Some("anthropic"));
+        assert_eq!(db::get_setting(&conn, crate::mcp::SETTING_ENABLED).unwrap().as_deref(), Some("true"));
     }
 
     #[test]
@@ -685,7 +747,7 @@ mod tests {
             FetchOutcome::TwoFactorRequired,
         ] {
             assert_eq!(apply_fetch(&conn, &outcome), Changes::default(), "{outcome:?}");
-            assert!(org_policy::effective(&conn).unwrap().local_only, "{outcome:?}");
+            assert!(org_policy::effective_for(&conn, Some(org_policy::TEST_ORG_WORKSPACE)).unwrap().local_only, "{outcome:?}");
         }
     }
 
@@ -738,8 +800,14 @@ mod tests {
         assert_eq!(db::get_setting(&conn, "summary_provider").unwrap().as_deref(), Some("anthropic"));
     }
 
+    fn force_local_only(on: bool) {
+        let pairs = if on { vec![("local_only", org_policy::ManagedValue::Bool(true))] } else { vec![] };
+        org_policy::force_for_test(&pairs);
+        org_policy::reload_managed();
+    }
+
     #[test]
-    fn local_only_moves_refused_settings_to_their_enforced_values() {
+    fn a_managed_local_only_moves_refused_settings_to_their_enforced_values() {
         let (_d, conn) = conn();
         db::set_setting(&conn, "summary_provider", "anthropic").unwrap();
         db::set_setting(&conn, crate::mcp::SETTING_ENABLED, "true").unwrap();
@@ -747,6 +815,8 @@ mod tests {
         cfg.per_language.insert("no".into(), crate::stt::from_legacy_settings(Some("local"), None, None, None, None));
         db::set_setting(&conn, "transcribe_config", &serde_json::to_string(&cfg).unwrap()).unwrap();
         org_policy::cache_local_only(&conn, "Northwind");
+        assert!(!apply_local_only(&conn).unwrap(), "an organisation's rewrites nothing");
+        force_local_only(true);
 
         assert!(apply_local_only(&conn).unwrap());
         let get = |k: &str| db::get_setting(&conn, k).unwrap();
@@ -756,6 +826,7 @@ mod tests {
         let cfg: crate::stt::TranscribeConfig = serde_json::from_str(&get("transcribe_config").unwrap()).unwrap();
         assert_eq!(cfg.default.provider(), ProviderId::Local);
         assert!(!apply_local_only(&conn).unwrap(), "settled settings stay as they are");
+        force_local_only(false);
     }
 
     #[test]
@@ -764,7 +835,7 @@ mod tests {
         db::set_setting(&conn, "summary_provider", "anthropic").unwrap();
         db::set_setting(&conn, crate::mcp::SETTING_ENABLED, "true").unwrap();
         db::set_setting(&conn, org_policy::SETTING_ORG_CONFIG, "{not json").unwrap();
-        assert!(apply_local_only(&conn).is_err());
+        assert!(!apply_local_only(&conn).unwrap());
         assert_eq!(db::get_setting(&conn, "summary_provider").unwrap().as_deref(), Some("anthropic"));
         assert_eq!(db::get_setting(&conn, crate::mcp::SETTING_ENABLED).unwrap().as_deref(), Some("true"));
     }
@@ -775,14 +846,15 @@ mod tests {
         db::set_setting(&conn, "summary_provider", "custom").unwrap();
         db::set_setting(&conn, "chat_provider", "custom").unwrap();
         db::set_setting(&conn, "custom_base_url", "http://localhost:1234/v1").unwrap();
-        org_policy::cache_local_only(&conn, "Northwind");
+        force_local_only(true);
         apply_local_only(&conn).unwrap();
+        force_local_only(false);
         assert_eq!(db::get_setting(&conn, "summary_provider").unwrap().as_deref(), Some("custom"));
         assert_eq!(db::get_setting(&conn, "chat_provider").unwrap().as_deref(), Some("custom"));
     }
     fn device_body(audio_forbidden: bool, telemetry_off: bool) -> String {
         format!(
-            r#"{{"orgs":[{{"id":"o1","name":"Northwind","policy":{{"local_only":false,"retention_days":0,"telemetry_off":{telemetry_off},"audio_forbidden":{audio_forbidden}}}}}]}}"#
+            r#"{{"orgs":[{{"id":"o1","name":"Northwind","policy":{{"local_only":false,"retention_days":0,"telemetry_off":{telemetry_off},"audio_forbidden":{audio_forbidden}}},"workspaces":["w1"]}}]}}"#
         )
     }
 
@@ -819,19 +891,37 @@ mod tests {
     }
 
     #[test]
-    fn audio_forbidden_arriving_turns_keep_audio_off_once() {
+    fn an_organisations_audio_forbidden_leaves_keep_audio_and_sweeps_its_departments() {
+        let (_d, conn) = conn();
+        db::set_setting(&conn, "keep_audio", "true").unwrap();
+        assert_eq!(
+            apply_fetch(&conn, &org_policy::classify(200, &device_body(true, false))),
+            Changes { policy: true, settings: false, content: true, retention: false }
+        );
+        assert_eq!(get(&conn, "keep_audio").as_deref(), Some("true"), "Personal still keeps audio");
+        assert_eq!(apply_fetch(&conn, &org_policy::classify(200, &device_body(true, false))), Changes::default());
+        let scope = org_policy::sweep_scope(&authorise_audio_sweep(&conn, "o1").unwrap());
+        assert_eq!(scope, org_policy::SweepScope::Workspaces(vec!["w1".into()]));
+        assert!(scope.covers("w1"));
+        assert!(!scope.covers("") && !scope.covers("w2"), "Personal and other workspaces keep their audio");
+        assert!(authorise_audio_sweep(&conn, "o2").is_err());
+    }
+
+    #[test]
+    fn a_managed_audio_forbidden_turns_keep_audio_off_once_and_sweeps_everything() {
         let (_d, conn) = conn();
         db::set_setting(&conn, "keep_audio", "true").unwrap();
         db::set_setting(&conn, "transcribe_manually", "true").unwrap();
-        assert_eq!(
-            apply_fetch(&conn, &org_policy::classify(200, &device_body(true, false))),
-            Changes { policy: true, settings: true, content: true, retention: false }
-        );
+        org_policy::force_for_test(&[("audio_forbidden", org_policy::ManagedValue::Bool(true))]);
+        org_policy::reload_managed();
+        assert!(apply_device_policies(&conn).unwrap());
         assert_eq!(get(&conn, "keep_audio").as_deref(), Some("false"));
         assert_eq!(get(&conn, "transcribe_manually").as_deref(), Some("true"), "the closed gate defers nothing");
-        assert_eq!(apply_fetch(&conn, &org_policy::classify(200, &device_body(true, false))), Changes::default());
-        assert!(authorise_audio_sweep(&conn, "o1").is_ok());
-        assert!(authorise_audio_sweep(&conn, "o2").is_err());
+        assert!(!apply_device_policies(&conn).unwrap());
+        let scope = org_policy::sweep_scope(&authorise_audio_sweep(&conn, org_policy::MANAGED_SWEEP_ID).unwrap());
+        assert!(scope.covers("") && scope.covers("w1"));
+        org_policy::force_for_test(&[]);
+        org_policy::reload_managed();
     }
 
     #[test]
@@ -863,7 +953,8 @@ mod tests {
     fn a_swept_organisation_authorises_no_second_sweep() {
         let (_d, conn) = conn();
         apply_fetch(&conn, &org_policy::classify(200, &device_body(true, false)));
-        org_policy::record_audio_sweep(&conn, "o1").unwrap();
+        let due = org_policy::audio_sweep_due(&conn).unwrap();
+        org_policy::record_audio_sweep(&conn, &due).unwrap();
         assert!(authorise_audio_sweep(&conn, "o1").is_err());
     }
 
@@ -1002,7 +1093,12 @@ mod tests {
                 let note = get_note(&conn, &id);
                 assert_eq!(refuse_past_retention(&conn, &id, NOW), Ok(()), "state {state}");
                 for to in ["w1", "w2", ""] {
-                    assert_eq!(check_move(&conn, &note, to, Some("Team"), NOW), Ok(()), "state {state}");
+                    let moved = check_move(&conn, &note, to, Some("Team"), NOW);
+                    if state == 2 && !ws.is_empty() && to != ws {
+                        assert!(moved.is_err(), "an unreadable cache keeps a note in its workspace");
+                    } else {
+                        assert_eq!(moved, Ok(()), "state {state}");
+                    }
                 }
                 for date in [NOW, NOW - 10_000 * DAY, note.created_at + DAY, 1, org_policy::MIN_EPOCH_MS - 1] {
                     assert_eq!(check_redate(&conn, &note, date, NOW), Ok(()), "state {state}, date {date}");
@@ -1047,6 +1143,55 @@ mod tests {
         assert_eq!(check_move(&conn, &young, "w1", Some("Case work"), NOW), Ok(()));
         assert_eq!(check_move(&conn, &old, "w2", Some("Other"), NOW), Ok(()), "outside the organisation");
         assert_eq!(check_move(&conn, &old, "", None, NOW), Ok(()), "to Personal");
+    }
+
+    #[test]
+    fn a_note_cant_leave_a_department_whose_organisation_governs_its_notes() {
+        for policy in [
+            r#""local_only":true,"retention_days":0,"telemetry_off":false,"audio_forbidden":false"#,
+            r#""local_only":false,"retention_days":0,"telemetry_off":false,"audio_forbidden":true"#,
+            r#""local_only":false,"retention_days":30,"telemetry_off":false,"audio_forbidden":false"#,
+        ] {
+            let (_d, conn) = conn();
+            let body = format!(
+                r#"{{"orgs":[{{"id":"o1","name":"Northwind","policy":{{{policy}}},"workspaces":["w1","w1b"]}},
+                   {{"id":"o2","name":"Fjordby","policy":{{{policy}}},"workspaces":["w3"]}}]}}"#
+            );
+            apply_fetch(&conn, &org_policy::classify(200, &body));
+            let note = get_note(&conn, &aged_note(&conn, "w1", 1));
+            for to in ["", "w2", "w3"] {
+                assert_eq!(
+                    check_move(&conn, &note, to, Some("Team"), NOW),
+                    Err("Blocked by Northwind: its notes can't move out of its departments.".into()),
+                    "{policy} to {to:?}"
+                );
+            }
+            assert_eq!(check_move(&conn, &note, "w1b", Some("Team"), NOW), Ok(()), "within the organisation");
+            let personal = get_note(&conn, &aged_note(&conn, "", 1));
+            assert_eq!(check_move(&conn, &personal, "w1", Some("Team"), NOW), Ok(()), "moving in is allowed");
+            let free = get_note(&conn, &aged_note(&conn, "w2", 1));
+            assert_eq!(check_move(&conn, &free, "", None, NOW), Ok(()));
+        }
+    }
+
+    /// The command takes Tauri state, so this pins that a move into an
+    /// audio_forbidden department deletes the note's audio and pings sync.
+    #[test]
+    fn a_move_into_an_audio_forbidden_department_drops_the_notes_audio() {
+        let notes = include_str!("notes.rs");
+        let mv = &notes[notes.find("pub fn notes_set_workspace").unwrap()..];
+        let mv = &mv[..mv.find("\n}\n").unwrap()];
+        let order = ["check_move", "forbids_audio", "delete_stored_audio", "note_changed_for_sync", "note_moved"];
+        let at: Vec<usize> = order.iter().map(|k| mv.find(k).unwrap_or_else(|| panic!("{k}"))).collect();
+        assert!(at.windows(2).all(|w| w[0] < w[1]), "{at:?}");
+    }
+
+    #[test]
+    fn telemetry_off_alone_keeps_no_note_in_its_department() {
+        let (_d, conn) = conn();
+        apply_fetch(&conn, &org_policy::classify(200, &device_body(false, true)));
+        let note = get_note(&conn, &aged_note(&conn, "w1", 1));
+        assert_eq!(check_move(&conn, &note, "", None, NOW), Ok(()));
     }
 
     #[test]

@@ -260,15 +260,18 @@ fn check_note_date(created_at: i64, now_ms: i64) -> Result<(), String> {
 /// note recorded in Personal be shared to a team, or moved between workspaces.
 /// The sync layer tombstones it in the old workspace and recreates it in the new
 /// one (they're distinct remote records keyed on `(workspace, client_id)`).
+/// A note moving into a department whose organisation forbids audio leaves its
+/// stored audio behind.
 #[tauri::command]
 pub fn notes_set_workspace(
+    app: AppHandle,
     state: State<AppState>,
     id: String,
     workspace_id: String,
     // Only for the refusal's wording; the backend keeps no workspace names.
     workspace_name: Option<String>,
 ) -> Result<(), String> {
-    let from = {
+    let (from, drop_audio) = {
         let conn = state.db.lock();
         let note = db::get_note(&conn, &id).map_err(err)?;
         if note.workspace_id == workspace_id {
@@ -276,8 +279,14 @@ pub fn notes_set_workspace(
         }
         super::org::check_move(&conn, &note, &workspace_id, workspace_name.as_deref(), db::now_ms())?;
         db::set_note_workspace(&conn, &id, &workspace_id).map_err(err)?;
-        note.workspace_id
+        (note.workspace_id, crate::org_policy::forbids_audio(&conn, &workspace_id))
     };
+    if drop_audio && crate::sessions::is_safe_session_id(&id) {
+        let app_dir = app.path().app_data_dir().map_err(err)?;
+        if crate::sessions::delete_stored_audio(&crate::sessions::recordings_dir(&app_dir, &id)) > 0 {
+            super::note_changed_for_sync(&app, &id);
+        }
+    }
     state.sync.note_moved(&id, &from, &workspace_id);
     Ok(())
 }

@@ -121,16 +121,23 @@ pub fn is_enabled(conn: &Connection) -> bool {
     refusal(conn).is_none()
 }
 
-/// What every tool says instead of answering, or `None` when it may answer. An
-/// organisation's `local_only` turns the server off whatever the switch says,
-/// since an MCP client hands what it reads to its own cloud model; a policy that
-/// can't be read refuses too.
+/// What every tool says instead of answering, or `None` when it may answer. A
+/// managed profile's `local_only` turns the server off whatever the switch
+/// says, since an MCP client hands what it reads to its own cloud model.
 pub fn refusal(conn: &Connection) -> Option<String> {
     crate::org_policy::reload_managed();
-    if let Err(e) = crate::org_policy::check_leaves_mac(conn) {
-        return Some(e.to_string());
+    let managed = crate::org_policy::effective_managed();
+    if managed.local_only {
+        return Some(managed.blocked().to_string());
     }
     (!is_switched_on(conn)).then(disabled_message)
+}
+
+/// What a tool says instead of answering about notes in `workspace`: set when
+/// the organisation owning that department keeps its notes on this Mac, or when
+/// that can't be read. Personal and other workspaces answer as usual.
+pub fn workspace_refusal(conn: &Connection, workspace: &str) -> Option<String> {
+    crate::org_policy::check_leaves_mac(conn, Some(workspace)).err().map(|e| e.to_string())
 }
 
 /// Whether the user's switch is on, policy aside.
@@ -220,16 +227,18 @@ mod tests {
     }
 
     #[test]
-    fn local_only_turns_the_server_off_whatever_the_switch_says() {
+    fn an_organisations_local_only_refuses_its_departments_and_leaves_the_server_on() {
         let dir = tempfile::tempdir().unwrap();
         let conn = crate::db::open(&dir.path().join("t.sqlite")).unwrap();
         crate::db::set_setting(&conn, SETTING_ENABLED, "true").unwrap();
         crate::org_policy::cache_local_only(&conn, "Northwind");
-        assert!(!is_enabled(&conn));
+        assert!(is_enabled(&conn));
         assert_eq!(
-            refusal(&conn).unwrap(),
+            workspace_refusal(&conn, crate::org_policy::TEST_ORG_WORKSPACE).unwrap(),
             "Blocked by Northwind: processing stays on this Mac."
         );
+        assert_eq!(workspace_refusal(&conn, ""), None, "Personal");
+        assert_eq!(workspace_refusal(&conn, "w-other"), None, "a workspace in no organisation");
     }
 
     #[test]
@@ -246,16 +255,17 @@ mod tests {
     }
 
     #[test]
-    fn an_unreadable_policy_keeps_the_server_off() {
+    fn an_unreadable_policy_refuses_every_workspace_but_personal() {
         let dir = tempfile::tempdir().unwrap();
         let conn = crate::db::open(&dir.path().join("t.sqlite")).unwrap();
         crate::db::set_setting(&conn, SETTING_ENABLED, "true").unwrap();
         crate::db::set_setting(&conn, "org_config", "{not json").unwrap();
-        assert!(!is_enabled(&conn));
+        assert!(is_enabled(&conn));
         assert_eq!(
-            refusal(&conn).unwrap(),
+            workspace_refusal(&conn, "w1").unwrap(),
             "Blocked by your organisation: processing stays on this Mac."
         );
+        assert_eq!(workspace_refusal(&conn, ""), None);
     }
 
     /// The fast path: a database the app has already created opens without the

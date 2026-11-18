@@ -3,16 +3,23 @@
 //   - control rows (new kit): label + muted description left, control right
 //   - block rows (legacy tabs): label on top, free-form children below
 // The legacy shape stays until PRD 2/2 rebuilds the remaining bodies.
+// `scope` names the workspace a section's settings apply to, for the sections
+// an organisation's policy can govern.
 export function Section({
   title,
+  scope,
   children,
 }: {
   title: string;
+  scope?: string;
   children: React.ReactNode;
 }) {
   return (
     <section className="mb-8">
-      <h2 className="text-sm font-medium mb-2.5">{title}</h2>
+      <h2 className="text-sm font-medium mb-2.5 flex items-baseline gap-2">
+        {title}
+        {scope && <span className="text-xs font-normal text-[var(--color-text-muted)]">{scope}</span>}
+      </h2>
       {/* py-2 keeps legacy block children (which carry no vertical padding
           of their own) off the card edges until PRD 2/2 rebuilds them onto
           Rows; kit Rows add their own py on top of it. */}

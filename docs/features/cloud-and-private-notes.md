@@ -37,7 +37,7 @@ humla-cloud's indexer reads with a service token across every workspace, which n
 
 ## Managed configuration (organisation layer, C6)
 
-An MDM configuration profile for the domain `no.humla.app` pins policies on a Mac with no sign-in, and no sign-out releases them (spec: `humla-cloud/docs/organisation-layer.md` §4 option C). `org_policy::managed()` reads it through CFPreferences and `effective()` merges it strictest-wins with the cached server config, as one more `Layer` whose source is **"This Mac's configuration"** (`MANAGED_SOURCE`, mirrored in `src/lib/orgPolicy.ts`).
+An MDM configuration profile for the domain `no.humla.app` pins policies on a Mac with no sign-in, and no sign-out releases them (spec: `humla-cloud/docs/organisation-layer.md` §4 option C). `org_policy::managed()` reads it through CFPreferences and `effective_for()` merges it strictest-wins into the policy of every workspace, Personal included, as one more `Layer` whose source is **"This Mac's configuration"** (`MANAGED_SOURCE`, mirrored in `src/lib/orgPolicy.ts`). An organisation's own policies reach only its departments (C9).
 
 Flat keys in the payload, named after the server's fields:
 
@@ -54,7 +54,7 @@ Flat keys in the payload, named after the server's fields:
 - `retention_days` is **not read** from a profile. Retention covers organisation workspaces only, which a profile can't name, and `retention_in_force` reads only the server cache.
 - Read once on first use and again on every `cloud_status` (sign-in and window focus) and every MCP call (`mcp::refusal`), after `CFPreferencesAppSynchronize`; which also moves settings to their enforced values (`apply_policy_to_settings`) and emits `org_policy_changed` when the layer changed. At launch, before the sync observer exists, `apply_managed_at_launch` does the same.
 - `server_url` is pinned by writing it into `cloud_base_url`, so every reader stays unchanged; when that changes the setting, the whole stored account (email, password, token) is dropped (`org::pin_managed_server` → `cloud_auth::forget_account`), since a password left behind would sign in to the new server. `cloud_configure` refuses any other URL, and `cloud_status.server_managed` hides Change server and Disconnect.
-- A profile that forces `audio_forbidden` to `true` (not a mistyped value) owes the same one-time sweep and notice as an organisation, recorded in `org_audio_swept` as `mac-configuration` (`MANAGED_SWEEP_ID`).
+- A profile that forces `audio_forbidden` to `true` (not a mistyped value) owes a one-time sweep of every note's audio (an organisation's covers only its departments), recorded in `org_audio_swept` as `mac-configuration` (`MANAGED_SWEEP_ID`).
 - Tests never read the Mac's profiles (under `cfg(test)` the cache and `read_forced` are per thread, set by `force_for_test`); the parsing is `parse_managed` over a map of forced values. Linux builds read nothing.
 
 A sample profile: [`no.humla.app.mobileconfig`](no.humla.app.mobileconfig).

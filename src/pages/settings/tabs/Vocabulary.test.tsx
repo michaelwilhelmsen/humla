@@ -1,5 +1,5 @@
-import { describe, it, expect, vi } from "vitest";
-import { render, screen, within } from "@testing-library/react";
+import { afterEach, describe, it, expect, vi } from "vitest";
+import { cleanup, render, screen, within } from "@testing-library/react";
 import { mockTauri } from "../../../test/tauri";
 import userEvent from "@testing-library/user-event";
 import { VocabularySection, VOCABULARY_LIMIT, parseVocabulary } from "./Vocabulary";
@@ -56,14 +56,38 @@ describe("VocabularySection", () => {
   });
 });
 
+const CASE_WORK = { id: "w1", name: "Case work", role: "member" as const, plan_status: "active" as const };
+
+function inWorkspace(ws: typeof CASE_WORK | null) {
+  useCloudStore.setState({ status: { ...DISCONNECTED, current_workspace: ws, workspaces: ws ? [ws] : [] } });
+}
+
 describe("VocabularySection with an organisation", () => {
-  it("shows its terms as locked chips above the user's, with the marker once", async () => {
+  afterEach(() => inWorkspace(null));
+
+  const withNorthwind = () =>
     mockTauri({
       org_status: () => ({
         policy: { org_name: null, reason: null, local_only: false, retention_days: 0, telemetry_off: false, audio_forbidden: false, rules: [] },
-        orgs: [{ id: "o1", name: "Northwind", reason: "", vocabulary: ["Northwind", "Fjord"], workspaces: [] }],
+        orgs: [{ id: "o1", name: "Northwind", reason: "", vocabulary: ["Northwind", "Fjord"], workspaces: ["w1"] }],
       }),
     });
+
+  it("shows nothing of it in Personal or another workspace", async () => {
+    withNorthwind();
+    for (const ws of [null, { ...CASE_WORK, id: "w2", name: "Other" }]) {
+      inWorkspace(ws);
+      renderWith("Tauri");
+      await new Promise((r) => setTimeout(r, 0));
+      expect(screen.queryByRole("list", { name: "Organisation terms" })).toBeNull();
+      expect(screen.queryByRole("button", { name: /Managed by/ })).toBeNull();
+      cleanup();
+    }
+  });
+
+  it("shows its terms as locked chips above the user's, with the marker once", async () => {
+    withNorthwind();
+    inWorkspace(CASE_WORK);
     renderWith("Tauri");
     const locked = await screen.findByRole("list", { name: "Organisation terms" });
     expect(within(locked).getAllByRole("listitem").map((li) => li.textContent)).toEqual(["Northwind", "Fjord"]);
@@ -102,6 +126,8 @@ describe("VocabularySection for an organisation admin", () => {
         logged_in: true,
         user: { id: "u1", email: "a@example.no", name: "A", verified: true },
         two_factor: { available: true, enabled: twoFactor, recovery_codes_left: 0, required_by: [] },
+        current_workspace: CASE_WORK,
+        workspaces: [CASE_WORK],
       },
       ready: true,
     });

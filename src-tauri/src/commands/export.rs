@@ -356,7 +356,7 @@ fn note_recordings(app: &AppHandle, note_id: &str) -> Result<PathBuf, String> {
 #[tauri::command]
 pub async fn note_audio_export_info(app: AppHandle, note_id: String) -> Result<Vec<TakeAudio>, String> {
     let recordings = note_recordings(&app, &note_id)?;
-    let forbidden = super::audio_forbidden(&app);
+    let forbidden = super::audio_forbidden(&app, &note_id);
     tauri::async_runtime::spawn_blocking(move || without_audio_if(forbidden, note_audio_info(&recordings)))
         .await
         .map_err(|e| format!("audio info task failed: {e}"))
@@ -377,7 +377,7 @@ fn without_audio_if(forbidden: bool, takes: Vec<TakeAudio>) -> Vec<TakeAudio> {
 /// let this device store, at the user's request, to a place the user chose.
 #[tauri::command]
 pub async fn export_note_audio(app: AppHandle, note_id: String, spec: AudioExportSpec) -> Result<(), String> {
-    if super::audio_forbidden(&app) {
+    if super::audio_forbidden(&app, &note_id) {
         return Err("Your organisation doesn't allow saving audio.".into());
     }
     let recordings = note_recordings(&app, &note_id)?;

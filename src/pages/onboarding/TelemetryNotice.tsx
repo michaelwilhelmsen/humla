@@ -29,7 +29,7 @@ export function TelemetryNotice() {
     let cancelled = false;
     const load = async () => {
       const rule = await ipc.orgStatus().then(
-        (s) => (s?.policy ? policySource(s.policy, "telemetry_off") : null),
+        (s) => (s?.device ? policySource(s.device, "telemetry_off") : null),
         () => UNREADABLE,
       );
       if (cancelled) return;

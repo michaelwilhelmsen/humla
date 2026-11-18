@@ -860,11 +860,12 @@ export const ipc = {
   permissionsRequest: (kind: PermissionKind) => invoke<PermissionsStatus>("permissions_request", { kind }),
   permissionsOpenSettings: (kind: PermissionKind) => invoke<void>("permissions_open_settings", { kind }),
 
-  orgStatus: () => invoke<OrgStatus>("org_status"),
+  /** The policies for notes in `workspaceId` (Personal when empty), and what applies app-wide. */
+  orgStatus: (workspaceId = "") => invoke<OrgStatus>("org_status", { workspaceId: workspaceId || null }),
   auditNoteOpened: (noteId: string) => invoke<void>("audit_note_opened", { noteId }),
   auditNoteCopied: (noteId: string) => invoke<void>("audit_note_copied", { noteId }),
   orgAudioNotice: () => invoke<AudioSweep | null>("org_audio_notice"),
-  /** Deletes every note's stored audio for `orgId`'s policy; returns the file count. */
+  /** Deletes the stored audio `orgId`'s policy covers; returns the file count. */
   orgAudioSweep: (orgId: string) => invoke<number>("org_audio_sweep", { orgId }),
   /** The organisations the signed-in user administers. */
   orgAdminOrgs: () => invoke<AdminOrg[]>("org_admin_orgs"),
@@ -1140,6 +1141,11 @@ export function onDiarizeStatus(cb: (e: DiarizeStatus) => void): Promise<Unliste
 }
 export function onRecordingError(cb: (e: RecordingError) => void): Promise<UnlistenFn> {
   return listen<RecordingError>("recording_error", (e) => cb(e.payload));
+}
+/** A recording or import's transcription was moved to this Mac by `source`'s
+ *  `local_only`. */
+export function onTranscriptionKeptLocal(cb: (e: { noteId: string; source: string }) => void): Promise<UnlistenFn> {
+  return listen<{ noteId: string; source: string }>("transcription_kept_local", (e) => cb(e.payload));
 }
 export function onRecordingDiagnostic(cb: (e: RecordingDiagnostic) => void): Promise<UnlistenFn> {
   return listen<RecordingDiagnostic>("recording_diagnostic", (e) => cb(e.payload));

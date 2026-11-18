@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { ipc, onRecordingDiagnostic, onRecordingError, onRecordingStatus, onSummary, onSummaryStatus, onTitleStatus, onTranscribeStatus, onDiarizeStatus, onTranscript, onTranscriptReplaced, onNotesChanged, onSyncStatus, onSyncConflict, onLocalWhisperProgress, onLocalWhisperDownloadError, type Client, type Folder, type Note, type RecordingDiagnostic, type RecordingStatus, type Step } from "./ipc";
+import { ipc, onRecordingDiagnostic, onRecordingError, onTranscriptionKeptLocal, onRecordingStatus, onSummary, onSummaryStatus, onTitleStatus, onTranscribeStatus, onDiarizeStatus, onTranscript, onTranscriptReplaced, onNotesChanged, onSyncStatus, onSyncConflict, onLocalWhisperProgress, onLocalWhisperDownloadError, type Client, type Folder, type Note, type RecordingDiagnostic, type RecordingStatus, type Step } from "./ipc";
 import { onOrgInvitesChanged, useCloudStore } from "./cloud";
 
 type NotesState = {
@@ -367,6 +367,10 @@ let recordingNoteId: string | null = null;
 // The note id of an in-flight *import* (distinct from a live recording), so that
 // when it finishes we can tell the user if the file yielded no transcript.
 let importingNoteId: string | null = null;
+export function keptLocalMessage(source: string): string {
+  return `Transcription stays on this Mac for ${source || "your organisation"}.`;
+}
+
 export function bindBackendListeners() {
   if (listenersBound) return;
   listenersBound = true;
@@ -443,6 +447,7 @@ export function bindBackendListeners() {
     useRecordingStore.getState().setDiarizing(noteId, active);
   });
   onRecordingError(({ noteId, message }) => useRecordingStore.getState().pushError({ noteId, message }));
+  onTranscriptionKeptLocal(({ source }) => useRecordingStore.getState().pushFlash(keptLocalMessage(source)));
   onRecordingDiagnostic((d) => {
     const st = useRecordingStore.getState();
     st.setDiag(d);

@@ -40,7 +40,7 @@ describe("TelemetryNotice", () => {
   });
 
   it("never opts in under telemetry_off and offers no switch", async () => {
-    const { writes, events } = backend(null, () => ({ policy: telemetryOff }));
+    const { writes, events } = backend(null, () => ({ policy: NO_POLICY, device: telemetryOff }));
     render(<TelemetryNotice />);
     expect(await screen.findByText(/counters are off/)).toBeTruthy();
     expect(screen.getByRole("button", { name: /Managed by Northwind/ })).toBeTruthy();
@@ -56,7 +56,7 @@ describe("TelemetryNotice", () => {
       telemetry_off: true,
       rules: [{ kind: "telemetry_off", source: MANAGED_SOURCE, reason: "" }],
     };
-    const { writes, events } = backend(null, () => ({ policy: managed, orgs: [], retention: {} }));
+    const { writes, events } = backend(null, () => ({ policy: managed, device: managed, orgs: [], retention: {} }));
     render(<TelemetryNotice />);
     expect(await screen.findByText(/counters are off/)).toBeTruthy();
     expect(screen.getByRole("button", { name: /Managed by This Mac's configuration/ })).toBeTruthy();
