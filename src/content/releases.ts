@@ -11,6 +11,25 @@ export type Release = {
 
 export const releases: Release[] = [
   {
+    version: "0.80.0",
+    date: "2026-11-18",
+    title: "Copilot works again, and Sign in with Microsoft",
+    summary: "GitHub Copilot works with the latest Copilot CLI again, and teams on Microsoft can sign in to Humla's cloud with their work account.",
+    visual: "copilot",
+    paragraphs: [
+      "Copilot CLI 1.0.113 changed how it talks to apps, and Humla couldn't start it any more, so Copilot summaries and chat stopped working for anyone who had updated it. Humla now speaks the new version. If the CLI on your Mac is older or newer than the one Humla supports, Humla downloads the supported one itself (about 140 MB) and carries on, instead of asking you to. Settings → Summary also shows the version Humla actually runs.",
+      "If your organisation signs in with Microsoft, you can now sign in to Humla's cloud with your work account. The button appears in Settings → Account, during setup and when you create a workspace, once you type an email address your organisation has set up for it. Two-step verification works as it does with a password.",
+    ],
+    highlights: [
+      "Copilot works with Copilot CLI 1.0.113 and newer.",
+      "Humla downloads the Copilot CLI it supports when yours won't start.",
+      "Sign in with Microsoft for organisations that use it.",
+    ],
+    issues: [
+      { title: "It sadly does no longer work with Copilot", reference: "#251", status: "Closed", url: "https://github.com/michaelwilhelmsen/humla/issues/251" },
+    ],
+  },
+  {
     version: "0.79.0",
     date: "2026-11-18",
     title: "Organisation rules stay in their own workspaces",
