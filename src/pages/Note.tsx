@@ -30,7 +30,8 @@ import {
   Users,
   X,
 } from "lucide-react";
-import { deletedAfter, redateBounds, useRetentionDays } from "../lib/orgPolicy";
+import { deletedAfter, redateBounds, useNoteOrgPolicy } from "../lib/orgPolicy";
+import { recordsOpens, reportCopied, reportOpened } from "../lib/audit";
 import { ipc, onNotesPurged, onSummaryThinkingDelta, onSummaryContentDelta, type Note as TNote, type NoteRevision, type NoteSession, type SummaryPrompt, type TimelineEntry } from "../lib/ipc";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { SUMMARY_CAPABLE, type SummaryProvider } from "../lib/providers";
@@ -477,7 +478,12 @@ export function Note() {
   // Set once the note is deleted for good under this view: nothing may save
   // to it or put it back in the store.
   const purged = useRef(false);
-  const retentionDays = useRetentionDays(draft?.workspace_id);
+  const { retentionDays, audit } = useNoteOrgPolicy(draft?.workspace_id);
+  const draftId = draft?.id;
+  const opensRecorded = recordsOpens(audit, draft?.workspace_id);
+  useEffect(() => {
+    if (draftId && opensRecorded) reportOpened(draftId);
+  }, [draftId, opensRecorded]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1552,7 +1558,9 @@ export function Note() {
                     onChange={patchProvider}
                   />
                   <div className="ml-auto flex items-center gap-0.5">
-                    {hasSummary && <CopyButton label="Summary" getText={() => draft.summary} />}
+                    {hasSummary && (
+                      <CopyButton label="Summary" getText={() => draft.summary} onCopied={() => reportCopied(audit, draft)} />
+                    )}
                     {!readOnly && (
                       <button
                         type="button"
@@ -1652,7 +1660,7 @@ export function Note() {
                       revision snapshot of nothing. */}
                   {hasTranscript && (
                     <div className="ml-auto flex items-center gap-0.5">
-                      <CopyButton label="Transcript" getText={copyableTranscript} />
+                      <CopyButton label="Transcript" getText={copyableTranscript} onCopied={() => reportCopied(audit, draft)} />
                       {/* A take still holding untranscribed audio on a note
                           that already has text — the second take of a note
                           recorded with "Transcribe manually" on, which is the
@@ -2781,7 +2789,7 @@ function SummaryProviderChip({
 // closure rather than the component reaching for a field itself.
 // 1.5s "Copied" feedback via a Check icon swap. stopPropagation keeps
 // the click from reaching a header row that acts on clicks of its own.
-function CopyButton({ getText, label }: { getText: () => string; label: string }) {
+function CopyButton({ getText, label, onCopied }: { getText: () => string; label: string; onCopied?: () => void }) {
   const [copied, setCopied] = useState(false);
   return (
     <button
@@ -2792,6 +2800,7 @@ function CopyButton({ getText, label }: { getText: () => string; label: string }
         if (!text) return;
         try {
           await navigator.clipboard.writeText(text);
+          onCopied?.();
           setCopied(true);
           window.setTimeout(() => setCopied(false), 1500);
         } catch (err) {

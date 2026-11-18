@@ -861,6 +861,8 @@ export const ipc = {
   permissionsOpenSettings: (kind: PermissionKind) => invoke<void>("permissions_open_settings", { kind }),
 
   orgStatus: () => invoke<OrgStatus>("org_status"),
+  auditNoteOpened: (noteId: string) => invoke<void>("audit_note_opened", { noteId }),
+  auditNoteCopied: (noteId: string) => invoke<void>("audit_note_copied", { noteId }),
   orgAudioNotice: () => invoke<AudioSweep | null>("org_audio_notice"),
   /** Deletes every note's stored audio for `orgId`'s policy; returns the file count. */
   orgAudioSweep: (orgId: string) => invoke<number>("org_audio_sweep", { orgId }),

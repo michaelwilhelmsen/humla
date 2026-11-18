@@ -46,6 +46,21 @@ describe("policyRows", () => {
     ]);
   });
 
+  it("adds a row for each organisation that records opening its notes", () => {
+    const org = (id: string, name: string, audit_reads?: boolean) => ({
+      id,
+      name,
+      reason: `${name} says so`,
+      vocabulary: [],
+      workspaces: [],
+      audit_reads,
+    });
+    const rows = policyRows(NO_POLICY, [org("o1", "Northwind", true), org("o2", "Contoso", false), org("o3", "Fabrikam")]);
+    expect(rows.map((r) => [r.label, r.value, r.source, r.reason])).toEqual([
+      ["Opening notes", "Recorded", "Northwind", "Northwind says so"],
+    ]);
+  });
+
   it("says one day in the singular", () => {
     const policy = { ...NO_POLICY, retention_days: 1, rules: [rule("retention_days")] };
     expect(policyRows(policy)[0].value).toBe("Deleted after 1 day");

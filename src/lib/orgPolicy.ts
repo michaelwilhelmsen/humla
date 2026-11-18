@@ -3,6 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { ipc, type ProviderConfig } from "./ipc";
 import { useCloudStore } from "./cloud";
 import { allowedUnderLocalOnly } from "./providers";
+import type { AuditScope } from "./audit";
 
 export { isLoopbackUrl } from "./loopback";
 
@@ -34,6 +35,9 @@ export type OrgSummary = {
   vocabulary: string[];
   /** The organisation's departments the user is in. */
   workspaces: string[];
+  /** Opening its notes is recorded. Absent on a summary the client builds for
+   *  an organisation it only administers. */
+  audit_reads?: boolean;
 };
 
 /** Mirrors `commands::org_admin::AdminOrg`. */
@@ -52,7 +56,7 @@ export type AdminContent = { templates: AdminTemplate[]; vocabulary: string[] };
 /** Days of retention per workspace, from `org_policy::retention_scope`. */
 export type RetentionScope = Record<string, number>;
 
-export type OrgStatus = { policy: EffectivePolicy; orgs?: OrgSummary[]; retention?: RetentionScope };
+export type OrgStatus = { policy: EffectivePolicy; orgs?: OrgSummary[]; retention?: RetentionScope; audit?: AuditScope };
 
 /** Mirrors `org_policy::AudioSweep`. */
 export type AudioSweep = { org_id: string; org_name: string };
@@ -131,12 +135,13 @@ export const NO_POLICY: EffectivePolicy = {
   rules: [],
 };
 
-export type PolicyRow = { kind: PolicyKind; label: string; value: string; source: string; reason: string };
+export type PolicyRow = { key: string; label: string; value: string; source: string; reason: string };
 
 const ORDER: PolicyKind[] = ["local_only", "retention_days", "audio_forbidden", "telemetry_off"];
 
-/** One row per policy in force: the setting it fixes and its enforced value. */
-export function policyRows(policy: EffectivePolicy): PolicyRow[] {
+/** One row per policy in force: the setting it fixes and its enforced value.
+ *  Then one per organisation that records opening its notes. */
+export function policyRows(policy: EffectivePolicy, orgs: OrgSummary[] = []): PolicyRow[] {
   const describe = (kind: PolicyKind): { label: string; value: string } => {
     switch (kind) {
       case "local_only":
@@ -149,10 +154,14 @@ export function policyRows(policy: EffectivePolicy): PolicyRow[] {
         return { label: "Send anonymous usage counters", value: "Off" };
     }
   };
-  return ORDER.flatMap((kind) => {
+  const enforced = ORDER.flatMap((kind) => {
     const rule = policy.rules.find((r) => r.kind === kind);
-    return rule ? [{ kind, ...describe(kind), source: rule.source, reason: rule.reason }] : [];
+    return rule ? [{ key: kind, ...describe(kind), source: rule.source, reason: rule.reason }] : [];
   });
+  const audited = orgs
+    .filter((o) => o.audit_reads)
+    .map((o) => ({ key: `audit_reads:${o.id}`, label: "Opening notes", value: "Recorded", source: o.name, reason: o.reason }));
+  return [...enforced, ...audited];
 }
 
 /**
@@ -164,10 +173,18 @@ export function useOrgPolicy(): EffectivePolicy {
   return useOrgPolicyStatus().policy;
 }
 
-/** Days before a note in `workspaceId` is deleted under its organisation's
- *  retention; 0 when none applies. */
-export function useRetentionDays(workspaceId: string | null | undefined): number {
-  return retentionDaysFor(useOrgPolicyStatus().retention, workspaceId);
+/** [`policyRows`] for the policies and organisations in force. */
+export function usePolicyRows(): PolicyRow[] {
+  const { policy, orgs } = useOrgPolicyStatus();
+  return policyRows(policy, orgs);
+}
+
+/** What the organisations ask of a note in `workspaceId`: days before it is
+ *  deleted (0 when none), and the audit scope its opens and copies are
+ *  reported against. */
+export function useNoteOrgPolicy(workspaceId: string | null | undefined): { retentionDays: number; audit: AuditScope } {
+  const { retention, audit } = useOrgPolicyStatus();
+  return { retentionDays: retentionDaysFor(retention, workspaceId), audit };
 }
 
 /** Who sets `local_only` (null when off), and whether the policy has loaded.
@@ -177,10 +194,18 @@ export function useLocalOnly(): { managed: PolicyRule | null; known: boolean } {
   return { managed: localOnlySource(policy), known };
 }
 
-type PolicyStatus = { policy: EffectivePolicy; retention: RetentionScope; known: boolean };
+type PolicyStatus = {
+  policy: EffectivePolicy;
+  retention: RetentionScope;
+  audit: AuditScope;
+  orgs: OrgSummary[];
+  known: boolean;
+};
+
+const UNKNOWN: PolicyStatus = { policy: NO_POLICY, retention: {}, audit: {}, orgs: [], known: false };
 
 function useOrgPolicyStatus(): PolicyStatus {
-  const [state, setState] = useState<PolicyStatus>({ policy: NO_POLICY, retention: {}, known: false });
+  const [state, setState] = useState<PolicyStatus>(UNKNOWN);
   const cloudStatus = useCloudStore((s) => s.status);
 
   useEffect(() => {
@@ -190,9 +215,16 @@ function useOrgPolicyStatus(): PolicyStatus {
         .orgStatus()
         .then(
           (s) =>
-            !cancelled && setState({ policy: s?.policy ?? NO_POLICY, retention: s?.retention ?? {}, known: true }),
+            !cancelled &&
+            setState({
+              policy: s?.policy ?? NO_POLICY,
+              retention: s?.retention ?? {},
+              audit: s?.audit ?? {},
+              orgs: s?.orgs ?? [],
+              known: true,
+            }),
         )
-        .catch(() => !cancelled && setState({ policy: NO_POLICY, retention: {}, known: true }));
+        .catch(() => !cancelled && setState({ ...UNKNOWN, known: true }));
     void load();
     let unlisten: (() => void) | undefined;
     void listen("org_policy_changed", () => void load()).then((u) => {
