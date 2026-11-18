@@ -72,6 +72,8 @@ export function mockTauri(
         };
       case "org_audio_notice":
         return null;
+      case "org_admin_orgs":
+        return [];
       case "org_status":
         return {
           policy: {

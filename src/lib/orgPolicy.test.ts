@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 import sttConfig from "../../src-tauri/src/stt/config.rs?raw";
+import policySrc from "../../src-tauri/src/org_policy.rs?raw";
 import vectors from "./loopbackVectors.json";
 import redate from "./redateVectors.json";
 import {
+  MANAGED_SOURCE,
   NO_POLICY,
   ON_DEVICE_WHISPER,
   enforceLocalOnly,
@@ -122,5 +124,11 @@ describe("policySource", () => {
     expect(policySource(policy, "audio_forbidden")?.source).toBe("Contoso");
     expect(policySource(policy, "telemetry_off")).toBeNull();
     expect(policySource(NO_POLICY, "audio_forbidden")).toBeNull();
+  });
+});
+
+describe("MANAGED_SOURCE", () => {
+  it("mirrors org_policy::MANAGED_SOURCE", () => {
+    expect(policySrc).toContain(`pub(crate) const MANAGED_SOURCE: &str = "${MANAGED_SOURCE}";`);
   });
 });

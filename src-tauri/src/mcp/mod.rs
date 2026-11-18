@@ -125,6 +125,7 @@ pub fn is_enabled(conn: &Connection) -> bool {
 /// since an MCP client hands what it reads to its own cloud model; a policy that
 /// can't be read refuses too.
 pub fn refusal(conn: &Connection) -> Option<String> {
+    crate::org_policy::reload_managed();
     if let Err(e) = crate::org_policy::check_leaves_mac(conn) {
         return Some(e.to_string());
     }
@@ -228,6 +229,19 @@ mod tests {
             refusal(&conn).unwrap(),
             "Blocked by Northwind: processing stays on this Mac."
         );
+    }
+
+    #[test]
+    fn a_profile_installed_while_the_server_runs_turns_it_off() {
+        use crate::org_policy::{force_for_test, ManagedValue, MANAGED_SOURCE};
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("t.sqlite")).unwrap();
+        crate::db::set_setting(&conn, SETTING_ENABLED, "true").unwrap();
+        assert!(is_enabled(&conn));
+        force_for_test(&[("local_only", ManagedValue::Bool(true))]);
+        assert_eq!(refusal(&conn).unwrap(), format!("Blocked by {MANAGED_SOURCE}: processing stays on this Mac."));
+        force_for_test(&[]);
+        assert!(is_enabled(&conn), "and back on once it is removed");
     }
 
     #[test]

@@ -117,6 +117,8 @@ tauri-plugin-updater = "2"
 whisper-rs = { version = "0.16", features = ["metal"] }
 apple-native-keyring-store = { version = "1", features = ["keychain"] }
 block2 = "0.6"
+core-foundation = "0.10"
+core-foundation-sys = "0.8"
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSError", "NSSet", "NSString"] }
 objc2-user-notifications = { version = "0.3", default-features = false, features = ["std", "block2", "UNNotification", "UNNotificationAction", "UNNotificationCategory", "UNNotificationContent", "UNNotificationRequest", "UNNotificationResponse", "UNNotificationSettings", "UNNotificationTrigger", "UNUserNotificationCenter"] }

@@ -83,9 +83,14 @@ Feature detail lives in `docs/features/` and `docs/architecture/`; read the link
 - Custom endpoint: base URL used exactly as typed; send only `model`, `messages`, `stream` (and `tools`). Nothing is guessed about the server.
 - Copilot: always through the CLI (never the Copilot API directly), started with `--no-auto-update`, `--disable-builtin-mcps`, `--disable-client-telemetry` and the SDK's `disable_client_telemetry`; one SDK session per chat turn; log usage lines, never content. Copilot uses `copilot_model` / `copilot_chat_model`, not `chat_model`.
 
+### Organisation admins
+
+- An org admin edits templates and terms on the server only (`commands/org_admin.rs`), never through a local queue; every write ends with `refresh_org_config`. The `organisations` PATCH carries `vocabulary` and nothing else. A template save keeps the departments the admin can't see (`scope_workspaces`). Policies are never edited in the client. An organisation the admin is in no department of is read straight from `org_templates` / `organisations` (`org_admin_content`) into the editing views only: never cached, applied or offered in a picker.
+
 ### Cloud session
 
 - The password is only a fallback and is dropped the first time the server answers `two_factor_required`. The sync worker never signs in; it reports `signed_out` / `two_factor_required`. A change made while a workspace is 2FA-locked is never dropped.
+- A managed configuration profile (`org_policy::managed`, source "This Mac's configuration") counts only forced values, reads a policy key of the wrong type as on, never sets retention, and pins `server_url` by writing `cloud_base_url` and dropping the whole stored account; forcing `audio_forbidden` to `true` owes the one-time audio sweep (`mac-configuration`). → [cloud and private notes](docs/features/cloud-and-private-notes.md)
 
 ### Backend runtime
 

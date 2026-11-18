@@ -10,7 +10,7 @@ import { ValuePill } from "../components/ValuePill";
 import { Toggle } from "../components/Toggle";
 import type { SettingsHook } from "../useSettings";
 import { ManagedRow } from "../ManagedRow";
-import { policyRows, useOrgPolicy } from "../../../lib/orgPolicy";
+import { MANAGED_SOURCE, policyRows, useOrgPolicy } from "../../../lib/orgPolicy";
 
 const inputCls =
   "w-full text-sm px-3 py-2 rounded-md border border-[var(--color-line-visible)] bg-[var(--color-surface)] focus:border-[var(--color-text-muted)] transition-colors";
@@ -31,6 +31,15 @@ export function PoliciesSection() {
         />
       ))}
     </Section>
+  );
+}
+
+function ServerRow({ url, managed }: { url: string; managed?: boolean }) {
+  const value = <ValuePill>{url}</ValuePill>;
+  return managed ? (
+    <ManagedRow label="Server" source={MANAGED_SOURCE} reason="" control={value} />
+  ) : (
+    <Row label="Server" control={value} />
   );
 }
 
@@ -192,7 +201,7 @@ export function AccountTab({ s, update }: Pick<SettingsHook, "s" | "update">) {
               </div>
             </div>
           )}
-          <Row label="Server" control={<ValuePill>{status.base_url}</ValuePill>} />
+          <ServerRow url={status.base_url} managed={status.server_managed} />
           <Row
             label="Upload recording audio"
             description="Transcripts and summaries always sync. Off keeps audio on this Mac. Personal notes never leave it."
@@ -204,17 +213,19 @@ export function AccountTab({ s, update }: Pick<SettingsHook, "s" | "update">) {
               />
             }
           />
-          <Row
-            label="Disconnect server"
-            description="Signs you out. Your notes stay on this Mac."
-            control={
-              <Btn onClick={disconnect} disabled={busy} aria-label="Disconnect server">
-                <span className="inline-flex items-center gap-1.5">
-                  <CloudOff size={14} strokeWidth={1.5} /> Disconnect
-                </span>
-              </Btn>
-            }
-          />
+          {!status.server_managed && (
+            <Row
+              label="Disconnect server"
+              description="Signs you out. Your notes stay on this Mac."
+              control={
+                <Btn onClick={disconnect} disabled={busy} aria-label="Disconnect server">
+                  <span className="inline-flex items-center gap-1.5">
+                    <CloudOff size={14} strokeWidth={1.5} /> Disconnect
+                  </span>
+                </Btn>
+              }
+            />
+          )}
         </Section>
         <TwoFactorSection />
       </>
@@ -225,7 +236,7 @@ export function AccountTab({ s, update }: Pick<SettingsHook, "s" | "update">) {
   if (status.configured && auth.step === "code") {
     return (
       <Section title="Two-factor authentication">
-        <Row label="Server" control={<ValuePill>{status.base_url}</ValuePill>} />
+        <ServerRow url={status.base_url} managed={status.server_managed} />
         <div className="py-3.5">
           <TwoFactorCodeForm
             busy={auth.busy}
@@ -255,7 +266,7 @@ export function AccountTab({ s, update }: Pick<SettingsHook, "s" | "update">) {
             Your session has ended. Sign in again to keep syncing.
           </div>
         )}
-        <Row label="Server" control={<ValuePill>{status.base_url}</ValuePill>} />
+        <ServerRow url={status.base_url} managed={status.server_managed} />
         {isSignup && (
           <Row label="Name">
             <input className={inputCls} type="text" autoComplete="name" value={name}
@@ -281,7 +292,9 @@ export function AccountTab({ s, update }: Pick<SettingsHook, "s" | "update">) {
             <Btn onClick={submit} disabled={formBusy || !canSubmit}>
               {auth.busy ? (isSignup ? "Creating…" : "Signing in…") : isSignup ? "Create account" : "Sign in"}
             </Btn>
-            <Btn onClick={disconnect} disabled={formBusy}>Change server</Btn>
+            {!status.server_managed && (
+              <Btn onClick={disconnect} disabled={formBusy}>Change server</Btn>
+            )}
           </div>
           <div className="flex items-center gap-4">
             <button type="button" onClick={toggleMode}

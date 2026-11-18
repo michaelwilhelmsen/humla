@@ -392,6 +392,26 @@ describe("Account section", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("a managed server can't be changed from the sign-in form", async () => {
+    const dialog = await openAccount({ ...signedOutConfigured(), server_managed: true });
+    expect(await within(dialog).findByRole("button", { name: /^sign in$/i })).toBeInTheDocument();
+    expect(within(dialog).getByText("https://sync.example.com")).toBeInTheDocument();
+    expect(within(dialog).getByRole("button", { name: /managed by this mac's configuration/i })).toBeInTheDocument();
+    expect(within(dialog).queryByRole("button", { name: /change server/i })).not.toBeInTheDocument();
+  });
+
+  it("a managed server can't be disconnected once signed in", async () => {
+    const dialog = await openAccount({ ...signedIn("member", false), server_managed: true });
+    expect(await within(dialog).findByText("https://sync.humla.team")).toBeInTheDocument();
+    expect(within(dialog).queryByRole("button", { name: /disconnect server/i })).not.toBeInTheDocument();
+  });
+
+  it("an unmanaged server can be changed", async () => {
+    const dialog = await openAccount(signedOutConfigured());
+    expect(await within(dialog).findByRole("button", { name: /change server/i })).toBeInTheDocument();
+    expect(within(dialog).queryByRole("button", { name: /managed by/i })).not.toBeInTheDocument();
+  });
+
   describe("Policies", () => {
     const enforced = {
       policy: {
@@ -433,6 +453,26 @@ describe("Account section", () => {
       });
       const dialog = await screen.findByRole("dialog", { name: /settings/i });
       expect(await within(dialog).findByText("On this Mac only")).toBeInTheDocument();
+    });
+
+    it("names this Mac's configuration as the source of a managed rule", async () => {
+      renderApp("/settings?tab=account", {
+        cloud_status: () => signedOutConfigured(),
+        org_status: () => ({
+          policy: {
+            org_name: "This Mac's configuration",
+            reason: null,
+            local_only: false,
+            retention_days: 0,
+            telemetry_off: true,
+            audio_forbidden: false,
+            rules: [{ kind: "telemetry_off", source: "This Mac's configuration", reason: "" }],
+          },
+        }),
+      });
+      const dialog = await screen.findByRole("dialog", { name: /settings/i });
+      expect(await within(dialog).findByText("Send anonymous usage counters")).toBeInTheDocument();
+      expect(within(dialog).getByRole("button", { name: /managed by this mac's configuration/i })).toBeInTheDocument();
     });
 
     it("is absent when no policy is on", async () => {

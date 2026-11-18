@@ -2,11 +2,18 @@ import { useEffect, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { ipc, type SummaryPrompt } from "./ipc";
 import { useCloudStore } from "./cloud";
-import type { OrgSummary } from "./orgPolicy";
+import type { AdminContent, AdminOrg, OrgSummary } from "./orgPolicy";
 import { SUMMARY_PRESETS, presetLabel } from "./presets";
 
 export function isOrgTemplate(t: SummaryPrompt): boolean {
   return !!t.org_id;
+}
+
+/** The server's `client_id` of an organisation template, from its row id
+ *  (`org_policy::template_row_id`). */
+export function orgTemplateClientId(t: SummaryPrompt): string | null {
+  const prefix = `org_${t.org_id}_`;
+  return t.org_id && t.id.startsWith(prefix) ? t.id.slice(prefix.length) : null;
 }
 
 /** Whether an organisation template is offered in `workspaceId`. In Personal
@@ -97,7 +104,12 @@ export function useOrgContentVersion(): number {
 /** The organisations whose templates and terms apply here. A failed read
  *  shows none. */
 export function useOrgs(): OrgSummary[] {
-  const [orgs, setOrgs] = useState<OrgSummary[]>([]);
+  return useOrgsState() ?? [];
+}
+
+/** [`useOrgs`], but `null` until the first read has answered. */
+export function useOrgsState(): OrgSummary[] | null {
+  const [orgs, setOrgs] = useState<OrgSummary[] | null>(null);
   const cloudStatus = useCloudStore((s) => s.status);
   const version = useOrgContentVersion();
   useEffect(() => {
@@ -111,4 +123,106 @@ export function useOrgs(): OrgSummary[] {
     };
   }, [cloudStatus, version]);
   return orgs;
+}
+
+/** The organisations the signed-in user administers, asked of the server.
+ *  Signed out, offline or on any failure there are none, so nothing offers to
+ *  edit what can't be saved. */
+export function useAdminOrgs(): AdminOrg[] {
+  const [orgs, setOrgs] = useState<AdminOrg[]>([]);
+  const loggedIn = useCloudStore((s) => s.status.logged_in);
+  const userId = useCloudStore((s) => s.status.user?.id ?? "");
+  useEffect(() => {
+    if (!loggedIn) {
+      setOrgs([]);
+      return;
+    }
+    let cancelled = false;
+    ipc
+      .orgAdminOrgs()
+      .then((next) => !cancelled && setOrgs(next ?? []))
+      .catch(() => !cancelled && setOrgs([]));
+    return () => {
+      cancelled = true;
+    };
+  }, [loggedIn, userId]);
+  return orgs;
+}
+
+/** Of `orgs`, the ones the user can edit here: administered, and not waiting
+ *  on the two-factor authentication the organisation requires (`locked`). */
+export function editableOrgs(
+  orgs: OrgSummary[],
+  admin: AdminOrg[],
+  twoFactorOn: boolean,
+): { editable: OrgSummary[]; locked: OrgSummary[] } {
+  const adminOf = (o: OrgSummary) => admin.find((a) => a.id === o.id);
+  return {
+    editable: orgs.filter((o) => {
+      const a = adminOf(o);
+      return a && (!a.require_2fa || twoFactorOn);
+    }),
+    locked: orgs.filter((o) => {
+      const a = adminOf(o);
+      return a && a.require_2fa && !twoFactorOn;
+    }),
+  };
+}
+
+/** An organisation the user administers, with its templates and terms as the
+ *  server holds them (`content`, null until read or when the read failed). */
+export type AdminOrgContent = { summary: OrgSummary; content: AdminContent | null; error: string | null };
+
+/** Every organisation in `admin`, read from the server for editing: an admin
+ *  sees templates for departments they aren't in, which the config leaves out.
+ *  The result stays in this hook's state: nothing caches it, applies it or
+ *  offers it in a picker. Nothing is asked until the config has been read
+ *  (`orgs` non-null), and organisations waiting on two-factor authentication
+ *  are left out. */
+export function useAdminContent(
+  orgs: OrgSummary[] | null,
+  admin: AdminOrg[],
+  twoFactorOn: boolean,
+): { list: AdminOrgContent[]; reload: () => void } {
+  const [content, setContent] = useState<Record<string, { content: AdminContent | null; error: string | null }>>({});
+  const [round, setRound] = useState(0);
+  const readable = orgs === null ? [] : admin.filter((a) => !a.require_2fa || twoFactorOn);
+  const key = readable.map((a) => a.id).join(",");
+  useEffect(() => {
+    if (!key) return;
+    let cancelled = false;
+    for (const id of key.split(",")) {
+      ipc
+        .orgAdminContent(id)
+        .then((c) => !cancelled && setContent((prev) => ({ ...prev, [id]: { content: c, error: null } })))
+        .catch((e) => !cancelled && setContent((prev) => ({ ...prev, [id]: { content: null, error: String(e) } })));
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, [key, round]);
+  return {
+    list: readable.map((a) => {
+      const cached = orgs?.find((o) => o.id === a.id);
+      const read = content[a.id];
+      return {
+        summary: {
+          id: a.id,
+          name: cached?.name ?? a.name,
+          reason: cached?.reason ?? "",
+          vocabulary: read?.content?.vocabulary ?? cached?.vocabulary ?? [],
+          workspaces: cached?.workspaces ?? [],
+        },
+        content: read?.content ?? null,
+        error: read?.error ?? null,
+      };
+    }),
+    reload: () => setRound((r) => r + 1),
+  };
+}
+
+/** Organisation terms exactly as stored: blanks and exact repeats dropped,
+ *  never split on commas. */
+export function storedTerms(vocabulary: string[]): string[] {
+  return [...new Set(vocabulary.filter((t) => t.trim()))];
 }

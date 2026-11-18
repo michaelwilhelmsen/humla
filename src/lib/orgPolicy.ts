@@ -22,6 +22,10 @@ export type EffectivePolicy = {
   rules: PolicyRule[];
 };
 
+/** Who a managed configuration profile's rules name. Mirrors
+ *  `org_policy::MANAGED_SOURCE`. */
+export const MANAGED_SOURCE = "This Mac's configuration";
+
 /** Mirrors `org_policy::OrgSummary`. */
 export type OrgSummary = {
   id: string;
@@ -31,6 +35,19 @@ export type OrgSummary = {
   /** The organisation's departments the user is in. */
   workspaces: string[];
 };
+
+/** Mirrors `commands::org_admin::AdminOrg`. */
+export type AdminOrg = { id: string; name: string; require_2fa: boolean };
+
+/** Mirrors `commands::org_admin::OrgTemplateDraft`: `workspaces` are the
+ *  user's own departments, `hidden` counts the others it is offered to. */
+export type OrgTemplateDraft = { name: string; content: string; workspaces: string[]; hidden: number };
+
+/** Mirrors `commands::org_admin::AdminContent`: an administered organisation
+ *  as the server holds it. Edited only, never applied on this Mac. A
+ *  template's `workspaces` are every department it is offered in; empty is all. */
+export type AdminTemplate = { client_id: string; name: string; content: string; workspaces: string[] };
+export type AdminContent = { templates: AdminTemplate[]; vocabulary: string[] };
 
 /** Days of retention per workspace, from `org_policy::retention_scope`. */
 export type RetentionScope = Record<string, number>;

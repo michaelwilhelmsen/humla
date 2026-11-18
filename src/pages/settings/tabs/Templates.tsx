@@ -3,12 +3,20 @@ import { Copy, Eye, Lock, Pencil, Plus, Trash2 } from "lucide-react";
 import { ipc, type SummaryPrompt } from "../../../lib/ipc";
 import { useCloudStore } from "../../../lib/cloud";
 import {
+  editableOrgs,
+  isOrgTemplate,
+  orgTemplateClientId,
   pickerTemplates,
   useActiveWorkspaceId,
+  useAdminContent,
+  useAdminOrgs,
   useOrgContentVersion,
-  useOrgs,
+  useOrgsState,
 } from "../../../lib/orgContent";
+import type { OrgSummary } from "../../../lib/orgPolicy";
 import { ManagedBadge } from "../ManagedRow";
+import { Segmented } from "../components/Segmented";
+import { Select } from "../../../components/ui/Select";
 import {
   SUMMARY_PRESETS,
   presetLabel,
@@ -23,13 +31,27 @@ const quietBtnClass =
 
 type Draft = { id: string | null; name: string; content: string };
 
+/** An organisation template in its editor. `every` is offered in every
+ *  department; otherwise `workspaces` (the user's own departments) plus the
+ *  `hidden` ones they aren't in, which the backend keeps. */
+type OrgDraft = {
+  orgId: string;
+  clientId: string | null;
+  name: string;
+  content: string;
+  every: boolean;
+  workspaces: string[];
+  hidden: number;
+};
+
 // Templates are `summary_prompts` rows. One created while a team workspace is
 // active belongs to that workspace and syncs to every member, who can all edit
 // it; personal ones stay on this Mac. The server refuses every template write
 // from a viewer, and a new template always lands in the active workspace, so a
 // viewer there can neither edit shared templates nor create one. An
 // organisation's templates are read-only and listed only in the departments
-// they are offered to.
+// they are offered to, except to its admins, who see all of them and edit them
+// on the server.
 export function TemplatesSection({ language }: { language: string }) {
   const [templates, setTemplates] = useState<SummaryPrompt[]>([]);
   const [viewing, setViewing] = useState<{ name: string; content: string; template: string } | null>(null);
@@ -42,8 +64,16 @@ export function TemplatesSection({ language }: { language: string }) {
   const currentRole = useCloudStore((s) => s.status.current_workspace?.role);
   const workspaces = useCloudStore((s) => s.status.workspaces);
   const activeWorkspaceId = useActiveWorkspaceId();
-  const orgs = useOrgs();
+  const orgsState = useOrgsState();
+  const orgs = orgsState ?? [];
   const orgVersion = useOrgContentVersion();
+  const adminOrgs = useAdminOrgs();
+  const twoFactorOn = useCloudStore((s) => s.status.two_factor?.enabled ?? false);
+  const adminContent = useAdminContent(orgsState, adminOrgs, twoFactorOn);
+  const [orgEditing, setOrgEditing] = useState<OrgDraft | null>(null);
+  const [orgEditorError, setOrgEditorError] = useState<string | null>(null);
+  const [orgSaving, setOrgSaving] = useState(false);
+  const [orgError, setOrgError] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -96,10 +126,122 @@ export function TemplatesSection({ language }: { language: string }) {
     setEditing({ id: null, name: `${name} (copy)`, content });
   }
 
-  const { org: fromOrg, own } = pickerTemplates(templates, activeWorkspaceId, orgs);
+  async function openOrgTemplate(t: SummaryPrompt) {
+    const clientId = orgTemplateClientId(t);
+    if (!t.org_id || !clientId) return;
+    try {
+      const d = await ipc.orgTemplateOpen(t.org_id, clientId);
+      setOrgEditorError(null);
+      setOrgEditing({
+        orgId: t.org_id,
+        clientId,
+        name: d.name,
+        content: d.content,
+        every: d.workspaces.length === 0 && d.hidden === 0,
+        workspaces: d.workspaces,
+        hidden: d.hidden,
+      });
+      setOrgError(null);
+    } catch (e) {
+      setOrgError(String(e));
+    }
+  }
+
+  function newOrgTemplate(orgId: string) {
+    setOrgEditorError(null);
+    setOrgEditing({ orgId, clientId: null, name: "", content: "", every: true, workspaces: [], hidden: 0 });
+  }
+
+  async function saveOrg() {
+    if (!orgEditing) return;
+    const d = orgEditing;
+    setOrgSaving(true);
+    try {
+      await ipc.orgTemplateSave(d.orgId, d.clientId, d.name.trim(), d.content, d.every ? null : d.workspaces);
+      setOrgEditing(null);
+      setOrgEditorError(null);
+      setOrgError(null);
+      adminContent.reload();
+      await refresh();
+    } catch (e) {
+      setOrgEditorError(String(e));
+      adminContent.reload();
+    } finally {
+      setOrgSaving(false);
+    }
+  }
+
+  async function removeOrg(t: SummaryPrompt) {
+    const clientId = orgTemplateClientId(t);
+    if (!t.org_id || !clientId) return;
+    try {
+      await ipc.orgTemplateDelete(t.org_id, clientId);
+      setConfirmDeleteId(null);
+      setOrgError(null);
+      adminContent.reload();
+      await refresh();
+    } catch (e) {
+      setConfirmDeleteId(null);
+      setOrgError(String(e));
+    }
+  }
+
+  const { org: offered, own } = pickerTemplates(templates, activeWorkspaceId, orgs);
+  // An administered organisation is listed from the server once read, so its
+  // admins see templates for departments they aren't in; until then, and for
+  // everyone else, from the cache. Server rows are only shown here.
+  const outsideConfig: OrgSummary[] =
+    orgsState === null
+      ? []
+      : adminOrgs
+          .filter((a) => !orgs.some((o) => o.id === a.id))
+          .map((a) => ({ id: a.id, name: a.name, reason: "", vocabulary: [], workspaces: [] }));
+  const { editable: administered, locked: twoFactorLocked } = editableOrgs(
+    [...orgs, ...outsideConfig],
+    adminOrgs,
+    twoFactorOn,
+  );
+  const fromServer = (orgId?: string) => adminContent.list.find((a) => a.summary.id === orgId && a.content);
+  const editable = administered.filter((o) => fromServer(o.id)).map((o) => fromServer(o.id)!.summary);
+  const canAdmin = (t: SummaryPrompt) => !!fromServer(t.org_id);
+  const serverRows: SummaryPrompt[] = adminContent.list.flatMap((a) =>
+    (a.content?.templates ?? []).map((t) => ({
+      id: `org_${a.summary.id}_${t.client_id}`,
+      name: t.name,
+      content: t.content,
+      created_at: 0,
+      updated_at: 0,
+      workspace_id: "",
+      org_id: a.summary.id,
+      org_workspaces: t.workspaces,
+    })),
+  );
+  const fromOrg: SummaryPrompt[] = [
+    ...templates.filter((t) => isOrgTemplate(t) && !fromServer(t.org_id) && offered.includes(t)),
+    ...serverRows,
+  ];
+  const adminErrors = adminContent.list.flatMap((a) => (a.error ? [a.error] : []));
   const shared = own.filter((t) => t.workspace_id);
   const personal = own.filter((t) => !t.workspace_id);
-  const orgsShown = orgs.filter((o) => fromOrg.some((t) => t.org_id === o.id));
+  const orgsShown = orgs.filter(
+    (o) =>
+      fromOrg.some((t) => t.org_id === o.id) ||
+      editable.some((e) => e.id === o.id) ||
+      twoFactorLocked.includes(o),
+  );
+  const departmentLabels = (t: SummaryPrompt) => {
+    const named = departmentNames(t);
+    const others = (t.org_workspaces ?? []).length - named.length;
+    if (others === 0) return named;
+    const word = others === 1 ? "department" : "departments";
+    return [...named, named.length > 0 ? `${others} other ${word}` : `${others} ${word}`];
+  };
+  const showOrgGroup = fromOrg.length > 0 || editable.length > 0 || twoFactorLocked.length > 0;
+  const editingOrg = editable.find((o) => o.id === orgEditing?.orgId);
+  const orgDepartments = (editingOrg?.workspaces ?? []).map((id) => ({
+    id,
+    name: workspaces.find((w) => w.id === id)?.name ?? id,
+  }));
   const departmentNames = (t: SummaryPrompt) =>
     (t.org_workspaces ?? []).flatMap((id) => workspaces.find((w) => w.id === id)?.name ?? []);
   const inWorkspace = workspaceName !== null || shared.length > 0;
@@ -118,27 +260,12 @@ export function TemplatesSection({ language }: { language: string }) {
 
   const ownRow = (t: SummaryPrompt) =>
     confirmDeleteId === t.id ? (
-      <div key={t.id} className="flex items-center justify-between gap-4 py-2.5">
-        <div className="min-w-0">
-          <div className="text-sm truncate">Delete “{t.name}”?</div>
-          <p className="text-xs text-[var(--color-text-muted)] mt-0.5">
-            Notes using it fall back to Meeting.
-          </p>
-        </div>
-        <div className="flex gap-1.5 shrink-0">
-          <button type="button" className="nd-btn" onClick={() => setConfirmDeleteId(null)}>
-            Cancel
-          </button>
-          <button
-            type="button"
-            className="nd-btn"
-            style={{ color: "var(--color-danger)" }}
-            onClick={() => remove(t.id)}
-          >
-            Delete
-          </button>
-        </div>
-      </div>
+      <ConfirmDelete
+        key={t.id}
+        title={`Delete “${t.name}”?`}
+        onCancel={() => setConfirmDeleteId(null)}
+        onDelete={() => remove(t.id)}
+      />
     ) : (
       <TemplateRow
         key={t.id}
@@ -179,47 +306,108 @@ export function TemplatesSection({ language }: { language: string }) {
 
   return (
     <>
-      {fromOrg.length > 0 && (
+      {showOrgGroup && (
         <GroupSection
           title="From your organisation"
           aside={
-            <div className="flex flex-wrap justify-end gap-1">
+            <div className="flex flex-wrap items-center justify-end gap-1">
               {orgsShown.map((o) => (
                 <ManagedBadge key={o.id} source={o.name} reason={o.reason} />
               ))}
+              {editable.length > 0 && (
+                <button type="button" className="nd-btn ml-1" onClick={() => newOrgTemplate(editable[0].id)}>
+                  <Plus size={14} aria-hidden /> New template
+                </button>
+              )}
             </div>
           }
         >
-          {fromOrg.map((t) => (
-            <TemplateRow
-              key={t.id}
-              name={t.name}
-              locked
-              departments={departmentNames(t)}
-              actions={
-                <>
-                  <button
-                    type="button"
-                    className={quietBtnClass}
-                    aria-label={`View ${t.name}`}
-                    onClick={() => setViewing({ name: t.name, content: t.content, template: t.content })}
-                  >
-                    <Eye size={13} aria-hidden /> View
-                  </button>
-                  {canCreate && (
-                    <button
-                      type="button"
-                      className={quietBtnClass}
-                      aria-label={`Duplicate ${t.name}`}
-                      onClick={() => duplicate(t.name, t.content)}
-                    >
-                      <Copy size={13} aria-hidden /> Duplicate
-                    </button>
-                  )}
-                </>
-              }
-            />
+          {fromOrg.map((t) =>
+            confirmDeleteId === t.id ? (
+              <ConfirmDelete
+                key={t.id}
+                title={`Delete “${t.name}” for everyone?`}
+                onCancel={() => setConfirmDeleteId(null)}
+                onDelete={() => removeOrg(t)}
+              />
+            ) : (
+              <TemplateRow
+                key={t.id}
+                name={t.name}
+                locked={!canAdmin(t)}
+                departments={departmentLabels(t)}
+                actions={
+                  canAdmin(t) ? (
+                    <>
+                      <button
+                        type="button"
+                        className={quietBtnClass}
+                        aria-label={`Edit ${t.name}`}
+                        onClick={() => openOrgTemplate(t)}
+                      >
+                        <Pencil size={13} aria-hidden /> Edit
+                      </button>
+                      {canCreate && (
+                        <button
+                          type="button"
+                          className={quietBtnClass}
+                          aria-label={`Duplicate ${t.name}`}
+                          onClick={() => duplicate(t.name, t.content)}
+                        >
+                          <Copy size={13} aria-hidden />
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        className={quietBtnClass}
+                        aria-label={`Delete ${t.name}`}
+                        onClick={() => setConfirmDeleteId(t.id)}
+                      >
+                        <Trash2 size={13} aria-hidden />
+                      </button>
+                    </>
+                  ) : (
+                    <>
+                      <button
+                        type="button"
+                        className={quietBtnClass}
+                        aria-label={`View ${t.name}`}
+                        onClick={() => setViewing({ name: t.name, content: t.content, template: t.content })}
+                      >
+                        <Eye size={13} aria-hidden /> View
+                      </button>
+                      {canCreate && (
+                        <button
+                          type="button"
+                          className={quietBtnClass}
+                          aria-label={`Duplicate ${t.name}`}
+                          onClick={() => duplicate(t.name, t.content)}
+                        >
+                          <Copy size={13} aria-hidden /> Duplicate
+                        </button>
+                      )}
+                    </>
+                  )
+                }
+              />
+            ),
+          )}
+          {fromOrg.length === 0 && editable.length > 0 && <EmptyRow />}
+          {twoFactorLocked.map((o) => (
+            <p key={o.id} className="text-xs text-[var(--color-text-muted)] py-3.5">
+              {o.name} requires two-factor authentication to edit its templates. Set it up in Settings → Account.
+            </p>
           ))}
+          {adminErrors.map((e) => (
+            <p key={e} role="alert" className="text-xs py-3" style={{ color: "var(--color-danger)" }}>
+              {e}
+            </p>
+          ))}
+          {orgError && (
+            <p role="alert" className="text-xs py-3" style={{ color: "var(--color-danger)" }}>
+              {orgError}
+            </p>
+          )}
         </GroupSection>
       )}
 
@@ -309,6 +497,44 @@ export function TemplatesSection({ language }: { language: string }) {
       </Modal>
 
       <Modal
+        open={orgEditing !== null}
+        onClose={() => setOrgEditing(null)}
+        title={orgEditing?.clientId ? "Edit organisation template" : "New organisation template"}
+      >
+        {orgEditing && (
+          <TemplateEditor
+            value={orgEditing}
+            onChange={setOrgEditing}
+            onCancel={() => setOrgEditing(null)}
+            onSave={saveOrg}
+            error={orgEditorError}
+            canSave={
+              !orgSaving && (orgEditing.every || orgEditing.workspaces.length > 0 || orgEditing.hidden > 0)
+            }
+          >
+            {orgEditing.clientId === null && editable.length > 1 && (
+              <div className="flex flex-col gap-1.5">
+                <span className="text-xs font-medium text-[var(--color-text-muted)]">Organisation</span>
+                <Select
+                  ariaLabel="Organisation"
+                  value={orgEditing.orgId}
+                  onChange={(orgId) => setOrgEditing({ ...orgEditing, orgId, workspaces: [] })}
+                  options={editable.map((o) => ({ value: o.id, label: o.name }))}
+                />
+              </div>
+            )}
+            {(orgDepartments.length > 0 || orgEditing.hidden > 0) && (
+              <DepartmentPicker
+                draft={orgEditing}
+                departments={orgDepartments}
+                onChange={(every, chosen) => setOrgEditing({ ...orgEditing, every, workspaces: chosen })}
+              />
+            )}
+          </TemplateEditor>
+        )}
+      </Modal>
+
+      <Modal
         open={editing !== null}
         onClose={() => setEditing(null)}
         title={editing?.id ? "Edit template" : "New template"}
@@ -384,16 +610,96 @@ function TemplateRow({
   );
 }
 
-function TemplateEditor({
+function ConfirmDelete({
+  title,
+  onCancel,
+  onDelete,
+}: {
+  title: string;
+  onCancel: () => void;
+  onDelete: () => void;
+}) {
+  return (
+    <div className="flex items-center justify-between gap-4 py-2.5">
+      <div className="min-w-0">
+        <div className="text-sm truncate">{title}</div>
+        <p className="text-xs text-[var(--color-text-muted)] mt-0.5">Notes using it fall back to Meeting.</p>
+      </div>
+      <div className="flex gap-1.5 shrink-0">
+        <button type="button" className="nd-btn" onClick={onCancel}>
+          Cancel
+        </button>
+        <button type="button" className="nd-btn" style={{ color: "var(--color-danger)" }} onClick={onDelete}>
+          Delete
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function DepartmentPicker({
+  draft,
+  departments,
+  onChange,
+}: {
+  draft: OrgDraft;
+  departments: { id: string; name: string }[];
+  onChange: (every: boolean, workspaces: string[]) => void;
+}) {
+  const toggle = (id: string, on: boolean) =>
+    onChange(false, on ? [...draft.workspaces, id] : draft.workspaces.filter((w) => w !== id));
+  return (
+    <div className="flex flex-col gap-2">
+      <span className="text-xs font-medium text-[var(--color-text-muted)]">Offered in</span>
+      <Segmented
+        label="Offered in"
+        value={draft.every ? "every" : "some"}
+        onChange={(v) => onChange(v === "every", draft.workspaces)}
+        options={[
+          { value: "every", label: "Every department" },
+          { value: "some", label: "Some departments" },
+        ]}
+      />
+      {!draft.every && (
+        <div className="flex flex-col gap-1.5">
+          {departments.map((d) => (
+            <label key={d.id} className="flex items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={draft.workspaces.includes(d.id)}
+                onChange={(e) => toggle(d.id, e.target.checked)}
+                className="h-4 w-4 accent-[var(--color-accent)]"
+              />
+              {d.name}
+            </label>
+          ))}
+          {draft.hidden > 0 && (
+            <p className="text-xs text-[var(--color-text-muted)]">
+              Also offered in {draft.hidden} {draft.hidden === 1 ? "department" : "departments"} you're not in.
+            </p>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function TemplateEditor<T extends { name: string; content: string }>({
   value,
   onChange,
   onCancel,
   onSave,
+  error = null,
+  canSave = true,
+  children,
 }: {
-  value: Draft;
-  onChange: (next: Draft) => void;
+  value: T;
+  onChange: (next: T) => void;
   onCancel: () => void;
   onSave: () => void;
+  error?: string | null;
+  canSave?: boolean;
+  children?: ReactNode;
 }) {
   return (
     <div className="flex flex-col gap-4">
@@ -418,6 +724,12 @@ function TemplateEditor({
           placeholder="What the summary should contain."
         />
       </label>
+      {children}
+      {error && (
+        <p role="alert" className="text-sm" style={{ color: "var(--color-danger)" }}>
+          {error}
+        </p>
+      )}
       <div className="flex justify-end gap-2">
         <button type="button" className="nd-btn" onClick={onCancel}>
           Cancel
@@ -425,7 +737,7 @@ function TemplateEditor({
         <button
           type="button"
           className="nd-btn nd-btn-primary"
-          disabled={!value.name.trim()}
+          disabled={!value.name.trim() || !canSave}
           onClick={onSave}
         >
           Save template

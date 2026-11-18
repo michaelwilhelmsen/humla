@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";
 import { mockTauri } from "../../test/tauri";
-import { NO_POLICY, type EffectivePolicy } from "../../lib/orgPolicy";
+import { MANAGED_SOURCE, NO_POLICY, type EffectivePolicy } from "../../lib/orgPolicy";
 import { TelemetryNotice } from "./TelemetryNotice";
 
 const telemetryOff: EffectivePolicy = {
@@ -45,6 +45,21 @@ describe("TelemetryNotice", () => {
     expect(await screen.findByText(/counters are off/)).toBeTruthy();
     expect(screen.getByRole("button", { name: /Managed by Northwind/ })).toBeTruthy();
     expect(screen.queryByRole("button", { name: /Turn on/ })).toBeNull();
+    expect(writes).toEqual({});
+    expect(events).toEqual([]);
+  });
+
+  it("never opts in under this Mac's configuration, before any sign-in", async () => {
+    const managed: EffectivePolicy = {
+      ...NO_POLICY,
+      org_name: MANAGED_SOURCE,
+      telemetry_off: true,
+      rules: [{ kind: "telemetry_off", source: MANAGED_SOURCE, reason: "" }],
+    };
+    const { writes, events } = backend(null, () => ({ policy: managed, orgs: [], retention: {} }));
+    render(<TelemetryNotice />);
+    expect(await screen.findByText(/counters are off/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: /Managed by This Mac's configuration/ })).toBeTruthy();
     expect(writes).toEqual({});
     expect(events).toEqual([]);
   });
