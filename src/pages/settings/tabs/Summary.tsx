@@ -14,7 +14,7 @@ import { CustomEndpointCard, CustomModelField } from "../../../components/provid
 import { useCopilotStatus } from "../../../components/provider/useCopilot";
 import { SUMMARY_PROVIDERS } from "../types";
 import { ipc, type SummaryPrompt } from "../../../lib/ipc";
-import { useActiveWorkspaceName, useLocalOnly } from "../../../lib/orgPolicy";
+import { useWorkspaceScope, useLocalOnly } from "../../../lib/orgPolicy";
 import { templateOptions, useActiveWorkspaceId, useOrgContentVersion, useOrgs } from "../../../lib/orgContent";
 import { allowedUnderLocalOnly } from "../../../lib/providers";
 import { ManagedRow } from "../ManagedRow";
@@ -42,7 +42,7 @@ export function SummaryTab({
     };
   }, [orgVersion]);
   const { managed, known } = useLocalOnly();
-  const workspaceName = useActiveWorkspaceName();
+  const workspaceScope = useWorkspaceScope();
   const provider = managed ? enforcedLlmProvider(s.summary_provider, s.custom_base_url, "local") : s.summary_provider;
   const isLocal = provider === "local";
   const isAnthropic = known && provider === "anthropic";
@@ -63,7 +63,7 @@ export function SummaryTab({
 
   return (
     <>
-      <Section title="Summaries" scope={workspaceName}>
+      <Section title="Summaries" scope={workspaceScope}>
         {managed ? (
           <ManagedRow
             label="Provider"

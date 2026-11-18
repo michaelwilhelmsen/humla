@@ -8,7 +8,7 @@ import { Row, Section } from "../components/Section";
 import { Toggle } from "../components/Toggle";
 import type { SettingsHook } from "../useSettings";
 import { retainsAudio } from "../../../lib/audioGate";
-import { policySource, useActiveWorkspaceName, useOrgPolicy } from "../../../lib/orgPolicy";
+import { policySource, useWorkspaceScope, useOrgPolicy } from "../../../lib/orgPolicy";
 import { ManagedRow } from "../ManagedRow";
 
 // Recording section: capture permissions, audio retention, and menu-bar mode
@@ -18,7 +18,7 @@ export function RecordingSection({
   update,
 }: Pick<SettingsHook, "s" | "update">) {
   const policy = useOrgPolicy();
-  const workspaceName = useActiveWorkspaceName();
+  const workspaceScope = useWorkspaceScope();
   const audioManaged = policySource(policy, "audio_forbidden");
   const keeping = retainsAudio(s.keep_audio, policy.audio_forbidden);
   const manualTranscription = s.transcribe_manually === "true";
@@ -30,7 +30,7 @@ export function RecordingSection({
         <Permissions />
       </Section>
 
-      <Section title="Audio retention" scope={workspaceName}>
+      <Section title="Audio retention" scope={workspaceScope}>
         {audioManaged ? (
           <ManagedRow
             label="Keep recorded audio"

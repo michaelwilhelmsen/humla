@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { ipc, type ProviderConfig } from "./ipc";
 import { useCloudStore } from "./cloud";
@@ -200,9 +200,9 @@ export function policyRows(policy: EffectivePolicy, orgs: OrgSummary[] = []): Po
   return [...enforced, ...audited];
 }
 
-/** The policies one source enforces, and the departments they apply to (none
- *  for a managed profile, which governs every workspace). */
-export type PolicyGroup = { key: string; source: string; workspaces: string[]; rows: PolicyRow[] };
+/** The policies one source enforces, and the departments they apply to. A
+ *  managed profile governs every workspace. */
+export type PolicyGroup = { key: string; source: string; workspaces: string[]; everyWorkspace: boolean; rows: PolicyRow[] };
 
 /** Each organisation's rules with its departments, then the managed profile's. */
 export function policyGroups(status: Pick<PolicyStatus, "orgPolicies" | "orgs" | "managed">): PolicyGroup[] {
@@ -210,10 +210,11 @@ export function policyGroups(status: Pick<PolicyStatus, "orgPolicies" | "orgs" |
     const org = status.orgs.find((o) => o.id === op.org_id);
     const rows = policyRows(op.policy, org ? [org] : []);
     const source = org?.name ?? op.policy.org_name ?? "";
-    return rows.length > 0 ? [{ key: op.org_id, source, workspaces: op.workspaces, rows }] : [];
+    return rows.length > 0 ? [{ key: op.org_id, source, workspaces: op.workspaces, everyWorkspace: false, rows }] : [];
   });
   const managed = policyRows(status.managed);
-  if (managed.length > 0) groups.push({ key: "managed", source: MANAGED_SOURCE, workspaces: [], rows: managed });
+  if (managed.length > 0)
+    groups.push({ key: "managed", source: MANAGED_SOURCE, workspaces: [], everyWorkspace: true, rows: managed });
   return groups;
 }
 
@@ -255,9 +256,10 @@ export function useNoteOrgPolicy(workspaceId: string | null | undefined): {
 } {
   const ws = workspaceId?.trim() ?? "";
   const { policy, governed, retention, audit } = useOrgPolicyStatus(ws);
+  const named = ws && Object.prototype.hasOwnProperty.call(governed, ws) ? governed[ws] : null;
   return {
     policy,
-    managedBy: (ws && Object.prototype.hasOwnProperty.call(governed, ws) ? governed[ws] : null) ?? null,
+    managedBy: named ?? (ws ? organisationRuleSource(policy) : null),
     retentionDays: retentionDaysFor(retention, ws),
     audit,
   };
@@ -276,11 +278,21 @@ export function useLocalOnly(): { managed: PolicyRule | null; known: boolean } {
   return { managed: localOnlySource(policy), known };
 }
 
-/** The name Settings shows for the workspace a governed section applies to. */
-export function useActiveWorkspaceName(): string {
-  return useCloudStore(
+/** Who among the organisations governs notes under `policy`, or null: the
+ *  source of its first note rule that isn't the managed profile. */
+export function organisationRuleSource(policy: EffectivePolicy): string | null {
+  const kinds: PolicyKind[] = ["local_only", "audio_forbidden", "retention_days"];
+  return policy.rules.find((r) => kinds.includes(r.kind) && r.source !== MANAGED_SOURCE)?.source ?? null;
+}
+
+/** The workspace name Settings shows on a section a policy can govern, or
+ *  undefined when no organisation is cached, so Settings stay as they were. */
+export function useWorkspaceScope(): string | undefined {
+  const { orgs } = useOrgPolicyStatus("");
+  const name = useCloudStore(
     (s) => s.status.current_workspace?.name ?? s.status.locked_current_workspace?.name ?? "Personal",
   );
+  return orgs.length > 0 ? name : undefined;
 }
 
 type PolicyStatus = {
@@ -310,9 +322,16 @@ const UNKNOWN: PolicyStatus = {
 function useOrgPolicyStatus(workspaceId: string): PolicyStatus {
   const [state, setState] = useState<PolicyStatus>(UNKNOWN);
   const cloudStatus = useCloudStore((s) => s.status);
+  const loadedFor = useRef(workspaceId);
 
   useEffect(() => {
     let cancelled = false;
+    // The previous workspace's policy would show its rows until this one
+    // lands; what isn't per workspace stays.
+    if (loadedFor.current !== workspaceId) {
+      loadedFor.current = workspaceId;
+      setState((s) => ({ ...s, policy: NO_POLICY, known: false }));
+    }
     const load = () =>
       ipc
         .orgStatus(workspaceId)

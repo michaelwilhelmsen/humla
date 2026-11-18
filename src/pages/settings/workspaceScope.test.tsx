@@ -42,7 +42,10 @@ function backend() {
     org_status: (args) => {
       const ws = (args as { workspaceId: string | null }).workspaceId;
       asked.push(ws);
-      return { policy: ws === "w1" ? NORTHWIND : NO_POLICY };
+      return {
+        policy: ws === "w1" ? NORTHWIND : NO_POLICY,
+        orgs: [{ id: "o1", name: "Northwind", reason: "", vocabulary: [], workspaces: ["w1"] }],
+      };
     },
   });
   return asked;
@@ -61,6 +64,16 @@ describe("Settings follow the active workspace", () => {
     await waitFor(() => expect(screen.queryByRole("button", { name: /Managed by/ })).toBeNull());
     expect(screen.getByText("Personal")).toBeInTheDocument();
     expect(screen.getByRole("combobox", { name: /OpenAI/ })).not.toBeDisabled();
+  });
+
+  it("names no workspace for someone in no organisation", async () => {
+    mockTauri({ org_status: () => ({ policy: NO_POLICY, orgs: [] }) });
+    switchTo({ id: "w2", name: "Screenpartner" });
+    render(<SummaryTab s={settings({ summary_provider: "openai" })} update={async () => {}} />);
+    await screen.findByRole("combobox", { name: /OpenAI/ });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(screen.queryByText("Screenpartner")).toBeNull();
+    expect(screen.getByRole("heading", { name: "Summaries" })).toHaveTextContent(/^Summaries$/);
   });
 
   it("keeps recorded audio managed only in the governed department", async () => {

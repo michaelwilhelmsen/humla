@@ -25,7 +25,7 @@ import {
   isOllamaUrl,
 } from "../../../lib/localModels";
 import { ipc } from "../../../lib/ipc";
-import { useActiveWorkspaceName, useLocalOnly } from "../../../lib/orgPolicy";
+import { useWorkspaceScope, useLocalOnly } from "../../../lib/orgPolicy";
 import { ManagedRow } from "../ManagedRow";
 import { enforcedLlmProvider } from "./Summary";
 import type { SettingsHook } from "../useSettings";
@@ -47,7 +47,7 @@ export function modelSuitsProvider(model: string, provider: string): boolean {
 
 export function ChatTab({ s, update }: Pick<SettingsHook, "s" | "update">) {
   const { managed, known } = useLocalOnly();
-  const workspaceName = useActiveWorkspaceName();
+  const workspaceScope = useWorkspaceScope();
   const provider = managed ? enforcedLlmProvider(s.chat_provider, s.custom_base_url, "ollama") : s.chat_provider;
   const isOllama = provider === "ollama" || (managed !== null && provider === "local");
   const isAnthropic = known && provider === "anthropic";
@@ -108,7 +108,7 @@ export function ChatTab({ s, update }: Pick<SettingsHook, "s" | "update">) {
   ];
 
   return (
-    <Section title="AI Chat" scope={workspaceName}>
+    <Section title="AI Chat" scope={workspaceScope}>
       <p className="text-xs text-[var(--color-text-muted)] leading-relaxed py-3.5">
         Workspace chat is set under Account → Workspace chat.
       </p>
