@@ -769,7 +769,7 @@ pub async fn cloud_verify_two_factor(
 // ---- managing two-factor authentication -------------------------------------
 
 #[derive(Clone, Copy)]
-enum Verb {
+pub(crate) enum Verb {
     Get,
     Post,
     Patch,
@@ -778,7 +778,7 @@ enum Verb {
 /// A request to a two-factor route or a workspace record, as the signed-in user:
 /// the session is renewed and the request sent once more if the server refuses
 /// its token. Failures read through [`route_error`].
-async fn authed_call(
+pub(crate) async fn authed_call(
     state: &State<'_, AppState>,
     verb: Verb,
     path: &str,
