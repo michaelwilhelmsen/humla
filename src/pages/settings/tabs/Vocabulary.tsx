@@ -1,7 +1,15 @@
 import { useState } from "react";
 import { Lock, X } from "lucide-react";
 import { Section } from "../components/Section";
-import { editableOrgs, orgTerms, storedTerms, useAdminContent, useAdminOrgs, useOrgsState } from "../../../lib/orgContent";
+import {
+  editableOrgs,
+  orgTerms,
+  storedTerms,
+  useActiveWorkspaceId,
+  useAdminContent,
+  useAdminOrgs,
+  useOrgsState,
+} from "../../../lib/orgContent";
 import { useCloudStore } from "../../../lib/cloud";
 import { ipc } from "../../../lib/ipc";
 import type { OrgSummary } from "../../../lib/orgPolicy";
@@ -60,12 +68,18 @@ export function VocabularySection({ s, update }: Pick<SettingsHook, "s" | "updat
   );
   const read = (id: string) => adminContent.list.find((a) => a.summary.id === id && a.content);
   const editable = administered.flatMap((o) => read(o.id)?.summary ?? []);
-  const locked = orgTerms(orgs.filter((o) => !editable.some((e) => e.id === o.id)));
+  // An organisation's terms apply to notes in its own departments.
+  const activeWorkspaceId = useActiveWorkspaceId();
+  const inScope = (o: OrgSummary) => activeWorkspaceId !== "" && o.workspaces.includes(activeWorkspaceId);
+  const locked = orgTerms(orgs.filter((o) => inScope(o) && !editable.some((e) => e.id === o.id)));
   const [draft, setDraft] = useState("");
   const full = terms.length >= VOCABULARY_LIMIT;
   const candidates = splitDraft(draft);
   const badged = orgs.filter(
-    (o) => o.vocabulary.some((t) => t.trim()) || editable.some((e) => e.id === o.id) || twoFactorLocked.includes(o),
+    (o) =>
+      (inScope(o) && o.vocabulary.some((t) => t.trim())) ||
+      editable.some((e) => e.id === o.id) ||
+      twoFactorLocked.includes(o),
   );
 
   function add() {

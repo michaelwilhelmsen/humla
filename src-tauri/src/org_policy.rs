@@ -321,11 +321,16 @@ pub(crate) fn summaries(config: Option<&OrgConfig>) -> Vec<OrgSummary> {
         .unwrap_or_default()
 }
 
-/// Every organisation's terms in order. Nothing cached, or a cache that can't
-/// be read, adds none.
-pub(crate) fn vocabulary(conn: &Connection) -> Vec<String> {
+/// The terms of the organisation owning `workspace_id`, in order. Personal, a
+/// workspace in no organisation, nothing cached, or a cache that can't be read
+/// adds none.
+pub(crate) fn vocabulary_for(conn: &Connection, workspace_id: Option<&str>) -> Vec<String> {
     match cached(conn) {
-        Ok(config) => config.into_iter().flat_map(|c| c.orgs).flat_map(|o| o.vocabulary).collect(),
+        Ok(config) => config
+            .iter()
+            .flat_map(|c| orgs_for(c, workspace_id))
+            .flat_map(|o| o.vocabulary.iter().cloned())
+            .collect(),
         Err(e) => {
             eprintln!("org policy: unreadable, no organisation terms: {e:#}");
             Vec::new()
@@ -1014,6 +1019,15 @@ pub(crate) fn retention_rule(conn: &Connection, workspace_id: &str) -> Option<Re
     retention_in_force(conn).remove(workspace_id)
 }
 
+/// Whether an organisation owning `workspace_id` forbids audio, read from a
+/// cache that parses cleanly: only that may delete audio.
+pub(crate) fn forbids_audio(conn: &Connection, workspace_id: &str) -> bool {
+    match cached(conn) {
+        Ok(Some(config)) => orgs_for(&config, Some(workspace_id)).iter().any(|o| o.policy.audio_forbidden),
+        _ => false,
+    }
+}
+
 /// Notes created before the returned time are past `days` at `now_ms`.
 pub(crate) fn retention_cutoff(now_ms: i64, days: u32) -> i64 {
     now_ms.saturating_sub(i64::from(days).saturating_mul(DAY_MS))
@@ -1668,10 +1682,10 @@ mod tests {
     #[test]
     fn no_organisation_adds_no_rows_and_no_terms() {
         let (_d, conn) = conn();
-        assert!(vocabulary(&conn).is_empty());
+        assert!(vocabulary_for(&conn, Some("w1")).is_empty());
         assert!(!apply_templates(&conn, &OrgConfig::default()).unwrap());
         store(&conn, &classify(200, r#"{"orgs":[]}"#)).unwrap();
-        assert!(vocabulary(&conn).is_empty());
+        assert!(vocabulary_for(&conn, Some("w1")).is_empty());
         assert!(summaries(cached(&conn).unwrap().as_ref()).is_empty());
     }
 
@@ -1684,12 +1698,25 @@ mod tests {
     }
 
     #[test]
-    fn terms_come_from_every_organisation_in_order() {
+    fn terms_come_only_from_the_organisation_owning_the_department() {
         let (_d, conn) = conn();
         cache_one_org(&conn);
-        assert_eq!(vocabulary(&conn), ["Northwind"]);
+        assert_eq!(vocabulary_for(&conn, Some("w1")), ["Northwind"]);
+        for ws in [None, Some(""), Some("w2")] {
+            assert!(vocabulary_for(&conn, ws).is_empty(), "{ws:?}");
+        }
         crate::db::set_setting(&conn, SETTING_ORG_CONFIG, "{not json").unwrap();
-        assert!(vocabulary(&conn).is_empty());
+        assert!(vocabulary_for(&conn, Some("w1")).is_empty());
+    }
+
+    #[test]
+    fn only_a_clean_cache_forbids_audio_for_a_move() {
+        let (_d, conn) = conn();
+        assert!(store(&conn, &classify(200, TWO_ORGS)).unwrap());
+        assert!(forbids_audio(&conn, "wa"));
+        assert!(!forbids_audio(&conn, "wb") && !forbids_audio(&conn, ""));
+        crate::db::set_setting(&conn, SETTING_ORG_CONFIG, "{not json").unwrap();
+        assert!(!forbids_audio(&conn, "wa"));
     }
 
     #[test]
