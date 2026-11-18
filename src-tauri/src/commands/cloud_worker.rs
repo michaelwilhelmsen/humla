@@ -146,8 +146,8 @@ impl Manager {
         self.running.lock().abort();
     }
 
-    /// Refresh the organisation config while the worker runs, paced by
-    /// `org::next_delay`: back off while the server can't be reached, stop on a
+    /// Refresh the organisation config while the worker runs, then send the
+    /// queued audit reports, paced by `org::next_delay`: back off while the server can't be reached, stop on a
     /// server without the route until a refresh hears it answer. Without a
     /// session it skips the round, leaving the cache in force.
     fn org_refresh_loop(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
@@ -163,6 +163,9 @@ impl Manager {
                     Ok((base, session)) => Some(org::refresh_org_config(&db, &app, &base, &session.token).await),
                     Err(_) => None,
                 };
+                if attempt.is_some() {
+                    crate::org_audit::flush(&db, &cache).await;
+                }
                 delay = match org::next_delay(delay, attempt) {
                     Some(next) => next,
                     None => {

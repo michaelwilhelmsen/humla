@@ -66,15 +66,16 @@ pub fn open_db(path: &Path) -> anyhow::Result<Connection> {
     crate::db::open(path)
 }
 
-/// Whether this database already has every column the tools read. A single prepared
+/// Whether this database already has every column the tools read, and the audit
+/// queue they write to. A single prepared
 /// statement that is never run: preparing it resolves every name against the live
 /// schema, which is the whole question, and `LIMIT 0` means it would touch no rows
 /// even if it were.
 fn schema_is_current(conn: &Connection) -> bool {
     const PROBE: &str = "SELECT n.id, n.title, n.body, n.transcript, n.summary, n.language, \
          n.detected_language, n.speakers, n.folder_id, n.client_id, n.workspace_id, \
-         n.deleted_at, n.created_at, c.seq, c.source, c.text, c.speakers \
-         FROM notes n, note_chunks c, note_chunks_fts f, clients, folders LIMIT 0";
+         n.deleted_at, n.created_at, c.seq, c.source, c.text, c.speakers, q.format \
+         FROM notes n, note_chunks c, note_chunks_fts f, clients, folders, org_audit_queue q LIMIT 0";
     conn.prepare(PROBE).is_ok()
 }
 

@@ -19,6 +19,9 @@ pub struct OrgStatus {
     pub orgs: Vec<OrgSummary>,
     /// Days of retention per workspace (`org_policy::retention_scope`).
     pub retention: BTreeMap<String, u32>,
+    /// Each organisation workspace, with whether opening a note there is
+    /// recorded (`org_audit::scope`).
+    pub audit: BTreeMap<String, bool>,
 }
 
 #[tauri::command]
@@ -27,7 +30,28 @@ pub fn org_status(state: State<'_, AppState>) -> Result<OrgStatus, String> {
     let policy = org_policy::effective(&conn).map_err(|e| format!("organisation policy: {e}"))?;
     let config = org_policy::cached(&conn).map_err(|e| format!("organisation policy: {e}"))?;
     let retention = config.as_ref().map(org_policy::retention_scope).unwrap_or_default();
-    Ok(OrgStatus { policy, orgs: org_policy::summaries(config.as_ref()), retention })
+    let audit = config.as_ref().map(crate::org_audit::scope).unwrap_or_default();
+    Ok(OrgStatus { policy, orgs: org_policy::summaries(config.as_ref()), retention, audit })
+}
+
+/// A note was opened in the app: queued for its organisation's audit log under
+/// `audit_reads`, once per note per few minutes.
+#[tauri::command]
+pub fn audit_note_opened(state: State<'_, AppState>, note_id: String) -> Result<(), String> {
+    audit_note(&state, &note_id, crate::org_audit::Action::Open)
+}
+
+/// A panel's Copy button copied the note's text.
+#[tauri::command]
+pub fn audit_note_copied(state: State<'_, AppState>, note_id: String) -> Result<(), String> {
+    audit_note(&state, &note_id, crate::org_audit::Action::Export(crate::org_audit::Format::Copy))
+}
+
+fn audit_note(state: &State<'_, AppState>, note_id: &str, action: crate::org_audit::Action) -> Result<(), String> {
+    let conn = state.db.lock();
+    let note = db::get_note(&conn, note_id).map_err(|e| e.to_string())?;
+    crate::org_audit::record(&conn, action, &note.workspace_id, &note.id);
+    Ok(())
 }
 
 /// The organisation whose `audio_forbidden` still owes the sweep of audio on
@@ -124,7 +148,13 @@ pub(crate) async fn refresh_org_config(
     }
     let changes = {
         let conn = db.lock();
-        apply_fetch(&conn, &outcome)
+        let changes = apply_fetch(&conn, &outcome);
+        if let Some(session) = super::cloud_auth::cached_session() {
+            if let Err(e) = crate::org_audit::adopt_account(&conn, &session.user_id) {
+                eprintln!("org audit: couldn't switch accounts: {e:#}");
+            }
+        }
+        changes
     };
     if changes.policy || changes.retention {
         let _ = app.emit("org_policy_changed", ());
@@ -153,9 +183,15 @@ pub(crate) fn apply_fetch(conn: &rusqlite::Connection, outcome: &FetchOutcome) -
     let before = org_policy::effective(conn).ok();
     let retention_before = org_policy::retention_in_force(conn);
     let orgs_before = org_policy::cached(conn).ok().map(|c| org_policy::summaries(c.as_ref()));
+    let audit_before = crate::org_audit::scope_in_force(conn);
     let stored = org_policy::store(conn, outcome).inspect_err(|e| {
         eprintln!("cloud: couldn't cache the organisation config: {e:#}");
     });
+    if let (FetchOutcome::Fetched(config), Ok(true)) = (outcome, &stored) {
+        if config.orgs.is_empty() {
+            release_audit_queue(conn);
+        }
+    }
     let after = org_policy::effective(conn).ok();
     let orgs_after = org_policy::cached(conn).ok().map(|c| org_policy::summaries(c.as_ref()));
     let templates = match (outcome, stored) {
@@ -167,10 +203,20 @@ pub(crate) fn apply_fetch(conn: &rusqlite::Connection, outcome: &FetchOutcome) -
     };
     let settings = apply_policy_to_settings(conn);
     Changes {
-        policy: before != after,
+        policy: before != after || audit_before != crate::org_audit::scope_in_force(conn),
         settings,
         content: templates || orgs_before != orgs_after,
         retention: retention_before != org_policy::retention_in_force(conn),
+    }
+}
+
+/// An authenticated answer listing no organisation: the user left, or was
+/// removed from, every one, so their queued reports go too.
+fn release_audit_queue(conn: &rusqlite::Connection) {
+    match crate::org_audit::discard_all(conn) {
+        Ok(0) => {}
+        Ok(n) => eprintln!("org audit: in no organisation any more, discarded {n} reports"),
+        Err(e) => eprintln!("org audit: couldn't discard the queue: {e:#}"),
     }
 }
 
@@ -510,6 +556,47 @@ mod tests {
     }
 
     const EMPTY: &str = r#"{"orgs":[]}"#;
+
+    fn audit_org(reads: bool) -> String {
+        format!(
+            r#"{{"orgs":[{{"id":"o1","name":"Northwind","policy":{{"local_only":false,"retention_days":0,"telemetry_off":false,"audio_forbidden":false,"audit_reads":{reads}}},"workspaces":["w1aaaaaaaaaaaaa"]}}]}}"#
+        )
+    }
+
+    fn queue_len(conn: &rusqlite::Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM org_audit_queue", [], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn only_a_confirmed_leave_discards_the_audit_queue() {
+        use crate::org_audit::{record, Action, Format};
+        let (_d, conn) = conn();
+        apply_fetch(&conn, &org_policy::classify(200, &audit_org(false)));
+        crate::org_audit::adopt_account(&conn, "u1").unwrap();
+        assert!(record(&conn, Action::Export(Format::Pdf), "w1aaaaaaaaaaaaa", "n1"));
+        for outcome in [
+            FetchOutcome::SignedOut,
+            FetchOutcome::TwoFactorRequired,
+            FetchOutcome::Unsupported,
+            FetchOutcome::Failed("timeout".into()),
+            org_policy::classify(200, "{}"),
+        ] {
+            apply_fetch(&conn, &outcome);
+            assert_eq!(queue_len(&conn), 1, "{outcome:?}");
+        }
+        assert!(record(&conn, Action::AudioSave, "w1aaaaaaaaaaaaa", "n1"), "signed out, the cache still records");
+        apply_fetch(&conn, &org_policy::classify(200, EMPTY));
+        assert_eq!(queue_len(&conn), 0);
+        assert!(!record(&conn, Action::AudioSave, "w1aaaaaaaaaaaaa", "n1"), "and records nothing more");
+    }
+
+    #[test]
+    fn audit_reads_turning_on_is_a_policy_change() {
+        let (_d, conn) = conn();
+        apply_fetch(&conn, &org_policy::classify(200, &audit_org(false)));
+        assert!(apply_fetch(&conn, &org_policy::classify(200, &audit_org(true))).policy);
+        assert!(!apply_fetch(&conn, &org_policy::classify(200, &audit_org(true))).policy);
+    }
 
     #[test]
     fn the_first_empty_answer_changes_nothing() {

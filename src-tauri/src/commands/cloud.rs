@@ -679,6 +679,9 @@ pub async fn cloud_status(
         super::cloud_auth::fetch_two_factor_status(&base_url, &session.token),
         super::org::refresh_org_config(&state.db, &app, &base_url, &session.token),
     );
+    // After sign-in too, when no workspace is selected and the worker isn't running.
+    let (db, cache) = (state.db.clone(), state.keychain_cache.clone());
+    tauri::async_runtime::spawn(async move { crate::org_audit::flush(&db, &cache).await });
     let workspaces = match workspaces {
         Ok(ws) => ws,
         // Don't crash status on a transient list failure, but don't swallow it
@@ -1224,6 +1227,7 @@ pub async fn cloud_delete_workspace(
     let path = format!("/api/collections/workspaces/records/{workspace_id}");
     authed_delete(&base, &session.token, &path).await?;
     clear_roster_cache(&state, &workspace_id); // the cache dies with the workspace (#116)
+    discard_audit_queue(&state, &workspace_id);
     if read_workspace_id(&state).as_deref() == Some(workspace_id.as_str()) {
         {
             let conn = state.db.lock();
@@ -1232,6 +1236,12 @@ pub async fn cloud_delete_workspace(
         state.sync.config_changed(); // deleted the active workspace → stop syncing
     }
     Ok(())
+}
+
+fn discard_audit_queue(state: &State<'_, AppState>, workspace_id: &str) {
+    if let Err(e) = crate::org_audit::discard_workspace(&state.db.lock(), workspace_id) {
+        eprintln!("org audit: couldn't discard a workspace's reports: {e:#}");
+    }
 }
 
 /// Leave a workspace (remove yourself). Goes through the server-side hook
@@ -1245,6 +1255,8 @@ pub async fn cloud_leave_workspace(
     state: State<'_, AppState>,
     workspace_id: String,
 ) -> Result<(), String> {
+    // What was recorded while still a member is reported before leaving.
+    crate::org_audit::flush(&state.db, &state.keychain_cache).await;
     let (base, session) = ensure_session(&state).await?;
     let resp = http()
         .post(format!("{base}/api/humla/leave-workspace"))
@@ -1255,6 +1267,7 @@ pub async fn cloud_leave_workspace(
         .map_err(|e| e.to_string())?;
     pb_json(resp).await?; // surfaces the hook's message (e.g. owner-can't-leave)
     clear_roster_cache(&state, &workspace_id); // the cache dies with the membership (#116)
+    discard_audit_queue(&state, &workspace_id);
     super::org::refresh_org_config(&state.db, &app, &base, &session.token).await;
     if read_workspace_id(&state).as_deref() == Some(workspace_id.as_str()) {
         {
