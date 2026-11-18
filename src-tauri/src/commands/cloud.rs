@@ -691,7 +691,7 @@ pub async fn cloud_status(
         fetch_billing_config(&base_url),
         super::cloud_auth::fetch_two_factor_status(&base_url, &session.token),
         super::org::refresh_org_config(&state.db, &app, &base_url, &session.token),
-        super::invites::refresh(&app, &base_url, &session.token),
+        super::invites::refresh(&app, &base_url, &session),
     );
     // After sign-in too, when no workspace is selected and the worker isn't running.
     let (db, cache) = (state.db.clone(), state.keychain_cache.clone());

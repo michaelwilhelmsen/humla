@@ -21,10 +21,9 @@ const WITHDRAW_PATH: &str = "/api/humla/invites/withdraw";
 /// Sent with the whole list whenever it changes.
 pub(crate) const CHANGED_EVENT: &str = "org_invites_changed";
 
-/// The sync worker asks at most this often; `cloud_status` (window focus)
-/// always asks.
-#[cfg_attr(not(feature = "cloud"), allow(dead_code))]
-const WORKER_INTERVAL: Duration = Duration::from_secs(60);
+/// The most often the list is fetched, unless the account changed, its email
+/// was just verified, or an invite was answered here.
+const INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct OrgInvite {
@@ -40,6 +39,39 @@ pub struct OrgInvite {
     pub invited_by_name: String,
     #[serde(default)]
     pub created: String,
+    /// The organisation's policies, which apply here once joined. `None` from a
+    /// server that doesn't send them.
+    #[serde(default, deserialize_with = "lenient")]
+    pub policy: Option<InvitePolicy>,
+    #[serde(default)]
+    pub policy_reason: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct InvitePolicy {
+    #[serde(default)]
+    pub local_only: bool,
+    /// Days before notes are deleted; 0 is off.
+    #[serde(default)]
+    pub retention_days: u32,
+    #[serde(default)]
+    pub telemetry_off: bool,
+    #[serde(default)]
+    pub audio_forbidden: bool,
+}
+
+/// A policy that doesn't read is left out rather than losing the invite.
+/// PocketBase numbers may arrive as `30.0`.
+fn lenient<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<InvitePolicy>, D::Error> {
+    let value = Option::<serde_json::Value>::deserialize(d)?;
+    let Some(serde_json::Value::Object(mut obj)) = value else {
+        return Ok(None);
+    };
+    if let Some(days) = obj.get("retention_days").and_then(|v| v.as_f64()) {
+        let days = if days.is_finite() && days > 0.0 { days.min(u32::MAX as f64).round() as u32 } else { 0 };
+        obj.insert("retention_days".into(), days.into());
+    }
+    Ok(serde_json::from_value(serde_json::Value::Object(obj)).ok())
 }
 
 #[derive(Deserialize)]
@@ -68,9 +100,82 @@ pub(crate) fn parse_pending(body: &serde_json::Value) -> Vec<PendingInvite> {
         .unwrap_or_default()
 }
 
-/// The pending invites last heard from the server.
-static INVITES: Mutex<Vec<OrgInvite>> = Mutex::new(Vec::new());
-static LAST_FETCH: Mutex<Option<Instant>> = Mutex::new(None);
+/// The pending invites last heard from the server, and whose they are.
+static STORE: Mutex<Store> = Mutex::new(Store::new());
+
+struct Store {
+    user: String,
+    verified: bool,
+    /// Bumped by every local change, so a fetch that started before one can't
+    /// undo it.
+    generation: u64,
+    list: Vec<OrgInvite>,
+    last_fetch: Option<Instant>,
+}
+
+/// Who a fetch is for, and the state it started from.
+#[derive(Debug)]
+struct Ticket {
+    user: String,
+    generation: u64,
+}
+
+impl Store {
+    const fn new() -> Self {
+        Self { user: String::new(), verified: false, generation: 0, list: Vec::new(), last_fetch: None }
+    }
+
+    fn due(&self, user: &str, verified: bool, now: Instant) -> bool {
+        self.user != user || self.verified != verified || self.last_fetch.is_none_or(|t| now.duration_since(t) >= INTERVAL)
+    }
+
+    /// Start a fetch for `user`. Another account's list goes first; returns
+    /// whether that dropped anything.
+    fn begin(&mut self, user: &str, verified: bool, now: Instant) -> (Ticket, bool) {
+        let mut dropped = false;
+        if self.user != user {
+            dropped = !self.list.is_empty();
+            self.user = user.to_string();
+            self.list.clear();
+            self.generation += 1;
+        }
+        self.verified = verified;
+        self.last_fetch = Some(now);
+        (Ticket { user: user.to_string(), generation: self.generation }, dropped)
+    }
+
+    /// Take a fetch's list, unless the account or the list changed since it
+    /// started. Returns whether the list changed.
+    fn apply(&mut self, ticket: &Ticket, list: Vec<OrgInvite>) -> bool {
+        if ticket.user != self.user || ticket.generation != self.generation || self.list == list {
+            return false;
+        }
+        self.list = list;
+        true
+    }
+
+    fn forget(&mut self, invite_id: &str) -> bool {
+        self.generation += 1;
+        self.last_fetch = None;
+        let before = self.list.len();
+        self.list.retain(|i| i.id != invite_id);
+        self.list.len() != before
+    }
+
+    fn clear(&mut self) {
+        let generation = self.generation + 1;
+        *self = Self::new();
+        self.generation = generation;
+    }
+
+    fn list_for(&self, user: &str) -> Vec<OrgInvite> {
+        if self.user == user {
+            self.list.clone()
+        } else {
+            Vec::new()
+        }
+    }
+}
 
 /// The list a reply to `GET /api/humla/invites` gives, or `None` when it says
 /// nothing about it and the last list stands. 404 is a server without invites.
@@ -82,34 +187,13 @@ pub(crate) fn parse_list(status: u16, body: &str) -> Option<Vec<OrgInvite>> {
     }
 }
 
-/// Make `list` the known one. Returns whether it changed.
-fn replace(slot: &Mutex<Vec<OrgInvite>>, list: Vec<OrgInvite>) -> bool {
-    let mut current = slot.lock();
-    if *current == list {
-        return false;
-    }
-    *current = list;
-    true
-}
-
-fn remove(slot: &Mutex<Vec<OrgInvite>>, invite_id: &str) -> bool {
-    let mut current = slot.lock();
-    let before = current.len();
-    current.retain(|i| i.id != invite_id);
-    current.len() != before
-}
-
-pub(crate) fn known() -> Vec<OrgInvite> {
-    INVITES.lock().clone()
-}
-
-/// Forget the list, on sign-out: it belongs to the account.
+/// Forget the list on every change of account: it belongs to the account.
 pub(crate) fn clear() {
-    replace(&INVITES, Vec::new());
+    STORE.lock().clear();
 }
 
-fn announce(app: &tauri::AppHandle) {
-    let _ = app.emit(CHANGED_EVENT, known());
+fn announce(app: &tauri::AppHandle, list: Vec<OrgInvite>) {
+    let _ = app.emit(CHANGED_EVENT, list);
 }
 
 async fn fetch(base: &str, token: &str) -> Option<Vec<OrgInvite>> {
@@ -123,30 +207,39 @@ async fn fetch(base: &str, token: &str) -> Option<Vec<OrgInvite>> {
     parse_list(status, &body)
 }
 
-/// Ask the server for the pending invites, announce a change, and return the
-/// list now known. A failed request keeps the last one.
-pub(crate) async fn refresh(app: &tauri::AppHandle, base: &str, token: &str) -> Vec<OrgInvite> {
-    *LAST_FETCH.lock() = Some(Instant::now());
-    if let Some(list) = fetch(base, token).await {
-        if replace(&INVITES, list) {
-            announce(app);
+/// Ask the server for `session`'s pending invites when due, announce a change,
+/// and return the list now known for that account. A failed request keeps the
+/// last one.
+pub(crate) async fn refresh(app: &tauri::AppHandle, base: &str, session: &super::cloud_auth::Session) -> Vec<OrgInvite> {
+    let user = session.user_id.as_str();
+    let ticket = {
+        let mut store = STORE.lock();
+        if !store.due(user, session.verified, Instant::now()) {
+            return store.list_for(user);
+        }
+        let (ticket, dropped) = store.begin(user, session.verified, Instant::now());
+        if dropped {
+            announce(app, Vec::new());
+        }
+        ticket
+    };
+    if let Some(list) = fetch(base, &session.token).await {
+        let mut store = STORE.lock();
+        if store.apply(&ticket, list) {
+            let list = store.list.clone();
+            drop(store);
+            announce(app, list);
         }
     }
-    known()
-}
-
-/// [`refresh`] for the sync worker's round, at most once per [`WORKER_INTERVAL`].
-#[cfg_attr(not(feature = "cloud"), allow(dead_code))]
-pub(crate) async fn refresh_if_due(app: &tauri::AppHandle, base: &str, token: &str) {
-    let due = LAST_FETCH.lock().is_none_or(|t| t.elapsed() >= WORKER_INTERVAL);
-    if due {
-        refresh(app, base, token).await;
-    }
+    STORE.lock().list_for(user)
 }
 
 fn forget(app: &tauri::AppHandle, invite_id: &str) {
-    if remove(&INVITES, invite_id) {
-        announce(app);
+    let mut store = STORE.lock();
+    if store.forget(invite_id) {
+        let list = store.list.clone();
+        drop(store);
+        announce(app, list);
     }
 }
 
@@ -259,7 +352,29 @@ mod tests {
             role: "member".into(),
             invited_by_name: "Kari".into(),
             created: "2026-11-18 10:00:00.000Z".into(),
+            policy: None,
+            policy_reason: String::new(),
         }
+    }
+
+    #[test]
+    fn an_invite_carries_its_organisations_policy() {
+        let body = r#"{"invites":[{"id":"i1","workspace_id":"ws1","policy_reason":"Health data.",
+            "policy":{"local_only":true,"retention_days":30.0,"telemetry_off":false,"audio_forbidden":true}}]}"#;
+        let list = parse_list(200, body).unwrap();
+        assert_eq!(
+            list[0].policy,
+            Some(InvitePolicy { local_only: true, retention_days: 30, telemetry_off: false, audio_forbidden: true })
+        );
+        assert_eq!(list[0].policy_reason, "Health data.");
+    }
+
+    #[test]
+    fn a_policy_that_doesnt_read_keeps_the_invite() {
+        let list = parse_list(200, r#"{"invites":[{"id":"i1","workspace_id":"ws1","policy":"strict"}]}"#).unwrap();
+        assert_eq!(list[0].policy, None);
+        let list = parse_list(200, r#"{"invites":[{"id":"i1","workspace_id":"ws1","policy":null}]}"#).unwrap();
+        assert_eq!(list[0].policy, None);
     }
 
     #[test]
@@ -291,20 +406,62 @@ mod tests {
     }
 
     #[test]
-    fn replace_reports_only_a_change() {
-        let slot = Mutex::new(Vec::new());
-        assert!(!replace(&slot, vec![]));
-        assert!(replace(&slot, vec![invite("i1")]));
-        assert!(!replace(&slot, vec![invite("i1")]));
-        assert!(replace(&slot, vec![]));
+    fn a_fetch_takes_effect_only_for_the_account_it_was_for() {
+        let now = Instant::now();
+        let mut store = Store::new();
+        let (a, _) = store.begin("userA", true, now);
+        assert!(store.apply(&a, vec![invite("i1")]));
+        assert_eq!(store.list_for("userA"), vec![invite("i1")]);
+        assert!(store.list_for("userB").is_empty(), "never another account's list");
+
+        // B signs in and starts a fetch that fails: A's invites are gone anyway.
+        let (b, dropped) = store.begin("userB", true, now);
+        assert!(dropped);
+        assert!(store.list_for("userB").is_empty());
+        // A late reply for A is ignored.
+        assert!(!store.apply(&a, vec![invite("i1")]));
+        assert!(store.list_for("userB").is_empty());
+        assert!(store.apply(&b, vec![invite("i2")]));
+        assert_eq!(store.list_for("userB"), vec![invite("i2")]);
     }
 
     #[test]
-    fn remove_drops_one_invite() {
-        let slot = Mutex::new(vec![invite("i1"), invite("i2")]);
-        assert!(remove(&slot, "i1"));
-        assert!(!remove(&slot, "i1"));
-        assert_eq!(slot.lock().iter().map(|i| i.id.as_str()).collect::<Vec<_>>(), ["i2"]);
+    fn a_fetch_in_flight_across_a_sign_out_restores_nothing() {
+        let mut store = Store::new();
+        let (a, _) = store.begin("userA", true, Instant::now());
+        store.clear();
+        assert!(!store.apply(&a, vec![invite("i1")]));
+        assert!(store.list_for("userA").is_empty());
+    }
+
+    #[test]
+    fn an_answered_invite_stays_gone_when_an_older_fetch_lands() {
+        let now = Instant::now();
+        let mut store = Store::new();
+        let (first, _) = store.begin("userA", true, now);
+        store.apply(&first, vec![invite("i1"), invite("i2")]);
+        let (older, _) = store.begin("userA", true, now);
+        assert!(store.forget("i1"));
+        assert!(!store.apply(&older, vec![invite("i1"), invite("i2")]));
+        assert_eq!(store.list_for("userA"), vec![invite("i2")]);
+        assert!(!store.forget("i1"));
+    }
+
+    #[test]
+    fn fetches_are_paced_unless_something_changed() {
+        let now = Instant::now();
+        let mut store = Store::new();
+        assert!(store.due("userA", false, now));
+        store.begin("userA", false, now);
+        assert!(!store.due("userA", false, now + Duration::from_secs(5)), "window focus doesn't refetch");
+        assert!(store.due("userA", false, now + INTERVAL));
+        assert!(store.due("userA", true, now), "a just-verified email asks at once");
+        assert!(store.due("userB", false, now), "so does another account");
+        store.forget("i1");
+        assert!(store.due("userA", false, now), "and an answer given here");
+        store.begin("userA", false, now);
+        store.clear();
+        assert!(store.due("userA", false, now), "and a sign-in");
     }
 
     #[test]

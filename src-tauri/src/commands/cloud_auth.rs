@@ -569,6 +569,7 @@ fn adopt(
         token: Some(session.token.clone()),
     };
     store_account(&state.keychain_cache, Some(&account))?;
+    super::invites::clear();
     adopt_audit_account(&state.db, &session.user_id);
     set_session(Some(session));
     Ok(())
@@ -593,6 +594,7 @@ pub(crate) fn forget_account(cache: &crate::keychain::Cache) {
 }
 
 fn forget_account_with(store: impl FnOnce(Option<&StoredAccount>) -> Result<(), String>) {
+    super::invites::clear();
     if let Err(e) = store(None) {
         eprintln!("cloud: couldn't remove the stored account: {e}");
     }

@@ -162,7 +162,7 @@ impl Manager {
                 let attempt = match super::cloud_auth::ensure_session_from(&db, &cache).await {
                     Ok((base, session)) => {
                         let attempt = org::refresh_org_config(&db, &app, &base, &session.token).await;
-                        super::invites::refresh_if_due(&app, &base, &session.token).await;
+                        super::invites::refresh(&app, &base, &session).await;
                         Some(attempt)
                     }
                     Err(_) => None,
