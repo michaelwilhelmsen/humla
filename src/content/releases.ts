@@ -11,6 +11,25 @@ export type Release = {
 
 export const releases: Release[] = [
   {
+    version: "0.77.0",
+    date: "2026-11-18",
+    title: "Organisations, and a new home for templates",
+    summary: "Templates and vocabulary get their own place in Settings, and Humla is ready for organisations that set rules for their teams.",
+    paragraphs: [
+      "Settings has a new layout. Templates and Vocabulary are now sections of their own at the top, next to the things you set up once, like recording, transcription, summaries and chat. You can view and duplicate the built-in templates, and your vocabulary is a list of terms you can add and remove one by one. A lot of help text that only repeated its label is gone too.",
+      "Humla can now belong to an organisation, with each department as a workspace inside it. An organisation can hand its people approved templates and shared terms, and it can set rules for every Mac in it: keep all processing on the Mac, never keep recorded audio, turn off the anonymous usage counters, or delete notes after a set number of days. A setting a rule decides shows who decides it. Organisation admins edit the templates and terms right in Settings. IT can also set the same rules through a configuration profile on managed Macs, so they apply from the first launch.",
+      "If you're not in an organisation, none of this changes anything for you. One fix reaches everyone: a take recorded with Transcribe manually could be lost if Keep recorded audio was switched off during the recording. It's now transcribed when the recording stops.",
+    ],
+    highlights: [
+      "Templates and Vocabulary have their own sections in Settings.",
+      "Organisations can share templates and terms with their departments.",
+      "Organisation rules for on-Mac processing, audio, usage counters and deletion.",
+      "Configuration profiles for managed Macs.",
+      "A Transcribe manually take is no longer lost when audio keeping is switched off.",
+    ],
+    issues: [],
+  },
+  {
     version: "0.76.1",
     date: "2026-11-17",
     title: "Housekeeping and security fixes",
