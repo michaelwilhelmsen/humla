@@ -2066,6 +2066,17 @@ const CASES: Record<string, Scenario> = {
     render: () => null, // unused — `route` renders the app
     ipc: localOnlyIpc(),
   },
+  // The same organisation, viewed from a workspace outside its departments.
+  "summaries-ungoverned": {
+    route: "/settings?tab=summaries",
+    render: () => null, // unused — `route` renders the app
+    ipc: localOnlyIpc({ inDepartment: false }),
+  },
+  "transcription-ungoverned": {
+    route: "/settings?tab=transcription",
+    render: () => null, // unused — `route` renders the app
+    ipc: localOnlyIpc({ inDepartment: false }),
+  },
 
   // --- audio_forbidden and telemetry_off from an organisation. `org-audio-notice`
   // is the one-time notice before the sweep of audio already on this Mac.
@@ -2376,8 +2387,12 @@ function devicePolicyIpc({ notice }: { notice: boolean }): Record<string, Handle
   };
 }
 
-function localOnlyIpc(): Record<string, Handler> {
+// `inDepartment` puts the active workspace in Northwind's department; off, it is
+// another workspace, where the same settings are the user's own.
+function localOnlyIpc({ inDepartment = true }: { inDepartment?: boolean } = {}): Record<string, Handler> {
   const reason = "Nothing leaves this Mac.";
+  const barnevern = { id: "ws1", name: "Barnevern", role: "member", plan_status: "active" };
+  const screenpartner = { id: "ws2", name: "Screenpartner", role: "owner", plan_status: "active" };
   const stored: Record<string, string> = {
     summary_provider: "anthropic",
     chat_provider: "openai",
@@ -2385,17 +2400,31 @@ function localOnlyIpc(): Record<string, Handler> {
     mcp_enabled: "true",
     webhook_enabled: "true",
   };
+  const governed = {
+    org_name: "Northwind",
+    reason,
+    local_only: true,
+    retention_days: 0,
+    telemetry_off: false,
+    audio_forbidden: false,
+    rules: [{ kind: "local_only", source: "Northwind", reason }],
+  };
+  const none = { ...governed, org_name: null, reason: null, local_only: false, rules: [] };
   return {
-    org_status: () => ({
-      policy: {
-        org_name: "Northwind",
-        reason,
-        local_only: true,
-        retention_days: 0,
-        telemetry_off: false,
-        audio_forbidden: false,
-        rules: [{ kind: "local_only", source: "Northwind", reason }],
-      },
+    cloud_status: () => ({
+      ...DISCONNECTED,
+      configured: true,
+      logged_in: true,
+      base_url: "https://sync.humla.team",
+      user: { id: "u1", email: "m@example.no", name: "Michael", verified: true },
+      current_workspace: inDepartment ? barnevern : screenpartner,
+      workspaces: [barnevern, screenpartner],
+    }),
+    org_status: (args) => ({
+      policy: (args as { workspaceId?: string | null })?.workspaceId === "ws1" ? governed : none,
+      orgs: [{ id: "o1", name: "Northwind", reason, vocabulary: ["Barnevern", "Tiltaksplan"], workspaces: ["ws1"] }],
+      org_policies: [{ org_id: "o1", workspaces: ["ws1"], policy: governed }],
+      governed: { ws1: "Northwind" },
     }),
     settings_get: (args) => stored[(args as { key: string }).key] ?? null,
     get_transcribe_config: () => ({
