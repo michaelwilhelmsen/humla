@@ -49,18 +49,29 @@ describe("Settings → Account invitations", () => {
 
   it("says what joining means before it accepts", async () => {
     const accepts: unknown[] = [];
-    const card = await openInvites({
-      cloud_accept_invite: (args) => {
-        accepts.push(args);
-        return "ws-org";
+    const withPolicy: OrgInvite = {
+      ...INVITE,
+      policy: { local_only: true, retention_days: 30, telemetry_off: false, audio_forbidden: true },
+      policy_reason: "Health data stays here.",
+    };
+    const card = await openInvites(
+      {
+        cloud_accept_invite: (args) => {
+          accepts.push(args);
+          return "ws-org";
+        },
       },
-    });
+      signedIn([withPolicy]),
+    );
     await userEvent.click(within(card).getByRole("button", { name: "Accept" }));
 
     expect(accepts).toHaveLength(0);
     expect(within(card).getByText(/bergen kommune's policies will apply to humla on this mac/i)).toBeInTheDocument();
     expect(within(card).getByText("On this Mac only")).toBeInTheDocument();
-    expect(within(card).getByText("Off, and stored audio deleted")).toBeInTheDocument();
+    expect(within(card).getByText("Deleted after 30 days")).toBeInTheDocument();
+    expect(within(card).queryByText("Send anonymous usage counters")).toBeNull();
+    expect(within(card).getByText("Health data stays here.")).toBeInTheDocument();
+    expect(within(card).getByText("Your name will show to Bergen kommune's admins.")).toBeInTheDocument();
 
     await userEvent.click(within(card).getByRole("button", { name: /join child welfare/i }));
     expect(accepts).toEqual([{ inviteId: "i1" }]);
@@ -202,6 +213,30 @@ describe("inviting into an organisation department", () => {
     await userEvent.click(within(dialog).getByRole("button", { name: "Withdraw" }));
     expect(withdrawn).toEqual([{ inviteId: "i9" }]);
     await waitFor(() => expect(within(dialog).queryByText("ola@example.no")).toBeNull());
+  });
+
+  it("drops a late list for the department it left", async () => {
+    const SECOND = { ...DEPT, id: "w2", name: "Schools" };
+    const both = { ...status, workspaces: [DEPT, SECOND] };
+    let releaseFirst: (list: unknown) => void = () => {};
+    renderApp("/settings?tab=account", {
+      cloud_status: () => both,
+      cloud_workspace_members: () => MEMBERS,
+      org_status: () => ({ ...ORG_STATUS, orgs: [{ ...ORG_STATUS.orgs[0], workspaces: ["w1", "w2"] }] }),
+      cloud_pending_invites: (args) =>
+        (args as { workspaceId: string }).workspaceId === "w1"
+          ? new Promise((resolve) => (releaseFirst = resolve))
+          : [{ id: "i2", email: "lise@example.no", role: "member", invited_by_name: "", created: "" }],
+    });
+    const dialog = await screen.findByRole("dialog", { name: /settings/i });
+    await within(dialog).findByText(/add member by email/i);
+    await waitFor(() => expect(releaseFirst).not.toBe(undefined));
+    useCloudStore.setState({ status: { ...both, current_workspace: SECOND } });
+    expect(await within(dialog).findByText("lise@example.no")).toBeInTheDocument();
+    releaseFirst([{ id: "i1", email: "ola@example.no", role: "member", invited_by_name: "", created: "" }]);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(within(dialog).queryByText("ola@example.no")).toBeNull();
+    expect(within(dialog).getByText("lise@example.no")).toBeInTheDocument();
   });
 
   it("lists no open invites in a workspace outside an organisation", async () => {

@@ -2282,6 +2282,8 @@ function accountIpc({ signedIn, policies, invites = false }: { signedIn: boolean
                     role: "member",
                     invited_by_name: "Kari Nordmann",
                     created: "2026-11-18 10:00:00.000Z",
+                    policy: { local_only: true, retention_days: 90, telemetry_off: false, audio_forbidden: true },
+                    policy_reason: "Case notes stay on municipal devices.",
                   },
                 ]
               : [],

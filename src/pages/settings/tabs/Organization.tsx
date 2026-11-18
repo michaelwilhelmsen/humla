@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { LogOut, ShieldCheck, Trash2, UserPlus } from "lucide-react";
 import { open as openExternal } from "@tauri-apps/plugin-shell";
 import {
@@ -251,6 +251,8 @@ export function OrganizationTab() {
   const orgWorkspaces = useOrgWorkspaces();
   const showPending = canManage && !!ws && orgWorkspaces.includes(ws.id);
   const [pending, setPending] = useState<PendingInvite[]>([]);
+  // Only the latest load lands, so the list is always the department shown.
+  const pendingLoad = useRef(0);
 
   // Reseed the rename field and reset the danger confirms whenever the active
   // workspace (or its name, after a rename) changes.
@@ -281,12 +283,15 @@ export function OrganizationTab() {
 
   // Best-effort: an older server, or one that won't show them, lists none.
   const loadPending = useCallback(async (id: string) => {
-    setPending(await cloudApi.pendingInvites(id).catch(() => []));
+    const load = ++pendingLoad.current;
+    const list = await cloudApi.pendingInvites(id).catch(() => []);
+    if (load === pendingLoad.current) setPending(list);
   }, []);
 
   useEffect(() => {
+    pendingLoad.current++;
+    setPending([]);
     if (ws?.id && showPending) void loadPending(ws.id);
-    else setPending([]);
   }, [ws?.id, showPending, loadPending]);
 
   useEffect(() => {

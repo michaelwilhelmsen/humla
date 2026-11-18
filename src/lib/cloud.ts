@@ -42,6 +42,17 @@ export type OrgInvite = {
   role: string;
   invited_by_name: string;
   created: string;
+  /** The organisation's policies; absent from a server that doesn't send them. */
+  policy?: InvitePolicy | null;
+  policy_reason?: string;
+};
+
+/** Mirrors `commands::invites::InvitePolicy`. `retention_days` 0 is off. */
+export type InvitePolicy = {
+  local_only: boolean;
+  retention_days: number;
+  telemetry_off: boolean;
+  audio_forbidden: boolean;
 };
 
 /** An open invite to a department, as its owner and admins see it. Mirrors

@@ -82,14 +82,18 @@ export function OrgInviteCard({
       {confirming && (
         <div className="rounded-md bg-[var(--color-pill-hover)] px-3 py-2.5 flex flex-col gap-2 text-xs">
           <p>{consent.lead}</p>
-          <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1">
-            {consent.items.map((item) => (
-              <div key={item.label} className="contents">
-                <dt className="text-[var(--color-text-muted)]">{item.label}</dt>
-                <dd>{item.value}</dd>
-              </div>
-            ))}
-          </dl>
+          {consent.items.length > 0 && (
+            <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1">
+              {consent.items.map((item) => (
+                <div key={item.label} className="contents">
+                  <dt className="text-[var(--color-text-muted)]">{item.label}</dt>
+                  <dd>{item.value}</dd>
+                </div>
+              ))}
+            </dl>
+          )}
+          {consent.reason && <p className="text-[var(--color-text-muted)]">{consent.reason}</p>}
+          <p>{consent.visibility}</p>
           <div className="flex gap-2 pt-1">
             <button type="button" className="nd-btn nd-btn-primary" onClick={accept} disabled={busy}>
               {busy ? "Joining…" : `Join ${invite.workspace_name}`}
