@@ -11,6 +11,23 @@ export type Release = {
 
 export const releases: Release[] = [
   {
+    version: "0.78.0",
+    date: "2026-11-18",
+    title: "Department invites and an audit log",
+    summary: "Joining an organisation's department now takes your yes, and organisations can keep a log of who did what with their notes.",
+    paragraphs: [
+      "When someone invites you to a department of an organisation, Humla now asks you first. The invite shows up in the workspace switcher and in Settings → Account, with who sent it and the rules that department's organisation has on, like keeping all processing on your Mac or deleting notes after a while. You join only if you say yes. Workspaces that aren't part of an organisation work as before.",
+      "Organisations can now keep an audit log of their departments' notes: who created, changed, shared, exported or deleted a note, and, if the organisation turns it on, who opened one. Humla reports opens and exports from the app, and the log never holds the notes themselves, only who did what and when. Settings → Account shows when your organisation records opens. Admins read the log in the new organisation dashboard on the web.",
+      "One change for everyone in a team: only the owner of a workspace can now invite someone as an admin.",
+    ],
+    highlights: [
+      "Department invites you accept or decline, with the organisation's rules shown first.",
+      "Audit log for organisations, without note content.",
+      "Only a workspace's owner can invite an admin.",
+    ],
+    issues: [],
+  },
+  {
     version: "0.77.0",
     date: "2026-11-18",
     title: "Organisations, and a new home for templates",
