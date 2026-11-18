@@ -1127,11 +1127,12 @@ fn cache_org(conn: &Connection, audit_reads: bool) {
         r#"{{"orgs":[{{"id":"o1","name":"Northwind","policy":{{"local_only":false,"retention_days":0,"telemetry_off":false,"audio_forbidden":false,"audit_reads":{audit_reads}}},"workspaces":["{ORG_WS}"]}}]}}"#
     );
     crate::org_policy::store(conn, &crate::org_policy::classify(200, &body)).unwrap();
+    crate::org_audit::adopt_account(conn, "u1").unwrap();
 }
 
 fn opens_queued(conn: &Connection) -> Vec<(String, String)> {
     let mut stmt = conn
-        .prepare("SELECT workspace_id, note_id FROM org_audit_queue WHERE action = 'note.open' AND format IS NULL ORDER BY id")
+        .prepare("SELECT workspace_id, note_id FROM org_audit_queue WHERE action = 'note.open' AND via = 'mcp' ORDER BY id")
         .unwrap();
     let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
     rows.collect::<rusqlite::Result<_>>().unwrap()
@@ -1163,4 +1164,20 @@ fn reads_queue_nothing_without_audit_reads_or_an_organisation() {
     assert!(!execute(&conn, ORG_WS, TOOL_GET, &json!({ "note_id": org_note }), NOW).is_error);
     assert!(!exec(&conn, TOOL_TRANSCRIPT, &json!({ "note_id": personal })).is_error);
     assert!(opens_queued(&conn).is_empty());
+}
+
+#[test]
+fn excerpts_and_listed_summaries_of_organisation_notes_are_opens_too() {
+    let conn = open();
+    cache_org(&conn, true);
+    let hit = seed_in(&conn, ORG_WS, "Board", "Alice: the budget is approved.");
+    assert!(!execute(&conn, ORG_WS, TOOL_SEARCH, &json!({ ARG_QUERY: "budget" }), NOW).is_error);
+    assert_eq!(opens_queued(&conn), [(ORG_WS.to_string(), hit.clone())]);
+    let other = seed_in(&conn, ORG_WS, "Standup", "Bob: done.");
+    assert!(!execute(&conn, ORG_WS, TOOL_LIST, &json!({}), NOW).is_error);
+    assert_eq!(
+        opens_queued(&conn),
+        [(ORG_WS.to_string(), hit), (ORG_WS.to_string(), other)],
+        "the listing's other note; the searched one is inside its window"
+    );
 }

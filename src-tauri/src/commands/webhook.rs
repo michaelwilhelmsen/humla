@@ -242,7 +242,10 @@ pub async fn webhook_send_note(
         .collect();
     let in_progress = state.recording.lock().note_id.as_deref() == Some(note_id.as_str());
     let payload = build_payload(&note, &facts, recording(&takes, in_progress), Utc::now());
-    deliver(&endpoint, &payload).await
+    deliver(&endpoint, &payload).await?;
+    let format = crate::org_audit::Action::Export(crate::org_audit::Format::Webhook);
+    crate::org_audit::record(&state.db.lock(), format, &note.workspace_id, &note.id);
+    Ok(())
 }
 
 /// What the payload says about a note that the note row alone can't.

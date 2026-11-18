@@ -520,6 +520,7 @@ async fn obtain_session_from(
     }
     let session = renewed?;
     set_session(Some(session.clone()));
+    adopt_audit_account(db, &session.user_id);
     Ok((base, session, true))
 }
 
@@ -568,8 +569,16 @@ fn adopt(
         token: Some(session.token.clone()),
     };
     store_account(&state.keychain_cache, Some(&account))?;
+    adopt_audit_account(&state.db, &session.user_id);
     set_session(Some(session));
     Ok(())
+}
+
+/// Reports queued under another account never go out as this one.
+fn adopt_audit_account(db: &Arc<parking_lot::Mutex<rusqlite::Connection>>, user_id: &str) {
+    if let Err(e) = crate::org_audit::adopt_account(&db.lock(), user_id) {
+        eprintln!("org audit: couldn't switch accounts: {e:#}");
+    }
 }
 
 /// Forget the session, any sign-in waiting for its code, and the stored account.

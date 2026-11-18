@@ -148,7 +148,13 @@ pub(crate) async fn refresh_org_config(
     }
     let changes = {
         let conn = db.lock();
-        apply_fetch(&conn, &outcome)
+        let changes = apply_fetch(&conn, &outcome);
+        if let Some(session) = super::cloud_auth::cached_session() {
+            if let Err(e) = crate::org_audit::adopt_account(&conn, &session.user_id) {
+                eprintln!("org audit: couldn't switch accounts: {e:#}");
+            }
+        }
+        changes
     };
     if changes.policy || changes.retention {
         let _ = app.emit("org_policy_changed", ());
@@ -566,6 +572,7 @@ mod tests {
         use crate::org_audit::{record, Action, Format};
         let (_d, conn) = conn();
         apply_fetch(&conn, &org_policy::classify(200, &audit_org(false)));
+        crate::org_audit::adopt_account(&conn, "u1").unwrap();
         assert!(record(&conn, Action::Export(Format::Pdf), "w1aaaaaaaaaaaaa", "n1"));
         for outcome in [
             FetchOutcome::SignedOut,

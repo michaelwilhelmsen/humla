@@ -442,10 +442,22 @@ pub fn open(path: &Path) -> Result<Connection> {
             workspace_id TEXT NOT NULL,
             note_id      TEXT NOT NULL,
             client_at    INTEGER NOT NULL,
-            format       TEXT
+            format       TEXT,
+            via          TEXT,
+            account      TEXT NOT NULL DEFAULT '',
+            pending_at   INTEGER NOT NULL DEFAULT 0,
+            retry_at     INTEGER NOT NULL DEFAULT 0
         )",
         [],
     )?;
+    for column in [
+        "via TEXT",
+        "account TEXT NOT NULL DEFAULT ''",
+        "pending_at INTEGER NOT NULL DEFAULT 0",
+        "retry_at INTEGER NOT NULL DEFAULT 0",
+    ] {
+        let _ = conn.execute(&format!("ALTER TABLE org_audit_queue ADD COLUMN {column}"), []);
+    }
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_org_audit_queue_workspace ON org_audit_queue(workspace_id)",
         [],

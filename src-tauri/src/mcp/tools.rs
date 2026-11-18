@@ -690,6 +690,9 @@ fn run_search(conn: &Connection, workspace: &str, args: &Value, now_ms: i64) -> 
         v
     };
     let langs = db::note_languages(conn, &ids).unwrap_or_default();
+    for id in &ids {
+        record_read(conn, workspace, id);
+    }
 
     // Note order = first appearance in rank order = best rank; excerpts WITHIN a
     // note run in reading order, because rank order scrambles them and garbles any
@@ -753,6 +756,13 @@ fn search_header(query: &str, matched: Option<usize>, excerpts: usize, notes: us
     }
 }
 
+/// A note's content handed to an MCP client (a read, an excerpt, a listed
+/// summary) is an open under its organisation's `audit_reads`, as a workspace
+/// chat turn records every note it shows the model.
+fn record_read(conn: &Connection, workspace: &str, note_id: &str) {
+    crate::org_audit::record(conn, crate::org_audit::Action::OpenViaMcp, workspace, note_id);
+}
+
 /// Fetch a live Note in the active workspace, or the error a client should see.
 /// The workspace and soft-delete checks are here rather than at each call site so a
 /// direct fetch by id can never reach past the tenant the server resolved.
@@ -784,8 +794,7 @@ fn fetch_with_header(
     tail: &str,
 ) -> Result<(db::Note, String), Outcome> {
     let note = fetch_note(conn, workspace, note_id)?;
-    // An MCP client reading a note is an open, under the organisation's `audit_reads`.
-    crate::org_audit::record(conn, crate::org_audit::Action::Open, &note.workspace_id, &note.id);
+    record_read(conn, &note.workspace_id, &note.id);
     let langs = db::note_languages(conn, &[note_id]).unwrap_or_default();
     // The same descriptor a listing row is built from, for the one note. Without it a
     // client that jumps straight to an id — from a search hit, or one the user pasted —
@@ -1017,6 +1026,9 @@ fn run_list(conn: &Connection, workspace: &str, args: &Value, now_ms: i64) -> Ou
     let kept = if overflow { &notes[..limit] } else { &notes[..] };
     let ids: Vec<&str> = kept.iter().map(|n| n.id.as_str()).collect();
     let langs = db::note_languages(conn, &ids).unwrap_or_default();
+    for n in kept {
+        record_read(conn, workspace, &n.id);
+    }
 
     let mut lines = vec![format!("{} note(s), most recent first:", kept.len())];
     for (i, n) in kept.iter().enumerate() {
