@@ -96,7 +96,7 @@ export function mockTauri(
       case "copilot_models":
         return [];
       case "copilot_status":
-        return { login: null, cliPath: null, cliVersion: null, cliError: null, downloadVersion: "0.0.0-test" };
+        return { login: null, cliPath: null, cliVersion: null, cliError: null, cliIsDownload: false, downloadVersion: "0.0.0-test" };
       case "copilot_sign_in_start":
         return { userCode: "ABCD-1234", verificationUri: "https://github.com/login/device", expiresIn: 900 };
       // No embedding server in a test environment — the honest default is the

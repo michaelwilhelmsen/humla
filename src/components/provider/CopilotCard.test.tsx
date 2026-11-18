@@ -12,6 +12,7 @@ const SIGNED_OUT: CopilotStatus = {
   cliPath: "/usr/local/bin/copilot",
   cliVersion: "1.2.3",
   cliError: null,
+  cliIsDownload: false,
   downloadVersion: "1.2.3",
 };
 const SIGNED_IN: CopilotStatus = { ...SIGNED_OUT, login: "octocat" };
@@ -71,10 +72,18 @@ describe("CopilotCard: the CLI", () => {
     expect(download).toHaveBeenCalled();
   });
 
-  it("doesn't offer a download for a CLI of the supported version", async () => {
-    setup({ copilot_status: () => ({ ...SIGNED_IN, cliError: "Couldn't start the Copilot CLI: crashed" }) });
+  it("doesn't offer a download when Humla's own download won't start", async () => {
+    setup({
+      copilot_status: () => ({ ...SIGNED_IN, cliIsDownload: true, cliError: "Couldn't start the Copilot CLI: crashed" }),
+    });
     expect(await screen.findByText("Installed · 1.2.3")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Download Copilot CLI" })).toBeNull();
+  });
+
+  it("offers a download for the user's own CLI that won't start, whatever version it reports", async () => {
+    setup({ copilot_status: () => ({ ...SIGNED_IN, cliError: "Couldn't start the Copilot CLI: version mismatch" }) });
+    expect(await screen.findByText(/version 1\.2\.3\) didn't start/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Download Copilot CLI" })).toBeInTheDocument();
   });
 
   it("says why a download failed and offers to try again", async () => {

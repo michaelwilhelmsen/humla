@@ -614,12 +614,13 @@ function copilotCase(state: "no-cli" | "broken-cli" | "signed-out" | "signed-in"
       copilot_status: () => ({
         login: state === "signed-in" || state === "broken-cli" ? "octocat" : null,
         cliPath: state === "no-cli" ? null : "/Users/u/.hermes/node/lib/node_modules/@github/copilot/node_modules/@github/copilot-darwin-arm64/copilot",
-        cliVersion: state === "no-cli" ? null : state === "broken-cli" ? "0.9.0" : "1.0.112",
+        cliVersion: state === "no-cli" ? null : state === "broken-cli" ? "0.9.0" : "1.0.114",
         cliError:
           state === "broken-cli"
-            ? "Couldn't start the Copilot CLI: protocol version 2 is not in the supported range 3..=3"
+            ? "Couldn't start the Copilot CLI: version mismatch: server=3, supported=4–4"
             : null,
-        downloadVersion: "1.0.112",
+        cliIsDownload: false,
+        downloadVersion: "1.0.114",
       }),
       copilot_sign_in_start: () => ({
         userCode: "8C17-B75D",

@@ -3,8 +3,9 @@
 //! run in the background and report through `copilot_sign_in` and
 //! `copilot_cli_download` events, since either can outlast an invoke.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
+use anyhow::Context;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -14,9 +15,9 @@ use crate::AppState;
 /// Bumped by every sign-in start, cancel and sign-out, so an older poll stops itself.
 static SIGN_IN_GENERATION: AtomicU64 = AtomicU64::new(0);
 
-/// Set while a download runs: the Summary and Chat cards can both ask for one,
-/// and both follow the one that runs through its events.
-static DOWNLOADING: AtomicBool = AtomicBool::new(false);
+/// Held while a download runs: the Settings cards and a call that found a CLI
+/// on another protocol can all ask for one, and only one runs.
+static DOWNLOAD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -27,6 +28,8 @@ pub struct CopilotStatus {
     cli_version: Option<String>,
     /// Why the CLI last failed to start, if it did.
     cli_error: Option<String>,
+    /// Whether the CLI found is Humla's own download of `download_version`.
+    cli_is_download: bool,
     /// The version a download would fetch.
     download_version: &'static str,
 }
@@ -40,8 +43,10 @@ pub async fn copilot_status(app: AppHandle, state: State<'_, AppState>) -> Resul
         Some(p) => cli::version(p).await,
         None => None,
     };
+    let cli_is_download = cli_path.as_deref() == Some(cli::managed_path(&app_data).as_path());
     Ok(CopilotStatus {
         login,
+        cli_is_download,
         cli_path: cli_path.map(|p| p.display().to_string()),
         cli_version,
         cli_error: state.copilot.start_error(),
@@ -158,14 +163,23 @@ struct DownloadEvent {
 /// Download the pinned CLI in the background.
 #[tauri::command]
 pub async fn copilot_cli_download(app: AppHandle) -> Result<(), String> {
-    let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
-    if DOWNLOADING.swap(true, Ordering::SeqCst) {
-        return Ok(());
-    }
     tauri::async_runtime::spawn(async move {
+        let _ = fetch_cli(&app).await;
+    });
+    Ok(())
+}
+
+/// Download the pinned CLI unless it is already there, reporting through
+/// `copilot_cli_download` events.
+async fn fetch_cli(app: &AppHandle) -> anyhow::Result<()> {
+    let app_data = app.path().app_data_dir()?;
+    let _only_one = DOWNLOAD.lock().await;
+    let result = if cli::managed_path(&app_data).is_file() {
+        Ok(())
+    } else {
         let mut last = -1.0;
         let progress_app = app.clone();
-        let result = cli::download(&app_data, move |fraction| {
+        cli::download(&app_data, move |fraction| {
             if fraction - last >= 0.01 || fraction >= 1.0 {
                 last = fraction;
                 let _ = progress_app.emit(
@@ -174,29 +188,40 @@ pub async fn copilot_cli_download(app: AppHandle) -> Result<(), String> {
                 );
             }
         })
-        .await;
-        let state: State<AppState> = app.state();
-        state.copilot.forget_cli().await;
-        DOWNLOADING.store(false, Ordering::SeqCst);
-        let event = match result {
-            Ok(_) => DownloadEvent { status: "done", fraction: Some(1.0), message: None },
-            Err(e) => DownloadEvent { status: "failed", fraction: None, message: Some(format!("{e:#}")) },
-        };
-        let _ = app.emit("copilot_cli_download", event);
-    });
-    Ok(())
+        .await
+        .map(|_| ())
+    };
+    let state: State<AppState> = app.state();
+    state.copilot.forget_cli().await;
+    let event = match &result {
+        Ok(()) => DownloadEvent { status: "done", fraction: Some(1.0), message: None },
+        Err(e) => DownloadEvent { status: "failed", fraction: None, message: Some(format!("{e:#}")) },
+    };
+    let _ = app.emit("copilot_cli_download", event);
+    result
+}
+
+/// A running client signed in as the user. A CLI on another protocol than the
+/// SDK's is replaced by the pinned download, and the start tried once more.
+pub(crate) async fn copilot_client(app: &AppHandle) -> anyhow::Result<copilot_sdk::Client> {
+    let state: State<AppState> = app.state();
+    let app_data = app.path().app_data_dir()?;
+    match state.copilot.ready_client(&state.keychain_cache, &app_data).await {
+        Err(e) => {
+            let found = state.copilot.cli(&app_data).await;
+            if !copilot::should_replace_cli(&e, found.as_deref(), &cli::managed_path(&app_data)) {
+                return Err(e);
+            }
+            eprintln!("[copilot] the CLI speaks another protocol; downloading {}", cli::VERSION);
+            fetch_cli(app).await.context("couldn't download the Copilot CLI Humla supports")?;
+            state.copilot.ready_client(&state.keychain_cache, &app_data).await
+        }
+        ok => ok,
+    }
 }
 
 #[tauri::command]
-pub async fn copilot_models(
-    app: AppHandle,
-    state: State<'_, AppState>,
-) -> Result<Vec<copilot::session::ModelInfo>, String> {
-    let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
-    let client = state
-        .copilot
-        .ready_client(&state.keychain_cache, &app_data)
-        .await
-        .map_err(|e| e.to_string())?;
+pub async fn copilot_models(app: AppHandle) -> Result<Vec<copilot::session::ModelInfo>, String> {
+    let client = copilot_client(&app).await.map_err(|e| e.to_string())?;
     copilot::session::list_models(&client).await.map_err(|e| e.to_string())
 }

@@ -11,21 +11,42 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context};
-use github_copilot_sdk::handler::ApproveAllHandler;
-use github_copilot_sdk::rpc::HandlePendingToolCallRequest;
-use github_copilot_sdk::subscription::EventSubscription;
-use github_copilot_sdk::session_events::{AssistantMessageData, AssistantMessageToolRequest};
-use github_copilot_sdk::rpc::ModelPolicyState;
-use github_copilot_sdk::types::{SessionConfig, SystemMessageConfig};
-use github_copilot_sdk::types::{RequestId, SessionEvent};
-use github_copilot_sdk::session::Session;
-use github_copilot_sdk::{CliProgram, Client, ClientOptions, Tool};
+use copilot_sdk::handler::ApproveAllHandler;
+use copilot_sdk::rpc::HandlePendingToolCallRequest;
+use copilot_sdk::subscription::EventSubscription;
+use copilot_sdk::session_events::{AssistantMessageData, AssistantMessageToolRequest};
+use copilot_sdk::rpc::ModelPolicyState;
+use copilot_sdk::types::{CreateSessionOptions, SystemMessageConfig};
+use copilot_sdk::types::{RequestId, SessionEvent};
+use copilot_sdk::session::Session;
+use copilot_sdk::{
+    CliProgram, Client, ClientMode, ClientOptions, RuntimeConnection, SpawnedProcessOptions, Tool,
+};
 
 use crate::chat::adapter::{CancelFlag, ChatStep, ChatTurn, ToolCall, ToolSpec};
 use crate::openai::StreamChunk;
 
 /// What every model call through Copilot may take before it is given up on.
 const CALL_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// The CLI started but speaks a protocol version the SDK doesn't.
+#[derive(Debug)]
+pub struct WrongProtocol(pub String);
+
+impl std::fmt::Display for WrongProtocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for WrongProtocol {}
+
+pub fn is_version_mismatch(e: &copilot_sdk::Error) -> bool {
+    matches!(
+        e.kind(),
+        copilot_sdk::ErrorKind::Protocol(copilot_sdk::ProtocolErrorKind::VersionMismatch { .. })
+    )
+}
 
 /// The running CLI, kept between calls: starting one takes a second or two.
 /// A new one starts when the binary or the token changes; the old one lives on
@@ -55,29 +76,36 @@ impl Runtime {
                 return Ok(r.client.clone());
             }
         }
-        let mut opts = ClientOptions::default();
-        opts.program = CliProgram::Path(cli.to_path_buf());
-        opts.github_token = Some(token.to_string());
-        opts.use_logged_in_user = Some(false);
-        opts.working_directory = std::env::temp_dir();
-        opts.disable_client_telemetry = true;
-        opts.extra_args = vec![
-            // The SDK refuses a CLI outside its protocol range, so the CLI
-            // must not swap itself for a newer download.
-            "--no-auto-update".into(),
-            "--disable-builtin-mcps".into(),
-            "--disable-client-telemetry".into(),
-        ];
+        // Spawned over stdio: 2.0 otherwise loads the runtime into Humla's own
+        // process, and Humla only ever drives the CLI as a child.
+        let process = SpawnedProcessOptions::new()
+            .with_program(CliProgram::Path(cli.to_path_buf()))
+            .with_working_directory(std::env::temp_dir())
+            .with_args([
+                // The SDK refuses a CLI outside its protocol range, so the CLI
+                // must not swap itself for a newer download.
+                "--no-auto-update",
+                "--disable-builtin-mcps",
+                "--disable-client-telemetry",
+            ]);
+        let opts = ClientOptions::new(ClientMode::CodingAgent)
+            .with_runtime(RuntimeConnection::SpawnedStdio(process))
+            .with_github(|g| g.with_token(token).with_use_logged_in_user(false))
+            .with_observability(|o| o.with_disable_client_telemetry(true));
         let client = match Client::start(opts).await {
             Ok(client) => client,
             Err(e) => {
                 let message = format!("Couldn't start the Copilot CLI: {e}");
                 *self.start_error.lock() = Some(message.clone());
-                bail!(
+                let advice = format!(
                     "{message}. If it is an older or newer version than {}, download the one \
                      Humla supports in Settings.",
                     super::cli::VERSION
                 );
+                if is_version_mismatch(&e) {
+                    return Err(WrongProtocol(advice).into());
+                }
+                bail!(advice);
             }
         };
         *self.start_error.lock() = None;
@@ -244,13 +272,16 @@ impl Live {
     ) -> anyhow::Result<Self> {
         // Custom tools ask permission before the CLI hands them back; no
         // built-in tool is available to ask.
-        let mut cfg = SessionConfig::default().with_permission_handler(Arc::new(ApproveAllHandler));
-        cfg.streaming = Some(true);
-        cfg.model = Some(model.to_string());
-        cfg.system_message =
-            Some(SystemMessageConfig::new().with_mode("replace").with_content(system));
-        cfg.available_tools = Some(tools.iter().map(|t| t.name.clone()).collect());
-        cfg.tools = (!tools.is_empty()).then_some(tools);
+        let names: Vec<String> = tools.iter().map(|t| t.name.clone()).collect();
+        let mut cfg = CreateSessionOptions::default()
+            .with_model(model)
+            .with_system_message(SystemMessageConfig::new().with_mode("replace").with_content(system))
+            .with_permissions(|p| p.with_on_request(Arc::new(ApproveAllHandler)))
+            .with_events(|e| e.with_streaming(true))
+            .with_tools(|t| t.with_available_tools(names));
+        if !tools.is_empty() {
+            cfg = cfg.with_tools(|t| t.with_definitions(tools));
+        }
         let session = client
             .create_session(cfg)
             .await
@@ -483,6 +514,15 @@ mod tests {
 
     fn model(id: &str, multiplier: Option<f64>) -> ModelInfo {
         ModelInfo { id: id.into(), name: id.into(), vendor: None, multiplier }
+    }
+
+    #[test]
+    fn only_a_protocol_mismatch_counts_as_the_wrong_protocol() {
+        use copilot_sdk::{Error, ErrorKind, ProtocolErrorKind};
+        let mismatch = Error::from(ErrorKind::Protocol(ProtocolErrorKind::VersionMismatch { server: 3, min: 4, max: 4 }));
+        let timeout = Error::from(ErrorKind::Protocol(ProtocolErrorKind::CliStartupTimeout));
+        assert!(is_version_mismatch(&mismatch));
+        assert!(!is_version_mismatch(&timeout));
     }
 
     #[test]

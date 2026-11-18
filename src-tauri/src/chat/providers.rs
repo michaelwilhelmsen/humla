@@ -316,12 +316,12 @@ impl ChatAdapter for CustomChatAdapter {
 /// GitHub Copilot through its CLI. One adapter serves one turn, and the turn's
 /// steps share a session (`copilot::session::ChatTurnSession`).
 pub struct CopilotChatAdapter {
-    client: github_copilot_sdk::Client,
+    client: copilot_sdk::Client,
     turn: crate::copilot::session::ChatTurnSession,
 }
 
 impl CopilotChatAdapter {
-    pub fn new(client: github_copilot_sdk::Client) -> Self {
+    pub fn new(client: copilot_sdk::Client) -> Self {
         Self { client, turn: Default::default() }
     }
 }
