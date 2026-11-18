@@ -26,6 +26,7 @@ mod chat;
 mod embed;
 mod import_date;
 mod org_policy;
+mod org_audit;
 // Public so the `humla-mcp` binary (#172) can drive it. Everything below it —
 // `db`, `html_text` — stays private to the crate.
 pub mod mcp;
@@ -421,6 +422,8 @@ where
             commands::cloud_delete_workspace,
             commands::cloud_leave_workspace,
             commands::org_status,
+            commands::audit_note_opened,
+            commands::audit_note_copied,
             commands::org_audio_notice,
             commands::org_audio_sweep,
             commands::org_admin_orgs,

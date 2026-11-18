@@ -177,6 +177,11 @@ pub fn export_note(app: AppHandle, note_id: String, spec: ExportSpec) -> Result<
         }
     };
     std::fs::write(&spec.path, bytes).map_err(|e| format!("write export file: {e}"))?;
+    let format = match spec.format {
+        ExportFormat::Pdf => crate::org_audit::Format::Pdf,
+        ExportFormat::Markdown | ExportFormat::Txt => crate::org_audit::Format::Text,
+    };
+    crate::org_audit::record(&state.db.lock(), crate::org_audit::Action::Export(format), &note.workspace_id, &note.id);
     Ok(())
 }
 
@@ -381,7 +386,13 @@ pub async fn export_note_audio(app: AppHandle, note_id: String, spec: AudioExpor
         write_note_audio(&sources, spec.format, Path::new(&spec.path))
     })
     .await
-    .map_err(|e| format!("save audio task failed: {e}"))?
+    .map_err(|e| format!("save audio task failed: {e}"))??;
+    let state: tauri::State<AppState> = app.state();
+    let conn = state.db.lock();
+    if let Ok(note) = db::get_note(&conn, &note_id) {
+        crate::org_audit::record(&conn, crate::org_audit::Action::AudioSave, &note.workspace_id, &note.id);
+    }
+    Ok(())
 }
 
 #[cfg(test)]

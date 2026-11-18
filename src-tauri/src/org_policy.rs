@@ -53,6 +53,11 @@ pub(crate) struct OrgPolicy {
     pub retention_days: u32,
     pub telemetry_off: bool,
     pub audio_forbidden: bool,
+    /// Opening a note in the organisation's workspaces is recorded in its audit
+    /// log (`org_audit`). Per organisation, so it never joins [`merge`]. Optional,
+    /// since a server from before the audit log doesn't send it.
+    #[serde(default)]
+    pub audit_reads: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -293,6 +298,8 @@ pub struct OrgSummary {
     pub vocabulary: Vec<String>,
     /// The organisation's departments the user is in.
     pub workspaces: Vec<String>,
+    /// Opening its notes is recorded (`OrgPolicy::audit_reads`).
+    pub audit_reads: bool,
 }
 
 pub(crate) fn summaries(config: Option<&OrgConfig>) -> Vec<OrgSummary> {
@@ -306,6 +313,7 @@ pub(crate) fn summaries(config: Option<&OrgConfig>) -> Vec<OrgSummary> {
                     reason: o.policy_reason.clone(),
                     vocabulary: o.vocabulary.clone(),
                     workspaces: o.workspaces.clone(),
+                    audit_reads: o.policy.audit_reads,
                 })
                 .collect()
         })
@@ -471,6 +479,7 @@ pub(crate) fn parse_managed(forced: &BTreeMap<String, ManagedValue>) -> Managed 
             retention_days: 0,
             telemetry_off: flag("telemetry_off"),
             audio_forbidden: flag("audio_forbidden"),
+            audit_reads: false,
         },
     });
     let server_url = match forced.get("server_url") {
@@ -698,7 +707,13 @@ pub(crate) fn effective_or_strictest(conn: &Connection) -> EffectivePolicy {
         merge(&[Layer {
             source: UNKNOWN_SOURCE.into(),
             reason: String::new(),
-            policy: OrgPolicy { local_only: true, telemetry_off: true, audio_forbidden: true, retention_days: 0 },
+            policy: OrgPolicy {
+                local_only: true,
+                telemetry_off: true,
+                audio_forbidden: true,
+                retention_days: 0,
+                audit_reads: false,
+            },
         }])
     })
 }
@@ -911,7 +926,7 @@ mod tests {
         "templates":[{"client_id":"t1","name":"Case meeting","content":"…","workspaces":[],"deleted":false}]}]}"#;
 
     fn policy(local_only: bool, retention_days: u32, telemetry_off: bool, audio_forbidden: bool) -> OrgPolicy {
-        OrgPolicy { local_only, retention_days, telemetry_off, audio_forbidden }
+        OrgPolicy { local_only, retention_days, telemetry_off, audio_forbidden, audit_reads: false }
     }
 
     fn layer(source: &str, p: OrgPolicy) -> Layer {
@@ -1028,6 +1043,16 @@ mod tests {
         assert_eq!(org.policy, policy(true, 30, true, false));
         assert_eq!(org.workspaces, ["w1"]);
         assert_eq!(org.templates[0].client_id, "t1");
+    }
+
+    #[test]
+    fn audit_reads_is_read_when_sent_and_off_when_not() {
+        let FetchOutcome::Fetched(config) = classify(200, ONE_ORG) else { panic!() };
+        assert!(!config.orgs[0].policy.audit_reads, "a server from before the audit log");
+        let body = ONE_ORG.replace("\"audio_forbidden\":false}", "\"audio_forbidden\":false,\"audit_reads\":true}");
+        let FetchOutcome::Fetched(config) = classify(200, &body) else { panic!() };
+        assert!(config.orgs[0].policy.audit_reads);
+        assert!(summaries(Some(&config))[0].audit_reads);
     }
 
     #[test]

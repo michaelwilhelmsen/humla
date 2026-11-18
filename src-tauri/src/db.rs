@@ -433,6 +433,23 @@ pub fn open(path: &Path) -> Result<Connection> {
     // first-message title). Existing threads keep their identity: title derived
     // from the oldest user message, date fallback when empty.
     backfill_conversation_titles(&conn)?;
+    // Organisation audit reports waiting to be sent (`org_audit`). Keyed by
+    // note id but outside `purge_note_rows`: the trail outlives the note.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS org_audit_queue (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            action       TEXT NOT NULL,
+            workspace_id TEXT NOT NULL,
+            note_id      TEXT NOT NULL,
+            client_at    INTEGER NOT NULL,
+            format       TEXT
+        )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_org_audit_queue_workspace ON org_audit_queue(workspace_id)",
+        [],
+    )?;
     // Index is created AFTER the ALTERs so it's safe on both fresh DBs and
     // older DBs that needed the column added.
     conn.execute(
