@@ -80,15 +80,18 @@ pub(crate) fn endpoint_url<'a>(cfg: &'a ProviderConfig, custom_base_url: Option<
 
 /// Where a note's audio is transcribed: the user's config for `language`, with
 /// each slot the policy for the note's workspace refuses moved to on-device
-/// Whisper, as Settings shows it under "Managed by".
+/// Whisper, as Settings shows it under "Managed by". The second half names who
+/// moved it there, when that changed anything.
 pub(crate) fn resolve_for_note(
     conn: &rusqlite::Connection,
     cfg: &TranscribeConfig,
     note_id: &str,
     language: &str,
-) -> ProviderConfig {
+) -> (ProviderConfig, Option<String>) {
     let policy = org_policy::effective_for_note(conn, note_id);
-    enforce(cfg, &policy, custom_base_url(conn).as_deref()).resolve(language).clone()
+    let used = enforce(cfg, &policy, custom_base_url(conn).as_deref()).resolve(language).clone();
+    let kept_by = (&used != cfg.resolve(language)).then(|| policy.local_only_source().unwrap_or_default().to_string());
+    (used, kept_by)
 }
 
 /// Refuse a transcription config the policy for a note's workspace doesn't
@@ -217,12 +220,14 @@ mod tests {
         let personal = org_policy::note_in(&conn, "");
         let cfg = config();
         for lang in ["en", "no"] {
-            let p = resolve_for_note(&conn, &cfg, &governed, lang);
+            let (p, kept_by) = resolve_for_note(&conn, &cfg, &governed, lang);
             assert_eq!(p.provider(), crate::providers::ProviderId::Local, "{lang}");
+            assert_eq!(kept_by.as_deref(), Some("Northwind"), "{lang}");
             assert!(check(&conn, &governed, &p).is_ok());
         }
-        assert_eq!(resolve_for_note(&conn, &cfg, &personal, "en"), cfg.default);
-        assert_eq!(resolve_for_note(&conn, &cfg, &personal, "no"), cfg.per_language["no"]);
+        assert_eq!(resolve_for_note(&conn, &cfg, &governed, "sv").1, None, "already on this Mac");
+        assert_eq!(resolve_for_note(&conn, &cfg, &personal, "en"), (cfg.default.clone(), None));
+        assert_eq!(resolve_for_note(&conn, &cfg, &personal, "no"), (cfg.per_language["no"].clone(), None));
     }
 
     #[test]

@@ -1142,6 +1142,11 @@ export function onDiarizeStatus(cb: (e: DiarizeStatus) => void): Promise<Unliste
 export function onRecordingError(cb: (e: RecordingError) => void): Promise<UnlistenFn> {
   return listen<RecordingError>("recording_error", (e) => cb(e.payload));
 }
+/** A recording or import's transcription was moved to this Mac by `source`'s
+ *  `local_only`. */
+export function onTranscriptionKeptLocal(cb: (e: { noteId: string; source: string }) => void): Promise<UnlistenFn> {
+  return listen<{ noteId: string; source: string }>("transcription_kept_local", (e) => cb(e.payload));
+}
 export function onRecordingDiagnostic(cb: (e: RecordingDiagnostic) => void): Promise<UnlistenFn> {
   return listen<RecordingDiagnostic>("recording_diagnostic", (e) => cb(e.payload));
 }
