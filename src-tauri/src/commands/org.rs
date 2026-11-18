@@ -193,12 +193,27 @@ pub(crate) fn apply_policy_to_settings(conn: &rusqlite::Connection) -> bool {
 /// what the policy in force enforces, so a managed profile works before any
 /// sign-in.
 pub(crate) fn apply_managed_at_launch(conn: &rusqlite::Connection, cache: &crate::keychain::Cache) {
-    match super::cloud::pin_managed_server_url(conn) {
-        Ok(true) => super::cloud_auth::forget_server(cache),
-        Ok(false) => {}
-        Err(e) => eprintln!("org policy: couldn't pin the managed server URL: {e:#}"),
-    }
+    pin_managed_server(conn, org_policy::managed().server_url.as_deref(), || {
+        super::cloud_auth::forget_account(cache)
+    });
     apply_policy_to_settings(conn);
+}
+
+/// Pin `managed` as the server URL. When that changes it, the stored account
+/// belongs to another server, and `forget` drops all of it: a password left
+/// behind would sign in to the new server. Returns whether it changed.
+pub(crate) fn pin_managed_server(conn: &rusqlite::Connection, managed: Option<&str>, forget: impl FnOnce()) -> bool {
+    match super::cloud::pin_server_url(conn, managed) {
+        Ok(true) => {
+            forget();
+            true
+        }
+        Ok(false) => false,
+        Err(e) => {
+            eprintln!("org policy: couldn't pin the managed server URL: {e:#}");
+            false
+        }
+    }
 }
 
 /// Re-read the managed configuration profile and act on what changed: pin a
@@ -207,12 +222,11 @@ pub(crate) fn apply_managed_at_launch(conn: &rusqlite::Connection, cache: &crate
 pub(crate) fn refresh_managed_config(app: &tauri::AppHandle, state: &State<'_, AppState>) {
     let change = org_policy::reload_managed();
     if change.server_url {
-        let pinned = super::cloud::pin_managed_server_url(&state.db.lock()).unwrap_or_else(|e| {
-            eprintln!("org policy: couldn't pin the managed server URL: {e:#}");
-            false
+        let managed = org_policy::managed().server_url;
+        let pinned = pin_managed_server(&state.db.lock(), managed.as_deref(), || {
+            super::cloud_auth::forget_account(&state.keychain_cache)
         });
         if pinned {
-            super::cloud_auth::server_changed(state);
             state.sync.config_changed();
         }
     }
@@ -476,6 +490,18 @@ pub(crate) fn announce_purged(app: &tauri::AppHandle, ids: &[String]) {
 mod tests {
     use super::*;
     use crate::providers::ProviderId;
+
+    #[test]
+    fn a_managed_pin_that_changes_the_server_forgets_the_account() {
+        let (_d, conn) = conn();
+        let mut forgotten = 0;
+        assert!(!pin_managed_server(&conn, None, || forgotten += 1));
+        db::set_setting(&conn, super::super::cloud::SETTING_BASE_URL, "https://old.example").unwrap();
+        assert!(pin_managed_server(&conn, Some("https://new.example"), || forgotten += 1));
+        assert_eq!(forgotten, 1);
+        assert!(!pin_managed_server(&conn, Some("https://new.example"), || forgotten += 1));
+        assert_eq!(forgotten, 1, "the same server keeps its account");
+    }
 
     fn conn() -> (tempfile::TempDir, rusqlite::Connection) {
         let dir = tempfile::tempdir().unwrap();

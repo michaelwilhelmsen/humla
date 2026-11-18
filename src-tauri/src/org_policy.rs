@@ -429,6 +429,7 @@ fn effective_with(conn: &Connection, managed: Option<Layer>) -> anyhow::Result<E
 /// The name a managed configuration profile's policies are shown under.
 pub(crate) const MANAGED_SOURCE: &str = "This Mac's configuration";
 const MANAGED_FLAGS: [&str; 3] = ["local_only", "telemetry_off", "audio_forbidden"];
+#[cfg(target_os = "macos")]
 const MANAGED_KEYS: [&str; 5] = ["local_only", "telemetry_off", "audio_forbidden", "policy_reason", "server_url"];
 
 /// A forced preference value, as far as the profile's keys care.
@@ -446,6 +447,9 @@ pub(crate) enum ManagedValue {
 pub(crate) struct Managed {
     pub layer: Option<Layer>,
     pub server_url: Option<String>,
+    /// `audio_forbidden` is forced to `true` itself, not read as on from a
+    /// value of the wrong type: only then may it delete stored audio.
+    pub sweeps_audio: bool,
 }
 
 /// Read the forced values of the profile's keys. A flag forced to anything but
@@ -477,7 +481,8 @@ pub(crate) fn parse_managed(forced: &BTreeMap<String, ManagedValue>) -> Managed 
             None
         }
     };
-    Managed { layer, server_url }
+    let sweeps_audio = forced.get("audio_forbidden") == Some(&ManagedValue::Bool(true));
+    Managed { layer, server_url, sweeps_audio }
 }
 
 fn is_server_url(s: &str) -> bool {
@@ -485,15 +490,49 @@ fn is_server_url(s: &str) -> bool {
         .is_ok_and(|u| matches!(u.scheme(), "http" | "https") && u.host_str().is_some_and(|h| !h.is_empty()))
 }
 
+#[cfg(not(test))]
 static MANAGED: parking_lot::RwLock<Option<Managed>> = parking_lot::RwLock::new(None);
+
+#[cfg(not(test))]
+fn swap_managed(fresh: Managed) -> Option<Managed> {
+    MANAGED.write().replace(fresh)
+}
+
+#[cfg(not(test))]
+fn last_managed() -> Option<Managed> {
+    MANAGED.read().clone()
+}
+
+// Per test thread, so a test's profile never leaks into another test.
+#[cfg(test)]
+thread_local! {
+    static MANAGED: std::cell::RefCell<Option<Managed>> = const { std::cell::RefCell::new(None) };
+    static FORCED: std::cell::RefCell<BTreeMap<String, ManagedValue>> = const { std::cell::RefCell::new(BTreeMap::new()) };
+}
+
+#[cfg(test)]
+fn swap_managed(fresh: Managed) -> Option<Managed> {
+    MANAGED.with(|m| m.borrow_mut().replace(fresh))
+}
+
+#[cfg(test)]
+fn last_managed() -> Option<Managed> {
+    MANAGED.with(|m| m.borrow().clone())
+}
+
+/// Install a profile for this test thread; the next read sees it.
+#[cfg(test)]
+pub(crate) fn force_for_test(pairs: &[(&str, ManagedValue)]) {
+    FORCED.with(|f| *f.borrow_mut() = pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect());
+}
 
 /// The managed configuration as last read; read once on first use.
 pub(crate) fn managed() -> Managed {
-    if let Some(m) = MANAGED.read().clone() {
+    if let Some(m) = last_managed() {
         return m;
     }
     reload_managed();
-    MANAGED.read().clone().unwrap_or_default()
+    last_managed().unwrap_or_default()
 }
 
 /// What a re-read of the managed configuration changed.
@@ -506,11 +545,11 @@ pub(crate) struct ManagedChange {
 /// Read the managed configuration again; profiles can arrive while the app runs.
 pub(crate) fn reload_managed() -> ManagedChange {
     let fresh = parse_managed(&read_forced());
-    let mut slot = MANAGED.write();
-    let old = slot.take().unwrap_or_default();
-    let change = ManagedChange { policy: old.layer != fresh.layer, server_url: old.server_url != fresh.server_url };
-    *slot = Some(fresh);
-    change
+    let old = swap_managed(fresh.clone()).unwrap_or_default();
+    ManagedChange {
+        policy: old.layer != fresh.layer || old.sweeps_audio != fresh.sweeps_audio,
+        server_url: old.server_url != fresh.server_url,
+    }
 }
 
 /// The preference domain an MDM profile's payload targets is the bundle id.
@@ -519,10 +558,15 @@ fn read_forced() -> BTreeMap<String, ManagedValue> {
     read_forced_in("no.humla.app")
 }
 
-/// Tests never see this Mac's profiles.
-#[cfg(any(not(target_os = "macos"), test))]
+#[cfg(all(not(target_os = "macos"), not(test)))]
 fn read_forced() -> BTreeMap<String, ManagedValue> {
     BTreeMap::new()
+}
+
+/// Tests never see this Mac's profiles, only [`force_for_test`]'s.
+#[cfg(test)]
+fn read_forced() -> BTreeMap<String, ManagedValue> {
+    FORCED.with(|f| f.borrow().clone())
 }
 
 /// Only values a profile forces count, never the user's own `defaults write`.
@@ -531,9 +575,14 @@ fn read_forced_in(domain: &str) -> BTreeMap<String, ManagedValue> {
     use core_foundation::base::{CFType, TCFType};
     use core_foundation::boolean::CFBoolean;
     use core_foundation::string::CFString;
-    use core_foundation_sys::preferences::{CFPreferencesAppValueIsForced, CFPreferencesCopyAppValue};
+    use core_foundation_sys::preferences::{
+        CFPreferencesAppSynchronize, CFPreferencesAppValueIsForced, CFPreferencesCopyAppValue,
+    };
 
     let app = CFString::new(domain);
+    // SAFETY: `app` outlives the call. Drops this process's cached values, so
+    // a profile installed since the last read is seen.
+    unsafe { CFPreferencesAppSynchronize(app.as_concrete_TypeRef()) };
     let mut out = BTreeMap::new();
     for key in MANAGED_KEYS {
         let k = CFString::new(key);
@@ -695,16 +744,22 @@ pub struct AudioSweep {
     pub org_name: String,
 }
 
-/// The first organisation that forbids audio and hasn't swept yet. Only a
-/// cache that reads cleanly can name one, and only an organisation with an id
-/// and a name: a policy that can't be read closes the audio gate through
-/// [`effective_or_strictest`] but never deletes anything.
+/// The id a managed configuration profile's sweep is recorded under. Not a
+/// PocketBase id, which is alphanumeric, so it can't name an organisation.
+pub(crate) const MANAGED_SWEEP_ID: &str = "mac-configuration";
+
+/// The first organisation, then a managed profile, that forbids audio and
+/// hasn't swept yet. Only a cache that reads cleanly can name an organisation,
+/// and only one with an id and a name; a profile owes it only when it forces
+/// `audio_forbidden` to `true`. A policy that can't be read closes the audio
+/// gate through [`effective_or_strictest`] but never deletes anything.
 pub(crate) fn audio_sweep_due(conn: &Connection) -> Option<AudioSweep> {
-    let Ok(Some(config)) = cached(conn) else { return None };
     let swept = swept_orgs(conn);
-    config
-        .orgs
-        .into_iter()
+    let orgs = match cached(conn) {
+        Ok(Some(config)) => config.orgs,
+        _ => Vec::new(),
+    };
+    orgs.into_iter()
         .find(|o| {
             o.policy.audio_forbidden
                 && !o.id.trim().is_empty()
@@ -712,6 +767,10 @@ pub(crate) fn audio_sweep_due(conn: &Connection) -> Option<AudioSweep> {
                 && !swept.contains(&o.id)
         })
         .map(|o| AudioSweep { org_id: o.id, org_name: o.name })
+        .or_else(|| {
+            (managed().sweeps_audio && !swept.iter().any(|id| id == MANAGED_SWEEP_ID))
+                .then(|| AudioSweep { org_id: MANAGED_SWEEP_ID.into(), org_name: MANAGED_SOURCE.into() })
+        })
 }
 
 fn swept_orgs(conn: &Connection) -> Vec<String> {
@@ -1522,5 +1581,67 @@ mod tests {
         cache_audio(&conn, "", "Northwind", true);
         assert_eq!(audio_sweep_due(&conn), None);
         assert!(effective_or_strictest(&conn).audio_forbidden);
+    }
+
+    #[test]
+    fn a_profile_forcing_audio_forbidden_owes_one_sweep() {
+        let (_d, conn) = conn();
+        force_for_test(&[("audio_forbidden", ManagedValue::Bool(true))]);
+        reload_managed();
+        let due = audio_sweep_due(&conn).unwrap();
+        assert_eq!(due, AudioSweep { org_id: MANAGED_SWEEP_ID.into(), org_name: MANAGED_SOURCE.into() });
+        record_audio_sweep(&conn, MANAGED_SWEEP_ID).unwrap();
+        assert_eq!(audio_sweep_due(&conn), None, "once only");
+    }
+
+    #[test]
+    fn an_organisation_sweeps_before_the_profile_and_both_once() {
+        let (_d, conn) = conn();
+        cache_audio(&conn, "o1", "Northwind", true);
+        force_for_test(&[("audio_forbidden", ManagedValue::Bool(true))]);
+        reload_managed();
+        assert_eq!(audio_sweep_due(&conn).unwrap().org_id, "o1");
+        record_audio_sweep(&conn, "o1").unwrap();
+        assert_eq!(audio_sweep_due(&conn).unwrap().org_id, MANAGED_SWEEP_ID);
+        record_audio_sweep(&conn, MANAGED_SWEEP_ID).unwrap();
+        assert_eq!(audio_sweep_due(&conn), None);
+    }
+
+    #[test]
+    fn a_profile_sweeps_only_when_it_forces_audio_forbidden_true() {
+        let (_d, conn) = conn();
+        for pairs in [
+            vec![],
+            vec![("audio_forbidden", ManagedValue::Bool(false))],
+            vec![("local_only", ManagedValue::Bool(true))],
+            vec![("audio_forbidden", ManagedValue::Text("true".into()))],
+        ] {
+            force_for_test(&pairs);
+            reload_managed();
+            assert_eq!(audio_sweep_due(&conn), None, "{pairs:?}");
+        }
+        assert!(effective_or_strictest(&conn).audio_forbidden, "a mistyped value still closes the gate");
+    }
+
+    #[test]
+    fn a_profile_still_sweeps_beside_an_unreadable_cache() {
+        let (_d, conn) = conn();
+        crate::db::set_setting(&conn, SETTING_ORG_CONFIG, "{not json").unwrap();
+        force_for_test(&[("audio_forbidden", ManagedValue::Bool(true))]);
+        reload_managed();
+        assert_eq!(audio_sweep_due(&conn).unwrap().org_id, MANAGED_SWEEP_ID);
+    }
+
+    #[test]
+    fn a_reload_sees_a_profile_installed_since_the_last_read() {
+        assert_eq!(managed(), Managed::default());
+        force_for_test(&[("local_only", ManagedValue::Bool(true)), ("server_url", ManagedValue::Text("https://s.example".into()))]);
+        assert_eq!(managed().layer, None, "cached until re-read");
+        assert_eq!(reload_managed(), ManagedChange { policy: true, server_url: true });
+        assert!(managed().layer.unwrap().policy.local_only);
+        assert_eq!(reload_managed(), ManagedChange::default(), "nothing new");
+        force_for_test(&[]);
+        assert_eq!(reload_managed(), ManagedChange { policy: true, server_url: true });
+        assert_eq!(managed(), Managed::default());
     }
 }

@@ -574,7 +574,17 @@ fn adopt(
 
 /// Forget the session, any sign-in waiting for its code, and the stored account.
 pub(crate) fn sign_out(state: &State<'_, AppState>) {
-    if let Err(e) = store_account(&state.keychain_cache, None) {
+    forget_account(&state.keychain_cache);
+}
+
+/// [`sign_out`] through the Keychain cache, for callers that run before
+/// `AppState` exists.
+pub(crate) fn forget_account(cache: &crate::keychain::Cache) {
+    forget_account_with(|account| store_account(cache, account));
+}
+
+fn forget_account_with(store: impl FnOnce(Option<&StoredAccount>) -> Result<(), String>) {
+    if let Err(e) = store(None) {
         eprintln!("cloud: couldn't remove the stored account: {e}");
     }
     set_session(None);
@@ -583,14 +593,9 @@ pub(crate) fn sign_out(state: &State<'_, AppState>) {
 
 /// A new server invalidates the session, and its token must not be sent to it.
 pub(crate) fn server_changed(state: &State<'_, AppState>) {
-    forget_server(&state.keychain_cache);
-}
-
-/// [`server_changed`] for callers that run before `AppState` exists.
-pub(crate) fn forget_server(cache: &crate::keychain::Cache) {
-    if let Some(mut account) = read_account(cache) {
+    if let Some(mut account) = read_account(&state.keychain_cache) {
         if account.token.take().is_some() {
-            let _ = store_account(cache, Some(&account));
+            let _ = store_account(&state.keychain_cache, Some(&account));
         }
     }
     set_session(None);
@@ -955,6 +960,20 @@ pub async fn cloud_set_workspace_require_2fa(
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    #[test]
+    fn forgetting_the_account_leaves_no_credentials() {
+        set_session(Some(session("old-server-token")));
+        *CHALLENGE.lock() = Some(Challenge { base: "https://old".into(), email: "m@example.no".into(), mfa_id: "m1".into() });
+        let mut stored = Some(account(Some("hunter2"), Some("t")));
+        forget_account_with(|a| {
+            stored = a.cloned();
+            Ok(())
+        });
+        assert_eq!(stored, None, "email, password and token all go");
+        assert!(cached_session().is_none());
+        assert!(CHALLENGE.lock().is_none());
+    }
 
     fn session(token: &str) -> Session {
         Session { token: token.into(), user_id: "u1".into(), ..Session::default() }

@@ -173,13 +173,9 @@ pub(crate) fn base_url(conn: &rusqlite::Connection) -> Option<String> {
 }
 
 /// Write the server URL a managed configuration profile sets into the setting
-/// every reader uses. Returns whether it changed, in which case the session
-/// belongs to another server and must be dropped (`cloud_auth::forget_server`).
-pub(crate) fn pin_managed_server_url(conn: &rusqlite::Connection) -> anyhow::Result<bool> {
-    pin_server_url(conn, crate::org_policy::managed().server_url.as_deref())
-}
-
-fn pin_server_url(conn: &rusqlite::Connection, managed: Option<&str>) -> anyhow::Result<bool> {
+/// every reader uses. Returns whether it changed; `org::pin_managed_server`
+/// then drops the stored account.
+pub(crate) fn pin_server_url(conn: &rusqlite::Connection, managed: Option<&str>) -> anyhow::Result<bool> {
     let Some(url) = managed else { return Ok(false) };
     if base_url(conn).as_deref() == Some(url) {
         return Ok(false);

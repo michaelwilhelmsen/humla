@@ -90,7 +90,7 @@ Feature detail lives in `docs/features/` and `docs/architecture/`; read the link
 ### Cloud session
 
 - The password is only a fallback and is dropped the first time the server answers `two_factor_required`. The sync worker never signs in; it reports `signed_out` / `two_factor_required`. A change made while a workspace is 2FA-locked is never dropped.
-- A managed configuration profile (`org_policy::managed`, source "This Mac's configuration") counts only forced values, reads a policy key of the wrong type as on, never sets retention, and pins `server_url` by writing `cloud_base_url` and dropping the session token. → [cloud and private notes](docs/features/cloud-and-private-notes.md)
+- A managed configuration profile (`org_policy::managed`, source "This Mac's configuration") counts only forced values, reads a policy key of the wrong type as on, never sets retention, and pins `server_url` by writing `cloud_base_url` and dropping the whole stored account; forcing `audio_forbidden` to `true` owes the one-time audio sweep (`mac-configuration`). → [cloud and private notes](docs/features/cloud-and-private-notes.md)
 
 ### Backend runtime
 
