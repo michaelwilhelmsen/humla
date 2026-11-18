@@ -25,6 +25,7 @@ mod diarization;
 // creates a note for a headless recording.
 pub(crate) mod cloud;
 pub(crate) mod cloud_auth;
+mod cloud_microsoft;
 mod export;
 // Live cloud-sync worker glue. Behind the `cloud` feature; `pub` so `run()` can
 // reach `cloud_worker::install`. Not a #[tauri::command] group, so no glob
@@ -64,6 +65,7 @@ pub use deferred::*;
 pub use diarization::*;
 pub use cloud::*;
 pub use cloud_auth::*;
+pub use cloud_microsoft::*;
 pub use export::*;
 pub use folders::*;
 pub use import::*;

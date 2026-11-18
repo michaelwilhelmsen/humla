@@ -76,7 +76,7 @@ pub(crate) enum AuthFailure {
     Unreachable(String),
 }
 
-/// The answer to a correct password.
+/// The answer to a correct password, or to a Microsoft sign-in.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum PasswordLogin {
     SignedIn(Session),
@@ -85,7 +85,7 @@ pub(crate) enum PasswordLogin {
     TwoFactor { mfa_id: String },
 }
 
-fn str_field(val: &serde_json::Value, key: &str) -> String {
+pub(super) fn str_field(val: &serde_json::Value, key: &str) -> String {
     val.get(key).and_then(|v| v.as_str()).unwrap_or_default().to_string()
 }
 
@@ -381,7 +381,7 @@ pub(crate) async fn renew(
 // ---- the process's session --------------------------------------------------
 
 const CRED_ACCOUNT: &str = "cloud_credentials";
-const NOT_CONFIGURED: &str = "Cloud isn't configured — set the server URL first.";
+pub(super) const NOT_CONFIGURED: &str = "Cloud isn't configured — set the server URL first.";
 
 static SESSION: LazyLock<Mutex<Option<Session>>> = LazyLock::new(|| Mutex::new(None));
 
@@ -389,12 +389,13 @@ static SESSION: LazyLock<Mutex<Option<Session>>> = LazyLock::new(|| Mutex::new(N
 /// moment wait for one renewal instead of each signing in.
 static RENEWING: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(|| tokio::sync::Mutex::new(()));
 
-/// A password sign-in waiting for its code: the one the code step answers.
+/// A sign-in waiting for its code: the one the code step answers.
 #[derive(Clone)]
 struct Challenge {
     base: String,
     email: String,
     mfa_id: String,
+    microsoft: bool,
 }
 
 static CHALLENGE: LazyLock<Mutex<Option<Challenge>>> = LazyLock::new(|| Mutex::new(None));
@@ -600,6 +601,7 @@ fn forget_account_with(store: impl FnOnce(Option<&StoredAccount>) -> Result<(), 
     }
     set_session(None);
     *CHALLENGE.lock() = None;
+    super::cloud_microsoft::cancel();
 }
 
 /// A new server invalidates the session, and its token must not be sent to it.
@@ -611,14 +613,15 @@ pub(crate) fn server_changed(state: &State<'_, AppState>) {
     }
     set_session(None);
     *CHALLENGE.lock() = None;
+    super::cloud_microsoft::cancel();
 }
 
-fn http() -> reqwest::Client {
+pub(super) fn http() -> reqwest::Client {
     crate::http::client()
 }
 
 /// Read a response as `(status, JSON body)`; a body that isn't JSON reads as null.
-async fn status_and_body(resp: reqwest::Response) -> (u16, serde_json::Value) {
+pub(super) async fn status_and_body(resp: reqwest::Response) -> (u16, serde_json::Value) {
     let status = resp.status().as_u16();
     (status, resp.json().await.unwrap_or_default())
 }
@@ -680,8 +683,8 @@ fn login_error(failure: AuthFailure) -> String {
 
 // ---- signing in --------------------------------------------------------------
 
-/// Where a password sign-in landed: signed in, or waiting for the code from the
-/// user's authenticator app ([`cloud_verify_two_factor`]).
+/// Where a sign-in landed: signed in, or waiting for the code from the user's
+/// authenticator app ([`cloud_verify_two_factor`]).
 #[derive(Serialize)]
 #[serde(tag = "step", rename_all = "snake_case")]
 pub enum SignInStep {
@@ -699,18 +702,38 @@ pub async fn cloud_login(
     let base = super::cloud::read_base_url(&state).ok_or(NOT_CONFIGURED)?;
     let email = email.trim();
     match (PocketBase { base: &base }).password_login(email, &password).await {
-        Ok(PasswordLogin::SignedIn(session)) => {
-            adopt(&state, session, email, Some(&password))?;
+        Ok(login) => {
+            Ok(finish_sign_in(app, state, base, login, email, Some(&password), false).await?)
+        }
+        Err(failure) => Err(login_error(failure)),
+    }
+}
+
+/// Act on a credential the server accepted: sign in, or hold the challenge for
+/// the code step. `password` is stored only for an account that can sign in with
+/// it alone.
+pub(super) async fn finish_sign_in(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    base: String,
+    login: PasswordLogin,
+    email: &str,
+    password: Option<&str>,
+    microsoft: bool,
+) -> Result<SignInStep, String> {
+    match login {
+        PasswordLogin::SignedIn(session) => {
+            adopt(&state, session, email, password)?;
             *CHALLENGE.lock() = None;
             state.sync.config_changed(); // signed in → start the sync worker
             let status = super::cloud::cloud_status(app, state).await?;
             Ok(SignInStep::SignedIn { status: Box::new(status) })
         }
-        Ok(PasswordLogin::TwoFactor { mfa_id }) => {
-            *CHALLENGE.lock() = Some(Challenge { base, email: email.to_string(), mfa_id });
+        PasswordLogin::TwoFactor { mfa_id } => {
+            *CHALLENGE.lock() =
+                Some(Challenge { base, email: email.to_string(), mfa_id, microsoft });
             Ok(SignInStep::TwoFactor)
         }
-        Err(failure) => Err(login_error(failure)),
     }
 }
 
@@ -730,11 +753,13 @@ pub(crate) async fn sign_in_new_account(
     }
 }
 
-fn challenge_expired() -> CloudError {
-    CloudError {
-        reason: "challenge_expired".into(),
-        message: "That sign-in has expired. Enter your password again.".into(),
-    }
+fn challenge_expired(microsoft: bool) -> CloudError {
+    let message = if microsoft {
+        "That sign-in has expired. Sign in with Microsoft again."
+    } else {
+        "That sign-in has expired. Enter your password again."
+    };
+    CloudError { reason: "challenge_expired".into(), message: message.into() }
 }
 
 /// Finish a password sign-in that asked for a second factor: the code from the
@@ -746,7 +771,7 @@ pub async fn cloud_verify_two_factor(
     code: Option<String>,
     recovery_code: Option<String>,
 ) -> Result<CloudStatus, CloudError> {
-    let challenge = CHALLENGE.lock().clone().ok_or_else(challenge_expired)?;
+    let challenge = CHALLENGE.lock().clone().ok_or_else(|| challenge_expired(false))?;
     let mut body = second_factor(code, recovery_code)?;
     body["mfaId"] = serde_json::Value::String(challenge.mfa_id.clone());
     let resp = http()
@@ -760,6 +785,7 @@ pub async fn cloud_verify_two_factor(
         let failure = two_factor_error(status, &body);
         if failure.reason == "challenge_expired" {
             *CHALLENGE.lock() = None;
+            return Err(challenge_expired(challenge.microsoft));
         }
         return Err(failure);
     }
@@ -975,7 +1001,7 @@ mod tests {
     #[test]
     fn forgetting_the_account_leaves_no_credentials() {
         set_session(Some(session("old-server-token")));
-        *CHALLENGE.lock() = Some(Challenge { base: "https://old".into(), email: "m@example.no".into(), mfa_id: "m1".into() });
+        *CHALLENGE.lock() = Some(Challenge { base: "https://old".into(), email: "m@example.no".into(), mfa_id: "m1".into(), microsoft: false });
         let mut stored = Some(account(Some("hunter2"), Some("t")));
         forget_account_with(|a| {
             stored = a.cloned();

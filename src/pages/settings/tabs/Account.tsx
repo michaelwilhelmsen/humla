@@ -3,6 +3,7 @@ import { Cloud, CloudOff, LogOut } from "lucide-react";
 import { cloudApi, useCloudStore, HUMLA_CLOUD_URL } from "../../../lib/cloud";
 import { useCloudSignIn } from "../../../lib/useCloudSignIn";
 import { TwoFactorCodeForm } from "../../../components/TwoFactorCodeForm";
+import { MicrosoftSignIn } from "../../../components/MicrosoftSignIn";
 import { TwoFactorSection } from "./TwoFactor";
 import { OrgInviteCard } from "../../../components/OrgInviteCard";
 import { Row, Section } from "../components/Section";
@@ -91,7 +92,7 @@ export function AccountTab({ s, update }: Pick<SettingsHook, "s" | "update">) {
   const [error, setError] = useState<string | null>(null);
   const [verifyMsg, setVerifyMsg] = useState<string | null>(null);
   const [resetMsg, setResetMsg] = useState<string | null>(null);
-  const auth = useCloudSignIn();
+  const auth = useCloudSignIn(email);
 
   // A session that ended by itself names its account, so the form can ask the
   // user back without them retyping it. Status arrives after the first render.
@@ -306,7 +307,8 @@ export function AccountTab({ s, update }: Pick<SettingsHook, "s" | "update">) {
         )}
         <Row label="Email">
           <input className={inputCls} type="email" autoComplete="username" value={email}
-            onChange={(e) => setEmail(e.target.value)} placeholder="you@example.com" />
+            onChange={(e) => setEmail(e.target.value)} onBlur={auth.emailBlurred}
+            placeholder="you@example.com" />
         </Row>
         <Row label="Password">
           <input className={inputCls} type="password"
@@ -321,12 +323,15 @@ export function AccountTab({ s, update }: Pick<SettingsHook, "s" | "update">) {
           )}
           <div className="flex gap-2">
             <Btn onClick={submit} disabled={formBusy || !canSubmit}>
-              {auth.busy ? (isSignup ? "Creating…" : "Signing in…") : isSignup ? "Create account" : "Sign in"}
+              {auth.busy && !auth.waitingForMicrosoft
+                ? (isSignup ? "Creating…" : "Signing in…")
+                : isSignup ? "Create account" : "Sign in"}
             </Btn>
             {!status.server_managed && (
               <Btn onClick={disconnect} disabled={formBusy}>Change server</Btn>
             )}
           </div>
+          <MicrosoftSignIn auth={auth} />
           <div className="flex items-center gap-4">
             <button type="button" onClick={toggleMode}
               className="text-xs text-[var(--color-interactive)] hover:underline">

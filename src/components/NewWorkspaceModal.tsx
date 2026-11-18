@@ -22,6 +22,7 @@ import type { CheckoutSource } from "../lib/cloud";
 import { useNotesStore } from "../lib/store";
 import { useCloudSignIn } from "../lib/useCloudSignIn";
 import { TwoFactorCodeForm } from "./TwoFactorCodeForm";
+import { MicrosoftSignIn } from "./MicrosoftSignIn";
 import { Modal } from "../pages/settings/components/Modal";
 
 // Creating a workspace, end to end, in one sheet.
@@ -240,10 +241,10 @@ function ConnectStage({ onClose }: { onClose: () => void }) {
 
 function AuthStage() {
   const status = useCloudStore((s) => s.status);
-  const auth = useCloudSignIn();
   const [mode, setMode] = useState<"signin" | "signup">("signup");
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
+  const auth = useCloudSignIn(email);
   const [password, setPassword] = useState("");
   const { busy, error } = auth;
 
@@ -301,6 +302,7 @@ function AuthStage() {
             aria-label="Email"
             value={email}
             onChange={(e) => setEmail(e.target.value)}
+            onBlur={auth.emailBlurred}
             placeholder="you@example.com"
           />
           <input
@@ -314,6 +316,7 @@ function AuthStage() {
             placeholder={isSignup ? "At least 8 characters" : "••••••••"}
           />
         </div>
+        <MicrosoftSignIn auth={auth} />
         <Err>{error}</Err>
         {/* Branch, don't assert: a self-hosted server bills nothing, so quoting a
             per-seat price here would be the app inventing a charge. */}
@@ -330,7 +333,7 @@ function AuthStage() {
           disabled={busy || !canSubmit}
           className="nd-btn nd-btn-primary"
         >
-          {busy
+          {busy && !auth.waitingForMicrosoft
             ? isSignup
               ? "Creating…"
               : "Signing in…"

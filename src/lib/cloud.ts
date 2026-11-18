@@ -89,11 +89,14 @@ export const TWO_FACTOR_UNAVAILABLE: TwoFactorStatus = {
   required_by: [],
 };
 
-/** Where a password sign-in landed: signed in, or waiting for the code from
- *  the user's authenticator app (`cloudApi.verifyTwoFactor`). */
+/** Where a sign-in landed: signed in, or waiting for the code from the user's
+ *  authenticator app (`cloudApi.verifyTwoFactor`). */
 export type SignInStep =
   | { step: "signed_in"; status: CloudStatus }
   | { step: "two_factor" };
+
+/** Sign-in methods the server offers beside the password. */
+export type SignInMethods = { microsoft: boolean };
 
 /** The second factor a two-factor route takes. */
 export type SecondFactor = { code: string } | { recoveryCode: string };
@@ -220,6 +223,13 @@ export const cloudApi = {
   configure: (baseUrl: string) => invoke<void>("cloud_configure", { baseUrl }),
   login: (email: string, password: string) =>
     invoke<SignInStep>("cloud_login", { email, password }),
+  /** What the server offers `email`; with no email, what it offers everyone. */
+  signInMethods: (email?: string) => invoke<SignInMethods>("cloud_sign_in_methods", { email }),
+  /** Sign in with Microsoft in the system browser, prefilled with `email`.
+   *  Resolves when the browser comes back; rejects with reason `cancelled`
+   *  after `cancelMicrosoft`. */
+  loginMicrosoft: (email?: string) => invoke<SignInStep>("cloud_login_microsoft", { email }),
+  cancelMicrosoft: () => invoke<void>("cloud_cancel_microsoft"),
   /** Finish a sign-in that answered with `two_factor`. */
   verifyTwoFactor: (factor: SecondFactor) =>
     invoke<CloudStatus>("cloud_verify_two_factor", factorArgs(factor)),
