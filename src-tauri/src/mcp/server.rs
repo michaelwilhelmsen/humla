@@ -94,6 +94,11 @@ impl HumlaMcp {
                 .with_mime_type("text/plain")];
         }
         let workspace = super::active_workspace(&conn);
+        if let Some(refusal) = super::workspace_refusal(&conn, &workspace) {
+            return vec![Resource::new(RESOURCE_DISABLED, "Humla — kept on this Mac")
+                .with_description(refusal)
+                .with_mime_type("text/plain")];
+        }
         let notes =
             crate::db::list_notes_filtered(&conn, Default::default(), &workspace, RESOURCE_LIMIT)
                 .unwrap_or_default();
@@ -114,7 +119,9 @@ impl HumlaMcp {
         // server is broken, which is the opposite of the message — and the message is
         // the entire point of offering it.
         if uri == RESOURCE_DISABLED {
-            let refusal = super::refusal(&self.db.lock());
+            let conn = self.db.lock();
+            let refusal = super::refusal(&conn)
+                .or_else(|| super::workspace_refusal(&conn, &super::active_workspace(&conn)));
             return Ok(refusal.unwrap_or_else(super::disabled_message));
         }
         let Some(note_id) = uri.strip_prefix(RESOURCE_PREFIX) else {
@@ -424,28 +431,44 @@ mod tests {
     }
 
     #[test]
-    fn local_only_answers_nothing_from_the_library_even_when_switched_on() {
+    fn local_only_answers_nothing_from_its_departments_and_personal_as_usual() {
+        use crate::org_policy::TEST_ORG_WORKSPACE;
         let dir = tempfile::tempdir().unwrap();
         let conn = crate::db::open(&dir.path().join("t.sqlite")).unwrap();
-        let note = crate::db::create_note(&conn, "en", "meeting", "").unwrap();
-        crate::db::update_note(
-            &conn,
-            &note.id,
-            &crate::db::NotePatch { title: Some("Secret meeting".into()), ..Default::default() },
-        )
-        .unwrap();
+        let titled = |title: &str, workspace: &str| {
+            let note = crate::db::create_note(&conn, "en", "meeting", "").unwrap();
+            crate::db::update_note(
+                &conn,
+                &note.id,
+                &crate::db::NotePatch { title: Some(title.into()), ..Default::default() },
+            )
+            .unwrap();
+            crate::db::set_note_workspace(&conn, &note.id, workspace).unwrap();
+            note.id
+        };
+        let secret = titled("Secret meeting", TEST_ORG_WORKSPACE);
+        let personal = titled("Personal meeting", "");
         crate::db::set_setting(&conn, super::super::SETTING_ENABLED, "true").unwrap();
+        crate::db::set_setting(&conn, "cloud_workspace_id", TEST_ORG_WORKSPACE).unwrap();
         crate::org_policy::cache_local_only(&conn, "Northwind");
         let server = HumlaMcp::new(conn);
 
         for spec in tools::specs() {
             let (text, is_error) =
-                server.dispatch(spec.name, serde_json::json!({ "query": "secret", "note_id": note.id }));
+                server.dispatch(spec.name, serde_json::json!({ "query": "secret", "note_id": secret }));
             assert!(is_error, "{}", spec.name);
             assert!(text.starts_with("Blocked by Northwind"), "{}: {text}", spec.name);
         }
         let rendered = serde_json::to_string(&server.resources()).unwrap();
         assert!(!rendered.contains("Secret meeting"), "{rendered}");
         assert!(server.read_uri(RESOURCE_DISABLED).unwrap().starts_with("Blocked by Northwind"));
+
+        crate::db::set_setting(&server.db.lock(), "cloud_workspace_id", "").unwrap();
+        let (text, is_error) = server.dispatch(tools::TOOL_GET, serde_json::json!({ "note_id": personal }));
+        assert!(!is_error && text.contains("Personal meeting"), "{text}");
+        let (text, is_error) = server.dispatch(tools::TOOL_GET, serde_json::json!({ "note_id": secret }));
+        assert!(is_error && !text.contains("Secret meeting"), "{text}");
+        let rendered = serde_json::to_string(&server.resources()).unwrap();
+        assert!(rendered.contains("Personal meeting") && !rendered.contains("Secret meeting"), "{rendered}");
     }
 }

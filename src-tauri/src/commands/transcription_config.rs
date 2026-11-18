@@ -35,7 +35,7 @@ pub fn set_transcribe_config(
 ) -> Result<(), String> {
     let json = serde_json::to_string(&config).map_err(err)?;
     let conn = state.db.lock();
-    let policy = org_policy::effective_or_strictest(&conn);
+    let policy = org_policy::effective_managed();
     if !validate(&config, &policy, custom_base_url(&conn).as_deref()).is_empty() {
         return Err(policy.blocked().to_string());
     }
@@ -78,11 +78,29 @@ pub(crate) fn endpoint_url<'a>(cfg: &'a ProviderConfig, custom_base_url: Option<
     }
 }
 
-/// Refuse a transcription config the policy doesn't allow, before any Keychain
-/// read.
-pub(crate) fn check(conn: &rusqlite::Connection, cfg: &ProviderConfig) -> anyhow::Result<()> {
+/// Where a note's audio is transcribed: the user's config for `language`, with
+/// each slot the policy for the note's workspace refuses moved to on-device
+/// Whisper, as Settings shows it under "Managed by".
+pub(crate) fn resolve_for_note(
+    conn: &rusqlite::Connection,
+    cfg: &TranscribeConfig,
+    note_id: &str,
+    language: &str,
+) -> ProviderConfig {
+    let policy = org_policy::effective_for_note(conn, note_id);
+    enforce(cfg, &policy, custom_base_url(conn).as_deref()).resolve(language).clone()
+}
+
+/// Refuse a transcription config the policy for a note's workspace doesn't
+/// allow, before any Keychain read.
+pub(crate) fn check(conn: &rusqlite::Connection, note_id: &str, cfg: &ProviderConfig) -> anyhow::Result<()> {
+    let policy = org_policy::effective_for_note(conn, note_id);
     let custom = custom_base_url(conn);
-    org_policy::check_endpoint(conn, cfg.provider(), endpoint_url(cfg, custom.as_deref())).map(|_| ())
+    if policy.allows(cfg.provider(), endpoint_url(cfg, custom.as_deref())) {
+        Ok(())
+    } else {
+        Err(policy.blocked())
+    }
 }
 
 /// The slots the policy refuses: `"default"` and the language code of each
@@ -130,7 +148,7 @@ mod tests {
     fn local_only() -> EffectivePolicy {
         let (_d, conn) = conn();
         org_policy::cache_local_only(&conn, "Northwind");
-        org_policy::effective(&conn).unwrap()
+        org_policy::effective_for(&conn, Some(org_policy::TEST_ORG_WORKSPACE)).unwrap()
     }
 
     fn conn() -> (tempfile::TempDir, rusqlite::Connection) {
@@ -174,15 +192,43 @@ mod tests {
     }
 
     #[test]
-    fn check_refuses_a_cloud_transcriber_under_local_only() {
+    fn check_refuses_a_cloud_transcriber_only_for_a_governed_note() {
         let (_d, conn) = conn();
         org_policy::cache_local_only(&conn, "Northwind");
+        let governed = org_policy::note_in(&conn, org_policy::TEST_ORG_WORKSPACE);
         let cfg = config();
-        let err = check(&conn, &cfg.default).unwrap_err().to_string();
+        let err = check(&conn, &governed, &cfg.default).unwrap_err().to_string();
         assert_eq!(err, "Blocked by Northwind: processing stays on this Mac.");
-        assert!(check(&conn, &cfg.per_language["sv"]).is_ok());
-        assert!(check(&conn, &cfg.per_language["da"]).is_err(), "custom with no URL");
+        assert!(check(&conn, &governed, &cfg.per_language["sv"]).is_ok());
+        assert!(check(&conn, &governed, &cfg.per_language["da"]).is_err(), "custom with no URL");
+        for ws in ["", "w-other"] {
+            let free = org_policy::note_in(&conn, ws);
+            assert!(check(&conn, &free, &cfg.default).is_ok(), "{ws:?}");
+        }
         db::set_setting(&conn, "custom_base_url", "http://[::1]:9000/v1").unwrap();
-        assert!(check(&conn, &cfg.per_language["da"]).is_ok());
+        assert!(check(&conn, &governed, &cfg.per_language["da"]).is_ok());
+    }
+
+    #[test]
+    fn a_governed_note_is_transcribed_on_this_mac_and_others_as_configured() {
+        let (_d, conn) = conn();
+        org_policy::cache_local_only(&conn, "Northwind");
+        let governed = org_policy::note_in(&conn, org_policy::TEST_ORG_WORKSPACE);
+        let personal = org_policy::note_in(&conn, "");
+        let cfg = config();
+        for lang in ["en", "no"] {
+            let p = resolve_for_note(&conn, &cfg, &governed, lang);
+            assert_eq!(p.provider(), crate::providers::ProviderId::Local, "{lang}");
+            assert!(check(&conn, &governed, &p).is_ok());
+        }
+        assert_eq!(resolve_for_note(&conn, &cfg, &personal, "en"), cfg.default);
+        assert_eq!(resolve_for_note(&conn, &cfg, &personal, "no"), cfg.per_language["no"]);
+    }
+
+    #[test]
+    fn saving_the_config_follows_only_the_managed_profile() {
+        let (_d, conn) = conn();
+        org_policy::cache_local_only(&conn, "Northwind");
+        assert!(validate(&config(), &org_policy::effective_managed(), None).is_empty());
     }
 }

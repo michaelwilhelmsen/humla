@@ -42,7 +42,7 @@ pub(super) async fn write_playback_assets(
         return;
     };
 
-    if audio == PlaybackAudio::FollowGate && keep_audio_enabled(app) {
+    if audio == PlaybackAudio::FollowGate && keep_audio_enabled(app, note_id) {
         if let Err(e) = build_playback(mic_wav, sys_wav, &target).await {
             eprintln!("playback: build_playback: {e}");
         }

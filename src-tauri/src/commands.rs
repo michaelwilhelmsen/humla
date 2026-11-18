@@ -144,11 +144,12 @@ fn local_llm_base_url(conn: &rusqlite::Connection) -> anyhow::Result<String> {
         .unwrap_or_else(|| DEFAULT_LOCAL_LLM_BASE_URL.to_string()))
 }
 
-/// Refuse a summary or chat provider the organisation policy doesn't allow,
-/// before any Keychain slot opens. A custom endpoint with no URL is checked as
-/// having none, which `local_only` refuses.
+/// Refuse a summary or chat provider the policy for notes in `workspace_id`
+/// doesn't allow, before any Keychain slot opens. A custom endpoint with no URL
+/// is checked as having none, which `local_only` refuses.
 fn check_llm_endpoint(
     conn: &rusqlite::Connection,
+    workspace_id: Option<&str>,
     id: crate::providers::ProviderId,
 ) -> anyhow::Result<crate::org_policy::EffectivePolicy> {
     use crate::providers::ProviderId;
@@ -161,7 +162,7 @@ fn check_llm_endpoint(
         | ProviderId::Deepgram
         | ProviderId::Groq => None,
     };
-    crate::org_policy::check_endpoint(conn, id, url.as_deref())
+    crate::org_policy::check_endpoint(conn, workspace_id, id, url.as_deref())
 }
 fn err<E: std::fmt::Display>(e: E) -> String { e.to_string() }
 
@@ -317,18 +318,20 @@ fn raw_setting(app: &AppHandle, key: &str) -> Option<String> {
     db::get_setting(&conn, key).ok().flatten()
 }
 
-/// Read the device's `keep_audio` decision (#24). The single gate consulted by
-/// every path that would write, upload or download a WAV.
-pub(crate) fn keep_audio_enabled(app: &AppHandle) -> bool {
-    sessions::retain_audio(raw_setting(app, "keep_audio").as_deref(), audio_forbidden(app))
+/// Read the `keep_audio` decision (#24) for one note: the device's setting,
+/// closed by `audio_forbidden` from a managed profile or from the organisation
+/// owning the note's department. The single gate consulted by every path that
+/// would write, upload or download a WAV.
+pub(crate) fn keep_audio_enabled(app: &AppHandle, note_id: &str) -> bool {
+    sessions::retain_audio(raw_setting(app, "keep_audio").as_deref(), audio_forbidden(app, note_id))
 }
 
-/// Whether an organisation's `audio_forbidden` is in force. A policy that
+/// Whether `audio_forbidden` is in force for a note. A policy or note that
 /// can't be read counts as forbidding audio.
-pub(crate) fn audio_forbidden(app: &AppHandle) -> bool {
+pub(crate) fn audio_forbidden(app: &AppHandle, note_id: &str) -> bool {
     let state: State<AppState> = app.state();
     let conn = state.db.lock();
-    crate::org_policy::effective_or_strictest(&conn).audio_forbidden
+    crate::org_policy::effective_for_note(&conn, note_id).audio_forbidden
 }
 
 /// Whether a capture starting now should keep the Mac from idle sleep (#180).
@@ -341,9 +344,9 @@ pub(crate) fn keep_awake_enabled(app: &AppHandle) -> bool {
 /// Whether a recording starting now should defer transcription (#146). Reads
 /// both halves of the decision — see [`sessions::defer_transcription`] for why
 /// `keep_audio` gates it.
-pub(crate) fn deferred_transcription_enabled(app: &AppHandle) -> bool {
+pub(crate) fn deferred_transcription_enabled(app: &AppHandle, note_id: &str) -> bool {
     let manual = raw_setting(app, "transcribe_manually");
-    sessions::defer_transcription(manual.as_deref(), keep_audio_enabled(app))
+    sessions::defer_transcription(manual.as_deref(), keep_audio_enabled(app, note_id))
 }
 
 /// How far the run has got, on the same per-note channel. Measured in audio

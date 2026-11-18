@@ -438,7 +438,7 @@ pub async fn recording_start(
     // this note to Deepgram keeps its live transcript while a Norwegian note on
     // local Whisper defers.
     let sink_mode = if matches!(provider_cfg, crate::stt::ProviderConfig::Local(_))
-        && deferred_transcription_enabled(&app)
+        && deferred_transcription_enabled(&app, &note_id)
     {
         SinkMode::Deferred
     } else {
@@ -1115,7 +1115,7 @@ async fn post_stop_chain_inner(
     // multi-take note recorded with keep_audio off simply can't be unified.)
     // One gate decision for the whole chain, so retention and the deferred
     // branch below can't disagree.
-    let keep_audio = keep_audio_enabled(&app);
+    let keep_audio = keep_audio_enabled(&app, &note_id);
     let t_keep = std::time::Instant::now();
     maybe_keep_audio(&app, &note_id, &post_stop, &progress, keep_audio).await;
     clock.record(|t| t.keep_audio_ms = ms_since(t_keep));
@@ -1388,11 +1388,12 @@ pub(super) async fn check_provider_ready(
             .unwrap_or_default();
         if note_lang.trim().is_empty() { global } else { note_lang }
     };
-    let provider_cfg = transcribe_cfg.resolve(&language).clone();
-    {
+    let provider_cfg = {
         let conn = state.db.lock();
-        super::transcription_config::check(&conn, &provider_cfg).map_err(err)?;
-    }
+        let provider_cfg = super::transcription_config::resolve_for_note(&conn, &transcribe_cfg, note_id, &language);
+        super::transcription_config::check(&conn, note_id, &provider_cfg).map_err(err)?;
+        provider_cfg
+    };
     // Each cloud provider has its own Keychain slot. Look up the right one so
     // the check doesn't pass when (e.g.) the user picked Deepgram but only saved
     // an OpenAI key.

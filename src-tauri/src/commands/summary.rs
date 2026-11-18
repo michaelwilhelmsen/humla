@@ -147,7 +147,7 @@ pub(super) fn summary_provider_id(
     let id = ProviderId::parse(&provider)
         .filter(|p| p.capabilities().summarize)
         .ok_or_else(|| anyhow::anyhow!("unknown summary provider “{provider}” — pick one in Settings"))?;
-    super::check_llm_endpoint(conn, id)?;
+    super::check_llm_endpoint(conn, Some(&note.workspace_id), id)?;
     Ok(id)
 }
 
@@ -724,12 +724,41 @@ mod tests {
     fn local_only_refuses_cloud_summaries_before_any_key_is_read() {
         let (_dir, conn) = temp_conn();
         crate::org_policy::cache_local_only(&conn, "Northwind");
-        let note = db::create_note(&conn, "no", "meeting", "").unwrap();
+        let note = governed_note(&conn);
         for id in ["openai", "anthropic", "copilot"] {
             db::set_setting(&conn, "summary_provider", id).unwrap();
             let err = summary_provider_id(&conn, &note).unwrap_err().to_string();
             assert_eq!(err, "Blocked by Northwind: processing stays on this Mac.", "{id}");
         }
+    }
+
+    fn governed_note(conn: &rusqlite::Connection) -> Note {
+        db::get_note(conn, &crate::org_policy::note_in(conn, crate::org_policy::TEST_ORG_WORKSPACE)).unwrap()
+    }
+
+    #[test]
+    fn an_organisations_local_only_leaves_personal_and_other_workspaces_alone() {
+        let (_dir, conn) = temp_conn();
+        crate::org_policy::cache_local_only(&conn, "Northwind");
+        db::set_setting(&conn, "summary_provider", "openai").unwrap();
+        for ws in ["", "w-other"] {
+            let note = db::get_note(&conn, &crate::org_policy::note_in(&conn, ws)).unwrap();
+            assert_eq!(summary_provider_id(&conn, &note).unwrap(), ProviderId::OpenAi, "{ws:?}");
+        }
+        assert!(summary_provider_id(&conn, &governed_note(&conn)).is_err());
+    }
+
+    #[test]
+    fn a_managed_profile_refuses_cloud_summaries_for_every_note() {
+        use crate::org_policy::{force_for_test, reload_managed, ManagedValue};
+        let (_dir, conn) = temp_conn();
+        force_for_test(&[("local_only", ManagedValue::Bool(true))]);
+        reload_managed();
+        db::set_setting(&conn, "summary_provider", "openai").unwrap();
+        let personal = db::create_note(&conn, "no", "meeting", "").unwrap();
+        assert!(summary_provider_id(&conn, &personal).is_err());
+        force_for_test(&[]);
+        reload_managed();
     }
 
     #[test]
@@ -738,7 +767,7 @@ mod tests {
         crate::org_policy::cache_local_only(&conn, "Northwind");
         db::set_setting(&conn, "local_llm_model", "gemma4:12b-mlx").unwrap();
         db::set_setting(&conn, "custom_model", "m").unwrap();
-        let note = db::create_note(&conn, "no", "meeting", "").unwrap();
+        let note = governed_note(&conn);
 
         db::set_setting(&conn, "summary_provider", "local").unwrap();
         assert!(resolve_provider(&conn, &note, None).is_ok(), "the default localhost URL");
@@ -758,7 +787,7 @@ mod tests {
         let (_dir, conn) = temp_conn();
         crate::org_policy::cache_local_only(&conn, "Northwind");
         db::set_setting(&conn, "summary_provider", "local").unwrap();
-        let mut note = db::create_note(&conn, "no", "meeting", "").unwrap();
+        let mut note = governed_note(&conn);
         note.summary_provider = "anthropic".into();
         assert!(summary_provider_id(&conn, &note).is_err());
     }

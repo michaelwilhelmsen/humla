@@ -1410,7 +1410,7 @@ fn latest_session(app: &tauri::AppHandle, note_id: &str) -> Result<std::path::Pa
 pub(crate) async fn upload_note_audio(app: &tauri::AppHandle, note_id: &str) -> Result<(), String> {
     // Nothing was written to upload (#24). Bail before the 60 s wait loop below,
     // which would otherwise poll for a playback.wav that by design never lands.
-    if !crate::commands::keep_audio_enabled(app) {
+    if !crate::commands::keep_audio_enabled(app, note_id) {
         return Ok(());
     }
     let state = app.state::<AppState>();
@@ -1480,10 +1480,10 @@ pub(crate) async fn upload_note_audio(app: &tauri::AppHandle, note_id: &str) -> 
 /// remote audio, or when this device has `keep_audio` off. The `audio` field is
 /// protected, so it's fetched with a short-lived file token.
 pub(crate) async fn download_note_audio(app: &tauri::AppHandle, note_id: &str) -> Result<bool, String> {
-    // `keep_audio` is device-scoped (#24): a Mac told to store no audio doesn't
-    // fetch a teammate's recording either, or the setting would only describe
-    // the notes this device happened to record.
-    if !crate::commands::keep_audio_enabled(app) {
+    // `keep_audio` covers every note on this device (#24): a Mac told to store
+    // no audio doesn't fetch a teammate's recording either, or the setting would
+    // only describe the notes this device happened to record.
+    if !crate::commands::keep_audio_enabled(app, note_id) {
         return Ok(false);
     }
     let state = app.state::<AppState>();
@@ -1710,7 +1710,7 @@ pub(crate) async fn upload_note_sessions(
     }
     // Audio recorded before `audio_forbidden` arrived stays on disk until the
     // sweep runs; it must not upload meanwhile.
-    let sync_audio = sync_audio && !crate::commands::audio_forbidden(app);
+    let sync_audio = sync_audio && !crate::commands::audio_forbidden(app, note_id);
     let app_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     let recordings = crate::sessions::recordings_dir(&app_dir, note_id);
     // Only real (manifest-backed) sessions sync per-session; a legacy flat note
@@ -1813,7 +1813,7 @@ pub(crate) async fn upload_note_sessions(
 /// reconstructed — including on a no-audio device, where the note still becomes
 /// readable. No-op for Personal notes.
 pub(crate) async fn download_note_sessions(app: &tauri::AppHandle, note_id: &str) -> Result<bool, String> {
-    let keep_audio = crate::commands::keep_audio_enabled(app);
+    let keep_audio = crate::commands::keep_audio_enabled(app, note_id);
     let state = app.state::<AppState>();
     let workspace = {
         let conn = state.db.lock();
