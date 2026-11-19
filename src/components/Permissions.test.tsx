@@ -66,3 +66,67 @@ describe("Settings → Permissions: notifications", () => {
     expect(opened).toEqual([{ kind: "notifications" }]);
   });
 });
+
+describe("Settings → Permissions: system audio", () => {
+  it("asks for System Audio Recording instead of Screen Recording where macOS has it", async () => {
+    const asked: unknown[] = [];
+    mockTauri({
+      permissions_status: () => ({
+        microphone: "granted",
+        screen: "denied",
+        systemAudio: asked.length ? "granted" : "not_determined",
+        notifications: "granted",
+      }),
+      permissions_request: (args) => {
+        asked.push(args);
+        return { microphone: "granted", screen: "denied", systemAudio: "granted", notifications: "granted" };
+      },
+    });
+    render(<Permissions />);
+
+    expect(await screen.findByText("System audio")).toBeTruthy();
+    expect(screen.queryByText("Screen Recording")).toBeNull();
+    expect(screen.queryByText(/Restart Humla/)).toBeNull();
+    await userEvent.click(screen.getByRole("button", { name: "Request" }));
+
+    expect(asked).toEqual([{ kind: "systemAudio" }]);
+    expect(await screen.findAllByText("Granted")).toHaveLength(3);
+  });
+
+  it("sends a user who turned system audio down to System Settings", async () => {
+    const opened: unknown[] = [];
+    mockTauri({
+      permissions_status: () => ({
+        microphone: "granted",
+        screen: "denied",
+        systemAudio: "denied",
+        notifications: "granted",
+      }),
+      permissions_open_settings: (args) => {
+        opened.push(args);
+        return null;
+      },
+    });
+    render(<Permissions />);
+
+    await screen.findByText("System audio");
+    expect(screen.queryByRole("button", { name: "Request" })).toBeNull();
+    await userEvent.click(screen.getByRole("button", { name: "Open System Settings" }));
+    expect(opened).toEqual([{ kind: "systemAudio" }]);
+  });
+
+  it("keeps Screen Recording on macOS before 14.2", async () => {
+    mockTauri({
+      permissions_status: () => ({
+        microphone: "granted",
+        screen: "granted",
+        systemAudio: "unsupported",
+        notifications: "granted",
+      }),
+    });
+    render(<Permissions />);
+
+    expect(await screen.findByText("Screen Recording")).toBeTruthy();
+    expect(screen.queryByText("System audio")).toBeNull();
+  });
+});

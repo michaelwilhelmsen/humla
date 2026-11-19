@@ -29,8 +29,10 @@ export type EditableKey = Exclude<
   | "onboarding_step"
   | "telemetry_enabled"
   | "record_hotkey"
-  // Owned by Home's offer card (src/lib/nemotronOffer.ts).
+  // Owned by Home's offer cards (src/lib/nemotronOffer.ts,
+  // src/components/SystemAudioOffer.tsx).
   | "nemotron_offer"
+  | "system_audio_offer"
 >;
 
 export type { Provider } from "../../lib/providers";

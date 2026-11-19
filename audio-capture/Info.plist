@@ -10,5 +10,7 @@
 	<string>APPL</string>
 	<key>LSUIElement</key>
 	<true/>
+	<key>NSAudioCaptureUsageDescription</key>
+	<string>Humla captures system audio (the other side of meetings) to transcribe and summarize them.</string>
 </dict>
 </plist>

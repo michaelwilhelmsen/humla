@@ -45,6 +45,36 @@ func screenStatusString() -> String {
     return result
 }
 
+// The System Audio Recording permission a process tap needs (macOS 14.2+).
+// macOS has no public call to read or request it, so these go through TCC's
+// own `TCCAccessPreflight` / `TCCAccessRequest`, loaded at runtime.
+enum SystemAudioPermission {
+    private typealias Preflight = @convention(c) (CFString, CFDictionary?) -> Int
+    private typealias Request = @convention(c) (CFString, CFDictionary?, @escaping (Bool) -> Void) -> Void
+    private static let service = "kTCCServiceAudioCapture" as CFString
+    private static let tcc = dlopen("/System/Library/PrivateFrameworks/TCC.framework/Versions/A/TCC", RTLD_NOW)
+
+    /// "granted", "denied", "not_determined", "unsupported" before macOS 14.2,
+    /// or "unknown" when TCC's functions can't be loaded.
+    static func status() -> String {
+        guard #available(macOS 14.2, *) else { return "unsupported" }
+        guard let sym = dlsym(tcc, "TCCAccessPreflight") else { return "unknown" }
+        switch unsafeBitCast(sym, to: Preflight.self)(service, nil) {
+        case 0: return "granted"
+        case 1: return "denied"
+        default: return "not_determined"
+        }
+    }
+
+    static func request(_ done: @escaping (Bool) -> Void) {
+        guard #available(macOS 14.2, *), let sym = dlsym(tcc, "TCCAccessRequest") else {
+            done(false)
+            return
+        }
+        unsafeBitCast(sym, to: Request.self)(service, nil, done)
+    }
+}
+
 func printJSON(_ obj: [String: Any]) {
     if let data = try? JSONSerialization.data(withJSONObject: obj),
        let s = String(data: data, encoding: .utf8) {
@@ -59,8 +89,16 @@ if allArgs.count >= 2 {
         printJSON([
             "microphone": micStatusString(),
             "screen": screenStatusString(),
+            "systemAudio": SystemAudioPermission.status(),
         ])
         exit(0)
+    case "request-system-audio":
+        SystemAudioPermission.request { granted in
+            printJSON(["systemAudio": granted ? "granted" : "denied"])
+            exit(granted ? 0 : 1)
+        }
+        RunLoop.main.run()
+        exit(1) // unreachable
     case "request-microphone":
         AVCaptureDevice.requestAccess(for: .audio) { granted in
             printJSON(["microphone": granted ? "granted" : "denied"])
@@ -973,10 +1011,36 @@ final class SystemAudioOutput: NSObject, SCStreamOutput {
             }
         }
 
-        let ratio = targetSampleRate / inFormat.sampleRate
+        let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        convertAndWrite(inBuffer, converter: conv, stamp: pts.isNumeric ? pts.seconds : nil, arrival: arrival)
+    }
+
+    /// Tap path entry point (macOS 14.2+): the same conversion and writers as
+    /// a ScreenCaptureKit buffer, for a buffer already copied out of the
+    /// tap's IOProc. Rebuilds the converter whenever the tap's format changes
+    /// (an output device switch, or AirPods dropping into call mode).
+    func ingest(_ inBuffer: AVAudioPCMBuffer, stamp: Double?, arrival: Double) {
+        bufferCount += 1
+        let f = inBuffer.format
+        if inFormat == nil || inFormat?.sampleRate != f.sampleRate ||
+            inFormat?.channelCount != f.channelCount ||
+            inFormat?.isInterleaved != f.isInterleaved ||
+            inFormat?.commonFormat != f.commonFormat {
+            inFormat = f
+            converter = AVAudioConverter(from: f, to: targetFormat)
+            FileHandle.standardError.write(Data("tap: built converter inFormat=\(f) → target\n".utf8))
+        }
+        guard let conv = converter else { return }
+        convertAndWrite(inBuffer, converter: conv, stamp: stamp, arrival: arrival)
+    }
+
+    private func convertAndWrite(_ inBuffer: AVAudioPCMBuffer, converter conv: AVAudioConverter, stamp: Double?, arrival: Double) {
+        let frames = inBuffer.frameLength
+        let inRate = inBuffer.format.sampleRate
+        let ratio = targetSampleRate / inRate
         let cap = AVAudioFrameCount(Double(frames) * ratio + 1024)
         guard let out = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: cap) else {
-            FileHandle.standardError.write(Data("scstream: out PCMBuffer alloc failed\n".utf8))
+            FileHandle.standardError.write(Data("sys: out PCMBuffer alloc failed\n".utf8))
             return
         }
 
@@ -991,13 +1055,13 @@ final class SystemAudioOutput: NSObject, SCStreamOutput {
         if convStatus == .error {
             if bufferCount <= 3 {
                 let msg = error?.localizedDescription ?? "unknown"
-                FileHandle.standardError.write(Data("scstream: conv.convert error: \(msg)\n".utf8))
+                FileHandle.standardError.write(Data("sys: conv.convert error: \(msg)\n".utf8))
             }
             return
         }
         guard let chans = out.floatChannelData else {
             if bufferCount <= 3 {
-                FileHandle.standardError.write(Data("scstream: no floatChannelData on out buffer\n".utf8))
+                FileHandle.standardError.write(Data("sys: no floatChannelData on out buffer\n".utf8))
             }
             return
         }
@@ -1011,23 +1075,22 @@ final class SystemAudioOutput: NSObject, SCStreamOutput {
             written = n
             if bufferCount == 1 {
                 FileHandle.standardError.write(Data(
-                    "scstream: first buffer written to sysWriter (n=\(n) samples)\n".utf8
+                    "sys: first buffer written to sysWriter (n=\(n) samples)\n".utf8
                 ))
             }
         } else {
             if bufferCount <= 3 {
-                FileHandle.standardError.write(Data("scstream: makeBuffer returned nil (n=\(n))\n".utf8))
+                FileHandle.standardError.write(Data("sys: makeBuffer returned nil (n=\(n))\n".utf8))
             }
         }
         // Only a buffer that got this far is noted, so one dropped on any of
         // the early returns above shows up as a gap in what was written —
         // which is the timeline the WAV actually has.
-        let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         sysTiming.note(
-            stamp: pts.isNumeric ? pts.seconds : nil,
+            stamp: stamp,
             arrival: arrival,
             inFrames: Int(frames),
-            inRate: inFormat.sampleRate,
+            inRate: inRate,
             outFrames: written
         )
     }
@@ -1035,8 +1098,46 @@ final class SystemAudioOutput: NSObject, SCStreamOutput {
 
 let systemOutput = SystemAudioOutput()
 var scStream: SCStream?
+/// The process tap feeding the sys stream on macOS 14.2+. `Any` so the
+/// global can exist on macOS 13, where the type is unavailable.
+var systemTap: Any?
+
+/// `--sys-source tap | sck | none`, chosen by the app from the permissions it
+/// holds (`permissions::system_audio_source`). No flag means ScreenCaptureKit.
+let systemAudioSource: String = {
+    guard let i = args.firstIndex(of: "--sys-source"), i + 1 < args.count else { return "sck" }
+    return args[i + 1]
+}()
 
 func startSystemAudio() async {
+    if systemAudioSource == "none" { return }
+    if #available(macOS 14.2, *), systemAudioSource == "tap" {
+        let tap = SystemAudioTap(output: systemOutput)
+        do {
+            try tap.start()
+            systemTap = tap
+            holdSystemAwake()
+            return
+        } catch {
+            // ScreenCaptureKit without its permission would prompt mid-meeting.
+            guard screenStatusString() == "granted" else {
+                emitError("system audio: \(error)")
+                return
+            }
+            FileHandle.standardError.write(Data("tap: \(error); falling back to ScreenCaptureKit\n".utf8))
+        }
+    }
+    await startScreenCaptureAudio()
+}
+
+func stopSystemTap() {
+    if #available(macOS 14.2, *), let tap = systemTap as? SystemAudioTap {
+        tap.stop()
+    }
+    systemTap = nil
+}
+
+func startScreenCaptureAudio() async {
     do {
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
         guard let display = content.displays.first else {
@@ -1121,6 +1222,7 @@ func pauseCapture() {
     if paused { return }
     paused = true
     engine.pause()
+    stopSystemTap()
     if let s = scStream {
         Task { try? await s.stopCapture() }
         scStream = nil
@@ -1262,6 +1364,8 @@ let shutdown: () -> Void = {
         // engine.stop() is synchronous and returns immediately;
         // ChunkWriter.close() is also synchronous (queue.sync).
         engine.stop()
+        // The tap stops synchronously, so it goes before the writers close.
+        stopSystemTap()
         micFullWriter.close()
         sysFullWriter.close()
         micWriter.close()

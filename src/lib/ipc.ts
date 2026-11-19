@@ -167,6 +167,9 @@ export type SettingsKey =
   // The offer to switch to Nemotron 3 that an upgraded install gets: "pending"
   // (written by the upgrade migration), "accepted" or "declined".
   | "nemotron_offer"
+  // "declined" once the Home card offering System Audio Recording to a Screen
+  // Recording user was turned down.
+  | "system_audio_offer"
   | "keep_audio"
   // Skip transcription while recording and run it later from the note's
   // Transcribe action (#146). Only ever in force while `keep_audio` is on —
@@ -890,16 +893,19 @@ export const ipc = {
     invoke<void>("org_vocabulary_edit", { orgId, add, remove }),
 };
 
-export type PermissionKind = "microphone" | "screen" | "notifications";
+export type PermissionKind = "microphone" | "screen" | "systemAudio" | "notifications";
 export type PermissionStatus =
   | "granted"
   | "denied"
   | "restricted"
   | "not_determined"
+  | "unsupported"
   | "unknown";
 export type PermissionsStatus = {
   microphone: PermissionStatus;
   screen: PermissionStatus;
+  /** System Audio Recording (macOS 14.2+); "unsupported" on older macOS. */
+  systemAudio: PermissionStatus;
   notifications: PermissionStatus;
 };
 
