@@ -1971,11 +1971,9 @@ async fn error_for_pb(resp: reqwest::Response) -> Result<reqwest::Response> {
 
 /// Best-effort realtime: keep a PocketBase SSE connection open and, on every
 /// record change in a subscribed collection, nudge `notify` to pull. The token
-/// is reused across reconnects (handed back to the session only on a 401), and
-/// reconnects use exponential backoff capped at 5 minutes — so a
-/// persistently-broken realtime endpoint can't hammer the server every few
-/// seconds. All failures are non-fatal: the worker's interval poll is the
-/// reliable path; realtime only lowers latency when it's connected.
+/// is reused across reconnects (handed back to the session only on a 401).
+/// All failures are non-fatal: the worker's interval poll is the reliable path;
+/// realtime only lowers latency when it's connected.
 async fn realtime_loop(config: Config, http: reqwest::Client, notify: Arc<tokio::sync::Notify>) {
     let mut backoff_secs = 1u64;
     let mut token: Option<String> = None;
@@ -1985,35 +1983,69 @@ async fn realtime_loop(config: Config, http: reqwest::Client, notify: Arc<tokio:
                 Ok(a) => token = Some(a.token),
                 Err(e) => {
                     eprintln!("cloud-sync: realtime auth failed ({e:#}); polling continues");
-                    tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
-                    backoff_secs = (backoff_secs * 2).min(300);
+                    let (wait, next) = reconnect_delay(false, backoff_secs);
+                    tokio::time::sleep(jittered(wait, random_u64())).await;
+                    backoff_secs = next;
                     continue;
                 }
             }
         }
-        let started = now_ms();
         let tok = token.clone().unwrap_or_default();
-        if let Err(e) = realtime_once(&config, &http, &tok, &notify).await {
-            eprintln!("cloud-sync: realtime disconnected ({e:#}); polling continues");
+        let mut subscribed = false;
+        if let Err(e) = realtime_once(&config, &http, &tok, &notify, &mut subscribed).await {
+            if !subscribed {
+                eprintln!("cloud-sync: realtime unavailable ({e:#}); polling continues");
+            }
             if is_unauthorized(&e) {
                 config.session.rejected(&tok);
                 token = None; // token died → renewed next round
             }
         }
-        // A connection that stayed up a while was healthy → reset the backoff.
-        if now_ms() - started > 60_000 {
-            backoff_secs = 1;
-        }
-        tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
-        backoff_secs = (backoff_secs * 2).min(300);
+        let (wait, next) = reconnect_delay(subscribed, backoff_secs);
+        tokio::time::sleep(jittered(wait, random_u64())).await;
+        backoff_secs = next;
     }
 }
 
+/// Somewhere between half of `secs` and all of it, picked by `random`, so
+/// clients that lost the server together don't all come back together.
+fn jittered(secs: u64, random: u64) -> Duration {
+    let half = secs * 500;
+    Duration::from_millis(half + random % (half + 1))
+}
+
+fn random_u64() -> u64 {
+    use std::hash::BuildHasher;
+    std::collections::hash_map::RandomState::new().hash_one(())
+}
+
+/// PocketBase ends a realtime stream after five minutes without an event, so a
+/// stream silent for longer than this is dead (the Mac slept, the network
+/// changed) and is replaced.
+const REALTIME_READ_TIMEOUT: Duration = Duration::from_secs(330);
+
+/// After a realtime connection ends: seconds to wait before the next one, and
+/// the backoff to carry. A connection that subscribed proved the endpoint works,
+/// so however it ended (PocketBase closes idle streams after five minutes) the
+/// next one follows at once. One that never got that far backs off, doubling to
+/// five minutes, so a broken endpoint isn't hammered.
+fn reconnect_delay(subscribed: bool, backoff_secs: u64) -> (u64, u64) {
+    if subscribed {
+        (1, 1)
+    } else {
+        (backoff_secs, (backoff_secs * 2).min(300))
+    }
+}
+
+/// One realtime connection. `subscribed` is set once the subscription is in
+/// place, and then a pull is asked for, since nothing was listening between
+/// connections.
 async fn realtime_once(
     config: &Config,
     http: &reqwest::Client,
     token: &str,
     notify: &Arc<tokio::sync::Notify>,
+    subscribed: &mut bool,
 ) -> Result<()> {
     let mut resp = http.get(format!("{}/api/realtime", config.base_url)).send().await?;
     if !resp.status().is_success() {
@@ -2024,9 +2056,11 @@ async fn realtime_once(
     }
 
     let mut buf: Vec<u8> = Vec::new();
-    let mut subscribed = false;
     // `chunk()` reads the next piece of the streamed body (no StreamExt needed).
-    while let Some(chunk) = resp.chunk().await? {
+    while let Some(chunk) = tokio::time::timeout(REALTIME_READ_TIMEOUT, resp.chunk())
+        .await
+        .map_err(|_| anyhow!("realtime: no data for {} s", REALTIME_READ_TIMEOUT.as_secs()))??
+    {
         buf.extend_from_slice(&chunk);
         // Bound memory, but generously: a single SSE event carries a full changed
         // record, and a long meeting transcript can be hundreds of KB — tearing
@@ -2062,11 +2096,12 @@ async fn realtime_once(
                                 body: "realtime subscribe".to_string(),
                             }));
                         }
-                        subscribed = true;
+                        *subscribed = true;
+                        notify.notify_one();
                     }
                 }
                 // Any record event in a subscribed collection → coalesced pull.
-                Some(_) if subscribed => notify.notify_one(),
+                Some(_) if *subscribed => notify.notify_one(),
                 _ => {}
             }
         }
@@ -3436,6 +3471,91 @@ mod it {
         assert_eq!(failure_state(&pushed.unwrap_err()), SyncState::SignedOut);
         assert_eq!(failure_state(&pulled.unwrap_err()), SyncState::SignedOut);
         assert_eq!(outbox_attempts(&db, "n1"), Some(0), "the change is kept, no attempt spent");
+    }
+
+    fn realtime_stand_in(method: &str, _: &str) -> (u16, String) {
+        match method {
+            "GET" => (200, "event:PB_CONNECT\ndata:{\"clientId\":\"c1\"}\n\n".into()),
+            _ => (204, String::new()),
+        }
+    }
+
+    /// A connection that subscribes asks for one pull, since nothing was
+    /// listening before it, and its end is not an error.
+    #[tokio::test]
+    async fn a_realtime_subscription_asks_for_a_pull_and_ends_cleanly() {
+        let base = fake_server(realtime_stand_in).await;
+        let config = config_for(&base, "wsA", FakeSession::signed_in("t1"));
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let mut subscribed = false;
+
+        let ended = realtime_once(&config, &crate::http::client(), "t1", &notify, &mut subscribed).await;
+
+        assert!(ended.is_ok(), "{ended:?}");
+        assert!(subscribed);
+        tokio::time::timeout(Duration::from_secs(1), notify.notified()).await.expect("a pull was asked for");
+    }
+
+    /// A refused subscription is a failure: no pull, and it backs off.
+    #[tokio::test]
+    async fn a_refused_realtime_subscription_asks_for_nothing() {
+        let base = fake_server(|method, _| match method {
+            "GET" => realtime_stand_in(method, ""),
+            _ => (403, "{}".into()),
+        })
+        .await;
+        let config = config_for(&base, "wsA", FakeSession::signed_in("t1"));
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let mut subscribed = false;
+
+        let ended = realtime_once(&config, &crate::http::client(), "t1", &notify, &mut subscribed).await;
+
+        assert!(ended.is_err());
+        assert!(!subscribed);
+        assert!(tokio::time::timeout(Duration::from_millis(100), notify.notified()).await.is_err());
+    }
+
+    #[test]
+    fn realtime_reconnects_at_once_after_a_subscribed_connection_and_backs_off_otherwise() {
+        assert_eq!(reconnect_delay(true, 64), (1, 1));
+        assert_eq!(reconnect_delay(false, 1), (1, 2));
+        assert_eq!(reconnect_delay(false, 64), (64, 128));
+        assert_eq!(reconnect_delay(false, 256), (256, 300));
+        assert_eq!(reconnect_delay(false, 300), (300, 300));
+    }
+
+    #[test]
+    fn a_reconnect_waits_between_half_and_all_of_its_delay() {
+        assert_eq!(jittered(1, 0), Duration::from_millis(500));
+        assert_eq!(jittered(1, 500), Duration::from_millis(1000));
+        assert_eq!(jittered(1, 501), Duration::from_millis(500));
+        assert_eq!(jittered(300, u64::MAX), Duration::from_millis(150_000 + u64::MAX % 150_001));
+        for r in [0, 7, 1 << 40, u64::MAX] {
+            let d = jittered(64, r);
+            assert!(d >= Duration::from_secs(32) && d <= Duration::from_secs(64), "{d:?}");
+        }
+    }
+
+    /// A stream that goes silent for longer than PocketBase ever stays quiet is
+    /// dead, and is given up rather than waited on forever.
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_realtime_stream_is_given_up() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _ = socket.read(&mut [0u8; 4096]).await;
+            let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+            socket.write_all(head.as_bytes()).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+        });
+        let config = config_for(&base, "wsA", FakeSession::signed_in("t1"));
+        let mut subscribed = false;
+
+        let ended = realtime_once(&config, &crate::http::client(), "t1", &Arc::new(tokio::sync::Notify::new()), &mut subscribed).await;
+
+        assert!(format!("{:#}", ended.unwrap_err()).contains("no data for 330 s"));
     }
 
     /// A token the server refuses goes back to the session, which renews it;
