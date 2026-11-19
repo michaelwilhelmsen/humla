@@ -24,4 +24,4 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 # A stand-in PocketBase on a local port, for the worker's session tests.
-tokio = { version = "1", features = ["net", "io-util"] }
+tokio = { version = "1", features = ["net", "io-util", "test-util"] }
