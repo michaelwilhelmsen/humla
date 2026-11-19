@@ -49,6 +49,9 @@ import { NewWorkspaceModal } from "./components/NewWorkspaceModal";
 import { DISCONNECTED, useCloudStore, type CloudStatus, type CloudWorkspace } from "./lib/cloud";
 import { DEFAULTS, EMPTY_DIARIZE_STATE, type EditableKey } from "./pages/settings/types";
 import { SummaryStep } from "./pages/onboarding/steps/Summary";
+import { PermissionsStep } from "./pages/onboarding/steps/Permissions";
+import { Permissions } from "./components/Permissions";
+import { Section } from "./pages/settings/components/Section";
 import { TranscriptionStep } from "./pages/onboarding/steps/Transcription";
 import { STEP_ORDER, type StepContext, type StepId } from "./pages/onboarding/types";
 import type { DiarizeEngine, ProviderConfig, RecordingStatus, Step, TimelineEntry } from "./lib/ipc";
@@ -847,7 +850,7 @@ function menubarCase(closeToTray: boolean, hotkey: string): Scenario {
       record_hotkey_set: () => null,
       launch_at_login_get: () => closeToTray,
       launch_at_login_set: () => null,
-      permissions_status: () => ({ microphone: "granted", screen: "granted", notifications: "granted" }),
+      permissions_status: () => ({ microphone: "granted", screen: "granted", systemAudio: "granted", notifications: "granted" }),
       stored_audio_stats: () => ({ notes: 0, files: 0, bytes: 0, noteIds: [] }),
     },
   };
@@ -871,7 +874,7 @@ function retentionCase(keepAudio: boolean, manual: boolean): Scenario {
     ipc: {
       record_hotkey_get: () => "Command+Control+KeyR",
       record_hotkey_set: () => null,
-      permissions_status: () => ({ microphone: "granted", screen: "granted", notifications: "granted" }),
+      permissions_status: () => ({ microphone: "granted", screen: "granted", systemAudio: "granted", notifications: "granted" }),
       stored_audio_stats: () => ({ notes: 0, files: 0, bytes: 0, noteIds: [] }),
     },
   };
@@ -995,6 +998,36 @@ function nemotronOfferCase(offer?: NemotronOfferState): Scenario {
     },
     seed: offer ? () => useNemotronOffer.setState({ offer }) : undefined,
   };
+}
+
+// ---- system audio through its own permission -------------------------------
+// Onboarding, Settings and Home's card, each in the state that decides its copy:
+// never asked, turned down, and macOS before 14.2 (Screen Recording).
+function systemAudioPermissions(systemAudio: string, screen: string) {
+  return { microphone: "granted", screen, systemAudio, notifications: "granted" };
+}
+
+function systemAudioCase(where: "onboarding" | "settings" | "home", systemAudio: string, screen = "denied"): Scenario {
+  const permissions_status = () => systemAudioPermissions(systemAudio, screen);
+  if (where === "home") {
+    return {
+      route: "/",
+      render: () => null,
+      ipc: { notes_list: () => demoNotes(), folders_list: () => DEMO_FOLDERS, permissions_status },
+    };
+  }
+  if (where === "settings") {
+    return {
+      wrap: settingsWrap,
+      render: () => (
+        <Section title="Permissions">
+          <Permissions />
+        </Section>
+      ),
+      ipc: { permissions_status },
+    };
+  }
+  return { step: "permissions", render: (ctx) => <PermissionsStep ctx={ctx} />, ipc: { permissions_status } };
 }
 
 // ---- workspace-creation axis: the sheet's five stages ----------------------
@@ -1504,6 +1537,12 @@ const CASES: Record<string, Scenario> = {
     "Failed to build the model execution plan using a model architecture file",
   ),
   "engines-warming": diarizeWarmingCase(),
+  "system-audio-onboarding": systemAudioCase("onboarding", "not_determined"),
+  "system-audio-onboarding-denied": systemAudioCase("onboarding", "denied"),
+  "system-audio-onboarding-old-macos": systemAudioCase("onboarding", "unsupported"),
+  "system-audio-settings": systemAudioCase("settings", "not_determined"),
+  "system-audio-settings-denied": systemAudioCase("settings", "denied"),
+  "system-audio-offer": systemAudioCase("home", "not_determined", "granted"),
   "offer-home": nemotronOfferCase(),
   "offer-downloading": nemotronOfferCase({ stage: "downloading", fraction: 0.42, phase: "downloading" }),
   "offer-warming": nemotronOfferCase({ stage: "downloading", fraction: 0, phase: "warming" }),

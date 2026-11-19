@@ -2,54 +2,13 @@ import AVFoundation
 import CoreAudio
 import Foundation
 
-// System audio from a Core Audio process tap (macOS 14.2+), instead of a
-// ScreenCaptureKit stream (#220).
-//
-// Why: on macOS 26 a long ScreenCaptureKit stream can keep delivering audio
-// buffers at the normal rate while every sample in them is zero. The stream
-// reports no error and no gap, so the far side of a call is silently lost
-// for the rest of the take. Seen on eight Zoom calls in four weeks on one
-// Mac (sometimes preceded by a stretch where only 1 buffer in 8 carried
-// audio); a fresh stream immediately captured audio again. Other SCK-based
-// recorders report the same shape (e.g. moona3k/macparakeet#912). A process
-// tap reads the processes' output mix from the HAL directly, so it does not
-// depend on a ScreenCaptureKit session staying healthy.
-//
-// Shape: a global stereo tap of every process except Humla's own (this
-// sidecar and its parent; the app's WebKit content process is not excluded
-// yet, as with ScreenCaptureKit today), a private aggregate device clocked
-// off the default output with the tap as its only input, and an IOProc that
-// copies each buffer out and hands it to `SystemAudioOutput.ingest`, which
-// owns the conversion to 16 kHz mono and the writers — the same path a
-// ScreenCaptureKit buffer takes.
-//
-// A tap's format follows the output device (AirPods joining a call drop to
-// 16/24 kHz), and the aggregate is clocked off the device that was default
-// when it was built. So the tap and the aggregate are rebuilt whenever the
-// default output device or the tap's format changes; `ingest` rebuilds its
-// converter when the buffer format changes.
-//
-// On the one call where the HAL was logged, the ScreenCaptureKit failure
-// began within a second of an "Audio IO Overload" — twice, the second time
-// on the fresh stream that had recovered it — with an AirPods headset in
-// call mode. Not every overload broke it. Nothing says a tap is immune to
-// whatever breaks there, so the tap watches itself and is rebuilt — a gap of
-// a fraction of a second, not the rest of the take — when its IOProc stops
-// being called, or when it delivers exact digital silence while another
-// process is running audio output. Both tests wait for another process to
-// be playing, because a tap's IO only starts with the first sound some
-// process plays: before that, no buffers is the healthy state. The silence
-// test also fires on an app that holds its output open and plays nothing,
-// so rebuilds back off (30 s, doubling to 10 min) until the tap hears
-// something again.
-//
-// The sys stream is lined up with the mic by sample index downstream
-// (`build_playback_wav`, the timeline, the transcript order), and
-// ScreenCaptureKit delivered buffers from the start, silence included. A
-// tap delivers nothing until something plays and nothing across a rebuild,
-// so `deliver` writes those spans as silence, timed from the host clock: the
-// first buffer is padded back to when `start()` ran, and any later gap over
-// 100 ms is filled up to the buffer that ends it.
+// System audio from a Core Audio process tap (macOS 14.2+), fed through
+// `SystemAudioOutput.ingest` like a ScreenCaptureKit buffer. A tap's format
+// follows the output device, so it is rebuilt when the default output or its
+// format changes, and when it stalls or delivers exact silence while another
+// process plays. It delivers nothing until something plays and nothing across a
+// rebuild, while sys is lined up with the mic by sample index downstream, so
+// `deliver` writes those spans as silence timed from the host clock.
 
 enum TapError: Error, CustomStringConvertible {
     case status(String, OSStatus)
@@ -71,15 +30,21 @@ final class SystemAudioTap {
     private var aggregateID = AudioObjectID(kAudioObjectUnknown)
     private var procID: AudioDeviceIOProcID?
     private var format: AVAudioFormat?
+    private var tapDescription: CATapDescription?
+    private var excluded: [AudioObjectID] = []
     private var listening = false
     private var stopped = true
     private let output: SystemAudioOutput
     private var defaultOutputListener: AudioObjectPropertyListenerBlock?
+    private var processListListener: AudioObjectPropertyListenerBlock?
+    // Set once TCC reports the permission granted, `control` only.
+    private var permissionConfirmed = false
 
     // Health, written on `queue` by `deliver` and read on `control`.
     private let health = NSLock()
     private var lastBuffer: Double = 0
     private var lastSignal: Double = 0
+    private var everSignal = false
     // Health rebuilds, `control` only.
     private var rebuildBackoff: Double = SystemAudioTap.backoffFloor
     private var nextHealthRebuild: Double = 0
@@ -114,18 +79,24 @@ final class SystemAudioTap {
     }
 
     func stop() {
-        control.sync {
-            stopped = true
-            removeListeners()
-            teardown()
-        }
+        control.sync { shutDown() }
+        // A buffer from this tap still queued must not reach the writers after
+        // a resume's new tap has started.
+        queue.sync {}
+    }
+
+    /// `control` only.
+    private func shutDown() {
+        stopped = true
+        removeListeners()
+        teardown()
     }
 
     // MARK: build / teardown
 
     private func build() throws {
-        let excluded = Self.processObjects(for: [getpid(), getppid()])
-        let desc = CATapDescription(stereoGlobalTapButExcludeProcesses: excluded)
+        let own = Self.ownProcessObjects()
+        let desc = CATapDescription(stereoGlobalTapButExcludeProcesses: own)
         desc.uuid = UUID()
         desc.name = "Humla system audio"
         desc.isPrivate = true
@@ -135,16 +106,10 @@ final class SystemAudioTap {
         var err = AudioHardwareCreateProcessTap(desc, &tap)
         guard err == noErr else { throw TapError.status("AudioHardwareCreateProcessTap", err) }
         tapID = tap
+        tapDescription = desc
+        excluded = own
 
-        var asbd = AudioStreamBasicDescription()
-        var size = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
-        var addr = AudioObjectPropertyAddress(
-            mSelector: kAudioTapPropertyFormat,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
-        )
-        err = AudioObjectGetPropertyData(tapID, &addr, 0, nil, &size, &asbd)
-        guard err == noErr else { teardown(); throw TapError.status("read tap format", err) }
+        guard var asbd = Self.tapFormat(tapID) else { teardown(); throw TapError.unavailable("read tap format failed") }
         guard let fmt = AVAudioFormat(streamDescription: &asbd) else {
             teardown(); throw TapError.unavailable("tap format unsupported (sr=\(asbd.mSampleRate) ch=\(asbd.mChannelsPerFrame))")
         }
@@ -173,7 +138,7 @@ final class SystemAudioTap {
 
         var proc: AudioDeviceIOProcID?
         err = AudioDeviceCreateIOProcIDWithBlock(&proc, aggregateID, queue) { [weak self] _, inInputData, inInputTime, _, _ in
-            self?.deliver(inInputData, inInputTime)
+            self?.deliver(inInputData, inInputTime, format: fmt)
         }
         guard err == noErr, let p = proc else { teardown(); throw TapError.status("AudioDeviceCreateIOProcIDWithBlock", err) }
         procID = p
@@ -206,18 +171,18 @@ final class SystemAudioTap {
         aggregateID = AudioObjectID(kAudioObjectUnknown)
         tapID = AudioObjectID(kAudioObjectUnknown)
         format = nil
+        tapDescription = nil
+        excluded = []
     }
 
-    /// Rebuild after the default output device or the tap's format changed,
-    /// or after `checkHealth` found the tap stalled or silent. The new
-    /// interval is opened before the first buffer of the rebuilt tap, so
-    /// `capture_timing` shows where the switch fell.
-    private func rebuild(_ why: String) {
+    /// The new `capture_timing` interval opens before the rebuilt tap's first
+    /// buffer, so it shows where the rebuild fell.
+    private func rebuild(_ why: String, opening interval: String = "tap_rebuild") {
         control.async { [weak self] in
             guard let self = self, !self.stopped else { return }
             FileHandle.standardError.write(Data("tap: rebuilding (\(why))\n".utf8))
             self.teardown()
-            sysTiming.openInterval("device_change")
+            sysTiming.openInterval(interval)
             do {
                 try self.build()
                 self.failedRebuilds = 0
@@ -235,11 +200,16 @@ final class SystemAudioTap {
 
     // MARK: IO
 
-    private func deliver(_ abl: UnsafePointer<AudioBufferList>, _ time: UnsafePointer<AudioTimeStamp>) {
-        guard let fmt = format else { return }
+    /// Runs on `queue`. Takes the format its IOProc was built with rather than
+    /// reading `format`, which `control` rewrites during a rebuild.
+    private func deliver(_ abl: UnsafePointer<AudioBufferList>, _ time: UnsafePointer<AudioTimeStamp>, format fmt: AVAudioFormat) {
         let arrival = hostSecondsNow()
-        let src = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: abl))
-        guard src.count > 0, src[0].mDataByteSize > 0 else { return }
+        let all = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: abl))
+        // The aggregate lists its sub-device's input streams before the tap's.
+        let tapBuffers = fmt.isInterleaved ? 1 : Int(fmt.channelCount)
+        guard all.count >= tapBuffers else { return }
+        let src = Array(all.suffix(tapBuffers))
+        guard src[0].mDataByteSize > 0 else { return }
         let bytesPerFrame = max(1, Int(fmt.streamDescription.pointee.mBytesPerFrame))
         let frames = AVAudioFrameCount(Int(src[0].mDataByteSize) / bytesPerFrame)
         guard frames > 0, let copy = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: frames) else { return }
@@ -257,7 +227,10 @@ final class SystemAudioTap {
         let signal = Self.carriesSignal(src)
         health.lock()
         lastBuffer = arrival
-        if signal { lastSignal = arrival }
+        if signal {
+            lastSignal = arrival
+            everSignal = true
+        }
         health.unlock()
 
         let at = stamp ?? arrival
@@ -289,11 +262,9 @@ final class SystemAudioTap {
         }
     }
 
-    /// Any sample that is not an exact zero. A healthy tap of a call is
-    /// almost never exactly zero for long — the far side's comfort noise and
-    /// codec floor keep it off zero — which is what the ScreenCaptureKit
-    /// failure lost.
-    private static func carriesSignal(_ abl: UnsafeMutableAudioBufferListPointer) -> Bool {
+    /// Any sample that is not an exact zero. A call's comfort noise and codec
+    /// floor keep a healthy tap off zero.
+    private static func carriesSignal(_ abl: [AudioBuffer]) -> Bool {
         for buf in abl {
             guard let p = buf.mData else { continue }
             let words = Int(buf.mDataByteSize) / 4
@@ -324,28 +295,40 @@ final class SystemAudioTap {
         rebuild("\(why) while another process plays audio")
     }
 
+    /// A tap the user turned down at macOS's prompt records silence, so it is
+    /// stopped and the app told. Only before the tap has carried any sound,
+    /// which a refused tap never does.
+    private func checkPermission() {
+        guard !permissionConfirmed, !stopped else { return }
+        switch SystemAudioPermission.status() {
+        case "granted":
+            permissionConfirmed = true
+        case "denied":
+            health.lock()
+            let heard = everSignal
+            health.unlock()
+            if heard {
+                permissionConfirmed = true
+                return
+            }
+            emitError("System audio not allowed — only your microphone is being recorded. Allow it in Settings → Permissions.")
+            shutDown()
+        default:
+            break
+        }
+    }
+
     /// Whether any process other than Humla's own is running audio output.
     private static func anotherProcessIsPlaying() -> Bool {
-        let own: Set<pid_t> = [getpid(), getppid()]
         var addr = AudioObjectPropertyAddress(
-            mSelector: kAudioHardwarePropertyProcessObjectList,
+            mSelector: kAudioProcessPropertyIsRunningOutput,
             mScope: kAudioObjectPropertyScopeGlobal,
             mElement: kAudioObjectPropertyElementMain
         )
-        let system = AudioObjectID(kAudioObjectSystemObject)
-        var size: UInt32 = 0
-        guard AudioObjectGetPropertyDataSize(system, &addr, 0, nil, &size) == noErr, size > 0 else { return false }
-        var objects = [AudioObjectID](repeating: 0, count: Int(size) / MemoryLayout<AudioObjectID>.size)
-        guard AudioObjectGetPropertyData(system, &addr, 0, nil, &size, &objects) == noErr else { return false }
-        for obj in objects {
-            var pid: pid_t = 0
-            var pidSize = UInt32(MemoryLayout<pid_t>.size)
-            addr.mSelector = kAudioProcessPropertyPID
-            guard AudioObjectGetPropertyData(obj, &addr, 0, nil, &pidSize, &pid) == noErr, !own.contains(pid) else { continue }
+        for (obj, pid) in processes() where !isOwn(pid) {
             var running: UInt32 = 0
-            var runSize = UInt32(MemoryLayout<UInt32>.size)
-            addr.mSelector = kAudioProcessPropertyIsRunningOutput
-            if AudioObjectGetPropertyData(obj, &addr, 0, nil, &runSize, &running) == noErr, running != 0 { return true }
+            var size = UInt32(MemoryLayout<UInt32>.size)
+            if AudioObjectGetPropertyData(obj, &addr, 0, nil, &size, &running) == noErr, running != 0 { return true }
         }
         return false
     }
@@ -359,10 +342,17 @@ final class SystemAudioTap {
             mElement: kAudioObjectPropertyElementMain
         )
         let listener: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
-            self?.rebuild("default output device changed")
+            self?.rebuild("default output device changed", opening: "device_change")
         }
         AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &defaultOut, control, listener)
         defaultOutputListener = listener
+        var processList = Self.processListAddress
+        let processListener: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            guard let self = self, !self.stopped else { return }
+            self.excludeNewOwnProcesses()
+        }
+        AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &processList, control, processListener)
+        processListListener = processListener
         // The tap's own format moves when the device it follows changes rate
         // without the default changing (AirPods entering call mode).
         let poll = DispatchSource.makeTimerSource(queue: control)
@@ -371,21 +361,15 @@ final class SystemAudioTap {
             guard let self = self, !self.stopped else { return }
             guard self.tapID != kAudioObjectUnknown, let fmt = self.format else {
                 // The last rebuild failed; keep trying rather than stay deaf.
-                self.rebuild("retrying a failed rebuild")
+                self.rebuild("retrying a failed rebuild", opening: "device_change")
                 return
             }
-            var asbd = AudioStreamBasicDescription()
-            var size = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
-            var addr = AudioObjectPropertyAddress(
-                mSelector: kAudioTapPropertyFormat,
-                mScope: kAudioObjectPropertyScopeGlobal,
-                mElement: kAudioObjectPropertyElementMain
-            )
-            if AudioObjectGetPropertyData(self.tapID, &addr, 0, nil, &size, &asbd) == noErr,
+            if let asbd = Self.tapFormat(self.tapID),
                asbd.mSampleRate != fmt.sampleRate || asbd.mChannelsPerFrame != fmt.channelCount {
-                self.rebuild("tap format changed to \(asbd.mSampleRate)Hz")
+                self.rebuild("tap format changed to \(asbd.mSampleRate)Hz", opening: "device_change")
                 return
             }
+            self.checkPermission()
             self.checkHealth()
         }
         poll.resume()
@@ -406,30 +390,96 @@ final class SystemAudioTap {
             AudioObjectRemovePropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &defaultOut, control, listener)
             defaultOutputListener = nil
         }
+        if let listener = processListListener {
+            var processList = Self.processListAddress
+            AudioObjectRemovePropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &processList, control, listener)
+            processListListener = nil
+        }
         listening = false
     }
 
     private var formatPoll: DispatchSourceTimer?
 
+    /// Humla's WebKit processes only appear in Core Audio once they play
+    /// something, so they join the exclusion list when the process list
+    /// changes. Rebuilds when the tap won't take the new list.
+    private func excludeNewOwnProcesses() {
+        guard let desc = tapDescription else { return }
+        let own = Self.ownProcessObjects()
+        guard own != excluded else { return }
+        desc.processes = own
+        var ref = Unmanaged.passUnretained(desc).toOpaque()
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioTapPropertyDescription,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        let err = AudioObjectSetPropertyData(tapID, &addr, 0, nil, UInt32(MemoryLayout<UnsafeMutableRawPointer>.size), &ref)
+        if err == noErr {
+            excluded = own
+            FileHandle.standardError.write(Data("tap: now leaving out \(own.count) of Humla's processes\n".utf8))
+        } else {
+            rebuild("Humla's processes changed (OSStatus \(err))")
+            excluded = own
+        }
+    }
+
     // MARK: helpers
 
-    private static func processObjects(for pids: [pid_t]) -> [AudioObjectID] {
-        var out: [AudioObjectID] = []
-        for var pid in pids where pid > 1 {
-            var obj = AudioObjectID(kAudioObjectUnknown)
-            var size = UInt32(MemoryLayout<AudioObjectID>.size)
-            var addr = AudioObjectPropertyAddress(
-                mSelector: kAudioHardwarePropertyTranslatePIDToProcessObject,
-                mScope: kAudioObjectPropertyScopeGlobal,
-                mElement: kAudioObjectPropertyElementMain
-            )
-            let err = AudioObjectGetPropertyData(
-                AudioObjectID(kAudioObjectSystemObject), &addr,
-                UInt32(MemoryLayout<pid_t>.size), &pid, &size, &obj
-            )
-            if err == noErr, obj != kAudioObjectUnknown { out.append(obj) }
+    private typealias ResponsiblePID = @convention(c) (pid_t) -> pid_t
+    private static let responsiblePID: ResponsiblePID? = {
+        guard let sym = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "responsibility_get_pid_responsible_for_pid") else { return nil }
+        return unsafeBitCast(sym, to: ResponsiblePID.self)
+    }()
+
+    /// This sidecar, the app that launched it, and every process macOS holds
+    /// the app responsible for (its WebKit content and GPU processes).
+    private static func isOwn(_ pid: pid_t) -> Bool {
+        let app = getppid()
+        if pid == getpid() || pid == app { return true }
+        guard app > 1, let responsible = responsiblePID else { return false }
+        return responsible(pid) == app
+    }
+
+    /// The Core Audio process objects of `isOwn` processes, sorted so two
+    /// reads compare equal when nothing changed.
+    private static func ownProcessObjects() -> [AudioObjectID] {
+        processes().filter { isOwn($0.pid) }.map(\.object).sorted()
+    }
+
+    private static let processListAddress = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyProcessObjectList,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+    )
+
+    /// Every process Core Audio knows, with its PID.
+    private static func processes() -> [(object: AudioObjectID, pid: pid_t)] {
+        let system = AudioObjectID(kAudioObjectSystemObject)
+        var addr = processListAddress
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(system, &addr, 0, nil, &size) == noErr, size > 0 else { return [] }
+        var objects = [AudioObjectID](repeating: 0, count: Int(size) / MemoryLayout<AudioObjectID>.size)
+        guard AudioObjectGetPropertyData(system, &addr, 0, nil, &size, &objects) == noErr else { return [] }
+        addr.mSelector = kAudioProcessPropertyPID
+        return objects.compactMap { obj in
+            var pid: pid_t = 0
+            var pidSize = UInt32(MemoryLayout<pid_t>.size)
+            guard AudioObjectGetPropertyData(obj, &addr, 0, nil, &pidSize, &pid) == noErr else { return nil }
+            return (obj, pid)
         }
-        return out
+    }
+
+    private static func tapFormat(_ tap: AudioObjectID) -> AudioStreamBasicDescription? {
+        var asbd = AudioStreamBasicDescription()
+        var size = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioTapPropertyFormat,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        guard AudioObjectGetPropertyData(tap, &addr, 0, nil, &size, &asbd) == noErr else { return nil }
+        return asbd
     }
 
     private static func defaultOutputUID() -> String? {

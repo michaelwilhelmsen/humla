@@ -40,6 +40,7 @@ Feature detail lives in `docs/features/` and `docs/architecture/`; read the link
 
 - Keep the two streams separate end-to-end; don't reintroduce mixing. Don't infer capture topology from a stream merely being present: diarize **both** streams when both have content, and apply `You:` only when the mic diarize resolves to exactly one voice.
 - `recording_stop` must drain inflight chunks **before** snapshotting `chunk_log`.
+- **The system-audio source is chosen in `permissions::system_audio_source`, never in the sidecar** (#220), passed as `--sys-source tap|sck`: the process tap once System Audio Recording is granted (or neither it nor Screen Recording was ever granted), `none` when both are refused, else ScreenCaptureKit, so a Screen Recording user is never prompted mid-meeting. A denied tap records silence instead of failing; never start one then, and the sidecar stops one turned down at the prompt mid-take. The UI doesn't mirror that rule: `systemAudioKind` / `systemAudioReady` (`src/lib/systemAudio.ts`) only decide which permission it shows and asks for.
 - **`recording_status` describes the live capture and nothing else** (#187); only the finishing capture's post-stop chain writes it. Re-diarize reports on `diarize_status`, replay on `transcribe_status`. `ChainProgress` (`PostStop` / `Rediarize` / `Replay` / `Silent`) is passed in; `diarize_and_apply`, `rediarize_apply_to_chunks` and `unify_note_speakers` never choose the channel.
 - The backend owns the single capture slot through the whole stop chain: `recording_start` and `import_audio` refuse on `StopState`.
 - **A discrete step counter is text, never the progress value** (#189). `discreteCounter` in `RecordingBar.tsx` is the one place this lives. Step index/count derive from `recording::stream_reports`; never write `1, 2` by hand. Keep `stop_steps` / `replay_steps` in step with the emitting code.
@@ -137,7 +138,7 @@ Feature detail lives in `docs/features/` and `docs/architecture/`; read the link
 │  │SQLite(rusql)│  │ audio-capture   │  │ speaker-diarize │  │
 │  │ notes /     │  │ sidecar (Swift) │  │ sidecar (Swift) │  │
 │  │ folders /   │  │ AVAudioEngine + │  │ FluidAudio      │  │
-│  │ settings    │  │ ScreenCaptureKit│  │ (CoreML / ANE)  │  │
+│  │ settings    │  │ process tap/SCK │  │ (CoreML / ANE)  │  │
 │  └─────────────┘  └─────────────────┘  └─────────────────┘  │
 │                                                             │
 │  ┌─────────────────────────────────┐  ┌─────────────────┐   │
@@ -186,7 +187,7 @@ Two Swift binaries bundled via `bundle.macOS.externalBin`, Developer ID + harden
 
 ## macOS specifics
 
-- Bundle id `no.humla.app`; a stable Developer ID signature keeps TCC permissions (Microphone, Screen Recording) across rebuilds.
+- Bundle id `no.humla.app`; a stable Developer ID signature keeps TCC permissions (Microphone, Screen Recording, System Audio Recording) across rebuilds.
 - Entitlements (`src-tauri/entitlements.plist`): mic input, network client, screen capture usage description, no app-sandbox.
 - Notifications go through UserNotifications and need the user's permission; buttons and clicks only work in a built `.app`.
 

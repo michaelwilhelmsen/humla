@@ -144,11 +144,11 @@ export function DoneStep({ ctx }: { ctx: StepContext }) {
           value={
             s == null
               ? "Checking…"
-              : s.screenGranted
+              : s.systemAudioReady
                 ? "Granted"
                 : "Skipped — in-person only"
           }
-          tone={s == null ? "muted" : s.screenGranted ? "ok" : "muted"}
+          tone={s == null ? "muted" : s.systemAudioReady ? "ok" : "muted"}
           onClick={() => ctx.goTo("permissions")}
         />
 

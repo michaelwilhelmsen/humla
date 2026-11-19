@@ -45,6 +45,36 @@ func screenStatusString() -> String {
     return result
 }
 
+// The System Audio Recording permission a process tap needs (macOS 14.2+).
+// macOS has no public call to read or request it, so these go through TCC's
+// own `TCCAccessPreflight` / `TCCAccessRequest`, loaded at runtime.
+enum SystemAudioPermission {
+    private typealias Preflight = @convention(c) (CFString, CFDictionary?) -> Int
+    private typealias Request = @convention(c) (CFString, CFDictionary?, @escaping (Bool) -> Void) -> Void
+    private static let service = "kTCCServiceAudioCapture" as CFString
+    private static let tcc = dlopen("/System/Library/PrivateFrameworks/TCC.framework/Versions/A/TCC", RTLD_NOW)
+
+    /// "granted", "denied", "not_determined", "unsupported" before macOS 14.2,
+    /// or "unknown" when TCC's functions can't be loaded.
+    static func status() -> String {
+        guard #available(macOS 14.2, *) else { return "unsupported" }
+        guard let sym = dlsym(tcc, "TCCAccessPreflight") else { return "unknown" }
+        switch unsafeBitCast(sym, to: Preflight.self)(service, nil) {
+        case 0: return "granted"
+        case 1: return "denied"
+        default: return "not_determined"
+        }
+    }
+
+    static func request(_ done: @escaping (Bool) -> Void) {
+        guard #available(macOS 14.2, *), let sym = dlsym(tcc, "TCCAccessRequest") else {
+            done(false)
+            return
+        }
+        unsafeBitCast(sym, to: Request.self)(service, nil, done)
+    }
+}
+
 func printJSON(_ obj: [String: Any]) {
     if let data = try? JSONSerialization.data(withJSONObject: obj),
        let s = String(data: data, encoding: .utf8) {
@@ -59,8 +89,16 @@ if allArgs.count >= 2 {
         printJSON([
             "microphone": micStatusString(),
             "screen": screenStatusString(),
+            "systemAudio": SystemAudioPermission.status(),
         ])
         exit(0)
+    case "request-system-audio":
+        SystemAudioPermission.request { granted in
+            printJSON(["systemAudio": granted ? "granted" : "denied"])
+            exit(granted ? 0 : 1)
+        }
+        RunLoop.main.run()
+        exit(1) // unreachable
     case "request-microphone":
         AVCaptureDevice.requestAccess(for: .audio) { granted in
             printJSON(["microphone": granted ? "granted" : "denied"])
@@ -1060,16 +1098,20 @@ final class SystemAudioOutput: NSObject, SCStreamOutput {
 
 let systemOutput = SystemAudioOutput()
 var scStream: SCStream?
-/// The process tap feeding the sys stream on macOS 14.2+ (#220). `Any` so the
+/// The process tap feeding the sys stream on macOS 14.2+. `Any` so the
 /// global can exist on macOS 13, where the type is unavailable.
 var systemTap: Any?
 
-/// `HUMLA_SYS_CAPTURE=sck` forces the ScreenCaptureKit path, for comparing the
-/// two on one machine.
-let forceScreenCaptureKit = ProcessInfo.processInfo.environment["HUMLA_SYS_CAPTURE"] == "sck"
+/// `--sys-source tap | sck | none`, chosen by the app from the permissions it
+/// holds (`permissions::system_audio_source`). No flag means ScreenCaptureKit.
+let systemAudioSource: String = {
+    guard let i = args.firstIndex(of: "--sys-source"), i + 1 < args.count else { return "sck" }
+    return args[i + 1]
+}()
 
 func startSystemAudio() async {
-    if #available(macOS 14.2, *), !forceScreenCaptureKit {
+    if systemAudioSource == "none" { return }
+    if #available(macOS 14.2, *), systemAudioSource == "tap" {
         let tap = SystemAudioTap(output: systemOutput)
         do {
             try tap.start()
@@ -1077,8 +1119,11 @@ func startSystemAudio() async {
             holdSystemAwake()
             return
         } catch {
-            // Fall through to ScreenCaptureKit: a take with SCK's failure mode
-            // still beats a take with no far side at all.
+            // ScreenCaptureKit without its permission would prompt mid-meeting.
+            guard screenStatusString() == "granted" else {
+                emitError("system audio: \(error)")
+                return
+            }
             FileHandle.standardError.write(Data("tap: \(error); falling back to ScreenCaptureKit\n".utf8))
         }
     }
@@ -1319,8 +1364,7 @@ let shutdown: () -> Void = {
         // engine.stop() is synchronous and returns immediately;
         // ChunkWriter.close() is also synchronous (queue.sync).
         engine.stop()
-        // The tap stops synchronously and fast, unlike stopCapture(), so it
-        // goes before the writers close rather than after.
+        // The tap stops synchronously, so it goes before the writers close.
         stopSystemTap()
         micFullWriter.close()
         sysFullWriter.close()

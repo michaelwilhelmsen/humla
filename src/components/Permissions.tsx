@@ -1,15 +1,18 @@
 import { useEffect, useState } from "react";
 import { ipc, type PermissionKind, type PermissionStatus, type PermissionsStatus } from "../lib/ipc";
+import { systemAudioKind } from "../lib/systemAudio";
 
 const LABEL: Record<PermissionKind, string> = {
   microphone: "Microphone",
   screen: "Screen Recording",
+  systemAudio: "System audio",
   notifications: "Notifications",
 };
 
 const HELP: Record<PermissionKind, string> = {
   microphone: "Required to record your voice.",
   screen: "Required to capture system audio (the other side of meetings).",
+  systemAudio: "Required to capture the other side of meetings.",
   notifications:
     "For recordings started from the menu bar or a link.",
 };
@@ -80,12 +83,13 @@ export function Permissions() {
   }
 
   if (!status) return null;
+  const audioKind = systemAudioKind(status);
 
   // Rows, not cards: the settings Section around this draws the card and the
   // hairlines between its children.
   return (
     <>
-      {(["microphone", "screen", "notifications"] as PermissionKind[]).map((kind) => {
+      {(["microphone", audioKind, "notifications"] as PermissionKind[]).map((kind) => {
         const s = statusLabel(status[kind]);
         // Microphone can be prompted only when it's "not_determined". Screen
         // Recording always reports "denied" until CGRequestScreenCaptureAccess
@@ -149,9 +153,11 @@ export function Permissions() {
           </div>
         );
       })}
-      <p className="text-xs text-[var(--color-text-muted)] py-3.5">
-        Restart Humla after enabling Screen Recording.
-      </p>
+      {audioKind === "screen" && (
+        <p className="text-xs text-[var(--color-text-muted)] py-3.5">
+          Restart Humla after enabling Screen Recording.
+        </p>
+      )}
     </>
   );
 }

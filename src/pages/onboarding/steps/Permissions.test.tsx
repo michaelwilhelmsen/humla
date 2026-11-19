@@ -60,3 +60,51 @@ describe("onboarding permissions: notifications", () => {
     expect(mic.disabled).toBe(false);
   });
 });
+
+describe("onboarding permissions: system audio", () => {
+  function perms(systemAudio: string, screen = "denied") {
+    return { microphone: "granted", screen, systemAudio, notifications: "granted" };
+  }
+
+  it("asks for System Audio Recording, with no restart, on macOS 14.2+", async () => {
+    const asked: unknown[] = [];
+    mockTauri({
+      permissions_status: () => perms(asked.length ? "granted" : "not_determined"),
+      permissions_request: (args) => {
+        asked.push(args);
+        return perms("granted");
+      },
+    });
+    render(<PermissionsStep ctx={ctx()} />);
+
+    await userEvent.click(await screen.findByRole("button", { name: "Enable system audio" }));
+    expect(asked).toEqual([{ kind: "systemAudio" }]);
+    expect(await screen.findAllByText("Granted")).toHaveLength(3);
+    expect(screen.queryByText("Restart required")).toBeNull();
+    expect(screen.queryByText(/Skip — I only record/)).toBeNull();
+    expect(screen.queryByText(/Screen Recording/)).toBeNull();
+  });
+
+  it("opens System Settings once system audio was turned down", async () => {
+    const opened: unknown[] = [];
+    mockTauri({
+      permissions_status: () => perms("denied"),
+      permissions_open_settings: (args) => {
+        opened.push(args);
+        return null;
+      },
+    });
+    render(<PermissionsStep ctx={ctx()} />);
+
+    await userEvent.click(await screen.findByRole("button", { name: "Open System Settings" }));
+    expect(opened).toEqual([{ kind: "systemAudio" }]);
+    expect(screen.getByText(/Skip — I only record/)).toBeTruthy();
+  });
+
+  it("keeps Screen Recording before macOS 14.2", async () => {
+    mockTauri({ permissions_status: () => perms("unsupported") });
+    render(<PermissionsStep ctx={ctx()} />);
+
+    expect(await screen.findByText(/macOS bundles system-audio capture/)).toBeTruthy();
+  });
+});

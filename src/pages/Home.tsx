@@ -5,6 +5,7 @@ import { ipc } from "../lib/ipc";
 import { useNotesStore } from "../lib/store";
 import { NemotronOffer } from "../components/NemotronOffer";
 import { ReleaseNotes } from "../components/ReleaseNotes";
+import { SystemAudioOffer } from "../components/SystemAudioOffer";
 import humlaIcon from "../../src-tauri/icons/icon.png";
 
 export function Home() {
@@ -48,6 +49,7 @@ export function Home() {
             New note
           </button>
         </div>
+        <SystemAudioOffer />
         <NemotronOffer />
         <ReleaseNotes />
       </div>

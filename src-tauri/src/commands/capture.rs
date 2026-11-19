@@ -5,7 +5,7 @@
 use super::api_keys::read_provider_api_key;
 use super::diarization::diarize_and_apply;
 use super::models::local_model_path;
-use super::permissions::capture_permissions;
+use super::permissions::{capture_permissions, far_side_warning, system_audio_source, SystemAudioSource};
 use super::playback::{write_playback_assets, PlaybackAudio};
 use super::transcribe::{record_detected_language, transcribe_chunk};
 use super::transcription_config::read_transcribe_config;
@@ -446,16 +446,17 @@ pub async fn recording_start(
     };
 
     // Pre-check microphone permission — without it we can't capture anything useful.
+    let mut sys_source = SystemAudioSource::ScreenCaptureKit;
     if let Ok(p) = capture_permissions(&app).await {
         if p.microphone != "granted" {
             let msg = "Microphone permission required. Open Settings → Permissions to grant.".to_string();
             emit_error(&app, Some(&note_id), &msg);
             return Err(msg);
         }
-        if p.screen != "granted" {
-            emit_error(&app, Some(&note_id),
-                "Screen Recording not granted — only your microphone will be captured. Grant in Settings → Permissions and restart for the full meeting transcript.");
+        if let Some(warning) = far_side_warning(&p) {
+            emit_error(&app, Some(&note_id), warning);
         }
+        sys_source = system_audio_source(&p);
     }
 
     // Shared-note recording lock. For a workspace note, claim it before we
@@ -483,6 +484,7 @@ pub async fn recording_start(
     let sidecar_path = sidecar_path(&app)?;
     let mut cmd = Command::new(&sidecar_path);
     cmd.arg("--out").arg(&temp_dir);
+    cmd.arg("--sys-source").arg(sys_source.arg());
     if keep_awake_enabled(&app) {
         cmd.arg("--keep-awake");
     }
