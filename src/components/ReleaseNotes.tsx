@@ -53,6 +53,7 @@ const VISUAL_CAPTION: Record<NonNullable<Release["visual"]>, string> = {
   copilot: "Use the Copilot subscription you already have.",
   custom: "Bring any OpenAI-compatible API.",
   share: "Share a note with the people who need it.",
+  "system-audio": "Record the call, not the screen.",
 };
 
 function ReleaseVisual({ kind }: { kind: NonNullable<Release["visual"]> }) {
@@ -142,6 +143,15 @@ function ReleaseVisual({ kind }: { kind: NonNullable<Release["visual"]> }) {
           </ul>
           <div className="release-preview-formats"><span className="is-selected">M4A</span><span>WAV</span></div>
           <div className="release-preview-sent"><FileAudio size={14} strokeWidth={1.8} />weekly-planning.m4a</div>
+        </>}
+        {kind === "system-audio" && <>
+          <div className="release-demo-heading"><span>Permissions</span></div>
+          <ul className="release-preview-takes">
+            <li><span>Microphone</span><span>Granted</span></li>
+            <li><span>System audio</span><span>Granted</span></li>
+            <li className="is-total"><span>Screen Recording</span><span>Not needed</span></li>
+          </ul>
+          <div className="release-preview-sent"><CircleCheck size={14} strokeWidth={1.8} />Recording both sides of the call</div>
         </>}
         {kind === "copilot" && <>
           <div className="release-demo-heading"><span>GitHub Copilot</span></div>

@@ -3,13 +3,35 @@ export type Release = {
   date: string;
   title: string;
   summary: string;
-  visual?: "filters" | "privacy" | "activity" | "updates" | "speakers" | "webhook" | "export" | "two-factor" | "date" | "audio" | "copilot" | "custom" | "share";
+  visual?: "filters" | "privacy" | "activity" | "updates" | "speakers" | "webhook" | "export" | "two-factor" | "date" | "audio" | "copilot" | "custom" | "share" | "system-audio";
   paragraphs: string[];
   highlights: string[];
   issues: { title: string; reference: string; status: "Open" | "Closed"; url: string }[];
 };
 
 export const releases: Release[] = [
+  {
+    version: "0.81.0",
+    date: "2026-11-19",
+    title: "Record calls without Screen Recording",
+    summary: "On macOS 14.2 and later, Humla records the other side of a call straight from the Mac's audio, so it no longer needs Screen Recording.",
+    visual: "system-audio",
+    paragraphs: [
+      "To hear the other side of a meeting, Humla used to open a screen recording and throw the picture away. macOS still treated that as recording your screen: the menu bar showed it during every meeting, and every so often macOS asked whether Humla could keep doing it. On macOS 14.2 and later, Humla now reads the audio your Mac plays directly, with the System audio permission instead. Nothing on your screen is captured.",
+      "It also fixes calls where the other side went missing. On macOS 26, a long screen recording could keep running while its sound had gone silent, and everything said after that point was lost from the transcript. Reading the Mac's audio directly doesn't do that, and Humla keeps up when you switch speakers or headphones in the middle of a call.",
+      "New installs ask for System audio during setup. If you already gave Humla Screen Recording, nothing changes until you choose to: a card on Home offers the switch, and Settings → Recording → Permissions has it too. On macOS older than 14.2, Humla keeps using Screen Recording. Also in this release: team sync reconnects quietly when the network drops it, instead of stalling for a minute.",
+    ],
+    highlights: [
+      "System audio replaces Screen Recording on macOS 14.2 and later.",
+      "No more screen recording indicator or recurring macOS prompt during meetings.",
+      "The other side of a long call no longer goes silent on macOS 26.",
+      "Team sync reconnects quietly after a network drop.",
+    ],
+    issues: [
+      { title: "Capture system audio with a Core Audio process tap instead of ScreenCaptureKit (macOS 14.2+), so Humla no longer needs Screen Recording", reference: "#220", status: "Closed", url: "https://github.com/michaelwilhelmsen/humla/issues/220" },
+      { title: "Cloud sync: realtime connection is cut every 60 s", reference: "#238", status: "Closed", url: "https://github.com/michaelwilhelmsen/humla/issues/238" },
+    ],
+  },
   {
     version: "0.80.0",
     date: "2026-11-18",
