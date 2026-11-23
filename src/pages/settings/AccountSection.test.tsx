@@ -339,6 +339,32 @@ describe("Account section", () => {
     ).toBeInTheDocument();
   });
 
+  it("in Personal, a failed portal request shows its error under that workspace only", async () => {
+    const status = signedIn("owner");
+    status.current_workspace = null as never;
+    status.workspaces = [
+      { id: "w1", name: "Acme", role: "owner", plan_status: "trialing" },
+      { id: "w2", name: "Beta", role: "owner", plan_status: "past_due" },
+    ];
+    renderApp("/settings?tab=account", {
+      cloud_status: () => status,
+      cloud_billing_portal: () => {
+        throw new Error("portal down");
+      },
+    });
+    const dialog = await screen.findByRole("dialog", { name: /settings/i });
+
+    await userEvent.click(
+      await within(dialog).findByRole("button", { name: /fix payment for beta/i }),
+    );
+    const errors = await within(dialog).findAllByText(/portal down/i);
+    expect(errors).toHaveLength(1);
+    // Rendered in Beta's row, next to its button.
+    expect(errors[0].parentElement).toContainElement(
+      within(dialog).getByRole("button", { name: /fix payment for beta/i }),
+    );
+  });
+
   it("in Personal, shows no billing section when the server doesn't bill", async () => {
     const status = signedIn("owner", false);
     status.current_workspace = null as never;

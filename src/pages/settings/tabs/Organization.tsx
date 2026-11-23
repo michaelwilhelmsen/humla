@@ -23,6 +23,7 @@ import { ValuePill } from "../components/ValuePill";
 import { Toggle } from "../components/Toggle";
 import { ChatKeyPanel } from "./ChatKeyPanel";
 import { NewWorkspaceModal } from "../../../components/NewWorkspaceModal";
+import { hasLiveSubscription } from "../../../lib/billing";
 
 const inputCls =
   "flex-1 min-w-0 text-sm px-3 py-2 rounded-md border border-[var(--color-line-visible)] bg-[var(--color-surface)] focus:border-[var(--color-text-muted)] transition-colors";
@@ -128,8 +129,7 @@ function BillingPanel({
   // seat count is meaningless otherwise). "past_due" is included so an owner
   // fixing payment still sees what they're being billed for.
   const seats = typeof ws.seats === "number" && ws.seats > 0 ? ws.seats : null;
-  const seatsBilled =
-    ws.plan_status === "active" || ws.plan_status === "trialing" || ws.plan_status === "past_due";
+  const seatsBilled = hasLiveSubscription(ws);
 
   async function go(kind: "checkout" | "portal") {
     setBusy(true);
@@ -223,15 +223,11 @@ function BillingPanel({
   );
 }
 
-/** Workspaces the signed-in user owns whose subscription exists on Stripe, so
- *  the Customer Portal has something to show. `none` and `canceled` have no
- *  live subscription; they subscribe from inside the workspace. */
+/** Workspaces the signed-in user owns with a live Stripe subscription: the
+ *  ones the Customer Portal can manage or cancel. The rest subscribe from
+ *  inside the workspace. */
 export function ownedSubscriptions(workspaces: CloudWorkspace[]): CloudWorkspace[] {
-  return workspaces.filter(
-    (w) =>
-      w.role === "owner" &&
-      (w.plan_status === "active" || w.plan_status === "trialing" || w.plan_status === "past_due"),
-  );
+  return workspaces.filter((w) => w.role === "owner" && hasLiveSubscription(w));
 }
 
 // Billing while no workspace is open. An owner who tried Cloud and went back to
@@ -240,8 +236,9 @@ export function ownedSubscriptions(workspaces: CloudWorkspace[]): CloudWorkspace
 // the open one). Portal only, never Checkout: every row here has a live
 // subscription, and a second Checkout would bill the owner twice.
 function OwnedBillingSection({ workspaces }: { workspaces: CloudWorkspace[] }) {
+  const refreshCloud = useCloudStore((s) => s.refresh);
   const [busyId, setBusyId] = useState<string | null>(null);
-  const [err, setErr] = useState<string | null>(null);
+  const [err, setErr] = useState<{ id: string; message: string } | null>(null);
 
   async function openPortal(id: string) {
     setBusyId(id);
@@ -249,7 +246,7 @@ function OwnedBillingSection({ workspaces }: { workspaces: CloudWorkspace[] }) {
     try {
       await openExternal(await cloudApi.billingPortal(id));
     } catch (e) {
-      setErr(String(e));
+      setErr({ id, message: String(e) });
     } finally {
       setBusyId(null);
     }
@@ -259,27 +256,37 @@ function OwnedBillingSection({ workspaces }: { workspaces: CloudWorkspace[] }) {
     <Section title="Billing">
       {workspaces.map((w) => {
         const meta = planMeta(w.plan_status);
-        const pastDue = w.plan_status === "past_due";
+        const action = w.plan_status === "past_due" ? "Fix payment" : "Manage billing";
+        const opening = busyId === w.id;
         return (
-          <div key={w.id} className="flex items-center justify-between gap-6 py-3.5">
-            <div className="flex items-center gap-2 min-w-0">
-              <span className="text-sm truncate">{w.name}</span>
-              <ValuePill color={meta.color}>{meta.label}</ValuePill>
+          <div key={w.id} className="flex flex-col gap-2 py-3.5">
+            <div className="flex items-center justify-between gap-6">
+              <div className="flex items-center gap-2 min-w-0">
+                <span className="text-sm truncate">{w.name}</span>
+                <ValuePill color={meta.color}>{meta.label}</ValuePill>
+              </div>
+              <Btn
+                onClick={() => openPortal(w.id)}
+                disabled={busyId !== null}
+                aria-label={opening ? `Opening billing for ${w.name}` : `${action} for ${w.name}`}
+              >
+                {opening ? "Opening…" : action}
+              </Btn>
             </div>
-            <Btn
-              onClick={() => openPortal(w.id)}
-              disabled={busyId !== null}
-              aria-label={`${pastDue ? "Fix payment" : "Manage billing"} for ${w.name}`}
-            >
-              {busyId === w.id ? "Opening…" : pastDue ? "Fix payment" : "Manage billing"}
-            </Btn>
+            {err?.id === w.id && (
+              <p className="text-xs text-[var(--color-danger)] break-all">{err.message}</p>
+            )}
           </div>
         );
       })}
-      {err && <p className="text-xs text-[var(--color-danger)] break-all pb-3.5">{err}</p>}
-      <p className="text-[11px] text-[var(--color-text-muted)] pb-3.5">
-        Opens Stripe in your browser, where you can change or cancel the subscription.
-      </p>
+      <div className="flex items-center justify-between gap-6 py-3.5">
+        <p className="text-[11px] text-[var(--color-text-muted)]">
+          Opens Stripe in your browser, where you can change or cancel the subscription.
+        </p>
+        <Btn onClick={() => void refreshCloud()} disabled={busyId !== null}>
+          Refresh
+        </Btn>
+      </div>
     </Section>
   );
 }
