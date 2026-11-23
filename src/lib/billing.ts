@@ -27,6 +27,13 @@ export function planIsLive(ws: CloudWorkspace | null | undefined): boolean {
   return ws?.plan_status === "trialing" || ws?.plan_status === "active";
 }
 
+/** The workspace's subscription exists on Stripe (trialing, active or past
+ *  due), so the Customer Portal has something to manage and seats are billed.
+ *  `none` and `canceled` have no live subscription. */
+export function hasLiveSubscription(ws: CloudWorkspace): boolean {
+  return planIsLive(ws) || ws.plan_status === "past_due";
+}
+
 /**
  * Which Stripe surface a workspace needs, given its plan:
  *

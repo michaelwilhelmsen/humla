@@ -23,6 +23,7 @@ import { ValuePill } from "../components/ValuePill";
 import { Toggle } from "../components/Toggle";
 import { ChatKeyPanel } from "./ChatKeyPanel";
 import { NewWorkspaceModal } from "../../../components/NewWorkspaceModal";
+import { hasLiveSubscription } from "../../../lib/billing";
 
 const inputCls =
   "flex-1 min-w-0 text-sm px-3 py-2 rounded-md border border-[var(--color-line-visible)] bg-[var(--color-surface)] focus:border-[var(--color-text-muted)] transition-colors";
@@ -128,8 +129,7 @@ function BillingPanel({
   // seat count is meaningless otherwise). "past_due" is included so an owner
   // fixing payment still sees what they're being billed for.
   const seats = typeof ws.seats === "number" && ws.seats > 0 ? ws.seats : null;
-  const seatsBilled =
-    ws.plan_status === "active" || ws.plan_status === "trialing" || ws.plan_status === "past_due";
+  const seatsBilled = hasLiveSubscription(ws);
 
   async function go(kind: "checkout" | "portal") {
     setBusy(true);
@@ -220,6 +220,74 @@ function BillingPanel({
         Opens Stripe in your browser.
       </p>
     </div>
+  );
+}
+
+/** Workspaces the signed-in user owns with a live Stripe subscription: the
+ *  ones the Customer Portal can manage or cancel. The rest subscribe from
+ *  inside the workspace. */
+export function ownedSubscriptions(workspaces: CloudWorkspace[]): CloudWorkspace[] {
+  return workspaces.filter((w) => w.role === "owner" && hasLiveSubscription(w));
+}
+
+// Billing while no workspace is open. An owner who tried Cloud and went back to
+// Personal still has to be able to manage or cancel the subscription without
+// first switching into the workspace (the full BillingPanel only renders for
+// the open one). Portal only, never Checkout: every row here has a live
+// subscription, and a second Checkout would bill the owner twice.
+function OwnedBillingSection({ workspaces }: { workspaces: CloudWorkspace[] }) {
+  const refreshCloud = useCloudStore((s) => s.refresh);
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const [err, setErr] = useState<{ id: string; message: string } | null>(null);
+
+  async function openPortal(id: string) {
+    setBusyId(id);
+    setErr(null);
+    try {
+      await openExternal(await cloudApi.billingPortal(id));
+    } catch (e) {
+      setErr({ id, message: String(e) });
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  return (
+    <Section title="Billing">
+      {workspaces.map((w) => {
+        const meta = planMeta(w.plan_status);
+        const action = w.plan_status === "past_due" ? "Fix payment" : "Manage billing";
+        const opening = busyId === w.id;
+        return (
+          <div key={w.id} className="flex flex-col gap-2 py-3.5">
+            <div className="flex items-center justify-between gap-6">
+              <div className="flex items-center gap-2 min-w-0">
+                <span className="text-sm truncate">{w.name}</span>
+                <ValuePill color={meta.color}>{meta.label}</ValuePill>
+              </div>
+              <Btn
+                onClick={() => openPortal(w.id)}
+                disabled={busyId !== null}
+                aria-label={opening ? `Opening billing for ${w.name}` : `${action} for ${w.name}`}
+              >
+                {opening ? "Opening…" : action}
+              </Btn>
+            </div>
+            {err?.id === w.id && (
+              <p className="text-xs text-[var(--color-danger)] break-all">{err.message}</p>
+            )}
+          </div>
+        );
+      })}
+      <div className="flex items-center justify-between gap-6 py-3.5">
+        <p className="text-[11px] text-[var(--color-text-muted)]">
+          Opens Stripe in your browser, where you can change or cancel the subscription.
+        </p>
+        <Btn onClick={() => void refreshCloud()} disabled={busyId !== null}>
+          Refresh
+        </Btn>
+      </div>
+    </Section>
   );
 }
 
@@ -316,41 +384,45 @@ export function OrganizationTab() {
   // No active workspace -----------------------------------------------------
   if (!ws) {
     const locked = status.locked_current_workspace;
+    const billable = status.billing_enabled ? ownedSubscriptions(status.workspaces) : [];
     return (
-      <Section title="Workspace">
-        <p className="text-sm text-[var(--color-text-muted)] py-3.5">
-          {locked
-            ? `${locked.name} requires two-factor authentication before you can open it. Turn it on under Two-factor authentication, above.`
-            : "You're in Personal (local-only). Create a workspace, or pick one in the sidebar."}
-        </p>
-        {status.workspaces.length > 0 && (
-          <Row label="Your workspaces">
-            <div className="flex flex-col gap-1">
-              {status.workspaces.map((w) => (
-                <button
-                  key={w.id}
-                  onClick={async () => {
-                    await cloudApi.selectWorkspace(w.id);
-                    await refreshCloud();
-                    await refreshNotes();
-                  }}
-                  className="flex items-center gap-2 px-3 py-2 rounded-md text-sm text-left border border-[var(--color-line)] hover:border-[var(--color-text-muted)] transition-colors"
-                >
-                  <span className="flex-1 truncate">{w.name}</span>
-                  <RolePill role={w.role} />
-                </button>
-              ))}
-            </div>
+      <>
+        <Section title="Workspace">
+          <p className="text-sm text-[var(--color-text-muted)] py-3.5">
+            {locked
+              ? `${locked.name} requires two-factor authentication before you can open it. Turn it on under Two-factor authentication, above.`
+              : "You're in Personal (local-only). Create a workspace, or pick one in the sidebar."}
+          </p>
+          {status.workspaces.length > 0 && (
+            <Row label="Your workspaces">
+              <div className="flex flex-col gap-1">
+                {status.workspaces.map((w) => (
+                  <button
+                    key={w.id}
+                    onClick={async () => {
+                      await cloudApi.selectWorkspace(w.id);
+                      await refreshCloud();
+                      await refreshNotes();
+                    }}
+                    className="flex items-center gap-2 px-3 py-2 rounded-md text-sm text-left border border-[var(--color-line)] hover:border-[var(--color-text-muted)] transition-colors"
+                  >
+                    <span className="flex-1 truncate">{w.name}</span>
+                    <RolePill role={w.role} />
+                  </button>
+                ))}
+              </div>
+            </Row>
+          )}
+          {/* One create flow, not two: this used to be a second bare name input
+              (the switcher had the other), and both left the new workspace
+              read-only with no hint of what to do next. */}
+          <Row label="Team workspace">
+            <Btn onClick={() => setCreatingOpen(true)}>Create team workspace…</Btn>
           </Row>
-        )}
-        {/* One create flow, not two: this used to be a second bare name input
-            (the switcher had the other), and both left the new workspace
-            read-only with no hint of what to do next. */}
-        <Row label="Team workspace">
-          <Btn onClick={() => setCreatingOpen(true)}>Create team workspace…</Btn>
-        </Row>
-        <NewWorkspaceModal open={creatingOpen} onClose={() => setCreatingOpen(false)} />
-      </Section>
+          <NewWorkspaceModal open={creatingOpen} onClose={() => setCreatingOpen(false)} />
+        </Section>
+        {billable.length > 0 && <OwnedBillingSection workspaces={billable} />}
+      </>
     );
   }
 
