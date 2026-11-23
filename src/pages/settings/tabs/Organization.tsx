@@ -223,6 +223,67 @@ function BillingPanel({
   );
 }
 
+/** Workspaces the signed-in user owns whose subscription exists on Stripe, so
+ *  the Customer Portal has something to show. `none` and `canceled` have no
+ *  live subscription; they subscribe from inside the workspace. */
+export function ownedSubscriptions(workspaces: CloudWorkspace[]): CloudWorkspace[] {
+  return workspaces.filter(
+    (w) =>
+      w.role === "owner" &&
+      (w.plan_status === "active" || w.plan_status === "trialing" || w.plan_status === "past_due"),
+  );
+}
+
+// Billing while no workspace is open. An owner who tried Cloud and went back to
+// Personal still has to be able to manage or cancel the subscription without
+// first switching into the workspace (the full BillingPanel only renders for
+// the open one). Portal only, never Checkout: every row here has a live
+// subscription, and a second Checkout would bill the owner twice.
+function OwnedBillingSection({ workspaces }: { workspaces: CloudWorkspace[] }) {
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  async function openPortal(id: string) {
+    setBusyId(id);
+    setErr(null);
+    try {
+      await openExternal(await cloudApi.billingPortal(id));
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  return (
+    <Section title="Billing">
+      {workspaces.map((w) => {
+        const meta = planMeta(w.plan_status);
+        const pastDue = w.plan_status === "past_due";
+        return (
+          <div key={w.id} className="flex items-center justify-between gap-6 py-3.5">
+            <div className="flex items-center gap-2 min-w-0">
+              <span className="text-sm truncate">{w.name}</span>
+              <ValuePill color={meta.color}>{meta.label}</ValuePill>
+            </div>
+            <Btn
+              onClick={() => openPortal(w.id)}
+              disabled={busyId !== null}
+              aria-label={`${pastDue ? "Fix payment" : "Manage billing"} for ${w.name}`}
+            >
+              {busyId === w.id ? "Opening…" : pastDue ? "Fix payment" : "Manage billing"}
+            </Btn>
+          </div>
+        );
+      })}
+      {err && <p className="text-xs text-[var(--color-danger)] break-all pb-3.5">{err}</p>}
+      <p className="text-[11px] text-[var(--color-text-muted)] pb-3.5">
+        Opens Stripe in your browser, where you can change or cancel the subscription.
+      </p>
+    </Section>
+  );
+}
+
 export function OrganizationTab() {
   const status = useCloudStore((s) => s.status);
   const refreshCloud = useCloudStore((s) => s.refresh);
@@ -316,41 +377,45 @@ export function OrganizationTab() {
   // No active workspace -----------------------------------------------------
   if (!ws) {
     const locked = status.locked_current_workspace;
+    const billable = status.billing_enabled ? ownedSubscriptions(status.workspaces) : [];
     return (
-      <Section title="Workspace">
-        <p className="text-sm text-[var(--color-text-muted)] py-3.5">
-          {locked
-            ? `${locked.name} requires two-factor authentication before you can open it. Turn it on under Two-factor authentication, above.`
-            : "You're in Personal (local-only). Create a workspace, or pick one in the sidebar."}
-        </p>
-        {status.workspaces.length > 0 && (
-          <Row label="Your workspaces">
-            <div className="flex flex-col gap-1">
-              {status.workspaces.map((w) => (
-                <button
-                  key={w.id}
-                  onClick={async () => {
-                    await cloudApi.selectWorkspace(w.id);
-                    await refreshCloud();
-                    await refreshNotes();
-                  }}
-                  className="flex items-center gap-2 px-3 py-2 rounded-md text-sm text-left border border-[var(--color-line)] hover:border-[var(--color-text-muted)] transition-colors"
-                >
-                  <span className="flex-1 truncate">{w.name}</span>
-                  <RolePill role={w.role} />
-                </button>
-              ))}
-            </div>
+      <>
+        <Section title="Workspace">
+          <p className="text-sm text-[var(--color-text-muted)] py-3.5">
+            {locked
+              ? `${locked.name} requires two-factor authentication before you can open it. Turn it on under Two-factor authentication, above.`
+              : "You're in Personal (local-only). Create a workspace, or pick one in the sidebar."}
+          </p>
+          {status.workspaces.length > 0 && (
+            <Row label="Your workspaces">
+              <div className="flex flex-col gap-1">
+                {status.workspaces.map((w) => (
+                  <button
+                    key={w.id}
+                    onClick={async () => {
+                      await cloudApi.selectWorkspace(w.id);
+                      await refreshCloud();
+                      await refreshNotes();
+                    }}
+                    className="flex items-center gap-2 px-3 py-2 rounded-md text-sm text-left border border-[var(--color-line)] hover:border-[var(--color-text-muted)] transition-colors"
+                  >
+                    <span className="flex-1 truncate">{w.name}</span>
+                    <RolePill role={w.role} />
+                  </button>
+                ))}
+              </div>
+            </Row>
+          )}
+          {/* One create flow, not two: this used to be a second bare name input
+              (the switcher had the other), and both left the new workspace
+              read-only with no hint of what to do next. */}
+          <Row label="Team workspace">
+            <Btn onClick={() => setCreatingOpen(true)}>Create team workspace…</Btn>
           </Row>
-        )}
-        {/* One create flow, not two: this used to be a second bare name input
-            (the switcher had the other), and both left the new workspace
-            read-only with no hint of what to do next. */}
-        <Row label="Team workspace">
-          <Btn onClick={() => setCreatingOpen(true)}>Create team workspace…</Btn>
-        </Row>
-        <NewWorkspaceModal open={creatingOpen} onClose={() => setCreatingOpen(false)} />
-      </Section>
+          <NewWorkspaceModal open={creatingOpen} onClose={() => setCreatingOpen(false)} />
+        </Section>
+        {billable.length > 0 && <OwnedBillingSection workspaces={billable} />}
+      </>
     );
   }
 
