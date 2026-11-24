@@ -291,6 +291,91 @@ describe("Account section", () => {
     expect(portals[0]).toMatchObject({ workspaceId: "w1" });
   });
 
+  it("in Personal, an owner can manage a subscribed workspace's billing without opening it", async () => {
+    // A trial user who went back to Personal has no open workspace, so the
+    // workspace's own Billing panel never renders. They still have to be able
+    // to cancel: this went unnoticed until a trial user couldn't find it.
+    const portals: unknown[] = [];
+    const checkouts: unknown[] = [];
+    const status = signedIn("owner");
+    status.current_workspace = null as never;
+    status.workspaces = [
+      { id: "w1", name: "Acme", role: "owner", plan_status: "trialing" },
+      { id: "w2", name: "Unpaid", role: "owner", plan_status: "none" },
+      { id: "w3", name: "Theirs", role: "member", plan_status: "active" },
+    ];
+    renderApp("/settings?tab=account", {
+      cloud_status: () => status,
+      cloud_billing_portal: (args) => {
+        portals.push(args);
+        return "https://billing.stripe.test/portal";
+      },
+      cloud_billing_checkout: (args) => {
+        checkouts.push(args);
+        return "https://checkout.stripe.test/session";
+      },
+    });
+    const dialog = await screen.findByRole("dialog", { name: /settings/i });
+
+    const manage = await within(dialog).findAllByRole("button", { name: /manage billing/i });
+    // Only the owned workspace with a live subscription; not the unsubscribed
+    // one (nothing to manage) nor one they don't own.
+    expect(manage).toHaveLength(1);
+    expect(manage[0]).toHaveAccessibleName(/acme/i);
+
+    await userEvent.click(manage[0]);
+    expect(portals).toEqual([expect.objectContaining({ workspaceId: "w1" })]);
+    expect(checkouts).toHaveLength(0);
+  });
+
+  it("in Personal, a past_due owned workspace offers Fix payment through the portal", async () => {
+    const status = signedIn("owner");
+    status.current_workspace = null as never;
+    status.workspaces = [{ id: "w1", name: "Acme", role: "owner", plan_status: "past_due" }];
+    const dialog = await openAccount(status);
+
+    expect(
+      await within(dialog).findByRole("button", { name: /fix payment for acme/i }),
+    ).toBeInTheDocument();
+  });
+
+  it("in Personal, a failed portal request shows its error under that workspace only", async () => {
+    const status = signedIn("owner");
+    status.current_workspace = null as never;
+    status.workspaces = [
+      { id: "w1", name: "Acme", role: "owner", plan_status: "trialing" },
+      { id: "w2", name: "Beta", role: "owner", plan_status: "past_due" },
+    ];
+    renderApp("/settings?tab=account", {
+      cloud_status: () => status,
+      cloud_billing_portal: () => {
+        throw new Error("portal down");
+      },
+    });
+    const dialog = await screen.findByRole("dialog", { name: /settings/i });
+
+    await userEvent.click(
+      await within(dialog).findByRole("button", { name: /fix payment for beta/i }),
+    );
+    const errors = await within(dialog).findAllByText(/portal down/i);
+    expect(errors).toHaveLength(1);
+    // Rendered in Beta's row, next to its button.
+    expect(errors[0].parentElement).toContainElement(
+      within(dialog).getByRole("button", { name: /fix payment for beta/i }),
+    );
+  });
+
+  it("in Personal, shows no billing section when the server doesn't bill", async () => {
+    const status = signedIn("owner", false);
+    status.current_workspace = null as never;
+    const dialog = await openAccount(status);
+
+    expect(await within(dialog).findByText(/your workspaces/i)).toBeInTheDocument();
+    expect(
+      within(dialog).queryByRole("button", { name: /manage billing/i }),
+    ).not.toBeInTheDocument();
+  });
+
   it("tags the checkout with the surface that started it", async () => {
     // The server records `source` on the Stripe subscription so a trial start
     // is attributable to the pane it came from. It ALLOWLISTS the value and

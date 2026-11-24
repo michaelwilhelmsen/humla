@@ -2041,6 +2041,26 @@ const CASES: Record<string, Scenario> = {
     render: () => null, // unused — `route` renders the app
     ipc: settingsContentIpc("viewer"),
   },
+  // An owner back in Personal with a trialing workspace and a past-due one:
+  // Account → Billing lists both without opening either.
+  "settings-billing-personal": {
+    route: "/settings?tab=account",
+    render: () => null, // unused — `route` renders the app
+    ipc: {
+      cloud_status: () => ({
+        ...DISCONNECTED,
+        logged_in: true,
+        billing_enabled: true,
+        user: { id: "u-me", email: "michael@humla.no", name: "Michael", verified: true },
+        current_workspace: null,
+        workspaces: [
+          { id: "w-trial", name: "Humla", role: "owner", plan_status: "trialing" },
+          { id: "w-due", name: "Screenpartner", role: "owner", plan_status: "past_due" },
+          { id: "w-other", name: "Acme", role: "member", plan_status: "active" },
+        ],
+      }),
+    },
+  },
   // `settings-org` is a member of two departments of an organisation that
   // supplies templates (one for every department, one for two) and terms.
   // Try `&section=vocabulary` and `&section=summaries`.
