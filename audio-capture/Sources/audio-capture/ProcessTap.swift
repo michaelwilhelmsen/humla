@@ -3,9 +3,9 @@ import CoreAudio
 import Foundation
 
 // System audio from a Core Audio process tap (macOS 14.2+), fed through
-// `SystemAudioOutput.ingest` like a ScreenCaptureKit buffer. A tap's format
-// follows the output device, so it is rebuilt when the default output or its
-// format changes, and when it stalls or delivers exact silence while another
+// `SystemAudioOutput.ingest` like a ScreenCaptureKit buffer. The tap arrives
+// at the output device's rate, so it is rebuilt when the default output or its
+// rate changes, and when it stalls or delivers exact silence while another
 // process plays. It delivers nothing until something plays and nothing across a
 // rebuild, while sys is lined up with the mic by sample index downstream, so
 // `deliver` writes those spans as silence timed from the host clock.
@@ -36,6 +36,7 @@ final class SystemAudioTap {
     private var stopped = true
     private let output: SystemAudioOutput
     private var defaultOutputListener: AudioObjectPropertyListenerBlock?
+    private var aggregateRateListener: AudioObjectPropertyListenerBlock?
     private var processListListener: AudioObjectPropertyListenerBlock?
     // Set once TCC reports the permission granted, `control` only.
     private var permissionConfirmed = false
@@ -110,10 +111,7 @@ final class SystemAudioTap {
         excluded = own
 
         guard var asbd = Self.tapFormat(tapID) else { teardown(); throw TapError.unavailable("read tap format failed") }
-        guard let fmt = AVAudioFormat(streamDescription: &asbd) else {
-            teardown(); throw TapError.unavailable("tap format unsupported (sr=\(asbd.mSampleRate) ch=\(asbd.mChannelsPerFrame))")
-        }
-        format = fmt
+        let tapRate = asbd.mSampleRate
 
         guard let outputUID = Self.defaultOutputUID() else {
             teardown(); throw TapError.unavailable("no default output device")
@@ -136,6 +134,25 @@ final class SystemAudioTap {
         guard err == noErr else { teardown(); throw TapError.status("AudioHardwareCreateAggregateDevice", err) }
         aggregateID = agg
 
+        // The aggregate delivers the tap at the output device's rate, which
+        // the tap's own format does not report: a headset in call mode runs
+        // at 16 or 24 kHz while the tap still says 48 kHz.
+        guard let rate = Self.nominalRate(aggregateID), rate > 0 else {
+            teardown(); throw TapError.unavailable("read aggregate sample rate failed")
+        }
+        asbd.mSampleRate = rate
+        guard let fmt = AVAudioFormat(streamDescription: &asbd) else {
+            teardown(); throw TapError.unavailable("tap format unsupported (sr=\(asbd.mSampleRate) ch=\(asbd.mChannelsPerFrame))")
+        }
+        format = fmt
+
+        let rateListener: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            self?.rebuild("output sample rate changed", opening: "device_change")
+        }
+        var rateAddr = Self.nominalRateAddress
+        AudioObjectAddPropertyListenerBlock(aggregateID, &rateAddr, control, rateListener)
+        aggregateRateListener = rateListener
+
         var proc: AudioDeviceIOProcID?
         err = AudioDeviceCreateIOProcIDWithBlock(&proc, aggregateID, queue) { [weak self] _, inInputData, inInputTime, _, _ in
             self?.deliver(inInputData, inInputTime, format: fmt)
@@ -152,12 +169,17 @@ final class SystemAudioTap {
         err = AudioDeviceStart(aggregateID, procID)
         guard err == noErr else { teardown(); throw TapError.status("AudioDeviceStart", err) }
         FileHandle.standardError.write(Data(
-            "tap: capture started (sr=\(fmt.sampleRate)Hz channels=\(fmt.channelCount) interleaved=\(fmt.isInterleaved))\n".utf8
+            "tap: capture started (sr=\(fmt.sampleRate)Hz tapSr=\(tapRate)Hz channels=\(fmt.channelCount) interleaved=\(fmt.isInterleaved))\n".utf8
         ))
     }
 
     private func teardown() {
         if aggregateID != kAudioObjectUnknown {
+            if let listener = aggregateRateListener {
+                var rateAddr = Self.nominalRateAddress
+                AudioObjectRemovePropertyListenerBlock(aggregateID, &rateAddr, control, listener)
+                aggregateRateListener = nil
+            }
             if let p = procID {
                 AudioDeviceStop(aggregateID, p)
                 AudioDeviceDestroyIOProcID(aggregateID, p)
@@ -353,8 +375,8 @@ final class SystemAudioTap {
         }
         AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &processList, control, processListener)
         processListListener = processListener
-        // The tap's own format moves when the device it follows changes rate
-        // without the default changing (AirPods entering call mode).
+        // The output device changes rate without the default changing
+        // (AirPods entering call mode); backs up the aggregate's rate listener.
         let poll = DispatchSource.makeTimerSource(queue: control)
         poll.schedule(deadline: .now() + 2, repeating: 2)
         poll.setEventHandler { [weak self] in
@@ -364,9 +386,12 @@ final class SystemAudioTap {
                 self.rebuild("retrying a failed rebuild", opening: "device_change")
                 return
             }
-            if let asbd = Self.tapFormat(self.tapID),
-               asbd.mSampleRate != fmt.sampleRate || asbd.mChannelsPerFrame != fmt.channelCount {
-                self.rebuild("tap format changed to \(asbd.mSampleRate)Hz", opening: "device_change")
+            if let asbd = Self.tapFormat(self.tapID), asbd.mChannelsPerFrame != fmt.channelCount {
+                self.rebuild("tap format changed to \(asbd.mChannelsPerFrame) channels", opening: "device_change")
+                return
+            }
+            if let rate = Self.nominalRate(self.aggregateID), rate != fmt.sampleRate {
+                self.rebuild("output sample rate changed to \(rate)Hz", opening: "device_change")
                 return
             }
             self.checkPermission()
@@ -480,6 +505,21 @@ final class SystemAudioTap {
         )
         guard AudioObjectGetPropertyData(tap, &addr, 0, nil, &size, &asbd) == noErr else { return nil }
         return asbd
+    }
+
+    private static let nominalRateAddress = AudioObjectPropertyAddress(
+        mSelector: kAudioDevicePropertyNominalSampleRate,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+    )
+
+    private static func nominalRate(_ device: AudioObjectID) -> Float64? {
+        guard device != kAudioObjectUnknown else { return nil }
+        var rate: Float64 = 0
+        var size = UInt32(MemoryLayout<Float64>.size)
+        var addr = nominalRateAddress
+        guard AudioObjectGetPropertyData(device, &addr, 0, nil, &size, &rate) == noErr else { return nil }
+        return rate
     }
 
     private static func defaultOutputUID() -> String? {
