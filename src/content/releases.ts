@@ -11,6 +11,25 @@ export type Release = {
 
 export const releases: Release[] = [
   {
+    version: "0.81.1",
+    date: "2026-11-24",
+    title: "Bugfix: system audio sample rate",
+    summary: "With a headset or AirPods, Humla 0.81.0 could record the other side of a call sped up, so their words came out as nonsense. This fixes it.",
+    paragraphs: [
+      "Humla 0.81.0 reads the other side of a call straight from your Mac's audio. When your headphones ran at a different rate than Humla expected, which AirPods and most Bluetooth headsets do during a call, their voices were recorded two or three times too fast. The transcript then showed sounds instead of words, while your own side came through fine.",
+      "Humla now records at the rate your headphones actually use, and keeps up when they switch rate in the middle of a call. Recordings made with 0.81.0 can't be repaired, because the sound itself was recorded too fast.",
+      "Also in this release: if you own a workspace with a Humla Cloud subscription, you can now manage its billing from Settings → Account while you're in Personal, so cancelling or fixing a payment no longer means switching into that workspace first.",
+    ],
+    highlights: [
+      "The other side of a call is recorded at the right speed with AirPods and Bluetooth headsets.",
+      "Humla keeps up when your headphones switch into call mode mid-meeting.",
+      "Manage a workspace's billing from Personal.",
+    ],
+    issues: [
+      { title: "Capture system audio with a Core Audio process tap instead of ScreenCaptureKit (macOS 14.2+), so Humla no longer needs Screen Recording", reference: "#220", status: "Closed", url: "https://github.com/michaelwilhelmsen/humla/issues/220" },
+    ],
+  },
+  {
     version: "0.81.0",
     date: "2026-11-19",
     title: "Record calls without Screen Recording",
