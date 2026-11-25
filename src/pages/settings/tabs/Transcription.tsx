@@ -297,7 +297,7 @@ export function TranscriptionTab({
       <Section title="Clean transcripts">
         <Row
           label="Clean transcripts"
-          description="After a recording, the model your summaries use marks filler words, words said twice and false starts, and the Transcript tab hides them. Nothing is rewritten, and Verbatim shows every word."
+          description="After a recording, the model your summaries use writes a clean read of the transcript: filler words, stutters and false starts gone, broken grammar mended. The Transcript tab shows it as Clean; Verbatim keeps every word as it was said."
           control={
             <Toggle
               label="Clean transcripts"

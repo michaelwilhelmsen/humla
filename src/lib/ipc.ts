@@ -178,9 +178,9 @@ export type SettingsKey =
   | "transcribe_manually"
   // Hold a system-sleep power assertion while a capture runs (#180).
   | "keep_awake"
-  // Clean transcripts (#217): after a recording, a model marks filler words,
-  // accidental repeats and false starts to hide in the reader. Default on;
-  // only the string "false" turns it off.
+  // Clean transcripts (#217): after a recording, a model writes a clean read
+  // of the transcript for the reader's Clean view. Default on; only the
+  // string "false" turns it off.
   | "clean_transcripts"
   // Which version the Transcript tab shows: "clean" (default) or "verbatim".
   // Remembered across notes; owned by the tab's own switch.
@@ -380,16 +380,17 @@ export type TimelineEntry = {
   sessionId: string;
   sessionIndex: number;
   chunkIdx: number;
-  // The clean view's mask (#217): indices into `words` (into the text's
-  // whitespace tokens when `words` is empty) hidden in Clean. Absent when no
-  // clean pass has read these exact words; empty when one did and hid
-  // nothing.
-  hidden?: number[];
+  // What the Clean view shows for this entry (#217). Absent when no clean
+  // pass has covered these exact words. A clean segment spans one or more
+  // consecutive entries of one speaker: its first entry carries the
+  // segment's clean text and words (timed in the take's clock, aligned to
+  // what was said), the rest carry empty ones.
+  clean?: { text: string; words: TimelineWord[] };
 };
 
-// What a clean pass did (#217): timeline entries the model read, and the
-// words it hid across them.
-export type CleanOutcome = { entries: number; hiddenWords: number };
+// What a clean pass did (#217): segments the model rewrote, and how many of
+// them a guard kept verbatim.
+export type CleanOutcome = { segments: number; keptVerbatim: number };
 
 // Outcome of the on-open orphaned-text repair (#169). `coversTranscript` is
 // the backend's own comparison of `note.transcript` against what the merged
@@ -593,9 +594,10 @@ export const ipc = {
   relaunchApp: () => invoke<void>("app_relaunch"),
   noteTimeline: (noteId: string) =>
     invoke<TimelineEntry[]>("note_timeline", { noteId }),
-  // Clean a note's transcript (#217): a model marks filler words, accidental
-  // repeats and false starts to hide in the reader's Clean view. Reads only
-  // entries without a mask unless `force`. Progress arrives on `clean_status`.
+  // Clean a note's transcript (#217): a model rewrites it as a clean read
+  // (fillers, stutters and false starts gone, grammar mended) for the
+  // reader's Clean view. Cleans only entries without a clean segment unless
+  // `force`. Progress arrives on `clean_status`.
   cleanNote: (noteId: string, force: boolean) =>
     invoke<CleanOutcome>("note_clean", { noteId, force }),
   // Repair transcript text no session timeline accounts for (#169), and report

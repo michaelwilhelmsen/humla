@@ -38,12 +38,10 @@ import { SUMMARY_CAPABLE, type SummaryProvider } from "../lib/providers";
 import { useLiveSetting, writeSetting } from "../lib/settingsBus";
 import {
   cleanCoverage,
-  cleanGroupText,
+  cleanDisplayTimeline,
   cleanTranscriptText,
-  fullyHidden,
-  hiddenWordSet,
+  emptyTurn,
   parseTranscriptView,
-  showWords,
   type CleanCoverage,
   type TranscriptView,
 } from "../lib/cleanView";
@@ -1174,7 +1172,7 @@ export function Note() {
     () =>
       // Copy takes what the reader shows: in Clean, the clean text, labelled
       // like the stored transcript.
-      (showsClean ? cleanTranscriptText(groupTimeline(timeline)) : null) ??
+      (showsClean ? cleanTranscriptText(groupTimeline(cleanDisplayTimeline(timeline))) : null) ??
       (isUnsaved("transcript") ? draftRef.current?.transcript : note?.transcript) ??
       draftRef.current?.transcript ??
       "",
@@ -3473,8 +3471,13 @@ export const TranscriptPlayer = memo(function TranscriptPlayer({
   const containerRef = useRef<HTMLDivElement | null>(null);
   // Held in a ref so the rAF tick can read the latest timeline
   // without restarting. Updated on every timeline change.
-  const timelineRef = useRef(timeline);
-  timelineRef.current = timeline;
+  // Clean (#217) shows each entry's clean words in place of its verbatim
+  // ones; the highlight and the turn list read this, the per-turn actions
+  // keep addressing the real entries (indices line up one to one).
+  const clean = view === "clean";
+  const shown = useMemo(() => (clean ? cleanDisplayTimeline(timeline) : timeline), [clean, timeline]);
+  const timelineRef = useRef(shown);
+  timelineRef.current = shown;
 
   const labels = useMemo(
     () => Array.from(new Set(timeline.map((t) => t.label).filter(Boolean))),
@@ -3499,10 +3502,9 @@ export const TranscriptPlayer = memo(function TranscriptPlayer({
   // single position in the flattened `words` array. Groups break at
   // session boundaries too, so each carries its session identity and a
   // divider anchor (#16).
-  const allGroups = useMemo(() => groupTimeline(timeline), [timeline]);
-  const clean = view === "clean";
+  const allGroups = useMemo(() => groupTimeline(shown), [shown]);
   const groups = useMemo(
-    () => (clean ? allGroups.filter((g) => !fullyHidden(g)) : allGroups),
+    () => (clean ? allGroups.filter((g) => !emptyTurn(g)) : allGroups),
     [allGroups, clean],
   );
   const sessionById = useMemo(() => {
@@ -3983,11 +3985,7 @@ export const TranscriptPlayer = memo(function TranscriptPlayer({
                   />
                 ) : g.words.length > 0 ? (
                   <div className="flex-1 nd-bare cursor-text leading-relaxed">
-                    {(clean
-                      ? showWords(g.words.map((w) => w.text), hiddenWordSet(g))
-                      : g.words.map((w, index) => ({ text: w.text, index }))
-                    ).map(({ text, index: wi }) => {
-                      const w = g.words[wi];
+                    {g.words.map((w, wi) => {
                       const wordActive = activeFlatIdxs.has(wi);
                       return (
                         <span
@@ -4000,7 +3998,7 @@ export const TranscriptPlayer = memo(function TranscriptPlayer({
                             "nd-word " + (wordActive ? "nd-word-active" : "")
                           }
                         >
-                          {text}
+                          {w.text}
                         </span>
                       );
                     }).reduce<React.ReactNode[]>((acc, node, i) => {
@@ -4022,7 +4020,7 @@ export const TranscriptPlayer = memo(function TranscriptPlayer({
                     // button shrink-wraps its text outside a flex row.
                     className="text-left w-full flex-1 nd-bare cursor-text"
                   >
-                    {clean ? cleanGroupText(g) : g.text}
+                    {g.text}
                   </button>
                 )}
               </>
@@ -4340,12 +4338,10 @@ function CleanViewRow({
     caption = "Word for word, as transcribed.";
   } else if (coverage.cleaned === 0) {
     caption = error ? `Not cleaned: ${error}` : "Not cleaned yet.";
+  } else if (coverage.cleaned < coverage.entries) {
+    caption = error ? `Partly cleaned: ${error}` : "Partly cleaned. The rest follows.";
   } else {
-    const n = coverage.hiddenWords;
-    caption = n === 0 ? "Nothing needed hiding." : `${n} ${n === 1 ? "word" : "words"} hidden.`;
-    if (coverage.cleaned < coverage.entries) {
-      caption += error ? ` Part not cleaned: ${error}` : " Part of it isn't cleaned yet.";
-    }
+    caption = "Fillers and false starts tidied. Verbatim has every word.";
   }
   return (
     <div className="flex flex-wrap items-center gap-x-3 gap-y-1 mt-2 mb-1">
@@ -4365,7 +4361,7 @@ function CleanViewRow({
         <button
           type="button"
           onClick={onCleanAgain}
-          title="Clean again: the model reads every turn anew."
+          title="Clean again: the model rewrites every turn anew."
           aria-label="Clean again"
           className="nd-btn-icon nd-btn-icon-sm"
         >

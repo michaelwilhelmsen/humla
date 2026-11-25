@@ -407,16 +407,19 @@ function noteCleanCase(view: "clean" | "verbatim"): Scenario {
       "Michael: Eh, skal vi, skal vi ta gjennomgangen nå?\nHege: Ja, ehm, jeg har jeg har notatene klare.",
     language: "no",
   });
-  const entry = (i: number, label: string, text: string, hidden?: number[]) => ({
+  // Words spread evenly over an entry's slot, as the backend would time them.
+  const timed = (text: string, startMs: number) =>
+    text.split(" ").map((t, k) => ({ text: t, start_ms: startMs + k * 300, end_ms: startMs + k * 300 + 250 }));
+  const entry = (i: number, label: string, text: string, clean?: string) => ({
     startMs: i * 4000,
     endMs: i * 4000 + 3800,
     label,
     text,
-    words: text.split(" ").map((t, k) => ({ text: t, start_ms: i * 4000 + k * 300, end_ms: i * 4000 + k * 300 + 250 })),
+    words: timed(text, i * 4000),
     sessionId: "s1",
     sessionIndex: 1,
     chunkIdx: i,
-    hidden,
+    clean: clean === undefined ? undefined : { text: clean, words: clean ? timed(clean, i * 4000) : [] },
   });
   const take = {
     id: "s1",
@@ -439,16 +442,28 @@ function noteCleanCase(view: "clean" | "verbatim"): Scenario {
         return key === "transcript_view" ? view : null;
       },
       note_timeline: () => [
-        entry(0, "Michael", "Eh, skal vi, skal vi ta gjennomgangen nå?", [0, 1, 2]),
-        entry(1, "Hege", "Ja, ehm, jeg har jeg har notatene klare. Og tallene fra fra forrige kvartal ligger i mappa.", [1, 2, 3, 10]),
-        entry(2, "Michael", "Bra. Øh, da starter vi der. Jeg tenkte at vi, liksom, ser på churn først.", [1, 10]),
-        entry(3, "Hege", "Mm.", [0]),
-        entry(4, "Stian", "Ja, ja. Det, eh, det fikser jeg."),
+        entry(0, "Michael", "Eh, skal vi, skal vi ta gjennomgangen nå?", "Skal vi ta gjennomgangen nå?"),
+        entry(
+          1,
+          "Hege",
+          "Ja, ehm, jeg har jeg har notatene klare.",
+          "Ja, jeg har notatene klare, og tallene fra forrige kvartal ligger i mappa.",
+        ),
+        entry(2, "Hege", "Og tallene fra fra forrige kvartal, altså, de ligger i mappa.", ""),
+        entry(
+          3,
+          "Michael",
+          "Bra. Øh, da starter vi der. Jeg tenkte at vi, liksom, ser på på churn først.",
+          "Bra. Da starter vi der. Jeg tenkte at vi ser på churn først.",
+        ),
+        entry(4, "Hege", "Mm.", ""),
+        entry(5, "Hege", "Churn er, eh, den er faktisk nede. Fra fire komma to til tre komma ni prosent.", "Churn er faktisk nede, fra 4,2 til 3,9 prosent."),
+        entry(6, "Stian", "Ja, ja. Det, eh, det fikser jeg."),
       ],
       note_timeline_repair: () => ({ repaired: false, coversTranscript: true }),
       note_sessions: () => [take],
       note_session_playback_path: () => "/mock/playback.wav",
-      note_clean: () => ({ entries: 0, hiddenWords: 0 }),
+      note_clean: () => ({ segments: 0, keptVerbatim: 0 }),
     },
     seed: () => {
       const url = URL.createObjectURL(quietToneWav(8));
