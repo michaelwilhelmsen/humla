@@ -334,7 +334,7 @@ const CLEAN_PROMPT: &str = "You turn raw meeting-transcript segments into a clea
 The user message is a JSON list of segments in order: {\"id\": 0, \"speaker\": \"…\", \"text\": \"…\"}. Each segment is one speaker's words, exactly as a speech recogniser heard them. Read the segments around each one as context.
 
 For every segment, write its text cleaned:
-- remove hesitation sounds and filler words that carry no meaning where they stand, in whatever language is spoken (um, uh, er, eh, ehm, øh, äh, like, you know, I mean, liksom, altså, på en måte, sånn, typ, halt, quasi…);
+- remove hesitation sounds and filler words that carry no meaning where they stand, in whatever language is spoken;
 - remove stutters and words said twice by accident;
 - when the speaker starts a sentence, breaks off and starts again, keep only the finished version;
 - fix grammar, punctuation and capitalisation where the speech left them broken, so every sentence reads correctly;
