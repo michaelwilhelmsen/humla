@@ -27,6 +27,16 @@ Engine choice, fallback, the `speaker-diarize` sidecar, and the echo pass that r
 
 Both streams are diarized when both have content; the mic is never assumed to hold one person. `You:` is applied only when the mic diarize resolves to exactly one voice. Don't infer capture topology from a stream merely being present: one stray system chunk used to collapse an in-person meeting onto `You:`.
 
+## From segments to turns
+
+Each chunk is split into per-speaker pieces by its words' midpoints against the diarizer's segments (`split_by_labels`). The pieces then go through one sequence, `refine_pieces` in `commands/transcript.rs`, which `build_labelled_transcript` (the transcript string), `serialize_timeline` (`timeline.jsonl`, what the reader draws) and the diagnostics dump all run. Never correct speakers in only one of them: the boundary moves used to run on the transcript string alone, so the reader never showed them and the first rebuild from the timeline undid them.
+
+1. `bridge_short_interjections`: an A-B-A sandwich whose B is at most 6 words and 3.5 s becomes A.
+2. `realign_sentence_boundaries`: a sentence's first or last 1–3 words that landed across a speaker change move to the side they belong to, with their word timings. Forward when a finished sentence is followed by a capitalised fragment and the next piece opens lowercase ("…the perfect way. It" / "does pay off."); backward when an open piece is followed by a lowercase `<1–3 words>.` and more ("…Brand" / "new. Hadn't done…"). Only within one stream, both pieces timed or both untimed, and within 2 s when timed. When both fit, the smaller move wins, and a repetition picks backward. Scripts without case never match.
+3. `absorb_text_continuation_chains`: pieces that are still one sentence (no terminator or dash at the end, lowercase next) get one speaker; a tie goes to the label that spoke first.
+
+Word texts come from `display_words`, which spells each timed word the way the chunk's transcript does: Deepgram (`punctuated_word` is read too), whisper-1 and Groq return bare words, and both the reader and the rules above need the punctuation and capitals.
+
 ## The `speaker-diarize` sidecar
 
 - **FluidAudio pinned exactly at 0.17.4.** It changes diarizer output in patch releases and `Package.resolved` is gitignored. 0.17.4 is Nemotron 3's floor (#203): it types preallocated output buffers from the model description (macOS 27 enforces this) and loads the `monolithic/v2` fp16 re-exports that compile for the Neural Engine on M3-class chips.

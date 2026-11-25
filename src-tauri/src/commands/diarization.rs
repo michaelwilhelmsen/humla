@@ -9,8 +9,8 @@ use super::timeline::{
 };
 use super::transcribe::drop_incidental_stream_hallucinations;
 use super::transcript::{
-    absorb_text_continuation_chains, bridge_short_interjections, build_labelled_transcript,
-    build_pieces_unbridged, single_piece, split_by_labels, split_by_segments, LabelledPiece,
+    build_labelled_transcript, build_pieces_unbridged, refine_pieces, single_piece,
+    split_by_labels, split_by_segments, LabelledPiece,
 };
 use super::unify::unify_note_speakers;
 use super::capture::{ms_since, record_timing, PostStopSnapshot, StopClock};
@@ -498,8 +498,7 @@ pub(super) async fn rediarize_apply_to_chunks(
     // did (or, more interestingly, didn't do) for this run.
     let pieces_pre = build_pieces_unbridged(&chunks, stage.splitter.as_ref());
     let mut pieces_post = pieces_pre.clone();
-    bridge_short_interjections(&mut pieces_post);
-    absorb_text_continuation_chains(&mut pieces_post);
+    refine_pieces(&mut pieces_post);
     write_diagnostics_json(
         &app,
         &note_id,
@@ -731,9 +730,9 @@ fn pieces_to_json(pieces: &[LabelledPiece]) -> Vec<serde_json::Value> {
 /// the diarize pipeline.
 ///
 /// `pieces` is the labelled-piece sequence the transcript emitter walks,
-/// captured before and after `bridge_short_interjections` runs. When present
-/// the dump also includes a `bridge_changes` diff so flicker-absorption
-/// decisions (and non-decisions) are inspectable.
+/// captured before and after `refine_pieces` runs. When present the dump
+/// also includes a `bridge_changes` diff so flicker-absorption and
+/// boundary-move decisions (and non-decisions) are inspectable.
 ///
 /// `mic_segments` are the mic's voices as diarized, echo included; `echo` says
 /// which of them the check dropped before they were numbered.
