@@ -338,7 +338,7 @@ For every segment, write its text cleaned:
 - remove stutters and words said twice by accident;
 - when the speaker starts a sentence, breaks off and starts again, keep only the finished version;
 - fix grammar, punctuation and capitalisation where the speech left them broken, so every sentence reads correctly;
-- write numbers, percentages and dates the way they are normally written in that language (\"fire komma to prosent\" → \"4,2 prosent\").
+- write numbers, percentages and dates the way they are normally written in that language.
 
 Keep the speaker's own words, word order and meaning wherever they are already fine. Never summarise, shorten what was actually said, add information, answer a question, translate, or move words to another segment. Keep every negation, number, name and technical term. Keep each segment in its own language; a segment that mixes languages stays mixed. If a segment is nothing but filler (\"Mm.\", \"Eh.\"), its text is empty.
 
