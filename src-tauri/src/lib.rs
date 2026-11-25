@@ -469,6 +469,7 @@ where
             commands::notes_with_recordings,
             commands::note_session_playback_path,
             commands::note_timeline,
+            commands::note_clean,
             commands::note_timeline_repair,
             commands::note_timeline_rename,
             commands::note_timeline_set_chunk_label,

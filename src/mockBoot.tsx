@@ -395,6 +395,69 @@ function notePlayerCase(): Scenario {
   };
 }
 
+// ---- #217 axis: the Transcript tab's Clean view -----------------------------
+// The whole note, because the question is the switch's place among the tab's
+// other rows, and what a cleaned turn reads like next to a verbatim one. Each
+// entry carries word timings and a mask the way `note_timeline` returns them.
+function noteCleanCase(view: "clean" | "verbatim"): Scenario {
+  const note = makeNote({
+    id: "n1",
+    title: "Kvartalsgjennomgang",
+    transcript:
+      "Michael: Eh, skal vi, skal vi ta gjennomgangen nå?\nHege: Ja, ehm, jeg har jeg har notatene klare.",
+    language: "no",
+  });
+  const entry = (i: number, label: string, text: string, hidden?: number[]) => ({
+    startMs: i * 4000,
+    endMs: i * 4000 + 3800,
+    label,
+    text,
+    words: text.split(" ").map((t, k) => ({ text: t, start_ms: i * 4000 + k * 300, end_ms: i * 4000 + k * 300 + 250 })),
+    sessionId: "s1",
+    sessionIndex: 1,
+    chunkIdx: i,
+    hidden,
+  });
+  const take = {
+    id: "s1",
+    index: 1,
+    startedAt: new Date(1_755_000_000_000).toISOString(),
+    durationMs: 20000,
+    streams: ["mic"],
+    hasPlayback: true,
+    canTranscribe: false,
+    canRetranscribe: true,
+  };
+  return {
+    route: "/note/n1",
+    render: () => null, // unused — `route` renders the app
+    ipc: {
+      notes_list: () => [note],
+      notes_get: () => note,
+      settings_get: (args) => {
+        const key = (args as { key?: string } | undefined)?.key;
+        return key === "transcript_view" ? view : null;
+      },
+      note_timeline: () => [
+        entry(0, "Michael", "Eh, skal vi, skal vi ta gjennomgangen nå?", [0, 1, 2]),
+        entry(1, "Hege", "Ja, ehm, jeg har jeg har notatene klare. Og tallene fra fra forrige kvartal ligger i mappa.", [1, 2, 3, 10]),
+        entry(2, "Michael", "Bra. Øh, da starter vi der. Jeg tenkte at vi, liksom, ser på churn først.", [1, 10]),
+        entry(3, "Hege", "Mm.", [0]),
+        entry(4, "Stian", "Ja, ja. Det, eh, det fikser jeg."),
+      ],
+      note_timeline_repair: () => ({ repaired: false, coversTranscript: true }),
+      note_sessions: () => [take],
+      note_session_playback_path: () => "/mock/playback.wav",
+      note_clean: () => ({ entries: 0, hiddenWords: 0 }),
+    },
+    seed: () => {
+      const url = URL.createObjectURL(quietToneWav(8));
+      (window as unknown as { __TAURI_INTERNALS__: { convertFileSrc: () => string } })
+        .__TAURI_INTERNALS__.convertFileSrc = () => url;
+    },
+  };
+}
+
 function quietToneWav(seconds: number): Blob {
   const rate = 16_000;
   const n = rate * seconds;
@@ -1657,6 +1720,8 @@ const CASES: Record<string, Scenario> = {
   "note-retention": noteRetentionCase(),
   "note-retention-move": noteRetentionCase(true),
   "note-player": notePlayerCase(),
+  "note-clean": noteCleanCase("clean"),
+  "note-clean-verbatim": noteCleanCase("verbatim"),
   "note-pending": noteTranscribeCase(false),
   "note-pending-text": noteTranscribeCase(true),
   // #146: the same note mid-replay. Two surfaces report the one run — the

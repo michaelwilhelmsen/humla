@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { ipc, onRecordingDiagnostic, onRecordingError, onTranscriptionKeptLocal, onRecordingStatus, onSummary, onSummaryStatus, onTitleStatus, onTranscribeStatus, onDiarizeStatus, onTranscript, onTranscriptReplaced, onNotesChanged, onSyncStatus, onSyncConflict, onLocalWhisperProgress, onLocalWhisperDownloadError, type Client, type Folder, type Note, type RecordingDiagnostic, type RecordingStatus, type Step } from "./ipc";
+import { ipc, onRecordingDiagnostic, onRecordingError, onTranscriptionKeptLocal, onRecordingStatus, onSummary, onSummaryStatus, onTitleStatus, onCleanStatus, onTranscribeStatus, onDiarizeStatus, onTranscript, onTranscriptReplaced, onNotesChanged, onSyncStatus, onSyncConflict, onLocalWhisperProgress, onLocalWhisperDownloadError, type Client, type Folder, type Note, type RecordingDiagnostic, type RecordingStatus, type Step } from "./ipc";
 import { onOrgInvitesChanged, useCloudStore } from "./cloud";
 
 type NotesState = {
@@ -157,6 +157,13 @@ export type RecordingState = {
   // rather than a store flag and a local state that can disagree.
   titling: Record<string, boolean>;
   setTitling: (noteId: string, active: boolean) => void;
+  // Notes with a clean pass running (#217), with its progress in model calls,
+  // and the reason the last pass on a note failed. A finished pass bumps
+  // `cleanedAt`, which the open note watches to re-read its timeline.
+  cleaning: Record<string, { done: number; total: number }>;
+  cleanErrors: Record<string, string>;
+  cleanedAt: Record<string, number>;
+  setCleaning: (noteId: string, status: { active: boolean; done: number; total: number; error: string | null }) => void;
   // Notes with a deferred transcription replaying (#146). Its own map, not the
   // recording `status`: the replay is per-note background work that may run
   // while a *different* note records, so putting it on the shared channel
@@ -225,6 +232,22 @@ export const useRecordingStore = create<RecordingState>((set, get) => ({
       if (active) next[noteId] = true;
       else delete next[noteId];
       return { titling: next };
+    }),
+  cleaning: {},
+  cleanErrors: {},
+  cleanedAt: {},
+  setCleaning: (noteId, { active, done, total, error }) =>
+    set((s) => {
+      const cleaning = { ...s.cleaning };
+      const cleanErrors = { ...s.cleanErrors };
+      if (active) {
+        cleaning[noteId] = { done, total };
+        delete cleanErrors[noteId];
+        return { cleaning, cleanErrors };
+      }
+      delete cleaning[noteId];
+      if (error) cleanErrors[noteId] = error;
+      return { cleaning, cleanErrors, cleanedAt: { ...s.cleanedAt, [noteId]: Date.now() } };
     }),
   transcribing: {},
   setTranscribing: (noteId, active, measure) =>
@@ -432,6 +455,9 @@ export function bindBackendListeners() {
     .catch((e) => console.warn("recording links not released", e));
   onTitleStatus(({ noteId, active }) => {
     useRecordingStore.getState().setTitling(noteId, active);
+  });
+  onCleanStatus(({ noteId, ...status }) => {
+    useRecordingStore.getState().setCleaning(noteId, status);
   });
   onSummaryStatus(({ noteId, active }) => {
     useRecordingStore.getState().setSummarizing(noteId, active);

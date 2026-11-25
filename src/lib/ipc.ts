@@ -178,6 +178,13 @@ export type SettingsKey =
   | "transcribe_manually"
   // Hold a system-sleep power assertion while a capture runs (#180).
   | "keep_awake"
+  // Clean transcripts (#217): after a recording, a model marks filler words,
+  // accidental repeats and false starts to hide in the reader. Default on;
+  // only the string "false" turns it off.
+  | "clean_transcripts"
+  // Which version the Transcript tab shows: "clean" (default) or "verbatim".
+  // Remembered across notes; owned by the tab's own switch.
+  | "transcript_view"
   // Cloud/teams: upload a finished recording's audio to its workspace note
   // so teammates can play it back. Default on; only the string "false"
   // disables it on the upload path. Surfaced in the Account section.
@@ -373,7 +380,16 @@ export type TimelineEntry = {
   sessionId: string;
   sessionIndex: number;
   chunkIdx: number;
+  // The clean view's mask (#217): indices into `words` (into the text's
+  // whitespace tokens when `words` is empty) hidden in Clean. Absent when no
+  // clean pass has read these exact words; empty when one did and hid
+  // nothing.
+  hidden?: number[];
 };
+
+// What a clean pass did (#217): timeline entries the model read, and the
+// words it hid across them.
+export type CleanOutcome = { entries: number; hiddenWords: number };
 
 // Outcome of the on-open orphaned-text repair (#169). `coversTranscript` is
 // the backend's own comparison of `note.transcript` against what the merged
@@ -577,6 +593,11 @@ export const ipc = {
   relaunchApp: () => invoke<void>("app_relaunch"),
   noteTimeline: (noteId: string) =>
     invoke<TimelineEntry[]>("note_timeline", { noteId }),
+  // Clean a note's transcript (#217): a model marks filler words, accidental
+  // repeats and false starts to hide in the reader's Clean view. Reads only
+  // entries without a mask unless `force`. Progress arrives on `clean_status`.
+  cleanNote: (noteId: string, force: boolean) =>
+    invoke<CleanOutcome>("note_clean", { noteId, force }),
   // Repair transcript text no session timeline accounts for (#169), and report
   // whether a gap remains. Call this BEFORE `noteTimeline` on open: the four
   // paths that rebuild the transcript from the timelines would otherwise
@@ -1054,6 +1075,15 @@ export type SummaryStatus = { noteId: string; active: boolean };
 // A title call is in flight for this note (#90). Brackets the model call only,
 // so it never fires for a note the backend declines to title.
 export type TitleStatus = { noteId: string; active: boolean };
+// A clean pass over this note's transcript (#217). `done`/`total` count model
+// calls; the closing event (`active: false`) carries `error` when it failed.
+export type CleanStatus = {
+  noteId: string;
+  active: boolean;
+  done: number;
+  total: number;
+  error: string | null;
+};
 // A deferred transcription is replaying this note's retained audio (#146).
 // Per-note, and never on `recording_status`: a live recording on a different
 // note may be in flight at the same time.
@@ -1140,6 +1170,9 @@ export function onSummaryStatus(cb: (e: SummaryStatus) => void): Promise<Unliste
 }
 export function onTitleStatus(cb: (e: TitleStatus) => void): Promise<UnlistenFn> {
   return listen<TitleStatus>("title_status", (e) => cb(e.payload));
+}
+export function onCleanStatus(cb: (e: CleanStatus) => void): Promise<UnlistenFn> {
+  return listen<CleanStatus>("clean_status", (e) => cb(e.payload));
 }
 export function onTranscribeStatus(cb: (e: TranscribeStatus) => void): Promise<UnlistenFn> {
   return listen<TranscribeStatus>("transcribe_status", (e) => cb(e.payload));

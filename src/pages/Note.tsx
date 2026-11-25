@@ -35,7 +35,19 @@ import { recordsOpens, reportCopied, reportOpened } from "../lib/audit";
 import { ipc, onNotesPurged, onSummaryThinkingDelta, onSummaryContentDelta, type Note as TNote, type NoteRevision, type NoteSession, type SummaryPrompt, type TimelineEntry } from "../lib/ipc";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { SUMMARY_CAPABLE, type SummaryProvider } from "../lib/providers";
-import { useLiveSetting } from "../lib/settingsBus";
+import { useLiveSetting, writeSetting } from "../lib/settingsBus";
+import {
+  cleanCoverage,
+  cleanGroupText,
+  cleanTranscriptText,
+  fullyHidden,
+  hiddenWordSet,
+  parseTranscriptView,
+  showWords,
+  type CleanCoverage,
+  type TranscriptView,
+} from "../lib/cleanView";
+import { Segmented } from "./settings/components/Segmented";
 import { useDownloadStore, useNotesStore, useRecordingStore } from "../lib/store";
 import { computeSetupStatus } from "../lib/setupStatus";
 import { useOwnerName, useCloudStore } from "../lib/cloud";
@@ -179,6 +191,12 @@ const BODY_MIN = 420;
  * to think" — this spends a model call, and the note has the rest of its life to
  * get a title. */
 const TITLE_BODY_SETTLE_MS = 10_000;
+
+// Notes (keyed with their clean coverage) whose missing Clean has been asked
+// for this app session (#217). One automatic attempt per state: a pass that
+// failed for a reason that holds (no model, a governed note) shows that
+// reason rather than being retried on every render.
+const autoCleanTried = new Set<string>();
 
 /** The note's title: an autosizing single-line box, or — while a title is being
  * written for it (#90) — a shimmer standing in for it.
@@ -1107,12 +1125,60 @@ export function Note() {
   // the store — except while our own free-text edit is still queued or saving,
   // where the draft is the newer of the two. Nothing here re-derives the
   // transcript from the timeline: the backend owns that projection (ADR-0004).
+  // Clean transcripts (#217). The switch is shown only while the setting is
+  // on; off, the reader is Verbatim whatever was last picked.
+  const cleanSetting = useLiveSetting("clean_transcripts");
+  const cleanOn = cleanSetting !== "false";
+  const transcriptViewSetting = useLiveSetting("transcript_view");
+  const transcriptView: TranscriptView = cleanOn
+    ? parseTranscriptView(transcriptViewSetting)
+    : "verbatim";
+  const cleaning = useRecordingStore((s) => (draft ? s.cleaning[draft.id] : undefined));
+  const cleanError = useRecordingStore((s) => (draft ? s.cleanErrors[draft.id] : undefined));
+  const cleanedAt = useRecordingStore((s) => (draft ? s.cleanedAt[draft.id] : undefined));
+  const coverage = useMemo(() => cleanCoverage(timeline), [timeline]);
+  const showsClean = transcriptView === "clean" && coverage.cleaned > 0;
+
+  // A finished clean pass wrote new masks: re-read the timeline that carries
+  // them.
+  useEffect(() => {
+    if (!draft?.id || !cleanedAt) return;
+    let cancelled = false;
+    ipc
+      .noteTimeline(draft.id)
+      .then((tl) => {
+        if (!cancelled) setTimeline(tl);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [draft?.id, cleanedAt]);
+
+  // Clean what hasn't been, the first time Clean is looked at: an older note,
+  // a take recorded with the setting off, entries a re-diarize or an edit
+  // left without a mask. Once per note and coverage per app session, so a
+  // pass that fails (no model set up, a governed note) isn't retried on every
+  // render; its reason shows in the switch's caption instead.
+  useEffect(() => {
+    if (!draft?.id || !cleanOn || transcriptView !== "clean") return;
+    if (activeTab !== "transcript" || recActive || cleaning) return;
+    if (coverage.entries === 0 || coverage.cleaned >= coverage.entries) return;
+    const key = `${draft.id}:${coverage.entries}:${coverage.cleaned}`;
+    if (autoCleanTried.has(key)) return;
+    autoCleanTried.add(key);
+    void ipc.cleanNote(draft.id, false).catch(() => {});
+  }, [draft?.id, cleanOn, transcriptView, activeTab, recActive, cleaning, coverage]);
+
   const copyableTranscript = useCallback(
     () =>
+      // Copy takes what the reader shows: in Clean, the clean text, labelled
+      // like the stored transcript.
+      (showsClean ? cleanTranscriptText(groupTimeline(timeline)) : null) ??
       (isUnsaved("transcript") ? draftRef.current?.transcript : note?.transcript) ??
       draftRef.current?.transcript ??
       "",
-    [note?.transcript, isUnsaved],
+    [note?.transcript, isUnsaved, showsClean, timeline],
   );
 
   if (!draft) return null;
@@ -1774,6 +1840,20 @@ export function Note() {
                       {!readOnly && (
                         <RediarizeAction noteId={draft.id} keepAudio={keepAudio} />
                       )}
+                      {cleanOn && timeline.length > 0 && timelineCoversTranscript && (
+                        <CleanViewRow
+                          view={transcriptView}
+                          onView={(v) => void writeSetting("transcript_view", v)}
+                          coverage={coverage}
+                          cleaning={cleaning}
+                          error={cleanError}
+                          onCleanAgain={
+                            readOnly || recActive
+                              ? undefined
+                              : () => void ipc.cleanNote(draft.id, true).catch(() => {})
+                          }
+                        />
+                      )}
                       {devMode && <DiagnosticsLinks noteId={draft.id} />}
                     </div>
                     {/* The styled reader is driven by the timeline, not by the
@@ -1818,6 +1898,7 @@ export function Note() {
                         disabled={readOnly || recActive}
                         fill
                         bottomAligned={transcriptLive}
+                        view={showsClean ? "clean" : "verbatim"}
                       />
                     ) : (
                       <TranscriptEditor
@@ -3267,6 +3348,7 @@ export const TranscriptPlayer = memo(function TranscriptPlayer({
   disabled,
   fill,
   bottomAligned,
+  view = "verbatim",
 }: {
   noteId: string;
   timeline: TimelineEntry[];
@@ -3287,6 +3369,10 @@ export const TranscriptPlayer = memo(function TranscriptPlayer({
   disabled: boolean;
   fill?: boolean;
   bottomAligned: boolean;
+  // Clean (#217) leaves out the words a clean pass marked hidden, and a turn
+  // with nothing left. Per-turn editing is Verbatim's: an edit replaces the
+  // words a mask points into.
+  view?: TranscriptView;
 }) {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   // Which session's audio is loaded in the player. Defaults to the first
@@ -3413,7 +3499,12 @@ export const TranscriptPlayer = memo(function TranscriptPlayer({
   // single position in the flattened `words` array. Groups break at
   // session boundaries too, so each carries its session identity and a
   // divider anchor (#16).
-  const groups = useMemo(() => groupTimeline(timeline), [timeline]);
+  const allGroups = useMemo(() => groupTimeline(timeline), [timeline]);
+  const clean = view === "clean";
+  const groups = useMemo(
+    () => (clean ? allGroups.filter((g) => !fullyHidden(g)) : allGroups),
+    [allGroups, clean],
+  );
   const sessionById = useMemo(() => {
     const m = new Map<string, NoteSession>();
     sessions.forEach((s) => m.set(s.id, s));
@@ -3892,7 +3983,11 @@ export const TranscriptPlayer = memo(function TranscriptPlayer({
                   />
                 ) : g.words.length > 0 ? (
                   <div className="flex-1 nd-bare cursor-text leading-relaxed">
-                    {g.words.map((w, wi) => {
+                    {(clean
+                      ? showWords(g.words.map((w) => w.text), hiddenWordSet(g))
+                      : g.words.map((w, index) => ({ text: w.text, index }))
+                    ).map(({ text, index: wi }) => {
+                      const w = g.words[wi];
                       const wordActive = activeFlatIdxs.has(wi);
                       return (
                         <span
@@ -3905,7 +4000,7 @@ export const TranscriptPlayer = memo(function TranscriptPlayer({
                             "nd-word " + (wordActive ? "nd-word-active" : "")
                           }
                         >
-                          {w.text}
+                          {text}
                         </span>
                       );
                     }).reduce<React.ReactNode[]>((acc, node, i) => {
@@ -3927,7 +4022,7 @@ export const TranscriptPlayer = memo(function TranscriptPlayer({
                     // button shrink-wraps its text outside a flex row.
                     className="text-left w-full flex-1 nd-bare cursor-text"
                   >
-                    {g.text}
+                    {clean ? cleanGroupText(g) : g.text}
                   </button>
                 )}
               </>
@@ -3939,7 +4034,7 @@ export const TranscriptPlayer = memo(function TranscriptPlayer({
             const titled = !!g.label && !!color;
             const actions = (
               <>
-                {!disabled && !isEditingGroup && (
+                {!disabled && !clean && !isEditingGroup && (
                   <button
                     type="button"
                     // mousedown with the default prevented, not click: an open
@@ -4220,6 +4315,67 @@ function DiagnosticsLinks({ noteId }: { noteId: string }) {
 // message for notes recorded before chunks were persisted (audio is
 // there, chunks aren't) so we surface that on click rather than hiding
 // the button entirely.
+/** The Transcript tab's Clean | Verbatim switch (#217), and one line on
+ *  where Clean stands for this note. */
+function CleanViewRow({
+  view,
+  onView,
+  coverage,
+  cleaning,
+  error,
+  onCleanAgain,
+}: {
+  view: TranscriptView;
+  onView: (v: TranscriptView) => void;
+  coverage: CleanCoverage;
+  cleaning: { done: number; total: number } | undefined;
+  error: string | undefined;
+  onCleanAgain?: () => void;
+}) {
+  let caption: string;
+  if (cleaning) {
+    caption =
+      cleaning.total > 0 ? `Cleaning… ${cleaning.done} of ${cleaning.total}` : "Cleaning…";
+  } else if (view === "verbatim") {
+    caption = "Word for word, as transcribed.";
+  } else if (coverage.cleaned === 0) {
+    caption = error ? `Not cleaned: ${error}` : "Not cleaned yet.";
+  } else {
+    const n = coverage.hiddenWords;
+    caption = n === 0 ? "Nothing needed hiding." : `${n} ${n === 1 ? "word" : "words"} hidden.`;
+    if (coverage.cleaned < coverage.entries) {
+      caption += error ? ` Part not cleaned: ${error}` : " Part of it isn't cleaned yet.";
+    }
+  }
+  return (
+    <div className="flex flex-wrap items-center gap-x-3 gap-y-1 mt-2 mb-1">
+      <Segmented<TranscriptView>
+        label="Transcript version"
+        value={view}
+        onChange={onView}
+        options={[
+          { value: "clean", label: "Clean" },
+          { value: "verbatim", label: "Verbatim" },
+        ]}
+      />
+      <span className="flex-1 min-w-0 text-xs text-[var(--color-text-muted)]" aria-live="polite">
+        {caption}
+      </span>
+      {view === "clean" && coverage.cleaned > 0 && !cleaning && onCleanAgain && (
+        <button
+          type="button"
+          onClick={onCleanAgain}
+          title="Clean again: the model reads every turn anew."
+          aria-label="Clean again"
+          className="nd-btn-icon nd-btn-icon-sm"
+        >
+          <RefreshCw size={14} strokeWidth={1.6} />
+        </button>
+      )}
+    </div>
+  );
+}
+
 function RediarizeAction({
   noteId,
   keepAudio,

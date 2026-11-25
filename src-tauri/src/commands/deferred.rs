@@ -613,6 +613,9 @@ async fn transcribe_take_sources(app: &AppHandle, note_id: &str, takes: Vec<Take
         Err(e) => eprintln!("unify: failed, keeping per-take labels: {e}"),
     }
     timings.unify_ms = ms_since(t_unify);
+    // Clean the transcript (#217), as the post-stop chain does once the
+    // speakers are final. It waits for this run to release the note.
+    tauri::async_runtime::spawn(super::clean::clean_note_quietly(app.clone(), note_id.to_string()));
 
     // The run's own line, once however it ends.
     timings.total_ms = ms_since(run_started);

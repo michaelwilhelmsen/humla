@@ -25,6 +25,8 @@ export type EditableKey = Exclude<
   // through the generic settings map.
   | "theme"
   | "palette"
+  // Owned by the Transcript tab's Clean | Verbatim switch (#217).
+  | "transcript_view"
   | "onboarding_completed"
   | "onboarding_step"
   | "telemetry_enabled"
@@ -45,6 +47,7 @@ export const DEFAULTS: Record<EditableKey, string> = {
   keep_audio: "false",
   transcribe_manually: "false",
   keep_awake: "true",
+  clean_transcripts: "true",
   close_to_tray: "false",
   sync_audio: "true",
   custom_vocabulary: "",

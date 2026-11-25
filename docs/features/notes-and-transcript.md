@@ -25,6 +25,15 @@ The styled reader renders from the merged timelines, so transcript text no timel
 - An unlabelled turn gets no title; in the player it keeps the inline row (the pencil and delete live on the title line).
 - `SpeakerLabels` chip strip: derives labels from the transcript on every render; rename is a line-anchored regex rewrite (`/^Speaker N: /gm` → `/^Michael: /gm`), no metadata table.
 
+## Clean view (#217)
+
+- **A view, never a second transcript.** The Transcript tab's Clean | Verbatim switch (`transcript_view`, default Clean; shown while `clean_transcripts` is on) leaves out the words a clean pass marked hidden, and a turn with nothing left. The timeline and `notes.transcript` stay verbatim; summary, chat, export, MCP and webhook read verbatim.
+- **The model only answers with a mask.** `commands/clean.rs` sends windows of about 160 numbered words (turns kept whole where they fit) to the note's summary provider through `resolve_provider` (so a governed note is refused like its summary), thinking off, an OpenAI reasoning model swapped for `TITLE_FALLBACK_MODEL`. The answer is `{"hide": [numbers]}`; it can't add or change a word, so every word shown keeps its timing and highlighting works in Clean.
+- **Guards after the answer:** numbers and a short list of negations are never hidden; an entry is hidden whole only at three words or fewer; a turn of eight words or more that would lose over 40% keeps them all. An unusable answer leaves its window verbatim.
+- **Stored per take in `clean.json`**, local to this Mac (derived, never synced): entry fingerprint (`clean::fingerprint`, FNV-1a over the entry's words) → hidden word indices. `note_timeline` attaches the mask matching each entry's current words as `hidden`; a renamed speaker keeps it, an edited or re-split entry loses it and shows verbatim until cleaned again.
+- **When it runs:** spawned at the end of the post-stop chain and of a deferred transcription (it waits for the note to stop being busy), and from the reader when Clean is shown with entries lacking a mask (once per note and coverage per app session). "Clean again" re-reads every entry. Failure on the automatic path is silent; the switch's caption names the reason. Progress on `clean_status`. The pass ends with `purge_note_assets_if_gone`.
+- **Display:** `showWords` (`src/lib/cleanView.ts`) capitalises a word that a hidden run left opening a sentence and moves a sentence end a hidden word carried onto the word before it. Per-turn editing is Verbatim's.
+
 ## Automatic titles (#90)
 
 - A note whose title Humla owns gets a short phrase from its content. `menubar::is_replaceable_title` is the single answer to "may this title be replaced?": empty, a `Recording 19 Aug 14:32` timestamp, or `Imported audio`. A real filename stem is never touched. Mirrored in TS as `isReplaceableTitle` (`src/lib/noteSync.ts`); change both.

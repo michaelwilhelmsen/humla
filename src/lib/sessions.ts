@@ -79,7 +79,25 @@ export type TimelineGroup = {
   // Word count contributed by each constituent chunk, so the active-word
   // highlight can map (chunk, word-in-chunk) → flat position in `words`.
   wordCountByChunk: number[];
+  // The Clean view's mask (#217), flattened: positions in `words` to hide.
+  hiddenWords: number[];
+  // The whitespace tokens of constituent entries that have no word timings,
+  // and the positions among them to hide: the Clean view of a turn the
+  // provider gave no timings for.
+  textTokens: string[];
+  hiddenTokens: number[];
 };
+
+/** One entry's mask, split by what it points into: its timed words, or (with
+ *  none) its text's tokens. */
+function maskOf(e: TimelineEntry, wordOffset: number, tokenOffset: number, tokens: string[]) {
+  const hidden = e.hidden ?? [];
+  if ((e.words?.length ?? 0) > 0) {
+    const n = e.words.length;
+    return { words: hidden.filter((i) => i < n).map((i) => wordOffset + i), tokens: [] as number[] };
+  }
+  return { words: [] as number[], tokens: hidden.filter((i) => i < tokens.length).map((i) => tokenOffset + i) };
+}
 
 /// Collapse consecutive same-speaker timeline entries into render groups,
 /// breaking a group at every speaker change AND every session boundary (so a
@@ -93,7 +111,9 @@ export function groupTimeline(timeline: TimelineEntry[]): TimelineGroup[] {
     const ws = e.words ?? [];
     const label = e.label || "";
     const last = out[out.length - 1];
+    const tokens = ws.length > 0 ? [] : e.text.split(/\s+/).filter(Boolean);
     if (last && last.label === label && last.sessionId === e.sessionId) {
+      const mask = maskOf(e, last.words.length, last.textTokens.length, tokens);
       last.indices.push(i);
       last.endMs = Math.max(last.endMs, e.endMs);
       // Skip empty entries when joining: a per-turn edit (#170) writes the new
@@ -103,9 +123,13 @@ export function groupTimeline(timeline: TimelineEntry[]): TimelineGroup[] {
       last.text = last.text && e.text ? `${last.text} ${e.text}` : last.text || e.text;
       last.words.push(...ws);
       last.wordCountByChunk.push(ws.length);
+      last.hiddenWords.push(...mask.words);
+      last.textTokens.push(...tokens);
+      last.hiddenTokens.push(...mask.tokens);
     } else {
       const firstInSession = !seenSessions.has(e.sessionId);
       seenSessions.add(e.sessionId);
+      const mask = maskOf(e, 0, 0, tokens);
       out.push({
         label,
         sessionId: e.sessionId,
@@ -117,6 +141,9 @@ export function groupTimeline(timeline: TimelineEntry[]): TimelineGroup[] {
         text: e.text,
         words: [...ws],
         wordCountByChunk: [ws.length],
+        hiddenWords: mask.words,
+        textTokens: tokens,
+        hiddenTokens: mask.tokens,
       });
     }
   }

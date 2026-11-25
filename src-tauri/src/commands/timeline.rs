@@ -48,6 +48,12 @@ pub struct TimelineEntry {
     pub session_id: String,
     pub session_index: u32,
     pub chunk_idx: usize,
+    /// The clean view's mask for this entry (#217): indices into `words`
+    /// (into the text's whitespace tokens when `words` is empty) to hide in
+    /// Clean. Absent when no clean pass has read these exact words; present
+    /// and empty when one has and found nothing to hide.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hidden: Option<Vec<u32>>,
 }
 
 /// Parse one session's `timeline.jsonl` into entries carrying that session's
@@ -99,6 +105,7 @@ fn parse_session_timeline(
             session_id: session_id.to_string(),
             session_index,
             chunk_idx: idx,
+            hidden: None,
         });
     }
     for i in 0..out.len() {
@@ -131,13 +138,29 @@ pub fn note_timeline(app: AppHandle, note_id: String) -> Result<Vec<TimelineEntr
     let recordings = sessions::recordings_dir(&app_dir, &note_id);
     let mut out = Vec::new();
     for (entry, dir) in sessions::resolve_sessions(&recordings) {
-        out.extend(parse_session_timeline(
-            &dir.join("timeline.jsonl"),
-            &entry.id,
-            entry.index,
-        ));
+        let mut take = parse_session_timeline(&dir.join("timeline.jsonl"), &entry.id, entry.index);
+        attach_clean_masks(&mut take, &super::clean::read_masks(&dir));
+        out.extend(take);
     }
     Ok(out)
+}
+
+/// Give each entry the clean mask stored for its exact words, if any (#217).
+fn attach_clean_masks(
+    take: &mut [TimelineEntry],
+    masks: &std::collections::BTreeMap<String, Vec<u32>>,
+) {
+    if masks.is_empty() {
+        return;
+    }
+    for e in take.iter_mut() {
+        let tokens: Vec<String> = if e.words.is_empty() {
+            e.text.split_whitespace().map(str::to_string).collect()
+        } else {
+            e.words.iter().map(|w| w.text.clone()).collect()
+        };
+        e.hidden = masks.get(&super::clean::fingerprint(&tokens)).cloned();
+    }
 }
 
 /// Outcome of [`note_timeline_repair`].
@@ -1462,6 +1485,40 @@ mod tests {
     }
 
     // ---- Per-session (#16) label offset + timeline plumbing -------------
+
+    #[test]
+    fn clean_masks_attach_by_the_entrys_exact_words() {
+        let entry = |text: &str, timed: bool| TimelineEntry {
+            start_ms: 0,
+            end_ms: 1_000,
+            label: "Hege".into(),
+            text: text.into(),
+            words: if timed {
+                text.split_whitespace()
+                    .map(|w| TimelineWord { text: w.into(), start_ms: 0, end_ms: 1 })
+                    .collect()
+            } else {
+                Vec::new()
+            },
+            session_id: "s".into(),
+            session_index: 1,
+            chunk_idx: 0,
+            hidden: None,
+        };
+        let toks = |t: &str| t.split_whitespace().map(str::to_string).collect::<Vec<_>>();
+        let mut masks = std::collections::BTreeMap::new();
+        masks.insert(crate::commands::clean::fingerprint(&toks("Ja, ehm, klart.")), vec![1]);
+        masks.insert(crate::commands::clean::fingerprint(&toks("Helt greit.")), vec![]);
+        let mut take = vec![
+            entry("Ja, ehm, klart.", true),
+            entry("Helt greit.", false),
+            entry("Ja, klart.", true), // edited since the pass: no mask
+        ];
+        attach_clean_masks(&mut take, &masks);
+        assert_eq!(take[0].hidden, Some(vec![1]));
+        assert_eq!(take[1].hidden, Some(vec![]));
+        assert_eq!(take[2].hidden, None);
+    }
 
     #[test]
     fn the_timeline_carries_the_same_speaker_boundaries_as_the_transcript() {

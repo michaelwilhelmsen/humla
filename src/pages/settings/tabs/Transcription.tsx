@@ -5,6 +5,7 @@ import { LocalModelManager } from "../components/LocalModelManager";
 import { PerLanguageOverrides } from "../components/PerLanguageOverrides";
 import { ProviderConfigForm } from "../components/ProviderConfigForm";
 import { Row, Section } from "../components/Section";
+import { Toggle } from "../components/Toggle";
 import { RenameYouRow } from "../components/RenameYouRow";
 import { Select } from "../../../components/ui/Select";
 import { ProviderKeyCard, type KeyProvider } from "../../../components/provider/ProviderKeyCard";
@@ -291,6 +292,20 @@ export function TranscriptionTab({
             used (#116 part 2). In Transcription rather than Chat because the row
             is about what transcripts say. */}
         <RenameYouRow />
+      </Section>
+
+      <Section title="Clean transcripts">
+        <Row
+          label="Clean transcripts"
+          description="After a recording, the model your summaries use marks filler words, words said twice and false starts, and the Transcript tab hides them. Nothing is rewritten, and Verbatim shows every word."
+          control={
+            <Toggle
+              label="Clean transcripts"
+              checked={s.clean_transcripts !== "false"}
+              onChange={(on) => update("clean_transcripts", on ? "true" : "false")}
+            />
+          }
+        />
       </Section>
     </>
   );
