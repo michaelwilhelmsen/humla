@@ -4,7 +4,7 @@
 //! rewrite it.
 
 use super::diarization::offset_speaker_label;
-use super::transcript::{dedup_mic_against_sys, estimated_speech_ms, refine_pieces, LabelledPiece};
+use super::transcript::{build_unrefined_pieces, estimated_speech_ms, refine_pieces, LabelledPiece};
 use super::{err, note_changed_for_sync, session_changed_for_sync};
 use crate::recording::{ChunkRecord, ChunkSource, TranscriptPayload};
 use crate::{db, sessions, AppState};
@@ -155,20 +155,13 @@ pub fn note_timeline(app: AppHandle, note_id: String) -> Result<Vec<TimelineEntr
 
 /// Give each entry the Clean view's text from the stored segment covering its
 /// exact words, if any (#217).
-fn attach_clean(take: &mut [TimelineEntry], segments: &[super::clean::Segment]) {
+fn attach_clean(take: &mut [TimelineEntry], segments: &[super::clean::CleanSegment]) {
     if segments.is_empty() {
         return;
     }
     let fps: Vec<String> = take
         .iter()
-        .map(|e| {
-            let tokens: Vec<String> = if e.words.is_empty() {
-                e.text.split_whitespace().map(str::to_string).collect()
-            } else {
-                e.words.iter().map(|w| w.text.clone()).collect()
-            };
-            super::clean::fingerprint(&tokens)
-        })
+        .map(|e| super::clean::fingerprint(&super::clean::tokens_of(e.words.iter().map(|w| w.text.as_str()), &e.text)))
         .collect();
     for (i, hit) in super::clean::match_segments(&fps, segments).into_iter().enumerate() {
         let Some(si) = hit else { continue };
@@ -444,15 +437,24 @@ pub(super) fn write_timeline_values(path: &std::path::Path, values: &[serde_json
 /// prefixed `Label: `. Mirrors `build_labelled_transcript`. Returns the
 /// session's contribution with no trailing newline.
 pub(super) fn group_values_to_transcript(values: &[serde_json::Value]) -> String {
+    group_lines(values.iter().map(|v| {
+        (
+            v.get("label").and_then(|s| s.as_str()).unwrap_or(""),
+            v.get("text").and_then(|s| s.as_str()).unwrap_or(""),
+        )
+    }))
+}
+
+/// `group_values_to_transcript` over `(label, text)` pairs.
+fn group_lines<'a>(lines: impl Iterator<Item = (&'a str, &'a str)>) -> String {
     let mut out = String::new();
-    let mut last_label: Option<String> = None;
-    for v in values {
-        let label = v.get("label").and_then(|s| s.as_str()).unwrap_or("").to_string();
-        let text = v.get("text").and_then(|s| s.as_str()).unwrap_or("").trim();
+    let mut last_label: Option<&str> = None;
+    for (label, text) in lines {
+        let text = text.trim();
         if text.is_empty() {
             continue;
         }
-        if last_label.as_deref() != Some(label.as_str()) {
+        if last_label != Some(label) {
             if !out.is_empty() {
                 out.push('\n');
             }
@@ -466,6 +468,44 @@ pub(super) fn group_values_to_transcript(values: &[serde_json::Value]) -> String
         out.push_str(text);
     }
     out
+}
+
+/// The takes' transcript with each entry's clean read in place of its words,
+/// grouped like the stored one, beside the verbatim projection of the same
+/// entries. `None` when no entry has a clean read.
+fn clean_projection(takes: &[Vec<TimelineEntry>]) -> Option<(String, String)> {
+    if !takes.iter().flatten().any(|e| e.clean.is_some()) {
+        return None;
+    }
+    let join = |pick: &dyn Fn(&TimelineEntry) -> &str| {
+        takes
+            .iter()
+            .map(|take| group_lines(take.iter().map(|e| (e.label.as_str(), pick(e)))))
+            .filter(|part| !part.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let verbatim = join(&|e| e.text.as_str());
+    let clean = join(&|e| e.clean.as_ref().map_or(e.text.as_str(), |c| c.text.as_str()));
+    Some((verbatim, clean))
+}
+
+/// The note's transcript as the Clean view reads it, for the summary (#217).
+/// `None` when nothing is cleaned, or when the timelines don't account for
+/// `transcript`, which then stays what the summary reads.
+pub(super) fn clean_transcript(app: &AppHandle, note_id: &str, transcript: &str) -> Option<String> {
+    let app_dir = app.path().app_data_dir().ok()?;
+    let recordings = sessions::recordings_dir(&app_dir, note_id);
+    let takes: Vec<Vec<TimelineEntry>> = sessions::resolve_sessions(&recordings)
+        .into_iter()
+        .map(|(entry, dir)| {
+            let mut take = parse_session_timeline(&dir.join("timeline.jsonl"), &entry.id, entry.index);
+            attach_clean(&mut take, &super::clean::read_segments(&dir));
+            take
+        })
+        .collect();
+    let (verbatim, clean) = clean_projection(&takes)?;
+    (verbatim.trim() == transcript.trim()).then_some(clean)
 }
 
 /// Rebuild the note's full DB transcript from every session's timeline, in
@@ -902,16 +942,6 @@ pub(super) fn serialize_timeline(
     split_chunk: &dyn Fn(&ChunkRecord) -> Vec<LabelledPiece>,
     label_offset: u32,
 ) -> String {
-    let kept = dedup_mic_against_sys(chunks);
-    let mut sorted: Vec<&ChunkRecord> = kept.iter().collect();
-    sorted.sort_by_key(|c| {
-        let source_rank = match c.source {
-            ChunkSource::Mic => 0,
-            ChunkSource::Sys => 1,
-        };
-        (c.start_ms, source_rank)
-    });
-
     // Estimate per-piece end_ms before serialising. Three sources, in
     // priority order:
     //   1. Piece's own word timings: max(w.end_ms) — exact, used
@@ -929,13 +959,9 @@ pub(super) fn serialize_timeline(
     // over-estimation is fine — the worst case is one extra row staying
     // lit a beat longer; under-estimation causes a visible skip.
 
-    // First flatten chunks → pieces and run the same corrections the DB
-    // transcript gets (`refine_pieces`): without them the transcript string
-    // collapses correctly while the playback view (driven by timeline.jsonl)
-    // still renders per-chunk speaker flicker and stray sentence fragments.
-    // Each piece carries its stream and the base its word timings are
-    // relative to; a boundary move can hand a piece words from an earlier
-    // chunk, so the base is the piece's own, not its chunk's.
+    // The same pieces and corrections the transcript string gets, so the
+    // reader and the transcript agree. A piece's word timings are relative to
+    // its own base, which a boundary move may have taken from an earlier chunk.
     struct Entry {
         source: ChunkSource,
         start_ms: u64,
@@ -944,19 +970,7 @@ pub(super) fn serialize_timeline(
         words: Vec<serde_json::Value>,
         max_word_end_abs: Option<u64>,
     }
-    let mut pieces: Vec<LabelledPiece> = Vec::new();
-    for chunk in &sorted {
-        for mut piece in split_chunk(chunk) {
-            if !piece.text.trim().is_empty() {
-                // A splitter may look labels up against a shifted copy of the
-                // chunk (unify does, in concat time), but word timings are
-                // always relative to this chunk's own start.
-                piece.base_ms = chunk.start_ms;
-                piece.source = chunk.source;
-                pieces.push(piece);
-            }
-        }
-    }
+    let mut pieces = build_unrefined_pieces(chunks, split_chunk);
     refine_pieces(&mut pieces);
     let entries: Vec<Entry> = pieces
         .iter()
@@ -1517,7 +1531,7 @@ mod tests {
 
     #[test]
     fn clean_segments_attach_to_their_exact_run_of_entries() {
-        use crate::commands::clean::{fingerprint, CleanWord, Segment};
+        use crate::commands::clean::{fingerprint, CleanWord, CleanSegment};
         let entry = |text: &str, timed: bool| TimelineEntry {
             start_ms: 0,
             end_ms: 1_000,
@@ -1537,13 +1551,13 @@ mod tests {
         };
         let fp = |t: &str| fingerprint(&t.split_whitespace().map(str::to_string).collect::<Vec<_>>());
         let segments = vec![
-            Segment {
+            CleanSegment {
                 members: vec![fp("Ja, ehm, jeg har"), fp("jeg har notatene.")],
                 text: Some("Ja, jeg har notatene.".into()),
                 words: vec![CleanWord { text: "Ja,".into(), start_ms: 0, end_ms: 1 }],
             },
-            Segment { members: vec![fp("Vi var 12.")], text: None, words: vec![] },
-            Segment { members: vec![fp("gammel tekst")], text: Some("x".into()), words: vec![] },
+            CleanSegment { members: vec![fp("Vi var 12.")], text: None, words: vec![] },
+            CleanSegment { members: vec![fp("gammel tekst")], text: Some("x".into()), words: vec![] },
         ];
         let mut take = vec![
             entry("Ja, ehm, jeg har", true),
@@ -1557,6 +1571,33 @@ mod tests {
         assert_eq!(take[1].clean, Some(CleanText { text: String::new(), words: vec![] }));
         assert_eq!(take[2].clean.as_ref().unwrap().text, "Vi var 12.");
         assert_eq!(take[3].clean, None);
+    }
+
+    #[test]
+    fn the_clean_projection_puts_each_clean_read_in_place_of_its_words() {
+        let e = |label: &str, text: &str, clean: Option<&str>| TimelineEntry {
+            start_ms: 0,
+            end_ms: 0,
+            label: label.into(),
+            text: text.into(),
+            words: vec![],
+            session_id: "s1".into(),
+            session_index: 1,
+            chunk_idx: 0,
+            clean: clean.map(|c| CleanText { text: c.into(), words: vec![] }),
+        };
+        let takes = vec![
+            vec![
+                e("Michael", "Eh, skal vi, skal vi", Some("Skal vi starte?")),
+                e("Michael", "starte?", Some("")),
+                e("Hege", "Ja.", None),
+            ],
+            vec![e("Hege", "Bra, ehm, bra.", Some("Bra."))],
+        ];
+        let (verbatim, clean) = clean_projection(&takes).unwrap();
+        assert_eq!(verbatim, "Michael: Eh, skal vi, skal vi starte?\nHege: Ja.\nHege: Bra, ehm, bra.");
+        assert_eq!(clean, "Michael: Skal vi starte?\nHege: Ja.\nHege: Bra.");
+        assert!(clean_projection(&[vec![e("Hege", "Ja.", None)]]).is_none());
     }
 
     #[test]

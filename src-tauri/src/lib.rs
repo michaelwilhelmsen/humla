@@ -470,6 +470,7 @@ where
             commands::note_session_playback_path,
             commands::note_timeline,
             commands::note_clean,
+            commands::note_clean_available,
             commands::note_timeline_repair,
             commands::note_timeline_rename,
             commands::note_timeline_set_chunk_label,

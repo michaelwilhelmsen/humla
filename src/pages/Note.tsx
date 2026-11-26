@@ -1131,9 +1131,30 @@ export function Note() {
   }, [notesForSweep, draft]);
 
   // Clean transcripts (#217). The switch is shown only while the setting is
-  // on; off, the reader is Verbatim whatever was last picked.
+  // on and the note's summary provider is set up to clean with; otherwise the
+  // reader is Verbatim whatever was last picked.
   const cleanSetting = useLiveSetting("clean_transcripts");
-  const cleanOn = cleanSetting !== "false";
+  const summaryProviderSetting = useLiveSetting("summary_provider");
+  const [cleanAvailable, setCleanAvailable] = useState(false);
+  useEffect(() => {
+    if (!draft?.id || cleanSetting === "false") {
+      setCleanAvailable(false);
+      return;
+    }
+    let cancelled = false;
+    ipc
+      .cleanAvailable(draft.id)
+      .then((ok) => {
+        if (!cancelled) setCleanAvailable(ok === true);
+      })
+      .catch(() => {
+        if (!cancelled) setCleanAvailable(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [draft?.id, draft?.summary_provider, cleanSetting, summaryProviderSetting]);
+  const cleanOn = cleanSetting !== "false" && cleanAvailable;
   const transcriptViewSetting = useLiveSetting("transcript_view");
   const transcriptView: TranscriptView = cleanOn
     ? parseTranscriptView(transcriptViewSetting)

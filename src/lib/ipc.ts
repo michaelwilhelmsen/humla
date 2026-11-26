@@ -605,6 +605,9 @@ export const ipc = {
   // reader's Clean view. Progress arrives on `clean_status`.
   cleanNote: (noteId: string, request: CleanRequest) =>
     invoke<CleanOutcome>("note_clean", { noteId, request }),
+  // Whether the note's summary provider is set up to clean with; the reader
+  // shows no Clean view without one.
+  cleanAvailable: (noteId: string) => invoke<boolean>("note_clean_available", { noteId }),
   // Repair transcript text no session timeline accounts for (#169), and report
   // whether a gap remains. Call this BEFORE `noteTimeline` on open: the four
   // paths that rebuild the transcript from the timelines would otherwise

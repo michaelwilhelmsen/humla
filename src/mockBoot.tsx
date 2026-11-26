@@ -469,6 +469,7 @@ function noteCleanCase(view: "clean" | "verbatim", pending = false): Scenario {
       note_sessions: () => [take],
       note_session_playback_path: () => "/mock/playback.wav",
       note_clean: () => ({ segments: 0, keptVerbatim: 0 }),
+      note_clean_available: () => true,
     },
     seed: () => {
       const url = URL.createObjectURL(quietToneWav(8));

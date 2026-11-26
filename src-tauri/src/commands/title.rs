@@ -25,7 +25,7 @@
 //!   would otherwise be toasted after every recording.
 
 use super::summary::{
-    language_directive, note_language, resolve_provider, summary_provider_id, use_light_model,
+    language_directive, note_language, resolve_provider, summary_provider_id, use_light_model, LightJob,
 };
 use crate::db::{self, NotePatch};
 use crate::menubar::is_replaceable_title;
@@ -295,7 +295,7 @@ async fn try_generate_note_title(
     // is definitely happening, which is exactly what the Note view shimmers
     // over. Bracketing any earlier would flash a placeholder on notes we then
     // decline to title.
-    use_light_model(app, &mut provider).await?;
+    use_light_model(app, &mut provider, LightJob::Title).await?;
     emit_title_status(app, note_id, true);
     let written = write_generated_title(app, note_id, &provider, &language, &note, force).await;
     emit_title_status(app, note_id, false);

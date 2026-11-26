@@ -5,7 +5,8 @@
 //! `timeline.jsonl` and `notes.transcript` stay verbatim (ADR-0004). A rewrite
 //! that fails a guard leaves its segment verbatim.
 
-use super::summary::{resolve_provider, summary_provider_id, use_light_model, ResolvedProvider};
+use super::transcript::{fold_word, word_ends_sentence};
+use super::summary::{resolve_provider, summary_provider_id, use_light_model, LightJob, ResolvedProvider};
 use crate::providers::ProviderId;
 use crate::{db, sessions, AppState};
 use futures_util::{stream, StreamExt};
@@ -105,7 +106,7 @@ pub(crate) fn clean_enabled(setting: Option<&str>) -> bool {
     setting != Some("false")
 }
 
-fn clean_setting_on(app: &AppHandle) -> bool {
+pub(super) fn clean_setting_on(app: &AppHandle) -> bool {
     clean_enabled(super::raw_setting(app, "clean_transcripts").as_deref())
 }
 
@@ -119,7 +120,7 @@ pub(crate) struct CleanWord {
 
 /// A run of one speaker's consecutive timeline entries, cleaned.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-pub(crate) struct Segment {
+pub(crate) struct CleanSegment {
     /// Fingerprints of the entries it covers, in order.
     pub(crate) members: Vec<String>,
     /// The clean text; `None` when a guard kept the segment verbatim. Empty
@@ -138,31 +139,27 @@ struct CleanFile {
     #[serde(default)]
     by: String,
     #[serde(default)]
-    segments: Vec<Segment>,
+    segments: Vec<CleanSegment>,
 }
 
 /// The words of one timeline entry as the reader shows them: its timed words,
 /// or its text's whitespace tokens when the provider gave no timings.
 pub(crate) fn entry_tokens(value: &serde_json::Value) -> Vec<String> {
-    let words: Vec<String> = value
-        .get("words")
-        .and_then(|w| w.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|w| w.get("text").and_then(|t| t.as_str()).map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
+    let words = value.get("words").and_then(|w| w.as_array()).into_iter().flatten();
+    tokens_of(
+        words.filter_map(|w| w.get("text").and_then(|t| t.as_str())),
+        value.get("text").and_then(|t| t.as_str()).unwrap_or(""),
+    )
+}
+
+/// An entry's words for its fingerprint: its timed words, or its text when it
+/// has none. The one rule for files and for the reader, so the two agree.
+pub(crate) fn tokens_of<'a>(words: impl Iterator<Item = &'a str>, text: &str) -> Vec<String> {
+    let words: Vec<String> = words.map(str::to_string).collect();
     if !words.is_empty() {
         return words;
     }
-    value
-        .get("text")
-        .and_then(|t| t.as_str())
-        .unwrap_or("")
-        .split_whitespace()
-        .map(str::to_string)
-        .collect()
+    text.split_whitespace().map(str::to_string).collect()
 }
 
 /// A stable fingerprint of an entry's words (64-bit FNV-1a, hex). Stable
@@ -184,13 +181,24 @@ pub(crate) fn fingerprint(tokens: &[String]) -> String {
 
 /// The segments stored for one take. Empty when the take was never cleaned or
 /// its file is from another version.
-pub(crate) fn read_segments(take_dir: &Path) -> Vec<Segment> {
-    std::fs::read_to_string(take_dir.join(CLEAN_FILE))
-        .ok()
-        .and_then(|s| serde_json::from_str::<CleanFile>(&s).ok())
+pub(crate) fn read_segments(take_dir: &Path) -> Vec<CleanSegment> {
+    read_take_file::<CleanFile>(take_dir, CLEAN_FILE)
         .filter(|f| f.v == CLEAN_VERSION)
         .map(|f| f.segments)
         .unwrap_or_default()
+}
+
+/// A JSON file of a take's directory, or `None` when it's missing or unreadable.
+pub(super) fn read_take_file<T: serde::de::DeserializeOwned>(take_dir: &Path, name: &str) -> Option<T> {
+    std::fs::read_to_string(take_dir.join(name)).ok().and_then(|s| serde_json::from_str(&s).ok())
+}
+
+/// Replace a JSON file of a take's directory whole.
+pub(super) fn write_take_file<T: Serialize>(take_dir: &Path, name: &str, value: &T) -> std::io::Result<()> {
+    let json = serde_json::to_string(value).map_err(std::io::Error::other)?;
+    let tmp = take_dir.join(format!("{name}.tmp"));
+    std::fs::write(&tmp, json)?;
+    std::fs::rename(tmp, take_dir.join(name))
 }
 
 /// Which stored segment, if any, starts at each entry and still matches the
@@ -199,7 +207,7 @@ pub(crate) fn read_segments(take_dir: &Path) -> Vec<Segment> {
 /// Picks the segments that together cover the most entries, so a short
 /// segment repeated elsewhere ("Ja.") can't take the place of a longer one
 /// that starts with the same words.
-pub(crate) fn match_segments(fps: &[String], segments: &[Segment]) -> Vec<Option<usize>> {
+pub(crate) fn match_segments(fps: &[String], segments: &[CleanSegment]) -> Vec<Option<usize>> {
     let mut by_first: HashMap<&str, Vec<usize>> = HashMap::new();
     for (si, s) in segments.iter().enumerate() {
         if let Some(first) = s.members.first() {
@@ -250,10 +258,6 @@ struct Plan {
     entries: Vec<usize>,
 }
 
-fn ends_sentence(token: &str) -> bool {
-    let core = token.trim_end_matches(['"', '\'', ')', ']', '»', '”', '’']);
-    matches!(core.chars().last(), Some('.' | '!' | '?' | '…'))
-}
 
 /// Cut the entries that need cleaning into segments: runs of one speaker's
 /// consecutive entries, at most `SEGMENT_WORDS` words, cut after an entry that
@@ -283,7 +287,7 @@ fn plan_segments(entries: &[Entry], needs: &dyn Fn(usize) -> bool) -> Vec<Plan> 
             // ends a sentence, so a restart isn't split from its false start.
             let cut = cur
                 .iter()
-                .rposition(|&j| entries[j].tokens.last().is_some_and(|t| ends_sentence(t)))
+                .rposition(|&j| entries[j].tokens.last().is_some_and(|t| word_ends_sentence(t)))
                 .filter(|&p| p + 1 < cur.len());
             match cut {
                 Some(p) => {
@@ -370,28 +374,14 @@ Answer:
 
 Answer with JSON only, no explanation: {\"segments\": [{\"id\": 0, \"text\": \"…\"}, …]}, one entry for every id you were given.";
 
-/// The clean texts a model's answer gives, by window-local id; `None` when the
-/// answer isn't one. Accepts `{"segments": [...]}`, possibly wrapped in prose
-/// or a code fence, or a bare list of `{id, text}`.
-fn parse_segments(raw: &str) -> Option<HashMap<usize, String>> {
-    let collect = |arr: &Vec<serde_json::Value>| -> HashMap<usize, String> {
-        arr.iter()
-            .filter_map(|v| {
-                let id = v.get("id").and_then(|i| {
-                    i.as_u64()
-                        .map(|n| n as usize)
-                        .or_else(|| i.as_str().and_then(|s| s.trim().parse().ok()))
-                })?;
-                let text = v.get("text").and_then(|t| t.as_str())?.to_string();
-                Some((id, text))
-            })
-            .collect()
-    };
+/// The list a model's JSON answer gives under `key`, possibly wrapped in prose
+/// or a code fence, or as a bare list; `None` when the answer isn't one.
+pub(super) fn answer_list(raw: &str, key: &str) -> Option<Vec<serde_json::Value>> {
     if let (Some(a), Some(b)) = (raw.find('{'), raw.rfind('}')) {
         if a < b {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw[a..=b]) {
-                if let Some(arr) = v.get("segments").and_then(|s| s.as_array()) {
-                    return Some(collect(arr));
+                if let Some(arr) = v.get(key).and_then(|s| s.as_array()) {
+                    return Some(arr.clone());
                 }
             }
         }
@@ -399,24 +389,39 @@ fn parse_segments(raw: &str) -> Option<HashMap<usize, String>> {
     if let (Some(a), Some(b)) = (raw.find('['), raw.rfind(']')) {
         if a < b {
             if let Ok(serde_json::Value::Array(arr)) = serde_json::from_str::<serde_json::Value>(&raw[a..=b]) {
-                return Some(collect(&arr));
+                return Some(arr);
             }
         }
     }
     None
 }
 
-/// A word folded to what two spellings of it share: alphanumerics, lowercased.
-fn fold(s: &str) -> String {
-    s.chars().filter(|c| c.is_alphanumeric()).flat_map(char::to_lowercase).collect()
+/// A JSON number, or a number written as a string.
+pub(super) fn json_int(v: &serde_json::Value) -> Option<i64> {
+    v.as_i64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
 }
+
+/// The clean texts a model's answer gives, by window-local id.
+fn parse_segments(raw: &str) -> Option<HashMap<usize, String>> {
+    let items = answer_list(raw, "segments")?;
+    Some(
+        items
+            .iter()
+            .filter_map(|v| {
+                let id = usize::try_from(json_int(v.get("id")?)?).ok()?;
+                Some((id, v.get("text")?.as_str()?.to_string()))
+            })
+            .collect(),
+    )
+}
+
 
 /// The pairs `(clean index, verbatim index)` of a longest common subsequence
 /// of the two word lists, compared folded. Words that fold to nothing (a lone
 /// dash) never match.
 fn align(clean: &[String], verbatim: &[String]) -> Vec<(usize, usize)> {
-    let a: Vec<String> = clean.iter().map(|t| fold(t)).collect();
-    let b: Vec<String> = verbatim.iter().map(|t| fold(t)).collect();
+    let a: Vec<String> = clean.iter().map(|t| fold_word(t)).collect();
+    let b: Vec<String> = verbatim.iter().map(|t| fold_word(t)).collect();
     let (n, m) = (a.len(), b.len());
     let mut dp = vec![0u16; (n + 1) * (m + 1)];
     let at = |i: usize, j: usize| i * (m + 1) + j;
@@ -451,26 +456,39 @@ fn has_negation(tokens: &[String]) -> bool {
     tokens.iter().enumerate().any(|(i, t)| {
         let tag = tokens
             .get(i + 1)
-            .is_some_and(|next| fold(next) == "sant" && (next.ends_with('?') || next.ends_with(',')));
-        NEGATIONS.contains(&fold(t).as_str()) && !tag
+            .is_some_and(|next| fold_word(next) == "sant" && (next.ends_with('?') || next.ends_with(',')));
+        NEGATIONS.contains(&fold_word(t).as_str()) && !tag
     })
 }
 
-/// Every run of digits in `tokens`, in order.
-fn digit_runs(tokens: &[String]) -> Vec<String> {
+/// The numbers written in digits, each as its digits alone, so a rewrite may
+/// group or punctuate them differently: "2400", "2 400" and "2.400" are one
+/// number, as are "12.30" and "12:30". A space joins only a group of three.
+fn numbers(tokens: &[String]) -> Vec<String> {
+    let chars: Vec<char> = tokens.join(" ").chars().collect();
+    let digits_from = |k: usize| chars[k..].iter().take_while(|c| c.is_ascii_digit()).count();
     let mut out = Vec::new();
-    for t in tokens {
-        let mut cur = String::new();
-        for c in t.chars() {
-            if c.is_ascii_digit() {
-                cur.push(c);
-            } else if !cur.is_empty() {
+    let mut cur = String::new();
+    let mut k = 0;
+    while k < chars.len() {
+        let c = chars[k];
+        if c.is_ascii_digit() {
+            cur.push(c);
+        } else if !cur.is_empty() {
+            let next = k + 1 < chars.len() && chars[k + 1].is_ascii_digit();
+            let joins = match c {
+                '.' | ',' | ':' => next,
+                ' ' | '\u{a0}' | '\u{202f}' => next && digits_from(k + 1) == 3,
+                _ => false,
+            };
+            if !joins {
                 out.push(std::mem::take(&mut cur));
             }
         }
-        if !cur.is_empty() {
-            out.push(cur);
-        }
+        k += 1;
+    }
+    if !cur.is_empty() {
+        out.push(cur);
     }
     out
 }
@@ -489,17 +507,17 @@ fn tidy_dash(token: &str) -> String {
 
 /// Words that are spoken, not pause marks or dashes.
 fn spoken(tokens: &[String]) -> usize {
-    tokens.iter().filter(|t| !fold(t).is_empty()).count()
+    tokens.iter().filter(|t| !fold_word(t).is_empty()).count()
 }
 
 /// Clean words the speaker said: those aligned to a verbatim word, plus words
 /// the recogniser ran together and the rewrite split ("Craftdu" → "Craft du")
 /// or split and the rewrite joined.
 fn said_words(clean: &[String], verbatim: &[String], pairs: &[(usize, usize)]) -> usize {
-    let verb: Vec<String> = verbatim.iter().map(|t| fold(t)).collect();
+    let verb: Vec<String> = verbatim.iter().map(|t| fold_word(t)).collect();
     let singles: HashSet<&str> = verb.iter().map(String::as_str).filter(|s| !s.is_empty()).collect();
     let pairs_joined: HashSet<String> = verb.windows(2).map(|w| format!("{}{}", w[0], w[1])).collect();
-    let c: Vec<String> = clean.iter().map(|t| fold(t)).collect();
+    let c: Vec<String> = clean.iter().map(|t| fold_word(t)).collect();
     let mut said: HashSet<usize> = pairs.iter().map(|&(i, _)| i).collect();
     for i in 0..c.len() {
         if said.contains(&i) || c[i].is_empty() {
@@ -524,9 +542,8 @@ fn refuse(verbatim: &[String], clean: &[String], aligned: usize) -> Option<&'sta
     if has_negation(verbatim) && !has_negation(clean) {
         return Some("dropped a negation");
     }
-    // Joined without a separator: a rewrite may group digits ("2400" → "2 400").
-    let clean_digits = digit_runs(clean).concat();
-    if digit_runs(verbatim).iter().any(|d| !clean_digits.contains(d.as_str())) {
+    let written_numbers = numbers(clean);
+    if numbers(verbatim).iter().any(|n| !written_numbers.contains(n)) {
         return Some("dropped a number");
     }
     if said >= LENGTH_GUARD_MIN_WORDS && (written as f32) < MIN_KEPT_SHARE * said as f32 {
@@ -588,24 +605,24 @@ fn project_times(
 /// A segment's clean result from the model's text for it: the guarded text
 /// and its timed words, or `text: None` (verbatim) when a guard refused it or
 /// the model gave no text for it.
-fn clean_segment(entries: &[Entry], plan: &Plan, answer: Option<&str>) -> (Segment, Option<&'static str>) {
+fn clean_segment(entries: &[Entry], plan: &Plan, answer: Option<&str>) -> (CleanSegment, Option<&'static str>) {
     let members: Vec<String> = plan.entries.iter().map(|&i| entries[i].fp.clone()).collect();
     let verbatim: Vec<String> = plan.entries.iter().flat_map(|&i| entries[i].tokens.iter().cloned()).collect();
     let times: Vec<Option<(u64, u64)>> = plan.entries.iter().flat_map(|&i| entries[i].times.iter().copied()).collect();
     let Some(answer) = answer else {
-        return (Segment { members, text: None, words: Vec::new() }, Some("no text for it in the answer"));
+        return (CleanSegment { members, text: None, words: Vec::new() }, Some("no text for it in the answer"));
     };
     let clean: Vec<String> = answer.split_whitespace().map(tidy_dash).collect();
     let pairs = align(&clean, &verbatim);
     if let Some(why) = refuse(&verbatim, &clean, said_words(&clean, &verbatim, &pairs)) {
-        return (Segment { members, text: None, words: Vec::new() }, Some(why));
+        return (CleanSegment { members, text: None, words: Vec::new() }, Some(why));
     }
     let timed: Option<Vec<(u64, u64)>> = times.iter().copied().collect();
     let words = match timed {
         Some(t) if !t.is_empty() => project_times(&clean, &t, &pairs),
         _ => Vec::new(),
     };
-    (Segment { members, text: Some(clean.join(" ")), words }, None)
+    (CleanSegment { members, text: Some(clean.join(" ")), words }, None)
 }
 
 /// Lifecycle of a clean pass, on its own channel so cleaning note B never
@@ -643,7 +660,7 @@ pub struct CleanOutcome {
 struct TakeWork {
     dir: PathBuf,
     entries: Vec<Entry>,
-    existing: Vec<Segment>,
+    existing: Vec<CleanSegment>,
 }
 
 fn take_work(dir: &Path) -> TakeWork {
@@ -677,17 +694,13 @@ fn take_work(dir: &Path) -> TakeWork {
     TakeWork { dir: dir.to_path_buf(), entries, existing: read_segments(dir) }
 }
 
-fn write_segments(dir: &Path, by: &str, segments: Vec<Segment>) -> std::io::Result<()> {
-    let file = CleanFile { v: CLEAN_VERSION, by: by.to_string(), segments };
-    let json = serde_json::to_string(&file).map_err(std::io::Error::other)?;
-    let tmp = dir.join(format!("{CLEAN_FILE}.tmp"));
-    std::fs::write(&tmp, json)?;
-    std::fs::rename(tmp, dir.join(CLEAN_FILE))
+fn write_segments(dir: &Path, by: &str, segments: Vec<CleanSegment>) -> std::io::Result<()> {
+    write_take_file(dir, CLEAN_FILE, &CleanFile { v: CLEAN_VERSION, by: by.to_string(), segments })
 }
 
 /// The stored segments that still match the take's entries, and which entries
 /// they cover.
-fn live_segments(take: &TakeWork) -> (Vec<Segment>, HashSet<usize>) {
+fn live_segments(take: &TakeWork) -> (Vec<CleanSegment>, HashSet<usize>) {
     let fps: Vec<String> = take.entries.iter().map(|e| e.fp.clone()).collect();
     let mut kept = Vec::new();
     let mut covered = HashSet::new();
@@ -712,7 +725,7 @@ async fn clean_note_inner(app: &AppHandle, note_id: &str, request: CleanRequest)
         .map(|(_, dir)| take_work(&dir))
         .collect();
     struct TakePlan {
-        kept: Vec<Segment>,
+        kept: Vec<CleanSegment>,
         segments: Vec<Plan>,
     }
     let plans: Vec<TakePlan> = takes
@@ -729,10 +742,7 @@ async fn clean_note_inner(app: &AppHandle, note_id: &str, request: CleanRequest)
         return Ok(CleanOutcome::default());
     }
 
-    let mut provider = light_provider(app, note_id, request).await?;
-    if provider.provider == ProviderId::OpenAi {
-        provider.model = super::CLEAN_OPENAI_MODEL.to_string();
-    }
+    let provider = light_provider(app, note_id, request, LightJob::Clean).await?;
     let by = format!("{}:{}", provider.provider.as_str(), provider.model);
     let limit = window_words(provider.provider);
     let windows: Vec<Vec<Vec<usize>>> = takes
@@ -815,11 +825,15 @@ async fn clean_note_inner(app: &AppHandle, note_id: &str, request: CleanRequest)
     Ok(outcome)
 }
 
-/// The provider a pass calls: the note's summary provider on its light model,
-/// with `reasoning_effort: "low"` on OpenAI. Provider first, then its key: the
-/// summary path's rule. An `Auto` pass leaves Copilot, which counts requests,
-/// alone.
-pub(super) async fn light_provider(app: &AppHandle, note_id: &str, request: CleanRequest) -> anyhow::Result<ResolvedProvider> {
+/// The provider a pass calls for `job`: the note's summary provider on the
+/// job's model. Provider first, then its key: the summary path's rule. An
+/// `Auto` pass leaves Copilot, which counts requests, alone.
+pub(super) async fn light_provider(
+    app: &AppHandle,
+    note_id: &str,
+    request: CleanRequest,
+    job: LightJob,
+) -> anyhow::Result<ResolvedProvider> {
     let state: State<AppState> = app.state();
     let provider_id = {
         let conn = state.db.lock();
@@ -838,10 +852,7 @@ pub(super) async fn light_provider(app: &AppHandle, note_id: &str, request: Clea
         let n = db::get_note(&conn, note_id)?;
         resolve_provider(&conn, &n, api_key)?
     };
-    use_light_model(app, &mut provider).await?;
-    if provider.reasoning_effort.is_some() {
-        provider.reasoning_effort = Some("low");
-    }
+    use_light_model(app, &mut provider, job).await?;
     Ok(provider)
 }
 
@@ -918,6 +929,33 @@ pub(crate) async fn clean_note_quietly(app: AppHandle, note_id: String) {
     if let Err(e) = run_claimed(&app, &note_id, CleanRequest::Auto, true, clean).await {
         eprintln!("[clean] note {note_id}: {e:#}");
     }
+}
+
+/// Whether the note's summary provider is set up and allowed for it, which a
+/// clean read needs: without one the reader shows no Clean view.
+#[tauri::command]
+pub async fn note_clean_available(app: AppHandle, note_id: String) -> bool {
+    clean_available(&app, &note_id).unwrap_or(false)
+}
+
+fn clean_available(app: &AppHandle, note_id: &str) -> anyhow::Result<bool> {
+    let state: State<AppState> = app.state();
+    let provider_id = {
+        let conn = state.db.lock();
+        let n = db::get_note(&conn, note_id)?;
+        summary_provider_id(&conn, &n)?
+    };
+    if provider_id == ProviderId::Copilot {
+        let signed_in = crate::keychain::read(&state.keychain_cache, crate::copilot::CREDENTIALS_ACCOUNT);
+        return Ok(matches!(signed_in, Ok(Some(_))));
+    }
+    let api_key = match provider_id.keychain_account() {
+        Some(_) => super::read_provider_api_key(&state, provider_id.as_str()).map_err(|e| anyhow::anyhow!("{e}"))?,
+        None => None,
+    };
+    let conn = state.db.lock();
+    let n = db::get_note(&conn, note_id)?;
+    Ok(resolve_provider(&conn, &n, api_key).is_ok())
 }
 
 /// Clean a note from the reader: on opening Clean on entries without a clean
@@ -1123,6 +1161,21 @@ mod tests {
     }
 
     #[test]
+    fn a_changed_number_is_refused_and_a_rewritten_one_is_not() {
+        let check = |v: &str, c: &str| {
+            let (v, c) = (toks(v), toks(c));
+            refuse(&v, &c, said_words(&c, &v, &align(&c, &v)))
+        };
+        assert_eq!(check("Vi var 15 der.", "Vi var 150 der."), Some("dropped a number"));
+        assert_eq!(check("Det tar 3 dager.", "Det tar 13 dager."), Some("dropped a number"));
+        assert_eq!(check("Møtet er 12.30 i morgen.", "Møtet er 12:30 i morgen."), None);
+        assert_eq!(check("Fra 4,2 til 3,9 prosent.", "Fra 4,2 til 3,9 prosent."), None);
+        assert_eq!(check("Det koster 2.400 kroner.", "Det koster 2 400 kroner."), None);
+        // Two numbers side by side stay two.
+        assert_eq!(numbers(&toks("side 2 3 og 4")), vec!["2", "3", "4"]);
+    }
+
+    #[test]
     fn words_the_recogniser_ran_together_or_split_count_as_said() {
         let v = toks("Samme Small Craftdu var også der, så vi kan transcribe på nytt.");
         let c = toks("Samme Small Craft du var også der, så vi kan transcribe pånytt.");
@@ -1156,7 +1209,7 @@ mod tests {
     #[test]
     fn stored_segments_match_only_the_exact_run_of_entries() {
         let fps: Vec<String> = ["a", "b", "c", "d"].iter().map(|s| s.to_string()).collect();
-        let seg = |m: &[&str]| Segment { members: m.iter().map(|s| s.to_string()).collect(), text: Some("x".into()), words: vec![] };
+        let seg = |m: &[&str]| CleanSegment { members: m.iter().map(|s| s.to_string()).collect(), text: Some("x".into()), words: vec![] };
         let segments = vec![seg(&["b", "c"]), seg(&["d", "e"])];
         // "d e" no longer matches: "e" is gone (an edit).
         assert_eq!(match_segments(&fps, &segments), vec![None, Some(0), None, None]);
@@ -1167,7 +1220,7 @@ mod tests {
         // "Ja." said alone later, and as the start of a longer run earlier: the
         // run must keep its segment, or its tail is cleaned again every time.
         let fps: Vec<String> = ["ja", "bra", "x", "ja", "y"].iter().map(|s| s.to_string()).collect();
-        let seg = |m: &[&str]| Segment { members: m.iter().map(|s| s.to_string()).collect(), text: Some("x".into()), words: vec![] };
+        let seg = |m: &[&str]| CleanSegment { members: m.iter().map(|s| s.to_string()).collect(), text: Some("x".into()), words: vec![] };
         let segments = vec![seg(&["ja"]), seg(&["ja", "bra"]), seg(&["x"]), seg(&["y"])];
         assert_eq!(match_segments(&fps, &segments), vec![Some(1), None, Some(2), Some(0), Some(3)]);
     }
@@ -1175,7 +1228,7 @@ mod tests {
     #[test]
     fn segments_round_trip_through_the_file_and_ignore_other_versions() {
         let dir = tempfile::tempdir().unwrap();
-        let s = vec![Segment {
+        let s = vec![CleanSegment {
             members: vec!["abc".into()],
             text: Some("Hei.".into()),
             words: vec![CleanWord { text: "Hei.".into(), start_ms: 0, end_ms: 200 }],

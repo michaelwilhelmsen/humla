@@ -33,7 +33,7 @@ pub(super) struct ResolvedProvider {
     pub(super) think: bool,
     /// Sent to cloud OpenAI only when set; the summary leaves it at the
     /// model's default.
-    pub(super) reasoning_effort: Option<&'static str>,
+    pub(super) reasoning_effort: Option<openai::ReasoningEffort>,
     /// The running Copilot CLI, which the caller attaches after resolving —
     /// starting it is async and resolving is not.
     pub(super) copilot: Option<copilot_sdk::Client>,
@@ -117,16 +117,35 @@ pub(super) async fn attach_copilot(app: &AppHandle, p: &mut ResolvedProvider) ->
     Ok(())
 }
 
-/// Point a provider at its light model, without thinking, for work that needs
-/// no summary model (a title, a clean read): OpenAI's `LIGHT_OPENAI_MODEL`
-/// with no reasoning, Copilot's cheapest model. Other providers keep the
-/// user's model. Starts the Copilot CLI, so call it once a model call is
-/// certain.
-pub(super) async fn use_light_model(app: &AppHandle, p: &mut ResolvedProvider) -> anyhow::Result<()> {
+/// Work a provider does besides the summary itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum LightJob {
+    Title,
+    /// Where a change of speaker cuts a sentence (#217).
+    SpeakerCheck,
+    /// The clean read (#217).
+    Clean,
+}
+
+/// The OpenAI model and reasoning each job runs on.
+fn openai_model_for(job: LightJob) -> (&'static str, openai::ReasoningEffort) {
+    use openai::ReasoningEffort::{Low, None};
+    match job {
+        LightJob::Title => (super::LIGHT_OPENAI_MODEL, None),
+        LightJob::SpeakerCheck => (super::LIGHT_OPENAI_MODEL, Low),
+        LightJob::Clean => (super::CLEAN_OPENAI_MODEL, Low),
+    }
+}
+
+/// Point a provider at the model for `job`, without thinking: OpenAI's per
+/// `openai_model_for`, Copilot's cheapest. Other providers keep the user's
+/// model. Starts the Copilot CLI, so call it once a model call is certain.
+pub(super) async fn use_light_model(app: &AppHandle, p: &mut ResolvedProvider, job: LightJob) -> anyhow::Result<()> {
     p.think = false;
     if p.provider == ProviderId::OpenAi {
-        p.model = super::LIGHT_OPENAI_MODEL.to_string();
-        p.reasoning_effort = Some("none");
+        let (model, effort) = openai_model_for(job);
+        p.model = model.to_string();
+        p.reasoning_effort = Some(effort);
     }
     attach_copilot(app, p).await?;
     if let Some(client) = p.copilot.as_ref() {
@@ -423,10 +442,17 @@ async fn run_summary(app: AppHandle, note_id: String) -> anyhow::Result<()> {
     } else {
         format!("[Notater]\n{body_text}")
     };
-    let transcript_block = if note.transcript.trim().is_empty() {
+    // The clean read where there is one (#217).
+    let transcript = if super::clean::clean_setting_on(&app) {
+        super::timeline::clean_transcript(&app, &note_id, &note.transcript)
+    } else {
+        None
+    }
+    .unwrap_or_else(|| note.transcript.clone());
+    let transcript_block = if transcript.trim().is_empty() {
         "[Transkripsjon]\n(ingen)".to_string()
     } else {
-        format!("[Transkripsjon]\n{}", note.transcript)
+        format!("[Transkripsjon]\n{transcript}")
     };
     let user_message = format!("{notes_block}\n\n{transcript_block}");
     // Stream thinking + content deltas to the frontend so the user sees
@@ -507,6 +533,15 @@ pub(super) fn language_directive(lang: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_job_asks_the_clean_model_for_no_reasoning() {
+        // gpt-6.2-sol answers `reasoning_effort: "none"` with HTTP 400.
+        for job in [LightJob::Title, LightJob::SpeakerCheck, LightJob::Clean] {
+            let (model, effort) = openai_model_for(job);
+            assert!(!(model == super::super::CLEAN_OPENAI_MODEL && effort == openai::ReasoningEffort::None), "{job:?}");
+        }
+    }
 
     fn temp_conn() -> (tempfile::TempDir, rusqlite::Connection) {
         let dir = tempfile::tempdir().unwrap();

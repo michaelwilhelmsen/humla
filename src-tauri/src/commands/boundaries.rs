@@ -13,7 +13,8 @@
 //! "Clean again". A change once judged is recorded by the words around it in
 //! the take's `boundaries.json` and not asked about again.
 
-use super::clean::{fingerprint, light_provider, CleanRequest};
+use super::clean::{answer_list, fingerprint, json_int, light_provider, read_take_file, write_take_file, CleanRequest};
+use super::summary::LightJob;
 use super::timeline::{commit_rebuilt_transcript, read_timeline_values, rebuild_note_transcript, write_timeline_values};
 use super::transcript::piece_ends_terminator;
 use crate::sessions;
@@ -82,44 +83,74 @@ impl Change {
     }
 }
 
-fn label(v: &Value) -> &str {
-    v.get("label").and_then(Value::as_str).unwrap_or("")
+/// One line of a take's `timeline.jsonl`. Fields this pass doesn't read ride
+/// along in `rest`, so writing a line back changes nothing else in it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct Line {
+    #[serde(default)]
+    label: String,
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    words: Vec<Word>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    start_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    end_ms: Option<u64>,
+    #[serde(flatten)]
+    rest: serde_json::Map<String, Value>,
 }
 
-fn source(v: &Value) -> &str {
-    v.get("source").and_then(Value::as_str).unwrap_or("")
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct Word {
+    #[serde(default)]
+    text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    start_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    end_ms: Option<u64>,
+    #[serde(flatten)]
+    rest: serde_json::Map<String, Value>,
 }
 
-fn words(v: &Value) -> &[Value] {
-    v.get("words").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[])
-}
-
-fn word_text(w: &Value) -> &str {
-    w.get("text").and_then(Value::as_str).unwrap_or("")
-}
-
-fn word_ms(w: &Value, key: &str) -> Option<u64> {
-    w.get(key).and_then(Value::as_u64)
-}
-
-/// Replace an entry's words, and its text and bounds with them.
-fn set_words(entry: &mut Value, ws: Vec<Value>) {
-    let text = ws.iter().map(word_text).collect::<Vec<_>>().join(" ");
-    if let (Some(start), Some(end)) = (ws.first().and_then(|w| word_ms(w, "start_ms")), ws.last().and_then(|w| word_ms(w, "end_ms"))) {
-        entry["start_ms"] = Value::from(start);
-        entry["end_ms"] = Value::from(end);
+impl Line {
+    fn spoken(&self) -> String {
+        self.words.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" ")
     }
-    entry["text"] = Value::String(text);
-    entry["words"] = Value::Array(ws);
+
+    /// Replace the line's words, and its text and bounds with them.
+    fn set_words(&mut self, words: Vec<Word>) {
+        if let (Some(start), Some(end)) = (words.first().and_then(|w| w.start_ms), words.last().and_then(|w| w.end_ms)) {
+            self.start_ms = Some(start);
+            self.end_ms = Some(end);
+        }
+        self.words = words;
+        self.text = self.spoken();
+    }
+
+    fn same_run(&self, other: &Line) -> bool {
+        self.label == other.label && self.source == other.source
+    }
 }
 
-/// The entries of one speaker's run from `from`, walking away from the change
+/// A take's timeline as lines, or `None` when one isn't a line this pass can
+/// write back faithfully.
+fn parse_lines(values: &[Value]) -> Option<Vec<Line>> {
+    values.iter().map(|v| serde_json::from_value(v.clone()).ok()).collect()
+}
+
+fn to_values(lines: &[Line]) -> Vec<Value> {
+    lines.iter().map(|l| serde_json::to_value(l).unwrap_or(Value::Null)).collect()
+}
+
+/// The lines of one speaker's run from `from`, walking away from the change
 /// (forward or backward), in the same stream.
-fn run(entries: &[Value], from: usize, forward: bool) -> Vec<usize> {
-    let (who, stream) = (label(&entries[from]), source(&entries[from]));
-    let same = |i: usize| label(&entries[i]) == who && source(&entries[i]) == stream;
+fn run(lines: &[Line], from: usize, forward: bool) -> Vec<usize> {
+    let same = |i: usize| lines[i].same_run(&lines[from]);
     if forward {
-        (from..entries.len()).take_while(|&i| same(i)).collect()
+        (from..lines.len()).take_while(|&i| same(i)).collect()
     } else {
         (0..=from).rev().take_while(|&i| same(i)).collect()
     }
@@ -133,37 +164,37 @@ fn ends_in_pause(text: &str) -> bool {
 }
 
 /// Every speaker change in a take's timeline that cuts a sentence: the earlier
-/// side ends without a terminator or a pause, between two timed entries of one
+/// side ends without a terminator or a pause, between two timed lines of one
 /// stream.
-fn candidates(entries: &[Value]) -> Vec<Change> {
-    let timed: Vec<usize> = (0..entries.len()).filter(|&i| !words(&entries[i]).is_empty()).collect();
+fn candidates(lines: &[Line]) -> Vec<Change> {
+    let timed: Vec<usize> = (0..lines.len()).filter(|&i| !lines[i].words.is_empty()).collect();
     let mut out = Vec::new();
     for pair in timed.windows(2) {
         let (a, b) = (pair[0], pair[1]);
-        let (ea, eb) = (&entries[a], &entries[b]);
-        if label(ea).is_empty() || label(eb).is_empty() || label(ea) == label(eb) || source(ea) != source(eb) {
+        let (la, lb) = (&lines[a], &lines[b]);
+        if la.label.is_empty() || lb.label.is_empty() || la.label == lb.label || la.source != lb.source {
             continue;
         }
-        let a_text = words(ea).iter().map(word_text).collect::<Vec<_>>().join(" ");
+        let a_text = la.spoken();
         if piece_ends_terminator(&a_text) || ends_in_pause(&a_text) {
             continue;
         }
-        let mut before_words: Vec<String> = run(entries, a, false)
+        let mut before_words: Vec<String> = run(lines, a, false)
             .iter()
-            .flat_map(|&i| words(&entries[i]).iter().rev().map(|w| word_text(w).to_string()))
+            .flat_map(|&i| lines[i].words.iter().rev().map(|w| w.text.clone()))
             .take(CONTEXT_WORDS)
             .collect();
         before_words.reverse();
-        let after_words: Vec<String> = run(entries, b, true)
+        let after_words: Vec<String> = run(lines, b, true)
             .iter()
-            .flat_map(|&i| words(&entries[i]).iter().map(|w| word_text(w).to_string()))
+            .flat_map(|&i| lines[i].words.iter().map(|w| w.text.clone()))
             .take(CONTEXT_WORDS)
             .collect();
         out.push(Change {
             before: a,
             after: b,
-            before_label: label(ea).to_string(),
-            after_label: label(eb).to_string(),
+            before_label: la.label.clone(),
+            after_label: lb.label.clone(),
             before_words,
             after_words,
         });
@@ -172,39 +203,39 @@ fn candidates(entries: &[Value]) -> Vec<Change> {
 }
 
 /// Move `mv` words across `change`: positive from the start of the later
-/// speaker's run to the earlier one, negative the other way. An entry whose
+/// speaker's run to the earlier one, negative the other way. A line whose
 /// words all move changes speaker whole; a partly moved one gives its words to
 /// its neighbour on the other side. Returns whether anything moved; a move the
 /// timeline no longer fits (labels changed since, too many words, too far from
 /// the change) moves nothing.
-fn apply_move(entries: &mut [Value], change: &Change, mv: i64) -> bool {
+fn apply_move(lines: &mut [Line], change: &Change, mv: i64) -> bool {
     let n = mv.unsigned_abs() as usize;
     if mv == 0 || n > MAX_MOVE_WORDS {
         return false;
     }
-    if label(&entries[change.before]) != change.before_label || label(&entries[change.after]) != change.after_label {
+    if lines[change.before].label != change.before_label || lines[change.after].label != change.after_label {
         return false;
     }
     let backward = mv > 0;
     let (side, to_label) = if backward {
-        (run(entries, change.after, true), change.before_label.clone())
+        (run(lines, change.after, true), change.before_label.clone())
     } else {
-        (run(entries, change.before, false), change.after_label.clone())
+        (run(lines, change.before, false), change.after_label.clone())
     };
-    let moving: Vec<&Value> = if backward {
-        side.iter().flat_map(|&i| words(&entries[i]).iter()).take(n).collect()
+    let moving: Vec<&Word> = if backward {
+        side.iter().flat_map(|&i| lines[i].words.iter()).take(n).collect()
     } else {
-        side.iter().flat_map(|&i| words(&entries[i]).iter().rev()).take(n).collect()
+        side.iter().flat_map(|&i| lines[i].words.iter().rev()).take(n).collect()
     };
     if moving.len() < n {
         return false;
     }
     let edge = if backward {
-        words(&entries[change.before]).last().and_then(|w| word_ms(w, "end_ms"))
+        lines[change.before].words.last().and_then(|w| w.end_ms)
     } else {
-        words(&entries[change.after]).first().and_then(|w| word_ms(w, "start_ms"))
+        lines[change.after].words.first().and_then(|w| w.start_ms)
     };
-    let farthest = moving.last().and_then(|w| word_ms(w, if backward { "end_ms" } else { "start_ms" }));
+    let farthest = moving.last().and_then(|w| if backward { w.end_ms } else { w.start_ms });
     if let (Some(edge), Some(far)) = (edge, farthest) {
         if far.abs_diff(edge) > MAX_MOVE_MS {
             return false;
@@ -217,17 +248,17 @@ fn apply_move(entries: &mut [Value], change: &Change, mv: i64) -> bool {
         if left == 0 {
             break;
         }
-        let count = words(&entries[i]).len();
+        let count = lines[i].words.len();
         if count <= left {
-            entries[i]["label"] = Value::String(to_label.clone());
+            lines[i].label = to_label.clone();
             left -= count;
             target = i;
             continue;
         }
-        let mut ws = words(&entries[i]).to_vec();
-        let moved: Vec<Value> = if backward { ws.drain(..left).collect() } else { ws.split_off(ws.len() - left) };
-        set_words(&mut entries[i], ws);
-        let mut tw = words(&entries[target]).to_vec();
+        let mut ws = std::mem::take(&mut lines[i].words);
+        let moved: Vec<Word> = if backward { ws.drain(..left).collect() } else { ws.split_off(ws.len() - left) };
+        lines[i].set_words(ws);
+        let mut tw = std::mem::take(&mut lines[target].words);
         if backward {
             tw.extend(moved);
         } else {
@@ -235,15 +266,15 @@ fn apply_move(entries: &mut [Value], change: &Change, mv: i64) -> bool {
             joined.extend(tw);
             tw = joined;
         }
-        set_words(&mut entries[target], tw);
+        lines[target].set_words(tw);
         left = 0;
     }
-    // Empty entries between the two sides follow the earlier one, so they
-    // can't split its run into two turns.
-    let earlier = label(&entries[change.before]).to_string();
-    for i in change.before + 1..change.after {
-        if words(&entries[i]).is_empty() {
-            entries[i]["label"] = Value::String(earlier.clone());
+    // Empty lines between the two sides follow the earlier one, so they can't
+    // split its run into two turns. A line with text keeps its speaker.
+    let earlier = lines[change.before].label.clone();
+    for line in &mut lines[change.before + 1..change.after] {
+        if line.words.is_empty() && line.text.trim().is_empty() {
+            line.label = earlier.clone();
         }
     }
     true
@@ -272,36 +303,15 @@ fn window_message<'a>(changes: impl Iterator<Item = &'a Change>) -> String {
     serde_json::to_string(&items).unwrap_or_default()
 }
 
-/// The moves a model's answer gives, by window-local id; `None` when the
-/// answer isn't one. Accepts `{"changes": [...]}`, possibly wrapped in prose or
-/// a code fence, or a bare list of `{id, move}`.
+/// The moves a model's answer gives, by window-local id.
 fn parse_changes(raw: &str) -> Option<HashMap<usize, i64>> {
-    let as_int = |v: &Value| v.as_i64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()));
-    let collect = |arr: &Vec<Value>| -> HashMap<usize, i64> {
-        arr.iter()
-            .filter_map(|v| {
-                let id = usize::try_from(as_int(v.get("id")?)?).ok()?;
-                Some((id, as_int(v.get("move")?)?))
-            })
-            .collect()
-    };
-    if let (Some(a), Some(b)) = (raw.find('{'), raw.rfind('}')) {
-        if a < b {
-            if let Ok(v) = serde_json::from_str::<Value>(&raw[a..=b]) {
-                if let Some(arr) = v.get("changes").and_then(Value::as_array) {
-                    return Some(collect(arr));
-                }
-            }
-        }
-    }
-    if let (Some(a), Some(b)) = (raw.find('['), raw.rfind(']')) {
-        if a < b {
-            if let Ok(Value::Array(arr)) = serde_json::from_str::<Value>(&raw[a..=b]) {
-                return Some(collect(&arr));
-            }
-        }
-    }
-    None
+    let items = answer_list(raw, "changes")?;
+    Some(
+        items
+            .iter()
+            .filter_map(|v| Some((usize::try_from(json_int(v.get("id")?)?).ok()?, json_int(v.get("move")?)?)))
+            .collect(),
+    )
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -311,9 +321,7 @@ struct BoundaryFile {
 }
 
 fn read_reviewed(take_dir: &Path) -> HashSet<String> {
-    std::fs::read_to_string(take_dir.join(BOUNDARY_FILE))
-        .ok()
-        .and_then(|s| serde_json::from_str::<BoundaryFile>(&s).ok())
+    read_take_file::<BoundaryFile>(take_dir, BOUNDARY_FILE)
         .filter(|f| f.v == BOUNDARY_VERSION)
         .map(|f| f.reviewed.into_iter().collect())
         .unwrap_or_default()
@@ -322,10 +330,7 @@ fn read_reviewed(take_dir: &Path) -> HashSet<String> {
 fn write_reviewed(take_dir: &Path, reviewed: &HashSet<String>) -> std::io::Result<()> {
     let mut keys: Vec<String> = reviewed.iter().cloned().collect();
     keys.sort();
-    let json = serde_json::to_string(&BoundaryFile { v: BOUNDARY_VERSION, reviewed: keys }).map_err(std::io::Error::other)?;
-    let tmp = take_dir.join(format!("{BOUNDARY_FILE}.tmp"));
-    std::fs::write(&tmp, json)?;
-    std::fs::rename(tmp, take_dir.join(BOUNDARY_FILE))
+    write_take_file(take_dir, BOUNDARY_FILE, &BoundaryFile { v: BOUNDARY_VERSION, reviewed: keys })
 }
 
 struct Take {
@@ -333,7 +338,7 @@ struct Take {
     /// The timeline as read before the model calls, to tell whether it changed
     /// while they ran.
     read: Vec<Value>,
-    entries: Vec<Value>,
+    lines: Vec<Line>,
     reviewed: HashSet<String>,
     changes: Vec<Change>,
 }
@@ -351,13 +356,17 @@ pub(crate) async fn review_note(app: &AppHandle, note_id: &str, request: CleanRe
         if !path.exists() {
             continue;
         }
-        let entries = read_timeline_values(&path);
+        let read = read_timeline_values(&path);
+        let Some(lines) = parse_lines(&read) else {
+            eprintln!("[turns] note {note_id}: a timeline line this pass can't write back, leaving the take");
+            continue;
+        };
         let reviewed = read_reviewed(&dir);
-        let changes = candidates(&entries)
+        let changes = candidates(&lines)
             .into_iter()
             .filter(|c| force || !reviewed.contains(&c.key()))
             .collect();
-        takes.push(Take { dir, read: entries.clone(), entries, reviewed, changes });
+        takes.push(Take { dir, read, lines, reviewed, changes });
     }
     let asked: Vec<(usize, usize)> = takes
         .iter()
@@ -368,7 +377,7 @@ pub(crate) async fn review_note(app: &AppHandle, note_id: &str, request: CleanRe
         return Ok(0);
     }
 
-    let provider = light_provider(app, note_id, request).await?;
+    let provider = light_provider(app, note_id, request, LightJob::SpeakerCheck).await?;
     let mut answers: HashMap<(usize, usize), i64> = HashMap::new();
     for window in asked.chunks(CHANGES_PER_CALL) {
         let message = window_message(window.iter().map(|&(t, c)| &takes[t].changes[c]));
@@ -397,21 +406,21 @@ pub(crate) async fn review_note(app: &AppHandle, note_id: &str, request: CleanRe
             eprintln!("[turns] note {note_id}: a timeline changed while its speaker changes were checked, leaving it");
             continue;
         }
-        let before: HashSet<String> = candidates(&take.entries).iter().map(Change::key).collect();
+        let before: HashSet<String> = candidates(&take.lines).iter().map(Change::key).collect();
         let mut changed = false;
         for (c, change) in take.changes.iter().enumerate() {
             let Some(&mv) = answers.get(&(t, c)) else { continue };
             take.reviewed.insert(change.key());
-            if apply_move(&mut take.entries, change, mv) {
+            if apply_move(&mut take.lines, change, mv) {
                 eprintln!("[turns] note {note_id}: moved {} word(s) {} at a speaker change", mv.unsigned_abs(), if mv > 0 { "back" } else { "forward" });
                 changed = true;
                 moved += 1;
             }
         }
         if changed {
-            write_timeline_values(&path, &take.entries).map_err(|e| anyhow::anyhow!(e))?;
+            write_timeline_values(&path, &to_values(&take.lines)).map_err(|e| anyhow::anyhow!(e))?;
             // A change a move created was judged with the one it replaced.
-            take.reviewed.extend(candidates(&take.entries).iter().map(Change::key).filter(|k| !before.contains(k)));
+            take.reviewed.extend(candidates(&take.lines).iter().map(Change::key).filter(|k| !before.contains(k)));
         }
         write_reviewed(&take.dir, &take.reviewed)?;
     }
@@ -434,7 +443,7 @@ mod tests {
     use serde_json::json;
 
     /// An entry whose words are spread 300 ms apart from `start_ms`.
-    fn entry(label: &str, text: &str, start_ms: u64) -> Value {
+    fn entry_value(label: &str, text: &str, start_ms: u64) -> Value {
         let ws: Vec<Value> = text
             .split_whitespace()
             .enumerate()
@@ -444,8 +453,25 @@ mod tests {
         json!({"start_ms": start_ms, "end_ms": end, "label": label, "text": text, "words": ws, "source": "mic"})
     }
 
-    fn texts(entries: &[Value]) -> Vec<(String, String)> {
-        entries.iter().map(|e| (label(e).to_string(), e["text"].as_str().unwrap().to_string())).collect()
+    /// A line whose words are spread 300 ms apart from `start_ms`.
+    fn entry(label: &str, text: &str, start_ms: u64) -> Line {
+        serde_json::from_value(entry_value(label, text, start_ms)).unwrap()
+    }
+
+    fn texts(lines: &[Line]) -> Vec<(String, String)> {
+        lines.iter().map(|l| (l.label.clone(), l.text.clone())).collect()
+    }
+
+    #[test]
+    fn a_line_writes_back_with_the_fields_this_pass_doesnt_read() {
+        let mut v = entry_value("Michael", "Keep recorded og", 0);
+        v["chunk"] = json!(7);
+        v["words"][0]["confidence"] = json!(0.9);
+        let lines = parse_lines(std::slice::from_ref(&v)).unwrap();
+        assert_eq!(to_values(&lines), vec![v]);
+        let legacy = json!({"start_ms": 0, "label": "A", "text": "uten ord"});
+        assert_eq!(to_values(&parse_lines(std::slice::from_ref(&legacy)).unwrap())[0]["end_ms"], Value::Null);
+        assert!(parse_lines(&[json!({"label": 3})]).is_none());
     }
 
     #[test]
@@ -466,7 +492,7 @@ mod tests {
     #[test]
     fn finished_sentences_other_streams_and_unlabelled_entries_are_not() {
         let mut sys = entry("Hege", "fortsetter her.", 3_000);
-        sys["source"] = json!("sys");
+        sys.source = Some("sys".into());
         let entries = vec![
             entry("Michael", "Dette er ferdig.", 0),
             entry("Esben", "Ja.", 1_000),
@@ -513,9 +539,9 @@ mod tests {
             texts(&entries),
             vec![("Sally".into(), "fordi de er ...".into()), ("Esben".into(), "Burde Apply stå oppe da.".into())]
         );
-        assert_eq!(entries[0]["end_ms"], 1_150);
-        assert_eq!(entries[1]["start_ms"], 1_200);
-        assert_eq!(entries[1]["words"][0]["text"], "Burde");
+        assert_eq!(entries[0].end_ms, Some(1_150));
+        assert_eq!(entries[1].start_ms, Some(1_200));
+        assert_eq!(entries[1].words[0].text, "Burde");
     }
 
     #[test]
@@ -541,13 +567,13 @@ mod tests {
         }
         // Speakers renamed since the change was read.
         let mut renamed = entries.clone();
-        renamed[1]["label"] = json!("Hege");
+        renamed[1].label = "Hege".into();
         assert!(!apply_move(&mut renamed, &change, 1));
         // Words said long after the change.
         let mut far = vec![entry("Michael", "Keep recorded og", 0), entry("Esben", "a b c d e f g h", 1_000)];
-        for (k, w) in far[1]["words"].as_array_mut().unwrap().iter_mut().enumerate() {
-            w["start_ms"] = json!(1_000 + k as u64 * 1_500);
-            w["end_ms"] = json!(1_000 + k as u64 * 1_500 + 200);
+        for (k, w) in far[1].words.iter_mut().enumerate() {
+            w.start_ms = Some(1_000 + k as u64 * 1_500);
+            w.end_ms = Some(1_000 + k as u64 * 1_500 + 200);
         }
         let change = candidates(&far).remove(0);
         assert!(!apply_move(&mut far, &change, 6));
@@ -555,15 +581,16 @@ mod tests {
 
     #[test]
     fn an_empty_entry_between_the_sides_follows_the_earlier_speaker() {
-        let mut entries = vec![
-            entry("Michael", "Keep recorded og", 0),
-            json!({"start_ms": 900, "end_ms": 950, "label": "Esben", "text": "", "words": [], "source": "mic"}),
-            entry("Esben", "Audio.", 1_000),
-        ];
+        let line = |text: &str| -> Line {
+            serde_json::from_value(json!({"start_ms": 900, "end_ms": 950, "label": "Esben", "text": text, "words": [], "source": "mic"})).unwrap()
+        };
+        let mut entries = vec![entry("Michael", "Keep recorded og", 0), line(""), line("uten tider"), entry("Esben", "Audio.", 1_000)];
         let change = candidates(&entries).remove(0);
         assert!(apply_move(&mut entries, &change, 1));
-        assert_eq!(label(&entries[1]), "Michael");
-        assert_eq!(label(&entries[2]), "Michael");
+        assert_eq!(entries[1].label, "Michael");
+        // Text the model never saw keeps its speaker.
+        assert_eq!(entries[2].label, "Esben");
+        assert_eq!(entries[3].label, "Michael");
     }
 
     #[test]
@@ -571,7 +598,7 @@ mod tests {
         let entries = vec![entry("Michael", "Keep recorded og", 0), entry("Esben", "Audio. Ja.", 1_000)];
         let change = candidates(&entries).remove(0);
         let mut renamed = entries.clone();
-        renamed[0]["label"] = json!("Speaker 1");
+        renamed[0].label = "Speaker 1".into();
         assert_eq!(candidates(&renamed)[0].key(), change.key());
         let mut moved = entries.clone();
         assert!(apply_move(&mut moved, &change, 1));

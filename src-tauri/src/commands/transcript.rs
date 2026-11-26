@@ -53,7 +53,7 @@ const DISPLAY_WORD_LOOKAHEAD: usize = 4;
 
 /// A word folded to what two spellings of it share: alphanumerics,
 /// lowercased. `"Hello,"` and `"hello"` fold alike.
-fn fold_word(s: &str) -> String {
+pub(super) fn fold_word(s: &str) -> String {
     s.chars()
         .filter(|c| c.is_alphanumeric())
         .flat_map(char::to_lowercase)
@@ -535,9 +535,9 @@ pub(super) fn absorb_text_continuation_chains(pieces: &mut [LabelledPiece]) {
 /// `(start_ms, source)` with mic first on a tie, and the per-chunk split.
 /// Each stream's `start_ms` counts from its own first frame, a few hundred ms
 /// apart, which a reader doesn't notice.
-pub(super) fn build_pieces_unbridged(
+pub(super) fn build_unrefined_pieces(
     chunks: &[ChunkRecord],
-    split_chunk: &(dyn Fn(&ChunkRecord) -> Vec<LabelledPiece> + Send),
+    split_chunk: &dyn Fn(&ChunkRecord) -> Vec<LabelledPiece>,
 ) -> Vec<LabelledPiece> {
     let kept = dedup_mic_against_sys(chunks);
     let mut sorted: Vec<&ChunkRecord> = kept.iter().collect();
@@ -592,7 +592,7 @@ pub(super) fn build_labelled_transcript(
     chunks: &[ChunkRecord],
     split_chunk: &(dyn Fn(&ChunkRecord) -> Vec<LabelledPiece> + Send),
 ) -> String {
-    let mut all_pieces = build_pieces_unbridged(chunks, split_chunk);
+    let mut all_pieces = build_unrefined_pieces(chunks, split_chunk);
     refine_pieces(&mut all_pieces);
 
     let mut output = String::new();
@@ -680,7 +680,7 @@ fn word_has_terminator(word: &str) -> bool {
 /// Whether `word` closes a sentence: its last character, after any closing
 /// quote or bracket, is `.!?…`. Unlike `word_has_terminator` a decimal
 /// (`3.5`) or an abbreviation's inner dot doesn't count.
-fn word_ends_sentence(word: &str) -> bool {
+pub(super) fn word_ends_sentence(word: &str) -> bool {
     let core = word.trim_end_matches(['"', '\'', ')', ']', '»', '”', '’']);
     matches!(core.chars().last(), Some('.' | '!' | '?' | '…'))
 }

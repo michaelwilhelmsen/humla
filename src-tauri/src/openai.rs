@@ -183,6 +183,24 @@ pub(crate) fn is_reasoning_model(model: &str) -> bool {
     }
 }
 
+/// How much a reasoning model thinks before it answers (`reasoning_effort`).
+/// Not every model accepts every value: `gpt-6.2-sol` refuses `none`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum ReasoningEffort {
+    None,
+    Low,
+}
+
+impl ReasoningEffort {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Low => "low",
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct ChatStreamRequest<'a> {
     model: &'a str,
@@ -191,7 +209,7 @@ struct ChatStreamRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning_effort: Option<&'a str>,
+    reasoning_effort: Option<ReasoningEffort>,
 }
 
 // One Server-Sent-Events frame from OpenAI's streaming /chat/completions.
@@ -544,7 +562,7 @@ async fn summarize_stream<F>(
     ep: Endpoint<'_>,
     api_key: &str,
     model: &str,
-    reasoning_effort: Option<&str>,
+    reasoning_effort: Option<ReasoningEffort>,
     system_prompt: &str,
     transcript: &str,
     mut on_chunk: F,
@@ -574,7 +592,7 @@ where
     eprintln!(
         "[llm] POST {} (stream) model={model} reasoning_effort={} system_chars={} user_chars={}",
         ep.url(),
-        reasoning_effort.unwrap_or("default"),
+        reasoning_effort.map_or("default", ReasoningEffort::as_str),
         system_prompt.len(),
         transcript.len()
     );
@@ -626,7 +644,7 @@ pub async fn summarize_with_base<F>(
     api_key: &str,
     model: &str,
     think: bool,
-    reasoning_effort: Option<&str>,
+    reasoning_effort: Option<ReasoningEffort>,
     system_prompt: &str,
     transcript: &str,
     on_chunk: F,
@@ -2163,7 +2181,8 @@ mod tests {
             })
             .unwrap()
         };
-        assert_eq!(req(Some("none"))["reasoning_effort"], "none");
+        assert_eq!(req(Some(ReasoningEffort::None))["reasoning_effort"], "none");
+        assert_eq!(req(Some(ReasoningEffort::Low))["reasoning_effort"], "low");
         assert!(req(None).get("reasoning_effort").is_none());
         assert!(is_reasoning_model(crate::commands::LIGHT_OPENAI_MODEL));
     }
