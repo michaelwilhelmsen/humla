@@ -185,7 +185,7 @@ function TranscriptEditorHarness({ disabled }: { disabled: boolean }) {
 // `PANEL_MAX` (720), per Note.tsx. This card was pinned at 420 for a long time,
 // which is how a turn's edit box shipped at a width that only looked right
 // there (#176): judge the reader at the bounds, not at one comfortable middle.
-function playerCase(disabled: boolean, width = 420, longNames = false): Scenario {
+function playerCase(disabled: boolean, width = 420, longNames = false, takes = 1): Scenario {
   return {
     wrap: (node) => (
       <div className="flex-1 min-h-0 flex justify-center px-6 py-8">
@@ -197,7 +197,7 @@ function playerCase(disabled: boolean, width = 420, longNames = false): Scenario
         </div>
       </div>
     ),
-    render: () => <TranscriptPlayerHarness disabled={disabled} longNames={longNames} />,
+    render: () => <TranscriptPlayerHarness disabled={disabled} longNames={longNames} takes={takes} />,
     ipc: {
       note_session_playback_path: () => null,
       note_timeline_set_chunk_text: () => null,
@@ -209,9 +209,12 @@ function playerCase(disabled: boolean, width = 420, longNames = false): Scenario
 function TranscriptPlayerHarness({
   disabled,
   longNames = false,
+  takes = 1,
 }: {
   disabled: boolean;
   longNames?: boolean;
+  /** More than one: two recordings, with audio, so the player offers a choice. */
+  takes?: number;
 }) {
   const turn = (
     chunkIdx: number,
@@ -243,20 +246,18 @@ function TranscriptPlayerHarness({
       noteId="mock-note"
       timeline={timeline}
       setTimeline={setTimeline}
-      sessions={[
-        {
-          id: "s1",
-          index: 1,
-          startedAt: new Date().toISOString(),
-          durationMs: 12000,
-          streams: ["mic"],
-          canTranscribe: false,
-          canRetranscribe: false,
-          hasPlayback: false,
-        },
-      ]}
+      sessions={Array.from({ length: takes }, (_, i) => ({
+        id: `s${i + 1}`,
+        index: i + 1,
+        startedAt: new Date().toISOString(),
+        durationMs: 12000,
+        streams: ["mic" as const],
+        canTranscribe: false,
+        canRetranscribe: false,
+        hasPlayback: takes > 1,
+      }))}
       fallbackPlaybackUrl={null}
-      audioAvailable={false}
+      audioAvailable={takes > 1}
       keepAudio={false}
       disabled={disabled}
       fill
@@ -1743,6 +1744,8 @@ const CASES: Record<string, Scenario> = {
   // question at 260 is whether the title row and the open edit box still fit;
   // at 720 it is whether the title still reads as a title.
   "player-260": playerCase(false, 260),
+  "player-takes": playerCase(false, 420, false, 2),
+  "player-takes-260": playerCase(false, 260, false, 2),
   "player-720": playerCase(false, 720),
   "player-260-longnames": playerCase(false, 260, true),
 

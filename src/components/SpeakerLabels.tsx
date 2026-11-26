@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
-import { Merge, User } from "lucide-react";
+import { User } from "lucide-react";
 import { extractSpeakerLabels } from "../lib/speakers";
 import { Menu, MenuContent, MenuItem, MenuLabel, MenuTrigger } from "./ui/Menu";
+import { cn } from "../lib/cn";
 import { Combobox, type ComboboxOption } from "./ui/Combobox";
 import {
   caseVariantTarget,
@@ -10,12 +11,12 @@ import {
 } from "../lib/speakerSuggest";
 import { isPerRecordingLabel } from "../lib/crossNoteRename";
 
-// Speaker chip strip shown above the transcript. Each unique speaker label
-// renders as a colour-coded pill; clicking a pill renames it inline, and a
-// dedicated merge affordance folds one label into another. A merge IS a
-// rename whose target is an already-existing label (#23) — both actions
-// surface through the single `onRename(oldLabel, newLabel)` callback, which
-// the parent wires to the transcript rewrite + backend timeline rename.
+// The speakers above the transcript, one quiet name each. Clicking a name
+// renames it inline, and the other speakers on the note are offered below the
+// input as merges. A merge IS a rename whose target is an already-existing
+// label (#23) — both surface through the single `onRename(oldLabel, newLabel)`
+// callback, which the parent wires to the transcript rewrite + backend
+// timeline rename.
 //
 // Extracted from Note.tsx so the strip can be unit-tested in isolation
 // (see SpeakerLabels.test.tsx).
@@ -65,7 +66,7 @@ export function SpeakerLabels({
   // disappears the moment a merge collapses the count back to 1.
   if (labels.length < 2) return null;
   return (
-    <div className="flex flex-wrap gap-2 mb-4">
+    <div className="flex flex-wrap gap-0.5 mb-2 -ml-2">
       {labels.map((label) => (
         <SpeakerChip
           key={label}
@@ -165,6 +166,30 @@ function SpeakerChip({
     ),
   }));
 
+  // The note's other speakers, as merges, unless a suggestion already names
+  // them. All of them while the name is untouched, then those the text matches.
+  const query = draft.trim().toLowerCase();
+  const suggested = new Set(ranked.map((s) => s.label.toLowerCase()));
+  for (const target of otherLabels) {
+    if (suggested.has(target.toLowerCase())) continue;
+    if (draft !== label && !target.toLowerCase().includes(query)) continue;
+    options.push({
+      value: target,
+      label: target,
+      content: (
+        <>
+          <span
+            className="inline-block h-2 w-2 shrink-0 rounded-full"
+            style={{ background: colors.get(target) ?? SPEAKER_COLORS[0] }}
+            aria-hidden
+          />
+          <span>@{target}</span>
+          <span className="ml-auto text-[11px] opacity-60">Merge</span>
+        </>
+      ),
+    });
+  }
+
   // Enter normally commits exactly what was typed. The one exception is a pure
   // case/diacritic variant of a name that already exists — "åse" beside "Åse" is
   // never a deliberate second person.
@@ -181,6 +206,11 @@ function SpeakerChip({
     const trimmed = next.trim();
     if (!trimmed || trimmed === label) {
       setDraft(label);
+      return;
+    }
+    // Into another speaker on this note: a merge, which is this note's alone.
+    if (otherLabels.includes(trimmed)) {
+      onMerge(trimmed);
       return;
     }
     // With other notes carrying this label, the scope is a real question and the
@@ -201,7 +231,8 @@ function SpeakerChip({
   // no merge.
   if (readOnly) {
     return (
-      <span className="nd-speaker-pill" style={{ background: color }}>
+      <span className={nameClass}>
+        <SpeakerDot color={color} />
         {label}
       </span>
     );
@@ -219,7 +250,8 @@ function SpeakerChip({
     return (
       <Menu open onOpenChange={(next) => !next && cancelScope()}>
         <MenuTrigger asChild>
-          <button type="button" className="nd-speaker-pill" style={{ background: color }}>
+          <button type="button" className={cn(nameClass, "bg-[var(--color-pill-hover)]")}>
+            <SpeakerDot color={color} />
             {pendingName}
           </button>
         </MenuTrigger>
@@ -261,69 +293,44 @@ function SpeakerChip({
     // size= sets the visible character width, so the input width tracks the
     // typed text. Floor at 3 so the pill never collapses to nothing mid-edit.
     return (
-      <Combobox
-        value={draft}
-        onValueChange={setDraft}
-        options={options}
-        preselect={preselect}
-        onCommit={commit}
-        onCancel={() => {
-          setDraft(label);
-          setEditing(false);
-        }}
-        aria-label={`Rename ${label}`}
-        listLabel="Speaker names you have used"
-        size={Math.max(draft.length, 3)}
-        className="nd-speaker-pill cursor-text outline-none"
-        style={{ background: color }}
-      />
+      <span className={cn(nameClass, "bg-[var(--color-pill-hover)]")}>
+        <SpeakerDot color={color} />
+        <Combobox
+          value={draft}
+          onValueChange={setDraft}
+          options={options}
+          preselect={preselect}
+          onCommit={commit}
+          onCancel={() => {
+            setDraft(label);
+            setEditing(false);
+          }}
+          aria-label={`Rename ${label}`}
+          autoFocus
+          listLabel="Speaker names"
+          size={Math.max(draft.length, 3)}
+          className="bg-transparent cursor-text outline-none"
+        />
+      </span>
     );
   }
 
   return (
-    <span className="inline-flex items-center gap-1">
-      <button
-        type="button"
-        onClick={() => setEditing(true)}
-        title="Click to rename — applies to every turn from this speaker"
-        className="nd-speaker-pill cursor-pointer hover:opacity-90"
-        style={{ background: color }}
-      >
-        {label}
-      </button>
-      {otherLabels.length > 0 && (
-        // The inline menu itself is the confirmation — the Tauri webview blocks
-        // window.confirm, so picking a target IS the commit and there's no
-        // destructive default (#23). Focus-in, arrow roving, Escape-returns-
-        // focus and dismissal all come from the shared `Menu` now (#114).
-        <Menu>
-          <MenuTrigger
-            aria-label={`Merge ${label} into another speaker`}
-            title="Merge this speaker into another"
-            className="inline-flex items-center justify-center rounded-full p-1 text-[color:var(--color-text-muted)] hover:text-[color:var(--color-text)] hover:bg-[color:var(--color-pill-hover)] transition-colors"
-          >
-            <Merge size={13} strokeWidth={1.75} />
-          </MenuTrigger>
-          <MenuContent aria-label={`Merge ${label} into`} className="bg-[var(--color-surface)]">
-            <MenuLabel>Merge into</MenuLabel>
-            {otherLabels.map((target) => (
-              <MenuItem
-                key={target}
-                aria-label={`Merge ${label} into ${target}`}
-                onSelect={() => onMerge(target)}
-                className="px-2 text-[11px] tracking-[0.04em] text-[color:var(--color-text)]"
-              >
-                <span
-                  className="inline-block h-2 w-2 shrink-0 rounded-full"
-                  style={{ background: colors.get(target) ?? SPEAKER_COLORS[0] }}
-                  aria-hidden
-                />
-                {target}
-              </MenuItem>
-            ))}
-          </MenuContent>
-        </Menu>
-      )}
-    </span>
+    <button
+      type="button"
+      onClick={() => setEditing(true)}
+      title={otherLabels.length > 0 ? "Rename, or merge into another speaker" : "Rename"}
+      className={cn(nameClass, "cursor-pointer hover:bg-[var(--color-pill-hover)]")}
+    >
+      <SpeakerDot color={color} />
+      {label}
+    </button>
   );
+}
+
+const nameClass =
+  "inline-flex items-center gap-1.5 h-7 max-w-full pl-2 pr-2.5 rounded-full text-[13px] text-[var(--color-text)] transition-colors";
+
+function SpeakerDot({ color }: { color: string }) {
+  return <span className="inline-block h-2 w-2 shrink-0 rounded-full" style={{ background: color }} aria-hidden />;
 }

@@ -119,29 +119,11 @@ input::placeholder, textarea::placeholder {
   line-height: 1.2;
 }
 
-/* Speaker label pill — small filled chip used in the rename strip
-   above the transcript. Colour is set per-speaker via inline style;
-   we cycle through the four semantic colours in first-encounter
-   order so each note has a stable visual mapping. */
-.nd-speaker-pill {
-  display: inline-flex;
-  align-items: center;
-  padding: 1px 9px;
-  border-radius: 999px;
-  font-family: var(--font-mono);
-  font-size: 11px;
-  font-weight: 500;
-  letter-spacing: 0.04em;
-  color: #ffffff;
-  white-space: nowrap;
-  vertical-align: 1px;
-}
-
 /* Speaker dot — compact gutter marker used inside the transcript
    body. Lives in a left margin via absolute positioning so the text
    column starts at column 0 (matches the textarea wrap when the
-   user clicks to edit). Click target is generous via a transparent
-   ::before so the 10 px visual still has a 32 px hit area. */
+   user clicks to edit). Where it is a button, a transparent ::before
+   gives the 10 px visual a 32 px hit area. */
 .nd-speaker-dot {
   position: absolute;
   /* `left: 0`, NOT a negative gutter offset. The dot used to hang at -16px,
@@ -167,27 +149,24 @@ input::placeholder, textarea::placeholder {
   border-radius: 50%;
   padding: 0;
   border: 0;
-  cursor: pointer;
   transition: transform 120ms cubic-bezier(0.25, 0.1, 0.25, 1),
               opacity 120ms cubic-bezier(0.25, 0.1, 0.25, 1);
 }
 
-.nd-speaker-dot::before {
+/* Only Verbatim's dot does something (it reassigns the turn); elsewhere the
+   dot is a marker and must not look clickable. */
+button.nd-speaker-dot:enabled {
+  cursor: pointer;
+}
+
+button.nd-speaker-dot:enabled::before {
   content: "";
   position: absolute;
   inset: -11px;
 }
 
-.nd-speaker-dot:hover {
+button.nd-speaker-dot:enabled:hover {
   transform: scale(1.25);
-}
-
-.nd-speaker-dot:disabled {
-  cursor: default;
-}
-
-.nd-speaker-dot:disabled:hover {
-  transform: none;
 }
 
 .nd-chip {
@@ -579,10 +558,13 @@ input::placeholder, textarea::placeholder {
  * spotlight without breaking the line shape. No CSS transitions: the
  * rAF loop snaps `currentMs` to the exact word boundary, and any
  * easing here would re-introduce the mushy lag we just removed. */
+/* The padding gives the highlight room; the margin keeps the words where
+   plain text would put them, so Verbatim lines up with Clean. */
 .nd-word {
   cursor: pointer;
   border-radius: 3px;
   padding: 0 1px;
+  margin: 0 -1px;
 }
 .nd-word:hover {
   background: var(--color-pill-hover);
@@ -993,14 +975,6 @@ kbd {
   font-family: inherit;
 }
 
-/* The transcript player's volume is PlaybackVolume, which can go past 100%;
-   the element's own mute button and slider would be a second control for it. */
-.nd-player::-webkit-media-controls-mute-button,
-.nd-player::-webkit-media-controls-volume-slider,
-.nd-player::-webkit-media-controls-volume-control-container {
-  display: none;
-}
-
 /* PlaybackVolume's slider (#234): a tick at 100%, and the range past it in
    the danger tone, filled or not, so a boost reads as one without a caption.
    `--value` and `--unity-at` are fractions of the range, set inline. */
@@ -1046,6 +1020,44 @@ kbd {
     border-color: var(--color-danger);
   }
   .nd-volume:focus-visible {
+    outline: 2px solid var(--color-interactive);
+    outline-offset: 2px;
+    border-radius: 4px;
+  }
+
+  /* PlayerBar's position. `--value` is the played fraction, set inline. */
+  .nd-scrub {
+    --thumb: 12px;
+    --pos: calc(var(--thumb) / 2 + (100% - var(--thumb)) * var(--value));
+    -webkit-appearance: none;
+    appearance: none;
+    height: 16px;
+    background: transparent;
+    cursor: pointer;
+  }
+  .nd-scrub:disabled {
+    cursor: default;
+  }
+  .nd-scrub::-webkit-slider-runnable-track {
+    height: 4px;
+    border-radius: 2px;
+    background: linear-gradient(
+      to right,
+      var(--color-text) 0 var(--pos),
+      var(--color-line-visible) var(--pos) 100%
+    );
+  }
+  .nd-scrub::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: var(--thumb);
+    height: var(--thumb);
+    margin-top: calc((4px - var(--thumb)) / 2);
+    border-radius: 50%;
+    background: var(--color-text);
+    box-shadow: 0 0 0 3px var(--color-surface-2);
+  }
+  .nd-scrub:focus-visible {
     outline: 2px solid var(--color-interactive);
     outline-offset: 2px;
     border-radius: 4px;

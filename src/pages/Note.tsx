@@ -27,7 +27,6 @@ import {
   Pencil,
   RefreshCw,
   Sparkles,
-  UserRoundPen,
   Users,
   X,
 } from "lucide-react";
@@ -60,8 +59,8 @@ import { formatDateChip, monthGrid, toTimeInput, withTime } from "../lib/noteDat
 import { Popover, PopoverContent, PopoverTrigger } from "../components/ui/Popover";
 import { shouldAdoptRemoteBody, shouldAdoptRemoteTitle, shouldRequestTitleForBody } from "../lib/noteSync";
 import { SpeakerLabels, speakerColorMap } from "../components/SpeakerLabels";
-import { RecordingSessions } from "../components/RecordingSessions";
-import { PlaybackVolume } from "../components/PlaybackVolume";
+import { PlayerBar, RecordingSelect } from "../components/PlayerBar";
+import { ProgressTrack } from "../components/ui/ProgressTrack";
 import { resumePlaybackVolume } from "../lib/playbackVolume";
 import {
   formatDuration,
@@ -652,7 +651,8 @@ export function Note() {
   // (#146). The backend decides both halves — untranscribed AND audio still on
   // disk — so a take whose audio was swept away never offers an action that
   // can only fail.
-  const pendingTranscription = sessions.some((sess) => sess.canTranscribe);
+  const pendingTakes = sessions.filter((sess) => sess.canTranscribe).length;
+  const pendingTranscription = pendingTakes > 0;
   // Any take whose raw streams are still on disk can be re-run — for a
   // recording that came back off the wrong language or the wrong model. Same
   // backend answer as `canTranscribe`, one condition looser.
@@ -1263,6 +1263,15 @@ export function Note() {
       "",
     [note?.transcript, isUnsaved, showsClean, cleanView],
   );
+  const speakerLabelCount = useMemo(
+    () => extractSpeakerLabels(draft?.transcript ?? "").length,
+    [draft?.transcript],
+  );
+  const rediarize = useRediarize(
+    draft?.id ?? null,
+    sessions.length > 1,
+    !!draft?.transcript.trim() && !readOnly,
+  );
 
   if (!draft) return null;
 
@@ -1286,6 +1295,38 @@ export function Note() {
   // chunks stay visible. After stop / on a saved note the user is
   // reading from the top, so flip back to top alignment.
   const transcriptLive = isRecording || isPaused || isStopping || isDiarizing || isImporting;
+
+  const languageValue = draft.language || uiLang;
+  const languagePicker = (
+    <LanguagePicker value={languageValue} onChange={(v) => patch("language", v)} />
+  );
+  const speakersPicker = (
+    <SpeakersPicker
+      value={draft.expected_speakers}
+      onChange={async (n) => {
+        if (!draft || readOnly) return;
+        const next = { ...draft, expected_speakers: n };
+        setDraft(next);
+        await ipc.updateNote(draft.id, { expected_speakers: n });
+        upsert(next);
+      }}
+    />
+  );
+  const transcriptSummary = [
+    LANGUAGES.find((l) => l.value === languageValue)?.label ?? languageValue,
+    speakerLabelCount > 0 ? speakerCountLabel(speakerLabelCount) : null,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+  const cleanSwitch = cleanOn && timeline.length > 0 && timelineCoversTranscript;
+  const canCleanAgain =
+    cleanSwitch &&
+    transcriptView === "clean" &&
+    cleanAvailable &&
+    !cleaning &&
+    !readOnly &&
+    !recActive &&
+    cleanedWords > 0;
 
   const folder = draft.folder_id ? folders.find((f) => f.id === draft.folder_id) : null;
   const backTo = folder ? `/folder/${folder.id}` : "/all-notes";
@@ -1778,91 +1819,50 @@ export function Note() {
               chatTarget && <ChatPanel target={chatTarget} onControls={handleChatControls} />
             ) : (
               <div className="flex-1 min-h-0 flex flex-col px-4 py-4">
-                <div className="flex flex-wrap items-center gap-2 mb-4 shrink-0">
-                  <LanguagePicker
-                    value={draft.language || uiLang}
-                    onChange={(v) => patch("language", v)}
-                  />
-                  <SpeakersPicker
-                    value={draft.expected_speakers}
-                    onChange={async (n) => {
-                      if (!draft || readOnly) return;
-                      const next = { ...draft, expected_speakers: n };
-                      setDraft(next);
-                      await ipc.updateNote(draft.id, { expected_speakers: n });
-                      upsert(next);
-                    }}
-                  />
-                  {/* Copy + Re-transcribe, mirroring the Summary group's
-                      Copy + Regenerate pair — the two panels' actions should
-                      not read as different kinds of control.
-
-                      Copy takes the raw stored string, labels and all: view
-                      mode drops the label text in favour of the coloured dot,
-                      but a pasted transcript is only useful elsewhere if it
-                      says who spoke.
-
-                      Both need a transcript, so the wrapper carries that guard
-                      and a note without one gets no empty flex box in the
-                      picker row. Re-transcribe is gated on it with Copy, not
-                      only on `canRetranscribe`: this control REPLACES a
-                      transcript, so on a note whose take was never transcribed
-                      it would sit beside the toolbar's Transcribe doing the
-                      same work, under a tooltip that isn't true — and spend a
-                      revision snapshot of nothing. */}
-                  {hasTranscript && (
-                    <div className="ml-auto flex items-center gap-0.5">
+                {hasTranscript ? (
+                  <div className="flex flex-wrap items-center gap-x-1 gap-y-1.5 mb-1.5 shrink-0 min-w-0">
+                    {cleanSwitch && (
+                      <Segmented<TranscriptView>
+                        label="Transcript version"
+                        value={transcriptView}
+                        onChange={(v) => void writeSetting("transcript_view", v)}
+                        options={[
+                          { value: "clean", label: "Clean" },
+                          { value: "verbatim", label: "Verbatim" },
+                        ]}
+                      />
+                    )}
+                    <div className="ml-auto flex items-center gap-0.5 min-w-0">
+                      <TranscriptSettings
+                        summary={transcriptSummary}
+                        language={languagePicker}
+                        speakers={speakersPicker}
+                        rediarize={readOnly ? null : rediarize}
+                        keepAudio={keepAudio}
+                        retranscribe={
+                          !readOnly && canRetranscribe
+                            ? {
+                                run: () => void runTranscribe(draft.id, "all"),
+                                disabled: isTranscribing || recActive,
+                              }
+                            : null
+                        }
+                        cleanAgain={
+                          canCleanAgain
+                            ? { edited: cleanView?.edited ?? 0, run: () => requestClean(draft.id, "all") }
+                            : null
+                        }
+                        diagnostics={devMode ? <DiagnosticsLinks noteId={draft.id} /> : null}
+                      />
                       <CopyButton label="Transcript" getText={copyableTranscript} onCopied={() => reportCopied(audit, draft)} />
-                      {/* A take still holding untranscribed audio on a note
-                          that already has text — the second take of a note
-                          recorded with "Transcribe manually" on, which is the
-                          ordinary shape once the setting is enabled. The empty
-                          state below carries this action when there is no
-                          text; here there is, so it belongs in the row, or the
-                          panel is once again reporting a gap it cannot close.
-
-                          Ordered by how much each changes: copy, then add the
-                          missing take, then replace every take's text. */}
-                      {!readOnly && pendingTranscription && (
-                        <button
-                          type="button"
-                          onClick={() => void runTranscribe(draft.id, "pending")}
-                          disabled={isTranscribing || recActive}
-                          title="Transcribe the take that hasn't been transcribed yet, leaving the rest of this transcript alone."
-                          aria-label="Transcribe"
-                          className="nd-btn-icon nd-btn-icon-sm"
-                        >
-                          <FileText size={15} strokeWidth={1.6} />
-                        </button>
-                      )}
-                      {!readOnly && canRetranscribe && (
-                        <button
-                          type="button"
-                          onClick={() => void runTranscribe(draft.id, "all")}
-                          disabled={isTranscribing || recActive}
-                          title={
-                            // Names what it replaces. The rewrite has no undo
-                            // of its own, so the backend snapshots a note
-                            // revision first — but a tooltip that said only
-                            // "re-transcribe" would leave the user to discover
-                            // that their corrected turns were gone.
-                            isTranscribing
-                              ? "Transcribing…"
-                              : "Re-transcribe from the saved audio, replacing this transcript. Uses the language and speaker count above."
-                          }
-                          aria-label="Re-transcribe"
-                          className="nd-btn-icon nd-btn-icon-sm"
-                        >
-                          <RefreshCw
-                            size={15}
-                            strokeWidth={1.6}
-                            className={isTranscribing ? "animate-spin" : undefined}
-                          />
-                        </button>
-                      )}
                     </div>
-                  )}
-                </div>
+                  </div>
+                ) : (
+                  <div className="flex flex-wrap items-center gap-2 mb-4 shrink-0">
+                    {languagePicker}
+                    {speakersPicker}
+                  </div>
+                )}
 
                 {(isRecording || isPaused) && <ListeningHeader noteId={draft.id} />}
 
@@ -1920,28 +1920,39 @@ export function Note() {
                             .catch((err) => console.error("noteTimelineRename failed", err));
                         }}
                       />
-                      {!readOnly && (
-                        <RediarizeAction noteId={draft.id} keepAudio={keepAudio} />
+                      {!readOnly && pendingTranscription && (
+                        <p className="mb-2 text-xs text-[var(--color-text-muted)]">
+                          {pendingTakes === 1
+                            ? "One recording hasn't been transcribed yet."
+                            : `${pendingTakes} recordings haven't been transcribed yet.`}{" "}
+                          <button
+                            type="button"
+                            onClick={() => void runTranscribe(draft.id, "pending")}
+                            disabled={isTranscribing || recActive}
+                            title="Transcribe the take that hasn't been transcribed yet, leaving the rest of this transcript alone."
+                            className="nd-bare underline underline-offset-2 text-[var(--color-accent-text)] hover:text-[var(--color-text)] disabled:opacity-50"
+                          >
+                            Transcribe
+                          </button>
+                        </p>
                       )}
-                      {cleanOn && timeline.length > 0 && timelineCoversTranscript && (
-                        <CleanViewRow
-                          view={transcriptView}
-                          onView={(v) => void writeSetting("transcript_view", v)}
+                      {cleanSwitch && (transcriptView === "clean" || !!cleaning) && (
+                        <CleanStatus
                           words={cleanWords}
                           cleanedWords={cleanedWords}
-                          edited={cleanView?.edited ?? 0}
                           stale={hasStaleTake(cleanView)}
-                          canClean={cleanAvailable}
                           cleaning={cleaning}
                           error={cleanError}
                           onClean={
-                            readOnly || recActive
+                            readOnly || recActive || !cleanAvailable
                               ? undefined
                               : (request) => requestClean(draft.id, request)
                           }
                         />
                       )}
-                      {devMode && <DiagnosticsLinks noteId={draft.id} />}
+                      {rediarize.error && (
+                        <p className="mb-2 text-xs text-[var(--color-danger)] break-all">{rediarize.error}</p>
+                      )}
                     </div>
                     {/* The styled reader is driven by the timeline, not by the
                         audio: with keep_audio off (#24) the WAV is absent but
@@ -3146,7 +3157,8 @@ export const TranscriptEditor = memo(function TranscriptEditor({
           // it beats any Tailwind border utility we could ask for here, so
           // dropping the opt-out IS the focus border the issue asks for.
           className={cn(
-            "w-full resize-none text-sm leading-relaxed text-[var(--color-text-muted)]",
+            "w-full resize-none",
+            READER_TEXT,
             fill && "flex-1 min-h-0 overflow-y-auto",
           )}
         />
@@ -3211,6 +3223,10 @@ function parseTranscriptLines(transcript: string): ParsedTranscriptLine[] {
   });
 }
 
+/** The transcript's text, the same in every reader: Clean, Verbatim and the
+ *  plain fallback. */
+const READER_TEXT = "text-[15px] leading-[1.65] text-[var(--color-text)]";
+
 /** A turn's speaker, above the words they said (#176).
  *
  * Shared by BOTH readers — `TranscriptPlayer` over a timeline and
@@ -3241,7 +3257,9 @@ function TurnTitle({
 }) {
   return (
     <div data-turn-title className={cn("flex items-center gap-1.5 mb-0.5", className)}>
-      <div className="relative w-3 shrink-0 self-stretch">{dot}</div>
+      {/* The name's size, so the dot's `lh` is the name's line and not the
+          transcript text's. */}
+      <div className="relative w-3 shrink-0 self-stretch text-[13px]">{dot}</div>
       {/* `title` carries what the truncation stops showing — the panel is
           dragged as narrow as `PANEL_FLOOR`, where a real full name is clipped
           (measured: clipping starts around a 280px panel). Same rule the note
@@ -3313,7 +3331,7 @@ const TranscriptView = memo(function TranscriptView({
       onClick={onClick}
       title={disabled ? disabledReason : "Click to edit"}
       className={
-        "text-sm leading-relaxed text-[var(--color-text-muted)] overflow-y-auto " +
+        READER_TEXT + " overflow-y-auto " +
         (fill ? "flex-1 min-h-0 " : "") +
         (disabled ? "cursor-default" : "cursor-text")
       }
@@ -3463,7 +3481,7 @@ export const TranscriptPlayer = memo(function TranscriptPlayer({
   fill?: boolean;
   bottomAligned: boolean;
   // Clean (#217) shows the note's clean paragraphs (`cleanView`) in place of
-  // the turns; the player above stays, for "play from here".
+  // the turns, with no player: it is a text to read and edit.
   view?: TranscriptView;
   cleanView?: CleanView | null;
   // A clean pass is running: in Clean, words it hasn't reached draw a
@@ -3473,7 +3491,7 @@ export const TranscriptPlayer = memo(function TranscriptPlayer({
 }) {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   // Which session's audio is loaded in the player. Defaults to the first
-  // session that has a playback file. Clicking a pill (or a word in another
+  // session that has a playback file. Picking a recording in the player (or a word in another
   // session) switches it.
   const [activeSessionId, setActiveSessionId] = useState<string | null>(
     () => (sessions.find((s) => s.hasPlayback) ?? sessions[0])?.id ?? null,
@@ -3543,7 +3561,7 @@ export const TranscriptPlayer = memo(function TranscriptPlayer({
     };
   }, [activeSessionId, noteId, fallbackPlaybackUrl]);
   const [isPlaying, setIsPlaying] = useState(false);
-  // Topmost session divider currently in view — the idle active-pill anchor.
+  // Topmost session divider currently in view — the player's recording when idle.
   const [topVisibleSessionId, setTopVisibleSessionId] = useState<string | null>(null);
   // The two derived states from playback position: which chunks
   // currently bracket currentTime (mic + sys can overlap, so this is a
@@ -3573,6 +3591,9 @@ export const TranscriptPlayer = memo(function TranscriptPlayer({
   const timelineRef = useRef(timeline);
   timelineRef.current = timeline;
   const clean = view === "clean" && !!cleanView;
+  useEffect(() => {
+    if (clean) audioRef.current?.pause();
+  }, [clean]);
 
   const labels = useMemo(
     () => Array.from(new Set(timeline.map((t) => t.label).filter(Boolean))),
@@ -3603,7 +3624,7 @@ export const TranscriptPlayer = memo(function TranscriptPlayer({
     sessions.forEach((s) => m.set(s.id, s));
     return m;
   }, [sessions]);
-  // The visually-active pill: playhead's session while playing, else the
+  // The player's recording: the playhead's session while playing, else the
   // topmost divider in view (idle scroll orientation).
   const activePillId = resolveActivePill({
     playing: isPlaying,
@@ -3748,9 +3769,9 @@ export const TranscriptPlayer = memo(function TranscriptPlayer({
       computeAndSync();
     };
     // When the source swaps to a newly-selected session, apply any pending
-    // seek (and resume) once the new audio is ready. This is how a pill
-    // click / cross-session word click seeks-and-keeps-playing across the
-    // src change.
+    // seek (and resume) once the new audio is ready. This is how picking a
+    // recording / a cross-session word click seeks-and-keeps-playing across
+    // the src change.
     const onLoaded = () => {
       applyPendingSeek();
       computeAndSync();
@@ -3814,7 +3835,7 @@ export const TranscriptPlayer = memo(function TranscriptPlayer({
     setActiveSessionId(sessionId);
   }
 
-  // Click a session pill: scroll that session's first turn to the top and
+  // Pick a recording in the player: scroll its first turn to the top and
   // seek the player to its start, keeping the current play state
   // (seek-and-keep-playing). Read-only carousel — no delete in v1.
   function selectSession(sessionId: string) {
@@ -3832,7 +3853,7 @@ export const TranscriptPlayer = memo(function TranscriptPlayer({
   }
 
   // Idle active-pill tracking: on scroll, find the topmost rendered turn and
-  // adopt its session so the lit pill follows the reader (#16).
+  // adopt its session so the player's recording follows the reader (#16).
   function handleScroll() {
     const el = scrollRef.current;
     if (!el) return;
@@ -3947,49 +3968,29 @@ export const TranscriptPlayer = memo(function TranscriptPlayer({
 
   return (
     <div className={fill ? "flex flex-col min-h-0 flex-1" : undefined}>
-      <div className={cn(fill && "shrink-0")}>
-        <RecordingSessions
-          sessions={sessions}
-          activeId={activePillId}
-          onSelect={selectSession}
+      {/* Mounted in Clean too, only out of sight: the playback listeners are
+          bound to this element once, on mount. */}
+      {audioAvailable && (
+        <audio
+          ref={audioRef}
+          src={activeUrl ?? undefined}
+          // preload="auto" so the whole WAV streams in up-front and
+          // every subsequent seek is in-memory. With "metadata" each
+          // user click triggered a range-request through Tauri's
+          // asset protocol; rapid clicking flooded I/O and on at
+          // least one user's machine made the whole system lag.
+          preload="auto"
+          // Lets the volume boost read the samples; the asset protocol answers CORS.
+          crossOrigin="anonymous"
+          onPlay={(e) => resumePlaybackVolume(e.currentTarget)}
+          hidden
         />
-      </div>
-      <div className={cn("flex items-center gap-2 mb-3", fill && "shrink-0")}>
-        {/* The no-audio line carries no "— Settings → Recording" pointer: the
-            user turned retention off themselves, so being told where the switch
-            is reads as nagging. The greyed re-diarize control's tooltip still
-            names it, for the case where someone wants the capability back. */}
-        {audioAvailable ? (
-          <>
-            <audio
-              ref={audioRef}
-              src={activeUrl ?? undefined}
-              controls
-              // preload="auto" so the whole WAV streams in up-front and
-              // every subsequent seek is in-memory. With "metadata" each
-              // user click triggered a range-request through Tauri's
-              // asset protocol; rapid clicking flooded I/O and on at
-              // least one user's machine made the whole system lag.
-              preload="auto"
-              // Lets the volume boost read the samples; the asset protocol answers CORS.
-              crossOrigin="anonymous"
-              onPlay={(e) => resumePlaybackVolume(e.currentTarget)}
-              className="nd-player flex-1 h-8"
-            />
-            <PlaybackVolume audioRef={audioRef} src={activeUrl} />
-          </>
-        ) : (
-          <p className="flex-1 text-xs text-[var(--color-text-muted)]">
-            {keepAudio
-              ? "No audio saved for this recording."
-              : "Audio not stored on this device."}
-          </p>
-        )}
-      </div>
+      )}
       {clean && cleanView ? (
         <div
           className={cn(
-            "text-sm leading-relaxed text-[var(--color-text-muted)] overflow-y-auto",
+            READER_TEXT,
+            "overflow-y-auto",
             fill && "flex-1 min-h-0",
           )}
           style={fill ? undefined : { maxHeight: "14rem" }}
@@ -4001,7 +4002,6 @@ export const TranscriptPlayer = memo(function TranscriptPlayer({
             speakers={labels}
             pending={cleanPending}
             disabled={disabled || !onCleanEdit}
-            onSeek={seekInSession}
             onEdit={onCleanEdit}
           />
         </div>
@@ -4010,7 +4010,8 @@ export const TranscriptPlayer = memo(function TranscriptPlayer({
           ref={scrollRef}
           onScroll={handleScroll}
           className={cn(
-            "text-sm leading-relaxed text-[var(--color-text-muted)] overflow-y-auto",
+            READER_TEXT,
+            "overflow-y-auto",
             fill && "flex-1 min-h-0",
           )}
           style={fill ? undefined : { maxHeight: "14rem" }}
@@ -4064,7 +4065,7 @@ export const TranscriptPlayer = memo(function TranscriptPlayer({
               }
             }
             const wordsNode = g.words.length > 0 && (
-              <div className="flex-1 nd-bare cursor-text leading-relaxed">
+              <div className="flex-1 nd-bare cursor-text">
                 {g.words.map((w, wi) => {
                   const wordActive = activeFlatIdxs.has(wi);
                   return (
@@ -4121,7 +4122,7 @@ export const TranscriptPlayer = memo(function TranscriptPlayer({
                     // 188px inside a 388px row). An unlabelled turn still puts
                     // it in a flex row, where `flex-1` governs. jsdom has no
                     // layout, so only the harness can see this.
-                    className="w-full flex-1 resize-none text-sm leading-relaxed bg-transparent"
+                    className="w-full flex-1 resize-none bg-transparent"
                   />
                 ) : wordsNode ? (
                   wordsNode
@@ -4220,9 +4221,9 @@ export const TranscriptPlayer = memo(function TranscriptPlayer({
               <div
                 data-idx={gi}
                 className={
-                  "group px-2 py-1 rounded transition-colors " +
+                  "group px-2 py-1.5 rounded-[10px] transition-colors " +
                   (isActive
-                    ? "bg-[var(--color-pill-hover)] text-[var(--color-text)]"
+                    ? "bg-[var(--color-pill-hover)]"
                     : "hover:bg-[var(--color-pill-hover)]")
                 }
               >
@@ -4299,6 +4300,27 @@ export const TranscriptPlayer = memo(function TranscriptPlayer({
         </div>
       </div>
       )}
+      {/* Hidden rather than unmounted in Clean, so it keeps its speed. */}
+      <div className={cn("pt-3", fill && "shrink-0")} hidden={clean}>
+        {audioAvailable ? (
+          <PlayerBar
+            audioRef={audioRef}
+            src={activeUrl}
+            sessions={sessions}
+            activeSessionId={activePillId}
+            onSelectSession={selectSession}
+          />
+        ) : (
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
+            {sessions.length > 1 && (
+              <RecordingSelect sessions={sessions} activeSessionId={activePillId} onSelect={selectSession} />
+            )}
+            <p className="text-xs text-[var(--color-text-muted)]">
+              {keepAudio ? "No audio saved for this recording." : "Audio not stored on this device."}
+            </p>
+          </div>
+        )}
+      </div>
     </div>
   );
 });
@@ -4339,7 +4361,7 @@ function escapeHtml(s: string): string {
     .replace(/'/g, "&#39;");
 }
 
-// Small "Diagnostics / Audio" link row under the speaker chips. Each
+// "Diagnostics / Audio" links at the foot of the transcription settings. Each
 // link is hidden until the corresponding files actually exist for this
 // note, so we don't dangle dead links — diagnostics only after a
 // diarize run has dumped its JSON, audio only when keep_audio was on
@@ -4389,7 +4411,7 @@ function DiagnosticsLinks({ noteId }: { noteId: string }) {
   }
 
   return (
-    <div className="flex items-center gap-3 text-xs text-[var(--color-text-muted)] mb-3">
+    <div className="flex items-center gap-3 text-xs text-[var(--color-text-muted)] px-2.5 pt-2 pb-1 mt-1 border-t border-[var(--color-line)]">
       {hasDiag && (
         <button
           type="button"
@@ -4414,10 +4436,12 @@ function DiagnosticsLinks({ noteId }: { noteId: string }) {
   );
 }
 
-/** The Clean view's paragraphs (#217). A paragraph plays from where it was
- *  said on click and is the user's to edit or give another speaker; a speaker's
- *  name heads each run of their paragraphs. Words no paragraph covers yet show
- *  as said, dimmed, or as a placeholder while a pass works on them. */
+type CleanTurn = Extract<CleanItem, { kind: "turn" }>;
+
+/** The Clean view's paragraphs (#217), read as a document: a speaker's name
+ *  heads each run of their paragraphs, and a click opens a paragraph in a card
+ *  to edit its text or give it another speaker. Words no paragraph covers yet
+ *  show as said, dimmed, or as a placeholder while a pass works on them. */
 function CleanParagraphs({
   view,
   sessions,
@@ -4425,7 +4449,6 @@ function CleanParagraphs({
   speakers,
   pending,
   disabled,
-  onSeek,
   onEdit,
 }: {
   view: CleanView;
@@ -4434,36 +4457,63 @@ function CleanParagraphs({
   speakers: string[];
   pending: boolean;
   disabled: boolean;
-  onSeek: (sessionId: string, ms: number) => void;
   onEdit?: (sessionId: string, turnId: string, edit: CleanEdit) => Promise<void>;
 }) {
-  const [editing, setEditing] = useState<string | null>(null);
+  const [editing, setEditing] = useState<{ sessionId: string; item: CleanTurn } | null>(null);
   const [editText, setEditText] = useState("");
+  const [editSpeaker, setEditSpeaker] = useState("");
   const taRef = useRef<HTMLTextAreaElement | null>(null);
+  // Focus leaves the card for the speaker menu, which must not count as leaving it.
+  const speakerMenuOpen = useRef(false);
+  const editingId = editing?.item.id ?? null;
   useEffect(() => {
     const ta = taRef.current;
-    if (!editing || !ta) return;
+    if (!editingId || !ta) return;
     ta.focus();
     ta.setSelectionRange(ta.value.length, ta.value.length);
-  }, [editing]);
+  }, [editingId]);
   useLayoutEffect(() => {
     const ta = taRef.current;
     if (!ta) return;
     ta.style.height = "auto";
     ta.style.height = `${ta.scrollHeight}px`;
-  }, [editing, editText]);
+  }, [editingId, editText]);
   const sessionById = useMemo(() => new Map(sessions.map((s) => [s.id, s])), [sessions]);
   const allSpeakers = useMemo(() => {
     const named = view.takes.flatMap((t) => t.items.map((i) => i.speaker));
     return Array.from(new Set([...speakers, ...named].filter(Boolean)));
   }, [speakers, view]);
 
-  function commit(sessionId: string, item: Extract<CleanItem, { kind: "turn" }>, next: string) {
+  function save() {
+    if (!editing) return;
     setEditing(null);
-    const text = next.trim().replace(/\s+/g, " ");
-    if (!text || text === item.text || !onEdit) return;
-    void onEdit(sessionId, item.id, { text });
+    const text = editText.trim().replace(/\s+/g, " ");
+    const edit: CleanEdit = {};
+    if (text && text !== editing.item.text) edit.text = text;
+    if (editSpeaker && editSpeaker !== editing.item.speaker) edit.speaker = editSpeaker;
+    if (!onEdit || (edit.text === undefined && edit.speaker === undefined)) return;
+    void onEdit(editing.sessionId, editing.item.id, edit);
   }
+
+  function open(sessionId: string, item: CleanTurn) {
+    if (disabled || editingId === item.id) return;
+    save();
+    setEditText(item.text);
+    setEditSpeaker(item.speaker);
+    setEditing({ sessionId, item });
+  }
+
+  const dotFor = (speaker: string) => (
+    <span
+      className="nd-speaker-dot"
+      style={{
+        background: colors.get(speaker) ?? "var(--color-text-disabled)",
+        left: 0,
+        top: "calc(0.5lh - 5px)",
+      }}
+      aria-hidden
+    />
+  );
 
   return (
     <>
@@ -4474,118 +4524,142 @@ function CleanParagraphs({
             {view.takes.length > 1 && <SessionDivider session={session} index={session?.index ?? 0} />}
             {take.items.map((item, k) => {
               const run = startsRun(take.items, k) && !!item.speaker;
-              const color = colors.get(item.speaker) ?? "var(--color-text-disabled)";
-              const dot = (
-                <span
-                  className="nd-speaker-dot"
-                  style={{ background: color, left: 0, top: "calc(0.5lh - 5px)" }}
-                  aria-hidden
+              const title = run && (
+                <TurnTitle
+                  dot={dotFor(item.speaker)}
+                  name={item.speaker}
+                  // The paragraph's own padding stands in for the title's
+                  // margin, so name, text and runs sit where Verbatim's do.
+                  className={cn("px-2 mb-0", k > 0 ? "pt-2.5" : "pt-1.5")}
                 />
               );
               if (item.kind === "gap") {
                 return (
-                  <div key={`gap-${k}`} className="px-2 py-1">
-                    {run && <TurnTitle dot={dot} name={item.speaker} meta={formatDuration(item.startMs)} />}
-                    {pending ? (
-                      <PendingLines words={item.words} />
-                    ) : (
-                      <p className="text-[var(--color-text-disabled)]" title="Not cleaned yet">
-                        {item.text}
-                      </p>
-                    )}
+                  <div key={`gap-${k}`}>
+                    {title}
+                    <div className="px-2 py-1">
+                      {pending ? (
+                        <PendingLines words={item.words} />
+                      ) : (
+                        <p className="text-[var(--color-text-disabled)]" title="Not cleaned yet">
+                          {item.text}
+                        </p>
+                      )}
+                    </div>
                   </div>
                 );
               }
-              const isEditing = editing === item.id && !disabled;
-              const actions =
-                disabled || isEditing ? null : (
-                  <>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setEditText(item.text);
-                        setEditing(item.id);
+              if (editingId === item.id && !disabled) {
+                return (
+                  <div key={item.id}>
+                    {title}
+                    <div
+                      className="my-0.5 rounded-[10px] border border-[var(--color-accent-2)] bg-[var(--color-surface)] px-2 pt-1 pb-2 shadow-[0_0_0_3px_var(--color-accent-soft)]"
+                      // Focus stays in the text while the card is used: a
+                      // mousedown elsewhere in it would take focus to the
+                      // page, and leaving the card saves it.
+                      onMouseDown={(e) => {
+                        if (e.target !== taRef.current && e.currentTarget.contains(e.target as Node)) e.preventDefault();
                       }}
-                      title="Edit this paragraph"
-                      aria-label="Edit this paragraph"
-                      className="nd-bare shrink-0 self-start opacity-0 group-hover:opacity-100 focus-visible:opacity-100 transition-opacity p-0.5 rounded text-[var(--color-text-muted)] hover:text-[var(--color-text)] hover:bg-[var(--color-pill-hover)]"
+                      onBlur={(e) => {
+                        if (speakerMenuOpen.current) return;
+                        if (e.relatedTarget instanceof Node && e.currentTarget.contains(e.relatedTarget)) return;
+                        save();
+                      }}
                     >
-                      <Pencil size={14} strokeWidth={1.5} />
-                    </button>
-                    {allSpeakers.length >= 2 && (
-                      <Menu>
-                        <MenuTrigger asChild>
-                          <button
-                            type="button"
-                            title="Change speaker"
-                            aria-label="Change speaker"
-                            className="nd-bare shrink-0 self-start opacity-0 group-hover:opacity-100 focus-visible:opacity-100 data-[state=open]:opacity-100 transition-opacity p-0.5 rounded text-[var(--color-text-muted)] hover:text-[var(--color-text)] hover:bg-[var(--color-pill-hover)]"
-                          >
-                            <UserRoundPen size={14} strokeWidth={1.5} />
-                          </button>
-                        </MenuTrigger>
-                        <MenuContent>
-                          {allSpeakers.map((name) => (
-                            <MenuItem
-                              key={name}
-                              disabled={name === item.speaker}
-                              onSelect={() => void onEdit?.(take.sessionId, item.id, { speaker: name })}
+                      <textarea
+                        ref={taRef}
+                        value={editText}
+                        onChange={(e) => setEditText(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Escape") {
+                            e.preventDefault();
+                            setEditing(null);
+                          } else if (e.key === "Enter" && !e.shiftKey) {
+                            e.preventDefault();
+                            save();
+                          }
+                        }}
+                        rows={1}
+                        aria-label="Edit this paragraph"
+                        className="nd-bare block w-full text-[var(--color-text)]"
+                      />
+                      <div className="flex items-center gap-2 pt-2">
+                        {allSpeakers.length >= 2 && (
+                          <Menu onOpenChange={(next) => (speakerMenuOpen.current = next)}>
+                            <MenuTrigger asChild>
+                              <button
+                                type="button"
+                                aria-label={`Speaker: ${editSpeaker}`}
+                                className="inline-flex items-center gap-1.5 h-7 min-w-0 pl-2.5 pr-2 rounded-full text-[13px] text-[var(--color-text)] bg-[var(--color-surface-2)] hover:bg-[var(--color-surface-raised)] transition-colors"
+                              >
+                                <span
+                                  className="inline-block h-2 w-2 shrink-0 rounded-full"
+                                  style={{ background: colors.get(editSpeaker) ?? "var(--color-text-disabled)" }}
+                                  aria-hidden
+                                />
+                                <span className="truncate">{editSpeaker}</span>
+                                <ChevronDown size={12} strokeWidth={2} className="shrink-0 text-[var(--color-text-muted)]" />
+                              </button>
+                            </MenuTrigger>
+                            <MenuContent
+                              aria-label="Speaker"
+                              onCloseAutoFocus={(e) => {
+                                e.preventDefault();
+                                taRef.current?.focus();
+                              }}
                             >
-                              {name}
-                            </MenuItem>
-                          ))}
-                        </MenuContent>
-                      </Menu>
-                    )}
-                  </>
-                );
-              const body = isEditing ? (
-                <textarea
-                  ref={taRef}
-                  value={editText}
-                  onChange={(e) => setEditText(e.target.value)}
-                  onBlur={() => commit(take.sessionId, item, editText)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Escape") {
-                      e.preventDefault();
-                      setEditing(null);
-                    } else if (e.key === "Enter" && !e.shiftKey) {
-                      e.preventDefault();
-                      commit(take.sessionId, item, editText);
-                    }
-                  }}
-                  rows={1}
-                  aria-label="Edit this paragraph"
-                  className="w-full flex-1 resize-none text-sm leading-relaxed bg-transparent text-[var(--color-text)]"
-                />
-              ) : (
-                <button
-                  type="button"
-                  onClick={() => onSeek(take.sessionId, item.startMs)}
-                  onDoubleClick={() => {
-                    if (disabled) return;
-                    setEditText(item.text);
-                    setEditing(item.id);
-                  }}
-                  title="Click to play from here, double-click to edit"
-                  className="text-left w-full flex-1 nd-bare cursor-text"
-                >
-                  {item.text}
-                </button>
-              );
-              return (
-                <div key={item.id} className="group px-2 py-1 rounded transition-colors hover:bg-[var(--color-pill-hover)]">
-                  {run ? (
-                    <>
-                      <TurnTitle dot={dot} name={item.speaker} meta={formatDuration(item.startMs)} trailing={actions} />
-                      {body}
-                    </>
-                  ) : (
-                    <div className="flex items-start gap-1">
-                      {body}
-                      {actions}
+                              {allSpeakers.map((name) => (
+                                <MenuItem key={name} onSelect={() => setEditSpeaker(name)}>
+                                  <span
+                                    className="inline-block h-2 w-2 shrink-0 rounded-full"
+                                    style={{ background: colors.get(name) ?? "var(--color-text-disabled)" }}
+                                    aria-hidden
+                                  />
+                                  <span className="flex-1 truncate">{name}</span>
+                                  {name === editSpeaker && (
+                                    <Check size={14} strokeWidth={2} className="shrink-0 text-[var(--color-accent-text)]" aria-hidden />
+                                  )}
+                                </MenuItem>
+                              ))}
+                            </MenuContent>
+                          </Menu>
+                        )}
+                        <div className="flex-1" />
+                        <button type="button" className="nd-btn" onClick={() => setEditing(null)}>
+                          Cancel
+                        </button>
+                        <button type="button" className="nd-btn nd-btn-primary" onClick={save}>
+                          Save
+                        </button>
+                      </div>
                     </div>
-                  )}
+                  </div>
+                );
+              }
+              return (
+                <div key={item.id}>
+                  {title}
+                  <p
+                    role={disabled ? undefined : "button"}
+                    tabIndex={disabled ? undefined : 0}
+                    // A click that ends a text selection leaves it for copying.
+                    onClick={() => {
+                      if (!window.getSelection()?.isCollapsed) return;
+                      open(take.sessionId, item);
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key !== "Enter" && e.key !== " ") return;
+                      e.preventDefault();
+                      open(take.sessionId, item);
+                    }}
+                    className={cn(
+                      "px-2 py-0.5 rounded-[10px] transition-colors",
+                      !disabled && "cursor-text hover:bg-[var(--color-pill-hover)]",
+                    )}
+                  >
+                    {item.text}
+                  </p>
                 </div>
               );
             })}
@@ -4601,9 +4675,9 @@ function CleanParagraphs({
  *  lands. */
 function PendingLines({ words }: { words: number }) {
   return (
-    <div aria-hidden className="leading-relaxed">
+    <div aria-hidden>
       {pendingLineWidths(words).map((width, i) => (
-        <div key={i} className="h-[1.625em] flex items-center">
+        <div key={i} className="h-[1.65em] flex items-center">
           <span className="skeleton block h-[0.75em]" style={{ width: `${width}%` }} />
         </div>
       ))}
@@ -4611,190 +4685,91 @@ function PendingLines({ words }: { words: number }) {
   );
 }
 
-/** The Transcript tab's Clean | Verbatim switch (#217), one line on where
- *  Clean stands for this note, and the button that cleans it. */
-function CleanViewRow({
-  view,
-  onView,
+/** Where Clean stands for this note (#217), when there is something to say,
+ *  and the link that cleans what hasn't been. */
+function CleanStatus({
   words,
   cleanedWords,
-  edited,
   stale,
-  canClean,
   cleaning,
   error,
   onClean,
 }: {
-  view: TranscriptView;
-  onView: (v: TranscriptView) => void;
   /** Verbatim words, and of those the ones the clean paragraphs cover. */
   words: number;
   cleanedWords: number;
-  /** Paragraphs the user changed, which "Clean again" replaces. */
-  edited: number;
   /** The verbatim changed under paragraphs the user edited. */
   stale: boolean;
-  /** A model is set up to clean with. */
-  canClean: boolean;
   cleaning: { done: number; total: number } | undefined;
   error: string | undefined;
   onClean?: (request: CleanRequest) => void;
 }) {
-  const [confirming, setConfirming] = useState(false);
+  const percent = cleaning ? cleanPercent(cleaning) : null;
   let caption = "";
-  if (cleaning) {
-    const percent = cleanPercent(cleaning);
-    caption = percent === null ? "Cleaning…" : `Cleaning… ${percent}%`;
-  } else if (view === "clean") {
-    if (cleanedWords === 0) caption = error ? `Not cleaned: ${error}` : "Not cleaned yet.";
-    else if (stale) caption = "The transcript changed after you edited this.";
-    else if (cleanedWords < words) caption = error ? `Partly cleaned: ${error}` : "Partly cleaned.";
-  }
-  const idle = view === "clean" && !cleaning && canClean && onClean;
-  if (idle && confirming) {
-    return (
-      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 mt-2 mb-1 text-xs">
-        <span className="flex-1 min-w-0 text-[var(--color-text-muted)]">
-          {edited === 1
-            ? "Clean again replaces the paragraph you edited."
-            : `Clean again replaces the ${edited} paragraphs you edited.`}
-        </span>
-        <button type="button" className="nd-btn" onClick={() => setConfirming(false)}>
-          Cancel
-        </button>
-        <button
-          type="button"
-          className="nd-btn nd-btn-primary"
-          onClick={() => {
-            setConfirming(false);
-            onClean("all");
-          }}
-        >
-          Clean again
-        </button>
-      </div>
-    );
-  }
+  if (cleaning) caption = percent === null ? "Cleaning…" : `Cleaning… ${percent}%`;
+  else if (cleanedWords === 0) caption = error ? `Not cleaned: ${error}` : "Not cleaned yet.";
+  else if (stale) caption = "The transcript changed after you edited this.";
+  else if (cleanedWords < words) caption = error ? `Partly cleaned: ${error}` : "Partly cleaned.";
+  if (!caption) return null;
   return (
-    <div className="flex flex-wrap items-center gap-x-3 gap-y-1 mt-2 mb-1">
-      <Segmented<TranscriptView>
-        label="Transcript version"
-        value={view}
-        onChange={onView}
-        options={[
-          { value: "clean", label: "Clean" },
-          { value: "verbatim", label: "Verbatim" },
-        ]}
-      />
-      <span className="flex-1 min-w-0 text-xs text-[var(--color-text-muted)]" aria-live="polite">
-        {caption}
-        {idle && !stale && cleanedWords < words && (
-          <>
-            {" "}
-            <button
-              type="button"
-              onClick={() => onClean("missing")}
-              className="nd-bare underline hover:text-[var(--color-text)]"
-            >
-              Clean now
-            </button>
-          </>
-        )}
-      </span>
-      {idle && cleanedWords > 0 && (
-        <button
-          type="button"
-          onClick={() => (edited > 0 ? setConfirming(true) : onClean("all"))}
-          title="Clean again: the model checks where speakers change and rewrites every paragraph anew."
-          aria-label="Clean again"
-          className="nd-btn-icon nd-btn-icon-sm"
-        >
-          <RefreshCw size={14} strokeWidth={1.6} />
-        </button>
+    <div className="mb-2 text-xs text-[var(--color-text-muted)]" aria-live="polite">
+      {caption}
+      {onClean && !cleaning && !stale && cleanedWords < words && (
+        <>
+          {" "}
+          <button
+            type="button"
+            onClick={() => onClean("missing")}
+            className="nd-bare underline underline-offset-2 text-[var(--color-accent-text)] hover:text-[var(--color-text)]"
+          >
+            Clean now
+          </button>
+        </>
+      )}
+      {cleaning && (
+        <ProgressTrack
+          value={percent === null ? null : percent / 100}
+          label={caption}
+          className="mt-1.5"
+        />
       )}
     </div>
   );
 }
 
-// User-facing "Re-diarize" affordance — sits above the transcript player so
-// it's adjacent to the speaker chip strip the user just looked at to realise
-// the speaker count is wrong. Visible regardless of dev mode.
-//
-// With no retained audio there is nothing to re-cluster, so it renders greyed
-// with a one-line reason instead of vanishing (#24): a silently absent control
-// reads as a bug, and the reason is actionable — it names the setting that
-// would keep the audio next time. Only shown at all once the note has a
-// transcript, so a fresh empty note isn't decorated with a dead control.
-//
-// Doesn't pre-check chunks.json existence; the backend has a clear error
-// message for notes recorded before chunks were persisted (audio is
-// there, chunks aren't) so we surface that on click rather than hiding
-// the button entirely.
-function RediarizeAction({
-  noteId,
-  keepAudio,
-}: {
-  noteId: string;
-  keepAudio: boolean;
-}) {
+/** Speaker detection run again from the saved audio. On a note with more than
+ *  one recording the backend unifies speakers across them instead. `enabled`
+ *  is whether the action is offered at all; nothing is fetched otherwise. */
+function useRediarize(noteId: string | null, multiSession: boolean, enabled: boolean) {
   const [hasAudio, setHasAudio] = useState(false);
-  const [multiSession, setMultiSession] = useState(false);
-  const [rediarizing, setRediarizing] = useState(false);
+  const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const phase = useRecordingStore((s) => s.status.phase);
+  // A run still going when the user opens another note reports to nobody.
+  const currentNote = useRef(noteId);
+  currentNote.current = noteId;
 
   useEffect(() => {
+    setBusy(false);
+    setError(null);
+  }, [noteId]);
+
+  useEffect(() => {
+    if (!noteId || !enabled) return;
     let cancelled = false;
     ipc.noteAudioFiles(noteId)
       .then((f) => {
         if (!cancelled) setHasAudio(f.length > 0);
       })
       .catch(() => {});
-    // On a multi-session note the backend runs the cross-session unify
-    // pass (#17) instead of the latest-take re-diarize, so the copy
-    // should say what will actually happen.
-    ipc.noteSessions(noteId)
-      .then((s) => {
-        if (!cancelled) setMultiSession(s.length > 1);
-      })
-      .catch(() => {});
     return () => {
       cancelled = true;
     };
-  }, [noteId, phase]);
+  }, [noteId, enabled, phase]);
 
-  // Greyed, not gone: the control stays visible with its reason beside it, so
-  // "why can't I fix these speaker labels" has an answer in place (#24).
-  //
-  // The reason is deliberately terse — the panel already carries one line
-  // where the player would be ("Audio not stored on this device — Settings →
-  // Recording"), and stacking a second copy of that pointer above the
-  // transcript turned the top of the panel into three lines of grey apology.
-  // The full pointer lives in the tooltip.
-  if (!hasAudio) {
-    return (
-      <p className="text-xs mb-3">
-        <button
-          type="button"
-          disabled
-          className="text-[var(--color-text-disabled)] cursor-not-allowed"
-          title={
-            keepAudio
-              ? "Speaker re-detection needs the recording's audio, which isn't saved for this note."
-              : "Speaker re-detection needs stored audio — turn on Keep recorded audio in Settings → Recording."
-          }
-        >
-          Re-diarize speakers
-        </button>
-        <span className="text-[var(--color-text-muted)]">
-          {" · needs stored audio"}
-        </span>
-      </p>
-    );
-  }
-
-  async function rediarize() {
-    setRediarizing(true);
+  const run = useCallback(async () => {
+    if (!noteId) return;
+    setBusy(true);
     setError(null);
     try {
       await ipc.rediarizeNote(noteId);
@@ -4802,38 +4777,148 @@ function RediarizeAction({
       // workspace (#16); a no-op for Personal notes.
       void ipc.uploadNoteSessions(noteId);
     } catch (e) {
-      setError(String(e));
+      if (currentNote.current === noteId) setError(String(e));
     } finally {
-      setRediarizing(false);
+      if (currentNote.current === noteId) setBusy(false);
     }
+  }, [noteId]);
+
+  return { hasAudio, multiSession, busy, error, run };
+}
+
+/** The Transcript tab's "Norwegian · 3 speakers", the transcript's language
+ *  and how many speakers it has. It opens what the next transcription uses
+ *  and everything that runs again over this transcript. */
+function TranscriptSettings({
+  summary,
+  language,
+  speakers,
+  rediarize,
+  keepAudio,
+  retranscribe,
+  cleanAgain,
+  diagnostics,
+}: {
+  summary: string;
+  language: React.ReactNode;
+  speakers: React.ReactNode;
+  rediarize: { hasAudio: boolean; multiSession: boolean; busy: boolean; run: () => Promise<void> } | null;
+  keepAudio: boolean;
+  retranscribe: { run: () => void; disabled: boolean } | null;
+  /** Clean again, with how many paragraphs the user edited, which it replaces. */
+  cleanAgain: { edited: number; run: () => void } | null;
+  diagnostics: React.ReactNode;
+}) {
+  const [open, setOpen] = useState(false);
+  const [confirming, setConfirming] = useState(false);
+  const row =
+    "flex w-full items-center gap-2.5 px-2.5 py-1.5 rounded-md text-sm text-left text-[var(--color-text)] hover:bg-[var(--color-pill-hover)] transition-colors disabled:opacity-50 disabled:hover:bg-transparent";
+  const icon = "shrink-0 text-[var(--color-text-muted)]";
+  const actions = !!rediarize || !!retranscribe || !!cleanAgain;
+
+  function act(run: () => void) {
+    setOpen(false);
+    run();
   }
 
   return (
-    <div className="flex flex-col gap-1 mb-3">
-      <button
-        type="button"
-        onClick={rediarize}
-        disabled={rediarizing}
-        className="self-start text-xs underline text-[var(--color-text-muted)] hover:text-[var(--color-text)] disabled:opacity-50"
-        title={
-          multiSession
-            ? "Re-run speaker detection across all recordings on this note, so the same voice gets one label everywhere"
-            : "Re-run speaker detection using the saved audio and the speaker count above"
-        }
-      >
-        {rediarizing
-          ? multiSession
-            ? "Unifying speakers…"
-            : "Re-diarizing…"
-          : multiSession
-            ? "Unify speakers across recordings"
-            : "Re-diarize speakers"}
-      </button>
-      {error && (
-        <p className="text-xs text-red-600 dark:text-red-400 break-all">
-          {error}
-        </p>
-      )}
-    </div>
+    <Popover
+      open={open}
+      onOpenChange={(next) => {
+        setOpen(next);
+        if (!next) setConfirming(false);
+      }}
+    >
+      <PopoverTrigger asChild>
+        <button
+          type="button"
+          aria-label={`Transcription settings: ${summary}`}
+          className="inline-flex items-center gap-1.5 h-8 min-w-0 pl-2.5 pr-2 rounded-full text-[13px] text-[var(--color-text-muted)] hover:bg-[var(--color-pill-hover)] hover:text-[var(--color-text)] data-[state=open]:bg-[var(--color-pill-hover)] data-[state=open]:text-[var(--color-text)] transition-colors"
+        >
+          <span className="truncate">{summary}</span>
+          <ChevronDown size={12} strokeWidth={2} className="shrink-0" />
+        </button>
+      </PopoverTrigger>
+      <PopoverContent align="end" maxHeight={440} className="w-[280px]">
+        {confirming && cleanAgain ? (
+          <div className="flex flex-col gap-3 px-2.5 py-2">
+            <p className="text-sm text-[var(--color-text)]">
+              {cleanAgain.edited === 1
+                ? "Clean again replaces the paragraph you edited."
+                : `Clean again replaces the ${cleanAgain.edited} paragraphs you edited.`}
+            </p>
+            <div className="flex justify-end gap-2">
+              <button type="button" className="nd-btn" onClick={() => setConfirming(false)}>
+                Cancel
+              </button>
+              <button type="button" className="nd-btn nd-btn-primary" onClick={() => act(cleanAgain.run)}>
+                Clean again
+              </button>
+            </div>
+          </div>
+        ) : (
+          <div className="flex flex-col">
+            <div className="flex items-center gap-2 pl-2.5 pr-1 py-1">
+              <span className="flex-1 text-sm text-[var(--color-text)]">Language</span>
+              {language}
+            </div>
+            <div className="flex items-center gap-2 pl-2.5 pr-1 py-1">
+              <span className="flex-1 text-sm text-[var(--color-text)]">Speakers</span>
+              {speakers}
+            </div>
+            {actions && <div className="h-px bg-[var(--color-line)] my-1 mx-1" aria-hidden />}
+            {rediarize && (
+              <button
+                type="button"
+                className={row}
+                disabled={!rediarize.hasAudio || rediarize.busy}
+                onClick={() => act(() => void rediarize.run())}
+                title={
+                  !rediarize.hasAudio
+                    ? keepAudio
+                      ? "Speaker re-detection needs the recording's audio, which isn't saved for this note."
+                      : "Speaker re-detection needs stored audio — turn on Keep recorded audio in Settings → Recording."
+                    : rediarize.multiSession
+                      ? "Re-run speaker detection across all recordings on this note, so the same voice gets one label everywhere"
+                      : "Re-run speaker detection using the saved audio and the speaker count above"
+                }
+              >
+                <Users size={15} strokeWidth={1.6} className={cn(icon, "self-start mt-0.5")} />
+                <span className="flex-1 flex flex-col">
+                  {rediarize.busy ? "Detecting speakers…" : "Detect speakers again"}
+                  {!rediarize.hasAudio && (
+                    <span className="text-xs text-[var(--color-text-muted)]">Needs stored audio</span>
+                  )}
+                </span>
+              </button>
+            )}
+            {retranscribe && (
+              <button
+                type="button"
+                className={row}
+                disabled={retranscribe.disabled}
+                onClick={() => act(retranscribe.run)}
+                title="Re-transcribe from the saved audio, replacing this transcript. Uses the language and speaker count above."
+              >
+                <FileText size={15} strokeWidth={1.6} className={icon} />
+                Transcribe again
+              </button>
+            )}
+            {cleanAgain && (
+              <button
+                type="button"
+                className={row}
+                onClick={() => (cleanAgain.edited > 0 ? setConfirming(true) : act(cleanAgain.run))}
+                title="The model checks where speakers change and rewrites every paragraph anew."
+              >
+                <Sparkles size={15} strokeWidth={1.6} className={icon} />
+                Clean again
+              </button>
+            )}
+            {diagnostics}
+          </div>
+        )}
+      </PopoverContent>
+    </Popover>
   );
 }
