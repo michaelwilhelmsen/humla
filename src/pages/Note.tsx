@@ -1130,14 +1130,6 @@ export function Note() {
     );
   }, [notesForSweep, draft]);
 
-  // What Copy hands over (#166), which is not always `draft.transcript`. A
-  // per-turn edit, a chunk delete or a label cycle (#170) rebuilds the string
-  // in the backend and it arrives on `transcript_replaced`; the draft
-  // deliberately refuses to adopt store transcript updates while idle (see
-  // `allowTranscriptSync`) so a debounced save can't clobber typing. So read
-  // the store — except while our own free-text edit is still queued or saving,
-  // where the draft is the newer of the two. Nothing here re-derives the
-  // transcript from the timeline: the backend owns that projection (ADR-0004).
   // Clean transcripts (#217). The switch is shown only while the setting is
   // on; off, the reader is Verbatim whatever was last picked.
   const cleanSetting = useLiveSetting("clean_transcripts");
@@ -1176,7 +1168,7 @@ export function Note() {
 
   // Clean what hasn't been, the first time Clean is looked at: an older note,
   // a take recorded with the setting off, entries a re-diarize or an edit
-  // left without a mask. Once per note and coverage per app session, so a
+  // left without a clean segment. Once per note and coverage per app session, so a
   // pass that fails (no model set up, a governed note) isn't retried on every
   // render; its reason shows in the switch's caption instead. A layout effect,
   // so the placeholder is up before verbatim text can paint under "Clean".
@@ -1190,10 +1182,14 @@ export function Note() {
     requestClean(draft.id, "auto");
   }, [draft?.id, cleanOn, transcriptView, activeTab, recActive, cleaning, coverage]);
 
+  // What Copy hands over (#166). In Clean, the clean read the reader shows,
+  // labelled like the stored transcript. In Verbatim, the store's transcript,
+  // which per-turn edits, deletes and label cycles (#170) rebuild in the
+  // backend and send on `transcript_replaced`: the draft refuses store updates
+  // while idle (`allowTranscriptSync`) so a debounced save can't clobber
+  // typing. Our own free-text edit still queued or saving is newer, though.
   const copyableTranscript = useCallback(
     () =>
-      // Copy takes what the reader shows: in Clean, the clean text, labelled
-      // like the stored transcript.
       (showsClean ? cleanTranscriptText(groupTimeline(cleanDisplayTimeline(timeline))) : null) ??
       (isUnsaved("transcript") ? draftRef.current?.transcript : note?.transcript) ??
       draftRef.current?.transcript ??

@@ -128,12 +128,11 @@ const DEFAULT_SILENCE_RMS_THRESHOLD: f32 = 0.005;
 const IMPORT_BACKLOG_PERMITS: usize = 16;
 
 const DEFAULT_SUMMARY_MODEL: &str = "gpt-5.4-mini";
-/// The OpenAI model for work that needs no summary model: an automatic title
-/// (#90), a clean read (#217). Sent with `reasoning_effort: "none"`, which this
-/// model accepts and `gpt-6.2-sol` refuses.
+/// The OpenAI model for work that needs no summary model: automatic titles
+/// (#90, `reasoning_effort: "none"`, which `gpt-6.2-sol` refuses) and the
+/// speaker check (#217, `"low"`).
 pub(crate) const LIGHT_OPENAI_MODEL: &str = "gpt-6-luna";
-/// The OpenAI model for the clean read (#217), with `reasoning_effort: "low"`:
-/// the light model leaves false starts and pause marks in place.
+/// The OpenAI model for the clean read (#217), with `reasoning_effort: "low"`.
 pub(crate) const CLEAN_OPENAI_MODEL: &str = "gpt-6.2-sol";
 // Ollama's default port + OpenAI-compat path. Any user running LM Studio,
 // llama-server, or vLLM will override this in Settings.

@@ -491,10 +491,8 @@ pub(super) fn absorb_text_continuation_chains(pieces: &mut [LabelledPiece]) {
                 None
             };
             // Word count per label, in the order the labels first appear in
-            // the chain. A Vec rather than a map so a tie goes to the label
-            // that spoke first, every time: a HashMap's iteration order is
-            // random per process, which made a tied chain land on a
-            // different speaker from one re-diarize to the next.
+            // the chain, so a tie goes to the label that spoke first on every
+            // run.
             let mut word_count_by_label: Vec<(String, usize)> = Vec::new();
             for piece in &pieces[i..=end] {
                 if let Some(label) = &piece.label {
@@ -533,19 +531,10 @@ pub(super) fn absorb_text_continuation_chains(pieces: &mut [LabelledPiece]) {
     }
 }
 
-/// Pure pipeline up to (but not including) `refine_pieces`: echo dedup,
-/// chronological sort, and the per-chunk split. Extracted so the diagnostic
-/// dump can capture the same unrefined piece sequence the transcript
-/// emitter and `serialize_timeline` walk, without duplicating the
-/// dedup/sort/split logic.
-///
-/// Chronological ordering uses `(start_ms, source)`. Mic and system
-/// chunks each carry start_ms relative to their own stream's first
-/// frame — close to but not exactly the same as global wall time
-/// (the streams start within a few hundred ms of each other). The
-/// tie-break preferring `Mic` reflects the typical UX assumption that
-/// the user speaks first; in practice the imprecision is well below
-/// the threshold a reader would notice.
+/// The pieces before `refine_pieces`: echo dedup, a sort by
+/// `(start_ms, source)` with mic first on a tie, and the per-chunk split.
+/// Each stream's `start_ms` counts from its own first frame, a few hundred ms
+/// apart, which a reader doesn't notice.
 pub(super) fn build_pieces_unbridged(
     chunks: &[ChunkRecord],
     split_chunk: &(dyn Fn(&ChunkRecord) -> Vec<LabelledPiece> + Send),
@@ -578,24 +567,11 @@ pub(super) fn build_pieces_unbridged(
 
 /// Every correction the labelled pieces get after the diarizer's split, in
 /// order. The one sequence `build_labelled_transcript`, `serialize_timeline`
-/// and the diagnostic dump all run, so the transcript string and the
-/// timeline the reader draws can't disagree about who said what. (They did:
-/// the boundary moves used to run on the transcript string alone, so the
-/// reader never showed them and the first rebuild from the timeline undid
-/// them.)
-///
-/// 1. `bridge_short_interjections`: an A-B-A sandwich with a brief B
-///    becomes A.
-/// 2. `realign_sentence_boundaries`: a sentence's first or last 1–3 words
-///    that landed on the wrong side of a speaker change move across,
-///    with their word timings.
-/// 3. `absorb_text_continuation_chains`: pieces that are still one
-///    sentence across a speaker change get one speaker.
-///
-/// Step 2 runs before step 3 on purpose. Both fire on "previous piece
-/// open, next piece lowercase"; moving the stray fragment closes the
-/// previous piece's sentence, so the chain rule no longer hands a whole
-/// turn to the other speaker for the sake of two words.
+/// and the diagnostic dump all run, so the transcript string and the timeline
+/// can't disagree about who said what. Boundary moves run before continuation
+/// chains: both fire on an open piece before a lowercase one, and moving the
+/// stray fragment first closes the sentence, so the chain rule doesn't hand a
+/// whole turn to the other speaker for two words.
 pub(super) fn refine_pieces(pieces: &mut [LabelledPiece]) {
     bridge_short_interjections(pieces);
     realign_sentence_boundaries(pieces);
@@ -883,32 +859,13 @@ fn repeats_across(
     !phrase.is_empty() && earlier.windows(phrase.len()).any(|w| w == phrase.as_slice())
 }
 
-/// Hand a sentence's stray first or last words across a speaker change to
-/// the side they belong to. The diarizer's turn boundary and the
-/// transcriber's word timings disagree by a few hundred milliseconds, so
-/// the opening words of a reply often land on the end of the previous
-/// turn ("…in the perfect way. It" / "does pay off."), or the closing word
-/// of a sentence on the start of the next ("…Brand new. Brand" / "new.
-/// Hadn't done anything…").
-///
-/// Only between neighbouring pieces of one stream with different labels,
-/// both timed or both untimed, at most `BOUNDARY_FRAGMENT_MAX_WORDS` words,
-/// and (when timed) within `BOUNDARY_MOVE_MAX_GAP_MS`. Words keep their
-/// timings, so playback highlighting follows the move; labels, word order
-/// and the words themselves are untouched.
-///
-/// When both directions fit, the smaller move wins: the diarizer's boundary
-/// is usually off by a word or two, so "Men hva med" + "budsjettet? Det er…"
-/// is more likely a question the first speaker finished than three words
-/// the second speaker began. A repetition (`repeats_across`) also picks
-/// backward; an even split otherwise goes forward.
-///
-/// The text cue is what licenses the move: Whisper at a real speaker change
-/// almost always closes the sentence and capitalises the next, so a
-/// capitalised fragment trailing a finished sentence, or a lowercase
-/// opening, is the boundary landing in the wrong place rather than a real
-/// turn. Scripts without case (Chinese, Japanese, Arabic, Hindi…) never
-/// match, which leaves them as the diarizer split them.
+/// Hand a sentence's stray first or last words across a speaker change to the
+/// side they belong to ("…the perfect way. It" / "does pay off."), with their
+/// timings: neighbouring pieces of one stream, both timed or both untimed, at
+/// most `BOUNDARY_FRAGMENT_MAX_WORDS` words within `BOUNDARY_MOVE_MAX_GAP_MS`.
+/// Letter case licenses the move, so scripts without case never match. When
+/// both directions fit, the smaller move wins; a repetition (`repeats_across`)
+/// picks backward, an even split forward.
 pub(super) fn realign_sentence_boundaries(pieces: &mut [LabelledPiece]) {
     for i in 0..pieces.len().saturating_sub(1) {
         let (left, right) = pieces.split_at_mut(i + 1);

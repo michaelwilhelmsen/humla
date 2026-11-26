@@ -1561,10 +1561,8 @@ mod tests {
 
     #[test]
     fn the_timeline_carries_the_same_speaker_boundaries_as_the_transcript() {
-        // The boundary moves used to run on the transcript string alone, so
-        // the reader (drawn from the timeline) still showed "It" on Speaker
-        // 1, and the first rebuild from the timeline put it back in the
-        // transcript too. Both now come out of `refine_pieces`.
+        // Both come out of `refine_pieces`, so the reader shows "It" where
+        // the transcript does.
         let chunks = vec![
             sys_with_words(
                 0,

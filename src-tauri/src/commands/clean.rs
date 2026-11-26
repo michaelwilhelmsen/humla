@@ -1,32 +1,9 @@
-//! Clean transcripts (#217): the reader can show a take as a clean read —
-//! filler words, stutters and abandoned false starts gone, grammar the speech
-//! broke put right, numbers written as numbers — beside the verbatim one.
-//!
-//! A model rewrites the transcript one segment at a time (a run of one
-//! speaker's consecutive timeline entries, about 110 words), keeping the
-//! speaker's own words, order and meaning. The rewrite is then aligned back to
-//! the verbatim words: every word the speaker actually said keeps its own
-//! timing, and a word the model changed or added takes the time of the words
-//! it replaced. So playback highlighting and click-to-seek work in Clean as in
-//! Verbatim, give or take a word where the text was restructured.
-//!
-//! The verbatim timeline stays canonical (ADR-0004): nothing here touches
-//! `timeline.jsonl` or `notes.transcript`, and summaries, chat, export, MCP and
-//! webhooks keep reading verbatim. A rewrite that fails a guard — it drops a
-//! negation or a number, or most of what it wrote was never said — leaves its
-//! segment verbatim instead.
-//!
-//! Stored per take in `clean.json` beside `timeline.jsonl`, local to this Mac
-//! (derived, never synced). A segment names its entries by a fingerprint of
-//! their words, so a renamed speaker keeps it, and an entry whose words changed
-//! (a per-turn edit, a re-diarize that moved a boundary) drops its segment back
-//! to verbatim until the next pass cleans it.
-//!
-//! Runs after the post-stop chain and a deferred transcription, and on demand
-//! when the reader asks for Clean on a take that lacks it. Uses the note's
-//! summary provider through `resolve_provider`, so a governed note is refused
-//! here as its summary is, on that provider's light model (`use_light_model`).
-//! Failure on the automatic path is silent, like titles.
+//! Clean transcripts (#217): a model rewrites each segment (one speaker's
+//! consecutive entries) as a clean read, which is aligned back to the verbatim
+//! words so every word said keeps its timing. Derived and local: stored per
+//! take in `clean.json`, keyed by the entries' word fingerprints, while
+//! `timeline.jsonl` and `notes.transcript` stay verbatim (ADR-0004). A rewrite
+//! that fails a guard leaves its segment verbatim.
 
 use super::summary::{resolve_provider, summary_provider_id, use_light_model, ResolvedProvider};
 use crate::providers::ProviderId;
@@ -41,7 +18,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 pub(crate) const CLEAN_FILE: &str = "clean.json";
 
 /// Bumped when the meaning of a stored segment changes, so an older file is
-/// ignored and the take cleaned again. 1 was the hide-only mask.
+/// ignored and the take cleaned again.
 const CLEAN_VERSION: u32 = 2;
 
 /// Most verbatim words in one segment: about a paragraph of one speaker, so a
@@ -498,7 +475,6 @@ fn digit_runs(tokens: &[String]) -> Vec<String> {
     out
 }
 
-/// Why a rewrite is refused, if it is. The segment then stays verbatim.
 /// A dash ends a broken-off thought, so punctuation after it ("–?", from a
 /// recogniser's "...?") goes.
 fn tidy_dash(token: &str) -> String {
@@ -539,6 +515,7 @@ fn said_words(clean: &[String], verbatim: &[String], pairs: &[(usize, usize)]) -
     said.len()
 }
 
+/// Why a rewrite is refused, if it is. The segment then stays verbatim.
 fn refuse(verbatim: &[String], clean: &[String], aligned: usize) -> Option<&'static str> {
     let (said, written) = (spoken(verbatim), spoken(clean));
     if written == 0 {
@@ -788,9 +765,11 @@ async fn clean_note_inner(app: &AppHandle, note_id: &str, request: CleanRequest)
                 Ok(a) => a,
                 Err(e) => {
                     failure = Some(e);
-                    // Keep what this take got so far; the rest is cleaned on
-                    // the next pass.
-                    let _ = write_segments(&take.dir, &by, segments);
+                    // Keep what this take got so far, and the rest is cleaned
+                    // on the next pass; "Clean again" keeps the old read whole.
+                    if !force {
+                        let _ = write_segments(&take.dir, &by, segments);
+                    }
                     break 'takes;
                 }
             };
@@ -836,11 +815,10 @@ async fn clean_note_inner(app: &AppHandle, note_id: &str, request: CleanRequest)
     Ok(outcome)
 }
 
-/// The provider a pass calls: the note's summary provider on its light model.
-/// On OpenAI with a little reasoning: without it the light model leaves false
-/// starts and pause marks in place and places no sentence with a speaker.
-/// Provider first, then its key: the summary path's rule. Nobody asked for an
-/// `Auto` pass, so it leaves Copilot, which counts requests, alone.
+/// The provider a pass calls: the note's summary provider on its light model,
+/// with `reasoning_effort: "low"` on OpenAI. Provider first, then its key: the
+/// summary path's rule. An `Auto` pass leaves Copilot, which counts requests,
+/// alone.
 pub(super) async fn light_provider(app: &AppHandle, note_id: &str, request: CleanRequest) -> anyhow::Result<ResolvedProvider> {
     let state: State<AppState> = app.state();
     let provider_id = {
@@ -867,9 +845,7 @@ pub(super) async fn light_provider(app: &AppHandle, note_id: &str, request: Clea
     Ok(provider)
 }
 
-/// Run a pass with the one-per-note guard and the status bracket: the speaker
-/// changes first when `turns` (`boundaries::review_note`), then the clean read
-/// when `clean`. A failed speaker check is logged and the clean read goes on.
+/// Run a pass unless one is running on the note already.
 async fn clean_note_guarded(
     app: &AppHandle,
     note_id: &str,
@@ -880,6 +856,20 @@ async fn clean_note_guarded(
     if !running().lock().insert(note_id.to_string()) {
         return Ok(CleanOutcome::default());
     }
+    run_claimed(app, note_id, request, turns, clean).await
+}
+
+/// A pass for a caller that holds the note's place in `running()`, released
+/// at the end with the closing status: the speaker changes first when `turns`
+/// (`boundaries::review_note`), then the clean read when `clean`. A failed
+/// speaker check is logged and the clean read goes on.
+async fn run_claimed(
+    app: &AppHandle,
+    note_id: &str,
+    request: CleanRequest,
+    turns: bool,
+    clean: bool,
+) -> anyhow::Result<CleanOutcome> {
     let result = async {
         if super::org::note_busy(app, note_id) {
             anyhow::bail!("This note is being recorded or transcribed. Clean runs when it's done.");
@@ -913,9 +903,10 @@ async fn clean_note_guarded(
 /// provider set up, a governed note, a model that's down).
 pub(crate) async fn clean_note_quietly(app: AppHandle, note_id: String) {
     // The chain that spawned this still holds the note (a stop in progress, a
-    // deferred transcription), so wait for it to let go.
+    // deferred transcription), and the reader may have started a pass that
+    // skips the speakers: wait for both to let go rather than skip ours.
     let mut waited = std::time::Duration::ZERO;
-    while super::org::note_busy(&app, &note_id) {
+    while super::org::note_busy(&app, &note_id) || !running().lock().insert(note_id.clone()) {
         if waited >= BUSY_WAIT_LIMIT {
             eprintln!("[clean] note {note_id}: still busy, not cleaning now");
             return;
@@ -924,7 +915,7 @@ pub(crate) async fn clean_note_quietly(app: AppHandle, note_id: String) {
         waited += BUSY_POLL;
     }
     let clean = clean_setting_on(&app);
-    if let Err(e) = clean_note_guarded(&app, &note_id, CleanRequest::Auto, true, clean).await {
+    if let Err(e) = run_claimed(&app, &note_id, CleanRequest::Auto, true, clean).await {
         eprintln!("[clean] note {note_id}: {e:#}");
     }
 }

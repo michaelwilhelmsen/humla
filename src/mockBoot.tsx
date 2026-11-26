@@ -398,7 +398,7 @@ function notePlayerCase(): Scenario {
 // ---- #217 axis: the Transcript tab's Clean view -----------------------------
 // The whole note, because the question is the switch's place among the tab's
 // other rows, and what a cleaned turn reads like next to a verbatim one. Each
-// entry carries word timings and a mask the way `note_timeline` returns them.
+// entry carries word timings and a clean read the way `note_timeline` returns them.
 // "pending": a pass a third of the way through, the turns it hasn't reached
 // drawn as placeholders.
 function noteCleanCase(view: "clean" | "verbatim", pending = false): Scenario {

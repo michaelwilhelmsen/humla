@@ -30,11 +30,14 @@ const BOUNDARY_VERSION: u32 = 1;
 const CONTEXT_WORDS: usize = 30;
 
 /// Most words one change may move, and how far from the change the farthest
-/// of them may have been said.
+/// of them may have been said. The prompt states the same limit.
 const MAX_MOVE_WORDS: usize = 8;
 const MAX_MOVE_MS: u64 = 6_000;
 
 const CHANGES_PER_CALL: usize = 40;
+
+/// Words either side of a change that name it in `boundaries.json`.
+const KEY_WORDS: usize = 8;
 
 const BOUNDARY_PROMPT: &str = "You check where a meeting transcript changes speaker. A speech recogniser assigned the words to speakers by voice, and sometimes the change lands a few words off, in the middle of a sentence: the end of one person's sentence is given to the next speaker, or the start of the next person's sentence to the previous one.
 
@@ -70,8 +73,8 @@ impl Change {
     /// The change named by the words around it, so a timeline rebuilt with
     /// the same words and boundary (or speakers renamed) keeps the judgement.
     fn key(&self) -> String {
-        let tail = &self.before_words[self.before_words.len().saturating_sub(8)..];
-        let head = &self.after_words[..self.after_words.len().min(8)];
+        let tail = &self.before_words[self.before_words.len().saturating_sub(KEY_WORDS)..];
+        let head = &self.after_words[..self.after_words.len().min(KEY_WORDS)];
         let mut tokens: Vec<String> = tail.to_vec();
         tokens.push("|".to_string());
         tokens.extend(head.iter().cloned());
@@ -327,6 +330,9 @@ fn write_reviewed(take_dir: &Path, reviewed: &HashSet<String>) -> std::io::Resul
 
 struct Take {
     dir: std::path::PathBuf,
+    /// The timeline as read before the model calls, to tell whether it changed
+    /// while they ran.
+    read: Vec<Value>,
     entries: Vec<Value>,
     reviewed: HashSet<String>,
     changes: Vec<Change>,
@@ -351,7 +357,7 @@ pub(crate) async fn review_note(app: &AppHandle, note_id: &str, request: CleanRe
             .into_iter()
             .filter(|c| force || !reviewed.contains(&c.key()))
             .collect();
-        takes.push(Take { dir, entries, reviewed, changes });
+        takes.push(Take { dir, read: entries.clone(), entries, reviewed, changes });
     }
     let asked: Vec<(usize, usize)> = takes
         .iter()
@@ -378,8 +384,19 @@ pub(crate) async fn review_note(app: &AppHandle, note_id: &str, request: CleanRe
         }
     }
 
+    // A recording started on the note while the model worked owns its
+    // transcript now.
+    if super::org::note_busy(app, note_id) {
+        anyhow::bail!("the note became busy while its speaker changes were checked");
+    }
     let mut moved = 0usize;
     for (t, take) in takes.iter_mut().enumerate() {
+        let path = take.dir.join("timeline.jsonl");
+        // An edit made while the model worked wins; its changes are asked about next time.
+        if read_timeline_values(&path) != take.read {
+            eprintln!("[turns] note {note_id}: a timeline changed while its speaker changes were checked, leaving it");
+            continue;
+        }
         let before: HashSet<String> = candidates(&take.entries).iter().map(Change::key).collect();
         let mut changed = false;
         for (c, change) in take.changes.iter().enumerate() {
@@ -392,7 +409,7 @@ pub(crate) async fn review_note(app: &AppHandle, note_id: &str, request: CleanRe
             }
         }
         if changed {
-            write_timeline_values(&take.dir.join("timeline.jsonl"), &take.entries).map_err(|e| anyhow::anyhow!(e))?;
+            write_timeline_values(&path, &take.entries).map_err(|e| anyhow::anyhow!(e))?;
             // A change a move created was judged with the one it replaced.
             take.reviewed.extend(candidates(&take.entries).iter().map(Change::key).filter(|k| !before.contains(k)));
         }
@@ -559,6 +576,11 @@ mod tests {
         let mut moved = entries.clone();
         assert!(apply_move(&mut moved, &change, 1));
         assert!(candidates(&moved).iter().all(|c| c.key() != change.key()));
+    }
+
+    #[test]
+    fn the_prompt_states_the_move_limit() {
+        assert!(BOUNDARY_PROMPT.contains(&format!("Never move more than {MAX_MOVE_WORDS}.")));
     }
 
     #[test]
