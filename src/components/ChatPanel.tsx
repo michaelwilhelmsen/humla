@@ -1,6 +1,8 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
+import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
+import remarkMath from "remark-math";
 import { useNavigate } from "react-router-dom";
 import { open as openExternal } from "@tauri-apps/plugin-shell";
 import {
@@ -76,7 +78,11 @@ import { htmlToText } from "../lib/noteList";
 const PAGE_SIZE = 30;
 
 const Markdown = memo(function Markdown({ source }: { source: string }) {
-  return <ReactMarkdown remarkPlugins={[remarkGfm]}>{source}</ReactMarkdown>;
+  return (
+    <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]}>
+      {source}
+    </ReactMarkdown>
+  );
 });
 
 function partsText(m: ChatMessageDto): string {

@@ -1,5 +1,6 @@
 @import "tailwindcss";
 @import "tippy.js/dist/tippy.css";
+@import "katex/dist/katex.min.css";
 
 /* Themes. Each file declares the whole token contract (src/lib/themeContract.ts)
    for its own `data-palette` value and nothing else — no component rules. The
@@ -857,6 +858,11 @@ button.nd-speaker-dot:enabled:hover {
 .prose-summary td:first-child { padding-left: 0; }
 .prose-summary th:last-child,
 .prose-summary td:last-child { padding-right: 0; }
+.prose-summary .katex-display {
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 0.25em 0;
+}
 
 /* Reasoning trace from local LLMs (Qwen 3.5 thinking, etc). Same markdown
    coverage as prose-summary but tuned to feel like a quiet sibling of the
