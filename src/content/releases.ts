@@ -3,13 +3,35 @@ export type Release = {
   date: string;
   title: string;
   summary: string;
-  visual?: "filters" | "privacy" | "activity" | "updates" | "speakers" | "webhook" | "export" | "two-factor" | "date" | "audio" | "copilot" | "custom" | "share" | "system-audio";
+  visual?: "filters" | "privacy" | "activity" | "updates" | "speakers" | "webhook" | "export" | "two-factor" | "date" | "audio" | "copilot" | "custom" | "share" | "system-audio" | "clean";
   paragraphs: string[];
   highlights: string[];
   issues: { title: string; reference: string; status: "Open" | "Closed"; url: string }[];
 };
 
 export const releases: Release[] = [
+  {
+    version: "0.82.0",
+    date: "2026-11-26",
+    title: "Clean transcripts",
+    summary: "The Transcript tab now has a clean read of every meeting, without the ums, repeats and false starts, and you can edit it like a document.",
+    visual: "clean",
+    paragraphs: [
+      "Speech doesn't read well. People start a sentence twice, trail off and fill the pauses with ums. After a recording, Humla now writes a clean read of the transcript: what was said, tidied the way you'd write it down. Names from your vocabulary come back spelled the way you spell them, and numbers come back as numbers. If a rewrite would change what someone said, say by dropping a \"not\" or a figure, Humla keeps the words as they were said.",
+      "Clean is a text you can work with. Click a paragraph to fix a word or give it to the right speaker. Your edits sync to your other devices and your team, the summary and exports use the clean version, and Humla never cleans over a paragraph you've edited without asking. Verbatim still has every word as it was said, with playback, and it's what chat and your integrations read.",
+      "Before cleaning, Humla also checks where the speaker changes and moves words that landed on the wrong person. The Transcript tab is calmer too: language and speaker count sit in one place at the top, speakers are renamed or merged with a click on their name, and the player has moved under Verbatim, with speed and skip buttons. Cleaning uses your summary provider. You can pick its model, or turn Clean off, in Settings → Transcription.",
+    ],
+    highlights: [
+      "A clean read of every transcript, next to Verbatim.",
+      "Edit a paragraph or give it to another speaker with a click.",
+      "Your edits sync, and the summary and exports use the clean version.",
+      "Words cut off at a speaker change move to whoever said them.",
+      "A calmer Transcript tab, with the player under Verbatim.",
+    ],
+    issues: [
+      { title: "feature request: Transcript cleaning", reference: "#217", status: "Closed", url: "https://github.com/michaelwilhelmsen/humla/issues/217" },
+    ],
+  },
   {
     version: "0.81.1",
     date: "2026-11-24",

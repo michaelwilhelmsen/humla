@@ -54,6 +54,7 @@ const VISUAL_CAPTION: Record<NonNullable<Release["visual"]>, string> = {
   custom: "Bring any OpenAI-compatible API.",
   share: "Share a note with the people who need it.",
   "system-audio": "Record the call, not the screen.",
+  clean: "Read what was said, cleaned up.",
 };
 
 function ReleaseVisual({ kind }: { kind: NonNullable<Release["visual"]> }) {
@@ -185,6 +186,14 @@ function ReleaseVisual({ kind }: { kind: NonNullable<Release["visual"]> }) {
           </div>
           <div className="release-preview-days">{[9, 10, 11, 12, 13, 14, 15].map((day) => <span key={day} className={day === 12 ? "is-selected" : undefined}>{day}</span>)}</div>
           <div className="release-preview-sent"><CircleCheck size={14} strokeWidth={1.8} />Moved to 12 March 2024</div>
+        </>}
+        {kind === "clean" && <>
+          <div className="release-demo-heading"><span>Product catch-up</span></div>
+          <div className="release-preview-formats"><span className="is-selected">Clean</span><span>Verbatim</span></div>
+          <div className="release-preview-turns">{PREVIEW_TURNS.slice(0, 3).map((turn) => <div key={turn.speaker}>
+            <div className="release-preview-turn-title"><i style={{ background: PREVIEW_TURN_COLORS.get(turn.speaker) }} />{turn.speaker}</div>
+            <p>{turn.text}</p>
+          </div>)}</div>
         </>}
         {kind === "speakers" && <>
           <div className="release-demo-heading"><span>Product catch-up</span><small>{speakerCountLabel(PREVIEW_TURNS.length)}</small></div>
