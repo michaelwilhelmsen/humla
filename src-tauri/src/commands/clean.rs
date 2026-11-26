@@ -872,9 +872,8 @@ fn read_doc(conn: &rusqlite::Connection, note_id: &str) -> anyhow::Result<CleanD
     parse_doc(&db::get_note(conn, note_id)?.clean_transcript).ok_or_else(|| anyhow::anyhow!(UNREADABLE_DOC))
 }
 
-/// Store the document; `edited` when the user changed it (`db::set_clean_transcript`).
-fn write_doc(conn: &rusqlite::Connection, note_id: &str, doc: &CleanDoc, edited: bool) -> anyhow::Result<()> {
-    db::set_clean_transcript(conn, note_id, &serde_json::to_string(doc)?, edited)?;
+fn write_doc(conn: &rusqlite::Connection, note_id: &str, doc: &CleanDoc) -> anyhow::Result<()> {
+    db::set_clean_transcript(conn, note_id, &serde_json::to_string(doc)?)?;
     Ok(())
 }
 
@@ -929,7 +928,7 @@ fn write_take(
     let take = doc.take_mut(session);
     take.by = by.to_string();
     take.turns = turns;
-    write_doc(&conn, note_id, &doc, false)?;
+    write_doc(&conn, note_id, &doc)?;
     Ok(true)
 }
 
@@ -1270,7 +1269,7 @@ pub fn note_clean_edit(
         if !apply_edit(&mut doc, &session_id, &turn_id, &edit)? {
             return Ok(());
         }
-        write_doc(&conn, &note_id, &doc, true).map_err(|e| e.to_string())?;
+        write_doc(&conn, &note_id, &doc).map_err(|e| e.to_string())?;
     }
     super::note_changed_for_sync(&app, &note_id);
     Ok(())
@@ -1288,7 +1287,7 @@ pub(super) fn rename_speaker(conn: &rusqlite::Connection, note_id: &str, old: &s
         changed = true;
     }
     if changed {
-        write_doc(conn, note_id, &doc, true)?;
+        write_doc(conn, note_id, &doc)?;
     }
     Ok(changed)
 }

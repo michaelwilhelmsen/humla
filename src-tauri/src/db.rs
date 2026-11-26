@@ -1041,18 +1041,13 @@ pub fn set_transcript(conn: &Connection, id: &str, text: &str) -> Result<()> {
     Ok(())
 }
 
-/// Replace the note's clean transcript (#217). `edited`: the user changed it,
-/// which moves `updated_at` so it wins last-write-wins. A clean pass's write
-/// leaves it, so cleaning a note doesn't move it up the note list.
-pub fn set_clean_transcript(conn: &Connection, id: &str, json: &str, edited: bool) -> Result<()> {
-    if edited {
-        conn.execute(
-            "UPDATE notes SET clean_transcript = ?1, updated_at = ?2 WHERE id = ?3",
-            params![json, now_ms(), id],
-        )?;
-    } else {
-        conn.execute("UPDATE notes SET clean_transcript = ?1 WHERE id = ?2", params![json, id])?;
-    }
+/// Replace the note's clean transcript (#217). It moves `updated_at` like the
+/// note's other text, so it syncs last-write-wins with the note.
+pub fn set_clean_transcript(conn: &Connection, id: &str, json: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE notes SET clean_transcript = ?1, updated_at = ?2 WHERE id = ?3",
+        params![json, now_ms(), id],
+    )?;
     Ok(())
 }
 
@@ -3342,19 +3337,15 @@ mod tests {
     /// #217 — a clean pass's write keeps the note where it is in the list; the
     /// user's edit moves it, so it wins last-write-wins.
     #[test]
-    fn only_an_edit_of_the_clean_transcript_moves_updated_at() {
+    fn writing_the_clean_transcript_moves_updated_at() {
         let dir = tempfile::tempdir().unwrap();
         let conn = open(&dir.path().join("clean.sqlite")).unwrap();
         let note = create_note(&conn, "en", "meeting", "").unwrap();
         conn.execute("UPDATE notes SET updated_at = 1 WHERE id = ?1", params![note.id]).unwrap();
 
-        set_clean_transcript(&conn, &note.id, r#"{"v":1,"takes":[]}"#, false).unwrap();
+        set_clean_transcript(&conn, &note.id, r#"{"v":1,"takes":[]}"#).unwrap();
         let after = get_note(&conn, &note.id).unwrap();
-        assert_eq!((after.clean_transcript.as_str(), after.updated_at), (r#"{"v":1,"takes":[]}"#, 1));
-
-        set_clean_transcript(&conn, &note.id, "", true).unwrap();
-        let after = get_note(&conn, &note.id).unwrap();
-        assert_eq!(after.clean_transcript, "");
+        assert_eq!(after.clean_transcript, r#"{"v":1,"takes":[]}"#);
         assert!(after.updated_at > 1);
     }
 

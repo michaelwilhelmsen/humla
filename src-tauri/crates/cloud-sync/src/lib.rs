@@ -660,14 +660,13 @@ impl Worker {
             Some((_, true, remote_cua)) if note.updated_at <= *remote_cua => *remote_cua + 1,
             _ => note.updated_at,
         };
-        let body = json!({
+        let mut body = json!({
             "client_id": uuid,
             "workspace": workspace,
             "owner": owner,
             "title": note.title,
             "body": note.body,
             "transcript": note.transcript,
-            "clean_transcript": note.clean_transcript,
             "summary": note.summary,
             "language": note.language,
             "summary_preset": note.summary_preset,
@@ -688,6 +687,7 @@ impl Worker {
             "client_updated_at": client_updated_at,
             "deleted": false,
         });
+        put_clean_transcript(&mut body, &note.clean_transcript);
         let resp = match &remote {
             Some((pb_id, _, _)) => {
                 self.http
@@ -1461,7 +1461,7 @@ impl Worker {
                 client,
                 n.private,
                 serde_json::to_string(&n.shared_with)?,
-                n.clean_transcript,
+                n.clean_transcript.as_deref().filter(|doc| !doc.is_empty()),
             ],
         )?;
         drop(conn); // release before firing the callback
@@ -1729,6 +1729,14 @@ fn test_purge_note_rows(conn: &Connection, id: &str) -> Result<()> {
     Ok(())
 }
 
+/// An empty clean transcript (#217) means "never cleaned here", so the push
+/// leaves the field out and the server keeps what another device wrote.
+fn put_clean_transcript(body: &mut serde_json::Value, doc: &str) {
+    if !doc.is_empty() {
+        body["clean_transcript"] = serde_json::Value::String(doc.to_owned());
+    }
+}
+
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct RemoteNote {
@@ -1746,8 +1754,8 @@ struct RemoteNote {
     owner: String,
     private: bool,
     shared_with: Vec<String>,
-    /// The clean transcript (#217); `None` from a server without the field,
-    /// which leaves the local one as it is.
+    /// The clean transcript (#217); `None` from a server without the field.
+    /// That and an empty one (never cleaned) leave the local one as it is.
     clean_transcript: Option<String>,
     created_at: i64,
     client_updated_at: i64,
@@ -2760,7 +2768,7 @@ mod it {
     /// #217: a server without the field leaves the local clean transcript
     /// alone; one that has it, empty or not, decides it.
     #[test]
-    fn a_pull_keeps_the_clean_transcript_unless_the_server_has_the_field() {
+    fn a_pull_keeps_the_clean_transcript_unless_the_server_has_one() {
         let db = test_db();
         let w = worker(db.clone(), offline_config("wsC"));
         let clean = || scalar(&db, "SELECT clean_transcript FROM notes WHERE id = ?1", "n1");
@@ -2776,7 +2784,20 @@ mod it {
         w.apply_remote_note(&pulled(20, ""), None).unwrap();
         assert_eq!(clean().as_deref(), Some(r#"{"v":1,"takes":[]}"#));
         w.apply_remote_note(&pulled(30, r#", "clean_transcript": """#), None).unwrap();
-        assert_eq!(clean().as_deref(), Some(""));
+        assert_eq!(clean().as_deref(), Some(r#"{"v":1,"takes":[]}"#));
+        w.apply_remote_note(&pulled(40, r#", "clean_transcript": "{\"v\":1,\"takes\":[{}]}""#), None).unwrap();
+        assert_eq!(clean().as_deref(), Some(r#"{"v":1,"takes":[{}]}"#));
+    }
+
+    /// #217 — a note never cleaned here sends no clean transcript, so a push
+    /// can't empty the one another device wrote.
+    #[test]
+    fn an_empty_clean_transcript_is_not_pushed() {
+        let mut body = json!({ "title": "T" });
+        put_clean_transcript(&mut body, "");
+        assert!(body.get("clean_transcript").is_none());
+        put_clean_transcript(&mut body, r#"{"v":1,"takes":[]}"#);
+        assert_eq!(body["clean_transcript"], r#"{"v":1,"takes":[]}"#);
     }
 
     /// #222 — a note re-dated on one device moves on the others too.
