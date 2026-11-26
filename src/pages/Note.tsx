@@ -1,7 +1,9 @@
 import { Link, useNavigate, useOutletContext, useParams } from "react-router-dom";
 import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
+import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
+import remarkMath from "remark-math";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import {
   Building2,
@@ -123,7 +125,11 @@ import {
 // the same string. Wrapping in memo + a stable `source` prop turns
 // that into a single parse per actual content change.
 const Markdown = memo(function Markdown({ source }: { source: string }) {
-  return <ReactMarkdown remarkPlugins={[remarkGfm]}>{source}</ReactMarkdown>;
+  return (
+    <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]}>
+      {source}
+    </ReactMarkdown>
+  );
 });
 
 /** Kick off a summary, surfacing any failure as a toast.

@@ -1,7 +1,6 @@
 import { useNavigate, useLocation } from "react-router-dom";
 import { Moon, Plus, Sun } from "lucide-react";
-import { ipc } from "../lib/ipc";
-import { useNotesStore } from "../lib/store";
+import { createNoteForRoute } from "../lib/createNote";
 import { useThemeStore } from "../lib/theme";
 
 function resolveEffectiveTheme(theme: "system" | "light" | "dark"): "light" | "dark" {
@@ -18,7 +17,6 @@ function resolveEffectiveTheme(theme: "system" | "light" | "dark"): "light" | "d
 export function TopBar() {
   const location = useLocation();
   const navigate = useNavigate();
-  const upsert = useNotesStore((s) => s.upsertLocal);
   const theme = useThemeStore((s) => s.theme);
   const setTheme = useThemeStore((s) => s.setTheme);
 
@@ -29,8 +27,7 @@ export function TopBar() {
   const effective = resolveEffectiveTheme(theme);
 
   async function newNote() {
-    const note = await ipc.createNote();
-    upsert(note);
+    const note = await createNoteForRoute(path);
     navigate(`/note/${note.id}`);
   }
 

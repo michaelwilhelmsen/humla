@@ -1,5 +1,6 @@
 import { useEffect } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
+import { createNoteForRoute } from "./createNote";
 import { ipc, onToggleRecord } from "./ipc";
 import { resolveHotkeyAction } from "./hotkey";
 import { useNotesStore, useRecordingStore } from "./store";
@@ -33,8 +34,7 @@ export function useGlobalShortcuts() {
 
       if (e.key === "n" && !e.shiftKey) {
         e.preventDefault();
-        const note = await ipc.createNote();
-        useNotesStore.getState().upsertLocal(note);
+        const note = await createNoteForRoute(window.location.pathname);
         navigate(`/note/${note.id}`);
       } else if (e.key === ",") {
         e.preventDefault();
@@ -92,10 +92,7 @@ export function useGlobalShortcuts() {
         } else if (action.kind === "start") {
           await ipc.recordingStart(action.noteId);
         } else if (action.kind === "startNew") {
-          // Nothing open to record into, so make somewhere to put it — and go
-          // there, since the window is visible and the user is watching.
-          const note = await ipc.createNote();
-          useNotesStore.getState().upsertLocal(note);
+          const note = await createNoteForRoute(window.location.pathname);
           navigate(`/note/${note.id}`);
           await ipc.recordingStart(note.id);
         }
