@@ -25,12 +25,13 @@
 //! Runs after the post-stop chain and a deferred transcription, and on demand
 //! when the reader asks for Clean on a take that lacks it. Uses the note's
 //! summary provider through `resolve_provider`, so a governed note is refused
-//! here as its summary is. Failure on the automatic path is silent, like titles.
+//! here as its summary is, on that provider's light model (`use_light_model`).
+//! Failure on the automatic path is silent, like titles.
 
-use super::summary::{attach_copilot, resolve_provider, summary_provider_id};
-use super::TITLE_FALLBACK_MODEL;
+use super::summary::{resolve_provider, summary_provider_id, use_light_model, ResolvedProvider};
 use crate::providers::ProviderId;
-use crate::{db, openai, sessions, AppState};
+use crate::{db, sessions, AppState};
+use futures_util::{stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -48,9 +49,40 @@ const CLEAN_VERSION: u32 = 2;
 const SEGMENT_WORDS: usize = 110;
 
 /// Most verbatim words in one model call. Several segments, often several
-/// speakers, so each reads in its conversation; small enough that a small
-/// local model rewrites every segment rather than summarising the lot.
-const WINDOW_WORDS: usize = 240;
+/// speakers, so each reads in its conversation. A small local model (and a
+/// custom endpoint may run one) rewrites every segment of a short window
+/// rather than summarising the lot; a cloud model holds a long one, and every
+/// call saved is a system prompt not sent again.
+const LOCAL_WINDOW_WORDS: usize = 240;
+const CLOUD_WINDOW_WORDS: usize = 1000;
+
+/// Model calls a pass keeps in flight at once.
+const CONCURRENT_CALLS: usize = 3;
+
+fn window_words(provider: ProviderId) -> usize {
+    match provider {
+        ProviderId::Local | ProviderId::Custom => LOCAL_WINDOW_WORDS,
+        _ => CLOUD_WINDOW_WORDS,
+    }
+}
+
+/// Why an automatic pass leaves a Copilot note alone: Copilot counts requests,
+/// so cleaning waits until the user asks.
+const COPILOT_ON_REQUEST: &str = "with Copilot, Clean runs only when you ask.";
+
+/// What a clean pass is asked to do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CleanRequest {
+    /// Nobody asked: the post-stop chain, or the reader opening Clean on
+    /// entries without a clean read. Cleans those entries.
+    Auto,
+    /// "Clean": the entries without a clean read.
+    Missing,
+    /// "Clean again": every entry anew, after checking every speaker change
+    /// anew.
+    All,
+}
 
 /// A segment this short may be cleaned away entirely ("Mm.", "Eh, ja").
 const DROP_MAX_WORDS: usize = 4;
@@ -187,6 +219,9 @@ pub(crate) fn read_segments(take_dir: &Path) -> Vec<Segment> {
 /// Which stored segment, if any, starts at each entry and still matches the
 /// entries that follow it. `fps` are the take's entry fingerprints in order.
 /// The answer is per entry: `Some(segment index)` on a segment's first entry.
+/// Picks the segments that together cover the most entries, so a short
+/// segment repeated elsewhere ("Ja.") can't take the place of a longer one
+/// that starts with the same words.
 pub(crate) fn match_segments(fps: &[String], segments: &[Segment]) -> Vec<Option<usize>> {
     let mut by_first: HashMap<&str, Vec<usize>> = HashMap::new();
     for (si, s) in segments.iter().enumerate() {
@@ -194,16 +229,24 @@ pub(crate) fn match_segments(fps: &[String], segments: &[Segment]) -> Vec<Option
             by_first.entry(first.as_str()).or_default().push(si);
         }
     }
-    let mut out = vec![None; fps.len()];
+    let n = fps.len();
+    // best[i]: the most entries from i on that segments can cover.
+    let mut best = vec![0usize; n + 1];
+    let mut pick: Vec<Option<usize>> = vec![None; n];
+    for i in (0..n).rev() {
+        best[i] = best[i + 1];
+        for &si in by_first.get(fps[i].as_str()).into_iter().flatten() {
+            let m = &segments[si].members;
+            if i + m.len() <= n && fps[i..i + m.len()] == m[..] && m.len() + best[i + m.len()] > best[i] {
+                best[i] = m.len() + best[i + m.len()];
+                pick[i] = Some(si);
+            }
+        }
+    }
+    let mut out = vec![None; n];
     let mut i = 0;
-    while i < fps.len() {
-        let hit = by_first.get(fps[i].as_str()).and_then(|candidates| {
-            candidates.iter().copied().find(|&si| {
-                let m = &segments[si].members;
-                i + m.len() <= fps.len() && fps[i..i + m.len()] == m[..]
-            })
-        });
-        match hit {
+    while i < n {
+        match pick[i] {
             Some(si) => {
                 out[i] = Some(si);
                 i += segments[si].members.len();
@@ -282,15 +325,15 @@ fn plan_segments(entries: &[Entry], needs: &dyn Fn(usize) -> bool) -> Vec<Plan> 
     out
 }
 
-/// Consecutive segments grouped into model calls of about `WINDOW_WORDS`.
-fn plan_windows(entries: &[Entry], segments: &[Plan]) -> Vec<Vec<usize>> {
+/// Consecutive segments grouped into model calls of about `limit` words.
+fn plan_windows(entries: &[Entry], segments: &[Plan], limit: usize) -> Vec<Vec<usize>> {
     let words = |p: &Plan| -> usize { p.entries.iter().map(|&i| entries[i].tokens.len()).sum() };
     let mut out: Vec<Vec<usize>> = Vec::new();
     let mut cur: Vec<usize> = Vec::new();
     let mut cur_words = 0;
     for (si, p) in segments.iter().enumerate() {
         let n = words(p);
-        if !cur.is_empty() && cur_words + n > WINDOW_WORDS {
+        if !cur.is_empty() && cur_words + n > limit {
             out.push(std::mem::take(&mut cur));
             cur_words = 0;
         }
@@ -336,11 +379,17 @@ The user message is a JSON list of segments in order: {\"id\": 0, \"speaker\": \
 For every segment, write its text cleaned:
 - remove hesitation sounds and filler words that carry no meaning where they stand, in whatever language is spoken;
 - remove stutters and words said twice by accident;
-- when the speaker starts a sentence, breaks off and starts again, keep only the finished version;
+- \"...\" and \"…\" mark where the speaker paused or broke off and never appear in the clean text: when the speaker breaks off and starts again, keep only the finished version; join a sentence a pause only interrupted; end a thought left unfinished with a dash (\"–\") rather than dropping it, and drop only a fragment that says nothing on its own;
+- repair words the recogniser split or ran together;
 - fix grammar, punctuation and capitalisation where the speech left them broken, so every sentence reads correctly;
 - write numbers, percentages and dates the way they are normally written in that language.
 
-Keep the speaker's own words, word order and meaning wherever they are already fine. Never summarise, shorten what was actually said, add information, answer a question, translate, or move words to another segment. Keep every negation, number, name and technical term. Keep each segment in its own language; a segment that mixes languages stays mixed. If a segment is nothing but filler (\"Mm.\", \"Eh.\"), its text is empty.
+Keep the speaker's own words, word order and meaning wherever they are already fine. Never summarise, shorten what was actually said, add information, answer a question, translate, or move words to another segment. Keep every negation, number, name, abbreviation and technical term as said. Keep each segment in its own language; a segment that mixes languages stays mixed. If a segment is nothing but filler (\"Mm.\", \"Eh.\"), its text is empty.
+
+Example. Segments:
+[{\"id\": 0, \"speaker\": \"Anna\", \"text\": \"So we, uh, we should ... we should move the launch to ... Friday. Mm. Because the, the tests ... the tests aren't done. And the budget is ...\"}, {\"id\": 1, \"speaker\": \"Ben\", \"text\": \"Yeah. Yeah, okay. And then ... I'll, I'll tell the ... Should I tell the team?\"}]
+Answer:
+{\"segments\": [{\"id\": 0, \"text\": \"So we should move the launch to Friday, because the tests aren't done. And the budget is –\"}, {\"id\": 1, \"text\": \"Yeah, okay. Should I tell the team?\"}]}
 
 Answer with JSON only, no explanation: {\"segments\": [{\"id\": 0, \"text\": \"…\"}, …]}, one entry for every id you were given.";
 
@@ -419,8 +468,15 @@ fn align(clean: &[String], verbatim: &[String]) -> Vec<(usize, usize)> {
     pairs
 }
 
+/// Whether `tokens` hold a negation. "Ikke sant?" / ", ikke sant," is a tag
+/// ("right?") that a clean read may drop, not a negation; "ikke sant." is one.
 fn has_negation(tokens: &[String]) -> bool {
-    tokens.iter().any(|t| NEGATIONS.contains(&fold(t).as_str()))
+    tokens.iter().enumerate().any(|(i, t)| {
+        let tag = tokens
+            .get(i + 1)
+            .is_some_and(|next| fold(next) == "sant" && (next.ends_with('?') || next.ends_with(',')));
+        NEGATIONS.contains(&fold(t).as_str()) && !tag
+    })
 }
 
 /// Every run of digits in `tokens`, in order.
@@ -443,23 +499,63 @@ fn digit_runs(tokens: &[String]) -> Vec<String> {
 }
 
 /// Why a rewrite is refused, if it is. The segment then stays verbatim.
+/// A dash ends a broken-off thought, so punctuation after it ("–?", from a
+/// recogniser's "...?") goes.
+fn tidy_dash(token: &str) -> String {
+    let mut chars = token.chars();
+    match chars.next() {
+        Some(dash @ ('–' | '—')) if !token[dash.len_utf8()..].is_empty() && chars.all(|c| c.is_ascii_punctuation()) => {
+            dash.to_string()
+        }
+        _ => token.to_string(),
+    }
+}
+
+/// Words that are spoken, not pause marks or dashes.
+fn spoken(tokens: &[String]) -> usize {
+    tokens.iter().filter(|t| !fold(t).is_empty()).count()
+}
+
+/// Clean words the speaker said: those aligned to a verbatim word, plus words
+/// the recogniser ran together and the rewrite split ("Craftdu" → "Craft du")
+/// or split and the rewrite joined.
+fn said_words(clean: &[String], verbatim: &[String], pairs: &[(usize, usize)]) -> usize {
+    let verb: Vec<String> = verbatim.iter().map(|t| fold(t)).collect();
+    let singles: HashSet<&str> = verb.iter().map(String::as_str).filter(|s| !s.is_empty()).collect();
+    let pairs_joined: HashSet<String> = verb.windows(2).map(|w| format!("{}{}", w[0], w[1])).collect();
+    let c: Vec<String> = clean.iter().map(|t| fold(t)).collect();
+    let mut said: HashSet<usize> = pairs.iter().map(|&(i, _)| i).collect();
+    for i in 0..c.len() {
+        if said.contains(&i) || c[i].is_empty() {
+            continue;
+        }
+        if pairs_joined.contains(&c[i]) {
+            said.insert(i);
+        } else if i + 1 < c.len() && singles.contains(format!("{}{}", c[i], c[i + 1]).as_str()) {
+            said.insert(i);
+            said.insert(i + 1);
+        }
+    }
+    said.len()
+}
+
 fn refuse(verbatim: &[String], clean: &[String], aligned: usize) -> Option<&'static str> {
-    if clean.is_empty() {
-        return (verbatim.len() > DROP_MAX_WORDS).then_some("emptied a segment that had content");
+    let (said, written) = (spoken(verbatim), spoken(clean));
+    if written == 0 {
+        return (said > DROP_MAX_WORDS).then_some("emptied a segment that had content");
     }
     if has_negation(verbatim) && !has_negation(clean) {
         return Some("dropped a negation");
     }
-    let clean_digits = digit_runs(clean).join(" ");
+    // Joined without a separator: a rewrite may group digits ("2400" → "2 400").
+    let clean_digits = digit_runs(clean).concat();
     if digit_runs(verbatim).iter().any(|d| !clean_digits.contains(d.as_str())) {
         return Some("dropped a number");
     }
-    if verbatim.len() >= LENGTH_GUARD_MIN_WORDS
-        && (clean.len() as f32) < MIN_KEPT_SHARE * verbatim.len() as f32
-    {
+    if said >= LENGTH_GUARD_MIN_WORDS && (written as f32) < MIN_KEPT_SHARE * said as f32 {
         return Some("shortened too much");
     }
-    if clean.len() >= ALIGN_GUARD_MIN_WORDS && (aligned as f32) < MIN_ALIGNED_SHARE * clean.len() as f32 {
+    if written >= ALIGN_GUARD_MIN_WORDS && (aligned as f32) < MIN_ALIGNED_SHARE * written as f32 {
         return Some("wrote words that weren't said");
     }
     None
@@ -522,9 +618,9 @@ fn clean_segment(entries: &[Entry], plan: &Plan, answer: Option<&str>) -> (Segme
     let Some(answer) = answer else {
         return (Segment { members, text: None, words: Vec::new() }, Some("no text for it in the answer"));
     };
-    let clean: Vec<String> = answer.split_whitespace().map(str::to_string).collect();
+    let clean: Vec<String> = answer.split_whitespace().map(tidy_dash).collect();
     let pairs = align(&clean, &verbatim);
-    if let Some(why) = refuse(&verbatim, &clean, pairs.len()) {
+    if let Some(why) = refuse(&verbatim, &clean, said_words(&clean, &verbatim, &pairs)) {
         return (Segment { members, text: None, words: Vec::new() }, Some(why));
     }
     let timed: Option<Vec<(u64, u64)>> = times.iter().copied().collect();
@@ -629,11 +725,9 @@ fn live_segments(take: &TakeWork) -> (Vec<Segment>, HashSet<usize>) {
 }
 
 /// Clean every take of `note_id` that has entries without a segment (every
-/// entry when `force`).
-async fn clean_note_inner(app: &AppHandle, note_id: &str, force: bool) -> anyhow::Result<CleanOutcome> {
-    if super::org::note_busy(app, note_id) {
-        anyhow::bail!("This note is being recorded or transcribed. Clean runs when it's done.");
-    }
+/// entry for `CleanRequest::All`).
+async fn clean_note_inner(app: &AppHandle, note_id: &str, request: CleanRequest) -> anyhow::Result<CleanOutcome> {
+    let force = request == CleanRequest::All;
     let app_dir = app.path().app_data_dir()?;
     let recordings = sessions::recordings_dir(&app_dir, note_id);
     let takes: Vec<TakeWork> = sessions::resolve_sessions(&recordings)
@@ -643,7 +737,6 @@ async fn clean_note_inner(app: &AppHandle, note_id: &str, force: bool) -> anyhow
     struct TakePlan {
         kept: Vec<Segment>,
         segments: Vec<Plan>,
-        windows: Vec<Vec<usize>>,
     }
     let plans: Vec<TakePlan> = takes
         .iter()
@@ -652,52 +745,46 @@ async fn clean_note_inner(app: &AppHandle, note_id: &str, force: bool) -> anyhow
             let segments = plan_segments(&t.entries, &|i| {
                 !t.entries[i].tokens.is_empty() && !covered.contains(&i)
             });
-            let windows = plan_windows(&t.entries, &segments);
-            TakePlan { kept, segments, windows }
+            TakePlan { kept, segments }
         })
         .collect();
-    let total: usize = plans.iter().map(|p| p.windows.len()).sum();
-    if total == 0 {
+    if plans.iter().all(|p| p.segments.is_empty()) {
         return Ok(CleanOutcome::default());
     }
 
-    // Provider first, then its key: the summary path's rule.
-    let state: State<AppState> = app.state();
-    let provider_id = {
-        let conn = state.db.lock();
-        let n = db::get_note(&conn, note_id)?;
-        summary_provider_id(&conn, &n)?
-    };
-    let api_key = match provider_id.keychain_account() {
-        Some(_) => super::read_provider_api_key(&state, provider_id.as_str()).map_err(|e| anyhow::anyhow!("{e}"))?,
-        None => None,
-    };
-    let mut provider = {
-        let conn = state.db.lock();
-        let n = db::get_note(&conn, note_id)?;
-        resolve_provider(&conn, &n, api_key)?
-    };
-    // A careful rewrite, not a reasoning task: thinking slows a pass with many
-    // calls and tempts the model to improve on what was said.
-    provider.think = false;
-    if provider.provider == ProviderId::OpenAi && openai::is_reasoning_model(&provider.model) {
-        provider.model = TITLE_FALLBACK_MODEL.to_string();
+    let mut provider = light_provider(app, note_id, request).await?;
+    if provider.provider == ProviderId::OpenAi {
+        provider.model = super::CLEAN_OPENAI_MODEL.to_string();
     }
-    attach_copilot(app, &mut provider).await?;
     let by = format!("{}:{}", provider.provider.as_str(), provider.model);
+    let limit = window_words(provider.provider);
+    let windows: Vec<Vec<Vec<usize>>> = takes
+        .iter()
+        .zip(&plans)
+        .map(|(t, p)| plan_windows(&t.entries, &p.segments, limit))
+        .collect();
+    let total: usize = windows.iter().map(Vec::len).sum();
 
     emit_status(app, note_id, true, 0, total, None);
     let mut outcome = CleanOutcome::default();
     let mut done = 0usize;
     let mut failure: Option<anyhow::Error> = None;
-    'takes: for (take, plan) in takes.iter().zip(plans) {
-        if plan.windows.is_empty() {
+    'takes: for ((take, plan), windows) in takes.iter().zip(plans).zip(&windows) {
+        if windows.is_empty() {
             continue;
         }
         let mut segments = plan.kept;
-        for window in &plan.windows {
-            let message = window_message(&take.entries, &plan.segments, window);
-            let answer = match provider.complete(CLEAN_PROMPT, &message, |_| {}).await {
+        let provider = &provider;
+        // By index: a closure over borrowed windows makes the spawned pass
+        // fail to prove `Send`.
+        let calls = (0..windows.len()).map(|wi| {
+            let message = window_message(&take.entries, &plan.segments, &windows[wi]);
+            async move { (wi, provider.complete(CLEAN_PROMPT, &message, |_| {}).await) }
+        });
+        let mut answers = stream::iter(calls).buffer_unordered(CONCURRENT_CALLS);
+        while let Some((wi, answer)) = answers.next().await {
+            let window = &windows[wi];
+            let answer = match answer {
                 Ok(a) => a,
                 Err(e) => {
                     failure = Some(e);
@@ -723,14 +810,22 @@ async fn clean_note_inner(app: &AppHandle, note_id: &str, force: bool) -> anyhow
                 }
                 segments.push(seg);
             }
+            // Written per call, so the reader fills in while the rest is
+            // cleaned. "Clean again" writes once per take: until then the
+            // reader keeps the clean read it has.
+            if !force {
+                if let Err(e) = write_segments(&take.dir, &by, segments.clone()) {
+                    failure = Some(e.into());
+                    break 'takes;
+                }
+            }
             done += 1;
             emit_status(app, note_id, true, done, total, None);
         }
-        write_segments(&take.dir, &by, segments)?;
+        if force {
+            write_segments(&take.dir, &by, segments)?;
+        }
     }
-    // A note trashed and purged while the model was working must not keep the
-    // file this pass just wrote.
-    super::notes::purge_note_assets_if_gone(app, note_id);
     if let Some(e) = failure {
         return Err(e);
     }
@@ -741,12 +836,69 @@ async fn clean_note_inner(app: &AppHandle, note_id: &str, force: bool) -> anyhow
     Ok(outcome)
 }
 
-/// Run a clean pass with the one-per-note guard and the status bracket.
-async fn clean_note_guarded(app: &AppHandle, note_id: &str, force: bool) -> anyhow::Result<CleanOutcome> {
+/// The provider a pass calls: the note's summary provider on its light model.
+/// On OpenAI with a little reasoning: without it the light model leaves false
+/// starts and pause marks in place and places no sentence with a speaker.
+/// Provider first, then its key: the summary path's rule. Nobody asked for an
+/// `Auto` pass, so it leaves Copilot, which counts requests, alone.
+pub(super) async fn light_provider(app: &AppHandle, note_id: &str, request: CleanRequest) -> anyhow::Result<ResolvedProvider> {
+    let state: State<AppState> = app.state();
+    let provider_id = {
+        let conn = state.db.lock();
+        let n = db::get_note(&conn, note_id)?;
+        summary_provider_id(&conn, &n)?
+    };
+    if request == CleanRequest::Auto && provider_id == ProviderId::Copilot {
+        anyhow::bail!(COPILOT_ON_REQUEST);
+    }
+    let api_key = match provider_id.keychain_account() {
+        Some(_) => super::read_provider_api_key(&state, provider_id.as_str()).map_err(|e| anyhow::anyhow!("{e}"))?,
+        None => None,
+    };
+    let mut provider = {
+        let conn = state.db.lock();
+        let n = db::get_note(&conn, note_id)?;
+        resolve_provider(&conn, &n, api_key)?
+    };
+    use_light_model(app, &mut provider).await?;
+    if provider.reasoning_effort.is_some() {
+        provider.reasoning_effort = Some("low");
+    }
+    Ok(provider)
+}
+
+/// Run a pass with the one-per-note guard and the status bracket: the speaker
+/// changes first when `turns` (`boundaries::review_note`), then the clean read
+/// when `clean`. A failed speaker check is logged and the clean read goes on.
+async fn clean_note_guarded(
+    app: &AppHandle,
+    note_id: &str,
+    request: CleanRequest,
+    turns: bool,
+    clean: bool,
+) -> anyhow::Result<CleanOutcome> {
     if !running().lock().insert(note_id.to_string()) {
         return Ok(CleanOutcome::default());
     }
-    let result = clean_note_inner(app, note_id, force).await;
+    let result = async {
+        if super::org::note_busy(app, note_id) {
+            anyhow::bail!("This note is being recorded or transcribed. Clean runs when it's done.");
+        }
+        if turns {
+            if let Err(e) = super::boundaries::review_note(app, note_id, request).await {
+                eprintln!("[turns] note {note_id}: {e:#}");
+            }
+        }
+        if clean {
+            clean_note_inner(app, note_id, request).await
+        } else {
+            Ok(CleanOutcome::default())
+        }
+    }
+    .await;
+    // A note trashed and purged while the model was working must not keep the
+    // files this pass just wrote.
+    super::notes::purge_note_assets_if_gone(app, note_id);
     running().lock().remove(note_id);
     // Always close the bracket, so the reader leaves "Cleaning…" and reloads
     // the timeline (or shows why it couldn't).
@@ -754,13 +906,12 @@ async fn clean_note_guarded(app: &AppHandle, note_id: &str, force: bool) -> anyh
     result
 }
 
-/// The post-stop chain's entry point, spawned rather than awaited. Silent:
-/// nobody asked for this pass, so nobody is told when it doesn't run (no
-/// summary provider set up, a governed note, a model that's down).
+/// The entry point of the chains that write a take's timeline (post-stop,
+/// deferred transcription, re-diarize), spawned rather than awaited: the
+/// speaker check, then the clean read when the setting is on. Silent: nobody
+/// asked for this pass, so nobody is told when it doesn't run (no summary
+/// provider set up, a governed note, a model that's down).
 pub(crate) async fn clean_note_quietly(app: AppHandle, note_id: String) {
-    if !clean_setting_on(&app) {
-        return;
-    }
     // The chain that spawned this still holds the note (a stop in progress, a
     // deferred transcription), so wait for it to let go.
     let mut waited = std::time::Duration::ZERO;
@@ -772,16 +923,20 @@ pub(crate) async fn clean_note_quietly(app: AppHandle, note_id: String) {
         tokio::time::sleep(BUSY_POLL).await;
         waited += BUSY_POLL;
     }
-    if let Err(e) = clean_note_guarded(&app, &note_id, false).await {
+    let clean = clean_setting_on(&app);
+    if let Err(e) = clean_note_guarded(&app, &note_id, CleanRequest::Auto, true, clean).await {
         eprintln!("[clean] note {note_id}: {e:#}");
     }
 }
 
-/// Clean a note from the reader: on asking for Clean on a take that lacks it,
-/// or on "Clean again" (`force`, every segment rewritten anew).
+/// Clean a note from the reader: on opening Clean on entries without a clean
+/// read (`Auto`), on "Clean now" (`Missing`) or on "Clean again" (`All`),
+/// which checks the speaker changes anew first. The reader's other requests
+/// change no speakers: they also run on notes the user only reads.
 #[tauri::command]
-pub async fn note_clean(app: AppHandle, note_id: String, force: bool) -> Result<CleanOutcome, String> {
-    clean_note_guarded(&app, &note_id, force).await.map_err(|e| e.to_string())
+pub async fn note_clean(app: AppHandle, note_id: String, request: CleanRequest) -> Result<CleanOutcome, String> {
+    let turns = request == CleanRequest::All;
+    clean_note_guarded(&app, &note_id, request, turns, true).await.map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -862,7 +1017,8 @@ mod tests {
         let entries: Vec<Entry> = (0..5).map(|i| entry(if i % 2 == 0 { "A" } else { "B" }, &vec!["ord"; 100].join(" "), i * 40_000)).collect();
         let plans = plan_segments(&entries, &|_| true);
         assert_eq!(plans.len(), 5);
-        assert_eq!(plan_windows(&entries, &plans), vec![vec![0, 1], vec![2, 3], vec![4]]);
+        assert_eq!(plan_windows(&entries, &plans, 240), vec![vec![0, 1], vec![2, 3], vec![4]]);
+        assert_eq!(plan_windows(&entries, &plans, 1000), vec![vec![0, 1, 2, 3, 4]]);
     }
 
     #[test]
@@ -943,6 +1099,48 @@ mod tests {
     }
 
     #[test]
+    fn pause_marks_and_dashes_are_not_words_to_the_guards() {
+        // An unfinished thought ended with a dash: nothing unsaid was written.
+        let v = toks("Jeg tror ikke det var noen ...");
+        let c = toks("Jeg tror ikke det var noen –");
+        assert_eq!(refuse(&v, &c, said_words(&c, &v, &align(&c, &v))), None);
+        // Pause marks don't make a segment long enough to be summarised.
+        let v = toks("Og så ... Men ... Ja ... Nei ... Så ...");
+        assert_eq!(refuse(&v, &toks("Ja."), 1), None);
+    }
+
+    #[test]
+    fn a_dash_drops_the_punctuation_after_it() {
+        assert_eq!(tidy_dash("–?"), "–");
+        assert_eq!(tidy_dash("—."), "—");
+        assert_eq!(tidy_dash("–"), "–");
+        assert_eq!(tidy_dash("til"), "til");
+        assert_eq!(tidy_dash("–ish"), "–ish");
+    }
+
+    #[test]
+    fn a_tag_question_and_a_grouped_number_are_not_losses() {
+        let check = |v: &str, c: &str| {
+            let (v, c) = (toks(v), toks(c));
+            refuse(&v, &c, said_words(&c, &v, &align(&c, &v)))
+        };
+        assert_eq!(check("Når du var ferdig, ikke sant, så var du der.", "Når du var ferdig, så var du der."), None);
+        assert_eq!(check("Ikke sant? Det går bra.", "Det går bra."), None);
+        assert_eq!(check("Det er ikke sant.", "Det er sant."), Some("dropped a negation"));
+        assert_eq!(check("Det er jo 2400 dokumenter.", "Det er jo 2 400 dokumenter."), None);
+        assert_eq!(check("Det er jo 2400 dokumenter.", "Det er jo mange dokumenter."), Some("dropped a number"));
+    }
+
+    #[test]
+    fn words_the_recogniser_ran_together_or_split_count_as_said() {
+        let v = toks("Samme Small Craftdu var også der, så vi kan transcribe på nytt.");
+        let c = toks("Samme Small Craft du var også der, så vi kan transcribe pånytt.");
+        assert_eq!(said_words(&c, &v, &align(&c, &v)), c.len());
+        let c = toks("Samme store båt var også der.");
+        assert!(said_words(&c, &v, &align(&c, &v)) < c.len());
+    }
+
+    #[test]
     fn a_refused_or_missing_segment_stays_verbatim_and_is_marked_read() {
         let e = entry("Hege", "Vi var, eh, 12 personer der.", 0);
         let plan = Plan { entries: vec![0] };
@@ -971,6 +1169,16 @@ mod tests {
         let segments = vec![seg(&["b", "c"]), seg(&["d", "e"])];
         // "d e" no longer matches: "e" is gone (an edit).
         assert_eq!(match_segments(&fps, &segments), vec![None, Some(0), None, None]);
+    }
+
+    #[test]
+    fn a_short_segment_repeated_elsewhere_doesnt_take_a_longer_ones_place() {
+        // "Ja." said alone later, and as the start of a longer run earlier: the
+        // run must keep its segment, or its tail is cleaned again every time.
+        let fps: Vec<String> = ["ja", "bra", "x", "ja", "y"].iter().map(|s| s.to_string()).collect();
+        let seg = |m: &[&str]| Segment { members: m.iter().map(|s| s.to_string()).collect(), text: Some("x".into()), words: vec![] };
+        let segments = vec![seg(&["ja"]), seg(&["ja", "bra"]), seg(&["x"]), seg(&["y"])];
+        assert_eq!(match_segments(&fps, &segments), vec![Some(1), None, Some(2), Some(0), Some(3)]);
     }
 
     #[test]

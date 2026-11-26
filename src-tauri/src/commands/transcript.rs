@@ -397,7 +397,7 @@ const CONTINUATION_CHAIN_MAX_LEN: usize = 6;
 /// `ends_sentence` deliberately ignores since its caller (the backward
 /// boundary move) wants to be conservative about joining across any pause
 /// cue.
-fn piece_ends_terminator(text: &str) -> bool {
+pub(super) fn piece_ends_terminator(text: &str) -> bool {
     let mut trimmed = text.trim_end();
     loop {
         let prev_len = trimmed.len();

@@ -392,6 +392,12 @@ export type TimelineEntry = {
 // them a guard kept verbatim.
 export type CleanOutcome = { segments: number; keptVerbatim: number };
 
+// What a clean pass is asked to do (#217); mirrors `clean::CleanRequest`.
+// "auto": nobody pressed anything (Clean opened on entries without a clean
+// read), so a Copilot note is left alone. "missing": the entries without one,
+// asked for. "all": every entry anew.
+export type CleanRequest = "auto" | "missing" | "all";
+
 // Outcome of the on-open orphaned-text repair (#169). `coversTranscript` is
 // the backend's own comparison of `note.transcript` against what the merged
 // timelines project — the client never re-derives the grouping rule to work
@@ -596,10 +602,9 @@ export const ipc = {
     invoke<TimelineEntry[]>("note_timeline", { noteId }),
   // Clean a note's transcript (#217): a model rewrites it as a clean read
   // (fillers, stutters and false starts gone, grammar mended) for the
-  // reader's Clean view. Cleans only entries without a clean segment unless
-  // `force`. Progress arrives on `clean_status`.
-  cleanNote: (noteId: string, force: boolean) =>
-    invoke<CleanOutcome>("note_clean", { noteId, force }),
+  // reader's Clean view. Progress arrives on `clean_status`.
+  cleanNote: (noteId: string, request: CleanRequest) =>
+    invoke<CleanOutcome>("note_clean", { noteId, request }),
   // Repair transcript text no session timeline accounts for (#169), and report
   // whether a gap remains. Call this BEFORE `noteTimeline` on open: the four
   // paths that rebuild the transcript from the timelines would otherwise

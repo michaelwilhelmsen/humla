@@ -31,6 +31,9 @@ pub(super) struct ResolvedProvider {
     // chain-of-thought). Default off; flipping it on lets users A/B the
     // quality difference in dev. Ignored for cloud + non-Ollama servers.
     pub(super) think: bool,
+    /// Sent to cloud OpenAI only when set; the summary leaves it at the
+    /// model's default.
+    pub(super) reasoning_effort: Option<&'static str>,
     /// The running Copilot CLI, which the caller attaches after resolving —
     /// starting it is async and resolving is not.
     pub(super) copilot: Option<copilot_sdk::Client>,
@@ -93,6 +96,7 @@ impl ResolvedProvider {
                     &self.api_key,
                     &self.model,
                     self.think,
+                    self.reasoning_effort,
                     system_prompt,
                     user_message,
                     on_chunk,
@@ -110,6 +114,27 @@ pub(super) async fn attach_copilot(app: &AppHandle, p: &mut ResolvedProvider) ->
         return Ok(());
     }
     p.copilot = Some(super::copilot_client(app).await?);
+    Ok(())
+}
+
+/// Point a provider at its light model, without thinking, for work that needs
+/// no summary model (a title, a clean read): OpenAI's `LIGHT_OPENAI_MODEL`
+/// with no reasoning, Copilot's cheapest model. Other providers keep the
+/// user's model. Starts the Copilot CLI, so call it once a model call is
+/// certain.
+pub(super) async fn use_light_model(app: &AppHandle, p: &mut ResolvedProvider) -> anyhow::Result<()> {
+    p.think = false;
+    if p.provider == ProviderId::OpenAi {
+        p.model = super::LIGHT_OPENAI_MODEL.to_string();
+        p.reasoning_effort = Some("none");
+    }
+    attach_copilot(app, p).await?;
+    if let Some(client) = p.copilot.as_ref() {
+        let models = crate::copilot::session::list_models(client).await.unwrap_or_default();
+        if let Some(cheapest) = crate::copilot::session::cheapest(&models) {
+            p.model = cheapest.to_string();
+        }
+    }
     Ok(())
 }
 
@@ -186,6 +211,7 @@ fn resolve_unchecked(
                 api_key: "humla-local".into(),
                 model,
                 think,
+                reasoning_effort: None,
                 copilot: None,
             })
         }
@@ -202,6 +228,7 @@ fn resolve_unchecked(
                 api_key,
                 model,
                 think: false,
+                reasoning_effort: None,
                 copilot: None,
             })
         }
@@ -220,6 +247,7 @@ fn resolve_unchecked(
                 api_key,
                 model,
                 think: false,
+                reasoning_effort: None,
                 copilot: None,
             })
         }
@@ -235,6 +263,7 @@ fn resolve_unchecked(
                 api_key: String::new(),
                 model,
                 think: false,
+                reasoning_effort: None,
                 copilot: None,
             })
         }
@@ -249,6 +278,7 @@ fn resolve_unchecked(
                 api_key: api_key.unwrap_or_default(),
                 model,
                 think: false,
+                reasoning_effort: None,
                 copilot: None,
             })
         }

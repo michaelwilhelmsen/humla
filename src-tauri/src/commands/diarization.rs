@@ -39,6 +39,11 @@ const DIARIZE_MODEL_MISSING_UNLABELLED: &str = "Speaker diarization model isn't 
 pub async fn rediarize_note(app: AppHandle, note_id: String) -> Result<(), String> {
     let result = rediarize_note_inner(app.clone(), note_id.clone()).await;
     notes::purge_note_assets_if_gone(&app, &note_id);
+    // The rebuilt timeline lost the speaker changes a model moved, and the
+    // clean read keyed on the old entries.
+    if result.is_ok() {
+        tauri::async_runtime::spawn(super::clean::clean_note_quietly(app.clone(), note_id.clone()));
+    }
     result
 }
 

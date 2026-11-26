@@ -25,13 +25,10 @@
 //!   would otherwise be toasted after every recording.
 
 use super::summary::{
-    attach_copilot, language_directive, note_language, resolve_provider, summary_provider_id,
+    language_directive, note_language, resolve_provider, summary_provider_id, use_light_model,
 };
-use super::TITLE_FALLBACK_MODEL;
 use crate::db::{self, NotePatch};
 use crate::menubar::is_replaceable_title;
-use crate::openai;
-use crate::providers::ProviderId;
 use crate::recording::TitleStatusPayload;
 use crate::AppState;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -294,23 +291,11 @@ async fn try_generate_note_title(
         }
         return Ok(None);
     }
-    // Thinking on a five-word title is waste, whatever the user set for
-    // summaries.
-    provider.think = false;
-    if provider.provider == ProviderId::OpenAi && openai::is_reasoning_model(&provider.model) {
-        provider.model = TITLE_FALLBACK_MODEL.to_string();
-    }
     // Everything cheap and every refusal is behind us: from here a model call
     // is definitely happening, which is exactly what the Note view shimmers
     // over. Bracketing any earlier would flash a placeholder on notes we then
     // decline to title.
-    attach_copilot(app, &mut provider).await?;
-    if let Some(client) = provider.copilot.as_ref() {
-        let models = crate::copilot::session::list_models(client).await.unwrap_or_default();
-        if let Some(cheapest) = crate::copilot::session::cheapest(&models) {
-            provider.model = cheapest.to_string();
-        }
-    }
+    use_light_model(app, &mut provider).await?;
     emit_title_status(app, note_id, true);
     let written = write_generated_title(app, note_id, &provider, &language, &note, force).await;
     emit_title_status(app, note_id, false);

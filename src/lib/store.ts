@@ -164,6 +164,9 @@ export type RecordingState = {
   cleanErrors: Record<string, string>;
   cleanedAt: Record<string, number>;
   setCleaning: (noteId: string, status: { active: boolean; done: number; total: number; error: string | null }) => void;
+  // A clean request that returned with its note still marked as cleaning and
+  // no closing event: nothing was written, so no timeline re-read.
+  settleCleanRequest: (noteId: string, error: string | null) => void;
   // Notes with a deferred transcription replaying (#146). Its own map, not the
   // recording `status`: the replay is per-note background work that may run
   // while a *different* note records, so putting it on the shared channel
@@ -248,6 +251,13 @@ export const useRecordingStore = create<RecordingState>((set, get) => ({
       delete cleaning[noteId];
       if (error) cleanErrors[noteId] = error;
       return { cleaning, cleanErrors, cleanedAt: { ...s.cleanedAt, [noteId]: Date.now() } };
+    }),
+  settleCleanRequest: (noteId, error) =>
+    set((s) => {
+      if (!s.cleaning[noteId]) return {};
+      const cleaning = { ...s.cleaning };
+      delete cleaning[noteId];
+      return { cleaning, cleanErrors: error ? { ...s.cleanErrors, [noteId]: error } : s.cleanErrors };
     }),
   transcribing: {},
   setTranscribing: (noteId, active, measure) =>

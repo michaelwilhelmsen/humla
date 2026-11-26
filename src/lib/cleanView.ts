@@ -20,15 +20,20 @@ export function parseTranscriptView(raw: string | null | undefined): TranscriptV
 
 /**
  * The timeline as the Clean view shows it: every entry with a clean text
- * takes it, the rest stay verbatim. A segment's first entry carries the whole
+ * takes it. The rest stay verbatim, or, while a pass is on its way to them
+ * (`pending`), are emptied so the reader draws a placeholder rather than
+ * passing verbatim off as clean. A segment's first entry carries the whole
  * segment, so it is stretched to the segment's last word: the player lights
  * an entry's words only while the playhead is inside the entry. Indices line
  * up one to one with `timeline`, so per-turn actions still address the real
  * entries.
  */
-export function cleanDisplayTimeline(timeline: readonly TimelineEntry[]): TimelineEntry[] {
+export function cleanDisplayTimeline(
+  timeline: readonly TimelineEntry[],
+  { pending = false }: { pending?: boolean } = {},
+): TimelineEntry[] {
   return timeline.map((e) => {
-    if (!e.clean) return e;
+    if (!e.clean) return pending ? { ...e, text: "", words: [] } : e;
     const lastEnd = e.clean.words.length > 0 ? e.clean.words[e.clean.words.length - 1].end_ms : 0;
     return {
       ...e,
@@ -37,6 +42,40 @@ export function cleanDisplayTimeline(timeline: readonly TimelineEntry[]): Timeli
       endMs: Math.max(e.endMs, lastEnd),
     };
   });
+}
+
+function entryWords(e: TimelineEntry): number {
+  const timed = e.words?.length ?? 0;
+  return timed > 0 ? timed : e.text.split(/\s+/).filter(Boolean).length;
+}
+
+/** Verbatim words among `indices` that no clean segment covers yet. */
+export function pendingWords(timeline: readonly TimelineEntry[], indices: readonly number[]): number {
+  let n = 0;
+  for (const i of indices) {
+    const e = timeline[i];
+    if (e && !e.clean) n += entryWords(e);
+  }
+  return n;
+}
+
+/** Words on one line of the reader at its usual width. */
+const WORDS_PER_LINE = 18;
+
+/** Placeholder lines for a turn of `words` words, each as a percentage of the
+ *  column: full lines, then a last one as long as what is left. */
+export function pendingLineWidths(words: number): number[] {
+  if (words <= 0) return [];
+  const lines = Math.ceil(words / WORDS_PER_LINE);
+  const rest = words - (lines - 1) * WORDS_PER_LINE;
+  const last = Math.max(15, Math.round((rest / WORDS_PER_LINE) * 100));
+  return [...Array<number>(lines - 1).fill(100), last];
+}
+
+/** How far a clean pass has come, in percent of its model calls; `null`
+ *  until it knows how many it will make. */
+export function cleanPercent({ done, total }: { done: number; total: number }): number | null {
+  return total > 0 ? Math.floor((done / total) * 100) : null;
 }
 
 /** Whether Clean has nothing left to show of this turn: it was only filler. */

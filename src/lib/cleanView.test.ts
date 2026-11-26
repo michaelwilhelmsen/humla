@@ -2,9 +2,12 @@ import { describe, expect, it } from "vitest";
 import {
   cleanCoverage,
   cleanDisplayTimeline,
+  cleanPercent,
   cleanTranscriptText,
   emptyTurn,
   parseTranscriptView,
+  pendingLineWidths,
+  pendingWords,
 } from "./cleanView";
 import type { TimelineEntry, TimelineWord } from "./ipc";
 import { groupTimeline } from "./sessions";
@@ -67,6 +70,14 @@ describe("cleanDisplayTimeline", () => {
     expect(shown[0].endMs).toBeGreaterThan(timeline[0].endMs);
   });
 
+  it("while a pass runs, empties the entries it hasn't reached instead of showing them verbatim", () => {
+    const shown = cleanDisplayTimeline(timeline, { pending: true });
+    expect(shown[0].text).toBe("Ja, jeg har notatene klare og tallene.");
+    expect(shown[2].text).toBe("");
+    expect(shown[2].words).toEqual([]);
+    expect(shown[2].startMs).toBe(timeline[2].startMs);
+  });
+
   it("keeps entry indices one to one, for per-turn actions", () => {
     const shown = cleanDisplayTimeline(timeline);
     expect(shown.map((e) => e.chunkIdx)).toEqual(timeline.map((e) => e.chunkIdx));
@@ -112,5 +123,35 @@ describe("cleanCoverage", () => {
         { ...entry("B", "", 3000), words: [] },
       ]),
     ).toEqual({ entries: 3, cleaned: 2 });
+  });
+});
+
+describe("pendingWords", () => {
+  it("counts the verbatim words still waiting for a clean read", () => {
+    const timeline = [
+      entry("A", "en to tre", 0, { text: "En, to, tre.", words: [] }),
+      entry("A", "fire fem", 1000),
+      { ...entry("A", "", 2000), text: "seks sju", words: [] },
+    ];
+    expect(pendingWords(timeline, [0, 1, 2])).toBe(4);
+    expect(pendingWords(timeline, [0])).toBe(0);
+  });
+});
+
+describe("pendingLineWidths", () => {
+  it("draws about as many lines as the turn will take", () => {
+    expect(pendingLineWidths(0)).toEqual([]);
+    expect(pendingLineWidths(1)).toEqual([15]);
+    expect(pendingLineWidths(9)).toEqual([50]);
+    expect(pendingLineWidths(18)).toEqual([100]);
+    expect(pendingLineWidths(45)).toEqual([100, 100, 50]);
+  });
+});
+
+describe("cleanPercent", () => {
+  it("is the share of model calls done, or nothing before the count is known", () => {
+    expect(cleanPercent({ done: 0, total: 0 })).toBeNull();
+    expect(cleanPercent({ done: 9, total: 45 })).toBe(20);
+    expect(cleanPercent({ done: 2, total: 3 })).toBe(66);
   });
 });

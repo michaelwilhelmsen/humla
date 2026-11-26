@@ -430,7 +430,7 @@ pub(super) fn read_timeline_values(path: &std::path::Path) -> Vec<serde_json::Va
 }
 
 /// Write timeline values back as JSONL (one object per line).
-fn write_timeline_values(path: &std::path::Path, values: &[serde_json::Value]) -> Result<(), String> {
+pub(super) fn write_timeline_values(path: &std::path::Path, values: &[serde_json::Value]) -> Result<(), String> {
     let mut out = String::new();
     for v in values {
         out.push_str(&v.to_string());

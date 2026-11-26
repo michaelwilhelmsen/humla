@@ -399,7 +399,9 @@ function notePlayerCase(): Scenario {
 // The whole note, because the question is the switch's place among the tab's
 // other rows, and what a cleaned turn reads like next to a verbatim one. Each
 // entry carries word timings and a mask the way `note_timeline` returns them.
-function noteCleanCase(view: "clean" | "verbatim"): Scenario {
+// "pending": a pass a third of the way through, the turns it hasn't reached
+// drawn as placeholders.
+function noteCleanCase(view: "clean" | "verbatim", pending = false): Scenario {
   const note = makeNote({
     id: "n1",
     title: "Kvartalsgjennomgang",
@@ -410,17 +412,20 @@ function noteCleanCase(view: "clean" | "verbatim"): Scenario {
   // Words spread evenly over an entry's slot, as the backend would time them.
   const timed = (text: string, startMs: number) =>
     text.split(" ").map((t, k) => ({ text: t, start_ms: startMs + k * 300, end_ms: startMs + k * 300 + 250 }));
-  const entry = (i: number, label: string, text: string, clean?: string) => ({
-    startMs: i * 4000,
-    endMs: i * 4000 + 3800,
-    label,
-    text,
-    words: timed(text, i * 4000),
-    sessionId: "s1",
-    sessionIndex: 1,
-    chunkIdx: i,
-    clean: clean === undefined ? undefined : { text: clean, words: clean ? timed(clean, i * 4000) : [] },
-  });
+  const entry = (i: number, label: string, text: string, cleanText?: string) => {
+    const clean = pending && i >= 3 ? undefined : cleanText;
+    return {
+      startMs: i * 4000,
+      endMs: i * 4000 + 3800,
+      label,
+      text,
+      words: timed(text, i * 4000),
+      sessionId: "s1",
+      sessionIndex: 1,
+      chunkIdx: i,
+      clean: clean === undefined ? undefined : { text: clean, words: clean ? timed(clean, i * 4000) : [] },
+    };
+  };
   const take = {
     id: "s1",
     index: 1,
@@ -469,6 +474,7 @@ function noteCleanCase(view: "clean" | "verbatim"): Scenario {
       const url = URL.createObjectURL(quietToneWav(8));
       (window as unknown as { __TAURI_INTERNALS__: { convertFileSrc: () => string } })
         .__TAURI_INTERNALS__.convertFileSrc = () => url;
+      if (pending) useRecordingStore.setState({ cleaning: { n1: { done: 1, total: 3 } } });
     },
   };
 }
@@ -1737,6 +1743,7 @@ const CASES: Record<string, Scenario> = {
   "note-player": notePlayerCase(),
   "note-clean": noteCleanCase("clean"),
   "note-clean-verbatim": noteCleanCase("verbatim"),
+  "note-clean-pending": noteCleanCase("clean", true),
   "note-pending": noteTranscribeCase(false),
   "note-pending-text": noteTranscribeCase(true),
   // #146: the same note mid-replay. Two surfaces report the one run — the
