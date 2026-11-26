@@ -137,10 +137,16 @@ fn openai_model_for(job: LightJob) -> (&'static str, openai::ReasoningEffort) {
     }
 }
 
-/// Point a provider at the model for `job`, without thinking: OpenAI's per
-/// `openai_model_for`, Copilot's cheapest. Other providers keep the user's
-/// model. Starts the Copilot CLI, so call it once a model call is certain.
-pub(super) async fn use_light_model(app: &AppHandle, p: &mut ResolvedProvider, job: LightJob) -> anyhow::Result<()> {
+/// Point a provider at the model for `job`, without thinking: `chosen` when
+/// the user picked one for it, else OpenAI's per `openai_model_for` and
+/// Copilot's cheapest, else the user's summary model. Starts the Copilot CLI,
+/// so call it once a model call is certain.
+pub(super) async fn use_light_model(
+    app: &AppHandle,
+    p: &mut ResolvedProvider,
+    job: LightJob,
+    chosen: Option<String>,
+) -> anyhow::Result<()> {
     p.think = false;
     if p.provider == ProviderId::OpenAi {
         let (model, effort) = openai_model_for(job);
@@ -148,7 +154,11 @@ pub(super) async fn use_light_model(app: &AppHandle, p: &mut ResolvedProvider, j
         p.reasoning_effort = Some(effort);
     }
     attach_copilot(app, p).await?;
-    if let Some(client) = p.copilot.as_ref() {
+    if let Some(model) = chosen {
+        p.reasoning_effort = (p.provider == ProviderId::OpenAi && openai::is_reasoning_model(&model))
+            .then_some(openai::ReasoningEffort::Low);
+        p.model = model;
+    } else if let Some(client) = p.copilot.as_ref() {
         let models = crate::copilot::session::list_models(client).await.unwrap_or_default();
         if let Some(cheapest) = crate::copilot::session::cheapest(&models) {
             p.model = cheapest.to_string();
@@ -444,7 +454,7 @@ async fn run_summary(app: AppHandle, note_id: String) -> anyhow::Result<()> {
     };
     // The clean read where there is one (#217).
     let transcript = if super::clean::clean_setting_on(&app) {
-        super::timeline::clean_transcript(&app, &note_id, &note.transcript)
+        super::clean::clean_text(&app, &note_id, &note.transcript)
     } else {
         None
     }

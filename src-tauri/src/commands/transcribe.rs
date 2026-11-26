@@ -319,7 +319,7 @@ pub(super) async fn transcribe_chunk(
 /// providers keep only the tail of a ~224-token prompt, which would drop the
 /// front of the list, so the list is cut to a length that fits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum VocabCap {
+pub(super) enum VocabCap {
     Terms(usize),
     Chars(usize),
 }
@@ -339,7 +339,7 @@ impl VocabCap {
 /// organisation's. Terms under three characters are dropped: every provider's
 /// biaser turns them into false positives. Without organisation terms the
 /// user's list is used exactly as stored.
-fn merge_vocabulary(org: &[String], user: &str, cap: VocabCap) -> Vec<String> {
+pub(super) fn merge_vocabulary(org: &[String], user: &str, cap: VocabCap) -> Vec<String> {
     let usable = |t: &&str| t.len() >= 3;
     let user = user.split(['\n', ',']).map(str::trim).filter(usable);
     let org: Vec<&str> = org.iter().map(|t| t.trim()).filter(usable).collect();

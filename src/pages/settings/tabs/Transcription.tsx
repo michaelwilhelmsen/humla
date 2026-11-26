@@ -7,6 +7,7 @@ import { ProviderConfigForm } from "../components/ProviderConfigForm";
 import { Row, Section } from "../components/Section";
 import { Toggle } from "../components/Toggle";
 import { RenameYouRow } from "../components/RenameYouRow";
+import { CleanModelRow } from "../components/CleanModelRow";
 import { Select } from "../../../components/ui/Select";
 import { ProviderKeyCard, type KeyProvider } from "../../../components/provider/ProviderKeyCard";
 import { CustomEndpointCard } from "../../../components/provider/CustomEndpoint";
@@ -288,6 +289,18 @@ export function TranscriptionTab({
           </p>
         </Disclosure>
 
+        <Row
+          label="Fix speaker changes"
+          description="Where a change of speaker cuts a sentence, a model from your summary provider moves the words to whoever said them."
+          control={
+            <Toggle
+              label="Fix speaker changes"
+              checked={s.speaker_check !== "false"}
+              onChange={(on) => update("speaker_check", on ? "true" : "false")}
+            />
+          }
+        />
+
         {/* Count-gated, so it is absent for a new install and gone for good once
             used (#116 part 2). In Transcription rather than Chat because the row
             is about what transcripts say. */}
@@ -297,7 +310,7 @@ export function TranscriptionTab({
       <Section title="Clean transcripts">
         <Row
           label="Clean transcripts"
-          description="After a recording, the model your summaries use writes a clean read of the transcript: filler words, stutters and false starts gone, broken grammar mended. The Transcript tab shows it as Clean; Verbatim keeps every word as it was said."
+          description="After a recording, a model from your summary provider writes a clean read of the transcript: filler words, stutters and false starts gone, broken grammar mended. The Transcript tab shows it as Clean; Verbatim keeps every word as it was said."
           control={
             <Toggle
               label="Clean transcripts"
@@ -306,6 +319,14 @@ export function TranscriptionTab({
             />
           }
         />
+        {s.clean_transcripts !== "false" && (
+          <CleanModelRow
+            provider={s.summary_provider}
+            setting={s.clean_model}
+            localBaseUrl={s.local_llm_base_url}
+            onChange={(v) => update("clean_model", v)}
+          />
+        )}
       </Section>
     </>
   );

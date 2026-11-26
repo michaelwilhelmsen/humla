@@ -1,41 +1,38 @@
 import { describe, expect, it } from "vitest";
 import {
-  cleanCoverage,
-  cleanDisplayTimeline,
   cleanPercent,
-  cleanTranscriptText,
-  emptyTurn,
+  cleanViewText,
+  hasParagraphs,
+  hasStaleTake,
   parseTranscriptView,
   pendingLineWidths,
-  pendingWords,
+  startsRun,
 } from "./cleanView";
-import type { TimelineEntry, TimelineWord } from "./ipc";
-import { groupTimeline } from "./sessions";
+import type { CleanItem, CleanView } from "./ipc";
 
-function words(text: string, startMs: number): TimelineWord[] {
-  return text
-    .split(/\s+/)
-    .filter(Boolean)
-    .map((t, i) => ({ text: t, start_ms: startMs + i * 300, end_ms: startMs + i * 300 + 250 }));
-}
+const turn = (speaker: string, text: string, id = text): CleanItem => ({
+  kind: "turn",
+  id,
+  speaker,
+  text,
+  startMs: 0,
+  edited: false,
+});
+const gap = (speaker: string, text: string): CleanItem => ({
+  kind: "gap",
+  speaker,
+  text,
+  startMs: 0,
+  words: text.split(" ").length,
+});
 
-function entry(
-  label: string,
-  text: string,
-  startMs: number,
-  clean?: { text: string; words: TimelineWord[] },
-): TimelineEntry {
-  const ws = words(text, startMs);
+function view(...takes: CleanItem[][]): CleanView {
   return {
-    startMs,
-    endMs: ws.length > 0 ? ws[ws.length - 1].end_ms : startMs,
-    label,
-    text,
-    words: ws,
-    sessionId: "s1",
-    sessionIndex: 1,
-    chunkIdx: 0,
-    clean,
+    takes: takes.map((items, i) => ({ sessionId: `s${i + 1}`, items, stale: false })),
+    words: 0,
+    cleanedWords: 0,
+    edited: 0,
+    unreadable: false,
   };
 }
 
@@ -48,110 +45,47 @@ describe("parseTranscriptView", () => {
   });
 });
 
-describe("cleanDisplayTimeline", () => {
-  const segmentWords = words("Ja, jeg har notatene klare og tallene.", 0);
-  const timeline = [
-    entry("Hege", "Ja, ehm, jeg har jeg har", 0, { text: "Ja, jeg har notatene klare og tallene.", words: segmentWords }),
-    entry("Hege", "notatene klare og og tallene.", 1800, { text: "", words: [] }),
-    entry("Michael", "Bra.", 4000),
-  ];
-
-  it("swaps in the clean text and words, and leaves uncleaned entries verbatim", () => {
-    const shown = cleanDisplayTimeline(timeline);
-    expect(shown[0].text).toBe("Ja, jeg har notatene klare og tallene.");
-    expect(shown[0].words).toBe(segmentWords);
-    expect(shown[1].words).toEqual([]);
-    expect(shown[2]).toBe(timeline[2]);
-  });
-
-  it("stretches a segment's first entry over the whole segment, so its words stay lit", () => {
-    const shown = cleanDisplayTimeline(timeline);
-    expect(shown[0].endMs).toBe(segmentWords[segmentWords.length - 1].end_ms);
-    expect(shown[0].endMs).toBeGreaterThan(timeline[0].endMs);
-  });
-
-  it("while a pass runs, empties the entries it hasn't reached instead of showing them verbatim", () => {
-    const shown = cleanDisplayTimeline(timeline, { pending: true });
-    expect(shown[0].text).toBe("Ja, jeg har notatene klare og tallene.");
-    expect(shown[2].text).toBe("");
-    expect(shown[2].words).toEqual([]);
-    expect(shown[2].startMs).toBe(timeline[2].startMs);
-  });
-
-  it("keeps entry indices one to one, for per-turn actions", () => {
-    const shown = cleanDisplayTimeline(timeline);
-    expect(shown.map((e) => e.chunkIdx)).toEqual(timeline.map((e) => e.chunkIdx));
-    expect(groupTimeline(shown)[0].indices).toEqual([0, 1]);
-  });
-});
-
-describe("emptyTurn", () => {
-  it("is a turn cleaned down to nothing", () => {
-    const [filler, reply] = groupTimeline(
-      cleanDisplayTimeline([
-        entry("Hege", "Mm.", 0, { text: "", words: [] }),
-        entry("Michael", "Bra.", 1000, { text: "Bra.", words: words("Bra.", 1000) }),
-      ]),
+describe("cleanViewText", () => {
+  it("joins a speaker's paragraphs into one line per take, mirroring the backend", () => {
+    const v = view(
+      [turn("Michael", "Skal vi?"), turn("Michael", "La oss."), gap("Hege", "eh ok"), turn("Hege", "")],
+      [turn("Hege", "Bra.")],
     );
-    expect(emptyTurn(filler)).toBe(true);
-    expect(emptyTurn(reply)).toBe(false);
+    expect(cleanViewText(v)).toBe("Michael: Skal vi? La oss.\nHege: eh ok\nHege: Bra.");
   });
 });
 
-describe("cleanTranscriptText", () => {
-  it("labels each turn like the stored transcript and drops emptied ones", () => {
-    const groups = groupTimeline(
-      cleanDisplayTimeline([
-        entry("Michael", "Eh, skal vi, skal vi starte?", 0, { text: "Skal vi starte?", words: words("Skal vi starte?", 0) }),
-        entry("Hege", "Mm.", 2000, { text: "", words: [] }),
-        entry("Stian", "Ja, ja. Det, eh, det fikser jeg.", 3000),
-      ]),
-    );
-    expect(cleanTranscriptText(groups)).toBe(
-      "Michael: Skal vi starte?\nStian: Ja, ja. Det, eh, det fikser jeg.",
-    );
+describe("hasParagraphs / hasStaleTake", () => {
+  it("reads whether there is anything clean, and whether a take went stale", () => {
+    expect(hasParagraphs(null)).toBe(false);
+    expect(hasParagraphs(view([gap("Hege", "eh ja")]))).toBe(false);
+    expect(hasParagraphs(view([turn("Hege", "Ja.")]))).toBe(true);
+    const stale = view([turn("Hege", "Ja.")]);
+    expect(hasStaleTake(stale)).toBe(false);
+    stale.takes[0].stale = true;
+    expect(hasStaleTake(stale)).toBe(true);
   });
 });
 
-describe("cleanCoverage", () => {
-  it("counts the entries a clean segment covers", () => {
-    expect(
-      cleanCoverage([
-        entry("A", "en to tre", 0, { text: "En, to, tre.", words: [] }),
-        entry("B", "fire fem", 1000, { text: "", words: [] }),
-        entry("A", "seks", 2000),
-        { ...entry("B", "", 3000), words: [] },
-      ]),
-    ).toEqual({ entries: 3, cleaned: 2 });
-  });
-});
-
-describe("pendingWords", () => {
-  it("counts the verbatim words still waiting for a clean read", () => {
-    const timeline = [
-      entry("A", "en to tre", 0, { text: "En, to, tre.", words: [] }),
-      entry("A", "fire fem", 1000),
-      { ...entry("A", "", 2000), text: "seks sju", words: [] },
-    ];
-    expect(pendingWords(timeline, [0, 1, 2])).toBe(4);
-    expect(pendingWords(timeline, [0])).toBe(0);
+describe("startsRun", () => {
+  it("is true where the speaker changes", () => {
+    const items = [turn("A", "1"), turn("A", "2"), gap("B", "3"), turn("A", "4")];
+    expect(items.map((_, i) => startsRun(items, i))).toEqual([true, false, true, true]);
   });
 });
 
 describe("pendingLineWidths", () => {
-  it("draws about as many lines as the turn will take", () => {
+  it("draws full lines, then the rest", () => {
     expect(pendingLineWidths(0)).toEqual([]);
-    expect(pendingLineWidths(1)).toEqual([15]);
     expect(pendingLineWidths(9)).toEqual([50]);
-    expect(pendingLineWidths(18)).toEqual([100]);
-    expect(pendingLineWidths(45)).toEqual([100, 100, 50]);
+    expect(pendingLineWidths(40)).toEqual([100, 100, 22]);
+    expect(pendingLineWidths(1)).toEqual([15]);
   });
 });
 
 describe("cleanPercent", () => {
-  it("is the share of model calls done, or nothing before the count is known", () => {
+  it("is unknown until the pass knows its calls", () => {
     expect(cleanPercent({ done: 0, total: 0 })).toBeNull();
-    expect(cleanPercent({ done: 9, total: 45 })).toBe(20);
-    expect(cleanPercent({ done: 2, total: 3 })).toBe(66);
+    expect(cleanPercent({ done: 1, total: 3 })).toBe(33);
   });
 });

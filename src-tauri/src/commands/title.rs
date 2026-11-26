@@ -295,7 +295,7 @@ async fn try_generate_note_title(
     // is definitely happening, which is exactly what the Note view shimmers
     // over. Bracketing any earlier would flash a placeholder on notes we then
     // decline to title.
-    use_light_model(app, &mut provider, LightJob::Title).await?;
+    use_light_model(app, &mut provider, LightJob::Title, None).await?;
     emit_title_status(app, note_id, true);
     let written = write_generated_title(app, note_id, &provider, &language, &note, force).await;
     emit_title_status(app, note_id, false);

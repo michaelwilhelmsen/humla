@@ -54,7 +54,7 @@ import { Permissions } from "./components/Permissions";
 import { Section } from "./pages/settings/components/Section";
 import { TranscriptionStep } from "./pages/onboarding/steps/Transcription";
 import { STEP_ORDER, type StepContext, type StepId } from "./pages/onboarding/types";
-import type { DiarizeEngine, ProviderConfig, RecordingStatus, Step, TimelineEntry } from "./lib/ipc";
+import type { CleanItem, CleanView, DiarizeEngine, ProviderConfig, RecordingStatus, Step, TimelineEntry } from "./lib/ipc";
 import { DEMO_CLIENTS, DEMO_FOLDERS, demoNotes } from "./test/noteLibrary";
 import { DEMO_RECOVERY_CODES, DEMO_TWO_FACTOR_SETUP } from "./test/twoFactorFixtures";
 // Mirrors src/main.tsx — every theme's typeface, so a scenario reviewed under
@@ -397,10 +397,8 @@ function notePlayerCase(): Scenario {
 
 // ---- #217 axis: the Transcript tab's Clean view -----------------------------
 // The whole note, because the question is the switch's place among the tab's
-// other rows, and what a cleaned turn reads like next to a verbatim one. Each
-// entry carries word timings and a clean read the way `note_timeline` returns them.
-// "pending": a pass a third of the way through, the turns it hasn't reached
-// drawn as placeholders.
+// other rows, and what the clean paragraphs read like. "pending": a pass a
+// third of the way through, the words it hasn't reached drawn as placeholders.
 function noteCleanCase(view: "clean" | "verbatim", pending = false): Scenario {
   const note = makeNote({
     id: "n1",
@@ -412,20 +410,52 @@ function noteCleanCase(view: "clean" | "verbatim", pending = false): Scenario {
   // Words spread evenly over an entry's slot, as the backend would time them.
   const timed = (text: string, startMs: number) =>
     text.split(" ").map((t, k) => ({ text: t, start_ms: startMs + k * 300, end_ms: startMs + k * 300 + 250 }));
-  const entry = (i: number, label: string, text: string, cleanText?: string) => {
-    const clean = pending && i >= 3 ? undefined : cleanText;
-    return {
-      startMs: i * 4000,
-      endMs: i * 4000 + 3800,
-      label,
-      text,
-      words: timed(text, i * 4000),
-      sessionId: "s1",
-      sessionIndex: 1,
-      chunkIdx: i,
-      clean: clean === undefined ? undefined : { text: clean, words: clean ? timed(clean, i * 4000) : [] },
-    };
-  };
+  const said: [string, string][] = [
+    ["Michael", "Eh, skal vi, skal vi ta gjennomgangen nå?"],
+    ["Hege", "Ja, ehm, jeg har jeg har notatene klare."],
+    ["Hege", "Og tallene fra fra forrige kvartal, altså, de ligger i mappa."],
+    ["Michael", "Bra. Øh, da starter vi der. Jeg tenkte at vi, liksom, ser på på churn først."],
+    ["Hege", "Mm."],
+    ["Hege", "Churn er, eh, den er faktisk nede. Fra fire komma to til tre komma ni prosent."],
+    ["Stian", "Ja, ja. Det, eh, det fikser jeg."],
+  ];
+  const timeline = said.map(([label, text], i) => ({
+    startMs: i * 4000,
+    endMs: i * 4000 + 3800,
+    label,
+    text,
+    words: timed(text, i * 4000),
+    sessionId: "s1",
+    sessionIndex: 1,
+    chunkIdx: i,
+  }));
+  const turn = (i: number, text: string, edited = false): CleanItem => ({
+    kind: "turn",
+    id: `t${i}`,
+    speaker: said[i][0],
+    text,
+    startMs: i * 4000,
+    edited,
+  });
+  const gap = (i: number): CleanItem => ({
+    kind: "gap",
+    speaker: said[i][0],
+    text: said[i][1],
+    startMs: i * 4000,
+    words: said[i][1].split(" ").length,
+  });
+  const items: CleanItem[] = [
+    turn(0, "Skal vi ta gjennomgangen nå?"),
+    turn(1, "Ja, jeg har notatene klare, og tallene fra forrige kvartal ligger i mappa.", true),
+    ...(pending
+      ? [gap(3), gap(5), gap(6)]
+      : [
+          turn(3, "Bra. Da starter vi der. Jeg tenkte at vi ser på churn først."),
+          turn(5, "Churn er faktisk nede, fra 4,2 til 3,9 prosent."),
+          gap(6),
+        ]),
+  ];
+  const words = said.reduce((n, [, t]) => n + t.split(" ").length, 0);
   const take = {
     id: "s1",
     index: 1,
@@ -446,30 +476,20 @@ function noteCleanCase(view: "clean" | "verbatim", pending = false): Scenario {
         const key = (args as { key?: string } | undefined)?.key;
         return key === "transcript_view" ? view : null;
       },
-      note_timeline: () => [
-        entry(0, "Michael", "Eh, skal vi, skal vi ta gjennomgangen nå?", "Skal vi ta gjennomgangen nå?"),
-        entry(
-          1,
-          "Hege",
-          "Ja, ehm, jeg har jeg har notatene klare.",
-          "Ja, jeg har notatene klare, og tallene fra forrige kvartal ligger i mappa.",
-        ),
-        entry(2, "Hege", "Og tallene fra fra forrige kvartal, altså, de ligger i mappa.", ""),
-        entry(
-          3,
-          "Michael",
-          "Bra. Øh, da starter vi der. Jeg tenkte at vi, liksom, ser på på churn først.",
-          "Bra. Da starter vi der. Jeg tenkte at vi ser på churn først.",
-        ),
-        entry(4, "Hege", "Mm.", ""),
-        entry(5, "Hege", "Churn er, eh, den er faktisk nede. Fra fire komma to til tre komma ni prosent.", "Churn er faktisk nede, fra 4,2 til 3,9 prosent."),
-        entry(6, "Stian", "Ja, ja. Det, eh, det fikser jeg."),
-      ],
+      note_timeline: () => timeline,
       note_timeline_repair: () => ({ repaired: false, coversTranscript: true }),
       note_sessions: () => [take],
       note_session_playback_path: () => "/mock/playback.wav",
       note_clean: () => ({ segments: 0, keptVerbatim: 0 }),
       note_clean_available: () => true,
+      note_clean_view: (): CleanView => ({
+        takes: [{ sessionId: "s1", items, stale: false }],
+        words,
+        cleanedWords: pending ? 23 : words - 8,
+        edited: 1,
+        unreadable: false,
+      }),
+      note_clean_edit: () => null,
     },
     seed: () => {
       const url = URL.createObjectURL(quietToneWav(8));

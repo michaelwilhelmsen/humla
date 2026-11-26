@@ -27,25 +27,24 @@ import {
   Pencil,
   RefreshCw,
   Sparkles,
+  UserRoundPen,
   Users,
   X,
 } from "lucide-react";
 import { deletedAfter, redateBounds, useNoteOrgPolicy } from "../lib/orgPolicy";
 import { recordsOpens, reportCopied, reportOpened } from "../lib/audit";
-import { ipc, onNotesPurged, onSummaryThinkingDelta, onSummaryContentDelta, type CleanRequest, type Note as TNote, type NoteRevision, type NoteSession, type SummaryPrompt, type TimelineEntry } from "../lib/ipc";
+import { ipc, onNotesPurged, onSummaryThinkingDelta, onSummaryContentDelta, type CleanEdit, type CleanItem, type CleanRequest, type CleanView, type Note as TNote, type NoteRevision, type NoteSession, type SummaryPrompt, type TimelineEntry } from "../lib/ipc";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { SUMMARY_CAPABLE, type SummaryProvider } from "../lib/providers";
 import { useLiveSetting, writeSetting } from "../lib/settingsBus";
 import {
-  cleanCoverage,
-  cleanDisplayTimeline,
   cleanPercent,
-  cleanTranscriptText,
-  emptyTurn,
+  cleanViewText,
+  hasParagraphs,
+  hasStaleTake,
   parseTranscriptView,
   pendingLineWidths,
-  pendingWords,
-  type CleanCoverage,
+  startsRun,
   type TranscriptView,
 } from "../lib/cleanView";
 import { Segmented } from "./settings/components/Segmented";
@@ -80,6 +79,7 @@ import { SelectablePopover } from "../components/SelectablePopover";
 import {
   Menu,
   MenuContent,
+  MenuItem,
   MenuRadioGroup,
   MenuRadioItem,
   MenuSeparator,
@@ -1130,8 +1130,8 @@ export function Note() {
     );
   }, [notesForSweep, draft]);
 
-  // Clean transcripts (#217). The switch is shown only while the setting is
-  // on and the note's summary provider is set up to clean with; otherwise the
+  // Clean transcripts (#217). The switch is shown while the setting is on and
+  // the note has paragraphs to show or a model to clean with; otherwise the
   // reader is Verbatim whatever was last picked.
   const cleanSetting = useLiveSetting("clean_transcripts");
   const summaryProviderSetting = useLiveSetting("summary_provider");
@@ -1154,68 +1154,114 @@ export function Note() {
       cancelled = true;
     };
   }, [draft?.id, draft?.summary_provider, cleanSetting, summaryProviderSetting]);
-  const cleanOn = cleanSetting !== "false" && cleanAvailable;
-  const transcriptViewSetting = useLiveSetting("transcript_view");
-  const transcriptView: TranscriptView = cleanOn
-    ? parseTranscriptView(transcriptViewSetting)
-    : "verbatim";
   const cleaning = useRecordingStore((s) => (draft ? s.cleaning[draft.id] : undefined));
   const cleanError = useRecordingStore((s) => (draft ? s.cleanErrors[draft.id] : undefined));
   const cleanedAt = useRecordingStore((s) => (draft ? s.cleanedAt[draft.id] : undefined));
-  const coverage = useMemo(() => cleanCoverage(timeline), [timeline]);
-  // While a pass runs, Clean draws a placeholder for the entries it hasn't
-  // reached rather than their verbatim text. Not during a recording, whose
-  // live text is verbatim until the take is done.
-  const cleanPending =
-    transcriptView === "clean" && !!cleaning && !recActive && coverage.cleaned < coverage.entries;
-  const showsClean = transcriptView === "clean" && (coverage.cleaned > 0 || cleanPending);
   const cleanDone = cleaning?.done ?? 0;
-
-  // Each model call, and the pass's end, wrote clean segments: re-read the
-  // timeline that carries them.
+  // The Clean view, kept with the note it belongs to so another note's never
+  // shows while this one's loads. Read again when the verbatim moved under it
+  // (the timeline), a pass wrote paragraphs, or the stored text changed (an
+  // edit here, a sync pull).
+  const [cleanViewState, setCleanViewState] = useState<{ noteId: string; view: CleanView } | null>(null);
+  const [cleanRev, setCleanRev] = useState(0);
   useEffect(() => {
-    if (!draft?.id || (!cleanedAt && cleanDone === 0)) return;
+    if (!draft?.id || cleanSetting === "false") return;
+    const noteId = draft.id;
     let cancelled = false;
     ipc
-      .noteTimeline(draft.id)
-      .then((tl) => {
-        if (!cancelled) setTimeline(tl);
+      .cleanView(noteId)
+      .then((view) => {
+        if (!cancelled && view) setCleanViewState({ noteId, view });
       })
       .catch(() => {});
     return () => {
       cancelled = true;
     };
-  }, [draft?.id, cleanedAt, cleanDone]);
+  }, [draft?.id, cleanSetting, timeline, cleanedAt, cleanDone, note?.clean_transcript, cleanRev]);
+  const cleanView =
+    cleanSetting !== "false" && cleanViewState && cleanViewState.noteId === draft?.id && !cleanViewState.view.unreadable
+      ? cleanViewState.view
+      : null;
+  const cleanParagraphs = hasParagraphs(cleanView);
+  const cleanOn = cleanSetting !== "false" && (cleanAvailable || cleanParagraphs);
+  const transcriptViewSetting = useLiveSetting("transcript_view");
+  const transcriptView: TranscriptView = cleanOn
+    ? parseTranscriptView(transcriptViewSetting)
+    : "verbatim";
+  const cleanWords = cleanView?.words ?? 0;
+  const cleanedWords = cleanView?.cleanedWords ?? 0;
+  // While a pass runs, Clean draws a placeholder for the words it hasn't
+  // reached rather than their verbatim text. Not during a recording, whose
+  // live text is verbatim until the take is done.
+  const cleanPending =
+    transcriptView === "clean" && !!cleaning && !recActive && cleanedWords < cleanWords;
+  const showsClean = transcriptView === "clean" && !!cleanView && (cleanParagraphs || cleanPending);
+
+  // A paragraph edited or given another speaker: shown at once, then read back.
+  const editClean = useCallback(
+    async (sessionId: string, turnId: string, edit: CleanEdit) => {
+      if (!draft?.id) return;
+      const noteId = draft.id;
+      setCleanViewState((st) =>
+        st && st.noteId === noteId
+          ? {
+              noteId,
+              view: {
+                ...st.view,
+                takes: st.view.takes.map((t) =>
+                  t.sessionId !== sessionId
+                    ? t
+                    : {
+                        ...t,
+                        items: t.items.map((i) =>
+                          i.kind === "turn" && i.id === turnId
+                            ? { ...i, text: edit.text ?? i.text, speaker: edit.speaker ?? i.speaker }
+                            : i,
+                        ),
+                      },
+                ),
+              },
+            }
+          : st,
+      );
+      try {
+        await ipc.cleanEdit(noteId, sessionId, turnId, edit);
+      } catch (e) {
+        useRecordingStore.getState().pushFlash(String(e));
+      }
+      setCleanRev((r) => r + 1);
+    },
+    [draft?.id],
+  );
 
   // Clean what hasn't been, the first time Clean is looked at: an older note,
-  // a take recorded with the setting off, entries a re-diarize or an edit
-  // left without a clean segment. Once per note and coverage per app session, so a
-  // pass that fails (no model set up, a governed note) isn't retried on every
-  // render; its reason shows in the switch's caption instead. A layout effect,
-  // so the placeholder is up before verbatim text can paint under "Clean".
+  // a take recorded with the setting off, words a re-diarize or an edit left
+  // without a paragraph. Once per note and coverage per app session, so a pass
+  // that fails (no model set up, a governed note) isn't retried on every
+  // render; its reason shows in the switch's caption instead.
   useLayoutEffect(() => {
-    if (!draft?.id || !cleanOn || transcriptView !== "clean") return;
+    if (!draft?.id || !cleanAvailable || !cleanView || transcriptView !== "clean") return;
     if (activeTab !== "transcript" || recActive || cleaning) return;
-    if (coverage.entries === 0 || coverage.cleaned >= coverage.entries) return;
-    const key = `${draft.id}:${coverage.entries}:${coverage.cleaned}`;
+    if (cleanWords === 0 || cleanedWords >= cleanWords) return;
+    const key = `${draft.id}:${cleanWords}:${cleanedWords}`;
     if (autoCleanTried.has(key)) return;
     autoCleanTried.add(key);
     requestClean(draft.id, "auto");
-  }, [draft?.id, cleanOn, transcriptView, activeTab, recActive, cleaning, coverage]);
+  }, [draft?.id, cleanAvailable, cleanView, transcriptView, activeTab, recActive, cleaning, cleanWords, cleanedWords]);
 
-  // What Copy hands over (#166). In Clean, the clean read the reader shows,
-  // labelled like the stored transcript. In Verbatim, the store's transcript,
+  // What Copy hands over (#166). In Clean, the clean transcript the reader
+  // shows, labelled like the stored one. In Verbatim, the store's transcript,
   // which per-turn edits, deletes and label cycles (#170) rebuild in the
   // backend and send on `transcript_replaced`: the draft refuses store updates
   // while idle (`allowTranscriptSync`) so a debounced save can't clobber
   // typing. Our own free-text edit still queued or saving is newer, though.
   const copyableTranscript = useCallback(
     () =>
-      (showsClean ? cleanTranscriptText(groupTimeline(cleanDisplayTimeline(timeline))) : null) ??
+      (showsClean && cleanView ? cleanViewText(cleanView) : null) ??
       (isUnsaved("transcript") ? draftRef.current?.transcript : note?.transcript) ??
       draftRef.current?.transcript ??
       "",
-    [note?.transcript, isUnsaved, showsClean, timeline],
+    [note?.transcript, isUnsaved, showsClean, cleanView],
   );
 
   if (!draft) return null;
@@ -1881,7 +1927,11 @@ export function Note() {
                         <CleanViewRow
                           view={transcriptView}
                           onView={(v) => void writeSetting("transcript_view", v)}
-                          coverage={coverage}
+                          words={cleanWords}
+                          cleanedWords={cleanedWords}
+                          edited={cleanView?.edited ?? 0}
+                          stale={hasStaleTake(cleanView)}
+                          canClean={cleanAvailable}
                           cleaning={cleaning}
                           error={cleanError}
                           onClean={
@@ -1936,7 +1986,9 @@ export function Note() {
                         fill
                         bottomAligned={transcriptLive}
                         view={showsClean ? "clean" : "verbatim"}
+                        cleanView={cleanView}
                         cleanPending={cleanPending}
+                        onCleanEdit={editClean}
                       />
                     ) : (
                       <TranscriptEditor
@@ -3387,7 +3439,9 @@ export const TranscriptPlayer = memo(function TranscriptPlayer({
   fill,
   bottomAligned,
   view = "verbatim",
+  cleanView = null,
   cleanPending = false,
+  onCleanEdit,
 }: {
   noteId: string;
   timeline: TimelineEntry[];
@@ -3408,13 +3462,14 @@ export const TranscriptPlayer = memo(function TranscriptPlayer({
   disabled: boolean;
   fill?: boolean;
   bottomAligned: boolean;
-  // Clean (#217) shows each entry's clean read and drops a turn cleaned down
-  // to nothing. Per-turn editing is Verbatim's: an edit changes the words a
-  // clean segment is keyed on.
+  // Clean (#217) shows the note's clean paragraphs (`cleanView`) in place of
+  // the turns; the player above stays, for "play from here".
   view?: TranscriptView;
-  // A clean pass is running: in Clean, entries it hasn't reached draw a
+  cleanView?: CleanView | null;
+  // A clean pass is running: in Clean, words it hasn't reached draw a
   // placeholder instead of their verbatim text.
   cleanPending?: boolean;
+  onCleanEdit?: (sessionId: string, turnId: string, edit: CleanEdit) => Promise<void>;
 }) {
   const audioRef = useRef<HTMLAudioElement | null>(null);
   // Which session's audio is loaded in the player. Defaults to the first
@@ -3515,16 +3570,9 @@ export const TranscriptPlayer = memo(function TranscriptPlayer({
   const containerRef = useRef<HTMLDivElement | null>(null);
   // Held in a ref so the rAF tick can read the latest timeline
   // without restarting. Updated on every timeline change.
-  // Clean (#217) shows each entry's clean words in place of its verbatim
-  // ones; the highlight and the turn list read this, the per-turn actions
-  // keep addressing the real entries (indices line up one to one).
-  const clean = view === "clean";
-  const shown = useMemo(
-    () => (clean ? cleanDisplayTimeline(timeline, { pending: cleanPending }) : timeline),
-    [clean, cleanPending, timeline],
-  );
-  const timelineRef = useRef(shown);
-  timelineRef.current = shown;
+  const timelineRef = useRef(timeline);
+  timelineRef.current = timeline;
+  const clean = view === "clean" && !!cleanView;
 
   const labels = useMemo(
     () => Array.from(new Set(timeline.map((t) => t.label).filter(Boolean))),
@@ -3549,16 +3597,7 @@ export const TranscriptPlayer = memo(function TranscriptPlayer({
   // single position in the flattened `words` array. Groups break at
   // session boundaries too, so each carries its session identity and a
   // divider anchor (#16).
-  const allGroups = useMemo(() => groupTimeline(shown), [shown]);
-  const groups = useMemo(
-    () =>
-      clean
-        ? allGroups.filter(
-            (g) => !emptyTurn(g) || (cleanPending && pendingWords(timeline, g.indices) > 0),
-          )
-        : allGroups,
-    [allGroups, clean, cleanPending, timeline],
-  );
+  const groups = useMemo(() => groupTimeline(timeline), [timeline]);
   const sessionById = useMemo(() => {
     const m = new Map<string, NoteSession>();
     sessions.forEach((s) => m.set(s.id, s));
@@ -3947,6 +3986,26 @@ export const TranscriptPlayer = memo(function TranscriptPlayer({
           </p>
         )}
       </div>
+      {clean && cleanView ? (
+        <div
+          className={cn(
+            "text-sm leading-relaxed text-[var(--color-text-muted)] overflow-y-auto",
+            fill && "flex-1 min-h-0",
+          )}
+          style={fill ? undefined : { maxHeight: "14rem" }}
+        >
+          <CleanParagraphs
+            view={cleanView}
+            sessions={sessions}
+            colors={colors}
+            speakers={labels}
+            pending={cleanPending}
+            disabled={disabled || !onCleanEdit}
+            onSeek={seekInSession}
+            onEdit={onCleanEdit}
+          />
+        </div>
+      ) : (
       <div
           ref={scrollRef}
           onScroll={handleScroll}
@@ -3982,7 +4041,6 @@ export const TranscriptPlayer = memo(function TranscriptPlayer({
             // constituent chunk, so it survives the re-group after a commit.
             const groupKey = `${g.sessionId}:${g.indices[0]}`;
             const isEditingGroup = editingKey === groupKey && !disabled;
-            const pending = clean && cleanPending ? pendingWords(timeline, g.indices) : 0;
             // Map the (chunk idx, word idx within chunk) pair the rAF
             // tick tracks into the flattened position in g.words. Each
             // chunk contributes wordCountByChunk[k] words; sum prior
@@ -4065,11 +4123,6 @@ export const TranscriptPlayer = memo(function TranscriptPlayer({
                     // layout, so only the harness can see this.
                     className="w-full flex-1 resize-none text-sm leading-relaxed bg-transparent"
                   />
-                ) : pending > 0 ? (
-                  <div className="flex-1 min-w-0 w-full">
-                    {wordsNode}
-                    <PendingLines words={pending} />
-                  </div>
                 ) : wordsNode ? (
                   wordsNode
                 ) : (
@@ -4093,7 +4146,7 @@ export const TranscriptPlayer = memo(function TranscriptPlayer({
             const titled = !!g.label && !!color;
             const actions = (
               <>
-                {!disabled && !clean && !isEditingGroup && (
+                {!disabled && !isEditingGroup && (
                   <button
                     type="button"
                     // mousedown with the default prevented, not click: an open
@@ -4245,6 +4298,7 @@ export const TranscriptPlayer = memo(function TranscriptPlayer({
           })()}
         </div>
       </div>
+      )}
     </div>
   );
 });
@@ -4360,6 +4414,188 @@ function DiagnosticsLinks({ noteId }: { noteId: string }) {
   );
 }
 
+/** The Clean view's paragraphs (#217). A paragraph plays from where it was
+ *  said on click and is the user's to edit or give another speaker; a speaker's
+ *  name heads each run of their paragraphs. Words no paragraph covers yet show
+ *  as said, dimmed, or as a placeholder while a pass works on them. */
+function CleanParagraphs({
+  view,
+  sessions,
+  colors,
+  speakers,
+  pending,
+  disabled,
+  onSeek,
+  onEdit,
+}: {
+  view: CleanView;
+  sessions: NoteSession[];
+  colors: Map<string, string>;
+  speakers: string[];
+  pending: boolean;
+  disabled: boolean;
+  onSeek: (sessionId: string, ms: number) => void;
+  onEdit?: (sessionId: string, turnId: string, edit: CleanEdit) => Promise<void>;
+}) {
+  const [editing, setEditing] = useState<string | null>(null);
+  const [editText, setEditText] = useState("");
+  const taRef = useRef<HTMLTextAreaElement | null>(null);
+  useEffect(() => {
+    const ta = taRef.current;
+    if (!editing || !ta) return;
+    ta.focus();
+    ta.setSelectionRange(ta.value.length, ta.value.length);
+  }, [editing]);
+  useLayoutEffect(() => {
+    const ta = taRef.current;
+    if (!ta) return;
+    ta.style.height = "auto";
+    ta.style.height = `${ta.scrollHeight}px`;
+  }, [editing, editText]);
+  const sessionById = useMemo(() => new Map(sessions.map((s) => [s.id, s])), [sessions]);
+  const allSpeakers = useMemo(() => {
+    const named = view.takes.flatMap((t) => t.items.map((i) => i.speaker));
+    return Array.from(new Set([...speakers, ...named].filter(Boolean)));
+  }, [speakers, view]);
+
+  function commit(sessionId: string, item: Extract<CleanItem, { kind: "turn" }>, next: string) {
+    setEditing(null);
+    const text = next.trim().replace(/\s+/g, " ");
+    if (!text || text === item.text || !onEdit) return;
+    void onEdit(sessionId, item.id, { text });
+  }
+
+  return (
+    <>
+      {view.takes.map((take) => {
+        const session = sessionById.get(take.sessionId);
+        return (
+          <div key={take.sessionId}>
+            {view.takes.length > 1 && <SessionDivider session={session} index={session?.index ?? 0} />}
+            {take.items.map((item, k) => {
+              const run = startsRun(take.items, k) && !!item.speaker;
+              const color = colors.get(item.speaker) ?? "var(--color-text-disabled)";
+              const dot = (
+                <span
+                  className="nd-speaker-dot"
+                  style={{ background: color, left: 0, top: "calc(0.5lh - 5px)" }}
+                  aria-hidden
+                />
+              );
+              if (item.kind === "gap") {
+                return (
+                  <div key={`gap-${k}`} className="px-2 py-1">
+                    {run && <TurnTitle dot={dot} name={item.speaker} meta={formatDuration(item.startMs)} />}
+                    {pending ? (
+                      <PendingLines words={item.words} />
+                    ) : (
+                      <p className="text-[var(--color-text-disabled)]" title="Not cleaned yet">
+                        {item.text}
+                      </p>
+                    )}
+                  </div>
+                );
+              }
+              const isEditing = editing === item.id && !disabled;
+              const actions =
+                disabled || isEditing ? null : (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setEditText(item.text);
+                        setEditing(item.id);
+                      }}
+                      title="Edit this paragraph"
+                      aria-label="Edit this paragraph"
+                      className="nd-bare shrink-0 self-start opacity-0 group-hover:opacity-100 focus-visible:opacity-100 transition-opacity p-0.5 rounded text-[var(--color-text-muted)] hover:text-[var(--color-text)] hover:bg-[var(--color-pill-hover)]"
+                    >
+                      <Pencil size={14} strokeWidth={1.5} />
+                    </button>
+                    {allSpeakers.length >= 2 && (
+                      <Menu>
+                        <MenuTrigger asChild>
+                          <button
+                            type="button"
+                            title="Change speaker"
+                            aria-label="Change speaker"
+                            className="nd-bare shrink-0 self-start opacity-0 group-hover:opacity-100 focus-visible:opacity-100 data-[state=open]:opacity-100 transition-opacity p-0.5 rounded text-[var(--color-text-muted)] hover:text-[var(--color-text)] hover:bg-[var(--color-pill-hover)]"
+                          >
+                            <UserRoundPen size={14} strokeWidth={1.5} />
+                          </button>
+                        </MenuTrigger>
+                        <MenuContent>
+                          {allSpeakers.map((name) => (
+                            <MenuItem
+                              key={name}
+                              disabled={name === item.speaker}
+                              onSelect={() => void onEdit?.(take.sessionId, item.id, { speaker: name })}
+                            >
+                              {name}
+                            </MenuItem>
+                          ))}
+                        </MenuContent>
+                      </Menu>
+                    )}
+                  </>
+                );
+              const body = isEditing ? (
+                <textarea
+                  ref={taRef}
+                  value={editText}
+                  onChange={(e) => setEditText(e.target.value)}
+                  onBlur={() => commit(take.sessionId, item, editText)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Escape") {
+                      e.preventDefault();
+                      setEditing(null);
+                    } else if (e.key === "Enter" && !e.shiftKey) {
+                      e.preventDefault();
+                      commit(take.sessionId, item, editText);
+                    }
+                  }}
+                  rows={1}
+                  aria-label="Edit this paragraph"
+                  className="w-full flex-1 resize-none text-sm leading-relaxed bg-transparent text-[var(--color-text)]"
+                />
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => onSeek(take.sessionId, item.startMs)}
+                  onDoubleClick={() => {
+                    if (disabled) return;
+                    setEditText(item.text);
+                    setEditing(item.id);
+                  }}
+                  title="Click to play from here, double-click to edit"
+                  className="text-left w-full flex-1 nd-bare cursor-text"
+                >
+                  {item.text}
+                </button>
+              );
+              return (
+                <div key={item.id} className="group px-2 py-1 rounded transition-colors hover:bg-[var(--color-pill-hover)]">
+                  {run ? (
+                    <>
+                      <TurnTitle dot={dot} name={item.speaker} meta={formatDuration(item.startMs)} trailing={actions} />
+                      {body}
+                    </>
+                  ) : (
+                    <div className="flex items-start gap-1">
+                      {body}
+                      {actions}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        );
+      })}
+    </>
+  );
+}
+
 /** A turn's placeholder while a clean pass works its way to it (#217): lines
  *  about the length of the text to come, so the page barely moves when it
  *  lands. */
@@ -4380,32 +4616,65 @@ function PendingLines({ words }: { words: number }) {
 function CleanViewRow({
   view,
   onView,
-  coverage,
+  words,
+  cleanedWords,
+  edited,
+  stale,
+  canClean,
   cleaning,
   error,
   onClean,
 }: {
   view: TranscriptView;
   onView: (v: TranscriptView) => void;
-  coverage: CleanCoverage;
+  /** Verbatim words, and of those the ones the clean paragraphs cover. */
+  words: number;
+  cleanedWords: number;
+  /** Paragraphs the user changed, which "Clean again" replaces. */
+  edited: number;
+  /** The verbatim changed under paragraphs the user edited. */
+  stale: boolean;
+  /** A model is set up to clean with. */
+  canClean: boolean;
   cleaning: { done: number; total: number } | undefined;
   error: string | undefined;
   onClean?: (request: CleanRequest) => void;
 }) {
-  let caption: string;
+  const [confirming, setConfirming] = useState(false);
+  let caption = "";
   if (cleaning) {
     const percent = cleanPercent(cleaning);
     caption = percent === null ? "Cleaning…" : `Cleaning… ${percent}%`;
-  } else if (view === "verbatim") {
-    caption = "Word for word, as transcribed.";
-  } else if (coverage.cleaned === 0) {
-    caption = error ? `Not cleaned: ${error}` : "Not cleaned yet.";
-  } else if (coverage.cleaned < coverage.entries) {
-    caption = error ? `Partly cleaned: ${error}` : "Partly cleaned.";
-  } else {
-    caption = "Fillers and false starts tidied. Verbatim has every word.";
+  } else if (view === "clean") {
+    if (cleanedWords === 0) caption = error ? `Not cleaned: ${error}` : "Not cleaned yet.";
+    else if (stale) caption = "The transcript changed after you edited this.";
+    else if (cleanedWords < words) caption = error ? `Partly cleaned: ${error}` : "Partly cleaned.";
   }
-  const idle = view === "clean" && !cleaning && onClean;
+  const idle = view === "clean" && !cleaning && canClean && onClean;
+  if (idle && confirming) {
+    return (
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 mt-2 mb-1 text-xs">
+        <span className="flex-1 min-w-0 text-[var(--color-text-muted)]">
+          {edited === 1
+            ? "Clean again replaces the paragraph you edited."
+            : `Clean again replaces the ${edited} paragraphs you edited.`}
+        </span>
+        <button type="button" className="nd-btn" onClick={() => setConfirming(false)}>
+          Cancel
+        </button>
+        <button
+          type="button"
+          className="nd-btn nd-btn-primary"
+          onClick={() => {
+            setConfirming(false);
+            onClean("all");
+          }}
+        >
+          Clean again
+        </button>
+      </div>
+    );
+  }
   return (
     <div className="flex flex-wrap items-center gap-x-3 gap-y-1 mt-2 mb-1">
       <Segmented<TranscriptView>
@@ -4419,7 +4688,7 @@ function CleanViewRow({
       />
       <span className="flex-1 min-w-0 text-xs text-[var(--color-text-muted)]" aria-live="polite">
         {caption}
-        {idle && coverage.cleaned < coverage.entries && (
+        {idle && !stale && cleanedWords < words && (
           <>
             {" "}
             <button
@@ -4432,11 +4701,11 @@ function CleanViewRow({
           </>
         )}
       </span>
-      {idle && coverage.cleaned > 0 && (
+      {idle && cleanedWords > 0 && (
         <button
           type="button"
-          onClick={() => onClean("all")}
-          title="Clean again: the model checks where speakers change and rewrites every turn anew."
+          onClick={() => (edited > 0 ? setConfirming(true) : onClean("all"))}
+          title="Clean again: the model checks where speakers change and rewrites every paragraph anew."
           aria-label="Clean again"
           className="nd-btn-icon nd-btn-icon-sm"
         >

@@ -1,9 +1,10 @@
 //! Clean transcripts (#217): a model rewrites each segment (one speaker's
-//! consecutive entries) as a clean read, which is aligned back to the verbatim
-//! words so every word said keeps its timing. Derived and local: stored per
-//! take in `clean.json`, keyed by the entries' word fingerprints, while
-//! `timeline.jsonl` and `notes.transcript` stay verbatim (ADR-0004). A rewrite
-//! that fails a guard leaves its segment verbatim.
+//! consecutive entries) as a paragraph of clean text, which the user may then
+//! edit. Stored in `notes.clean_transcript` and synced with the note, while
+//! `timeline.jsonl` and `notes.transcript` stay verbatim (ADR-0004). Each
+//! paragraph remembers the fingerprints of the entries it was written from, so
+//! a later pass cleans only what changed. A rewrite that fails a guard leaves
+//! its paragraph verbatim.
 
 use super::transcript::{fold_word, word_ends_sentence};
 use super::summary::{resolve_provider, summary_provider_id, use_light_model, LightJob, ResolvedProvider};
@@ -12,15 +13,12 @@ use crate::{db, sessions, AppState};
 use futures_util::{stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use tauri::{AppHandle, Emitter, Manager, State};
 
-/// The per-take file holding the clean segments.
-pub(crate) const CLEAN_FILE: &str = "clean.json";
-
-/// Bumped when the meaning of a stored segment changes, so an older file is
-/// ignored and the take cleaned again.
-const CLEAN_VERSION: u32 = 2;
+/// Bumped when the stored document's meaning changes. A document of a version
+/// this build doesn't know is shown and written by none of it.
+const CLEAN_DOC_VERSION: u32 = 1;
 
 /// Most verbatim words in one segment: about a paragraph of one speaker, so a
 /// false start and its restart land in the same segment.
@@ -53,12 +51,12 @@ const COPILOT_ON_REQUEST: &str = "with Copilot, Clean runs only when you ask.";
 #[serde(rename_all = "lowercase")]
 pub enum CleanRequest {
     /// Nobody asked: the post-stop chain, or the reader opening Clean on
-    /// entries without a clean read. Cleans those entries.
+    /// words no paragraph covers. Cleans those words.
     Auto,
-    /// "Clean": the entries without a clean read.
+    /// "Clean now": the words no paragraph covers.
     Missing,
-    /// "Clean again": every entry anew, after checking every speaker change
-    /// anew.
+    /// "Clean again": every paragraph anew, edited ones included, after
+    /// checking every speaker change anew.
     All,
 }
 
@@ -77,7 +75,7 @@ const ALIGN_GUARD_MIN_WORDS: usize = 4;
 const MIN_ALIGNED_SHARE: f32 = 0.6;
 
 /// Negations a rewrite may never lose, in the languages most Humla notes are
-/// in. Dropping "ikke" inverts a sentence; that is the one failure a clean read
+/// in. Dropping "ikke" inverts a sentence; that is the one failure a clean transcript
 /// must not have. Answers ("no", "nei") are left out: "Nei, nei, nei" → "Nei."
 /// is a fair clean-up. The prompt carries the rule for every other language.
 const NEGATIONS: &[&str] = &[
@@ -106,41 +104,105 @@ pub(crate) fn clean_enabled(setting: Option<&str>) -> bool {
     setting != Some("false")
 }
 
+/// Whether a model checks the speaker changes after a recording (Settings →
+/// Transcription → Fix speaker changes). On unless set to `"false"`.
+pub(crate) fn speaker_check_enabled(setting: Option<&str>) -> bool {
+    setting != Some("false")
+}
+
+/// The model the `clean_model` setting names for `provider`, if it names one
+/// for it: the setting is `<provider>:<model>`, or empty for the default.
+/// Mirrors `cleanModelFor` (`src/lib/cleanModel.ts`).
+pub(crate) fn clean_model_for(setting: Option<&str>, provider: ProviderId) -> Option<String> {
+    let (named, model) = setting?.split_once(':')?;
+    let model = model.trim();
+    (ProviderId::parse(named.trim())? == provider && !model.is_empty()).then(|| model.to_string())
+}
+
 pub(super) fn clean_setting_on(app: &AppHandle) -> bool {
     clean_enabled(super::raw_setting(app, "clean_transcripts").as_deref())
 }
 
-/// One word of a clean segment, with its time in the take's own clock.
+/// A note's clean transcript: `notes.clean_transcript` as JSON.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-pub(crate) struct CleanWord {
-    pub(crate) text: String,
-    pub(crate) start_ms: u64,
-    pub(crate) end_ms: u64,
-}
-
-/// A run of one speaker's consecutive timeline entries, cleaned.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-pub(crate) struct CleanSegment {
-    /// Fingerprints of the entries it covers, in order.
-    pub(crate) members: Vec<String>,
-    /// The clean text; `None` when a guard kept the segment verbatim. Empty
-    /// when the segment was only filler.
-    pub(crate) text: Option<String>,
-    /// The clean text's words with times projected from the verbatim words.
-    /// Empty when the entries had no word timings.
+pub(crate) struct CleanDoc {
+    pub(crate) v: u32,
     #[serde(default)]
-    pub(crate) words: Vec<CleanWord>,
+    pub(crate) takes: Vec<CleanTake>,
 }
 
-#[derive(Serialize, Deserialize, Default, Debug, Clone, PartialEq)]
-struct CleanFile {
-    v: u32,
+impl Default for CleanDoc {
+    fn default() -> Self {
+        Self { v: CLEAN_DOC_VERSION, takes: Vec::new() }
+    }
+}
+
+impl CleanDoc {
+    fn take(&self, session: &str) -> Option<&CleanTake> {
+        self.takes.iter().find(|t| t.session == session)
+    }
+
+    fn take_mut(&mut self, session: &str) -> &mut CleanTake {
+        match self.takes.iter().position(|t| t.session == session) {
+            Some(i) => &mut self.takes[i],
+            None => {
+                self.takes.push(CleanTake { session: session.to_string(), ..Default::default() });
+                self.takes.last_mut().expect("just pushed")
+            }
+        }
+    }
+}
+
+/// One take's paragraphs, in the order they were said.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+pub(crate) struct CleanTake {
+    pub(crate) session: String,
     /// What cleaned it, for diagnostics: `<provider>:<model>`.
     #[serde(default)]
-    by: String,
+    pub(crate) by: String,
     #[serde(default)]
-    segments: Vec<CleanSegment>,
+    pub(crate) turns: Vec<CleanTurn>,
 }
+
+/// A paragraph: one segment's clean text.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub(crate) struct CleanTurn {
+    /// Stays the same across passes, so an edit finds its paragraph.
+    pub(crate) id: String,
+    /// Fingerprints of the timeline entries it was written from, in order.
+    pub(crate) members: Vec<String>,
+    /// Where its first entry starts in the take, for "play from here".
+    pub(crate) start_ms: u64,
+    /// The entries' speaker when it was written, or the user's choice.
+    pub(crate) speaker: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) speaker_set: bool,
+    pub(crate) text: String,
+    /// The user rewrote the text.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) edited: bool,
+}
+
+impl CleanTurn {
+    fn touched(&self) -> bool {
+        self.edited || self.speaker_set
+    }
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// The stored document, an empty one when there is none, or `None` when it
+/// can't be read or is of another version.
+pub(crate) fn parse_doc(json: &str) -> Option<CleanDoc> {
+    if json.trim().is_empty() {
+        return Some(CleanDoc::default());
+    }
+    serde_json::from_str::<CleanDoc>(json).ok().filter(|d| d.v == CLEAN_DOC_VERSION)
+}
+
+const UNREADABLE_DOC: &str = "this note's clean transcript was written by another version of Humla.";
 
 /// The words of one timeline entry as the reader shows them: its timed words,
 /// or its text's whitespace tokens when the provider gave no timings.
@@ -179,15 +241,6 @@ pub(crate) fn fingerprint(tokens: &[String]) -> String {
     format!("{h:016x}")
 }
 
-/// The segments stored for one take. Empty when the take was never cleaned or
-/// its file is from another version.
-pub(crate) fn read_segments(take_dir: &Path) -> Vec<CleanSegment> {
-    read_take_file::<CleanFile>(take_dir, CLEAN_FILE)
-        .filter(|f| f.v == CLEAN_VERSION)
-        .map(|f| f.segments)
-        .unwrap_or_default()
-}
-
 /// A JSON file of a take's directory, or `None` when it's missing or unreadable.
 pub(super) fn read_take_file<T: serde::de::DeserializeOwned>(take_dir: &Path, name: &str) -> Option<T> {
     std::fs::read_to_string(take_dir.join(name)).ok().and_then(|s| serde_json::from_str(&s).ok())
@@ -201,40 +254,66 @@ pub(super) fn write_take_file<T: Serialize>(take_dir: &Path, name: &str, value: 
     std::fs::rename(tmp, take_dir.join(name))
 }
 
-/// Which stored segment, if any, starts at each entry and still matches the
-/// entries that follow it. `fps` are the take's entry fingerprints in order.
-/// The answer is per entry: `Some(segment index)` on a segment's first entry.
-/// Picks the segments that together cover the most entries, so a short
-/// segment repeated elsewhere ("Ja.") can't take the place of a longer one
-/// that starts with the same words.
-pub(crate) fn match_segments(fps: &[String], segments: &[CleanSegment]) -> Vec<Option<usize>> {
-    let mut by_first: HashMap<&str, Vec<usize>> = HashMap::new();
-    for (si, s) in segments.iter().enumerate() {
-        if let Some(first) = s.members.first() {
-            by_first.entry(first.as_str()).or_default().push(si);
+/// Whether paragraph `t` can stand at entry `i`: it started there when it was
+/// written, and the entries from there on are still the words it was written
+/// from.
+fn fits(entries: &[Entry], i: usize, t: &CleanTurn) -> bool {
+    let m = &t.members;
+    !m.is_empty()
+        && i + m.len() <= entries.len()
+        && entries[i].start_ms == t.start_ms
+        && entries[i..i + m.len()].iter().zip(m).all(|(e, fp)| e.fp == *fp)
+}
+
+/// Which stored paragraph, if any, stands at each entry (`Some(index)` on its
+/// first entry). A paragraph lands only where it started, and once. Where
+/// paragraphs overlap, the ones that together cover the most entries win.
+fn match_turns(entries: &[Entry], turns: &[CleanTurn]) -> Vec<Option<usize>> {
+    let mut by_start: HashMap<(u64, &str), Vec<usize>> = HashMap::new();
+    for (ti, t) in turns.iter().enumerate() {
+        if let Some(first) = t.members.first() {
+            by_start.entry((t.start_ms, first.as_str())).or_default().push(ti);
         }
     }
-    let n = fps.len();
-    // best[i]: the most entries from i on that segments can cover.
+    let candidates = |i: usize| -> Vec<usize> {
+        let e = &entries[i];
+        by_start
+            .get(&(e.start_ms, e.fp.as_str()))
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|&ti| fits(entries, i, &turns[ti]))
+            .collect()
+    };
+    let n = entries.len();
+    // best[i]: the most entries from i on that paragraphs can cover; span[i]:
+    // the length of the paragraph chosen at i, 0 for none.
     let mut best = vec![0usize; n + 1];
-    let mut pick: Vec<Option<usize>> = vec![None; n];
+    let mut span = vec![0usize; n];
     for i in (0..n).rev() {
         best[i] = best[i + 1];
-        for &si in by_first.get(fps[i].as_str()).into_iter().flatten() {
-            let m = &segments[si].members;
-            if i + m.len() <= n && fps[i..i + m.len()] == m[..] && m.len() + best[i + m.len()] > best[i] {
-                best[i] = m.len() + best[i + m.len()];
-                pick[i] = Some(si);
+        for ti in candidates(i) {
+            let m = turns[ti].members.len();
+            if m + best[i + m] > best[i] {
+                best[i] = m + best[i + m];
+                span[i] = m;
             }
         }
     }
     let mut out = vec![None; n];
+    let mut used = vec![false; turns.len()];
     let mut i = 0;
     while i < n {
-        match pick[i] {
-            Some(si) => {
-                out[i] = Some(si);
-                i += segments[si].members.len();
+        let pick = if span[i] > 0 {
+            candidates(i).into_iter().find(|&ti| !used[ti] && turns[ti].members.len() == span[i])
+        } else {
+            None
+        };
+        match pick {
+            Some(ti) => {
+                used[ti] = true;
+                out[i] = Some(ti);
+                i += span[i];
             }
             None => i += 1,
         }
@@ -247,8 +326,7 @@ pub(crate) fn match_segments(fps: &[String], segments: &[CleanSegment]) -> Vec<O
 struct Entry {
     label: String,
     tokens: Vec<String>,
-    /// Per token, its time when the entry had word timings.
-    times: Vec<Option<(u64, u64)>>,
+    start_ms: u64,
     fp: String,
 }
 
@@ -374,6 +452,30 @@ Answer:
 
 Answer with JSON only, no explanation: {\"segments\": [{\"id\": 0, \"text\": \"…\"}, …]}, one entry for every id you were given.";
 
+/// Most vocabulary terms the prompt carries.
+const PROMPT_TERMS: usize = 200;
+
+/// The prompt, with the note's vocabulary (the organisation's and the user's)
+/// so a name the recogniser misheard is written as it should be.
+fn clean_prompt(terms: &[String]) -> String {
+    if terms.is_empty() {
+        return CLEAN_PROMPT.to_string();
+    }
+    format!(
+        "{CLEAN_PROMPT}\n\nNames and terms these meetings use, spelled as they should be: {}. Where the recogniser misheard one of them, write it this way.",
+        terms.join(", ")
+    )
+}
+
+fn note_vocabulary(app: &AppHandle, note_id: &str) -> anyhow::Result<Vec<String>> {
+    let state: State<AppState> = app.state();
+    let conn = state.db.lock();
+    let workspace = db::get_note(&conn, note_id)?.workspace_id;
+    let user = db::get_setting(&conn, "custom_vocabulary")?.unwrap_or_default();
+    let org = crate::org_policy::vocabulary_for(&conn, Some(&workspace));
+    Ok(super::transcribe::merge_vocabulary(&org, &user, super::transcribe::VocabCap::Terms(PROMPT_TERMS)))
+}
+
 /// The list a model's JSON answer gives under `key`, possibly wrapped in prose
 /// or a code fence, or as a bare list; `None` when the answer isn't one.
 pub(super) fn answer_list(raw: &str, key: &str) -> Option<Vec<serde_json::Value>> {
@@ -451,7 +553,7 @@ fn align(clean: &[String], verbatim: &[String]) -> Vec<(usize, usize)> {
 }
 
 /// Whether `tokens` hold a negation. "Ikke sant?" / ", ikke sant," is a tag
-/// ("right?") that a clean read may drop, not a negation; "ikke sant." is one.
+/// ("right?") that a rewrite may drop, not a negation; "ikke sant." is one.
 fn has_negation(tokens: &[String]) -> bool {
     tokens.iter().enumerate().any(|(i, t)| {
         let tag = tokens
@@ -555,74 +657,32 @@ fn refuse(verbatim: &[String], clean: &[String], aligned: usize) -> Option<&'sta
     None
 }
 
-/// Times for the clean words: a word aligned to one the speaker said takes
-/// that word's time; a run of changed or added words shares, evenly, the span
-/// of the verbatim words between its aligned neighbours (or, with none between
-/// them, the gap between those neighbours).
-fn project_times(
-    clean: &[String],
-    times: &[(u64, u64)],
-    pairs: &[(usize, usize)],
-) -> Vec<CleanWord> {
-    let mut by_clean: Vec<Option<usize>> = vec![None; clean.len()];
-    for &(ci, vi) in pairs {
-        by_clean[ci] = Some(vi);
-    }
-    let seg_start = times.first().map(|t| t.0).unwrap_or(0);
-    let seg_end = times.last().map(|t| t.1).unwrap_or(seg_start);
-    let mut out: Vec<CleanWord> = Vec::with_capacity(clean.len());
-    let mut ci = 0;
-    while ci < clean.len() {
-        if let Some(vi) = by_clean[ci] {
-            out.push(CleanWord { text: clean[ci].clone(), start_ms: times[vi].0, end_ms: times[vi].1 });
-            ci += 1;
-            continue;
-        }
-        // An unaligned run [ci, run_end).
-        let run_end = (ci..clean.len()).find(|&k| by_clean[k].is_some()).unwrap_or(clean.len());
-        let prev_v = (0..ci).rev().find_map(|k| by_clean[k]);
-        let next_v = by_clean.get(run_end).copied().flatten();
-        let lo_v = prev_v.map_or(0, |v| v + 1);
-        let hi_v = next_v.unwrap_or(times.len());
-        let (span_start, span_end) = if lo_v < hi_v {
-            (times[lo_v].0, times[hi_v - 1].1)
-        } else {
-            (prev_v.map_or(seg_start, |v| times[v].1), next_v.map_or(seg_end, |v| times[v].0))
-        };
-        let span_end = span_end.max(span_start);
-        let n = (run_end - ci) as u64;
-        let step = (span_end - span_start) / n.max(1);
-        for (k, idx) in (ci..run_end).enumerate() {
-            let s = span_start + step * k as u64;
-            let e = if idx + 1 == run_end { span_end } else { s + step };
-            out.push(CleanWord { text: clean[idx].clone(), start_ms: s, end_ms: e.max(s) });
-        }
-        ci = run_end;
-    }
-    out
-}
-
-/// A segment's clean result from the model's text for it: the guarded text
-/// and its timed words, or `text: None` (verbatim) when a guard refused it or
-/// the model gave no text for it.
-fn clean_segment(entries: &[Entry], plan: &Plan, answer: Option<&str>) -> (CleanSegment, Option<&'static str>) {
-    let members: Vec<String> = plan.entries.iter().map(|&i| entries[i].fp.clone()).collect();
+/// A segment's paragraph from the model's text for it: the guarded text, or
+/// the verbatim words when a guard refused the rewrite or the model gave none.
+fn clean_turn(entries: &[Entry], plan: &Plan, answer: Option<&str>) -> (CleanTurn, Option<&'static str>) {
+    let first = &entries[plan.entries[0]];
     let verbatim: Vec<String> = plan.entries.iter().flat_map(|&i| entries[i].tokens.iter().cloned()).collect();
-    let times: Vec<Option<(u64, u64)>> = plan.entries.iter().flat_map(|&i| entries[i].times.iter().copied()).collect();
-    let Some(answer) = answer else {
-        return (CleanSegment { members, text: None, words: Vec::new() }, Some("no text for it in the answer"));
+    let (text, refused) = match answer {
+        None => (verbatim.join(" "), Some("no text for it in the answer")),
+        Some(answer) => {
+            let clean: Vec<String> = answer.split_whitespace().map(tidy_dash).collect();
+            let pairs = align(&clean, &verbatim);
+            match refuse(&verbatim, &clean, said_words(&clean, &verbatim, &pairs)) {
+                Some(why) => (verbatim.join(" "), Some(why)),
+                None => (clean.join(" "), None),
+            }
+        }
     };
-    let clean: Vec<String> = answer.split_whitespace().map(tidy_dash).collect();
-    let pairs = align(&clean, &verbatim);
-    if let Some(why) = refuse(&verbatim, &clean, said_words(&clean, &verbatim, &pairs)) {
-        return (CleanSegment { members, text: None, words: Vec::new() }, Some(why));
-    }
-    let timed: Option<Vec<(u64, u64)>> = times.iter().copied().collect();
-    let words = match timed {
-        Some(t) if !t.is_empty() => project_times(&clean, &t, &pairs),
-        _ => Vec::new(),
+    let turn = CleanTurn {
+        id: uuid::Uuid::new_v4().simple().to_string(),
+        members: plan.entries.iter().map(|&i| entries[i].fp.clone()).collect(),
+        start_ms: first.start_ms,
+        speaker: first.label.clone(),
+        speaker_set: false,
+        text,
+        edited: false,
     };
-    (CleanSegment { members, text: Some(clean.join(" ")), words }, None)
+    (turn, refused)
 }
 
 /// Lifecycle of a clean pass, on its own channel so cleaning note B never
@@ -656,130 +716,289 @@ pub struct CleanOutcome {
     pub kept_verbatim: usize,
 }
 
-/// One take's entries and the segments it already has.
-struct TakeWork {
-    dir: PathBuf,
-    entries: Vec<Entry>,
-    existing: Vec<CleanSegment>,
-}
-
-fn take_work(dir: &Path) -> TakeWork {
-    let values = super::timeline::read_timeline_values(&dir.join("timeline.jsonl"));
-    let entries = values
+/// A take's timeline entries as the clean pass and the view read them.
+fn take_entries(dir: &Path) -> Vec<Entry> {
+    super::timeline::read_timeline_values(&dir.join("timeline.jsonl"))
         .iter()
         .map(|v| {
             let tokens = entry_tokens(v);
-            let timed: Vec<(u64, u64)> = v
-                .get("words")
-                .and_then(|w| w.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|w| Some((w.get("start_ms")?.as_u64()?, w.get("end_ms")?.as_u64()?)))
-                        .collect()
-                })
-                .unwrap_or_default();
-            let times = if timed.len() == tokens.len() && !timed.is_empty() {
-                timed.into_iter().map(Some).collect()
-            } else {
-                vec![None; tokens.len()]
-            };
             Entry {
                 label: v.get("label").and_then(|s| s.as_str()).unwrap_or("").to_string(),
+                start_ms: v.get("start_ms").and_then(|s| s.as_u64()).unwrap_or(0),
                 fp: fingerprint(&tokens),
                 tokens,
-                times,
             }
         })
-        .collect();
-    TakeWork { dir: dir.to_path_buf(), entries, existing: read_segments(dir) }
+        .collect()
 }
 
-fn write_segments(dir: &Path, by: &str, segments: Vec<CleanSegment>) -> std::io::Result<()> {
-    write_take_file(dir, CLEAN_FILE, &CleanFile { v: CLEAN_VERSION, by: by.to_string(), segments })
+/// The note's takes in order: session id and entries.
+fn note_takes(app: &AppHandle, note_id: &str) -> anyhow::Result<Vec<(String, Vec<Entry>)>> {
+    let recordings = sessions::recordings_dir(&app.path().app_data_dir()?, note_id);
+    Ok(sessions::resolve_sessions(&recordings)
+        .into_iter()
+        .map(|(entry, dir)| (entry.id, take_entries(&dir)))
+        .collect())
 }
 
-/// The stored segments that still match the take's entries, and which entries
-/// they cover.
-fn live_segments(take: &TakeWork) -> (Vec<CleanSegment>, HashSet<usize>) {
-    let fps: Vec<String> = take.entries.iter().map(|e| e.fp.clone()).collect();
-    let mut kept = Vec::new();
-    let mut covered = HashSet::new();
-    for (i, hit) in match_segments(&fps, &take.existing).into_iter().enumerate() {
-        if let Some(si) = hit {
-            let seg = take.existing[si].clone();
-            covered.extend(i..i + seg.members.len());
-            kept.push(seg);
+/// Where a stored take's paragraphs land on its entries now: each matched
+/// paragraph with the entry it starts at, and whether a paragraph the user
+/// touched no longer matches (the verbatim changed under it).
+fn place_turns<'a>(entries: &[Entry], turns: &'a [CleanTurn]) -> (Vec<(usize, &'a CleanTurn)>, bool) {
+    let mut placed = Vec::new();
+    let mut matched = vec![false; turns.len()];
+    for (i, hit) in match_turns(entries, turns).into_iter().enumerate() {
+        if let Some(ti) = hit {
+            matched[ti] = true;
+            placed.push((i, &turns[ti]));
         }
     }
-    (kept, covered)
+    let stale = turns.iter().zip(&matched).any(|(t, &m)| t.touched() && !m);
+    (placed, stale)
 }
 
-/// Clean every take of `note_id` that has entries without a segment (every
-/// entry for `CleanRequest::All`).
+/// What the Clean view shows of one stretch of a take.
+#[derive(Serialize, Debug, Clone, PartialEq)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum CleanItem {
+    /// A paragraph of clean text.
+    #[serde(rename_all = "camelCase")]
+    Turn { id: String, speaker: String, text: String, start_ms: u64, edited: bool },
+    /// Verbatim words no paragraph covers yet.
+    #[serde(rename_all = "camelCase")]
+    Gap { speaker: String, text: String, start_ms: u64, words: usize },
+}
+
+#[derive(Serialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CleanTakeView {
+    pub session_id: String,
+    pub items: Vec<CleanItem>,
+    /// The verbatim changed under paragraphs the user edited: the take shows
+    /// its paragraphs as they are, and only "Clean again" writes it anew.
+    pub stale: bool,
+}
+
+/// The Clean view of a note.
+#[derive(Serialize, Debug, Clone, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CleanView {
+    pub takes: Vec<CleanTakeView>,
+    /// Verbatim words in the takes, and of those the ones paragraphs cover.
+    pub words: usize,
+    pub cleaned_words: usize,
+    /// Paragraphs the user edited or gave another speaker.
+    pub edited: usize,
+    /// The stored document is of another version, so it is neither shown nor
+    /// written.
+    pub unreadable: bool,
+}
+
+/// One take as the Clean view shows it, with its verbatim and covered words.
+/// A paragraph keeps the entries' current speaker unless the user chose one.
+fn take_view(session_id: &str, entries: &[Entry], take: Option<&CleanTake>) -> (CleanTakeView, usize, usize) {
+    let words: usize = entries.iter().map(|e| e.tokens.len()).sum();
+    let turns = take.map(|t| t.turns.as_slice()).unwrap_or_default();
+    let (placed, stale) = place_turns(entries, turns);
+    let paragraph = |t: &CleanTurn, speaker: &str| CleanItem::Turn {
+        id: t.id.clone(),
+        speaker: speaker.to_string(),
+        text: t.text.clone(),
+        start_ms: t.start_ms,
+        edited: t.edited,
+    };
+    if stale {
+        let items = turns.iter().filter(|t| !t.text.trim().is_empty()).map(|t| paragraph(t, &t.speaker)).collect();
+        return (CleanTakeView { session_id: session_id.to_string(), items, stale }, words, words);
+    }
+    let starts: HashMap<usize, &CleanTurn> = placed.into_iter().collect();
+    let mut items: Vec<CleanItem> = Vec::new();
+    let mut cleaned = 0;
+    let mut i = 0;
+    while i < entries.len() {
+        let e = &entries[i];
+        if let Some(t) = starts.get(&i) {
+            let n = t.members.len();
+            cleaned += entries[i..i + n].iter().map(|e| e.tokens.len()).sum::<usize>();
+            if !t.text.trim().is_empty() {
+                items.push(paragraph(t, if t.speaker_set { &t.speaker } else { &e.label }));
+            }
+            i += n;
+            continue;
+        }
+        if !e.tokens.is_empty() {
+            match items.last_mut() {
+                Some(CleanItem::Gap { speaker, text, words, .. }) if *speaker == e.label => {
+                    text.push(' ');
+                    text.push_str(&e.tokens.join(" "));
+                    *words += e.tokens.len();
+                }
+                _ => items.push(CleanItem::Gap {
+                    speaker: e.label.clone(),
+                    text: e.tokens.join(" "),
+                    start_ms: e.start_ms,
+                    words: e.tokens.len(),
+                }),
+            }
+        }
+        i += 1;
+    }
+    (CleanTakeView { session_id: session_id.to_string(), items, stale }, words, cleaned)
+}
+
+/// The Clean view of every take, from the stored document.
+fn build_view(takes: &[(String, Vec<Entry>)], doc: Option<&CleanDoc>) -> CleanView {
+    let Some(doc) = doc else {
+        return CleanView { unreadable: true, ..Default::default() };
+    };
+    let mut view = CleanView::default();
+    for (session, entries) in takes {
+        let (take, words, cleaned) = take_view(session, entries, doc.take(session));
+        view.words += words;
+        view.cleaned_words += cleaned;
+        view.takes.push(take);
+    }
+    view.edited = doc
+        .takes
+        .iter()
+        .filter(|t| takes.iter().any(|(s, _)| *s == t.session))
+        .flat_map(|t| &t.turns)
+        .filter(|t| t.touched())
+        .count();
+    view
+}
+
+fn read_doc(conn: &rusqlite::Connection, note_id: &str) -> anyhow::Result<CleanDoc> {
+    parse_doc(&db::get_note(conn, note_id)?.clean_transcript).ok_or_else(|| anyhow::anyhow!(UNREADABLE_DOC))
+}
+
+/// Store the document; `edited` when the user changed it (`db::set_clean_transcript`).
+fn write_doc(conn: &rusqlite::Connection, note_id: &str, doc: &CleanDoc, edited: bool) -> anyhow::Result<()> {
+    db::set_clean_transcript(conn, note_id, &serde_json::to_string(doc)?, edited)?;
+    Ok(())
+}
+
+/// A take's paragraphs after a pass wrote `fresh` ones, each with the entry it
+/// starts at: the stored paragraphs that still match, edits included, and a
+/// fresh one wherever none does. `replace` ("Clean again") drops what was
+/// stored. `None` when a paragraph the user touched no longer matches: the
+/// take changed under the pass, and only "Clean again" may write it.
+fn merge_take(entries: &[Entry], stored: &[CleanTurn], fresh: &[(usize, CleanTurn)], replace: bool) -> Option<Vec<CleanTurn>> {
+    let mut covered = vec![false; entries.len()];
+    let mut turns: Vec<(usize, CleanTurn)> = Vec::new();
+    if !replace {
+        let (placed, stale) = place_turns(entries, stored);
+        if stale {
+            return None;
+        }
+        for (i, t) in placed {
+            covered[i..i + t.members.len()].iter_mut().for_each(|c| *c = true);
+            turns.push((i, t.clone()));
+        }
+    }
+    for (i, t) in fresh {
+        let span = *i..*i + t.members.len();
+        if span.end <= entries.len() && !covered[span.clone()].iter().any(|&c| c) {
+            covered[span].iter_mut().for_each(|c| *c = true);
+            turns.push((*i, t.clone()));
+        }
+    }
+    turns.sort_by_key(|(i, _)| *i);
+    Some(turns.into_iter().map(|(_, t)| t).collect())
+}
+
+/// Store a pass's paragraphs for a take (`merge_take`), read and written
+/// under the database lock so an edit made while the model worked is kept.
+/// False when the take changed under the pass and nothing was written.
+fn write_take(
+    app: &AppHandle,
+    note_id: &str,
+    session: &str,
+    entries: &[Entry],
+    by: &str,
+    fresh: &[(usize, CleanTurn)],
+    replace: bool,
+) -> anyhow::Result<bool> {
+    let state: State<AppState> = app.state();
+    let conn = state.db.lock();
+    let mut doc = read_doc(&conn, note_id)?;
+    let stored = doc.take(session).map(|t| t.turns.as_slice()).unwrap_or_default();
+    let Some(turns) = merge_take(entries, stored, fresh, replace) else {
+        return Ok(false);
+    };
+    let take = doc.take_mut(session);
+    take.by = by.to_string();
+    take.turns = turns;
+    write_doc(&conn, note_id, &doc, false)?;
+    Ok(true)
+}
+
+/// Clean every take of `note_id` that has entries no paragraph covers (every
+/// entry for `CleanRequest::All`). A take whose verbatim changed under
+/// paragraphs the user edited is left alone, except by "Clean again".
 async fn clean_note_inner(app: &AppHandle, note_id: &str, request: CleanRequest) -> anyhow::Result<CleanOutcome> {
     let force = request == CleanRequest::All;
-    let app_dir = app.path().app_data_dir()?;
-    let recordings = sessions::recordings_dir(&app_dir, note_id);
-    let takes: Vec<TakeWork> = sessions::resolve_sessions(&recordings)
-        .into_iter()
-        .map(|(_, dir)| take_work(&dir))
-        .collect();
-    struct TakePlan {
-        kept: Vec<CleanSegment>,
-        segments: Vec<Plan>,
-    }
-    let plans: Vec<TakePlan> = takes
+    let takes = note_takes(app, note_id)?;
+    let doc = {
+        let state: State<AppState> = app.state();
+        let conn = state.db.lock();
+        read_doc(&conn, note_id)?
+    };
+    let plans: Vec<Vec<Plan>> = takes
         .iter()
-        .map(|t| {
-            let (kept, covered) = if force { (Vec::new(), HashSet::new()) } else { live_segments(t) };
-            let segments = plan_segments(&t.entries, &|i| {
-                !t.entries[i].tokens.is_empty() && !covered.contains(&i)
-            });
-            TakePlan { kept, segments }
+        .map(|(session, entries)| {
+            let mut covered = vec![false; entries.len()];
+            if !force {
+                let turns = doc.take(session).map(|t| t.turns.as_slice()).unwrap_or_default();
+                let (placed, stale) = place_turns(entries, turns);
+                if stale {
+                    return Vec::new();
+                }
+                for (i, t) in placed {
+                    covered[i..i + t.members.len()].iter_mut().for_each(|c| *c = true);
+                }
+            }
+            plan_segments(entries, &|i| !entries[i].tokens.is_empty() && !covered[i])
         })
         .collect();
-    if plans.iter().all(|p| p.segments.is_empty()) {
+    if plans.iter().all(Vec::is_empty) {
         return Ok(CleanOutcome::default());
     }
 
     let provider = light_provider(app, note_id, request, LightJob::Clean).await?;
+    let prompt = clean_prompt(&note_vocabulary(app, note_id)?);
     let by = format!("{}:{}", provider.provider.as_str(), provider.model);
     let limit = window_words(provider.provider);
     let windows: Vec<Vec<Vec<usize>>> = takes
         .iter()
         .zip(&plans)
-        .map(|(t, p)| plan_windows(&t.entries, &p.segments, limit))
+        .map(|((_, entries), segments)| plan_windows(entries, segments, limit))
         .collect();
     let total: usize = windows.iter().map(Vec::len).sum();
 
     emit_status(app, note_id, true, 0, total, None);
     let mut outcome = CleanOutcome::default();
     let mut done = 0usize;
+    let mut wrote = false;
     let mut failure: Option<anyhow::Error> = None;
-    'takes: for ((take, plan), windows) in takes.iter().zip(plans).zip(&windows) {
+    'takes: for (((session, entries), segments), windows) in takes.iter().zip(&plans).zip(&windows) {
         if windows.is_empty() {
             continue;
         }
-        let mut segments = plan.kept;
-        let provider = &provider;
+        let mut fresh: Vec<(usize, CleanTurn)> = Vec::new();
+        let (provider, prompt) = (&provider, prompt.as_str());
         // By index: a closure over borrowed windows makes the spawned pass
         // fail to prove `Send`.
         let calls = (0..windows.len()).map(|wi| {
-            let message = window_message(&take.entries, &plan.segments, &windows[wi]);
-            async move { (wi, provider.complete(CLEAN_PROMPT, &message, |_| {}).await) }
+            let message = window_message(entries, segments, &windows[wi]);
+            async move { (wi, provider.complete(prompt, &message, |_| {}).await) }
         });
         let mut answers = stream::iter(calls).buffer_unordered(CONCURRENT_CALLS);
         while let Some((wi, answer)) = answers.next().await {
-            let window = &windows[wi];
             let answer = match answer {
                 Ok(a) => a,
                 Err(e) => {
                     failure = Some(e);
-                    // Keep what this take got so far, and the rest is cleaned
-                    // on the next pass; "Clean again" keeps the old read whole.
-                    if !force {
-                        let _ = write_segments(&take.dir, &by, segments);
-                    }
                     break 'takes;
                 }
             };
@@ -790,30 +1009,39 @@ async fn clean_note_inner(app: &AppHandle, note_id: &str, request: CleanRequest)
                 eprintln!("[clean] note {note_id}: unusable answer, keeping a window verbatim");
                 HashMap::new()
             });
-            for (local, &si) in window.iter().enumerate() {
-                let (seg, refused) = clean_segment(&take.entries, &plan.segments[si], texts.get(&local).map(String::as_str));
+            for (local, &si) in windows[wi].iter().enumerate() {
+                let plan = &segments[si];
+                let (turn, refused) = clean_turn(entries, plan, texts.get(&local).map(String::as_str));
                 outcome.segments += 1;
                 if let Some(why) = refused {
                     outcome.kept_verbatim += 1;
                     eprintln!("[clean] note {note_id}: kept a segment verbatim ({why})");
                 }
-                segments.push(seg);
+                fresh.push((plan.entries[0], turn));
             }
             // Written per call, so the reader fills in while the rest is
             // cleaned. "Clean again" writes once per take: until then the
-            // reader keeps the clean read it has.
+            // reader keeps the paragraphs it has.
             if !force {
-                if let Err(e) = write_segments(&take.dir, &by, segments.clone()) {
-                    failure = Some(e.into());
-                    break 'takes;
+                match write_take(app, note_id, session, entries, &by, &fresh, false) {
+                    Ok(true) => wrote = true,
+                    Ok(false) => continue 'takes,
+                    Err(e) => {
+                        failure = Some(e);
+                        break 'takes;
+                    }
                 }
             }
             done += 1;
             emit_status(app, note_id, true, done, total, None);
         }
         if force {
-            write_segments(&take.dir, &by, segments)?;
+            write_take(app, note_id, session, entries, &by, &fresh, true)?;
+            wrote = true;
         }
+    }
+    if wrote {
+        super::note_changed_for_sync(app, note_id);
     }
     if let Some(e) = failure {
         return Err(e);
@@ -852,7 +1080,11 @@ pub(super) async fn light_provider(
         let n = db::get_note(&conn, note_id)?;
         resolve_provider(&conn, &n, api_key)?
     };
-    use_light_model(app, &mut provider, job).await?;
+    let chosen = match job {
+        LightJob::Clean => clean_model_for(super::raw_setting(app, "clean_model").as_deref(), provider.provider),
+        LightJob::Title | LightJob::SpeakerCheck => None,
+    };
+    use_light_model(app, &mut provider, job, chosen).await?;
     Ok(provider)
 }
 
@@ -872,8 +1104,8 @@ async fn clean_note_guarded(
 
 /// A pass for a caller that holds the note's place in `running()`, released
 /// at the end with the closing status: the speaker changes first when `turns`
-/// (`boundaries::review_note`), then the clean read when `clean`. A failed
-/// speaker check is logged and the clean read goes on.
+/// (`boundaries::review_note`), then the clean pass when `clean`. A failed
+/// speaker check is logged and the clean pass goes on.
 async fn run_claimed(
     app: &AppHandle,
     note_id: &str,
@@ -909,10 +1141,15 @@ async fn run_claimed(
 
 /// The entry point of the chains that write a take's timeline (post-stop,
 /// deferred transcription, re-diarize), spawned rather than awaited: the
-/// speaker check, then the clean read when the setting is on. Silent: nobody
+/// speaker check and the clean pass, each when its setting is on. Silent: nobody
 /// asked for this pass, so nobody is told when it doesn't run (no summary
 /// provider set up, a governed note, a model that's down).
 pub(crate) async fn clean_note_quietly(app: AppHandle, note_id: String) {
+    let turns = speaker_check_enabled(super::raw_setting(&app, "speaker_check").as_deref());
+    let clean = clean_setting_on(&app);
+    if !turns && !clean {
+        return;
+    }
     // The chain that spawned this still holds the note (a stop in progress, a
     // deferred transcription), and the reader may have started a pass that
     // skips the speakers: wait for both to let go rather than skip ours.
@@ -925,14 +1162,13 @@ pub(crate) async fn clean_note_quietly(app: AppHandle, note_id: String) {
         tokio::time::sleep(BUSY_POLL).await;
         waited += BUSY_POLL;
     }
-    let clean = clean_setting_on(&app);
-    if let Err(e) = run_claimed(&app, &note_id, CleanRequest::Auto, true, clean).await {
+    if let Err(e) = run_claimed(&app, &note_id, CleanRequest::Auto, turns, clean).await {
         eprintln!("[clean] note {note_id}: {e:#}");
     }
 }
 
 /// Whether the note's summary provider is set up and allowed for it, which a
-/// clean read needs: without one the reader shows no Clean view.
+/// clean pass needs.
 #[tauri::command]
 pub async fn note_clean_available(app: AppHandle, note_id: String) -> bool {
     clean_available(&app, &note_id).unwrap_or(false)
@@ -958,14 +1194,142 @@ fn clean_available(app: &AppHandle, note_id: &str) -> anyhow::Result<bool> {
     Ok(resolve_provider(&conn, &n, api_key).is_ok())
 }
 
-/// Clean a note from the reader: on opening Clean on entries without a clean
-/// read (`Auto`), on "Clean now" (`Missing`) or on "Clean again" (`All`),
-/// which checks the speaker changes anew first. The reader's other requests
-/// change no speakers: they also run on notes the user only reads.
+/// Clean a note from the reader: on opening Clean on words no paragraph
+/// covers (`Auto`), on "Clean now" (`Missing`) or on "Clean again" (`All`),
+/// which checks the speaker changes anew first when that's on. The reader's
+/// other requests change no speakers: they also run on notes the user only reads.
 #[tauri::command]
 pub async fn note_clean(app: AppHandle, note_id: String, request: CleanRequest) -> Result<CleanOutcome, String> {
-    let turns = request == CleanRequest::All;
+    let turns = request == CleanRequest::All && speaker_check_enabled(super::raw_setting(&app, "speaker_check").as_deref());
     clean_note_guarded(&app, &note_id, request, turns, true).await.map_err(|e| e.to_string())
+}
+
+/// The Clean view of a note: its paragraphs, and verbatim stretches no
+/// paragraph covers yet.
+#[tauri::command]
+pub fn note_clean_view(app: AppHandle, note_id: String) -> Result<CleanView, String> {
+    let takes = note_takes(&app, &note_id).map_err(|e| e.to_string())?;
+    let state: State<AppState> = app.state();
+    let stored = db::get_note(&state.db.lock(), &note_id).map_err(|e| e.to_string())?.clean_transcript;
+    Ok(build_view(&takes, parse_doc(&stored).as_ref()))
+}
+
+/// The user's change to a paragraph: new text, another speaker, or both.
+#[derive(Deserialize, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CleanEdit {
+    pub text: Option<String>,
+    pub speaker: Option<String>,
+}
+
+/// Apply `edit` to the paragraph `turn_id` of the take `session_id`. A
+/// paragraph the user changed stays as they left it when the verbatim is
+/// cleaned again.
+fn apply_edit(doc: &mut CleanDoc, session_id: &str, turn_id: &str, edit: &CleanEdit) -> Result<bool, String> {
+    let turn = doc
+        .takes
+        .iter_mut()
+        .filter(|t| t.session == session_id)
+        .flat_map(|t| t.turns.iter_mut())
+        .find(|t| t.id == turn_id)
+        .ok_or("This paragraph is gone: the transcript was cleaned again.")?;
+    let mut changed = false;
+    if let Some(text) = &edit.text {
+        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        if text.is_empty() {
+            return Err("A paragraph can't be empty.".into());
+        }
+        if text != turn.text {
+            turn.text = text;
+            turn.edited = true;
+            changed = true;
+        }
+    }
+    if let Some(speaker) = &edit.speaker {
+        if !turn.speaker_set || *speaker != turn.speaker {
+            turn.speaker = speaker.clone();
+            turn.speaker_set = true;
+            changed = true;
+        }
+    }
+    Ok(changed)
+}
+
+#[tauri::command]
+pub fn note_clean_edit(
+    app: AppHandle,
+    note_id: String,
+    session_id: String,
+    turn_id: String,
+    edit: CleanEdit,
+) -> Result<(), String> {
+    {
+        let state: State<AppState> = app.state();
+        let conn = state.db.lock();
+        let mut doc = read_doc(&conn, &note_id).map_err(|e| e.to_string())?;
+        if !apply_edit(&mut doc, &session_id, &turn_id, &edit)? {
+            return Ok(());
+        }
+        write_doc(&conn, &note_id, &doc, true).map_err(|e| e.to_string())?;
+    }
+    super::note_changed_for_sync(&app, &note_id);
+    Ok(())
+}
+
+/// Rename a speaker in the paragraphs, as `note_timeline_rename` does in the
+/// timelines. Whether anything changed.
+pub(super) fn rename_speaker(conn: &rusqlite::Connection, note_id: &str, old: &str, new: &str) -> anyhow::Result<bool> {
+    let Some(mut doc) = parse_doc(&db::get_note(conn, note_id)?.clean_transcript) else {
+        return Ok(false);
+    };
+    let mut changed = false;
+    for turn in doc.takes.iter_mut().flat_map(|t| t.turns.iter_mut()).filter(|t| t.speaker == old) {
+        turn.speaker = new.to_string();
+        changed = true;
+    }
+    if changed {
+        write_doc(conn, note_id, &doc, true)?;
+    }
+    Ok(changed)
+}
+
+/// The note's transcript with its paragraphs in place of the words they were
+/// written from, labelled like the stored one, for the summary and export.
+/// `None` when there are none, or when the timelines don't account for
+/// `transcript`, which then stays what they read.
+pub(super) fn clean_text(app: &AppHandle, note_id: &str, transcript: &str) -> Option<String> {
+    let takes = note_takes(app, note_id).ok()?;
+    let stored = {
+        let state: State<AppState> = app.state();
+        let conn = state.db.lock();
+        db::get_note(&conn, note_id).ok()?.clean_transcript
+    };
+    let view = build_view(&takes, parse_doc(&stored).as_ref());
+    let has_paragraphs = view.takes.iter().flat_map(|t| &t.items).any(|i| matches!(i, CleanItem::Turn { .. }));
+    if !has_paragraphs {
+        return None;
+    }
+    let verbatim = super::timeline::rebuild_note_transcript(app, note_id).ok()?;
+    if verbatim.trim() != transcript.trim() {
+        return None;
+    }
+    Some(view_text(&view))
+}
+
+/// A Clean view as text, one `Label: text` line per speaker's run.
+fn view_text(view: &CleanView) -> String {
+    view.takes
+        .iter()
+        .map(|take| {
+            super::timeline::group_lines(take.items.iter().map(|item| match item {
+                CleanItem::Turn { speaker, text, .. } | CleanItem::Gap { speaker, text, .. } => {
+                    (speaker.as_str(), text.as_str())
+                }
+            }))
+        })
+        .filter(|part| !part.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[cfg(test)]
@@ -976,13 +1340,9 @@ mod tests {
         s.split_whitespace().map(str::to_string).collect()
     }
 
-    /// A timed entry whose words run 300 ms apart from `start_ms`.
     fn entry(label: &str, text: &str, start_ms: u64) -> Entry {
         let tokens = toks(text);
-        let times = (0..tokens.len())
-            .map(|k| Some((start_ms + 300 * k as u64, start_ms + 300 * k as u64 + 250)))
-            .collect();
-        Entry { label: label.into(), fp: fingerprint(&tokens), tokens, times }
+        Entry { label: label.into(), fp: fingerprint(&tokens), tokens, start_ms }
     }
 
     #[test]
@@ -1080,30 +1440,6 @@ mod tests {
     }
 
     #[test]
-    fn kept_words_keep_their_time_and_changed_words_share_the_span_they_replace() {
-        let e = entry("Hege", "Churn er, eh, den er faktisk nede, fra fire komma to prosent.", 10_000);
-        let plan = Plan { entries: vec![0] };
-        let (seg, refused) = clean_segment(std::slice::from_ref(&e), &plan, Some("Churn er faktisk nede, fra 4,2 prosent."));
-        assert!(refused.is_none());
-        assert_eq!(seg.text.as_deref(), Some("Churn er faktisk nede, fra 4,2 prosent."));
-        let w = &seg.words;
-        assert_eq!(w.len(), 7);
-        // "Churn" was said first: its own time.
-        assert_eq!((w[0].start_ms, w[0].end_ms), (10_000, 10_250));
-        // "4,2" replaced "fire komma to" (verbatim 8..=10): it spans them.
-        assert_eq!(w[5].text, "4,2");
-        assert_eq!((w[5].start_ms, w[5].end_ms), (10_000 + 300 * 8, 10_000 + 300 * 10 + 250));
-        // Times never run backwards.
-        assert!(w.windows(2).all(|p| p[0].start_ms <= p[1].start_ms));
-    }
-
-    #[test]
-    fn an_added_word_takes_the_gap_between_its_neighbours() {
-        let words = project_times(&toks("a new b"), &[(0, 100), (500, 600)], &[(0, 0), (2, 1)]);
-        assert_eq!((words[1].start_ms, words[1].end_ms), (100, 500));
-    }
-
-    #[test]
     fn guards_keep_a_segment_verbatim() {
         let verbatim = toks("Det er, eh, ikke noe problem for oss i det hele tatt.");
         // Lost the negation.
@@ -1136,6 +1472,24 @@ mod tests {
         // Pause marks don't make a segment long enough to be summarised.
         let v = toks("Og så ... Men ... Ja ... Nei ... Så ...");
         assert_eq!(refuse(&v, &toks("Ja."), 1), None);
+    }
+
+    #[test]
+    fn the_clean_model_applies_only_to_the_provider_it_names() {
+        assert_eq!(clean_model_for(Some("openai:gpt-6-luna"), ProviderId::OpenAi), Some("gpt-6-luna".into()));
+        assert_eq!(clean_model_for(Some("local:qwen3:14b"), ProviderId::Local), Some("qwen3:14b".into()));
+        assert_eq!(clean_model_for(Some("ollama:qwen3:14b"), ProviderId::Local), Some("qwen3:14b".into()));
+        assert_eq!(clean_model_for(Some("openai:gpt-6-luna"), ProviderId::Anthropic), None);
+        assert_eq!(clean_model_for(Some("openai:"), ProviderId::OpenAi), None);
+        assert_eq!(clean_model_for(Some(""), ProviderId::OpenAi), None);
+        assert_eq!(clean_model_for(None, ProviderId::OpenAi), None);
+    }
+
+    #[test]
+    fn the_speaker_check_is_on_unless_turned_off() {
+        assert!(speaker_check_enabled(None));
+        assert!(speaker_check_enabled(Some("true")));
+        assert!(!speaker_check_enabled(Some("false")));
     }
 
     #[test]
@@ -1185,57 +1539,185 @@ mod tests {
     }
 
     #[test]
+    fn a_paragraph_is_the_clean_text_starting_where_its_entries_do() {
+        let entries = [entry("Hege", "Ja, ehm, jeg har", 4_000), entry("Hege", "jeg har notatene.", 5_000)];
+        let (turn, why) = clean_turn(&entries, &Plan { entries: vec![0, 1] }, Some("Ja, jeg har notatene."));
+        assert_eq!(why, None);
+        assert_eq!(turn.text, "Ja, jeg har notatene.");
+        assert_eq!(turn.members, vec![entries[0].fp.clone(), entries[1].fp.clone()]);
+        assert_eq!((turn.start_ms, turn.speaker.as_str()), (4_000, "Hege"));
+        assert!(!turn.touched());
+    }
+
+    #[test]
     fn a_refused_or_missing_segment_stays_verbatim_and_is_marked_read() {
         let e = entry("Hege", "Vi var, eh, 12 personer der.", 0);
         let plan = Plan { entries: vec![0] };
-        let (seg, why) = clean_segment(std::slice::from_ref(&e), &plan, Some("Vi var mange der."));
-        assert_eq!(seg.text, None);
-        assert_eq!(seg.members, vec![e.fp.clone()]);
+        let (turn, why) = clean_turn(std::slice::from_ref(&e), &plan, Some("Vi var mange der."));
+        assert_eq!(turn.text, "Vi var, eh, 12 personer der.");
+        assert_eq!(turn.members, vec![e.fp.clone()]);
         assert_eq!(why, Some("dropped a number"));
-        let (seg, why) = clean_segment(&[e], &plan, None);
-        assert_eq!(seg.text, None);
+        let (turn, why) = clean_turn(&[e], &plan, None);
+        assert_eq!(turn.text, "Vi var, eh, 12 personer der.");
         assert!(why.is_some());
     }
 
     #[test]
-    fn untimed_entries_get_text_and_no_words() {
-        let tokens = toks("Eh, det fikser jeg.");
-        let e = Entry { label: "Stian".into(), fp: fingerprint(&tokens), times: vec![None; tokens.len()], tokens };
-        let (seg, _) = clean_segment(&[e], &Plan { entries: vec![0] }, Some("Det fikser jeg."));
-        assert_eq!(seg.text.as_deref(), Some("Det fikser jeg."));
-        assert!(seg.words.is_empty());
-    }
-
-    #[test]
-    fn stored_segments_match_only_the_exact_run_of_entries() {
-        let fps: Vec<String> = ["a", "b", "c", "d"].iter().map(|s| s.to_string()).collect();
-        let seg = |m: &[&str]| CleanSegment { members: m.iter().map(|s| s.to_string()).collect(), text: Some("x".into()), words: vec![] };
-        let segments = vec![seg(&["b", "c"]), seg(&["d", "e"])];
+    fn a_paragraph_matches_only_the_exact_run_of_entries() {
+        let e: Vec<Entry> = ["a", "b", "c", "d"].iter().enumerate().map(|(i, w)| entry("H", w, i as u64)).collect();
+        let gone = CleanTurn { members: vec![e[3].fp.clone(), fingerprint(&toks("e"))], ..para("de", &[&e[3]], "x") };
         // "d e" no longer matches: "e" is gone (an edit).
-        assert_eq!(match_segments(&fps, &segments), vec![None, Some(0), None, None]);
+        assert_eq!(match_turns(&e, &[para("bc", &[&e[1], &e[2]], "x"), gone]), vec![None, Some(0), None, None]);
     }
 
     #[test]
-    fn a_short_segment_repeated_elsewhere_doesnt_take_a_longer_ones_place() {
-        // "Ja." said alone later, and as the start of a longer run earlier: the
-        // run must keep its segment, or its tail is cleaned again every time.
-        let fps: Vec<String> = ["ja", "bra", "x", "ja", "y"].iter().map(|s| s.to_string()).collect();
-        let seg = |m: &[&str]| CleanSegment { members: m.iter().map(|s| s.to_string()).collect(), text: Some("x".into()), words: vec![] };
-        let segments = vec![seg(&["ja"]), seg(&["ja", "bra"]), seg(&["x"]), seg(&["y"])];
-        assert_eq!(match_segments(&fps, &segments), vec![Some(1), None, Some(2), Some(0), Some(3)]);
+    fn a_paragraph_lands_only_where_it_started_and_once() {
+        // "Ja." said alone later, and as the start of a longer run earlier.
+        let e: Vec<Entry> = ["Ja.", "Bra.", "x", "Ja.", "y"].iter().enumerate().map(|(i, w)| entry("H", w, i as u64 * 1_000)).collect();
+        let all = [
+            para("ja-bra", &[&e[0], &e[1]], "Ja, bra."),
+            para("x", &[&e[2]], "x"),
+            para("ja", &[&e[3]], "Ja."),
+            para("y", &[&e[4]], "y"),
+        ];
+        assert_eq!(match_turns(&e, &all), vec![Some(0), None, Some(1), Some(2), Some(3)]);
+        // The later "Ja." alone never takes the earlier run's place, so the
+        // run's own paragraph still fits there when a pass writes it.
+        assert_eq!(match_turns(&e, &all[2..3]), vec![None, None, None, Some(0), None]);
+        // Untimed entries all start at 0: each paragraph still lands once.
+        let flat: Vec<Entry> = ["Ja.", "x", "Ja."].iter().map(|w| entry("H", w, 0)).collect();
+        let twice = [para("a", &[&flat[0]], "Ja."), para("b", &[&flat[1]], "x"), para("c", &[&flat[2]], "Ja.")];
+        assert_eq!(match_turns(&flat, &twice), vec![Some(0), Some(1), Some(2)]);
+    }
+
+    /// A paragraph written from `entries`, saying `text`.
+    fn para(id: &str, entries: &[&Entry], text: &str) -> CleanTurn {
+        CleanTurn {
+            id: id.into(),
+            members: entries.iter().map(|e| e.fp.clone()).collect(),
+            start_ms: entries[0].start_ms,
+            speaker: entries[0].label.clone(),
+            speaker_set: false,
+            text: text.into(),
+            edited: false,
+        }
+    }
+
+    fn take(turns: Vec<CleanTurn>) -> CleanTake {
+        CleanTake { session: "s1".into(), by: String::new(), turns }
+    }
+
+    fn item_texts(view: &CleanTakeView) -> Vec<String> {
+        view.items
+            .iter()
+            .map(|i| match i {
+                CleanItem::Turn { speaker, text, .. } => format!("{speaker}: {text}"),
+                CleanItem::Gap { speaker, text, .. } => format!("{speaker} (verbatim): {text}"),
+            })
+            .collect()
     }
 
     #[test]
-    fn segments_round_trip_through_the_file_and_ignore_other_versions() {
-        let dir = tempfile::tempdir().unwrap();
-        let s = vec![CleanSegment {
-            members: vec!["abc".into()],
-            text: Some("Hei.".into()),
-            words: vec![CleanWord { text: "Hei.".into(), start_ms: 0, end_ms: 200 }],
-        }];
-        write_segments(dir.path(), "local:gemma", s.clone()).unwrap();
-        assert_eq!(read_segments(dir.path()), s);
-        std::fs::write(dir.path().join(CLEAN_FILE), r#"{"v":1,"entries":{"abc":[1]}}"#).unwrap();
-        assert!(read_segments(dir.path()).is_empty());
+    fn the_view_shows_paragraphs_and_verbatim_where_none_covers_the_words() {
+        let e = [
+            entry("Michael", "Eh, skal vi starte?", 0),
+            entry("Hege", "Ja.", 2_000),
+            entry("Hege", "Bra, bra.", 3_000),
+            entry("Michael", "ny tekst", 4_000),
+        ];
+        let t = take(vec![para("a", &[&e[0]], "Skal vi starte?"), para("b", &[&e[1], &e[2]], "")]);
+        let (view, words, cleaned) = take_view("s1", &e, Some(&t));
+        // A paragraph cleaned down to nothing is left out; its words are covered.
+        assert_eq!(item_texts(&view), ["Michael: Skal vi starte?", "Michael (verbatim): ny tekst"]);
+        assert_eq!((words, cleaned), (9, 7));
+        assert!(!view.stale);
+    }
+
+    #[test]
+    fn a_paragraph_follows_the_speaker_of_its_words_unless_the_user_chose_one() {
+        let e = [entry("Speaker 2", "Det fikser jeg.", 0), entry("Speaker 2", "Og det.", 1_000)];
+        let mut chosen = para("b", &[&e[1]], "Og det.");
+        chosen.speaker = "Hege".into();
+        chosen.speaker_set = true;
+        let t = take(vec![para("a", &[&e[0]], "Det fikser jeg."), chosen]);
+        let (view, ..) = take_view("s1", &e, Some(&t));
+        assert_eq!(item_texts(&view), ["Speaker 2: Det fikser jeg.", "Hege: Og det."]);
+    }
+
+    #[test]
+    fn a_take_changed_under_an_edited_paragraph_shows_the_paragraphs_as_they_are() {
+        let old = entry("Hege", "Vi var tolv.", 0);
+        let now = [entry("Michael", "Vi var tretten.", 0)];
+        let mut edited = para("a", &[&old], "Vi var 12, sa Hege.");
+        edited.edited = true;
+        let t = take(vec![edited]);
+        let (view, words, cleaned) = take_view("s1", &now, Some(&t));
+        assert!(view.stale);
+        assert_eq!(item_texts(&view), ["Hege: Vi var 12, sa Hege."]);
+        assert_eq!(words, cleaned);
+    }
+
+    #[test]
+    fn a_pass_keeps_edits_and_fills_only_the_gaps() {
+        let e = [entry("Hege", "Eh, ja.", 0), entry("Hege", "Vi var tolv.", 1_000), entry("Michael", "Bra.", 2_000)];
+        let mut edited = para("a", &[&e[1]], "Vi var tolv, sa hun.");
+        edited.edited = true;
+        let stale_untouched = CleanTurn { members: vec!["gone".into()], ..para("x", &[&e[0]], "Gammel.") };
+        let fresh = vec![
+            (0, para("f0", &[&e[0]], "Ja.")),
+            (1, para("f1", &[&e[1]], "Vi var tolv.")),
+            (2, para("f2", &[&e[2]], "Bra.")),
+        ];
+        let merged = merge_take(&e, &[stale_untouched, edited.clone()], &fresh, false).unwrap();
+        let ids: Vec<&str> = merged.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, ["f0", "a", "f2"]);
+        // "Clean again" replaces the edit.
+        let merged = merge_take(&e, &[edited.clone()], &fresh, true).unwrap();
+        assert_eq!(merged.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["f0", "f1", "f2"]);
+        // An edited paragraph whose words changed stops the merge.
+        let changed = [entry("Hege", "Eh, ja.", 0), entry("Hege", "Vi var tretten.", 1_000)];
+        assert_eq!(merge_take(&changed, &[edited], &fresh[..1], false), None);
+    }
+
+    #[test]
+    fn an_edit_marks_the_paragraph_and_ignores_no_change() {
+        let e = entry("Hege", "Vi var tolv.", 0);
+        let mut doc = CleanDoc { v: CLEAN_DOC_VERSION, takes: vec![take(vec![para("a", &[&e], "Vi var tolv.")])] };
+        let same = CleanEdit { text: Some(" Vi var  tolv. ".into()), speaker: None };
+        assert_eq!(apply_edit(&mut doc, "s1", "a", &same), Ok(false));
+        let fix = CleanEdit { text: Some("Vi var tolv hos Cefor.".into()), speaker: Some("Hege".into()) };
+        assert_eq!(apply_edit(&mut doc, "s1", "a", &fix), Ok(true));
+        let t = &doc.takes[0].turns[0];
+        assert_eq!((t.text.as_str(), t.edited, t.speaker_set), ("Vi var tolv hos Cefor.", true, true));
+        assert!(apply_edit(&mut doc, "s1", "a", &CleanEdit { text: Some("  ".into()), speaker: None }).is_err());
+        assert!(apply_edit(&mut doc, "s2", "a", &fix).is_err());
+    }
+
+    #[test]
+    fn the_document_round_trips_and_another_version_is_left_alone() {
+        let e = entry("Hege", "Ja.", 0);
+        let mut doc = CleanDoc::default();
+        doc.take_mut("s1").turns.push(para("a", &[&e], "Ja."));
+        let json = serde_json::to_string(&doc).unwrap();
+        assert!(!json.contains("edited"), "untouched flags stay out of the stored JSON: {json}");
+        assert_eq!(parse_doc(&json), Some(doc));
+        assert_eq!(parse_doc(""), Some(CleanDoc::default()));
+        assert_eq!(parse_doc(r#"{"v": 2, "takes": []}"#), None);
+        assert!(build_view(&[], None).unreadable);
+    }
+
+    #[test]
+    fn the_prompt_carries_the_vocabulary_only_when_there_is_one() {
+        assert_eq!(clean_prompt(&[]), CLEAN_PROMPT);
+        let p = clean_prompt(&["Cefor".into(), "Humla".into()]);
+        assert!(p.starts_with(CLEAN_PROMPT) && p.ends_with("spelled as they should be: Cefor, Humla. Where the recogniser misheard one of them, write it this way."));
+    }
+
+    #[test]
+    fn the_summary_text_joins_a_speakers_paragraphs_into_one_line() {
+        let e = [entry("Michael", "Eh, skal vi?", 0), entry("Michael", "Ja, la oss.", 1_000), entry("Hege", "Ok.", 2_000)];
+        let t = take(vec![para("a", &[&e[0]], "Skal vi?"), para("b", &[&e[1]], "La oss.")]);
+        let view = build_view(&[("s1".into(), e.to_vec())], Some(&CleanDoc { v: CLEAN_DOC_VERSION, takes: vec![t] }));
+        assert_eq!(view_text(&view), "Michael: Skal vi? La oss.\nHege: Ok.");
     }
 }

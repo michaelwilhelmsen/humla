@@ -48,6 +48,8 @@ export const DEFAULTS: Record<EditableKey, string> = {
   transcribe_manually: "false",
   keep_awake: "true",
   clean_transcripts: "true",
+  clean_model: "",
+  speaker_check: "true",
   close_to_tray: "false",
   sync_audio: "true",
   custom_vocabulary: "",

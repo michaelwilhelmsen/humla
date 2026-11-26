@@ -50,3 +50,23 @@ describe("TranscriptionTab on a custom endpoint", () => {
     expect(screen.queryByLabelText("Custom API key")).toBeNull();
   });
 });
+
+describe("TranscriptionTab's model passes (#217)", () => {
+  it("turns the speaker check off", async () => {
+    const update = renderTab({ provider: "openai", model: "whisper-1" });
+    await userEvent.click(screen.getByRole("switch", { name: "Fix speaker changes" }));
+    expect(update).toHaveBeenCalledWith("speaker_check", "false");
+  });
+
+  it("picks the clean model among the summary provider's, named with the provider", async () => {
+    const update = renderTab({ provider: "openai", model: "whisper-1" }, { summary_provider: "openai" });
+    await userEvent.click(await screen.findByRole("combobox", { name: "Default (gpt-6.2-sol)" }));
+    await userEvent.click(await screen.findByRole("option", { name: "gpt-5.4-mini" }));
+    expect(update).toHaveBeenCalledWith("clean_model", "openai:gpt-5.4-mini");
+  });
+
+  it("shows no clean model while cleaning is off", () => {
+    renderTab({ provider: "openai", model: "whisper-1" }, { clean_transcripts: "false" });
+    expect(screen.queryByRole("combobox", { name: "Default (gpt-6.2-sol)" })).toBeNull();
+  });
+});

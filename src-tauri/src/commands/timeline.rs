@@ -48,20 +48,6 @@ pub struct TimelineEntry {
     pub session_id: String,
     pub session_index: u32,
     pub chunk_idx: usize,
-    /// What the Clean view shows for this entry (#217). Absent when no clean
-    /// pass has covered these exact words. A clean segment spans one or more
-    /// consecutive entries of a speaker: its first entry carries the segment's
-    /// clean text and words (timed in the take's clock), the rest carry empty
-    /// ones. A segment a guard kept verbatim carries each entry's own words.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub clean: Option<CleanText>,
-}
-
-/// An entry's text in the Clean view (#217).
-#[derive(Clone, serde::Serialize, Debug, PartialEq)]
-pub struct CleanText {
-    pub text: String,
-    pub words: Vec<TimelineWord>,
 }
 
 /// Parse one session's `timeline.jsonl` into entries carrying that session's
@@ -113,7 +99,6 @@ fn parse_session_timeline(
             session_id: session_id.to_string(),
             session_index,
             chunk_idx: idx,
-            clean: None,
         });
     }
     for i in 0..out.len() {
@@ -146,43 +131,9 @@ pub fn note_timeline(app: AppHandle, note_id: String) -> Result<Vec<TimelineEntr
     let recordings = sessions::recordings_dir(&app_dir, &note_id);
     let mut out = Vec::new();
     for (entry, dir) in sessions::resolve_sessions(&recordings) {
-        let mut take = parse_session_timeline(&dir.join("timeline.jsonl"), &entry.id, entry.index);
-        attach_clean(&mut take, &super::clean::read_segments(&dir));
-        out.extend(take);
+        out.extend(parse_session_timeline(&dir.join("timeline.jsonl"), &entry.id, entry.index));
     }
     Ok(out)
-}
-
-/// Give each entry the Clean view's text from the stored segment covering its
-/// exact words, if any (#217).
-fn attach_clean(take: &mut [TimelineEntry], segments: &[super::clean::CleanSegment]) {
-    if segments.is_empty() {
-        return;
-    }
-    let fps: Vec<String> = take
-        .iter()
-        .map(|e| super::clean::fingerprint(&super::clean::tokens_of(e.words.iter().map(|w| w.text.as_str()), &e.text)))
-        .collect();
-    for (i, hit) in super::clean::match_segments(&fps, segments).into_iter().enumerate() {
-        let Some(si) = hit else { continue };
-        let seg = &segments[si];
-        for k in 0..seg.members.len() {
-            let e = &mut take[i + k];
-            e.clean = Some(match (&seg.text, k) {
-                // Kept verbatim by a guard: each entry shows its own words.
-                (None, _) => CleanText { text: e.text.clone(), words: e.words.clone() },
-                (Some(text), 0) => CleanText {
-                    text: text.clone(),
-                    words: seg
-                        .words
-                        .iter()
-                        .map(|w| TimelineWord { text: w.text.clone(), start_ms: w.start_ms, end_ms: w.end_ms })
-                        .collect(),
-                },
-                (Some(_), _) => CleanText { text: String::new(), words: Vec::new() },
-            });
-        }
-    }
 }
 
 /// Outcome of [`note_timeline_repair`].
@@ -446,7 +397,7 @@ pub(super) fn group_values_to_transcript(values: &[serde_json::Value]) -> String
 }
 
 /// `group_values_to_transcript` over `(label, text)` pairs.
-fn group_lines<'a>(lines: impl Iterator<Item = (&'a str, &'a str)>) -> String {
+pub(super) fn group_lines<'a>(lines: impl Iterator<Item = (&'a str, &'a str)>) -> String {
     let mut out = String::new();
     let mut last_label: Option<&str> = None;
     for (label, text) in lines {
@@ -468,44 +419,6 @@ fn group_lines<'a>(lines: impl Iterator<Item = (&'a str, &'a str)>) -> String {
         out.push_str(text);
     }
     out
-}
-
-/// The takes' transcript with each entry's clean read in place of its words,
-/// grouped like the stored one, beside the verbatim projection of the same
-/// entries. `None` when no entry has a clean read.
-fn clean_projection(takes: &[Vec<TimelineEntry>]) -> Option<(String, String)> {
-    if !takes.iter().flatten().any(|e| e.clean.is_some()) {
-        return None;
-    }
-    let join = |pick: &dyn Fn(&TimelineEntry) -> &str| {
-        takes
-            .iter()
-            .map(|take| group_lines(take.iter().map(|e| (e.label.as_str(), pick(e)))))
-            .filter(|part| !part.trim().is_empty())
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-    let verbatim = join(&|e| e.text.as_str());
-    let clean = join(&|e| e.clean.as_ref().map_or(e.text.as_str(), |c| c.text.as_str()));
-    Some((verbatim, clean))
-}
-
-/// The note's transcript as the Clean view reads it, for the summary (#217).
-/// `None` when nothing is cleaned, or when the timelines don't account for
-/// `transcript`, which then stays what the summary reads.
-pub(super) fn clean_transcript(app: &AppHandle, note_id: &str, transcript: &str) -> Option<String> {
-    let app_dir = app.path().app_data_dir().ok()?;
-    let recordings = sessions::recordings_dir(&app_dir, note_id);
-    let takes: Vec<Vec<TimelineEntry>> = sessions::resolve_sessions(&recordings)
-        .into_iter()
-        .map(|(entry, dir)| {
-            let mut take = parse_session_timeline(&dir.join("timeline.jsonl"), &entry.id, entry.index);
-            attach_clean(&mut take, &super::clean::read_segments(&dir));
-            take
-        })
-        .collect();
-    let (verbatim, clean) = clean_projection(&takes)?;
-    (verbatim.trim() == transcript.trim()).then_some(clean)
 }
 
 /// Rebuild the note's full DB transcript from every session's timeline, in
@@ -925,6 +838,13 @@ pub fn note_timeline_rename(
         if let Err(e) = std::fs::write(&path, out) {
             eprintln!("timeline rename: write {}: {e}", path.display());
         }
+    }
+    let state: State<AppState> = app.state();
+    let renamed = super::clean::rename_speaker(&state.db.lock(), &note_id, &old_label, &new_label);
+    match renamed {
+        Ok(true) => super::note_changed_for_sync(&app, &note_id),
+        Ok(false) => {}
+        Err(e) => eprintln!("timeline rename: clean transcript: {e:#}"),
     }
     Ok(())
 }
@@ -1528,77 +1448,6 @@ mod tests {
     }
 
     // ---- Per-session (#16) label offset + timeline plumbing -------------
-
-    #[test]
-    fn clean_segments_attach_to_their_exact_run_of_entries() {
-        use crate::commands::clean::{fingerprint, CleanWord, CleanSegment};
-        let entry = |text: &str, timed: bool| TimelineEntry {
-            start_ms: 0,
-            end_ms: 1_000,
-            label: "Hege".into(),
-            text: text.into(),
-            words: if timed {
-                text.split_whitespace()
-                    .map(|w| TimelineWord { text: w.into(), start_ms: 0, end_ms: 1 })
-                    .collect()
-            } else {
-                Vec::new()
-            },
-            session_id: "s".into(),
-            session_index: 1,
-            chunk_idx: 0,
-            clean: None,
-        };
-        let fp = |t: &str| fingerprint(&t.split_whitespace().map(str::to_string).collect::<Vec<_>>());
-        let segments = vec![
-            CleanSegment {
-                members: vec![fp("Ja, ehm, jeg har"), fp("jeg har notatene.")],
-                text: Some("Ja, jeg har notatene.".into()),
-                words: vec![CleanWord { text: "Ja,".into(), start_ms: 0, end_ms: 1 }],
-            },
-            CleanSegment { members: vec![fp("Vi var 12.")], text: None, words: vec![] },
-            CleanSegment { members: vec![fp("gammel tekst")], text: Some("x".into()), words: vec![] },
-        ];
-        let mut take = vec![
-            entry("Ja, ehm, jeg har", true),
-            entry("jeg har notatene.", true),
-            entry("Vi var 12.", false),
-            entry("ny tekst", true), // edited since the pass: nothing attached
-        ];
-        attach_clean(&mut take, &segments);
-        assert_eq!(take[0].clean.as_ref().unwrap().text, "Ja, jeg har notatene.");
-        assert_eq!(take[0].clean.as_ref().unwrap().words.len(), 1);
-        assert_eq!(take[1].clean, Some(CleanText { text: String::new(), words: vec![] }));
-        assert_eq!(take[2].clean.as_ref().unwrap().text, "Vi var 12.");
-        assert_eq!(take[3].clean, None);
-    }
-
-    #[test]
-    fn the_clean_projection_puts_each_clean_read_in_place_of_its_words() {
-        let e = |label: &str, text: &str, clean: Option<&str>| TimelineEntry {
-            start_ms: 0,
-            end_ms: 0,
-            label: label.into(),
-            text: text.into(),
-            words: vec![],
-            session_id: "s1".into(),
-            session_index: 1,
-            chunk_idx: 0,
-            clean: clean.map(|c| CleanText { text: c.into(), words: vec![] }),
-        };
-        let takes = vec![
-            vec![
-                e("Michael", "Eh, skal vi, skal vi", Some("Skal vi starte?")),
-                e("Michael", "starte?", Some("")),
-                e("Hege", "Ja.", None),
-            ],
-            vec![e("Hege", "Bra, ehm, bra.", Some("Bra."))],
-        ];
-        let (verbatim, clean) = clean_projection(&takes).unwrap();
-        assert_eq!(verbatim, "Michael: Eh, skal vi, skal vi starte?\nHege: Ja.\nHege: Bra, ehm, bra.");
-        assert_eq!(clean, "Michael: Skal vi starte?\nHege: Ja.\nHege: Bra.");
-        assert!(clean_projection(&[vec![e("Hege", "Ja.", None)]]).is_none());
-    }
 
     #[test]
     fn the_timeline_carries_the_same_speaker_boundaries_as_the_transcript() {

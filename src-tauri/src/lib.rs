@@ -471,6 +471,8 @@ where
             commands::note_timeline,
             commands::note_clean,
             commands::note_clean_available,
+            commands::note_clean_view,
+            commands::note_clean_edit,
             commands::note_timeline_repair,
             commands::note_timeline_rename,
             commands::note_timeline_set_chunk_label,

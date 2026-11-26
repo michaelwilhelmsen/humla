@@ -90,6 +90,9 @@ export type Note = {
   deleted_at?: number | null;
   // Optional Client tag (issue #43). null = untagged. Independent of folder_id.
   client_id?: string | null;
+  // The clean transcript (#217) as the backend stores it; read it through
+  // `ipc.cleanView`, never parse it here.
+  clean_transcript?: string;
 };
 
 export type NoteRevision = {
@@ -143,6 +146,9 @@ export type ExportSpec = {
   // When false, the leading `Label: ` prefix is stripped from each
   // transcript line in the export.
   includeSpeakerLabels: boolean;
+  // The clean transcript (#217) in place of the verbatim one, where the note
+  // has one.
+  cleanTranscript: boolean;
 };
 
 /** The webhook endpoint as Settings reads it (#213): the URL and each header's
@@ -182,6 +188,13 @@ export type SettingsKey =
   // of the transcript for the reader's Clean view. Default on; only the
   // string "false" turns it off.
   | "clean_transcripts"
+  // Which model cleans transcripts (#217): "<provider>:<model>", or "" for
+  // the default (src/lib/cleanModel.ts).
+  | "clean_model"
+  // A model checks speaker changes that cut a sentence and moves the words to
+  // whoever said them (#217). Default on; only the string "false" turns it
+  // off. Mirrors `clean::speaker_check_enabled`.
+  | "speaker_check"
   // Which version the Transcript tab shows: "clean" (default) or "verbatim".
   // Remembered across notes; owned by the tab's own switch.
   | "transcript_view"
@@ -380,12 +393,6 @@ export type TimelineEntry = {
   sessionId: string;
   sessionIndex: number;
   chunkIdx: number;
-  // What the Clean view shows for this entry (#217). Absent when no clean
-  // pass has covered these exact words. A clean segment spans one or more
-  // consecutive entries of one speaker: its first entry carries the
-  // segment's clean text and words (timed in the take's clock, aligned to
-  // what was said), the rest carry empty ones.
-  clean?: { text: string; words: TimelineWord[] };
 };
 
 // What a clean pass did (#217): segments the model rewrote, and how many of
@@ -397,6 +404,30 @@ export type CleanOutcome = { segments: number; keptVerbatim: number };
 // read), so a Copilot note is left alone. "missing": the entries without one,
 // asked for. "all": every entry anew.
 export type CleanRequest = "auto" | "missing" | "all";
+
+// The Clean view of a note (#217); mirrors `clean::CleanView`. Per take, its
+// paragraphs ("turn") and the verbatim stretches no paragraph covers yet
+// ("gap"), in the order they were said.
+export type CleanItem =
+  | { kind: "turn"; id: string; speaker: string; text: string; startMs: number; edited: boolean }
+  | { kind: "gap"; speaker: string; text: string; startMs: number; words: number };
+export type CleanTakeView = {
+  sessionId: string;
+  items: CleanItem[];
+  // The verbatim changed under paragraphs the user edited.
+  stale: boolean;
+};
+export type CleanView = {
+  takes: CleanTakeView[];
+  words: number;
+  cleanedWords: number;
+  // Paragraphs the user edited or gave another speaker.
+  edited: number;
+  // Stored by another version of Humla: neither shown nor written.
+  unreadable: boolean;
+};
+// A change to one paragraph; mirrors `clean::CleanEdit`.
+export type CleanEdit = { text?: string; speaker?: string };
 
 // Outcome of the on-open orphaned-text repair (#169). `coversTranscript` is
 // the backend's own comparison of `note.transcript` against what the merged
@@ -608,6 +639,11 @@ export const ipc = {
   // Whether the note's summary provider is set up to clean with; the reader
   // shows no Clean view without one.
   cleanAvailable: (noteId: string) => invoke<boolean>("note_clean_available", { noteId }),
+  cleanView: (noteId: string) => invoke<CleanView>("note_clean_view", { noteId }),
+  // Rewrite a paragraph or give it another speaker. An edited paragraph stays
+  // as it is when the note is cleaned again, unless the user asks to replace it.
+  cleanEdit: (noteId: string, sessionId: string, turnId: string, edit: CleanEdit) =>
+    invoke<void>("note_clean_edit", { noteId, sessionId, turnId, edit }),
   // Repair transcript text no session timeline accounts for (#169), and report
   // whether a gap remains. Call this BEFORE `noteTimeline` on open: the four
   // paths that rebuild the transcript from the timelines would otherwise
