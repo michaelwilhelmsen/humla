@@ -9,8 +9,8 @@ use super::timeline::{
 };
 use super::transcribe::drop_incidental_stream_hallucinations;
 use super::transcript::{
-    absorb_text_continuation_chains, bridge_short_interjections, build_labelled_transcript,
-    build_pieces_unbridged, single_piece, split_by_labels, split_by_segments, LabelledPiece,
+    build_labelled_transcript, build_unrefined_pieces, refine_pieces, single_piece,
+    split_by_labels, split_by_segments, LabelledPiece,
 };
 use super::unify::unify_note_speakers;
 use super::capture::{ms_since, record_timing, PostStopSnapshot, StopClock};
@@ -39,6 +39,11 @@ const DIARIZE_MODEL_MISSING_UNLABELLED: &str = "Speaker diarization model isn't 
 pub async fn rediarize_note(app: AppHandle, note_id: String) -> Result<(), String> {
     let result = rediarize_note_inner(app.clone(), note_id.clone()).await;
     notes::purge_note_assets_if_gone(&app, &note_id);
+    // The rebuilt timeline lost the speaker changes a model moved, and the
+    // clean read keyed on the old entries.
+    if result.is_ok() {
+        tauri::async_runtime::spawn(super::clean::clean_note_quietly(app.clone(), note_id.clone()));
+    }
     result
 }
 
@@ -496,10 +501,9 @@ pub(super) async fn rediarize_apply_to_chunks(
     // Capture the labelled-piece sequence at both the pre- and post-
     // bridge stages so the diagnostic can show what the sandwich rule
     // did (or, more interestingly, didn't do) for this run.
-    let pieces_pre = build_pieces_unbridged(&chunks, stage.splitter.as_ref());
+    let pieces_pre = build_unrefined_pieces(&chunks, stage.splitter.as_ref());
     let mut pieces_post = pieces_pre.clone();
-    bridge_short_interjections(&mut pieces_post);
-    absorb_text_continuation_chains(&mut pieces_post);
+    refine_pieces(&mut pieces_post);
     write_diagnostics_json(
         &app,
         &note_id,
@@ -731,9 +735,8 @@ fn pieces_to_json(pieces: &[LabelledPiece]) -> Vec<serde_json::Value> {
 /// the diarize pipeline.
 ///
 /// `pieces` is the labelled-piece sequence the transcript emitter walks,
-/// captured before and after `bridge_short_interjections` runs. When present
-/// the dump also includes a `bridge_changes` diff so flicker-absorption
-/// decisions (and non-decisions) are inspectable.
+/// captured before and after `refine_pieces` runs, with the label changes
+/// between them.
 ///
 /// `mic_segments` are the mic's voices as diarized, echo included; `echo` says
 /// which of them the check dropped before they were numbered.
@@ -810,16 +813,9 @@ async fn write_diagnostics_json(
         })
         .collect();
 
-    // The post-split piece sequence is what `build_labelled_transcript`
-    // emits as `Speaker N: ...` lines. Capturing both the pre- and post-
-    // bridge versions, plus the diff, makes flicker-absorption decisions
-    // (or non-decisions) inspectable: every entry in `bridge_changes`
-    // is a piece the sandwich rule moved; every short A-B-A pattern that
-    // ISN'T in `bridge_changes` is a piece the bridge declined to move,
-    // and the reason is decidable from word count + duration + neighbours.
     let pieces_pre_json = pieces.map(|(pre, _)| pieces_to_json(pre));
     let pieces_post_json = pieces.map(|(_, post)| pieces_to_json(post));
-    let bridge_changes = match pieces {
+    let label_changes = match pieces {
         Some((pre, post)) if pre.len() == post.len() => pre
             .iter()
             .zip(post.iter())
@@ -848,9 +844,9 @@ async fn write_diagnostics_json(
         "mic_segments": mic_segments,
         "sys_segments": sys_segments,
         "chunks": chunk_payload,
-        "pieces_before_bridge": pieces_pre_json,
-        "pieces_after_bridge": pieces_post_json,
-        "bridge_changes": bridge_changes,
+        "pieces_before_refine": pieces_pre_json,
+        "pieces_after_refine": pieces_post_json,
+        "label_changes": label_changes,
         "echo": echo,
         "created_at": chrono::Utc::now().timestamp_millis(),
     });

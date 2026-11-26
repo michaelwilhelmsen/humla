@@ -41,8 +41,42 @@ struct Alternative {
 #[derive(Deserialize)]
 struct DGWord {
     word: String,
+    /// The word as the formatted transcript spells it, with its punctuation
+    /// and capitals: sent when `punctuate` or `smart_format` is on, which
+    /// this adapter always asks for. `word` alone is lowercased and bare,
+    /// and the reader shows word texts.
+    #[serde(default)]
+    punctuated_word: Option<String>,
     start: f64,
     end: f64,
+}
+
+/// Deepgram's words as the adapter's, each spelled as the formatted
+/// transcript spells it (`punctuated_word`) when Deepgram sent that, else the
+/// bare `word`.
+fn dg_words(words: Vec<DGWord>) -> Vec<Word> {
+    words
+        .into_iter()
+        .filter_map(|w| {
+            let text = w
+                .punctuated_word
+                .as_deref()
+                .filter(|p| !p.trim().is_empty())
+                .unwrap_or(&w.word)
+                .trim()
+                .to_string();
+            if text.is_empty() {
+                return None;
+            }
+            let start_ms = (w.start.max(0.0) * 1000.0).round() as u64;
+            let end_ms = (w.end.max(0.0) * 1000.0).round() as u64;
+            Some(Word {
+                text,
+                start_ms,
+                end_ms: end_ms.max(start_ms),
+            })
+        })
+        .collect()
 }
 
 #[derive(Default)]
@@ -140,23 +174,7 @@ impl BatchSttAdapter for DeepgramAdapter {
             .and_then(|c| c.alternatives.into_iter().next())
             .ok_or_else(|| anyhow!("Deepgram returned no alternatives"))?;
 
-        let words = alt
-            .words
-            .into_iter()
-            .filter_map(|w| {
-                let text = w.word.trim().to_string();
-                if text.is_empty() {
-                    return None;
-                }
-                let start_ms = (w.start.max(0.0) * 1000.0).round() as u64;
-                let end_ms = (w.end.max(0.0) * 1000.0).round() as u64;
-                Some(Word {
-                    text,
-                    start_ms,
-                    end_ms: end_ms.max(start_ms),
-                })
-            })
-            .collect();
+        let words = dg_words(alt.words);
 
         Ok(TranscribeResult {
             text: alt.transcript,
@@ -203,6 +221,21 @@ mod tests {
         assert_eq!(alt.words.len(), 2);
         assert_eq!(alt.words[0].word, "hello");
         assert!((alt.words[0].start - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn words_carry_the_punctuated_spelling() {
+        // `word` is lowercased and bare; with punctuate/smart_format on,
+        // `punctuated_word` is what the transcript says. A response without
+        // it (older models, formatting off) falls back to `word`.
+        let json = r#"[
+          {"word": "hello", "punctuated_word": "Hello,", "start": 0.5, "end": 0.9},
+          {"word": "world", "punctuated_word": "world.", "start": 1.0, "end": 1.4},
+          {"word": "bare", "start": 1.5, "end": 1.7}
+        ]"#;
+        let words: Vec<DGWord> = serde_json::from_str(json).unwrap();
+        let texts: Vec<String> = dg_words(words).into_iter().map(|w| w.text).collect();
+        assert_eq!(texts, vec!["Hello,", "world.", "bare"]);
     }
 
     #[test]

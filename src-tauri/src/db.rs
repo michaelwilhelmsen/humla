@@ -74,6 +74,11 @@ pub struct Note {
     // delete can be restored; a remote tombstone also lands here.
     #[serde(default)]
     pub deleted_at: Option<i64>,
+    // The note's clean transcript (#217): a `clean::CleanDoc` as JSON, empty
+    // until a clean pass writes one. It syncs; the user's edits move
+    // `updated_at`, a pass's writes don't.
+    #[serde(default)]
+    pub clean_transcript: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -317,6 +322,10 @@ pub fn open(path: &Path) -> Result<Connection> {
         [],
     );
     let _ = conn.execute(
+        "ALTER TABLE notes ADD COLUMN clean_transcript TEXT NOT NULL DEFAULT ''",
+        [],
+    );
+    let _ = conn.execute(
         "ALTER TABLE folders ADD COLUMN workspace_id TEXT NOT NULL DEFAULT ''",
         [],
     );
@@ -490,7 +499,7 @@ pub fn now_ms() -> i64 {
 // note would clobber a local tag.
 // Appended-only: `map_note` reads by position, so new columns go on the end
 // to keep every existing index stable.
-const NOTE_COLS: &str = "id, title, body, transcript, summary, audio_path, summary_preset, folder_id, language, summary_provider, expected_speakers, created_at, updated_at, owner, workspace_id, deleted_at, client_id, detected_language, private, shared_with";
+const NOTE_COLS: &str = "id, title, body, transcript, summary, audio_path, summary_preset, folder_id, language, summary_provider, expected_speakers, created_at, updated_at, owner, workspace_id, deleted_at, client_id, detected_language, private, shared_with, clean_transcript";
 
 /// List live notes in the active workspace (`""` = Personal / local-only).
 /// Excludes trashed notes (`deleted_at` set). Scoping by workspace keeps one
@@ -1029,6 +1038,16 @@ pub fn set_transcript(conn: &Connection, id: &str, text: &str) -> Result<()> {
         "UPDATE notes SET transcript = ?1, updated_at = ?2 WHERE id = ?3",
     )?;
     stmt.execute(params![text, now, id])?;
+    Ok(())
+}
+
+/// Replace the note's clean transcript (#217). It moves `updated_at` like the
+/// note's other text, so it syncs last-write-wins with the note.
+pub fn set_clean_transcript(conn: &Connection, id: &str, json: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE notes SET clean_transcript = ?1, updated_at = ?2 WHERE id = ?3",
+        params![json, now_ms(), id],
+    )?;
     Ok(())
 }
 
@@ -3298,6 +3317,7 @@ fn map_note(row: &rusqlite::Row) -> rusqlite::Result<Note> {
         detected_language: row.get(17)?,
         private: row.get(18)?,
         shared_with: serde_json::from_str(&row.get::<_, String>(19)?).unwrap_or_default(),
+        clean_transcript: row.get(20)?,
     })
 }
 
@@ -3313,6 +3333,21 @@ pub(crate) fn settings_only_conn() -> Connection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #217 — a clean pass's write keeps the note where it is in the list; the
+    /// user's edit moves it, so it wins last-write-wins.
+    #[test]
+    fn writing_the_clean_transcript_moves_updated_at() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(&dir.path().join("clean.sqlite")).unwrap();
+        let note = create_note(&conn, "en", "meeting", "").unwrap();
+        conn.execute("UPDATE notes SET updated_at = 1 WHERE id = ?1", params![note.id]).unwrap();
+
+        set_clean_transcript(&conn, &note.id, r#"{"v":1,"takes":[]}"#).unwrap();
+        let after = get_note(&conn, &note.id).unwrap();
+        assert_eq!(after.clean_transcript, r#"{"v":1,"takes":[]}"#);
+        assert!(after.updated_at > 1);
+    }
 
     /// #191 — a note is shared until someone says otherwise, and saying so is a
     /// real edit: it bumps `updated_at`, unlike the derived writes beside it,

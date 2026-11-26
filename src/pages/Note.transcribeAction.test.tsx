@@ -63,7 +63,12 @@ async function openTranscriptPanel(
 }
 
 function retranscribeButton() {
-  return screen.queryByRole("button", { name: /^re-transcribe$/i });
+  return screen.queryByRole("button", { name: /^transcribe again$/i });
+}
+
+/** The panel's "Norwegian · 2 speakers", where the runs over a transcript live. */
+async function openSettings(user: ReturnType<typeof userEvent.setup>) {
+  await user.click(await screen.findByRole("button", { name: /^transcription settings/i }));
 }
 
 function transcribeButton() {
@@ -160,18 +165,20 @@ describe("the transcript panel's re-transcribe control", () => {
       { transcript: TRANSCRIPT },
     );
 
-    await user.click(await screen.findByRole("button", { name: /^re-transcribe$/i }));
+    await openSettings(user);
+    await user.click(await screen.findByRole("button", { name: /^transcribe again$/i }));
 
     expect(transcribe).toHaveBeenCalledWith({ noteId: "n1", scope: "all" });
   });
 
   it("stays hidden when no take has its raw streams left", async () => {
-    await openTranscriptPanel(
+    const { user } = await openTranscriptPanel(
       [session({ canRetranscribe: false })],
       {},
       { transcript: TRANSCRIPT },
     );
-    await screen.findByRole("button", { name: /^copy transcript$/i });
+    await openSettings(user);
+    await screen.findByText("Language");
     expect(retranscribeButton()).not.toBeInTheDocument();
   });
 
@@ -181,7 +188,7 @@ describe("the transcript panel's re-transcribe control", () => {
     // `readOnly` comes off cloud status, not the note row: a workspace whose
     // plan isn't live locks its notes for everyone.
     const ws = { id: "w1", name: "Acme", role: "member" as const, plan_status: "none" as const };
-    await openTranscriptPanel(
+    const { user } = await openTranscriptPanel(
       [session({ canRetranscribe: true })],
       {
         cloud_status: () => ({
@@ -203,6 +210,8 @@ describe("the transcript panel's re-transcribe control", () => {
     );
     // Copy is still there — reading is what read-only allows.
     await screen.findByRole("button", { name: /^copy transcript$/i });
+    await openSettings(user);
+    await screen.findByText("Language");
     expect(retranscribeButton()).not.toBeInTheDocument();
   });
 
@@ -221,12 +230,13 @@ describe("the transcript panel's re-transcribe control", () => {
   });
 
   it("is disabled while a run is in flight on this note", async () => {
-    await openTranscriptPanel(
+    const { user } = await openTranscriptPanel(
       [session({ canRetranscribe: true })],
       {},
       { transcript: TRANSCRIPT },
     );
-    await screen.findByRole("button", { name: /^re-transcribe$/i });
+    await openSettings(user);
+    await screen.findByRole("button", { name: /^transcribe again$/i });
 
     act(() => useRecordingStore.getState().setTranscribing("n1", true));
 
@@ -368,21 +378,20 @@ describe("the transcript panel with both text and a pending take", () => {
     );
   }
 
-  /** The panel's own action row, so the toolbar's Transcribe can't answer for
-      it — they share an accessible name, deliberately: one action, two
-      surfaces. */
-  function actionRow() {
-    return screen.getByRole("button", { name: /^copy transcript$/i }).closest("div")!;
+  /** The panel's line about the take, so the toolbar's Transcribe can't
+      answer for it — they share an accessible name, deliberately: one action,
+      two surfaces. */
+  function statusLine() {
+    return screen.getByText(/one recording hasn't been transcribed yet/i).closest("p")!;
   }
 
-  it("offers Transcribe beside Copy and Re-transcribe", async () => {
-    await openMixed();
-    await screen.findByRole("button", { name: /^copy transcript$/i });
-
+  it("offers Transcribe in the panel's status line, and Transcribe again in its settings", async () => {
+    const { user } = await openMixed();
     expect(
-      within(actionRow()).getByRole("button", { name: /^transcribe$/i }),
+      within(await waitFor(statusLine)).getByRole("button", { name: /^transcribe$/i }),
     ).toBeInTheDocument();
-    expect(retranscribeButton()).toBeInTheDocument();
+    await openSettings(user);
+    expect(await screen.findByRole("button", { name: /^transcribe again$/i })).toBeInTheDocument();
   });
 
   // The two are different runs, and the difference is the whole reason both
@@ -392,34 +401,44 @@ describe("the transcript panel with both text and a pending take", () => {
     const transcribe = vi.fn(() => null);
     const { user } = await openMixed({ transcribe_note: transcribe });
 
-    await screen.findByRole("button", { name: /^copy transcript$/i });
-    await user.click(within(actionRow()).getByRole("button", { name: /^transcribe$/i }));
+    await user.click(within(await waitFor(statusLine)).getByRole("button", { name: /^transcribe$/i }));
 
     expect(transcribe).toHaveBeenCalledWith({ noteId: "n1", scope: "pending" });
   });
 
   it("is disabled while a run is in flight on this note", async () => {
     await openMixed();
-    await screen.findByRole("button", { name: /^copy transcript$/i });
+    await waitFor(statusLine);
 
     act(() => useRecordingStore.getState().setTranscribing("n1", true));
 
     await waitFor(() =>
-      expect(within(actionRow()).getByRole("button", { name: /^transcribe$/i })).toBeDisabled(),
+      expect(within(statusLine()).getByRole("button", { name: /^transcribe$/i })).toBeDisabled(),
     );
   });
 
-  // Nothing pending: the row is Copy + Re-transcribe as before.
-  it("drops back to Copy and Re-transcribe once every take has text", async () => {
+  it("counts the recordings still waiting", async () => {
+    await openTranscriptPanel(
+      [
+        session({ id: "s1", index: 1, canTranscribe: false, canRetranscribe: true }),
+        session({ id: "s2", index: 2, canTranscribe: true }),
+        session({ id: "s3", index: 3, canTranscribe: true }),
+      ],
+      {},
+      { transcript: TRANSCRIPT },
+    );
+    expect(await screen.findByText(/2 recordings haven't been transcribed yet/i)).toBeInTheDocument();
+  });
+
+  // Nothing pending: no line about it.
+  it("says nothing about a take once every take has text", async () => {
     await openTranscriptPanel(
       [session({ canTranscribe: false, canRetranscribe: true })],
       {},
       { transcript: TRANSCRIPT },
     );
-    await screen.findByRole("button", { name: /^re-transcribe$/i });
+    await screen.findByRole("button", { name: /^copy transcript$/i });
 
-    expect(
-      within(actionRow()).queryByRole("button", { name: /^transcribe$/i }),
-    ).not.toBeInTheDocument();
+    expect(screen.queryByText(/one recording hasn't been transcribed yet/i)).not.toBeInTheDocument();
   });
 });

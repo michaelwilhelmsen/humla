@@ -31,6 +31,9 @@ pub(super) struct ResolvedProvider {
     // chain-of-thought). Default off; flipping it on lets users A/B the
     // quality difference in dev. Ignored for cloud + non-Ollama servers.
     pub(super) think: bool,
+    /// Sent to cloud OpenAI only when set; the summary leaves it at the
+    /// model's default.
+    pub(super) reasoning_effort: Option<openai::ReasoningEffort>,
     /// The running Copilot CLI, which the caller attaches after resolving —
     /// starting it is async and resolving is not.
     pub(super) copilot: Option<copilot_sdk::Client>,
@@ -93,6 +96,7 @@ impl ResolvedProvider {
                     &self.api_key,
                     &self.model,
                     self.think,
+                    self.reasoning_effort,
                     system_prompt,
                     user_message,
                     on_chunk,
@@ -110,6 +114,56 @@ pub(super) async fn attach_copilot(app: &AppHandle, p: &mut ResolvedProvider) ->
         return Ok(());
     }
     p.copilot = Some(super::copilot_client(app).await?);
+    Ok(())
+}
+
+/// Work a provider does besides the summary itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum LightJob {
+    Title,
+    /// Where a change of speaker cuts a sentence (#217).
+    SpeakerCheck,
+    /// The clean read (#217).
+    Clean,
+}
+
+/// The OpenAI model and reasoning each job runs on.
+fn openai_model_for(job: LightJob) -> (&'static str, openai::ReasoningEffort) {
+    use openai::ReasoningEffort::{Low, None};
+    match job {
+        LightJob::Title => (super::LIGHT_OPENAI_MODEL, None),
+        LightJob::SpeakerCheck => (super::LIGHT_OPENAI_MODEL, Low),
+        LightJob::Clean => (super::CLEAN_OPENAI_MODEL, Low),
+    }
+}
+
+/// Point a provider at the model for `job`, without thinking: `chosen` when
+/// the user picked one for it, else OpenAI's per `openai_model_for` and
+/// Copilot's cheapest, else the user's summary model. Starts the Copilot CLI,
+/// so call it once a model call is certain.
+pub(super) async fn use_light_model(
+    app: &AppHandle,
+    p: &mut ResolvedProvider,
+    job: LightJob,
+    chosen: Option<String>,
+) -> anyhow::Result<()> {
+    p.think = false;
+    if p.provider == ProviderId::OpenAi {
+        let (model, effort) = openai_model_for(job);
+        p.model = model.to_string();
+        p.reasoning_effort = Some(effort);
+    }
+    attach_copilot(app, p).await?;
+    if let Some(model) = chosen {
+        p.reasoning_effort = (p.provider == ProviderId::OpenAi && openai::is_reasoning_model(&model))
+            .then_some(openai::ReasoningEffort::Low);
+        p.model = model;
+    } else if let Some(client) = p.copilot.as_ref() {
+        let models = crate::copilot::session::list_models(client).await.unwrap_or_default();
+        if let Some(cheapest) = crate::copilot::session::cheapest(&models) {
+            p.model = cheapest.to_string();
+        }
+    }
     Ok(())
 }
 
@@ -186,6 +240,7 @@ fn resolve_unchecked(
                 api_key: "humla-local".into(),
                 model,
                 think,
+                reasoning_effort: None,
                 copilot: None,
             })
         }
@@ -202,6 +257,7 @@ fn resolve_unchecked(
                 api_key,
                 model,
                 think: false,
+                reasoning_effort: None,
                 copilot: None,
             })
         }
@@ -220,6 +276,7 @@ fn resolve_unchecked(
                 api_key,
                 model,
                 think: false,
+                reasoning_effort: None,
                 copilot: None,
             })
         }
@@ -235,6 +292,7 @@ fn resolve_unchecked(
                 api_key: String::new(),
                 model,
                 think: false,
+                reasoning_effort: None,
                 copilot: None,
             })
         }
@@ -249,6 +307,7 @@ fn resolve_unchecked(
                 api_key: api_key.unwrap_or_default(),
                 model,
                 think: false,
+                reasoning_effort: None,
                 copilot: None,
             })
         }
@@ -393,10 +452,17 @@ async fn run_summary(app: AppHandle, note_id: String) -> anyhow::Result<()> {
     } else {
         format!("[Notater]\n{body_text}")
     };
-    let transcript_block = if note.transcript.trim().is_empty() {
+    // The clean read where there is one (#217).
+    let transcript = if super::clean::clean_setting_on(&app) {
+        super::clean::clean_text(&app, &note_id, &note.transcript)
+    } else {
+        None
+    }
+    .unwrap_or_else(|| note.transcript.clone());
+    let transcript_block = if transcript.trim().is_empty() {
         "[Transkripsjon]\n(ingen)".to_string()
     } else {
-        format!("[Transkripsjon]\n{}", note.transcript)
+        format!("[Transkripsjon]\n{transcript}")
     };
     let user_message = format!("{notes_block}\n\n{transcript_block}");
     // Stream thinking + content deltas to the frontend so the user sees
@@ -477,6 +543,15 @@ pub(super) fn language_directive(lang: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_job_asks_the_clean_model_for_no_reasoning() {
+        // gpt-6.2-sol answers `reasoning_effort: "none"` with HTTP 400.
+        for job in [LightJob::Title, LightJob::SpeakerCheck, LightJob::Clean] {
+            let (model, effort) = openai_model_for(job);
+            assert!(!(model == super::super::CLEAN_OPENAI_MODEL && effort == openai::ReasoningEffort::None), "{job:?}");
+        }
+    }
 
     fn temp_conn() -> (tempfile::TempDir, rusqlite::Connection) {
         let dir = tempfile::tempdir().unwrap();

@@ -4,10 +4,7 @@
 //! rewrite it.
 
 use super::diarization::offset_speaker_label;
-use super::transcript::{
-    absorb_text_continuation_chains, bridge_short_interjections, dedup_mic_against_sys,
-    estimated_speech_ms, LabelledPiece,
-};
+use super::transcript::{build_unrefined_pieces, estimated_speech_ms, refine_pieces, LabelledPiece};
 use super::{err, note_changed_for_sync, session_changed_for_sync};
 use crate::recording::{ChunkRecord, ChunkSource, TranscriptPayload};
 use crate::{db, sessions, AppState};
@@ -15,7 +12,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 /// One word's text + millisecond bounds in stream-absolute time.
 /// Drives the playback view's karaoke-style word highlight.
-#[derive(Clone, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct TimelineWord {
     pub text: String,
     pub start_ms: u64,
@@ -134,11 +131,7 @@ pub fn note_timeline(app: AppHandle, note_id: String) -> Result<Vec<TimelineEntr
     let recordings = sessions::recordings_dir(&app_dir, &note_id);
     let mut out = Vec::new();
     for (entry, dir) in sessions::resolve_sessions(&recordings) {
-        out.extend(parse_session_timeline(
-            &dir.join("timeline.jsonl"),
-            &entry.id,
-            entry.index,
-        ));
+        out.extend(parse_session_timeline(&dir.join("timeline.jsonl"), &entry.id, entry.index));
     }
     Ok(out)
 }
@@ -381,7 +374,7 @@ pub(super) fn read_timeline_values(path: &std::path::Path) -> Vec<serde_json::Va
 }
 
 /// Write timeline values back as JSONL (one object per line).
-fn write_timeline_values(path: &std::path::Path, values: &[serde_json::Value]) -> Result<(), String> {
+pub(super) fn write_timeline_values(path: &std::path::Path, values: &[serde_json::Value]) -> Result<(), String> {
     let mut out = String::new();
     for v in values {
         out.push_str(&v.to_string());
@@ -395,15 +388,24 @@ fn write_timeline_values(path: &std::path::Path, values: &[serde_json::Value]) -
 /// prefixed `Label: `. Mirrors `build_labelled_transcript`. Returns the
 /// session's contribution with no trailing newline.
 pub(super) fn group_values_to_transcript(values: &[serde_json::Value]) -> String {
+    group_lines(values.iter().map(|v| {
+        (
+            v.get("label").and_then(|s| s.as_str()).unwrap_or(""),
+            v.get("text").and_then(|s| s.as_str()).unwrap_or(""),
+        )
+    }))
+}
+
+/// `group_values_to_transcript` over `(label, text)` pairs.
+pub(super) fn group_lines<'a>(lines: impl Iterator<Item = (&'a str, &'a str)>) -> String {
     let mut out = String::new();
-    let mut last_label: Option<String> = None;
-    for v in values {
-        let label = v.get("label").and_then(|s| s.as_str()).unwrap_or("").to_string();
-        let text = v.get("text").and_then(|s| s.as_str()).unwrap_or("").trim();
+    let mut last_label: Option<&str> = None;
+    for (label, text) in lines {
+        let text = text.trim();
         if text.is_empty() {
             continue;
         }
-        if last_label.as_deref() != Some(label.as_str()) {
+        if last_label != Some(label) {
             if !out.is_empty() {
                 out.push('\n');
             }
@@ -837,6 +839,13 @@ pub fn note_timeline_rename(
             eprintln!("timeline rename: write {}: {e}", path.display());
         }
     }
+    let state: State<AppState> = app.state();
+    let renamed = super::clean::rename_speaker(&state.db.lock(), &note_id, &old_label, &new_label);
+    match renamed {
+        Ok(true) => super::note_changed_for_sync(&app, &note_id),
+        Ok(false) => {}
+        Err(e) => eprintln!("timeline rename: clean transcript: {e:#}"),
+    }
     Ok(())
 }
 
@@ -853,16 +862,6 @@ pub(super) fn serialize_timeline(
     split_chunk: &dyn Fn(&ChunkRecord) -> Vec<LabelledPiece>,
     label_offset: u32,
 ) -> String {
-    let kept = dedup_mic_against_sys(chunks);
-    let mut sorted: Vec<&ChunkRecord> = kept.iter().collect();
-    sorted.sort_by_key(|c| {
-        let source_rank = match c.source {
-            ChunkSource::Mic => 0,
-            ChunkSource::Sys => 1,
-        };
-        (c.start_ms, source_rank)
-    });
-
     // Estimate per-piece end_ms before serialising. Three sources, in
     // priority order:
     //   1. Piece's own word timings: max(w.end_ms) — exact, used
@@ -880,8 +879,9 @@ pub(super) fn serialize_timeline(
     // over-estimation is fine — the worst case is one extra row staying
     // lit a beat longer; under-estimation causes a visible skip.
 
-    // First flatten chunks → pieces, tagging each with the source so
-    // the next-same-source lookup works the same way it did per-chunk.
+    // The same pieces and corrections the transcript string gets, so the
+    // reader and the transcript agree. A piece's word timings are relative to
+    // its own base, which a boundary move may have taken from an earlier chunk.
     struct Entry {
         source: ChunkSource,
         start_ms: u64,
@@ -890,36 +890,27 @@ pub(super) fn serialize_timeline(
         words: Vec<serde_json::Value>,
         max_word_end_abs: Option<u64>,
     }
-    let mut entries: Vec<Entry> = Vec::new();
-    // Parallel pieces vec used solely as input to
-    // `bridge_short_interjections`, then drained back into `entries`
-    // below. We can't bridge `entries` directly because the bridge's
-    // sandwich rule reads `LabelledPiece.words` for duration; entries
-    // hold absolute-time word JSON. Keeping a parallel `LabelledPiece`
-    // sequence is the minimal way to ensure the timeline emits the
-    // same speaker labels `build_labelled_transcript` does — without
-    // this, the DB transcript collapses correctly but the playback
-    // view (driven by timeline.jsonl) still renders per-chunk
-    // speaker flicker.
-    let mut bridge_pieces: Vec<LabelledPiece> = Vec::new();
-    for chunk in &sorted {
-        for piece in split_chunk(chunk) {
+    let mut pieces = build_unrefined_pieces(chunks, split_chunk);
+    refine_pieces(&mut pieces);
+    let entries: Vec<Entry> = pieces
+        .iter()
+        .filter_map(|piece| {
             let trimmed = piece.text.trim();
             if trimmed.is_empty() {
-                continue;
+                return None;
             }
-            // Convert word timings to stream-absolute by adding the
-            // chunk's start_ms. The playback view's audio element runs
-            // in the merged playback.wav timeline; word timestamps
-            // inside a chunk are chunk-relative until we rebase here.
+            // Convert word timings to stream-absolute by adding the piece's
+            // base. The playback view's audio element runs in the merged
+            // playback timeline; word timestamps inside a chunk are
+            // chunk-relative until we rebase here.
             let words_abs: Vec<serde_json::Value> = piece
                 .words
                 .iter()
                 .map(|w| {
                     serde_json::json!({
                         "text": w.text,
-                        "start_ms": chunk.start_ms.saturating_add(w.start_ms),
-                        "end_ms": chunk.start_ms.saturating_add(w.end_ms),
+                        "start_ms": piece.base_ms.saturating_add(w.start_ms),
+                        "end_ms": piece.base_ms.saturating_add(w.end_ms),
                     })
                 })
                 .collect();
@@ -928,29 +919,23 @@ pub(super) fn serialize_timeline(
             let start_ms = piece
                 .words
                 .first()
-                .map(|w| chunk.start_ms.saturating_add(w.start_ms))
-                .unwrap_or(chunk.start_ms);
+                .map(|w| piece.base_ms.saturating_add(w.start_ms))
+                .unwrap_or(piece.base_ms);
             let max_word_end_abs = piece
                 .words
                 .iter()
-                .map(|w| chunk.start_ms.saturating_add(w.end_ms))
+                .map(|w| piece.base_ms.saturating_add(w.end_ms))
                 .max();
-            entries.push(Entry {
-                source: chunk.source,
+            Some(Entry {
+                source: piece.source,
                 start_ms,
                 text: trimmed.to_string(),
                 label: piece.label.clone().unwrap_or_default(),
                 words: words_abs,
                 max_word_end_abs,
-            });
-            bridge_pieces.push(piece);
-        }
-    }
-    bridge_short_interjections(&mut bridge_pieces);
-    absorb_text_continuation_chains(&mut bridge_pieces);
-    for (entry, bridged) in entries.iter_mut().zip(bridge_pieces.iter()) {
-        entry.label = bridged.label.clone().unwrap_or_default();
-    }
+            })
+        })
+        .collect();
 
     let next_same_source_start: Vec<u64> = entries
         .iter()
@@ -1463,6 +1448,56 @@ mod tests {
     }
 
     // ---- Per-session (#16) label offset + timeline plumbing -------------
+
+    #[test]
+    fn the_timeline_carries_the_same_speaker_boundaries_as_the_transcript() {
+        // Both come out of `refine_pieces`, so the reader shows "It" where
+        // the transcript does.
+        let chunks = vec![
+            sys_with_words(
+                0,
+                vec![
+                    ("starts", 0, 300), ("to", 300, 500), ("unravel", 500, 900), ("in", 900, 1_000),
+                    ("the", 1_000, 1_100), ("perfect", 1_100, 1_500), ("way.", 1_500, 1_900),
+                    ("It", 2_100, 2_300),
+                ],
+            ),
+            sys_with_words(
+                2_400,
+                vec![
+                    ("does", 0, 200), ("pay", 200, 400), ("off.", 400, 700), ("That's", 900, 1_200),
+                    ("what's", 1_200, 1_500), ("really", 1_500, 1_800), ("nice.", 1_800, 2_200),
+                ],
+            ),
+        ];
+        let segments = vec![
+            crate::diarize::Segment { start_ms: 0, end_ms: 2_350, speaker_id: "a".into() },
+            crate::diarize::Segment { start_ms: 2_350, end_ms: 5_000, speaker_id: "b".into() },
+        ];
+        let labels: std::collections::HashMap<String, String> = [
+            ("a".to_string(), "Speaker 1".to_string()),
+            ("b".to_string(), "Speaker 2".to_string()),
+        ]
+        .into();
+        let split = |c: &ChunkRecord| {
+            crate::commands::transcript::split_by_labels(c, &segments, &labels)
+        };
+
+        let transcript = build_labelled_transcript(&chunks, &split);
+        let values = jsonl_values(&serialize_timeline(&chunks, &split, 0));
+        assert_eq!(
+            transcript,
+            "Speaker 1: starts to unravel in the perfect way.\nSpeaker 2: It does pay off. That's what's really nice."
+        );
+        assert_eq!(group_values_to_transcript(&values), transcript);
+
+        // "It" moved with its timing: the second entry starts when it is
+        // spoken, and its first word is still lit at 2.1 s.
+        assert_eq!(values[1]["start_ms"].as_u64(), Some(2_100));
+        assert_eq!(values[1]["words"][0]["text"].as_str(), Some("It"));
+        assert_eq!(values[1]["words"][0]["start_ms"].as_u64(), Some(2_100));
+        assert_eq!(values[0]["end_ms"].as_u64(), Some(1_900));
+    }
 
     #[test]
     fn serialize_timeline_applies_label_offset() {

@@ -1,26 +1,35 @@
 //! Assembling the labelled transcript from transcribed chunks: per-speaker
 //! pieces split on word timings, mic echo dropped against the system stream,
-//! short interjections and continuation chains folded into the surrounding
-//! speaker, and run-on sentences mended across line boundaries.
+//! short interjections folded into the surrounding speaker, sentence
+//! fragments handed across a speaker change to the side they belong to, and
+//! continuation chains given one speaker. `refine_pieces` is that sequence;
+//! the transcript string and `timeline.jsonl` both come out of it.
 
 use super::diarization::assign_speaker;
 use crate::diarize;
-use crate::recording::{ChunkRecord, ChunkSource};
+use crate::recording::{ChunkRecord, ChunkSource, ChunkWord};
 
 /// One contiguous run of words within a chunk that all belong to the
 /// same speaker. A 15-second VAD chunk that opens with one voice and
 /// ends with another becomes two pieces; a single-voice chunk stays
 /// one piece.
 ///
-/// `words` are kept chunk-relative (matching `ChunkWord`'s convention)
-/// so the timeline serialiser can rebase them to stream-absolute the
-/// same way it always has, and may be empty when the underlying chunk
-/// had no word data and we fell back to whole-chunk labelling.
+/// `words` are relative to `base_ms` (the chunk's start, matching
+/// `ChunkWord`'s convention) so the timeline serialiser can rebase them to
+/// stream-absolute, and may be empty when the underlying chunk had no word
+/// data and we fell back to whole-chunk labelling.
 #[derive(Clone, Debug)]
 pub(super) struct LabelledPiece {
     pub(super) label: Option<String>,
     pub(super) text: String,
-    pub(super) words: Vec<crate::recording::ChunkWord>,
+    pub(super) words: Vec<ChunkWord>,
+    /// The stream the piece was heard on. Boundary repair only moves words
+    /// between pieces of one stream: a mic word is never a system speaker's.
+    pub(super) source: ChunkSource,
+    /// Stream-absolute time `words` are relative to: the chunk's start, until
+    /// a boundary move hands the piece words from an earlier chunk and the
+    /// base drops to that chunk's start.
+    pub(super) base_ms: u64,
 }
 
 /// Wrap a chunk's full text + words as a single labelled piece. Used by
@@ -30,8 +39,59 @@ pub(super) fn single_piece(c: &ChunkRecord, label: Option<String>) -> Vec<Labell
     vec![LabelledPiece {
         label,
         text: c.text.clone(),
-        words: c.words.clone(),
+        words: display_words(c),
+        source: c.source,
+        base_ms: c.start_ms,
     }]
+}
+
+/// Most words `display_words` looks ahead in the chunk's text for the one a
+/// timed word matches. Enough to step over a token the provider split or
+/// merged differently from its transcript; small enough that a common word
+/// can't latch onto a later sentence.
+const DISPLAY_WORD_LOOKAHEAD: usize = 4;
+
+/// A word folded to what two spellings of it share: alphanumerics,
+/// lowercased. `"Hello,"` and `"hello"` fold alike.
+pub(super) fn fold_word(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// The chunk's timed words, each spelled the way the chunk's own transcript
+/// spells it where the two agree.
+///
+/// Several providers return word timings without the transcript's
+/// punctuation or casing: Deepgram's `word`, and the `verbose_json` words of
+/// whisper-1 and Groq. The reader shows word texts, and the sentence rules in
+/// `realign_sentence_boundaries` and `absorb_text_continuation_chains` read
+/// terminators and capitals, so a bare `hello` where the transcript says
+/// `Hello.` loses both. Local Whisper's words already carry their
+/// punctuation, which makes this a no-op there. A word that matches no
+/// nearby transcript token keeps its own text, so nothing is ever dropped or
+/// invented.
+fn display_words(c: &ChunkRecord) -> Vec<ChunkWord> {
+    let tokens: Vec<&str> = c.text.split_whitespace().collect();
+    let mut next = 0usize;
+    c.words
+        .iter()
+        .map(|w| {
+            let folded = fold_word(&w.text);
+            if folded.is_empty() {
+                return w.clone();
+            }
+            let end = (next + DISPLAY_WORD_LOOKAHEAD).min(tokens.len());
+            match (next..end).find(|&k| fold_word(tokens[k]) == folded) {
+                Some(k) => {
+                    next = k + 1;
+                    ChunkWord { text: tokens[k].to_string(), ..w.clone() }
+                }
+                None => w.clone(),
+            }
+        })
+        .collect()
 }
 
 /// Split a chunk into per-speaker pieces by walking its word timings
@@ -82,7 +142,7 @@ pub(super) fn split_by_labels(
         return single_piece(c, label_for_time(c.start_ms));
     }
     let mut pieces: Vec<LabelledPiece> = Vec::new();
-    for word in &c.words {
+    for word in display_words(c) {
         let mid = word.start_ms.saturating_add(word.end_ms.saturating_sub(word.start_ms) / 2);
         let abs = c.start_ms.saturating_add(mid);
         let label = label_for_time(abs);
@@ -90,13 +150,15 @@ pub(super) fn split_by_labels(
             Some(last) if last.label == label => {
                 last.text.push(' ');
                 last.text.push_str(&word.text);
-                last.words.push(word.clone());
+                last.words.push(word);
             }
             _ => {
                 pieces.push(LabelledPiece {
                     label,
                     text: word.text.clone(),
-                    words: vec![word.clone()],
+                    words: vec![word],
+                    source: c.source,
+                    base_ms: c.start_ms,
                 });
             }
         }
@@ -326,13 +388,16 @@ pub(super) fn bridge_short_interjections(pieces: &mut [LabelledPiece]) {
 /// chain we've observed in dogfooded recordings.
 const CONTINUATION_CHAIN_MAX_LEN: usize = 6;
 
-/// Whether `text`'s last meaningful character is a sentence terminator
-/// (`.!?:;`). Trailing ellipsis ("..." or Unicode "…") is stripped first
-/// because Whisper uses them to mark trailing-off mid-utterance, not
-/// sentence end — a distinction `ends_sentence` deliberately ignores
-/// since its callers (the text-level merge passes) want to be
-/// conservative about fusing across any pause cue.
-fn piece_ends_terminator(text: &str) -> bool {
+/// Whether `text`'s last meaningful character ends the piece's thought: a
+/// sentence terminator (`.!?:;`) or a dash (`—`, `–`, a final `-`), which
+/// marks a speaker breaking off or being interrupted. Fusing across a dash
+/// joins two distinct turns into nonsense. Trailing ellipsis ("..." or
+/// Unicode "…") is stripped first because Whisper uses them to mark
+/// trailing-off mid-utterance, not sentence end — a distinction
+/// `ends_sentence` deliberately ignores since its caller (the backward
+/// boundary move) wants to be conservative about joining across any pause
+/// cue.
+pub(super) fn piece_ends_terminator(text: &str) -> bool {
     let mut trimmed = text.trim_end();
     loop {
         let prev_len = trimmed.len();
@@ -349,6 +414,7 @@ fn piece_ends_terminator(text: &str) -> bool {
     matches!(
         core.chars().last(),
         Some('.') | Some('!') | Some('?') | Some(':') | Some(';')
+            | Some('—') | Some('–') | Some('-')
     )
 }
 
@@ -424,24 +490,32 @@ pub(super) fn absorb_text_continuation_chains(pieces: &mut [LabelledPiece]) {
             } else {
                 None
             };
-            let mut word_count_by_label: std::collections::HashMap<String, usize> =
-                std::collections::HashMap::new();
+            // Word count per label, in the order the labels first appear in
+            // the chain, so a tie goes to the label that spoke first on every
+            // run.
+            let mut word_count_by_label: Vec<(String, usize)> = Vec::new();
             for piece in &pieces[i..=end] {
                 if let Some(label) = &piece.label {
                     let wc = piece.text.split_whitespace().count();
-                    *word_count_by_label.entry(label.clone()).or_insert(0) += wc;
+                    match word_count_by_label.iter_mut().find(|(l, _)| l == label) {
+                        Some((_, count)) => *count += wc,
+                        None => word_count_by_label.push((label.clone(), wc)),
+                    }
                 }
             }
             if word_count_by_label.len() >= 2 {
                 let chosen = pre_label
                     .as_ref()
                     .filter(|l| post_label.as_ref() == Some(l))
-                    .filter(|l| word_count_by_label.contains_key(l.as_str()))
+                    .filter(|l| word_count_by_label.iter().any(|(k, _)| k == *l))
                     .cloned()
                     .or_else(|| {
                         word_count_by_label
                             .iter()
-                            .max_by_key(|(_, &c)| c)
+                            .fold(None::<&(String, usize)>, |best, cur| match best {
+                                Some(b) if b.1 >= cur.1 => Some(b),
+                                _ => Some(cur),
+                            })
                             .map(|(k, _)| k.clone())
                     });
                 if let Some(winner) = chosen {
@@ -457,33 +531,13 @@ pub(super) fn absorb_text_continuation_chains(pieces: &mut [LabelledPiece]) {
     }
 }
 
-/// Rebuild the transcript by walking chunks in chronological order and
-/// emitting each one prefixed with its assigned label. Same-label runs
-/// get a single space between chunks (continuation); label changes get
-/// a newline + new prefix. Chunks the labeller declines to label
-/// (returns `None`) get joined to whatever came before them with a
-/// space, no prefix change — typically only happens when diarize
-/// produces zero segments and we're degrading gracefully.
-///
-/// Chronological ordering uses `(start_ms, source)`. Mic and system
-/// chunks each carry start_ms relative to their own stream's first
-/// frame — close to but not exactly the same as global wall time
-/// (the streams start within a few hundred ms of each other). The
-/// tie-break preferring `Mic` reflects the typical UX assumption that
-/// the user speaks first; in practice the imprecision is well below
-/// the threshold a reader would notice.
-///
-/// Cross-stream echo dedup runs first via `dedup_mic_against_sys` —
-/// see that function for details. Short cross-speaker interjections
-/// are absorbed into the surrounding speaker via
-/// `bridge_short_interjections` before emit.
-/// Pure pipeline up to (but not including) `bridge_short_interjections`.
-/// Extracted so the diagnostic dump can capture the same pre-bridge piece
-/// sequence the transcript emitter walks, without duplicating the
-/// dedup/sort/split logic.
-pub(super) fn build_pieces_unbridged(
+/// The pieces before `refine_pieces`: echo dedup, a sort by
+/// `(start_ms, source)` with mic first on a tie, and the per-chunk split.
+/// Each stream's `start_ms` counts from its own first frame, a few hundred ms
+/// apart, which a reader doesn't notice.
+pub(super) fn build_unrefined_pieces(
     chunks: &[ChunkRecord],
-    split_chunk: &(dyn Fn(&ChunkRecord) -> Vec<LabelledPiece> + Send),
+    split_chunk: &dyn Fn(&ChunkRecord) -> Vec<LabelledPiece>,
 ) -> Vec<LabelledPiece> {
     let kept = dedup_mic_against_sys(chunks);
     let mut sorted: Vec<&ChunkRecord> = kept.iter().collect();
@@ -497,23 +551,49 @@ pub(super) fn build_pieces_unbridged(
 
     let mut all_pieces: Vec<LabelledPiece> = Vec::new();
     for chunk in sorted {
-        for piece in split_chunk(chunk) {
+        for mut piece in split_chunk(chunk) {
             if piece.text.trim().is_empty() {
                 continue;
             }
+            // Word timings are relative to this chunk's own start, whatever
+            // copy of it the splitter looked labels up against.
+            piece.base_ms = chunk.start_ms;
+            piece.source = chunk.source;
             all_pieces.push(piece);
         }
     }
     all_pieces
 }
 
+/// Every correction the labelled pieces get after the diarizer's split, in
+/// order. The one sequence `build_labelled_transcript`, `serialize_timeline`
+/// and the diagnostic dump all run, so the transcript string and the timeline
+/// can't disagree about who said what. Boundary moves run before continuation
+/// chains: both fire on an open piece before a lowercase one, and moving the
+/// stray fragment first closes the sentence, so the chain rule doesn't hand a
+/// whole turn to the other speaker for two words.
+pub(super) fn refine_pieces(pieces: &mut [LabelledPiece]) {
+    bridge_short_interjections(pieces);
+    realign_sentence_boundaries(pieces);
+    absorb_text_continuation_chains(pieces);
+}
+
+/// Rebuild the transcript by walking chunks in chronological order and
+/// emitting each one prefixed with its assigned label. Same-label runs
+/// get a single space between chunks (continuation); label changes get
+/// a newline + new prefix. Chunks the labeller declines to label
+/// (returns `None`) get joined to whatever came before them with a
+/// space, no prefix change — typically only happens when diarize
+/// produces zero segments and we're degrading gracefully.
+///
+/// Cross-stream echo dedup runs first via `dedup_mic_against_sys` —
+/// see that function for details — then `refine_pieces`.
 pub(super) fn build_labelled_transcript(
     chunks: &[ChunkRecord],
     split_chunk: &(dyn Fn(&ChunkRecord) -> Vec<LabelledPiece> + Send),
 ) -> String {
-    let mut all_pieces = build_pieces_unbridged(chunks, split_chunk);
-    bridge_short_interjections(&mut all_pieces);
-    absorb_text_continuation_chains(&mut all_pieces);
+    let mut all_pieces = build_unrefined_pieces(chunks, split_chunk);
+    refine_pieces(&mut all_pieces);
 
     let mut output = String::new();
     let mut last_label: Option<String> = None;
@@ -543,34 +623,19 @@ pub(super) fn build_labelled_transcript(
         }
         output.push_str(trimmed);
     }
-    merge_run_on_sentences(&output)
+    output
 }
 
-/// Strip a leading `<label>: ` from a transcript line, returning the
-/// remainder. Mirrors the format `build_labelled_transcript` emits, so
-/// the merge pass can drop the absorbed line's prefix when joining.
-fn strip_label_prefix(line: &str) -> &str {
-    let trimmed = line.trim_start();
-    if let Some(colon) = trimmed.find(':') {
-        let label = &trimmed[..colon];
-        if !label.is_empty() && label.len() <= 40 && !label.contains('\n') {
-            let rest = &trimmed[colon + 1..];
-            return rest.trim_start();
-        }
-    }
-    line
-}
-
-/// Whether `line` ends with a sentence-terminating punctuation mark,
+/// Whether `text` ends with a sentence-terminating punctuation mark,
 /// allowing trailing close-quote/close-paren after the terminator
 /// (`he said.` / `(yes!)` / `"done."`). Trailing whitespace is ignored.
 ///
 /// Em-dash (`—`), en-dash (`–`), and a final ASCII hyphen are also
 /// treated as terminators. They mark a speaker trailing off mid-thought
-/// or being interrupted — fusing across them would join two distinct
+/// or being interrupted — joining across them would fuse two distinct
 /// turns into nonsense.
-fn ends_sentence(line: &str) -> bool {
-    let trimmed = line.trim_end();
+fn ends_sentence(text: &str) -> bool {
+    let trimmed = text.trim_end();
     let cleaned: String = trimmed
         .chars()
         .rev()
@@ -591,20 +656,6 @@ fn ends_sentence(line: &str) -> bool {
     )
 }
 
-/// Whether `line` (after any `<label>: ` prefix) begins with a
-/// lowercase letter — the textual cue that this line is the
-/// continuation of the previous line's clause rather than a fresh
-/// sentence. Lines that start with a digit, opening quote, or
-/// punctuation (parenthetical, em-dash) don't qualify; we want a
-/// strong signal.
-fn starts_lowercase(line: &str) -> bool {
-    let body = strip_label_prefix(line);
-    body.chars()
-        .next()
-        .map(|c| c.is_lowercase())
-        .unwrap_or(false)
-}
-
 /// Maximum word count for a "boundary fragment" that the diarizer
 /// likely mis-attributed across the speaker line. 1–3 words covers the
 /// real-world failure mode (Whisper emitted "...way. It" and the next
@@ -613,308 +664,241 @@ fn starts_lowercase(line: &str) -> bool {
 /// speakers.
 const BOUNDARY_FRAGMENT_MAX_WORDS: usize = 3;
 
-/// Split a transcript line into `(label_with_separator, body)`. The
-/// label part includes the leading whitespace, the label text, the
-/// `:`, and the space after it — so concatenating the two halves
-/// reproduces the original line exactly. Returns `("", line)` when
-/// there's no recognisable label prefix (defensive — production
-/// transcripts always have one, but the merge passes also run on
-/// hand-edited text).
-fn split_label_prefix(line: &str) -> (&str, &str) {
-    let trimmed = line.trim_start();
-    let leading_ws_len = line.len() - trimmed.len();
-    if let Some(colon) = trimmed.find(':') {
-        let label = &trimmed[..colon];
-        if !label.is_empty() && label.len() <= 40 && !label.contains('\n') {
-            let after_colon = &trimmed[colon + 1..];
-            let body_offset = colon + 1 + (after_colon.len() - after_colon.trim_start().len());
-            let total_offset = leading_ws_len + body_offset;
-            return (&line[..total_offset], &line[total_offset..]);
-        }
-    }
-    ("", line)
+/// Longest silence a moved fragment may sit from the words it joins. A
+/// sentence the diarizer cut in two runs on without a pause; a fragment
+/// two seconds away from the other side is more likely its own speaker's
+/// words. Only checked when both pieces carry word timings.
+const BOUNDARY_MOVE_MAX_GAP_MS: u64 = 2_000;
+
+/// Whether `word` contains a sentence terminator anywhere (`.!?…`). Colons,
+/// semicolons and dashes don't count: they are more often mid-clause than a
+/// clean sentence boundary to split on.
+fn word_has_terminator(word: &str) -> bool {
+    word.chars().any(|c| matches!(c, '.' | '!' | '?' | '…'))
 }
 
-/// Byte offset of the *last* sentence-terminator (`.!?…`) in `s`, or
-/// `None` if there isn't one. Used to find the boundary between the
-/// last finished sentence on a line and any trailing fragment.
-/// Excludes `:;` (more often mid-clause than sentence-final) and
-/// dash variants (those signal trailing-off, not a clean sentence
-/// boundary we want to split on).
-fn last_terminator_index(s: &str) -> Option<usize> {
-    s.char_indices()
-        .filter(|(_, c)| matches!(c, '.' | '!' | '?' | '…'))
-        .map(|(i, _)| i)
-        .next_back()
+/// Whether `word` closes a sentence: its last character, after any closing
+/// quote or bracket, is `.!?…`. Unlike `word_has_terminator` a decimal
+/// (`3.5`) or an abbreviation's inner dot doesn't count.
+pub(super) fn word_ends_sentence(word: &str) -> bool {
+    let core = word.trim_end_matches(['"', '\'', ')', ']', '»', '”', '’']);
+    matches!(core.chars().last(), Some('.' | '!' | '?' | '…'))
 }
 
-/// Byte offset of the *first* sentence-terminator (`.!?…`) in `s`,
-/// or `None` if there isn't one.
-fn first_terminator_index(s: &str) -> Option<usize> {
-    s.char_indices()
-        .find(|(_, c)| matches!(c, '.' | '!' | '?' | '…'))
-        .map(|(i, _)| i)
+fn starts_lowercase(word: &str) -> bool {
+    word.chars().next().is_some_and(char::is_lowercase)
 }
 
-/// Length in bytes of the character starting at byte index `i` in `s`.
-/// Used to step *past* a terminator character we located via
-/// `last_terminator_index` / `first_terminator_index`.
-fn char_len_at(s: &str, i: usize) -> usize {
-    s[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(0)
+fn starts_uppercase(word: &str) -> bool {
+    word.chars().next().is_some_and(char::is_uppercase)
 }
 
-/// Detect "the diarizer attributed the *next* speaker's first 1–3
-/// words to the *previous* speaker's turn" — a common Whisper-Word
-/// alignment artefact when a sentence terminator lands mid-chunk and
-/// the next sentence's opening words spill into the same chunk before
-/// the speaker change actually occurs.
-///
-/// Pattern (after stripping speaker labels):
-/// - `prev` body ends with `<sentence>. <1–3 capitalised words>`
-///   where the trailing words contain *no* terminator of their own
-///   (they're the start of a new sentence, not its end).
-/// - `next` body starts with a *lowercase* letter (the continuation
-///   that confirms those trailing words begin the same sentence).
-///
-/// Fix: trim the trailing words from `prev`, prepend them to `next`'s
-/// body. Speaker labels are preserved on both lines.
-fn forward_move_trailing(prev: &str, next: &str) -> Option<(String, String)> {
-    let (prev_label, prev_body) = split_label_prefix(prev);
-    let (next_label, next_body) = split_label_prefix(next);
-
-    // Bail on empty / label-only lines.
-    if prev_body.trim().is_empty() || next_body.trim().is_empty() {
+/// A piece's text as whitespace tokens, when they can move in step with its
+/// words: either the piece has no word timings at all, or exactly one token
+/// per timed word. `None` when the two disagree (a provider's words that
+/// don't line up with its transcript), and such a piece is left alone.
+fn piece_tokens(piece: &LabelledPiece) -> Option<Vec<String>> {
+    let tokens: Vec<String> = piece.text.split_whitespace().map(str::to_string).collect();
+    if tokens.is_empty() {
         return None;
     }
-
-    // The trailing fragment lives after the LAST `.!?…` in prev.
-    let term_idx = last_terminator_index(prev_body)?;
-    let after_term_byte = term_idx + char_len_at(prev_body, term_idx);
-    let trailing = prev_body.get(after_term_byte..)?.trim();
-    if trailing.is_empty() {
-        return None;
+    if piece.words.is_empty() || piece.words.len() == tokens.len() {
+        Some(tokens)
+    } else {
+        None
     }
+}
 
-    let trailing_words: Vec<&str> = trailing.split_whitespace().collect();
-    if trailing_words.is_empty() || trailing_words.len() > BOUNDARY_FRAGMENT_MAX_WORDS {
-        return None;
+/// Stream-absolute start of a piece's first word / end of its last.
+fn first_word_start_abs(piece: &LabelledPiece) -> Option<u64> {
+    piece.words.first().map(|w| piece.base_ms.saturating_add(w.start_ms))
+}
+
+fn last_word_end_abs(piece: &LabelledPiece) -> Option<u64> {
+    piece.words.last().map(|w| piece.base_ms.saturating_add(w.end_ms))
+}
+
+/// Whether two pieces' words, if they have timings, sit close enough for a
+/// fragment to move between them (`BOUNDARY_MOVE_MAX_GAP_MS`). Untimed pieces
+/// pass: there is nothing to measure, and the text cues alone decided before
+/// timings existed.
+fn within_move_gap(prev: &LabelledPiece, next: &LabelledPiece) -> bool {
+    match (last_word_end_abs(prev), first_word_start_abs(next)) {
+        (Some(end), Some(start)) => start.saturating_sub(end) <= BOUNDARY_MOVE_MAX_GAP_MS,
+        _ => true,
     }
+}
 
-    // First trailing word must be a sentence start (capitalised). If
-    // it's lowercase, this isn't a "next-speaker's-sentence-start"
-    // pattern — the full merge below will catch it instead.
-    let first_word = *trailing_words.first()?;
-    let first_char = first_word.chars().next()?;
-    if !first_char.is_uppercase() {
-        return None;
+/// Re-express a piece's word timings against an earlier base, so words
+/// from an earlier chunk can join it without a negative offset.
+fn lower_base(piece: &mut LabelledPiece, new_base: u64) {
+    if new_base >= piece.base_ms {
+        return;
     }
+    let shift = piece.base_ms - new_base;
+    for w in &mut piece.words {
+        w.start_ms += shift;
+        w.end_ms += shift;
+    }
+    piece.base_ms = new_base;
+}
 
-    // None of the trailing words may already contain a terminator —
-    // that would mean the trailing fragment is itself a complete
-    // sentence, which probably belongs to prev as the speaker's last
-    // word, not to next.
-    if trailing_words
+/// `words` moved from a piece based at `from_base` to one based at
+/// `to_base` (which `lower_base` has already made `<= from_base`).
+fn rebased(words: Vec<ChunkWord>, from_base: u64, to_base: u64) -> Vec<ChunkWord> {
+    let shift = from_base - to_base;
+    words
+        .into_iter()
+        .map(|w| ChunkWord { start_ms: w.start_ms + shift, end_ms: w.end_ms + shift, ..w })
+        .collect()
+}
+
+/// Move `prev`'s last `n` tokens (and their timed words) to the front of
+/// `next`.
+fn move_tail_forward(
+    prev: &mut LabelledPiece,
+    next: &mut LabelledPiece,
+    prev_tokens: &[String],
+    next_tokens: &[String],
+    n: usize,
+) {
+    let keep = prev_tokens.len() - n;
+    prev.text = prev_tokens[..keep].join(" ");
+    next.text = prev_tokens[keep..]
         .iter()
-        .any(|w| w.chars().any(|c| matches!(c, '.' | '!' | '?' | '…')))
-    {
-        return None;
+        .chain(next_tokens.iter())
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if !prev.words.is_empty() {
+        let moved = prev.words.split_off(keep);
+        lower_base(next, prev.base_ms);
+        let mut words = rebased(moved, prev.base_ms, next.base_ms);
+        words.append(&mut next.words);
+        next.words = words;
     }
-
-    // next must start lowercase — confirms the trailing fragment is
-    // the start of a sentence the next speaker continues.
-    if !starts_lowercase(next) {
-        return None;
-    }
-
-    // Build new prev: keep through the terminator, drop the trailing
-    // fragment.
-    let kept = prev_body
-        .get(..after_term_byte)?
-        .trim_end()
-        .to_string();
-    let new_prev = format!("{prev_label}{kept}");
-
-    // Build new next: prepend trailing fragment to existing body.
-    let trailing_joined = trailing_words.join(" ");
-    let new_next = format!("{next_label}{trailing_joined} {next_body}");
-
-    Some((new_prev, new_next))
 }
 
-/// Detect "the diarizer attributed the *previous* speaker's last 1–3
-/// words to the *next* speaker's turn" — the inverse of
-/// `forward_move_trailing`.
-///
-/// Pattern (after stripping speaker labels):
-/// - `prev` body ends *without* a sentence terminator (the speaker
-///   was mid-clause when the chunk boundary fell).
-/// - `next` body starts with `<1–3 words><terminator> <more
-///   content>` — i.e. a short fragment that closes a sentence,
-///   followed by genuinely new content that's clearly the next
-///   speaker's turn.
-///
-/// Fix: detach the leading fragment (up to and including the first
-/// terminator) from `next`, append it to `prev`. Speaker labels are
-/// preserved on both lines.
-fn backward_move_leading(prev: &str, next: &str) -> Option<(String, String)> {
-    let (prev_label, prev_body) = split_label_prefix(prev);
-    let (next_label, next_body) = split_label_prefix(next);
-
-    if prev_body.trim().is_empty() || next_body.trim().is_empty() {
-        return None;
+/// Move `next`'s first `n` tokens (and their timed words) to the end of
+/// `prev`.
+fn move_head_backward(
+    prev: &mut LabelledPiece,
+    next: &mut LabelledPiece,
+    prev_tokens: &[String],
+    next_tokens: &[String],
+    n: usize,
+) {
+    prev.text = prev_tokens
+        .iter()
+        .chain(next_tokens[..n].iter())
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(" ");
+    next.text = next_tokens[n..].join(" ");
+    if !next.words.is_empty() {
+        let rest = next.words.split_off(n);
+        let moved = std::mem::replace(&mut next.words, rest);
+        lower_base(prev, next.base_ms);
+        let mut words = rebased(moved, next.base_ms, prev.base_ms);
+        prev.words.append(&mut words);
     }
-
-    // prev must be open (no terminator at end).
-    if ends_sentence(prev) {
-        return None;
-    }
-
-    // next's body must contain a terminator within the first 1–3
-    // words.
-    let term_idx = first_terminator_index(next_body)?;
-    let term_end = term_idx + char_len_at(next_body, term_idx);
-    let leading = next_body.get(..term_end)?.trim();
-    let trailing = next_body.get(term_end..)?.trim_start();
-
-    let leading_words: Vec<&str> = leading.split_whitespace().collect();
-    if leading_words.is_empty() || leading_words.len() > BOUNDARY_FRAGMENT_MAX_WORDS {
-        return None;
-    }
-
-    // There must be content after the terminator — otherwise we'd be
-    // stripping `next` entirely, which is what `merge_run_on_sentences`
-    // already does (and gets the speaker attribution wrong, which is
-    // why this targeted move exists).
-    if trailing.is_empty() {
-        return None;
-    }
-
-    // Build new prev: append leading fragment to existing body.
-    let new_prev = format!("{prev_label}{} {leading}", prev_body.trim_end());
-
-    // Build new next: just the trailing portion, with its label.
-    let new_next = format!("{next_label}{trailing}");
-
-    Some((new_prev, new_next))
 }
 
-/// Detect a stutter / immediate-repetition signal at a line boundary.
-///
-/// When `prev` body has format `<earlier text>... <X> <terminator>
-/// <Y>` and `next` body has format `<Z> <terminator> <rest>`, the
-/// phrase `Y Z` may form a unit. If that exact phrase already appears
-/// in `prev` *before* the trailing `Y`, the speaker stuttered or
-/// repeated themselves — `Y Z` is the second occurrence, all on the
-/// same speaker's line. That's the cue to prefer backward-move (pull
-/// `Z` back to prev) over forward-move (push `Y` forward to next).
-///
-/// Without this signal, the AMC-style case ("AMC was a young company.
-/// Brand new. Brand" + "new. Hadn't done anything...") and the "It
-/// does pay off" case look identical to the structural rules — both
-/// have a 1-word trailing in prev and a 1-word leading in next. Only
-/// the repetition check separates them.
-fn has_repetition_signal(prev: &str, next: &str) -> bool {
-    let (_, prev_body) = split_label_prefix(prev);
-    let (_, next_body) = split_label_prefix(next);
-
-    let prev_term = match last_terminator_index(prev_body) {
-        Some(i) => i,
-        None => return false,
-    };
-    let after_prev_term = prev_term + char_len_at(prev_body, prev_term);
-    let trailing = match prev_body.get(after_prev_term..) {
-        Some(t) => t.trim(),
-        None => return false,
-    };
-    if trailing.is_empty() {
-        return false;
+/// Size of the fragment a forward move would hand from `prev` to `next`:
+/// `prev` ends `<sentence>. <1–3 words>` whose first word is capitalised and
+/// none of which closes a sentence, and `next` opens lowercase. Those
+/// trailing words are the next speaker's sentence start.
+fn forward_fragment(prev_tokens: &[String], next_tokens: &[String]) -> Option<usize> {
+    let last_end = prev_tokens.iter().rposition(|t| word_ends_sentence(t))?;
+    let trailing = &prev_tokens[last_end + 1..];
+    if trailing.is_empty() || trailing.len() > BOUNDARY_FRAGMENT_MAX_WORDS {
+        return None;
     }
-
-    let next_term = match first_terminator_index(next_body) {
-        Some(i) => i,
-        None => return false,
-    };
-    let leading = match next_body.get(..next_term) {
-        Some(l) => l.trim(),
-        None => return false,
-    };
-    if leading.is_empty() {
-        return false;
+    if !starts_uppercase(&trailing[0]) || trailing.iter().any(|t| word_has_terminator(t)) {
+        return None;
     }
-
-    let search_zone = match prev_body.get(..after_prev_term) {
-        Some(z) => z.to_lowercase(),
-        None => return false,
-    };
-    let combined = format!("{trailing} {leading}").to_lowercase();
-    search_zone.contains(&combined)
+    if !starts_lowercase(next_tokens.first()?) {
+        return None;
+    }
+    Some(trailing.len())
 }
 
-/// Heuristic chunk-boundary cleanup. Three operations applied at
-/// every adjacent line pair, with the choice between forward and
-/// backward moves disambiguated by a repetition-signal tiebreaker:
-///
-/// 1. **Forward-move** (`forward_move_trailing`): the next speaker's
-///    sentence-opening words got attributed to the previous speaker.
-///    Trim them off prev, prepend to next.
-/// 2. **Backward-move** (`backward_move_leading`): the previous
-///    speaker's sentence-closing words got attributed to the next
-///    speaker. Trim them off next, append to prev.
-/// 3. **Full merge**: prev ends without a terminator AND next starts
-///    lowercase, but neither (1) nor (2) applied. Fuse next's body
-///    into prev (its label is dropped). Common pattern: Whisper
-///    chopped a single sentence across chunks and the diarizer
-///    flipped speaker on the second half.
-///
-/// When forward and backward both qualify, the choice is made by
-/// `has_repetition_signal`: if the trailing-of-prev + leading-of-next
-/// phrase already appears earlier in prev, the speaker repeated
-/// themselves and the words belong on prev (backward); otherwise the
-/// trailing was misattributed and the words belong on next (forward).
-///
-/// All three preserve the textual signal as the safety check —
-/// Whisper at a real speaker boundary almost always emits a
-/// terminator AND capitalises the next sentence's first word, so
-/// when neither holds the boundary is almost certainly a chunk
-/// artefact rather than a real turn change.
-///
-/// Runs after `bridge_short_interjections` (which handles same-line
-/// short interjections inside a single chunk), catching what the
-/// structural sandwich rule can't.
-fn merge_run_on_sentences(text: &str) -> String {
-    let lines: Vec<&str> = text.split('\n').collect();
-    let mut merged: Vec<String> = Vec::with_capacity(lines.len());
-    for line in lines {
-        if let Some(prev) = merged.last_mut() {
-            let forward = forward_move_trailing(prev, line);
-            let backward = backward_move_leading(prev, line);
-            let chosen = match (forward, backward) {
-                (Some(f), Some(b)) => {
-                    if has_repetition_signal(prev, line) {
-                        Some(b)
-                    } else {
-                        Some(f)
-                    }
-                }
-                (Some(f), None) => Some(f),
-                (None, Some(b)) => Some(b),
-                (None, None) => None,
-            };
-            if let Some((new_prev, new_next)) = chosen {
-                *prev = new_prev;
-                merged.push(new_next);
-                continue;
-            }
-            if !ends_sentence(prev) && starts_lowercase(line) {
-                let stripped = strip_label_prefix(line);
-                prev.push(' ');
-                prev.push_str(stripped);
-                continue;
-            }
+/// Size of the fragment a backward move would hand from `next` to `prev`:
+/// `prev` is open (no terminator or dash at its end), and `next` opens
+/// lowercase with `<1–3 words>.` followed by more of its own. Those leading
+/// words close the previous speaker's sentence.
+fn backward_fragment(prev: &LabelledPiece, next_tokens: &[String]) -> Option<usize> {
+    if ends_sentence(&prev.text) || !starts_lowercase(next_tokens.first()?) {
+        return None;
+    }
+    let first_end = next_tokens.iter().position(|t| word_ends_sentence(t))?;
+    let n = first_end + 1;
+    if n > BOUNDARY_FRAGMENT_MAX_WORDS || n >= next_tokens.len() {
+        return None;
+    }
+    Some(n)
+}
+
+/// When both moves fit, whether the speaker was repeating themselves: the
+/// phrase `prev`'s trailing words + `next`'s leading words already occurs in
+/// `prev` before the trailing words ("Brand new. Brand" + "new. Hadn't…").
+/// Then the leading words are the repeat's end and belong on `prev`.
+fn repeats_across(
+    prev_tokens: &[String],
+    next_tokens: &[String],
+    tail: usize,
+    head: usize,
+) -> bool {
+    let fold = |t: &String| fold_word(t);
+    let phrase: Vec<String> = prev_tokens[prev_tokens.len() - tail..]
+        .iter()
+        .chain(next_tokens[..head].iter())
+        .map(fold)
+        .collect();
+    let earlier: Vec<String> = prev_tokens[..prev_tokens.len() - tail].iter().map(fold).collect();
+    !phrase.is_empty() && earlier.windows(phrase.len()).any(|w| w == phrase.as_slice())
+}
+
+/// Hand a sentence's stray first or last words across a speaker change to the
+/// side they belong to ("…the perfect way. It" / "does pay off."), with their
+/// timings: neighbouring pieces of one stream, both timed or both untimed, at
+/// most `BOUNDARY_FRAGMENT_MAX_WORDS` words within `BOUNDARY_MOVE_MAX_GAP_MS`.
+/// Letter case licenses the move, so scripts without case never match. When
+/// both directions fit, the smaller move wins; a repetition (`repeats_across`)
+/// picks backward, an even split forward.
+pub(super) fn realign_sentence_boundaries(pieces: &mut [LabelledPiece]) {
+    for i in 0..pieces.len().saturating_sub(1) {
+        let (left, right) = pieces.split_at_mut(i + 1);
+        let prev = &mut left[i];
+        let next = &mut right[0];
+        match (&prev.label, &next.label) {
+            (Some(a), Some(b)) if a != b => {}
+            _ => continue,
         }
-        merged.push(line.to_string());
+        if prev.source != next.source || prev.words.is_empty() != next.words.is_empty() {
+            continue;
+        }
+        let (Some(prev_tokens), Some(next_tokens)) = (piece_tokens(prev), piece_tokens(next)) else {
+            continue;
+        };
+        if !within_move_gap(prev, next) {
+            continue;
+        }
+        let forward = forward_fragment(&prev_tokens, &next_tokens);
+        let backward = backward_fragment(prev, &next_tokens);
+        match (forward, backward) {
+            (Some(tail), Some(head)) => {
+                if head < tail || repeats_across(&prev_tokens, &next_tokens, tail, head) {
+                    move_head_backward(prev, next, &prev_tokens, &next_tokens, head);
+                } else {
+                    move_tail_forward(prev, next, &prev_tokens, &next_tokens, tail);
+                }
+            }
+            (Some(tail), None) => move_tail_forward(prev, next, &prev_tokens, &next_tokens, tail),
+            (None, Some(head)) => move_head_backward(prev, next, &prev_tokens, &next_tokens, head),
+            (None, None) => {}
+        }
     }
-    merged.join("\n")
 }
 
 #[cfg(test)]
@@ -993,188 +977,6 @@ mod tests {
         assert!(!ends_sentence(""));
     }
 
-    #[test]
-    fn merge_glues_open_clause_to_lowercase_continuation() {
-        let input = "Speaker 1: I was thinking that\nSpeaker 1: we should pivot.";
-        assert_eq!(
-            merge_run_on_sentences(input),
-            "Speaker 1: I was thinking that we should pivot."
-        );
-    }
-
-    #[test]
-    fn merge_drops_label_prefix_from_absorbed_line() {
-        // Even when the absorbed line is a different speaker, the
-        // first speaker keeps the floor — Whisper's mid-utterance
-        // chunk break or a borderline diarizer flip is what produced
-        // this artefact, not a real speaker change.
-        let input = "Speaker 1: anyway the point is\nSpeaker 2: that we are out of time.";
-        assert_eq!(
-            merge_run_on_sentences(input),
-            "Speaker 1: anyway the point is that we are out of time."
-        );
-    }
-
-    #[test]
-    fn forward_move_relocates_long_fragment_trailing_word_to_next() {
-        // Real-recording case: a 14-word line ends with "Not" (no
-        // terminator) and the next 11-word line starts with "quite"
-        // (lowercase). Whisper cut a chunk between "things." and "Not
-        // quite 10". Forward-move detaches the trailing "Not" and
-        // hands it to next as the start of next's sentence —
-        // attribution is preserved on both sides instead of fusing
-        // them into one mis-labelled line.
-        let input = "Speaker 1: Like you were working probably for 10 years in a lot of different things. Not\nSpeaker 1: quite 10, but a solid six or seven years as a working actor.";
-        let output = merge_run_on_sentences(input);
-        assert_eq!(
-            output,
-            "Speaker 1: Like you were working probably for 10 years in a lot of different things.\nSpeaker 1: Not quite 10, but a solid six or seven years as a working actor."
-        );
-    }
-
-    #[test]
-    fn forward_move_relocates_trailing_sentence_start_to_next_speaker() {
-        // Real-recording case from a tester transcript: the next
-        // speaker's first word ("It") landed on the previous turn
-        // because Whisper's chunk boundary fell mid-sentence. The
-        // continuation ("does pay off") is lowercase, confirming
-        // "It" starts a sentence the next speaker delivers.
-        let input = "Speaker 1: starts to unravel in the perfect way. It\nSpeaker 2: does pay off. That's what's really nice.";
-        let output = merge_run_on_sentences(input);
-        assert_eq!(
-            output,
-            "Speaker 1: starts to unravel in the perfect way.\nSpeaker 2: It does pay off. That's what's really nice."
-        );
-    }
-
-    #[test]
-    fn forward_move_handles_multi_word_trailing_fragment() {
-        // 1–3 trailing capitalised words still qualify; the first must
-        // be a sentence start.
-        let input = "Speaker 1: that closes the door. So we\nSpeaker 2: can move on now.";
-        let output = merge_run_on_sentences(input);
-        assert_eq!(
-            output,
-            "Speaker 1: that closes the door.\nSpeaker 2: So we can move on now."
-        );
-    }
-
-    #[test]
-    fn forward_move_skips_when_trailing_starts_lowercase() {
-        // The trailing word "that" is lowercase — it's a continuation
-        // of the previous clause, not the start of a new sentence.
-        // Falls through to the full merge instead.
-        let input = "Speaker 1: I think that\nSpeaker 2: we should do it.";
-        let output = merge_run_on_sentences(input);
-        assert_eq!(
-            output,
-            "Speaker 1: I think that we should do it."
-        );
-    }
-
-    #[test]
-    fn backward_move_pulls_leading_sentence_close_to_prev_speaker() {
-        // Real-recording case: "AMC was a young company. Brand new.
-        // Brand" + "new. Hadn't done anything..." — the diarizer cut
-        // mid-utterance and gave "new." to the wrong speaker.
-        let input = "Speaker 1: AMC was a young company. Brand new. Brand\nSpeaker 2: new. Hadn't done anything significant yet.";
-        let output = merge_run_on_sentences(input);
-        assert_eq!(
-            output,
-            "Speaker 1: AMC was a young company. Brand new. Brand new.\nSpeaker 2: Hadn't done anything significant yet."
-        );
-    }
-
-    #[test]
-    fn backward_move_skips_when_leading_has_no_trailing_content() {
-        // If next is *just* the leading fragment (nothing after the
-        // terminator), the backward-move would empty it. Fall through
-        // to the full merge instead, which produces the cleaner
-        // single-line result.
-        let input = "Speaker 1: I think we should\nSpeaker 2: stop.";
-        let output = merge_run_on_sentences(input);
-        // Full merge fires (prev open + next lowercase): joined.
-        assert_eq!(output, "Speaker 1: I think we should stop.");
-    }
-
-    #[test]
-    fn backward_move_skips_when_leading_too_long() {
-        // 4-word leading fragment exceeds BOUNDARY_FRAGMENT_MAX_WORDS.
-        // The boundary stays put — wider moves risk shuffling real
-        // content between speakers.
-        let input = "Speaker 1: I was about to\nSpeaker 2: yes that is correct. Anyway moving on.";
-        let output = merge_run_on_sentences(input);
-        // Full merge fires (prev open + next lowercase "yes"). Acceptable
-        // fallback — at least the sentence is intact even if attribution
-        // collapses to prev.
-        assert!(output.contains("Speaker 1: I was about to yes that is correct"), "got: {output}");
-    }
-
-    #[test]
-    fn merge_keeps_em_dash_interruption_distinct() {
-        // A speaker trailing off / interrupted ends with an em-dash —
-        // the next speaker's lowercase reply must NOT fuse, or two
-        // distinct turns become one nonsensical sentence.
-        let input = "Speaker 1: But what about the —\nSpeaker 2: right but we have no time.";
-        assert_eq!(merge_run_on_sentences(input), input);
-    }
-
-    #[test]
-    fn merge_keeps_en_dash_interruption_distinct() {
-        let input = "Speaker 1: I was going to say –\nSpeaker 2: yeah I know what you mean.";
-        assert_eq!(merge_run_on_sentences(input), input);
-    }
-
-    #[test]
-    fn merge_keeps_lines_that_already_end_in_terminator() {
-        let input = "Speaker 1: hello there.\nSpeaker 2: yes hi.";
-        assert_eq!(merge_run_on_sentences(input), input);
-    }
-
-    #[test]
-    fn merge_keeps_lines_when_next_starts_uppercase() {
-        // No terminator on prev, but next starts with a capital — most
-        // likely a fresh sentence the speaker began. Keep separate.
-        let input = "Speaker 1: I was thinking that\nSpeaker 2: We should pivot.";
-        assert_eq!(merge_run_on_sentences(input), input);
-    }
-
-    #[test]
-    fn merge_handles_norwegian_lowercase_continuation() {
-        // The unicode lowercase check covers non-ASCII letters; common
-        // Humla case for Norwegian recordings.
-        let input = "Speaker 1: vi har snakket om\nSpeaker 1: økonomien lenge.";
-        assert_eq!(
-            merge_run_on_sentences(input),
-            "Speaker 1: vi har snakket om økonomien lenge."
-        );
-    }
-
-    #[test]
-    fn merge_chains_multiple_consecutive_glues() {
-        // Three lines, all open-ended, all start lowercase → collapse
-        // into a single line. The merged line keeps growing under the
-        // word-count guard because we measure prev's length on each
-        // step (it's well past 8 words by line 3 — but next is short).
-        let input = "Speaker 1: so I was thinking\nSpeaker 1: that we should\nSpeaker 1: pivot the strategy.";
-        assert_eq!(
-            merge_run_on_sentences(input),
-            "Speaker 1: so I was thinking that we should pivot the strategy."
-        );
-    }
-
-    #[test]
-    fn merge_passes_through_unlabelled_lines() {
-        // Defensive: lines without `Label:` prefix shouldn't gain one
-        // from the merge pass, and the prefix-stripping helper must
-        // not eat content that isn't actually a label.
-        let input = "first fragment\nsecond piece.";
-        assert_eq!(
-            merge_run_on_sentences(input),
-            "first fragment second piece."
-        );
-    }
-
     /// Build a piece directly without going through chunk splitting,
     /// with synthetic word timings. Each word is given a 200 ms span
     /// at `start_ms + i * 250 ms` so the caller can construct short
@@ -1198,6 +1000,8 @@ mod tests {
             label: label.map(str::to_string),
             text: text.to_string(),
             words: word_vec,
+            source: ChunkSource::Sys,
+            base_ms: 0,
         }
     }
 
@@ -1226,6 +1030,343 @@ mod tests {
             label: label.map(str::to_string),
             text: text.to_string(),
             words: word_vec,
+            source: ChunkSource::Sys,
+            base_ms: 0,
+        }
+    }
+
+    /// A timed piece whose words run 300 ms apart from `start_ms`, which is
+    /// stream-absolute: the piece is based at `base_ms` (its chunk's start)
+    /// and its words are stored relative to that, the way `split_by_labels`
+    /// builds them.
+    fn timed(label: &str, text: &str, base_ms: u64, start_ms: u64) -> LabelledPiece {
+        let words = text
+            .split_whitespace()
+            .enumerate()
+            .map(|(i, w)| crate::recording::ChunkWord {
+                text: w.to_string(),
+                start_ms: start_ms - base_ms + 300 * i as u64,
+                end_ms: start_ms - base_ms + 300 * i as u64 + 250,
+            })
+            .collect();
+        LabelledPiece {
+            label: Some(label.to_string()),
+            text: text.to_string(),
+            words,
+            source: ChunkSource::Sys,
+            base_ms,
+        }
+    }
+
+    /// Stream-absolute (text, start) of a piece's words, for asserting that a
+    /// move kept every word's timing.
+    fn abs_words(p: &LabelledPiece) -> Vec<(String, u64)> {
+        p.words.iter().map(|w| (w.text.clone(), p.base_ms + w.start_ms)).collect()
+    }
+
+    fn labels(pieces: &[LabelledPiece]) -> Vec<Option<String>> {
+        pieces.iter().map(|p| p.label.clone()).collect()
+    }
+
+    fn texts(pieces: &[LabelledPiece]) -> Vec<String> {
+        pieces.iter().map(|p| p.text.clone()).collect()
+    }
+
+    #[test]
+    fn forward_move_hands_sentence_start_to_next_speaker() {
+        // Real-recording case from a tester transcript: the next
+        // speaker's first word ("It") landed on the previous turn
+        // because the diarizer's boundary fell a word late. The
+        // continuation ("does pay off") is lowercase, confirming "It"
+        // starts a sentence the next speaker delivers.
+        let mut pieces = vec![
+            timed("Speaker 1", "starts to unravel in the perfect way. It", 0, 1_000),
+            timed("Speaker 2", "does pay off. That's what's really nice.", 0, 3_200),
+        ];
+        let it_at = abs_words(&pieces[0]).last().unwrap().1;
+        realign_sentence_boundaries(&mut pieces);
+        assert_eq!(
+            texts(&pieces),
+            vec![
+                "starts to unravel in the perfect way.",
+                "It does pay off. That's what's really nice."
+            ]
+        );
+        assert_eq!(labels(&pieces), vec![Some("Speaker 1".into()), Some("Speaker 2".into())]);
+        // The word moved with its timing, so playback still lights it when
+        // it is spoken.
+        assert_eq!(abs_words(&pieces[1])[0], ("It".to_string(), it_at));
+        assert_eq!(pieces[0].words.len(), 7);
+        assert_eq!(pieces[1].words.len(), 8);
+    }
+
+    #[test]
+    fn forward_move_handles_multi_word_fragment() {
+        let mut pieces = vec![
+            timed("Speaker 1", "that closes the door. So we", 0, 0),
+            timed("Speaker 2", "can move on now.", 0, 1_800),
+        ];
+        realign_sentence_boundaries(&mut pieces);
+        assert_eq!(texts(&pieces), vec!["that closes the door.", "So we can move on now."]);
+    }
+
+    #[test]
+    fn forward_move_skips_when_trailing_starts_lowercase() {
+        // "that" continues the previous clause; it isn't a new sentence's
+        // start. No move here; the chain rule decides the speaker instead.
+        let mut pieces = vec![
+            timed("Speaker 1", "I think that", 0, 0),
+            timed("Speaker 2", "we should do it.", 0, 900),
+        ];
+        let before = texts(&pieces);
+        realign_sentence_boundaries(&mut pieces);
+        assert_eq!(texts(&pieces), before);
+    }
+
+    #[test]
+    fn backward_move_pulls_sentence_close_to_prev_speaker() {
+        // Real-recording case: "AMC was a young company. Brand new.
+        // Brand" + "new. Hadn't done anything..." — the diarizer cut
+        // mid-utterance and gave "new." to the wrong speaker. Both moves
+        // fit; the repetition ("Brand new" already said) picks backward.
+        let mut pieces = vec![
+            timed("Speaker 1", "AMC was a young company. Brand new. Brand", 0, 0),
+            timed("Speaker 2", "new. Hadn't done anything significant yet.", 0, 2_400),
+        ];
+        realign_sentence_boundaries(&mut pieces);
+        assert_eq!(
+            texts(&pieces),
+            vec![
+                "AMC was a young company. Brand new. Brand new.",
+                "Hadn't done anything significant yet."
+            ]
+        );
+        assert_eq!(abs_words(&pieces[0]).last().unwrap(), &("new.".to_string(), 2_400));
+    }
+
+    #[test]
+    fn backward_move_skips_when_nothing_follows_the_fragment() {
+        // Moving "stop." would empty the next piece; that's the chain
+        // rule's case (one sentence, one speaker), not a boundary move.
+        let mut pieces = vec![
+            timed("Speaker 1", "I think we should", 0, 0),
+            timed("Speaker 2", "stop.", 0, 1_200),
+        ];
+        let before = texts(&pieces);
+        realign_sentence_boundaries(&mut pieces);
+        assert_eq!(texts(&pieces), before);
+    }
+
+    #[test]
+    fn backward_move_skips_a_capitalised_reply() {
+        // "Yes." after an open question is the other speaker answering,
+        // not the end of the question. Only a lowercase opening licenses
+        // the backward move.
+        let mut pieces = vec![
+            timed("Speaker 1", "do you think we should", 0, 0),
+            timed("Speaker 2", "Yes. I agree with that.", 0, 1_500),
+        ];
+        let before = texts(&pieces);
+        realign_sentence_boundaries(&mut pieces);
+        assert_eq!(texts(&pieces), before);
+    }
+
+    #[test]
+    fn backward_move_skips_when_fragment_too_long() {
+        // A 4-word leading fragment exceeds BOUNDARY_FRAGMENT_MAX_WORDS.
+        let mut pieces = vec![
+            timed("Speaker 1", "I was about to", 0, 0),
+            timed("Speaker 2", "yes that is correct. Anyway moving on.", 0, 1_200),
+        ];
+        let before = texts(&pieces);
+        realign_sentence_boundaries(&mut pieces);
+        assert_eq!(texts(&pieces), before);
+    }
+
+    #[test]
+    fn boundary_move_skips_same_speaker_other_stream_long_gap_and_mixed_timing() {
+        let pair = || {
+            vec![
+                timed("Speaker 1", "in the perfect way. It", 0, 0),
+                timed("Speaker 2", "does pay off.", 0, 1_800),
+            ]
+        };
+
+        let mut same = pair();
+        same[1].label = Some("Speaker 1".into());
+        realign_sentence_boundaries(&mut same);
+        assert_eq!(same[0].text, "in the perfect way. It");
+
+        let mut streams = pair();
+        streams[1].source = ChunkSource::Mic;
+        realign_sentence_boundaries(&mut streams);
+        assert_eq!(streams[0].text, "in the perfect way. It");
+
+        // Five seconds of silence between "It" and "does": not one sentence.
+        let mut gap = vec![
+            timed("Speaker 1", "in the perfect way. It", 0, 0),
+            timed("Speaker 2", "does pay off.", 0, 6_500),
+        ];
+        realign_sentence_boundaries(&mut gap);
+        assert_eq!(gap[0].text, "in the perfect way. It");
+
+        let mut mixed = pair();
+        mixed[1].words.clear();
+        realign_sentence_boundaries(&mut mixed);
+        assert_eq!(mixed[0].text, "in the perfect way. It");
+    }
+
+    #[test]
+    fn boundary_move_without_word_timings_moves_text_only() {
+        // OpenAI's gpt-4o family returns no word timings; the text cue is
+        // still there and the fix still applies to the transcript.
+        let mut pieces = vec![
+            piece(Some("Speaker 1"), "in the perfect way. It", false),
+            piece(Some("Speaker 2"), "does pay off.", false),
+        ];
+        realign_sentence_boundaries(&mut pieces);
+        assert_eq!(texts(&pieces), vec!["in the perfect way.", "It does pay off."]);
+        assert!(pieces[0].words.is_empty() && pieces[1].words.is_empty());
+    }
+
+    #[test]
+    fn boundary_move_across_chunks_keeps_absolute_timings() {
+        // The fragment sits in an earlier chunk (based at 0) than the
+        // piece it joins (based at 15 s). The receiving piece's base drops
+        // to the earlier chunk's start and every word keeps its time.
+        let mut pieces = vec![
+            timed("Speaker 1", "we close it here. It", 0, 12_000),
+            timed("Speaker 2", "does pay off now.", 15_000, 15_100),
+        ];
+        let before: Vec<(String, u64)> = abs_words(&pieces[0])
+            .into_iter()
+            .chain(abs_words(&pieces[1]))
+            .collect();
+        realign_sentence_boundaries(&mut pieces);
+        assert_eq!(texts(&pieces), vec!["we close it here.", "It does pay off now."]);
+        assert_eq!(pieces[1].base_ms, 0);
+        let after: Vec<(String, u64)> = abs_words(&pieces[0])
+            .into_iter()
+            .chain(abs_words(&pieces[1]))
+            .collect();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn boundary_move_prefers_the_smaller_correction() {
+        // Both moves fit: three words forward ("Men hva med" opens Speaker
+        // 2's turn) or one word backward ("budsjettet?" closes Speaker 1's
+        // question). The diarizer is usually off by a word, not three, and
+        // a question answered by the other speaker is the likelier reading.
+        let mut pieces = vec![
+            timed("Speaker 1", "Vi gjør det sånn. Men hva med", 0, 0),
+            timed("Speaker 2", "budsjettet? Det er ganske stramt i år, synes jeg.", 0, 2_400),
+        ];
+        realign_sentence_boundaries(&mut pieces);
+        assert_eq!(
+            texts(&pieces),
+            vec!["Vi gjør det sånn. Men hva med budsjettet?", "Det er ganske stramt i år, synes jeg."]
+        );
+    }
+
+    #[test]
+    fn refine_moves_the_fragment_instead_of_merging_the_turns() {
+        // The case behind "the first words of a sentence belong to the
+        // previous speaker": before the boundary move ran ahead of the
+        // chain rule, "It" left Speaker 1's piece open, the lowercase
+        // "does pay off" continued it, and the chain rule handed the whole
+        // of one turn to the other speaker.
+        let mut pieces = vec![
+            timed("Speaker 1", "Det løser seg på den perfekte måten. Det", 0, 0),
+            timed("Speaker 2", "lønner seg til slutt, og det er det fine med det.", 0, 2_400),
+            timed("Speaker 1", "Ja, det vet jeg.", 0, 6_500),
+        ];
+        refine_pieces(&mut pieces);
+        assert_eq!(
+            texts(&pieces),
+            vec![
+                "Det løser seg på den perfekte måten.",
+                "Det lønner seg til slutt, og det er det fine med det.",
+                "Ja, det vet jeg."
+            ]
+        );
+        assert_eq!(
+            labels(&pieces),
+            vec![Some("Speaker 1".into()), Some("Speaker 2".into()), Some("Speaker 1".into())]
+        );
+    }
+
+    #[test]
+    fn display_words_take_the_transcripts_punctuation_and_casing() {
+        // Deepgram's `word` and whisper-1's verbose words come bare; the
+        // chunk's transcript has the punctuation and capitals.
+        let mut c = sys_with_words(
+            0,
+            vec![("hello", 0, 300), ("world", 300, 600), ("how", 900, 1_100), ("are", 1_100, 1_300), ("you", 1_300, 1_500)],
+        );
+        c.text = "Hello, world. How are you?".into();
+        let shown: Vec<String> = display_words(&c).into_iter().map(|w| w.text).collect();
+        assert_eq!(shown, vec!["Hello,", "world.", "How", "are", "you?"]);
+    }
+
+    #[test]
+    fn display_words_keep_a_word_the_transcript_spells_differently() {
+        // Smart formatting can turn "four point two" into "4.2" in the
+        // transcript; those words have no match and keep their own text,
+        // and the words after them still line up.
+        let mut c = sys_with_words(
+            0,
+            vec![("churn", 0, 200), ("is", 200, 300), ("four", 300, 500), ("point", 500, 700), ("two", 700, 900), ("percent", 900, 1_200), ("now", 1_200, 1_400)],
+        );
+        c.text = "Churn is 4.2 percent now.".into();
+        let shown: Vec<String> = display_words(&c).into_iter().map(|w| w.text).collect();
+        assert_eq!(shown, vec!["Churn", "is", "four", "point", "two", "percent", "now."]);
+    }
+
+    #[test]
+    fn display_words_leave_local_whisper_words_alone() {
+        let c = sys_with_words(0, vec![("Hei,", 0, 200), ("du.", 200, 400)]);
+        let shown: Vec<String> = display_words(&c).into_iter().map(|w| w.text).collect();
+        assert_eq!(shown, vec!["Hei,", "du."]);
+    }
+
+    #[test]
+    fn transcript_from_bare_words_keeps_punctuation() {
+        let mut c = sys_with_words(0, vec![("hello", 0, 300), ("world", 300, 600)]);
+        c.text = "Hello world.".into();
+        let segments = vec![diarize::Segment { start_ms: 0, end_ms: 1_000, speaker_id: "a".into() }];
+        let labels: std::collections::HashMap<String, String> =
+            [("a".to_string(), "Speaker 1".to_string())].into();
+        let split = move |ch: &ChunkRecord| split_by_labels(ch, &segments, &labels);
+        assert_eq!(build_labelled_transcript(&[c], &split), "Speaker 1: Hello world.");
+    }
+
+    #[test]
+    fn continuation_chain_stops_at_a_dash() {
+        // A speaker trailing off or interrupted ends with a dash; the next
+        // speaker's lowercase reply is their own turn, not the rest of
+        // the sentence.
+        for cut in ["But what about the —", "I was going to say –", "Jeg ska-"] {
+            let mut pieces = vec![
+                piece(Some("Speaker 1"), cut, true),
+                piece(Some("Speaker 2"), "right but we have no time.", true),
+            ];
+            absorb_text_continuation_chains(&mut pieces);
+            assert_eq!(pieces[1].label.as_deref(), Some("Speaker 2"), "{cut}");
+        }
+    }
+
+    #[test]
+    fn continuation_chain_breaks_a_tie_by_who_spoke_first() {
+        // Two labels with the same word count and no agreeing neighbours:
+        // the first one in the chain wins, every run.
+        for _ in 0..20 {
+            let mut pieces = vec![
+                piece(Some("Speaker 2"), "Ja, jeg", true),
+                piece(Some("Speaker 1"), "skjønner det", true),
+            ];
+            absorb_text_continuation_chains(&mut pieces);
+            assert_eq!(labels(&pieces), vec![Some("Speaker 2".into()), Some("Speaker 2".into())]);
         }
     }
 

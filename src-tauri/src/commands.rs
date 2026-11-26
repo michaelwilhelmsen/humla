@@ -17,6 +17,8 @@ mod api_keys;
 mod assets;
 mod capture;
 mod chat;
+mod boundaries;
+mod clean;
 mod clients;
 mod copilot;
 mod deferred;
@@ -59,6 +61,7 @@ pub use api_keys::*;
 pub use assets::*;
 pub use capture::*;
 pub use chat::*;
+pub use clean::*;
 pub use clients::*;
 pub use copilot::*;
 pub use deferred::*;
@@ -125,15 +128,10 @@ const DEFAULT_SILENCE_RMS_THRESHOLD: f32 = 0.005;
 const IMPORT_BACKLOG_PERMITS: usize = 16;
 
 const DEFAULT_SUMMARY_MODEL: &str = "gpt-5.4-mini";
-/// The cloud model an automatic title call falls back to when the configured
-/// summary model reasons (#90) — which the default above does, so this is the
-/// model the default configuration actually titles with.
-///
-/// Pinned rather than derived: a reasoning model would spend thousands of
-/// invisible reasoning tokens on five words, in a call the user never asked
-/// for. It has to be a model every OpenAI key can reach, since a failure here
-/// is silent by design and would present as titling simply never happening.
-pub(crate) const TITLE_FALLBACK_MODEL: &str = "gpt-4o-mini";
+/// The OpenAI models for work besides the summary (`summary::LightJob`):
+/// titles and the speaker check, and the clean transcript (#217).
+pub(crate) const LIGHT_OPENAI_MODEL: &str = "gpt-6-luna";
+pub(crate) const CLEAN_OPENAI_MODEL: &str = "gpt-6.2-sol";
 // Ollama's default port + OpenAI-compat path. Any user running LM Studio,
 // llama-server, or vLLM will override this in Settings.
 const DEFAULT_LOCAL_LLM_BASE_URL: &str = "http://localhost:11434/v1";

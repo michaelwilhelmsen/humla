@@ -36,10 +36,26 @@ function setup(
   over: Partial<Note> = {},
   savePath: string | null = "/Users/me/weekly-sync.md",
   flushEdits: () => Promise<void> = () => Promise.resolve(),
+  cleanParagraphs = false,
 ) {
   const exportSpy = vi.fn();
   mockTauri({
     "plugin:dialog|save": () => savePath,
+    note_clean_view: () => ({
+      takes: [
+        {
+          sessionId: "s1",
+          items: cleanParagraphs
+            ? [{ kind: "turn", id: "t1", speaker: "You", text: "Hello.", startMs: 0, edited: false }]
+            : [],
+          stale: false,
+        },
+      ],
+      words: 4,
+      cleanedWords: cleanParagraphs ? 4 : 0,
+      edited: 0,
+      unreadable: false,
+    }),
     export_note: (args) => {
       exportSpy(args);
       return undefined;
@@ -91,6 +107,7 @@ describe("ExportModal", () => {
         includeTranscript: true,
         includeNotes: false,
         includeSpeakerLabels: true,
+        cleanTranscript: false,
       },
     });
     await waitFor(() => expect(onClose).toHaveBeenCalled());
@@ -135,6 +152,23 @@ describe("ExportModal", () => {
     const spec = (exportSpy.mock.calls[0]![0] as { spec: ExportSpec }).spec;
     expect(spec.includeSpeakerLabels).toBe(false);
     expect(spec.format).toBe("txt");
+  });
+
+  it("offers the clean transcript only when the note has one, on the reader's view", async () => {
+    const { exportSpy } = setup({}, "/Users/me/weekly-sync.md", () => Promise.resolve(), true);
+    const clean = await screen.findByRole("radio", { name: "Clean" });
+    expect(clean).toBeChecked();
+    await userEvent.click(screen.getByRole("button", { name: "Export…" }));
+    await waitFor(() => expect(exportSpy).toHaveBeenCalledTimes(1));
+    expect((exportSpy.mock.calls[0]![0] as { spec: ExportSpec }).spec.cleanTranscript).toBe(true);
+  });
+
+  it("exports verbatim from a note with no clean paragraphs", async () => {
+    const { exportSpy } = setup();
+    await userEvent.click(screen.getByRole("button", { name: "Export…" }));
+    await waitFor(() => expect(exportSpy).toHaveBeenCalledTimes(1));
+    expect(screen.queryByRole("radio", { name: "Clean" })).toBeNull();
+    expect((exportSpy.mock.calls[0]![0] as { spec: ExportSpec }).spec.cleanTranscript).toBe(false);
   });
 
   it("offers PDF and proposes a .pdf file for it", async () => {

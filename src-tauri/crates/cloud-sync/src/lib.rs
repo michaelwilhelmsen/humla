@@ -660,7 +660,7 @@ impl Worker {
             Some((_, true, remote_cua)) if note.updated_at <= *remote_cua => *remote_cua + 1,
             _ => note.updated_at,
         };
-        let body = json!({
+        let mut body = json!({
             "client_id": uuid,
             "workspace": workspace,
             "owner": owner,
@@ -687,6 +687,7 @@ impl Worker {
             "client_updated_at": client_updated_at,
             "deleted": false,
         });
+        put_clean_transcript(&mut body, &note.clean_transcript);
         let resp = match &remote {
             Some((pb_id, _, _)) => {
                 self.http
@@ -1392,10 +1393,10 @@ impl Worker {
                             "INSERT INTO notes
                                 (id, title, body, transcript, summary, audio_path, summary_preset,
                                  folder_id, client_id, language, summary_provider, expected_speakers, owner,
-                                 workspace_id, created_at, updated_at)
+                                 workspace_id, created_at, updated_at, clean_transcript)
                              SELECT ?1, title || ' (conflict copy)', body, transcript, summary,
                                  audio_path, summary_preset, folder_id, client_id, language, summary_provider,
-                                 expected_speakers, '', ?4, created_at, ?2
+                                 expected_speakers, '', ?4, created_at, ?2, clean_transcript
                              FROM notes WHERE id = ?3",
                             rusqlite::params![copy_id, now_ms(), n.client_id, home],
                         )?;
@@ -1431,14 +1432,16 @@ impl Worker {
         conn.execute(
             "INSERT INTO notes
                 (id, title, body, transcript, summary, audio_path, summary_preset,
-                 folder_id, client_id, language, summary_provider, expected_speakers, owner, workspace_id, created_at, updated_at, private, shared_with)
-             VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?14, ?8, '', ?9, ?12, ?13, ?10, ?11, ?15, ?16)
+                 folder_id, client_id, language, summary_provider, expected_speakers, owner, workspace_id, created_at, updated_at, private, shared_with,
+                 clean_transcript)
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?14, ?8, '', ?9, ?12, ?13, ?10, ?11, ?15, ?16, COALESCE(?17, ''))
              ON CONFLICT(id) DO UPDATE SET
                 title=excluded.title, body=excluded.body, transcript=excluded.transcript,
                 summary=excluded.summary, summary_preset=excluded.summary_preset,
                 folder_id=excluded.folder_id, client_id=excluded.client_id, language=excluded.language,
                 expected_speakers=excluded.expected_speakers, owner=excluded.owner,
                 private=excluded.private, shared_with=excluded.shared_with, created_at=excluded.created_at,
+                clean_transcript=COALESCE(?17, notes.clean_transcript),
                 updated_at=excluded.updated_at, deleted_at=NULL
              WHERE excluded.updated_at >= notes.updated_at",
             rusqlite::params![
@@ -1458,6 +1461,7 @@ impl Worker {
                 client,
                 n.private,
                 serde_json::to_string(&n.shared_with)?,
+                n.clean_transcript.as_deref().filter(|doc| !doc.is_empty()),
             ],
         )?;
         drop(conn); // release before firing the callback
@@ -1598,7 +1602,8 @@ impl Worker {
         let conn = self.db.lock();
         conn.query_row(
             "SELECT title, body, transcript, summary, language, summary_preset,
-                    folder_id, expected_speakers, created_at, updated_at, owner, client_id, private, shared_with
+                    folder_id, expected_speakers, created_at, updated_at, owner, client_id, private, shared_with,
+                    clean_transcript
              FROM notes WHERE id = ?1",
             rusqlite::params![uuid],
             |r| {
@@ -1617,6 +1622,7 @@ impl Worker {
                     client_id: r.get(11)?,
                     private: r.get(12)?,
                     shared_with: r.get(13)?,
+                    clean_transcript: r.get(14)?,
                 })
             },
         )
@@ -1693,6 +1699,8 @@ struct NoteRow {
     private: bool,
     /// JSON array of user ids, as stored.
     shared_with: String,
+    /// The clean transcript's JSON, empty when there is none.
+    clean_transcript: String,
 }
 
 struct FolderRow {
@@ -1721,6 +1729,14 @@ fn test_purge_note_rows(conn: &Connection, id: &str) -> Result<()> {
     Ok(())
 }
 
+/// An empty clean transcript (#217) means "never cleaned here", so the push
+/// leaves the field out and the server keeps what another device wrote.
+fn put_clean_transcript(body: &mut serde_json::Value, doc: &str) {
+    if !doc.is_empty() {
+        body["clean_transcript"] = serde_json::Value::String(doc.to_owned());
+    }
+}
+
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct RemoteNote {
@@ -1738,6 +1754,9 @@ struct RemoteNote {
     owner: String,
     private: bool,
     shared_with: Vec<String>,
+    /// The clean transcript (#217); `None` from a server without the field.
+    /// That and an empty one (never cleaned) leave the local one as it is.
+    clean_transcript: Option<String>,
     created_at: i64,
     client_updated_at: i64,
 }
@@ -2206,6 +2225,7 @@ mod it {
                 expected_speakers INTEGER, owner TEXT NOT NULL DEFAULT '',
                 workspace_id TEXT NOT NULL DEFAULT '', deleted_at INTEGER, client_id TEXT,
                 private INTEGER NOT NULL DEFAULT 0, shared_with TEXT NOT NULL DEFAULT '[]',
+                clean_transcript TEXT NOT NULL DEFAULT '',
                 created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
             );
             CREATE TABLE note_chunks (id TEXT PRIMARY KEY, note_id TEXT NOT NULL, text TEXT NOT NULL);
@@ -2743,6 +2763,41 @@ mod it {
                 == 1
         };
         assert!(is_null, "an empty reference clears the tag");
+    }
+
+    /// #217: a server without the field leaves the local clean transcript
+    /// alone; one that has it, empty or not, decides it.
+    #[test]
+    fn a_pull_keeps_the_clean_transcript_unless_the_server_has_one() {
+        let db = test_db();
+        let w = worker(db.clone(), offline_config("wsC"));
+        let clean = || scalar(&db, "SELECT clean_transcript FROM notes WHERE id = ?1", "n1");
+        let pulled = |at: i64, field: &str| -> RemoteNote {
+            serde_json::from_str(&format!(
+                r#"{{"client_id": "n1", "title": "T", "owner": "u1", "client_updated_at": {at}{field}}}"#
+            ))
+            .unwrap()
+        };
+
+        w.apply_remote_note(&pulled(10, r#", "clean_transcript": "{\"v\":1,\"takes\":[]}""#), None).unwrap();
+        assert_eq!(clean().as_deref(), Some(r#"{"v":1,"takes":[]}"#));
+        w.apply_remote_note(&pulled(20, ""), None).unwrap();
+        assert_eq!(clean().as_deref(), Some(r#"{"v":1,"takes":[]}"#));
+        w.apply_remote_note(&pulled(30, r#", "clean_transcript": """#), None).unwrap();
+        assert_eq!(clean().as_deref(), Some(r#"{"v":1,"takes":[]}"#));
+        w.apply_remote_note(&pulled(40, r#", "clean_transcript": "{\"v\":1,\"takes\":[{}]}""#), None).unwrap();
+        assert_eq!(clean().as_deref(), Some(r#"{"v":1,"takes":[{}]}"#));
+    }
+
+    /// #217 — a note never cleaned here sends no clean transcript, so a push
+    /// can't empty the one another device wrote.
+    #[test]
+    fn an_empty_clean_transcript_is_not_pushed() {
+        let mut body = json!({ "title": "T" });
+        put_clean_transcript(&mut body, "");
+        assert!(body.get("clean_transcript").is_none());
+        put_clean_transcript(&mut body, r#"{"v":1,"takes":[]}"#);
+        assert_eq!(body["clean_transcript"], r#"{"v":1,"takes":[]}"#);
     }
 
     /// #222 — a note re-dated on one device moves on the others too.

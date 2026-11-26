@@ -4,7 +4,7 @@ import userEvent from "@testing-library/user-event";
 import { SpeakerLabels } from "./SpeakerLabels";
 import { renameSpeakerInTranscript } from "../lib/speakers";
 
-// The speaker chip strip drives both rename and merge. Under the hood a
+// The speaker names drive both rename and merge. Under the hood a
 // merge IS a rename whose target is an already-existing label (#23), so
 // both actions surface through the single `onRename(oldLabel, newLabel)`
 // callback the parent wires to the transcript rewrite + timeline rename.
@@ -36,44 +36,36 @@ describe("SpeakerLabels strip visibility", () => {
 });
 
 describe("SpeakerLabels merge flow", () => {
-  it("offers a merge affordance on each chip", () => {
-    render(<SpeakerLabels transcript={TWO_SPEAKERS} onRename={vi.fn()} />);
-    expect(
-      screen.getByRole("button", { name: /merge speaker 1 into another/i }),
-    ).toBeTruthy();
-    expect(
-      screen.getByRole("button", { name: /merge speaker 2 into another/i }),
-    ).toBeTruthy();
-  });
-
-  it("lists only the OTHER labels as merge targets", async () => {
+  it("offers the note's other speakers as merges when a name is opened", async () => {
     const user = userEvent.setup();
     render(<SpeakerLabels transcript={THREE_SPEAKERS} onRename={vi.fn()} />);
 
-    await user.click(
-      screen.getByRole("button", { name: /merge speaker 1 into another/i }),
-    );
+    await user.click(screen.getByRole("button", { name: /^Speaker 1$/ }));
 
-    const menu = screen.getByRole("menu");
-    const items = screen.getAllByRole("menuitem");
     // Speaker 1 is the source — targets are Speaker 2 and Speaker 3 only.
-    expect(items).toHaveLength(2);
-    expect(menu.textContent).toContain("Speaker 2");
-    expect(menu.textContent).toContain("Speaker 3");
-    expect(items.some((i) => i.textContent?.includes("Speaker 1"))).toBe(false);
+    const options = screen.getAllByRole("option");
+    expect(options.map((o) => o.getAttribute("aria-label"))).toEqual(["Speaker 2", "Speaker 3"]);
+    expect(options.every((o) => /merge/i.test(o.textContent ?? ""))).toBe(true);
   });
 
-  it("calls onRename(source, target) when a merge target is chosen", async () => {
+  it("narrows the merges to what is typed", async () => {
+    const user = userEvent.setup();
+    render(<SpeakerLabels transcript={THREE_SPEAKERS} onRename={vi.fn()} />);
+
+    await user.click(screen.getByRole("button", { name: /^Speaker 1$/ }));
+    await user.clear(screen.getByRole("combobox"));
+    await user.type(screen.getByRole("combobox"), "3");
+
+    expect(screen.getAllByRole("option").map((o) => o.getAttribute("aria-label"))).toEqual(["Speaker 3"]);
+  });
+
+  it("calls onRename(source, target) when a merge is chosen", async () => {
     const user = userEvent.setup();
     const onRename = vi.fn();
     render(<SpeakerLabels transcript={TWO_SPEAKERS} onRename={onRename} />);
 
-    await user.click(
-      screen.getByRole("button", { name: /merge speaker 1 into another/i }),
-    );
-    await user.click(
-      screen.getByRole("menuitem", { name: /merge speaker 1 into speaker 2/i }),
-    );
+    await user.click(screen.getByRole("button", { name: /^Speaker 1$/ }));
+    await user.click(screen.getByRole("option", { name: "Speaker 2" }));
 
     expect(onRename).toHaveBeenCalledTimes(1);
     expect(onRename).toHaveBeenCalledWith("Speaker 1", "Speaker 2");
@@ -85,71 +77,49 @@ describe("SpeakerLabels merge flow", () => {
     expect(merged).toContain("Speaker 2:");
   });
 
-  it("moves focus onto the first menu item when opened from the keyboard", async () => {
+  it("merges with the arrow keys", async () => {
     const user = userEvent.setup();
-    render(<SpeakerLabels transcript={THREE_SPEAKERS} onRename={vi.fn()} />);
+    const onRename = vi.fn();
+    render(<SpeakerLabels transcript={THREE_SPEAKERS} onRename={onRename} />);
 
-    screen.getByRole("button", { name: /merge speaker 1 into another/i }).focus();
-    await user.keyboard("{Enter}");
+    await user.click(screen.getByRole("button", { name: /^Speaker 1$/ }));
+    await user.keyboard("{ArrowDown}{ArrowDown}{Enter}");
 
-    const items = screen.getAllByRole("menuitem");
-    expect(items[0]).toHaveFocus();
+    expect(onRename).toHaveBeenCalledWith("Speaker 1", "Speaker 3");
   });
 
-  it("keeps focus inside the menu when opened with the mouse", async () => {
+  it("merges on this note alone, without asking about other notes", async () => {
     const user = userEvent.setup();
-    render(<SpeakerLabels transcript={THREE_SPEAKERS} onRename={vi.fn()} />);
-
-    await user.click(
-      screen.getByRole("button", { name: /merge speaker 1 into another/i }),
+    const onRename = vi.fn();
+    const onRenameEverywhere = vi.fn();
+    render(
+      <SpeakerLabels
+        transcript={"Hege: a\nMichael: b"}
+        onRename={onRename}
+        onRenameEverywhere={onRenameEverywhere}
+        otherNotesWithLabel={{ Hege: 3 }}
+      />,
     );
 
-    // A pointer open highlights nothing (no focus-ring flash for mouse users),
-    // but focus lands on the menu itself so the arrow keys still reach the rows.
-    expect(screen.getByRole("menu")).toHaveFocus();
-  });
+    await user.click(screen.getByRole("button", { name: /^Hege$/ }));
+    await user.click(screen.getByRole("option", { name: "Michael" }));
 
-  it("roves focus with ArrowDown/ArrowUp (wrapping)", async () => {
-    const user = userEvent.setup();
-    render(<SpeakerLabels transcript={THREE_SPEAKERS} onRename={vi.fn()} />);
-
-    await user.click(
-      screen.getByRole("button", { name: /merge speaker 1 into another/i }),
-    );
-    const items = screen.getAllByRole("menuitem"); // Speaker 2, Speaker 3
-    await user.keyboard("{ArrowDown}");
-    expect(items[0]).toHaveFocus();
-    await user.keyboard("{ArrowDown}");
-    expect(items[1]).toHaveFocus();
-    await user.keyboard("{ArrowDown}"); // wraps back to first
-    expect(items[0]).toHaveFocus();
-    await user.keyboard("{ArrowUp}"); // wraps to last
-    expect(items[1]).toHaveFocus();
-  });
-
-  it("Escape closes the menu and returns focus to the merge trigger", async () => {
-    const user = userEvent.setup();
-    render(<SpeakerLabels transcript={THREE_SPEAKERS} onRename={vi.fn()} />);
-
-    const trigger = screen.getByRole("button", { name: /merge speaker 1 into another/i });
-    await user.click(trigger);
-    expect(screen.getByRole("menu")).toBeTruthy();
-    await user.keyboard("{Escape}");
+    expect(onRename).toHaveBeenCalledWith("Hege", "Michael");
+    expect(onRenameEverywhere).not.toHaveBeenCalled();
     expect(screen.queryByRole("menu")).toBeNull();
-    expect(trigger).toHaveFocus();
   });
 
-  it("closes the merge menu on Escape without merging", async () => {
+  it("leaves the speakers as they were on Escape", async () => {
     const user = userEvent.setup();
     const onRename = vi.fn();
     render(<SpeakerLabels transcript={TWO_SPEAKERS} onRename={onRename} />);
 
-    await user.click(
-      screen.getByRole("button", { name: /merge speaker 1 into another/i }),
-    );
-    expect(screen.queryByRole("menu")).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: /^Speaker 1$/ }));
+    expect(screen.getByRole("listbox")).toBeTruthy();
     await user.keyboard("{Escape}");
-    expect(screen.queryByRole("menu")).toBeNull();
+
+    expect(screen.queryByRole("listbox")).toBeNull();
+    expect(screen.getByRole("button", { name: /^Speaker 1$/ })).toBeTruthy();
     expect(onRename).not.toHaveBeenCalled();
   });
 
@@ -195,12 +165,8 @@ describe("SpeakerLabels rename still works", () => {
         onRename={onRename}
       />,
     );
-    await user.click(
-      screen.getByRole("button", { name: /merge michael into another/i }),
-    );
-    await user.click(
-      screen.getByRole("menuitem", { name: /merge michael into speaker 2/i }),
-    );
+    await user.click(screen.getByRole("button", { name: /^Michael$/ }));
+    await user.click(screen.getByRole("option", { name: "Speaker 2" }));
     expect(onRename).toHaveBeenCalledWith("Michael", "Speaker 2");
   });
 });
@@ -297,7 +263,7 @@ describe("SpeakerLabels rename picker", () => {
     const user = userEvent.setup();
     render(
       <SpeakerLabels
-        transcript={TWO_SPEAKERS}
+        transcript={"Speaker 1: hello\nMichael: hi"}
         onRename={vi.fn()}
         suggestions={{
           stats: [
@@ -309,8 +275,9 @@ describe("SpeakerLabels rename picker", () => {
       />,
     );
     await user.click(screen.getByRole("button", { name: /^Speaker 1$/ }));
-    // Converging on a placeholder is the opposite of the point.
-    expect(screen.queryByRole("listbox")).toBeNull();
+    // Converging on a placeholder is the opposite of the point. Michael is
+    // offered only as a merge, being on this note.
+    expect(screen.getAllByRole("option").map((o) => o.getAttribute("aria-label"))).toEqual(["Michael"]);
   });
 
   it("renames with no picker at all when there is nothing to suggest", async () => {

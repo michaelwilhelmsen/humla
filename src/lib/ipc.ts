@@ -90,6 +90,9 @@ export type Note = {
   deleted_at?: number | null;
   // Optional Client tag (issue #43). null = untagged. Independent of folder_id.
   client_id?: string | null;
+  // The clean transcript (#217) as the backend stores it; read it through
+  // `ipc.cleanView`, never parse it here.
+  clean_transcript?: string;
 };
 
 export type NoteRevision = {
@@ -143,6 +146,9 @@ export type ExportSpec = {
   // When false, the leading `Label: ` prefix is stripped from each
   // transcript line in the export.
   includeSpeakerLabels: boolean;
+  // The clean transcript (#217) in place of the verbatim one, where the note
+  // has one.
+  cleanTranscript: boolean;
 };
 
 /** The webhook endpoint as Settings reads it (#213): the URL and each header's
@@ -178,6 +184,20 @@ export type SettingsKey =
   | "transcribe_manually"
   // Hold a system-sleep power assertion while a capture runs (#180).
   | "keep_awake"
+  // Clean transcripts (#217): after a recording, a model writes a clean read
+  // of the transcript for the reader's Clean view. Default on; only the
+  // string "false" turns it off.
+  | "clean_transcripts"
+  // Which model cleans transcripts (#217): "<provider>:<model>", or "" for
+  // the default (src/lib/cleanModel.ts).
+  | "clean_model"
+  // A model checks speaker changes that cut a sentence and moves the words to
+  // whoever said them (#217). Default on; only the string "false" turns it
+  // off. Mirrors `clean::speaker_check_enabled`.
+  | "speaker_check"
+  // Which version the Transcript tab shows: "clean" (default) or "verbatim".
+  // Remembered across notes; owned by the tab's own switch.
+  | "transcript_view"
   // Cloud/teams: upload a finished recording's audio to its workspace note
   // so teammates can play it back. Default on; only the string "false"
   // disables it on the upload path. Surfaced in the Account section.
@@ -374,6 +394,40 @@ export type TimelineEntry = {
   sessionIndex: number;
   chunkIdx: number;
 };
+
+// What a clean pass did (#217): segments the model rewrote, and how many of
+// them a guard kept verbatim.
+export type CleanOutcome = { segments: number; keptVerbatim: number };
+
+// What a clean pass is asked to do (#217); mirrors `clean::CleanRequest`.
+// "auto": nobody pressed anything (Clean opened on entries without a clean
+// read), so a Copilot note is left alone. "missing": the entries without one,
+// asked for. "all": every entry anew.
+export type CleanRequest = "auto" | "missing" | "all";
+
+// The Clean view of a note (#217); mirrors `clean::CleanView`. Per take, its
+// paragraphs ("turn") and the verbatim stretches no paragraph covers yet
+// ("gap"), in the order they were said.
+export type CleanItem =
+  | { kind: "turn"; id: string; speaker: string; text: string; startMs: number; edited: boolean }
+  | { kind: "gap"; speaker: string; text: string; startMs: number; words: number };
+export type CleanTakeView = {
+  sessionId: string;
+  items: CleanItem[];
+  // The verbatim changed under paragraphs the user edited.
+  stale: boolean;
+};
+export type CleanView = {
+  takes: CleanTakeView[];
+  words: number;
+  cleanedWords: number;
+  // Paragraphs the user edited or gave another speaker.
+  edited: number;
+  // Stored by another version of Humla: neither shown nor written.
+  unreadable: boolean;
+};
+// A change to one paragraph; mirrors `clean::CleanEdit`.
+export type CleanEdit = { text?: string; speaker?: string };
 
 // Outcome of the on-open orphaned-text repair (#169). `coversTranscript` is
 // the backend's own comparison of `note.transcript` against what the merged
@@ -577,6 +631,19 @@ export const ipc = {
   relaunchApp: () => invoke<void>("app_relaunch"),
   noteTimeline: (noteId: string) =>
     invoke<TimelineEntry[]>("note_timeline", { noteId }),
+  // Clean a note's transcript (#217): a model rewrites it as a clean read
+  // (fillers, stutters and false starts gone, grammar mended) for the
+  // reader's Clean view. Progress arrives on `clean_status`.
+  cleanNote: (noteId: string, request: CleanRequest) =>
+    invoke<CleanOutcome>("note_clean", { noteId, request }),
+  // Whether the note's summary provider is set up to clean with; the reader
+  // shows no Clean view without one.
+  cleanAvailable: (noteId: string) => invoke<boolean>("note_clean_available", { noteId }),
+  cleanView: (noteId: string) => invoke<CleanView>("note_clean_view", { noteId }),
+  // Rewrite a paragraph or give it another speaker. An edited paragraph stays
+  // as it is when the note is cleaned again, unless the user asks to replace it.
+  cleanEdit: (noteId: string, sessionId: string, turnId: string, edit: CleanEdit) =>
+    invoke<void>("note_clean_edit", { noteId, sessionId, turnId, edit }),
   // Repair transcript text no session timeline accounts for (#169), and report
   // whether a gap remains. Call this BEFORE `noteTimeline` on open: the four
   // paths that rebuild the transcript from the timelines would otherwise
@@ -1054,6 +1121,15 @@ export type SummaryStatus = { noteId: string; active: boolean };
 // A title call is in flight for this note (#90). Brackets the model call only,
 // so it never fires for a note the backend declines to title.
 export type TitleStatus = { noteId: string; active: boolean };
+// A clean pass over this note's transcript (#217). `done`/`total` count model
+// calls; the closing event (`active: false`) carries `error` when it failed.
+export type CleanStatus = {
+  noteId: string;
+  active: boolean;
+  done: number;
+  total: number;
+  error: string | null;
+};
 // A deferred transcription is replaying this note's retained audio (#146).
 // Per-note, and never on `recording_status`: a live recording on a different
 // note may be in flight at the same time.
@@ -1140,6 +1216,9 @@ export function onSummaryStatus(cb: (e: SummaryStatus) => void): Promise<Unliste
 }
 export function onTitleStatus(cb: (e: TitleStatus) => void): Promise<UnlistenFn> {
   return listen<TitleStatus>("title_status", (e) => cb(e.payload));
+}
+export function onCleanStatus(cb: (e: CleanStatus) => void): Promise<UnlistenFn> {
+  return listen<CleanStatus>("clean_status", (e) => cb(e.payload));
 }
 export function onTranscribeStatus(cb: (e: TranscribeStatus) => void): Promise<UnlistenFn> {
   return listen<TranscribeStatus>("transcribe_status", (e) => cb(e.payload));

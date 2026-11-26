@@ -164,8 +164,8 @@ fn empty_answer_error(model: &str, finish_reason: Option<&str>, reasoning_chars:
 }
 
 /// Reasoning models: gpt-5 and every later generation, plus the o-series.
-/// They reject the `temperature` parameter and accept extra knobs like
-/// `reasoning_effort` (which we leave at the API default).
+/// They reject the `temperature` parameter. `reasoning_effort` is sent only
+/// when the caller names one, since not every model accepts every value.
 pub(crate) fn is_reasoning_model(model: &str) -> bool {
     if let Some(rest) = model.strip_prefix("gpt-") {
         // "gpt-5", "gpt-5.4-mini", "gpt-6", "gpt-6.1-nano", … — a major
@@ -183,6 +183,24 @@ pub(crate) fn is_reasoning_model(model: &str) -> bool {
     }
 }
 
+/// How much a reasoning model thinks before it answers (`reasoning_effort`).
+/// Not every model accepts every value: `gpt-6.2-sol` refuses `none`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum ReasoningEffort {
+    None,
+    Low,
+}
+
+impl ReasoningEffort {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Low => "low",
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct ChatStreamRequest<'a> {
     model: &'a str,
@@ -190,6 +208,8 @@ struct ChatStreamRequest<'a> {
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<ReasoningEffort>,
 }
 
 // One Server-Sent-Events frame from OpenAI's streaming /chat/completions.
@@ -542,6 +562,7 @@ async fn summarize_stream<F>(
     ep: Endpoint<'_>,
     api_key: &str,
     model: &str,
+    reasoning_effort: Option<ReasoningEffort>,
     system_prompt: &str,
     transcript: &str,
     mut on_chunk: F,
@@ -562,11 +583,16 @@ where
             Endpoint::Cloud if !is_reasoning_model(model) => Some(0.2),
             _ => None,
         },
+        reasoning_effort: match ep {
+            Endpoint::Cloud => reasoning_effort,
+            _ => None,
+        },
     };
     let started = std::time::Instant::now();
     eprintln!(
-        "[llm] POST {} (stream) model={model} system_chars={} user_chars={}",
+        "[llm] POST {} (stream) model={model} reasoning_effort={} system_chars={} user_chars={}",
         ep.url(),
+        reasoning_effort.map_or("default", ReasoningEffort::as_str),
         system_prompt.len(),
         transcript.len()
     );
@@ -602,7 +628,7 @@ where
     F: FnMut(StreamChunk) + Send,
 {
     let ep = Endpoint::Custom(base_url);
-    summarize_stream(ep, api_key.unwrap_or(""), model, system_prompt, transcript, on_chunk).await
+    summarize_stream(ep, api_key.unwrap_or(""), model, None, system_prompt, transcript, on_chunk).await
 }
 
 /// Same shape as `summarize` but takes an explicit base URL. Used to route
@@ -618,6 +644,7 @@ pub async fn summarize_with_base<F>(
     api_key: &str,
     model: &str,
     think: bool,
+    reasoning_effort: Option<ReasoningEffort>,
     system_prompt: &str,
     transcript: &str,
     on_chunk: F,
@@ -659,7 +686,7 @@ where
     // TCP idle rather than time-to-first-byte, the window is narrowed rather
     // than closed.
     if !is_local {
-        return summarize_stream(Endpoint::Cloud, api_key, model, system_prompt, transcript, on_chunk)
+        return summarize_stream(Endpoint::Cloud, api_key, model, reasoning_effort, system_prompt, transcript, on_chunk)
             .await;
     }
     // Local OpenAI-compat servers (LM Studio, llama-server, vLLM) stay
@@ -2142,6 +2169,24 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_named_reasoning_effort_is_sent_and_no_other_is() {
+        let req = |effort| {
+            serde_json::to_value(ChatStreamRequest {
+                model: "gpt-6-luna",
+                messages: vec![],
+                stream: true,
+                temperature: None,
+                reasoning_effort: effort,
+            })
+            .unwrap()
+        };
+        assert_eq!(req(Some(ReasoningEffort::None))["reasoning_effort"], "none");
+        assert_eq!(req(Some(ReasoningEffort::Low))["reasoning_effort"], "low");
+        assert!(req(None).get("reasoning_effort").is_none());
+        assert!(is_reasoning_model(crate::commands::LIGHT_OPENAI_MODEL));
+    }
+
     mod local_output_ceiling {
         use super::*;
         use crate::chat::test_server::serve;
@@ -2167,7 +2212,7 @@ mod tests {
         }
 
         async fn summarize(base: &str) -> Result<String> {
-            summarize_with_base(base, "", "gemma", false, "sys", "transcript", |_| {}).await
+            summarize_with_base(base, "", "gemma", false, None, "sys", "transcript", |_| {}).await
         }
 
         const ANSWER: &str = r#"data: {"choices":[{"delta":{"content":"Svar"},"finish_reason":"stop"}]}

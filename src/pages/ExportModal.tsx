@@ -1,7 +1,9 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { save } from "@tauri-apps/plugin-dialog";
 import { X } from "lucide-react";
 import { ipc, type ExportFormat, type Note } from "../lib/ipc";
+import { hasParagraphs, parseTranscriptView, type TranscriptView } from "../lib/cleanView";
+import { useLiveSetting } from "../lib/settingsBus";
 import { useRecordingStore } from "../lib/store";
 import { useCloudStore } from "../lib/cloud";
 import { Modal } from "./settings/components/Modal";
@@ -156,6 +158,25 @@ export function ExportModal({
   const [includeNotes, setIncludeNotes] = useState(false);
   const [includeSpeakerLabels, setIncludeSpeakerLabels] = useState(true);
   const [busy, setBusy] = useState(false);
+  // Clean or Verbatim (#217), offered when the note has clean paragraphs and
+  // starting on the version the reader shows.
+  const readerView = parseTranscriptView(useLiveSetting("transcript_view"));
+  const [hasClean, setHasClean] = useState(false);
+  const [version, setVersion] = useState<TranscriptView | null>(null);
+  useEffect(() => {
+    if (!open || !hasTranscript) return;
+    let cancelled = false;
+    ipc
+      .cleanView(note.id)
+      .then((view) => {
+        if (!cancelled) setHasClean(hasParagraphs(view));
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [open, note.id, hasTranscript]);
+  const transcriptVersion = hasClean ? (version ?? readerView) : "verbatim";
 
   const nothingSelected =
     !(includeSummary && hasSummary) &&
@@ -179,6 +200,7 @@ export function ExportModal({
         includeTranscript: includeTranscript && hasTranscript,
         includeNotes: includeNotes && hasNotes,
         includeSpeakerLabels,
+        cleanTranscript: transcriptVersion === "clean",
       });
       onClose();
     } catch (e) {
@@ -215,6 +237,21 @@ export function ExportModal({
             hint={hasNotes ? undefined : "empty"}
           />
         </div>
+
+        {hasClean && (
+          <div className="flex items-center justify-between gap-4">
+            <span className="text-sm">Transcript</span>
+            <Segmented<TranscriptView>
+              label="Transcript version"
+              value={transcriptVersion}
+              onChange={setVersion}
+              options={[
+                { value: "clean", label: "Clean" },
+                { value: "verbatim", label: "Verbatim" },
+              ]}
+            />
+          </div>
+        )}
 
         <div className="flex items-center justify-between gap-4">
           <span className="text-sm">Speaker labels in transcript</span>

@@ -1313,6 +1313,10 @@ async fn post_stop_chain_inner(
     // note_sessions metadata push; the assets upload separately (the frontend
     // fires cloud_upload_note_sessions once this chain lands on Idle).
     session_changed_for_sync(&app, &note_id, &session_id);
+    // Clean the transcript (#217) now that its speakers and boundaries are
+    // final. Spawned: it waits for this chain to release the note, then makes
+    // one model call per window, and the reader shows Verbatim until it lands.
+    tauri::async_runtime::spawn(super::clean::clean_note_quietly(app.clone(), note_id.clone()));
     // Now that every step that needs the WAVs has finished, drop the temp dir.
     // Best-effort: a leftover dir is harmless.
     clear_temp_dir(temp_dir, clock).await;

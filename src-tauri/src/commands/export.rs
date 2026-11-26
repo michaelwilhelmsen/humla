@@ -38,6 +38,10 @@ pub struct ExportSpec {
     /// When false, the leading `Label: ` prefix is stripped from each
     /// transcript line so the export reads as plain prose.
     pub include_speaker_labels: bool,
+    /// The clean transcript (#217) in place of the verbatim one, where the
+    /// note has one.
+    #[serde(default)]
+    pub clean_transcript: bool,
 }
 
 /// A section's content, before it is rendered for a format.
@@ -167,13 +171,12 @@ pub fn export_note(app: AppHandle, note_id: String, spec: ExportSpec) -> Result<
         let conn = state.db.lock();
         db::get_note(&conn, &note_id).map_err(err)?
     };
+    let clean = spec.clean_transcript.then(|| super::clean::clean_text(&app, &note_id, &note.transcript)).flatten();
+    let transcript = clean.as_deref().unwrap_or(&note.transcript);
     let bytes = match spec.format {
-        ExportFormat::Pdf => {
-            build_export_pdf(&note.title, &note.summary, &note.transcript, &note.body, &spec)?
-        }
+        ExportFormat::Pdf => build_export_pdf(&note.title, &note.summary, transcript, &note.body, &spec)?,
         ExportFormat::Markdown | ExportFormat::Txt => {
-            build_export_document(&note.title, &note.summary, &note.transcript, &note.body, &spec)
-                .into_bytes()
+            build_export_document(&note.title, &note.summary, transcript, &note.body, &spec).into_bytes()
         }
     };
     std::fs::write(&spec.path, bytes).map_err(|e| format!("write export file: {e}"))?;
@@ -407,6 +410,7 @@ mod tests {
             include_transcript: true,
             include_notes: false,
             include_speaker_labels: true,
+            clean_transcript: false,
         }
     }
 

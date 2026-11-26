@@ -54,7 +54,7 @@ import { Permissions } from "./components/Permissions";
 import { Section } from "./pages/settings/components/Section";
 import { TranscriptionStep } from "./pages/onboarding/steps/Transcription";
 import { STEP_ORDER, type StepContext, type StepId } from "./pages/onboarding/types";
-import type { DiarizeEngine, ProviderConfig, RecordingStatus, Step, TimelineEntry } from "./lib/ipc";
+import type { CleanItem, CleanView, DiarizeEngine, ProviderConfig, RecordingStatus, Step, TimelineEntry } from "./lib/ipc";
 import { DEMO_CLIENTS, DEMO_FOLDERS, demoNotes } from "./test/noteLibrary";
 import { DEMO_RECOVERY_CODES, DEMO_TWO_FACTOR_SETUP } from "./test/twoFactorFixtures";
 // Mirrors src/main.tsx — every theme's typeface, so a scenario reviewed under
@@ -185,7 +185,7 @@ function TranscriptEditorHarness({ disabled }: { disabled: boolean }) {
 // `PANEL_MAX` (720), per Note.tsx. This card was pinned at 420 for a long time,
 // which is how a turn's edit box shipped at a width that only looked right
 // there (#176): judge the reader at the bounds, not at one comfortable middle.
-function playerCase(disabled: boolean, width = 420, longNames = false): Scenario {
+function playerCase(disabled: boolean, width = 420, longNames = false, takes = 1): Scenario {
   return {
     wrap: (node) => (
       <div className="flex-1 min-h-0 flex justify-center px-6 py-8">
@@ -197,7 +197,7 @@ function playerCase(disabled: boolean, width = 420, longNames = false): Scenario
         </div>
       </div>
     ),
-    render: () => <TranscriptPlayerHarness disabled={disabled} longNames={longNames} />,
+    render: () => <TranscriptPlayerHarness disabled={disabled} longNames={longNames} takes={takes} />,
     ipc: {
       note_session_playback_path: () => null,
       note_timeline_set_chunk_text: () => null,
@@ -209,9 +209,12 @@ function playerCase(disabled: boolean, width = 420, longNames = false): Scenario
 function TranscriptPlayerHarness({
   disabled,
   longNames = false,
+  takes = 1,
 }: {
   disabled: boolean;
   longNames?: boolean;
+  /** More than one: two recordings, with audio, so the player offers a choice. */
+  takes?: number;
 }) {
   const turn = (
     chunkIdx: number,
@@ -243,20 +246,18 @@ function TranscriptPlayerHarness({
       noteId="mock-note"
       timeline={timeline}
       setTimeline={setTimeline}
-      sessions={[
-        {
-          id: "s1",
-          index: 1,
-          startedAt: new Date().toISOString(),
-          durationMs: 12000,
-          streams: ["mic"],
-          canTranscribe: false,
-          canRetranscribe: false,
-          hasPlayback: false,
-        },
-      ]}
+      sessions={Array.from({ length: takes }, (_, i) => ({
+        id: `s${i + 1}`,
+        index: i + 1,
+        startedAt: new Date().toISOString(),
+        durationMs: 12000,
+        streams: ["mic" as const],
+        canTranscribe: false,
+        canRetranscribe: false,
+        hasPlayback: takes > 1,
+      }))}
       fallbackPlaybackUrl={null}
-      audioAvailable={false}
+      audioAvailable={takes > 1}
       keepAudio={false}
       disabled={disabled}
       fill
@@ -391,6 +392,111 @@ function notePlayerCase(): Scenario {
       const url = URL.createObjectURL(quietToneWav(8));
       (window as unknown as { __TAURI_INTERNALS__: { convertFileSrc: () => string } })
         .__TAURI_INTERNALS__.convertFileSrc = () => url;
+    },
+  };
+}
+
+// ---- #217 axis: the Transcript tab's Clean view -----------------------------
+// The whole note, because the question is the switch's place among the tab's
+// other rows, and what the clean paragraphs read like. "pending": a pass a
+// third of the way through, the words it hasn't reached drawn as placeholders.
+function noteCleanCase(view: "clean" | "verbatim", pending = false): Scenario {
+  const note = makeNote({
+    id: "n1",
+    title: "Kvartalsgjennomgang",
+    transcript:
+      "Michael: Eh, skal vi, skal vi ta gjennomgangen nå?\nHege: Ja, ehm, jeg har jeg har notatene klare.",
+    language: "no",
+  });
+  // Words spread evenly over an entry's slot, as the backend would time them.
+  const timed = (text: string, startMs: number) =>
+    text.split(" ").map((t, k) => ({ text: t, start_ms: startMs + k * 300, end_ms: startMs + k * 300 + 250 }));
+  const said: [string, string][] = [
+    ["Michael", "Eh, skal vi, skal vi ta gjennomgangen nå?"],
+    ["Hege", "Ja, ehm, jeg har jeg har notatene klare."],
+    ["Hege", "Og tallene fra fra forrige kvartal, altså, de ligger i mappa."],
+    ["Michael", "Bra. Øh, da starter vi der. Jeg tenkte at vi, liksom, ser på på churn først."],
+    ["Hege", "Mm."],
+    ["Hege", "Churn er, eh, den er faktisk nede. Fra fire komma to til tre komma ni prosent."],
+    ["Stian", "Ja, ja. Det, eh, det fikser jeg."],
+  ];
+  const timeline = said.map(([label, text], i) => ({
+    startMs: i * 4000,
+    endMs: i * 4000 + 3800,
+    label,
+    text,
+    words: timed(text, i * 4000),
+    sessionId: "s1",
+    sessionIndex: 1,
+    chunkIdx: i,
+  }));
+  const turn = (i: number, text: string, edited = false): CleanItem => ({
+    kind: "turn",
+    id: `t${i}`,
+    speaker: said[i][0],
+    text,
+    startMs: i * 4000,
+    edited,
+  });
+  const gap = (i: number): CleanItem => ({
+    kind: "gap",
+    speaker: said[i][0],
+    text: said[i][1],
+    startMs: i * 4000,
+    words: said[i][1].split(" ").length,
+  });
+  const items: CleanItem[] = [
+    turn(0, "Skal vi ta gjennomgangen nå?"),
+    turn(1, "Ja, jeg har notatene klare, og tallene fra forrige kvartal ligger i mappa.", true),
+    ...(pending
+      ? [gap(3), gap(5), gap(6)]
+      : [
+          turn(3, "Bra. Da starter vi der. Jeg tenkte at vi ser på churn først."),
+          turn(5, "Churn er faktisk nede, fra 4,2 til 3,9 prosent."),
+          gap(6),
+        ]),
+  ];
+  const words = said.reduce((n, [, t]) => n + t.split(" ").length, 0);
+  const take = {
+    id: "s1",
+    index: 1,
+    startedAt: new Date(1_755_000_000_000).toISOString(),
+    durationMs: 20000,
+    streams: ["mic"],
+    hasPlayback: true,
+    canTranscribe: false,
+    canRetranscribe: true,
+  };
+  return {
+    route: "/note/n1",
+    render: () => null, // unused — `route` renders the app
+    ipc: {
+      notes_list: () => [note],
+      notes_get: () => note,
+      settings_get: (args) => {
+        const key = (args as { key?: string } | undefined)?.key;
+        return key === "transcript_view" ? view : null;
+      },
+      note_timeline: () => timeline,
+      note_timeline_repair: () => ({ repaired: false, coversTranscript: true }),
+      note_sessions: () => [take],
+      note_session_playback_path: () => "/mock/playback.wav",
+      note_clean: () => ({ segments: 0, keptVerbatim: 0 }),
+      note_clean_available: () => true,
+      note_clean_view: (): CleanView => ({
+        takes: [{ sessionId: "s1", items, stale: false }],
+        words,
+        cleanedWords: pending ? 23 : words - 8,
+        edited: 1,
+        unreadable: false,
+      }),
+      note_clean_edit: () => null,
+    },
+    seed: () => {
+      const url = URL.createObjectURL(quietToneWav(8));
+      (window as unknown as { __TAURI_INTERNALS__: { convertFileSrc: () => string } })
+        .__TAURI_INTERNALS__.convertFileSrc = () => url;
+      if (pending) useRecordingStore.setState({ cleaning: { n1: { done: 1, total: 3 } } });
     },
   };
 }
@@ -1638,6 +1744,8 @@ const CASES: Record<string, Scenario> = {
   // question at 260 is whether the title row and the open edit box still fit;
   // at 720 it is whether the title still reads as a title.
   "player-260": playerCase(false, 260),
+  "player-takes": playerCase(false, 420, false, 2),
+  "player-takes-260": playerCase(false, 260, false, 2),
   "player-720": playerCase(false, 720),
   "player-260-longnames": playerCase(false, 260, true),
 
@@ -1657,6 +1765,9 @@ const CASES: Record<string, Scenario> = {
   "note-retention": noteRetentionCase(),
   "note-retention-move": noteRetentionCase(true),
   "note-player": notePlayerCase(),
+  "note-clean": noteCleanCase("clean"),
+  "note-clean-verbatim": noteCleanCase("verbatim"),
+  "note-clean-pending": noteCleanCase("clean", true),
   "note-pending": noteTranscribeCase(false),
   "note-pending-text": noteTranscribeCase(true),
   // #146: the same note mid-replay. Two surfaces report the one run — the
