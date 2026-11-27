@@ -3231,6 +3231,10 @@ function parseTranscriptLines(transcript: string): ParsedTranscriptLine[] {
  *  plain fallback. */
 const READER_TEXT = "text-[15px] leading-[1.65] text-[var(--color-text)]";
 
+/** Clean's and Verbatim's turns carry `px-2` for their hover card; the reader
+ *  gives it back so their text lines up with the page. */
+const READER_BLEED = "-mx-2";
+
 /** A turn's speaker, above the words they said (#176).
  *
  * Shared by BOTH readers — `TranscriptPlayer` over a timeline and
@@ -3994,6 +3998,7 @@ export const TranscriptPlayer = memo(function TranscriptPlayer({
         <div
           className={cn(
             READER_TEXT,
+            READER_BLEED,
             "overflow-y-auto",
             fill && "flex-1 min-h-0",
           )}
@@ -4015,6 +4020,7 @@ export const TranscriptPlayer = memo(function TranscriptPlayer({
           onScroll={handleScroll}
           className={cn(
             READER_TEXT,
+            READER_BLEED,
             "overflow-y-auto",
             fill && "flex-1 min-h-0",
           )}
