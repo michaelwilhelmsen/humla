@@ -1318,6 +1318,7 @@ export function Note() {
   ]
     .filter(Boolean)
     .join(" · ");
+  const transcriptLanguageCode = languageValue === "auto" ? "Auto" : languageValue.toUpperCase();
   const cleanSwitch = cleanOn && timeline.length > 0 && timelineCoversTranscript;
   const canCleanAgain =
     cleanSwitch &&
@@ -1824,6 +1825,7 @@ export function Note() {
                     {cleanSwitch && (
                       <Segmented<TranscriptView>
                         label="Transcript version"
+                        size="sm"
                         value={transcriptView}
                         onChange={(v) => void writeSetting("transcript_view", v)}
                         options={[
@@ -1835,6 +1837,8 @@ export function Note() {
                     <div className="ml-auto flex items-center gap-0.5 min-w-0">
                       <TranscriptSettings
                         summary={transcriptSummary}
+                        languageCode={transcriptLanguageCode}
+                        speakerCount={speakerLabelCount}
                         language={languagePicker}
                         speakers={speakersPicker}
                         rediarize={readOnly ? null : rediarize}
@@ -3227,6 +3231,10 @@ function parseTranscriptLines(transcript: string): ParsedTranscriptLine[] {
  *  plain fallback. */
 const READER_TEXT = "text-[15px] leading-[1.65] text-[var(--color-text)]";
 
+/** Clean's and Verbatim's turns carry `px-2` for their hover card; the reader
+ *  gives it back so their text lines up with the page. */
+const READER_BLEED = "-mx-2";
+
 /** A turn's speaker, above the words they said (#176).
  *
  * Shared by BOTH readers — `TranscriptPlayer` over a timeline and
@@ -3990,6 +3998,7 @@ export const TranscriptPlayer = memo(function TranscriptPlayer({
         <div
           className={cn(
             READER_TEXT,
+            READER_BLEED,
             "overflow-y-auto",
             fill && "flex-1 min-h-0",
           )}
@@ -4011,6 +4020,7 @@ export const TranscriptPlayer = memo(function TranscriptPlayer({
           onScroll={handleScroll}
           className={cn(
             READER_TEXT,
+            READER_BLEED,
             "overflow-y-auto",
             fill && "flex-1 min-h-0",
           )}
@@ -4786,11 +4796,13 @@ function useRediarize(noteId: string | null, multiSession: boolean, enabled: boo
   return { hasAudio, multiSession, busy, error, run };
 }
 
-/** The Transcript tab's "Norwegian · 3 speakers", the transcript's language
- *  and how many speakers it has. It opens what the next transcription uses
- *  and everything that runs again over this transcript. */
+/** The Transcript tab's language code and speaker count. It opens what the
+ *  next transcription uses and everything that runs again over this
+ *  transcript. */
 function TranscriptSettings({
   summary,
+  languageCode,
+  speakerCount,
   language,
   speakers,
   rediarize,
@@ -4799,7 +4811,10 @@ function TranscriptSettings({
   cleanAgain,
   diagnostics,
 }: {
+  /** The full "Norwegian · 3 speakers", for the tooltip and screen readers. */
   summary: string;
+  languageCode: string;
+  speakerCount: number;
   language: React.ReactNode;
   speakers: React.ReactNode;
   rediarize: { hasAudio: boolean; multiSession: boolean; busy: boolean; run: () => Promise<void> } | null;
@@ -4833,10 +4848,18 @@ function TranscriptSettings({
         <button
           type="button"
           aria-label={`Transcription settings: ${summary}`}
-          className="inline-flex items-center gap-1.5 h-8 min-w-0 pl-2.5 pr-2 rounded-full text-[13px] text-[var(--color-text-muted)] hover:bg-[var(--color-pill-hover)] hover:text-[var(--color-text)] data-[state=open]:bg-[var(--color-pill-hover)] data-[state=open]:text-[var(--color-text)] transition-colors"
+          title={summary}
+          className="inline-flex shrink-0 items-center gap-1 h-8 pl-2 pr-1.5 rounded-full text-[13px] whitespace-nowrap tabular-nums text-[var(--color-text-muted)] hover:bg-[var(--color-pill-hover)] hover:text-[var(--color-text)] data-[state=open]:bg-[var(--color-pill-hover)] data-[state=open]:text-[var(--color-text)] transition-colors"
         >
-          <span className="truncate">{summary}</span>
-          <ChevronDown size={12} strokeWidth={2} className="shrink-0" />
+          <Languages size={14} strokeWidth={1.6} aria-hidden />
+          <span>{languageCode}</span>
+          {speakerCount > 0 && (
+            <>
+              <Users size={14} strokeWidth={1.6} aria-hidden className="ml-1" />
+              <span>{speakerCount}</span>
+            </>
+          )}
+          <ChevronDown size={12} strokeWidth={2} aria-hidden />
         </button>
       </PopoverTrigger>
       <PopoverContent align="end" maxHeight={440} className="w-[280px]">
