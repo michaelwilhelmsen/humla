@@ -11,6 +11,24 @@ export type Release = {
 
 export const releases: Release[] = [
   {
+    version: "0.83.0",
+    date: "2026-11-27",
+    title: "A tidier Transcript tab",
+    summary: "The top of the Transcript tab now fits on one line, and the transcript lines up with the rest of the panel.",
+    paragraphs: [
+      "The language and speaker count at the top of the Transcript tab now show as two small icons with a short code and a number, and the Clean | Verbatim switch is smaller. Together they fit on one line, even with the panel dragged narrow, where they used to wrap onto a line of their own. Hover over them for the full language name and speaker count.",
+      "The transcript text now starts at the same edge as everything above it, in both Clean and Verbatim. The highlight when you hover a paragraph reaches into the margin instead of pushing the text in.",
+    ],
+    highlights: [
+      "Language and speaker count as icons at the top of the Transcript tab.",
+      "A smaller Clean | Verbatim switch that fits on the same line.",
+      "Transcript text lines up with the rest of the panel.",
+    ],
+    issues: [
+      { title: "feature request: Transcript cleaning", reference: "#217", status: "Closed", url: "https://github.com/michaelwilhelmsen/humla/issues/217" },
+    ],
+  },
+  {
     version: "0.82.0",
     date: "2026-11-26",
     title: "Clean transcripts",
